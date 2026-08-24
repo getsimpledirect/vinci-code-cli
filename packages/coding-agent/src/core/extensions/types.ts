@@ -204,6 +204,9 @@ export interface ExtensionUIContext {
 		},
 	): Promise<T>;
 
+	/** [vinci] Whether an extension-owned overlay currently has keyboard focus. */
+	isOverlayActive?(): boolean;
+
 	/** Paste text into the editor, triggering paste handling (collapse for large content). */
 	pasteToEditor(text: string): void;
 
@@ -326,6 +329,9 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
 	shutdown(): void;
+	/** Declare an exit code for a successful headless run. Ignored when the host exits for another
+	 * reason. Last writer wins across extensions; the hint resets at each agent_start. */
+	declareHeadlessExitHint?(exitCode: number): void;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
 	/** Trigger compaction without awaiting completion. */
@@ -598,6 +604,16 @@ export interface SessionCompactEvent {
 	willRetry: boolean;
 }
 
+/** Fired by one-shot modes (print/json) after every submitted turn has finished, BEFORE the exit
+ *  code is decided. Handlers may await in-flight background work (e.g. crew agents, which run for
+ *  minutes after the main turn ends); turns that work triggers are run before the mode re-checks.
+ *  Interactive sessions never fire this event. */
+export interface SessionBeforeExitEvent {
+	type: "session_before_exit";
+	/** Which one-shot output mode is about to exit. */
+	mode: "text" | "json";
+}
+
 /** Fired before an extension runtime is torn down due to quit, reload, or session replacement. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
@@ -644,6 +660,7 @@ export type SessionEvent =
 	| SessionBeforeForkEvent
 	| SessionBeforeCompactEvent
 	| SessionCompactEvent
+	| SessionBeforeExitEvent
 	| SessionShutdownEvent
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent;
@@ -1138,7 +1155,7 @@ export interface RegisteredCommand {
 	sourceInfo: SourceInfo;
 	description?: string;
 	getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
-	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
 }
 
 export interface ResolvedCommand extends RegisteredCommand {
@@ -1175,6 +1192,7 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>,
 	): void;
 	on(event: "session_compact", handler: ExtensionHandler<SessionCompactEvent>): void;
+	on(event: "session_before_exit", handler: ExtensionHandler<SessionBeforeExitEvent>): void;
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;

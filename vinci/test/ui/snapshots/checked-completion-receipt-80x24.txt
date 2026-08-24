@@ -1,0 +1,21 @@
+ Add the project check
+
+ ● Create example.test.mjs
+   └ ✓ saved · +2 −0 · ctrl+o for full diff
+    +  1 import test from "node:test";
+    +  2 test("works", () => {});
+ • Running a script (node --test --test-reporter=dot example.t…
+   └ ✓ finished · 1 line of output
+
+ The project check passed and the test file is ready for review.
+
+  ✓ Done  ·  1 file
+  example.test.mjs  ·  check: node --test --test-reporter=dot example.test.mjs …
+  3 model calls · 300 in / 150 out · 0% cached · ~$0.0000 estimated · <time> active
+  Billed total in Platform.
+
+╭ ✹ Ask Vinci ──────────────────────────────────────────────────── ● connected ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ▶ AUTO  ·  Vinci ─── <workspace>  ·  0% full · ↓ 15 ╯

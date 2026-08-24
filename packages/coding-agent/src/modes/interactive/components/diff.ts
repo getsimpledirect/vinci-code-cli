@@ -1,5 +1,15 @@
 import * as Diff from "diff";
+import { vinciMaskEnabled, vinciMaskSecrets } from "../../../core/vinci-mask-secrets.ts";
 import { theme } from "../theme/theme.ts";
+
+// [vinci] Visible row tints on changed lines (GitHub-style): under VINCI_CODE, Vinci's theme
+// repurposes toolSuccessBg / toolErrorBg as the diff-added / diff-removed row backgrounds — the
+// tool panels that used to paint those tokens are disabled (see tool-execution.ts), so the only
+// background color left on screen is on the lines that actually changed. Upstream when env unset.
+function vinciDiffRow(kind: "added" | "removed", row: string): string {
+	if (process.env.VINCI_CODE !== "1") return row;
+	return theme.bg(kind === "added" ? "toolSuccessBg" : "toolErrorBg", row);
+}
 
 /**
  * Parse diff line to extract prefix, line number, and content.
@@ -77,6 +87,11 @@ export interface RenderDiffOptions {
  * - Added lines: green, with inverse on changed tokens
  */
 export function renderDiff(diffText: string, _options: RenderDiffOptions = {}): string {
+	// [vinci] mask secret-looking values before they are painted on screen (edit diffs of .env /
+	// config files). Display-only — the file on disk and what the model sees keep the real value.
+	if (vinciMaskEnabled()) {
+		diffText = vinciMaskSecrets(diffText);
+	}
 	const lines = diffText.split("\n");
 	const result: string[] = [];
 
@@ -121,20 +136,29 @@ export function renderDiff(diffText: string, _options: RenderDiffOptions = {}): 
 					replaceTabs(added.content),
 				);
 
-				result.push(theme.fg("toolDiffRemoved", `-${removed.lineNum} ${removedLine}`));
-				result.push(theme.fg("toolDiffAdded", `+${added.lineNum} ${addedLine}`));
+				result.push(vinciDiffRow("removed", theme.fg("toolDiffRemoved", `-${removed.lineNum} ${removedLine}`)));
+				result.push(vinciDiffRow("added", theme.fg("toolDiffAdded", `+${added.lineNum} ${addedLine}`)));
 			} else {
 				// Show all removed lines first, then all added lines
 				for (const removed of removedLines) {
-					result.push(theme.fg("toolDiffRemoved", `-${removed.lineNum} ${replaceTabs(removed.content)}`));
+					result.push(
+						vinciDiffRow(
+							"removed",
+							theme.fg("toolDiffRemoved", `-${removed.lineNum} ${replaceTabs(removed.content)}`),
+						),
+					);
 				}
 				for (const added of addedLines) {
-					result.push(theme.fg("toolDiffAdded", `+${added.lineNum} ${replaceTabs(added.content)}`));
+					result.push(
+						vinciDiffRow("added", theme.fg("toolDiffAdded", `+${added.lineNum} ${replaceTabs(added.content)}`)),
+					);
 				}
 			}
 		} else if (parsed.prefix === "+") {
 			// Standalone added line
-			result.push(theme.fg("toolDiffAdded", `+${parsed.lineNum} ${replaceTabs(parsed.content)}`));
+			result.push(
+				vinciDiffRow("added", theme.fg("toolDiffAdded", `+${parsed.lineNum} ${replaceTabs(parsed.content)}`)),
+			);
 			i++;
 		} else {
 			// Context line

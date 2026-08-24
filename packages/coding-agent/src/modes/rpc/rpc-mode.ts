@@ -229,6 +229,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return undefined as never;
 		},
 
+		isOverlayActive: () => false, // [vinci] RPC mode has no local overlay focus.
+
 		pasteToEditor(text: string): void {
 			// Paste handling not supported in RPC mode - falls back to setEditorText
 			this.setEditorText(text);

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { readdirSync, rmSync, writeFileSync } from "fs";
+import { execFileSync } from "child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import {
@@ -14,6 +15,40 @@ import type { AnthropicMessagesCompat, Api, KnownProvider, Model, OpenAICompleti
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageRoot = join(__dirname, "..");
+const snapshotsDir = join(__dirname, "snapshots");
+const refreshSnapshots = process.argv.includes("--refresh");
+
+const SNAPSHOT_FILES = [
+	"models-dev.json",
+	"nvidia-models.json",
+	"openrouter-models.json",
+	"ai-gateway-models.json",
+] as const;
+
+function snapshotPath(filename: string): string {
+	return join(snapshotsDir, filename);
+}
+
+function ensureSnapshotsExist(): void {
+	for (const filename of SNAPSHOT_FILES) {
+		if (!existsSync(snapshotPath(filename))) {
+			console.error(`Snapshot ${filename} not found. Run: npm --prefix packages/ai run generate-models:refresh`);
+			process.exit(1);
+		}
+	}
+}
+
+async function loadCatalog<T>(filename: string, url: string): Promise<T> {
+	if (!refreshSnapshots) {
+		return JSON.parse(readFileSync(snapshotPath(filename), "utf-8")) as T;
+	}
+
+	const response = await fetch(url);
+	const body = await response.text();
+	mkdirSync(snapshotsDir, { recursive: true });
+	writeFileSync(snapshotPath(filename), body, "utf-8");
+	return JSON.parse(body) as T;
+}
 
 interface ModelsDevModel {
 	id: string;
@@ -41,6 +76,25 @@ interface ModelsDevModel {
 
 interface NvidiaNimModelListItem {
 	id: string;
+}
+
+interface OpenRouterModel {
+	id: string;
+	name: string;
+	supported_parameters?: string[];
+	architecture?: {
+		modality?: string;
+	};
+	pricing?: {
+		prompt?: string;
+		completion?: string;
+		input_cache_read?: string;
+		input_cache_write?: string;
+	};
+	context_length?: number;
+	top_provider?: {
+		max_completion_tokens?: number;
+	};
 }
 
 interface AiGatewayModel {
@@ -577,9 +631,11 @@ function roundCost(value: number): number {
 
 async function fetchNvidiaNimModelIds(): Promise<Map<string, string>> {
 	try {
-		console.log("Fetching models from NVIDIA NIM API...");
-		const response = await fetch(`${NVIDIA_BASE_URL}/models`);
-		const data = (await response.json()) as { data?: NvidiaNimModelListItem[] };
+		if (refreshSnapshots) console.log("Fetching models from NVIDIA NIM API...");
+		const data = await loadCatalog<{ data?: NvidiaNimModelListItem[] }>(
+			"nvidia-models.json",
+			`${NVIDIA_BASE_URL}/models`,
+		);
 		const modelIds = new Map<string, string>();
 
 		for (const model of data.data ?? []) {
@@ -591,15 +647,18 @@ async function fetchNvidiaNimModelIds(): Promise<Map<string, string>> {
 		return modelIds;
 	} catch (error) {
 		console.error("Failed to fetch NVIDIA NIM models:", error);
+		if (refreshSnapshots) throw error;
 		return new Map();
 	}
 }
 
 async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 	try {
-		console.log("Fetching models from OpenRouter API...");
-		const response = await fetch("https://openrouter.ai/api/v1/models");
-		const data = await response.json();
+		if (refreshSnapshots) console.log("Fetching models from OpenRouter API...");
+		const data = await loadCatalog<{ data: OpenRouterModel[] }>(
+			"openrouter-models.json",
+			"https://openrouter.ai/api/v1/models",
+		);
 
 		const models: Model<any>[] = [];
 
@@ -649,15 +708,18 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 		return models;
 	} catch (error) {
 		console.error("Failed to fetch OpenRouter models:", error);
+		if (refreshSnapshots) throw error;
 		return [];
 	}
 }
 
 async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 	try {
-		console.log("Fetching models from Vercel AI Gateway API...");
-		const response = await fetch(`${AI_GATEWAY_MODELS_URL}/models`);
-		const data = await response.json();
+		if (refreshSnapshots) console.log("Fetching models from Vercel AI Gateway API...");
+		const data = await loadCatalog<{ data?: AiGatewayModel[] }>(
+			"ai-gateway-models.json",
+			`${AI_GATEWAY_MODELS_URL}/models`,
+		);
 		const models: Model<any>[] = [];
 
 		const toNumber = (value: string | number | undefined): number => {
@@ -707,15 +769,18 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 		return models;
 	} catch (error) {
 		console.error("Failed to fetch Vercel AI Gateway models:", error);
+		if (refreshSnapshots) throw error;
 		return [];
 	}
 }
 
 async function loadModelsDevData(): Promise<Model<any>[]> {
 	try {
-		console.log("Fetching models from models.dev API...");
-		const response = await fetch("https://models.dev/api.json");
-		const data = await response.json();
+		if (refreshSnapshots) console.log("Fetching models from models.dev API...");
+		const data = await loadCatalog<Record<string, { models?: Record<string, ModelsDevModel> }>>(
+			"models-dev.json",
+			"https://models.dev/api.json",
+		);
 
 		const models: Model<any>[] = [];
 		const nvidiaNimModelIds = data.nvidia?.models ? await fetchNvidiaNimModelIds() : new Map<string, string>();
@@ -1573,11 +1638,19 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		return models;
 	} catch (error) {
 		console.error("Failed to load models.dev data:", error);
+		if (refreshSnapshots) throw error;
 		return [];
 	}
 }
 
 async function generateModels() {
+	if (refreshSnapshots) {
+		console.log("Refreshing model catalog snapshots...");
+	} else {
+		console.log("Using committed snapshots (run generate-models:refresh to update)");
+		ensureSnapshotsExist();
+	}
+
 	// Fetch models from both sources
 	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras
 	// OpenRouter: xAI and other providers (excluding Anthropic, Google, OpenAI)
@@ -2098,7 +2171,25 @@ async function generateModels() {
 	for (const [provider, models] of Object.entries(providers)) {
 		console.log(`  ${provider}: ${Object.keys(models).length} models`);
 	}
+
+	// Format generated output files with biome to ensure deterministic output
+	const filesToFormat = [
+		join(packageRoot, "src/models.generated.ts"),
+		...Object.keys(providers).map((providerId) => join(packageRoot, "src/providers", `${providerId}.models.ts`)),
+	];
+	try {
+		execFileSync("npx", ["biome", "format", "--write", ...filesToFormat], {
+			stdio: "pipe",
+			cwd: packageRoot,
+		});
+	} catch (error) {
+		// Biome formatting is best-effort; don't fail if it errors
+		console.warn("Warning: biome formatting failed (non-fatal)");
+	}
 }
 
 // Run the generator
-generateModels().catch(console.error);
+generateModels().catch((error) => {
+	console.error(error);
+	process.exit(1);
+});

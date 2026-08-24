@@ -7,6 +7,7 @@ import { fuzzyFilter } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { formatNoModelsAvailableMessage } from "../core/auth-guidance.ts";
 import type { ModelRegistry } from "../core/model-registry.ts";
+import { SettingsManager } from "../core/settings-manager.ts";
 
 /**
  * Format a number as human-readable (e.g., 200000 -> "200K", 1000000 -> "1M")
@@ -26,13 +27,25 @@ function formatTokenCount(count: number): string {
 /**
  * List available models, optionally filtered by search pattern
  */
-export async function listModels(modelRegistry: ModelRegistry, searchPattern?: string): Promise<void> {
+export async function listModels(
+	modelRegistry: ModelRegistry,
+	searchPattern?: string,
+	settingsManager?: SettingsManager,
+): Promise<void> {
 	const loadError = modelRegistry.getError();
 	if (loadError) {
 		console.error(chalk.yellow(`Warning: errors loading models.json:\n${loadError}`));
 	}
 
-	const models = modelRegistry.getAvailable();
+	// [vinci] The managed product exposes model classes, not Pi's provider catalog.
+	const availableModels = modelRegistry.getAvailable();
+	const showOtherProviders =
+		process.env.VINCI_CODE === "1" &&
+		(settingsManager ?? SettingsManager.create(process.cwd())).getShowOtherProviders();
+	const models =
+		process.env.VINCI_CODE === "1" && !showOtherProviders
+			? availableModels.filter((model) => model.provider === "vinci")
+			: availableModels;
 
 	if (models.length === 0) {
 		console.log(formatNoModelsAvailableMessage());
@@ -52,6 +65,10 @@ export async function listModels(modelRegistry: ModelRegistry, searchPattern?: s
 
 	// Sort by provider, then by model id
 	filteredModels.sort((a, b) => {
+		if (showOtherProviders) {
+			const vinciOrder = Number(b.provider === "vinci") - Number(a.provider === "vinci");
+			if (vinciOrder !== 0) return vinciOrder;
+		}
 		const providerCmp = a.provider.localeCompare(b.provider);
 		if (providerCmp !== 0) return providerCmp;
 		return a.id.localeCompare(b.id);

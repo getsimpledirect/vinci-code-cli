@@ -37,6 +37,56 @@ describe("normalizeProviderError", () => {
 		expect(norm.messageCarriesBody).toBe(false);
 	});
 
+	it("preserves a machine-readable code from an openai APIError body", () => {
+		const error = Object.assign(new Error("429 status code (no body)"), {
+			status: 429,
+			error: {
+				error: {
+					code: "free_daily_cap",
+					message: "Daily allowance exhausted",
+				},
+			},
+		});
+
+		const norm = normalizeProviderError(error);
+
+		expect(norm.code).toBe("free_daily_cap");
+	});
+
+	it("preserves a machine-readable code from a direct SDK error body", () => {
+		const error = Object.assign(new Error("402 status code (no body)"), {
+			status: 402,
+			error: {
+				code: "balance_exhausted",
+				message: "Credits exhausted",
+			},
+		});
+
+		expect(normalizeProviderError(error).code).toBe("balance_exhausted");
+	});
+
+	it("preserves a machine-readable code from a raw JSON body", () => {
+		const error = Object.assign(new Error("Request failed"), {
+			statusCode: 402,
+			body: '{"error":{"code":"payment_failed","message":"Payment failed"}}',
+		});
+
+		const norm = normalizeProviderError(error);
+
+		expect(norm.code).toBe("payment_failed");
+	});
+
+	it("preserves a machine-readable code from a Bedrock response body", () => {
+		const error = Object.assign(new Error("ServiceException"), {
+			$response: {
+				statusCode: 429,
+				body: JSON.stringify({ error: { code: "capacity", message: "At capacity" } }),
+			},
+		});
+
+		expect(normalizeProviderError(error).code).toBe("capacity");
+	});
+
 	it("preserves the message when @google/genai already folds the body into it", () => {
 		const body = { error: { code: 403, message: "Permission denied" } };
 		const error = Object.assign(new Error(JSON.stringify(body)), {
@@ -69,8 +119,27 @@ describe("normalizeProviderError", () => {
 
 		expect(norm.status).toBeUndefined();
 		expect(norm.body).toBeUndefined();
+		expect(norm.code).toBeUndefined();
 		expect(norm.message).toBe('{"reason":"boom"}');
 		expect(norm.messageCarriesBody).toBe(false);
+	});
+
+	it("leaves code undefined when the provider body has no machine-readable code", () => {
+		const error = Object.assign(new Error("429 status code (no body)"), {
+			status: 429,
+			error: { error: { message: "Slow down" } },
+		});
+
+		expect(normalizeProviderError(error).code).toBeUndefined();
+	});
+
+	it("leaves code undefined when a raw body is not valid JSON", () => {
+		const error = Object.assign(new Error("Request failed"), {
+			statusCode: 429,
+			body: "free_daily_cap",
+		});
+
+		expect(normalizeProviderError(error).code).toBeUndefined();
 	});
 
 	it("treats an empty parsed body object as no body", () => {

@@ -12,6 +12,7 @@ import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { vinciResultBudget, vinciResultBudgetEnabled } from "./vinci-result-budget.ts";
 
 function toPosixPath(value: string): string {
 	return value.split(path.sep).join("/");
@@ -186,7 +187,10 @@ export function createFindToolDefinition(
 							});
 							const resultLimitReached = relativized.length >= effectiveLimit;
 							const rawOutput = relativized.join("\n");
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+							const truncation = truncateHead(rawOutput, {
+								maxLines: Number.MAX_SAFE_INTEGER,
+								maxBytes: vinciResultBudgetEnabled() ? vinciResultBudget().maxBytes : undefined,
+							});
 							let resultOutput = truncation.content;
 							const details: FindToolDetails = {};
 							const notices: string[] = [];
@@ -195,7 +199,9 @@ export function createFindToolDefinition(
 								details.resultLimitReached = effectiveLimit;
 							}
 							if (truncation.truncated) {
-								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+								notices.push(
+									`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit reached${vinciResultBudgetEnabled() ? ". Narrow the glob to reduce results" : ""}`,
+								);
 								details.truncation = truncation;
 							}
 							if (notices.length > 0) {
@@ -321,7 +327,10 @@ export function createFindToolDefinition(
 
 							const resultLimitReached = relativized.length >= effectiveLimit;
 							const rawOutput = relativized.join("\n");
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+							const truncation = truncateHead(rawOutput, {
+								maxLines: Number.MAX_SAFE_INTEGER,
+								maxBytes: vinciResultBudgetEnabled() ? vinciResultBudget().maxBytes : undefined,
+							});
 							let resultOutput = truncation.content;
 							const details: FindToolDetails = {};
 							const notices: string[] = [];
@@ -332,7 +341,9 @@ export function createFindToolDefinition(
 								details.resultLimitReached = effectiveLimit;
 							}
 							if (truncation.truncated) {
-								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+								notices.push(
+									`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit reached${vinciResultBudgetEnabled() ? ". Narrow the glob to reduce results" : ""}`,
+								);
 								details.truncation = truncation;
 							}
 							if (notices.length > 0) {

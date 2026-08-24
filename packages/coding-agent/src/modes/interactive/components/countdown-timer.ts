@@ -37,3 +37,23 @@ export class CountdownTimer {
 		}
 	}
 }
+
+export class ElapsedTimer {
+	private intervalId: ReturnType<typeof setInterval> | undefined;
+	private readonly startedAt = Date.now();
+
+	constructor(tui: TUI | undefined, onTick: (elapsedMs: number) => void) {
+		onTick(0);
+		this.intervalId = setInterval(() => {
+			onTick(Date.now() - this.startedAt);
+			tui?.requestRender();
+		}, 1000);
+	}
+
+	dispose(): void {
+		if (this.intervalId) {
+			clearInterval(this.intervalId);
+			this.intervalId = undefined;
+		}
+	}
+}

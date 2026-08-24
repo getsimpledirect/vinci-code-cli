@@ -1,0 +1,218 @@
+{
+  "version": 2,
+  "scenarios": [
+    {
+      "id": "p-map-concurrency-regression",
+      "repository": "https://github.com/sindresorhus/p-map.git",
+      "commit": "3ada5f36632aca8df860c376856270b6d2ba2de8",
+      "readOnly": false,
+      "provenance": {
+        "kind": "synthetic-regression"
+      },
+      "task": "The test suite is failing. Diagnose and fix the underlying bug. Work autonomously: inspect the code and tests, make only necessary changes, run relevant tests, and stop only when the fix is verified. Do not commit or push. Do not ask permission for ordinary in-scope edits or tests.",
+      "fixture": {
+        "runtime": "node",
+        "patch": "p-map-concurrency-one.patch",
+        "prepare": [["npm", "install", "--ignore-scripts", "--no-package-lock"]],
+        "verify": ["npm", "exec", "--", "ava", "--match", "enforce number in options.concurrency"],
+        "expectInitialFailure": true,
+        "expectCleanAfter": true,
+        "commitSeed": false
+      },
+      "timeoutSeconds": 600,
+      "maxToolCalls": 10,
+      "maxRepeatedToolSignature": 3,
+      "maxToolErrors": 2,
+      "maxTranscriptBytes": 500000,
+      "requireFinalReceipt": true
+    },
+    {
+      "id": "express-repeated-query-values",
+      "repository": "https://github.com/expressjs/express.git",
+      "commit": "8d09bfe6d88983da5c3e12cfdd54782c4dc675db",
+      "readOnly": false,
+      "provenance": {
+        "kind": "historical-fix",
+        "reportUrl": "https://github.com/expressjs/express/issues/7147",
+        "fixUrl": "https://github.com/expressjs/express/pull/7181",
+        "reportedBy": "nabilzhafri",
+        "fixedBy": "SAY-5"
+      },
+      "task": "Express 4.22.x regressed when an extended query contains more than 20 repeated values: req.query returns an object with numeric keys instead of the array returned by earlier versions. Reproduce and fix the underlying behavior while preserving the existing parser contract. Work autonomously, make only necessary changes, and run the focused regression test. Do not commit or push.",
+      "fixture": {
+        "runtime": "node",
+        "patch": "express-repeated-query-array.patch",
+        "prepare": [["npm", "install", "--ignore-scripts", "--no-package-lock"]],
+        "verify": ["npm", "test", "--", "--grep=more than 20 repeated values"],
+        "expectInitialFailure": true,
+        "expectCleanAfter": false,
+        "commitSeed": true,
+        "allowedChangedFiles": ["lib/utils.js", "lib/middleware/query.js"]
+      },
+      "timeoutSeconds": 600,
+      "maxToolCalls": 25,
+      "maxRepeatedToolSignature": 3,
+      "maxToolErrors": 2,
+      "maxTranscriptBytes": 700000,
+      "requireFinalReceipt": true
+    },
+    {
+      "id": "koa-content-length-overflow",
+      "repository": "https://github.com/koajs/koa.git",
+      "commit": "3f3ac48904229f807939d13ab49fdf8262a7aa08",
+      "readOnly": false,
+      "provenance": {
+        "kind": "historical-fix",
+        "reportUrl": "https://github.com/koajs/koa/pull/1961",
+        "fixUrl": "https://github.com/koajs/koa/pull/1961",
+        "reportedBy": "tejgokani",
+        "fixedBy": "tejgokani"
+      },
+      "task": "Koa's ctx.request.length overflows for Content-Length values above 2,147,483,647, producing negative or truncated numbers that can break upload limits and allocation logic. Fix the parsing so large valid lengths remain accurate and invalid values remain undefined. Work autonomously, keep the change focused, and run the relevant regression test. Do not commit or push.",
+      "fixture": {
+        "runtime": "node",
+        "patch": "koa-content-length-overflow.patch",
+        "prepare": [["npm", "install", "--ignore-scripts", "--no-package-lock"], ["npm", "run", "build"]],
+        "verify": ["npm", "test", "--", "--test-name-pattern=Content-Length > 2GB"],
+        "expectInitialFailure": true,
+        "expectCleanAfter": false,
+        "commitSeed": true,
+        "allowedChangedFiles": ["lib/request.js"]
+      },
+      "timeoutSeconds": 600,
+      "maxToolCalls": 18,
+      "maxRepeatedToolSignature": 3,
+      "maxToolErrors": 2,
+      "maxTranscriptBytes": 700000,
+      "requireFinalReceipt": true
+    },
+    {
+      "id": "execa-explicit-input-inherited-stdin",
+      "repository": "https://github.com/sindresorhus/execa.git",
+      "commit": "3ed0544b697fea99a367869a80a69589c026c4a8",
+      "readOnly": false,
+      "provenance": {
+        "kind": "historical-fix",
+        "reportUrl": "https://github.com/sindresorhus/execa/issues/1219",
+        "fixUrl": "https://github.com/sindresorhus/execa/pull/1232",
+        "reportedBy": "ehmicky",
+        "fixedBy": "puneetdixit200"
+      },
+      "task": "Execa mishandles explicit input when stdin or stdio is set to a single inherited stdin source. In that case the explicit input should become the only stdin source, while deliberate multi-source stdin arrays must continue to work. Diagnose and implement the focused fix, cover async and sync behavior, and run the relevant regression tests. Do not commit or push.",
+      "fixture": {
+        "runtime": "node",
+        "patch": "execa-inherited-stdin.patch",
+        "prepare": [["npm", "install", "--ignore-scripts", "--no-package-lock"]],
+        "verify": [
+          "npm",
+          "run",
+          "unit",
+          "--",
+          "test/io/input-option.js",
+          "test/transform/generator-mixed.js"
+        ],
+        "expectInitialFailure": true,
+        "expectCleanAfter": false,
+        "commitSeed": true,
+        "allowedChangedFiles": ["lib/**"]
+      },
+      "timeoutSeconds": 900,
+      "maxToolCalls": 38,
+      "maxRepeatedToolSignature": 3,
+      "maxToolErrors": 3,
+      "maxTranscriptBytes": 900000,
+      "requireFinalReceipt": true
+    },
+    {
+      "id": "vue-empty-immediate-watch",
+      "repository": "https://github.com/vuejs/core.git",
+      "commit": "1f2ca7e4837b1b0de0b91048fffdb03710c0b03e",
+      "readOnly": false,
+      "provenance": {
+        "kind": "historical-fix",
+        "reportUrl": "https://github.com/vuejs/core/issues/14898",
+        "fixUrl": "https://github.com/vuejs/core/pull/14914",
+        "reportedBy": "Aliz-v",
+        "fixedBy": "puneetdixit200"
+      },
+      "task": "Vue watch([], callback, { immediate: true }) does not invoke the callback on its immediate first run. Diagnose and fix the watcher behavior without regressing ordinary multi-source change detection. Work autonomously, keep the source change focused, and run the focused regression test. Do not commit or push.",
+      "fixture": {
+        "runtime": "node",
+        "patch": "vue-empty-immediate-watch.patch",
+        "prepare": [["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]],
+        "prepareTimeoutSeconds": 900,
+        "verify": ["pnpm", "test", "--run", "packages/runtime-core/__tests__/apiWatch.spec.ts", "-t", "watching empty multiple sources with immediate: true"],
+        "expectInitialFailure": true,
+        "expectCleanAfter": false,
+        "commitSeed": true,
+        "allowedChangedFiles": ["packages/reactivity/src/watch.ts", "packages/reactivity/__tests__/watch.spec.ts"]
+      },
+      "timeoutSeconds": 720,
+      "maxToolCalls": 26,
+      "maxRepeatedToolSignature": 3,
+      "maxToolErrors": 3,
+      "maxTranscriptBytes": 900000,
+      "requireFinalReceipt": true
+    },
+    {
+      "id": "gin-context-copy-state",
+      "repository": "https://github.com/gin-gonic/gin.git",
+      "commit": "293ad7edebb3ae30369288bd6416ca0d78474727",
+      "readOnly": false,
+      "provenance": {
+        "kind": "historical-fix",
+        "reportUrl": "https://github.com/gin-gonic/gin/pull/4695",
+        "fixUrl": "https://github.com/gin-gonic/gin/pull/4695",
+        "reportedBy": "Amirhf1",
+        "fixedBy": "Amirhf1"
+      },
+      "task": "Gin Context.Copy omits the Errors and Accepted state needed by code using the copied context, and copied slices must not alias the original. Diagnose and implement the focused copy behavior, preserving nil values, and run the focused regression tests. Do not commit or push.",
+      "fixture": {
+        "runtime": "go",
+        "patch": "gin-context-copy-state.patch",
+        "prepare": [["go", "mod", "download"]],
+        "verify": ["go", "test", ".", "-run", "^TestContextCopy(CopiesErrors|CopiesAccepted|NilErrorsAndAccepted)$"],
+        "expectInitialFailure": true,
+        "expectCleanAfter": false,
+        "commitSeed": true,
+        "allowedChangedFiles": ["context.go", "errors.go"]
+      },
+      "timeoutSeconds": 720,
+      "maxToolCalls": 20,
+      "maxRepeatedToolSignature": 3,
+      "maxToolErrors": 3,
+      "maxTranscriptBytes": 900000,
+      "requireFinalReceipt": true
+    },
+    {
+      "id": "starlette-authorityless-url-replace",
+      "repository": "https://github.com/Kludex/starlette.git",
+      "commit": "1a2f97293966f3e6549e4da3d00d526915b03b3b",
+      "readOnly": false,
+      "provenance": {
+        "kind": "historical-fix",
+        "reportUrl": "https://github.com/Kludex/starlette/pull/3317",
+        "fixUrl": "https://github.com/Kludex/starlette/pull/3317",
+        "reportedBy": "LeSingh1",
+        "fixedBy": "LeSingh1"
+      },
+      "task": "Starlette URL.replace raises IndexError when replacing an authority component on a path-only URL with no authority. Fix the empty-hostname handling while preserving existing URL replacement behavior, and run the focused regression test. Do not commit or push.",
+      "fixture": {
+        "runtime": "python",
+        "patch": "starlette-authorityless-url-replace.patch",
+        "prepare": [["uv", "sync", "--frozen", "--no-group", "docs"]],
+        "verify": ["uv", "run", "--frozen", "--no-sync", "pytest", "tests/test_datastructures.py::test_url"],
+        "expectInitialFailure": true,
+        "expectCleanAfter": false,
+        "commitSeed": true,
+        "allowedChangedFiles": ["starlette/datastructures.py"]
+      },
+      "timeoutSeconds": 720,
+      "maxToolCalls": 18,
+      "maxRepeatedToolSignature": 3,
+      "maxToolErrors": 3,
+      "maxTranscriptBytes": 900000,
+      "requireFinalReceipt": true
+    }
+  ]
+}

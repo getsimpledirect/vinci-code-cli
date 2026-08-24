@@ -2,6 +2,7 @@ import { Box, type Component, Container, getCapabilities, Image, Spacer, Text, t
 import type { ToolDefinition, ToolRenderContext } from "../../../core/extensions/types.ts";
 import { createAllToolDefinitions, type ToolName } from "../../../core/tools/index.ts";
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
+import { sanitizeTerminalLabel } from "../../../terminal-utils.ts";
 import { convertToPng } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
 
@@ -60,13 +61,28 @@ export class ToolExecutionComponent extends Container {
 		this.ui = ui;
 		this.cwd = cwd;
 
-		this.addChild(new Spacer(1));
+		// [vinci] Vinci's theme drops the tool background panels (tool*Bg = terminal default), which
+		// turns the panel's vertical padding + this leading spacer into ~4 lines of dead air between
+		// blocks. Tighten to zero — the chat container's own spacer keeps one line between blocks.
+		const vinciTight = process.env.VINCI_CODE === "1";
+		if (!vinciTight) this.addChild(new Spacer(1));
 
 		// Always create all shell variants. contentBox is used for default renderer-based composition.
 		// selfRenderContainer is used when the tool renders its own framing.
 		// contentText is reserved for generic fallback rendering when no tool definition exists.
-		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
-		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		// [vinci] No background panels at all under VINCI_CODE — Vinci's theme repurposes the tool*Bg
+		// tokens as DIFF ROW tints (see components/diff.ts), so the panels must not paint them.
+		this.contentBox = new Box(
+			1,
+			vinciTight ? 0 : 1,
+			vinciTight ? undefined : (text: string) => theme.bg("toolPendingBg", text),
+		);
+		this.contentText = new Text(
+			"",
+			1,
+			vinciTight ? 0 : 1,
+			vinciTight ? undefined : (text: string) => theme.bg("toolPendingBg", text),
+		);
 		this.selfRenderContainer = new Container();
 
 		if (this.hasRendererDefinition()) {
@@ -133,13 +149,82 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private createCallFallback(): Component {
-		return new Text(theme.fg("toolTitle", theme.bold(this.toolName)), 0, 0);
+		const configuredLabel = this.toolDefinition?.label ?? this.builtInToolDefinition?.label;
+		const plainLabel =
+			configuredLabel || this.toolName.replace(/[_-]+/g, " ").replace(/^./, (first) => first.toUpperCase());
+		// [vinci] Give tools without custom renderers the same semantic timeline as built-in tools.
+		if (process.env.VINCI_CODE === "1") {
+			return new Text(theme.fg("accent", "● ") + theme.fg("toolTitle", theme.bold(plainLabel)), 0, 0);
+		}
+		return new Text(theme.fg("toolTitle", theme.bold(plainLabel)), 0, 0);
 	}
 
 	private createResultFallback(): Component | undefined {
 		const output = this.getTextOutput();
 		if (!output) {
 			return undefined;
+		}
+		if (process.env.VINCI_CODE === "1") {
+			if (this.toolName === "rerun_check") {
+				const rawDetails = this.result?.details;
+				const details =
+					typeof rawDetails === "object" && rawDetails !== null && !Array.isArray(rawDetails)
+						? (rawDetails as {
+								passed?: unknown;
+								killed?: unknown;
+								stopped?: unknown;
+								unsafeReplay?: unknown;
+							})
+						: undefined;
+				const malformedFlag =
+					details !== undefined &&
+					[details.passed, details.killed, details.stopped, details.unsafeReplay].some(
+						(value) => value !== undefined && typeof value !== "boolean",
+					);
+				const status =
+					details === undefined ||
+					malformedFlag ||
+					typeof details.passed !== "boolean" ||
+					details.killed === true ||
+					details.stopped === true ||
+					details.unsafeReplay === true
+						? "neutral"
+						: this.result?.isError === true
+							? "failed"
+							: details.passed === true
+								? "passed"
+								: "failed";
+				const marker =
+					status === "passed"
+						? theme.fg("success", "  └ ✓ ")
+						: status === "failed"
+							? theme.fg("error", "  └ ! ")
+							: theme.fg("dim", "  └ ");
+				if (this.expanded) {
+					const color = status === "failed" ? "error" : status === "neutral" ? "muted" : "toolOutput";
+					return new Text(marker + theme.fg(color, output), 0, 0);
+				}
+				const lines = output
+					.split("\n")
+					.map((line) => line.trim())
+					.filter(Boolean);
+				const firstLine = lines[0] ?? "Finished.";
+				const summary = sanitizeTerminalLabel(firstLine, 60);
+				const expansion = lines.length > 1 ? theme.fg("dim", `  ·  ${lines.length} lines, ctrl+o to expand`) : "";
+				const color = status === "failed" ? "error" : "muted";
+				return new Text(marker + theme.fg(color, summary) + expansion, 0, 0);
+			}
+			const isError = this.result?.isError ?? false;
+			const marker = isError ? theme.fg("error", "  └ ! ") : theme.fg("success", "  └ ✓ ");
+			if (this.expanded) return new Text(marker + theme.fg(isError ? "error" : "toolOutput", output), 0, 0);
+			const lines = output
+				.split("\n")
+				.map((line) => line.trim())
+				.filter(Boolean);
+			const firstLine = lines[0] ?? (isError ? "The action didn't work." : "Finished.");
+			const summary = sanitizeTerminalLabel(firstLine, 60);
+			const expansion = lines.length > 1 ? theme.fg("dim", `  ·  ${lines.length} lines, ctrl+o to expand`) : "";
+			return new Text(marker + theme.fg(isError ? "error" : "muted", summary) + expansion, 0, 0);
 		}
 		return new Text(theme.fg("toolOutput", output), 0, 0);
 	}
@@ -251,11 +336,15 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
-		const bgFn = this.isPartial
-			? (text: string) => theme.bg("toolPendingBg", text)
-			: this.result?.isError
-				? (text: string) => theme.bg("toolErrorBg", text)
-				: (text: string) => theme.bg("toolSuccessBg", text);
+		// [vinci] see constructor — no state-colored panels under VINCI_CODE (tokens repurposed).
+		const bgFn =
+			process.env.VINCI_CODE === "1"
+				? undefined
+				: this.isPartial
+					? (text: string) => theme.bg("toolPendingBg", text)
+					: this.result?.isError
+						? (text: string) => theme.bg("toolErrorBg", text)
+						: (text: string) => theme.bg("toolSuccessBg", text);
 
 		let hasContent = false;
 		this.hideComponent = false;
@@ -284,6 +373,7 @@ export class ToolExecutionComponent extends Container {
 			}
 
 			if (this.result) {
+				const displayResult = this.getDisplayResult() ?? this.result;
 				const resultRenderer = this.getResultRenderer();
 				if (!resultRenderer) {
 					const component = this.createResultFallback();
@@ -294,7 +384,7 @@ export class ToolExecutionComponent extends Container {
 				} else {
 					try {
 						const component = resultRenderer(
-							{ content: this.result.content as any, details: this.result.details },
+							{ content: displayResult.content as any, details: displayResult.details },
 							{ expanded: this.expanded, isPartial: this.isPartial },
 							theme,
 							this.getRenderContext(this.resultRendererComponent),
@@ -359,7 +449,25 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private getTextOutput(): string {
-		return getRenderedTextOutput(this.result, this.showImages);
+		return getRenderedTextOutput(this.getDisplayResult(), this.showImages);
+	}
+
+	private getDisplayResult(): typeof this.result {
+		// [vinci] Hook reasons may contain model-only loop/planning guidance. Preserve it in the agent
+		// result while replacing only the display copy with a stable user-facing explanation.
+		if (
+			process.env.VINCI_CODE === "1" &&
+			this.result &&
+			typeof this.result.details === "object" &&
+			this.result.details !== null &&
+			(this.result.details as { vinciBlocked?: unknown }).vinciBlocked === true
+		) {
+			return {
+				...this.result,
+				content: [{ type: "text", text: "Vinci paused this action before it ran." }],
+			};
+		}
+		return this.result;
 	}
 
 	private formatToolExecution(): string {

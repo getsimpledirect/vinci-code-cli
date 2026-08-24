@@ -1,5 +1,5 @@
-import { describe, expect, test } from "vitest";
-import { parseArgs } from "../src/cli/args.ts";
+import { describe, expect, test, vi } from "vitest";
+import { parseArgs, printHelp } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
 	describe("--version flag", () => {
@@ -437,5 +437,47 @@ describe("parseArgs", () => {
 			expect(result.fileArgs).toEqual(["prompt.md"]);
 			expect(result.messages).toEqual(["Do the task"]);
 		});
+	});
+});
+
+describe("printHelp", () => {
+	test("hides provider and BYOK controls in Vinci Code", () => {
+		const previous = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+		try {
+			printHelp();
+			const output = log.mock.calls.map(([value]) => String(value)).join("\n");
+			expect(output).toContain("--list-models");
+			expect(output).not.toContain("--provider");
+			expect(output).not.toContain("--model <pattern>");
+			expect(output).not.toContain("--models <patterns>");
+			expect(output).not.toContain("--api-key");
+			expect(output).not.toContain("OPENROUTER_API_KEY");
+			expect(output).not.toContain("ANTHROPIC_API_KEY");
+		} finally {
+			if (previous === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previous;
+			log.mockRestore();
+		}
+	});
+
+	test("keeps provider controls in upstream Pi help", () => {
+		const previous = process.env.VINCI_CODE;
+		delete process.env.VINCI_CODE;
+		const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+		try {
+			printHelp();
+			const output = log.mock.calls.map(([value]) => String(value)).join("\n");
+			expect(output).toContain("--provider <name>");
+			expect(output).toContain("--api-key <key>");
+			expect(output).toContain("OPENROUTER_API_KEY");
+		} finally {
+			if (previous === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previous;
+			log.mockRestore();
+		}
 	});
 });

@@ -10,7 +10,7 @@ import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
-import { findInitialModel } from "./model-resolver.ts";
+import { findInitialModel, isManagedVinciProvider } from "./model-resolver.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -30,6 +30,7 @@ import {
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
+import { vinciDegroove } from "./vinci-degroove.ts";
 
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: process.cwd() */
@@ -129,6 +130,37 @@ function getDefaultAgentDir(): string {
 	return getAgentDir();
 }
 
+const MANAGED_VINCI_CLASS_RANK: Readonly<Record<string, number>> = {
+	forte: 0,
+	fortissimo: 1,
+};
+
+function providerHeader(headers: Record<string, string>, name: string): string | undefined {
+	const expected = name.toLowerCase();
+	for (const [key, value] of Object.entries(headers)) {
+		if (key.toLowerCase() === expected) return value.trim();
+	}
+	return undefined;
+}
+
+/** Reject a managed-gateway downgrade while only response headers, not response content, have been consumed. */
+export function assertNoManagedVinciDowngrade(
+	model: { provider: string; id: string },
+	headers: Record<string, string>,
+): void {
+	if (!isManagedVinciProvider(model.provider)) return;
+	const served = providerHeader(headers, "x-vinci-resolved-model")
+		?.toLowerCase()
+		.replace(/^vinci\//, "");
+	const requested = model.id.toLowerCase().replace(/^vinci\//, "");
+	const requestedRank = MANAGED_VINCI_CLASS_RANK[requested];
+	const servedRank = served ? MANAGED_VINCI_CLASS_RANK[served] : undefined;
+	if (requestedRank === undefined || servedRank === undefined || servedRank >= requestedRank) return;
+	throw new Error(
+		`Vinci refused cheaper class ${served} before consuming the response; this session requested ${requested}. No model downgrade was accepted.`,
+	);
+}
+
 /**
  * Create an AgentSession with the specified options.
  *
@@ -199,6 +231,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model = restoredModel;
 		}
 		if (!model) {
+			if (isManagedVinciProvider(existingSession.model.provider)) {
+				throw new Error(
+					`Managed Vinci model vinci/${existingSession.model.modelId} is unavailable. Vinci will not substitute a different model for this session.`,
+				);
+			}
 			modelFallbackMessage = `Could not restore model ${existingSession.model.provider}/${existingSession.model.modelId}`;
 		}
 	}
@@ -254,7 +291,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-		const converted = convertToLlm(messages);
+		// [vinci] Collapse identical failed-call loops in the MODEL'S view of the conversation before
+		// conversion — a small model imitates its context far more strongly than it follows
+		// instructions, so leaving six copies of the same broken call in view guarantees a seventh.
+		// Display/persistence keep the raw messages; see core/vinci-degroove.ts (no-op unless VINCI_CODE).
+		const converted = convertToLlm(vinciDegroove(messages));
 		// Check setting dynamically so mid-session changes take effect
 		if (!settingsManager.getBlockImages()) {
 			return converted;
@@ -344,16 +385,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return runner.emitBeforeProviderRequest(payload);
 		},
-		onResponse: async (response, _model) => {
+		onResponse: async (response, responseModel) => {
 			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("after_provider_response")) {
-				return;
+			if (runner?.hasHandlers("after_provider_response")) {
+				await runner.emit({
+					type: "after_provider_response",
+					status: response.status,
+					headers: response.headers,
+				});
 			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
+			assertNoManagedVinciDowngrade(responseModel, response.headers);
 		},
 		sessionId: sessionManager.getSessionId(),
 		transformContext: async (messages) => {

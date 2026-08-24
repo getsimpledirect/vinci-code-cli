@@ -1,0 +1,303 @@
+# Opt-in native Linux/PTY/soak lane. Terraform keeps the Auto Scaling Group at zero until this
+# workflow runs; the workflow and an instance-side watchdog both return it to zero.
+name: vinci-ec2-tests
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      repetitions:
+        description: "Times to repeat the loop, guard, shell-state, and UI regressions"
+        required: true
+        default: "5"
+        type: choice
+        options:
+          - "3"
+          - "5"
+          - "10"
+      repository_scenarios:
+        description: "Pinned public-repository lane; live uses the dedicated Vinci test credential"
+        required: true
+        default: "inventory"
+        type: choice
+        options:
+          - "inventory"
+          - "live"
+          - "skip"
+      repository_limit:
+        description: "Number of pinned public-repository scenarios"
+        required: true
+        default: "3"
+        type: choice
+        options:
+          - "1"
+          - "3"
+          - "4"
+          - "7"
+      repository_profile:
+        description: "Analysis is read-only; coding seeds a known failure and executes upstream tests"
+        required: true
+        default: "analysis"
+        type: choice
+        options:
+          - "analysis"
+          - "coding"
+      repository_model:
+        description: "Stable managed Vinci model contract recorded in every live corpus artifact"
+        required: true
+        default: "forte"
+        type: choice
+        options:
+          - "forte"
+      live_ui_capture:
+        description: "Record one real interactive PTY session for UX review during the live coding lane"
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
+permissions: {}
+
+concurrency:
+  group: vinci-ec2-tests
+  cancel-in-progress: false
+
+jobs:
+  aggressive:
+    # Org-only: needs the AWS OIDC trust that exists in getsimpledirect/vinci-code alone.
+    # Public and forked copies are structurally inert rather than failing noisily.
+    if: github.repository == 'getsimpledirect/vinci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.VINCI_EC2_TEST_REGION || 'ca-central-1' }}
+      AWS_ROLE_ARN: ${{ vars.VINCI_EC2_TEST_ROLE_ARN }}
+      ARTIFACT_BUCKET: ${{ vars.VINCI_EC2_TEST_BUCKET }}
+      AUTO_SCALING_GROUP: ${{ vars.VINCI_EC2_TEST_ASG }}
+      RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+      REPETITIONS: ${{ github.event_name == 'schedule' && '10' || inputs.repetitions || '5' }}
+      REPOSITORY_SCENARIOS: ${{ github.event_name == 'schedule' && 'inventory' || inputs.repository_scenarios || 'inventory' }}
+      REPOSITORY_LIMIT: ${{ github.event_name == 'schedule' && '3' || inputs.repository_limit || '3' }}
+      REPOSITORY_PROFILE: ${{ github.event_name == 'schedule' && 'analysis' || inputs.repository_profile || 'analysis' }}
+      REPOSITORY_PROVIDER: vinci
+      REPOSITORY_MODEL: ${{ github.event_name == 'schedule' && 'forte' || inputs.repository_model || 'forte' }}
+      LIVE_UI_CAPTURE: ${{ github.event_name == 'schedule' && 'no' || inputs.live_ui_capture || 'yes' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate runner configuration
+        run: |
+          set -euo pipefail
+          : "${AWS_ROLE_ARN:?Set VINCI_EC2_TEST_ROLE_ARN in GitHub Actions variables}"
+          : "${ARTIFACT_BUCKET:?Set VINCI_EC2_TEST_BUCKET in GitHub Actions variables}"
+          : "${AUTO_SCALING_GROUP:?Set VINCI_EC2_TEST_ASG in GitHub Actions variables}"
+          [[ "${REPETITIONS}" =~ ^(3|5|10)$ ]]
+          [[ "${REPOSITORY_SCENARIOS}" =~ ^(inventory|live|skip)$ ]]
+          [[ "${REPOSITORY_LIMIT}" =~ ^(1|3|4|7)$ ]]
+          [[ "${REPOSITORY_PROFILE}" =~ ^(analysis|coding)$ ]]
+          [[ "${REPOSITORY_PROVIDER}" == "vinci" ]]
+          [[ "${REPOSITORY_MODEL}" == "forte" ]]
+          [[ "${LIVE_UI_CAPTURE}" =~ ^(yes|no)$ ]]
+
+      - name: Authenticate to AWS with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: vinci-ec2-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Remove a stale runner before starting
+        run: |
+          set -euo pipefail
+          aws autoscaling set-desired-capacity \
+            --auto-scaling-group-name "${AUTO_SCALING_GROUP}" \
+            --desired-capacity 0
+          for _ in $(seq 1 60); do
+            instances="$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "${AUTO_SCALING_GROUP}" \
+              --query 'AutoScalingGroups[0].Instances[].InstanceId' \
+              --output text)"
+            if [[ -z "${instances}" || "${instances}" == "None" ]]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::The previous EC2 runner did not terminate within five minutes."
+          exit 1
+
+      - name: Stage the private source bundle
+        run: |
+          set -euo pipefail
+          COPYFILE_DISABLE=1 tar \
+            --exclude=.git \
+            --exclude=node_modules \
+            --exclude='*/node_modules' \
+            --exclude='._*' \
+            --exclude='*/._*' \
+            --exclude='.DS_Store' \
+            --exclude='*/.DS_Store' \
+            --exclude=dist \
+            --exclude='*/dist' \
+            --exclude='.terraform' \
+            --exclude='*/.terraform' \
+            --exclude='*.tfstate' \
+            --exclude='*.tfstate.*' \
+            --exclude=vinci-test-artifacts \
+            -czf /tmp/vinci-source.tgz .
+          aws s3 cp \
+            /tmp/vinci-source.tgz \
+            "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/source.tgz" \
+            --only-show-errors
+
+      - name: Stage the dedicated live-scenario credential
+        if: ${{ env.REPOSITORY_SCENARIOS == 'live' }}
+        env:
+          VINCI_TEST_API_KEY: ${{ secrets.VINCI_EC2_TEST_API_KEY }}
+        run: |
+          set -euo pipefail
+          : "${VINCI_TEST_API_KEY:?Set the VINCI_EC2_TEST_API_KEY Actions secret for live repository scenarios}"
+          umask 077
+          jq -n --arg key "${VINCI_TEST_API_KEY}" '{vinci: {type: "api_key", key: $key}}' >/tmp/vinci-test-auth.json
+          aws s3 cp \
+            /tmp/vinci-test-auth.json \
+            "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/auth.json" \
+            --only-show-errors
+          rm -f /tmp/vinci-test-auth.json
+
+      - name: Start one disposable runner
+        run: |
+          set -euo pipefail
+          aws autoscaling set-desired-capacity \
+            --auto-scaling-group-name "${AUTO_SCALING_GROUP}" \
+            --desired-capacity 1
+          instance_id=""
+          for _ in $(seq 1 60); do
+            instance_id="$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "${AUTO_SCALING_GROUP}" \
+              --query 'AutoScalingGroups[0].Instances[0].InstanceId' \
+              --output text)"
+            if [[ -n "${instance_id}" && "${instance_id}" != "None" ]]; then
+              echo "INSTANCE_ID=${instance_id}" >>"${GITHUB_ENV}"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Auto Scaling did not launch a runner within five minutes."
+          exit 1
+
+      - name: Wait for Systems Manager
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 90); do
+            ping_status="$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+              --query 'InstanceInformationList[0].PingStatus' \
+              --output text)"
+            if [[ "${ping_status}" == "Online" ]]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::The EC2 runner did not become available through Systems Manager."
+          exit 1
+
+      - name: Run aggressive tests through Systems Manager
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          source_uri="s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/source.tgz"
+          result_uri="s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/results.tgz"
+          auth_uri=""
+          ui_scenario=""
+          if [[ "${REPOSITORY_SCENARIOS}" == "live" ]]; then
+            auth_uri="s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/auth.json"
+          fi
+          if [[ "${LIVE_UI_CAPTURE}" == "yes" && "${REPOSITORY_SCENARIOS}" == "live" && "${REPOSITORY_PROFILE}" == "coding" ]]; then
+            ui_scenario="express-repeated-query-values"
+          fi
+          remote_command="$(printf '%s\n' \
+            'set -euo pipefail' \
+            'for attempt in $(seq 1 120); do [[ -f /var/lib/vinci-runner/ready ]] && break; sleep 5; done' \
+            '[[ -f /var/lib/vinci-runner/ready ]] || { tail -200 /var/log/cloud-init-output.log; exit 70; }' \
+            'rm -rf /home/vinci/run && install -d -o vinci -g vinci -m 0755 /home/vinci/run' \
+            "aws s3 cp '${source_uri}' /tmp/vinci-source.tgz --only-show-errors" \
+            'tar -C /home/vinci/run -xzf /tmp/vinci-source.tgz' \
+            'chown -R vinci:vinci /home/vinci/run' \
+            "bash /home/vinci/run/vinci/test/ec2/remote-run.sh '${result_uri}' '${REPETITIONS}' '${REPOSITORY_SCENARIOS}' '${REPOSITORY_LIMIT}' '${auth_uri}' '${REPOSITORY_PROFILE}' '${ui_scenario}' '${REPOSITORY_PROVIDER}' '${REPOSITORY_MODEL}'")"
+          jq -n --arg command "${remote_command}" '{commands: [$command]}' >ssm-parameters.json
+          command_id="$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name AWS-RunShellScript \
+            --comment "Vinci aggressive tests ${RUN_KEY}" \
+            --timeout-seconds 2400 \
+            --parameters file://ssm-parameters.json \
+            --query 'Command.CommandId' \
+            --output text)"
+          echo "SSM_COMMAND_ID=${command_id}" >>"${GITHUB_ENV}"
+
+          status="Pending"
+          for _ in $(seq 1 240); do
+            status="$(aws ssm get-command-invocation \
+              --command-id "${command_id}" \
+              --instance-id "${INSTANCE_ID}" \
+              --query Status \
+              --output text 2>/dev/null || echo Pending)"
+            case "${status}" in
+              Success|Cancelled|TimedOut|Failed|Cancelling)
+                break
+                ;;
+            esac
+            sleep 10
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "${command_id}" \
+            --instance-id "${INSTANCE_ID}" \
+            >artifacts/ssm-command.json || true
+          if [[ "${status}" != "Success" ]]; then
+            echo "::error::Remote Vinci tests ended with Systems Manager status ${status}."
+            jq -r '.StandardErrorContent // empty' artifacts/ssm-command.json
+            exit 1
+          fi
+
+      - name: Download repository, terminal, and diagnostic artifacts
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          result_uri="s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/results.tgz"
+          if aws s3 cp "${result_uri}" /tmp/vinci-results.tgz --only-show-errors; then
+            tar -C artifacts -xzf /tmp/vinci-results.tgz
+          else
+            echo "The remote result archive was not available." >artifacts/no-remote-results.txt
+          fi
+
+      - name: Return capacity to zero and remove staging objects
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          aws autoscaling set-desired-capacity \
+            --auto-scaling-group-name "${AUTO_SCALING_GROUP}" \
+            --desired-capacity 0
+          aws s3 rm "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/" --recursive --only-show-errors
+
+      - name: Upload visual and diagnostic artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vinci-ec2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

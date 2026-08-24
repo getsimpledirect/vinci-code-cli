@@ -1,0 +1,14 @@
+Vinci Code
+==========
+
+Vinci Code is a thin fork of Pi (pi-mono), built and maintained by SimpleDirect.
+
+It is derived from:
+
+  Pi (pi-mono) — https://github.com/badlogic/pi-mono
+  Copyright (c) 2025 Mario Zechner
+  Licensed under the MIT License (see /LICENSE at the repo root).
+
+All upstream Pi source is used unmodified; SimpleDirect's additions live entirely under
+the `vinci/` directory. The MIT License and the copyright notice above are retained per
+the license terms. This NOTICE does not modify the license.

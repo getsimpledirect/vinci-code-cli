@@ -420,6 +420,34 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("hideThinkingBlock", () => {
+		const originalVinciCode = process.env.VINCI_CODE;
+
+		afterEach(() => {
+			if (originalVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = originalVinciCode;
+		});
+
+		it("should hide thinking by default in Vinci", () => {
+			process.env.VINCI_CODE = "1";
+
+			expect(SettingsManager.inMemory().getHideThinkingBlock()).toBe(true);
+		});
+
+		it("should preserve explicit thinking visibility settings in Vinci", () => {
+			process.env.VINCI_CODE = "1";
+
+			expect(SettingsManager.inMemory({ hideThinkingBlock: false }).getHideThinkingBlock()).toBe(false);
+			expect(SettingsManager.inMemory({ hideThinkingBlock: true }).getHideThinkingBlock()).toBe(true);
+		});
+
+		it("should show thinking by default outside Vinci", () => {
+			delete process.env.VINCI_CODE;
+
+			expect(SettingsManager.inMemory().getHideThinkingBlock()).toBe(false);
+		});
+	});
+
 	describe("shellCommandPrefix", () => {
 		it("should load shellCommandPrefix from settings", () => {
 			const settingsPath = join(agentDir, "settings.json");

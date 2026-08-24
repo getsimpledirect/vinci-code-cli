@@ -3,6 +3,7 @@ import { type AssistantMessage, getModel, type Usage } from "@earendil-works/pi-
 import { describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { estimateTokens } from "../src/core/compaction/index.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -162,6 +163,82 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.contextUsage?.tokens ?? 0).toBeGreaterThan(25_000);
 		} finally {
 			session.dispose();
+		}
+	});
+
+	it("includes Vinci streaming text and reconciles to reported usage", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		const { session, sessionManager } = createSession();
+
+		try {
+			sessionManager.appendMessage(createAssistantMessage("committed", 20_000, 1));
+			syncAgentMessages(session, sessionManager);
+			const mutableState = session.agent.state as unknown as { streamingMessage?: AssistantMessage };
+
+			mutableState.streamingMessage = createAssistantMessage("a".repeat(400), 0, 2);
+			expect(session.getContextUsage()?.tokens).toBe(20_100);
+
+			mutableState.streamingMessage = createAssistantMessage("a".repeat(800), 20_500, 2);
+			expect(session.getContextUsage()?.tokens).toBe(20_500);
+
+			mutableState.streamingMessage = undefined;
+			sessionManager.appendMessage(createAssistantMessage("a".repeat(800), 20_450, 2));
+			syncAgentMessages(session, sessionManager);
+			expect(session.getContextUsage()?.tokens).toBe(20_450);
+		} finally {
+			session.dispose();
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	it("uses a content-only base for the first Vinci stream after compaction", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		const { session, sessionManager } = createSession();
+
+		try {
+			sessionManager.appendMessage(createUserMessage("first", 1));
+			sessionManager.appendMessage(createAssistantMessage("response1", 180_000, 2));
+			const keptUserId = sessionManager.appendMessage(createUserMessage("second", 3));
+			sessionManager.appendMessage(createAssistantMessage("response2", 195_000, 4));
+			sessionManager.appendCompaction("summary", keptUserId, 195_000);
+			sessionManager.appendMessage(createUserMessage("third", 5));
+			syncAgentMessages(session, sessionManager);
+
+			const streamingMessage = createAssistantMessage("a".repeat(400), 0, 6);
+			const mutableState = session.agent.state as unknown as { streamingMessage?: AssistantMessage };
+			mutableState.streamingMessage = streamingMessage;
+			const expectedTokens =
+				session.messages.reduce((total, message) => total + estimateTokens(message), 0) +
+				estimateTokens(streamingMessage);
+
+			expect(session.getContextUsage()?.tokens).toBe(expectedTokens);
+			expect(session.getContextUsage()?.tokens ?? Infinity).toBeLessThan(195_000);
+		} finally {
+			session.dispose();
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	it("keeps upstream context usage unchanged while a response streams", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		delete process.env.VINCI_CODE;
+		const { session, sessionManager } = createSession();
+
+		try {
+			sessionManager.appendMessage(createAssistantMessage("committed", 20_000, 1));
+			syncAgentMessages(session, sessionManager);
+			const mutableState = session.agent.state as unknown as { streamingMessage?: AssistantMessage };
+			mutableState.streamingMessage = createAssistantMessage("a".repeat(800), 0, 2);
+
+			expect(session.getContextUsage()?.tokens).toBe(20_000);
+		} finally {
+			session.dispose();
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
 		}
 	});
 });

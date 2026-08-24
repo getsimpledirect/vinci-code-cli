@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
-import type { Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
@@ -342,6 +342,12 @@ export async function generateBranchSummary(
 	const response = streamFn
 		? await (await streamFn(model, context, requestOptions)).result()
 		: await completeSimple(model, context, requestOptions);
+	const reporter = (
+		globalThis as typeof globalThis & {
+			__vinciRecordTaskCall?: (response: AssistantMessage, source: string) => void;
+		}
+	).__vinciRecordTaskCall;
+	reporter?.(response, "branch-summarization");
 
 	// Check if aborted or errored
 	if (response.stopReason === "aborted") {

@@ -21,6 +21,14 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	"out of budget",
 	"quota exceeded",
 	"billing",
+
+	// Vinci billing codes for various refusals — all non-retryable.
+	// These may appear in structured error bodies ({"error":{"code":"free_daily_cap"}})
+	// or as literal text in error messages.
+	"free_daily_cap",
+	"payment_failed",
+	"balance_exhausted",
+	"request_too_large",
 ]);
 
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
@@ -78,6 +86,9 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"you can retry your request",
 	"try your request again",
 	"please retry your request",
+
+	// Vinci capacity failures are transient and should be retried.
+	"capacity",
 ]);
 
 /**

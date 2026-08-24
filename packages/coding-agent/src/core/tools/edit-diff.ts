@@ -254,14 +254,112 @@ function countOccurrences(content: string, oldText: string): number {
 	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
 
-function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
+// [vinci] Give small models bounded, actionable evidence when an atomic multi-edit cannot apply.
+const EXCERPT_CONTEXT_LINES = 2;
+const EXCERPT_LINE_LENGTH = 180;
+const GENERIC_IDENTIFIERS = new Set([
+	"async",
+	"await",
+	"const",
+	"export",
+	"false",
+	"from",
+	"function",
+	"import",
+	"number",
+	"object",
+	"return",
+	"string",
+	"true",
+	"undefined",
+]);
+
+function identifiers(text: string): string[] {
+	return Array.from(
+		new Set(
+			(text.match(/[A-Za-z_$][A-Za-z0-9_$]{3,}/g) ?? []).filter(
+				(identifier) => !GENERIC_IDENTIFIERS.has(identifier),
+			),
+		),
+	);
+}
+
+function nearestCurrentExcerpt(content: string, oldText: string): string {
+	const oldLines = new Set(
+		oldText
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.length >= 4),
+	);
+	const oldIdentifiers = identifiers(oldText);
+	const lines = content.split("\n");
+	let bestIndex = -1;
+	let bestScore = 0;
+
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index];
+		const trimmed = line.trim();
+		let score = oldLines.has(trimmed) ? 1000 + trimmed.length : 0;
+		for (const identifier of oldIdentifiers) {
+			if (line.includes(identifier)) score += identifier.length;
+		}
+		if (score > bestScore) {
+			bestIndex = index;
+			bestScore = score;
+		}
+	}
+
+	if (bestIndex === -1 || bestScore === 0) return "";
+	const start = Math.max(0, bestIndex - EXCERPT_CONTEXT_LINES);
+	const end = Math.min(lines.length, bestIndex + EXCERPT_CONTEXT_LINES + 1);
+	const width = String(end).length;
+	return [
+		"Nearest current-file lines by shared identifiers (diagnostic only; not an edit match):",
+		...lines.slice(start, end).map((line, offset) => {
+			const visible = line.length > EXCERPT_LINE_LENGTH ? `${line.slice(0, EXCERPT_LINE_LENGTH - 1)}…` : line;
+			return `${String(start + offset + 1).padStart(width, " ")} | ${visible}`;
+		}),
+	].join("\n");
+}
+
+function editMatchSummary(matches: readonly FuzzyMatchResult[]): string {
+	const matched: string[] = [];
+	const missing: string[] = [];
+	for (let index = 0; index < matches.length; index++) {
+		(matches[index].found ? matched : missing).push(`edits[${index}]`);
+	}
+	return `Match check: ${matched.length > 0 ? `${matched.join(", ")} matched` : "no entries matched"}; ${missing.join(", ")} not found.`;
+}
+
+function getNotFoundError(
+	path: string,
+	editIndex: number,
+	matchResults: readonly FuzzyMatchResult[],
+	content: string,
+	oldText: string,
+): Error {
+	const totalEdits = matchResults.length;
+	const excerpt = nearestCurrentExcerpt(content, oldText);
 	if (totalEdits === 1) {
 		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
+			[
+				`Could not find the exact text in ${path}. No changes were applied.`,
+				"Re-read the current file and retry with one small, unique oldText copied from it.",
+				excerpt,
+			]
+				.filter(Boolean)
+				.join("\n"),
 		);
 	}
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
+		[
+			`Could not find edits[${editIndex}] in ${path}. No changes were applied.`,
+			editMatchSummary(matchResults),
+			"Retry only the matching replacement(s) for this file in a smaller call. Read the correct target file before sending unmatched replacements; one edit call can modify only its path.",
+			excerpt,
+		]
+			.filter(Boolean)
+			.join("\n"),
 	);
 }
 
@@ -320,13 +418,16 @@ export function applyEditsToNormalizedContent(
 	const initialMatches = normalizedEdits.map((edit) => fuzzyFindText(normalizedContent, edit.oldText));
 	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
 	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
+	const matchResults = usedFuzzyMatch
+		? normalizedEdits.map((edit) => fuzzyFindText(replacementBaseContent, edit.oldText))
+		: initialMatches;
 
 	const matchedEdits: MatchedEdit[] = [];
 	for (let i = 0; i < normalizedEdits.length; i++) {
 		const edit = normalizedEdits[i];
-		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
+		const matchResult = matchResults[i];
 		if (!matchResult.found) {
-			throw getNotFoundError(path, i, normalizedEdits.length);
+			throw getNotFoundError(path, i, matchResults, replacementBaseContent, edit.oldText);
 		}
 
 		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);

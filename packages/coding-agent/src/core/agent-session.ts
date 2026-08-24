@@ -95,6 +95,16 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+// [vinci] Verification system Phase 2 — turn-end completion-claim gate. See vinci/docs/VERIFICATION_SYSTEM.md.
+import {
+	type GraderVerdict,
+	gatherDiff,
+	looksLikeCompletionClaim,
+	parseGraderVerdict,
+	runReview,
+	taskFromBranch,
+	verificationEvidenceFromBranch,
+} from "./vinci-grader.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -136,7 +146,7 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow"; tokens?: number }
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
@@ -192,6 +202,7 @@ export interface AgentSessionConfig {
 
 export interface ExtensionBindings {
 	uiContext?: ExtensionUIContext;
+	headlessNotify?: (message: string, type?: "info" | "warning" | "error") => void;
 	mode?: ExtensionMode;
 	commandContextActions?: ExtensionCommandContextActions;
 	abortHandler?: () => void;
@@ -314,6 +325,7 @@ export class AgentSession {
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
+	private _extensionHeadlessNotify?: (message: string, type?: "info" | "warning" | "error") => void;
 	private _extensionMode: ExtensionMode = "print";
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _extensionAbortHandler?: () => void;
@@ -982,11 +994,173 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
+	// [vinci] Set when a THRESHOLD compaction ends a turn; consumed by the auto-continue loop below.
+	private _vinciThresholdCompacted = false;
+
+	/**
+	 * [vinci] Did the current turn actually change files (call the edit or write tool)? Scans back to
+	 * the start of this turn (the last real user message; auto-continue nudges are role "custom", so
+	 * they don't end the scan). Used by the Phase 2 verification gate so it only grades work this turn
+	 * produced — never pre-existing uncommitted WIP that a conversational completion claim happens to
+	 * coincide with.
+	 */
+	private _vinciTurnMadeEdits(): boolean {
+		const msgs = this.agent.state.messages;
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			const m = msgs[i];
+			if (m.role === "user") break; // reached the start of this turn
+			if (m.role === "assistant") {
+				for (const c of m.content) {
+					if (c.type === "toolCall" && (c.name === "edit" || c.name === "write")) return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
 		try {
+			this._vinciThresholdCompacted = false; // [vinci] fresh per user turn
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
+			}
+			// [vinci] Auto-continue after a threshold compaction ended the turn mid-task, so the user
+			// doesn't have to type "continue". SAFE BY CONSTRUCTION: only runs when a threshold
+			// compaction was flagged this turn (otherwise this block is a no-op → identical to
+			// upstream); bounded by a small cap so it can't loop; and self-limiting — the flag only
+			// re-arms if the "continue" turn is itself big enough to threshold-compact (i.e. still
+			// doing heavy work), so it stops once work winds down. Opt out with VINCI_NO_AUTOCONTINUE=1.
+			if (process.env.VINCI_CODE === "1") {
+				// Auto-continue nudges are MACHINERY, not conversation — send them as display:false custom
+				// messages so the model reads them (convertToLlm maps custom → user) but the transcript
+				// stays clean (the "continuing…" notice on the cut message is the only visible seam).
+				const vinciAutoNudge = (text: string): CustomMessage => ({
+					role: "custom",
+					customType: "vinci-auto-continue",
+					content: text,
+					display: false,
+					timestamp: Date.now(),
+				});
+				if (process.env.VINCI_NO_AUTOCONTINUE !== "1") {
+					let autoContinues = 0;
+					while (this._vinciThresholdCompacted && autoContinues < 3) {
+						this._vinciThresholdCompacted = false;
+						autoContinues++;
+						await this.agent.prompt(vinciAutoNudge("continue"));
+						while (await this._handlePostAgentRun()) {
+							await this.agent.continue();
+						}
+					}
+					// [vinci] Finish a length-cut reply: when the turn ended because the reply hit the
+					// output-token limit (stopReason "length") on a TEXT answer (a cut mid-tool-call isn't
+					// resumable prose), auto-continue with a PRECISE resume nudge. A bare "continue" makes a
+					// small model re-run its habits instead of resuming (observed live: three identical todo
+					// calls, then nothing); naming exactly what to do resumes the text. Observed cause: the
+					// gateway clamps some replies to 256 output tokens (documented in the internal ops repository) — each
+					// continue buys another budget until the answer completes. Bounded; same kill switch.
+					let lengthContinues = 0;
+					while (lengthContinues < 3) {
+						const last = [...this.agent.state.messages]
+							.reverse()
+							.find((m): m is AssistantMessage => m.role === "assistant");
+						if (!last || last.stopReason !== "length") break;
+						if (last.content.some((c) => c.type === "toolCall")) break;
+						lengthContinues++;
+						await this.agent.prompt(
+							vinciAutoNudge(
+								"Your previous reply was cut off by the reply-length limit. Continue EXACTLY where it stopped — do not repeat anything you already wrote, do not call tools, and do not restate the plan. Just write the rest of the answer, and keep it tight.",
+							),
+						);
+						while (await this._handlePostAgentRun()) {
+							await this.agent.continue();
+						}
+					}
+				}
+
+				// [vinci] Verification system Phase 2 (vinci/docs/VERIFICATION_SYSTEM.md): the turn-end
+				// completion-claim gate. A 9B's most dangerous move is announcing "done / all correct / up
+				// to date" on work it did NOT verify — and outside the todo flow (Phase 1) nothing catches
+				// it. When the turn settles on such a claim WITH uncommitted changes, run the INDEPENDENT
+				// grader on the REAL diff (untracked included) and, if it says "needs work", inject the
+				// concrete findings and continue the turn so the model must address them before it can
+				// finish. This is the sticky, non-todo path: the check runs whether or not a plan is in
+				// play, and a verdict — not a rationalization — decides. SAFE BY CONSTRUCTION: only grades
+				// a SETTLED text claim (never a cut mid-tool-call or a length-cut), only when a claim
+				// phrase is present AND there are real uncommitted changes (otherwise a no-op ≈ upstream);
+				// bounded by a small cap; and fail-safe — any grader error/unavailability lets the turn
+				// end rather than blocking it. Opt out with VINCI_NO_VERIFY=1.
+				if (process.env.VINCI_NO_VERIFY !== "1" && this.model) {
+					let verifyReprompts = 0;
+					while (verifyReprompts < 2) {
+						const last = [...this.agent.state.messages]
+							.reverse()
+							.find((m): m is AssistantMessage => m.role === "assistant");
+						if (!last || last.stopReason === "length") break;
+						if (last.content.some((c) => c.type === "toolCall")) break;
+						const claimText = last.content
+							.filter((c): c is TextContent => c.type === "text")
+							.map((c) => c.text)
+							.join("\n");
+						if (!looksLikeCompletionClaim(claimText)) break;
+						// Only grade work THIS turn actually produced. Otherwise a conversational "all done"
+						// (e.g. answering a question) with unrelated pre-existing WIP sitting in the working
+						// tree would drag that WIP into the grader and nudge the model to "fix" changes it
+						// never authored. If the turn made no edits, any diff is not ours → claim stands.
+						if (!this._vinciTurnMadeEdits()) break;
+
+						let verdict: GraderVerdict = "none";
+						let findings = "";
+						try {
+							const diff = gatherDiff(this._cwd);
+							if (!diff) break; // no uncommitted changes → nothing to verify, claim stands
+							const auth = await this._getCompactionRequestAuth(this.model);
+							if (!auth.apiKey) break; // can't grade without auth → don't block the turn
+							const branch = this.sessionManager.getBranch() as ReadonlyArray<{
+								type?: string;
+								customType?: string;
+								data?: unknown;
+								message?: { role?: string; content?: unknown };
+							}>;
+							const task = taskFromBranch(branch);
+							const verificationEvidence = verificationEvidenceFromBranch(branch);
+							// Pass the turn's abort signal so ESC / a stalled gateway can't hang the turn here
+							// (the gateway is known to occasionally accept a connection and never respond).
+							findings = await runReview(
+								this.model,
+								{ apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal: this.agent.signal },
+								task,
+								diff,
+								verificationEvidence,
+							);
+							verdict = parseGraderVerdict(findings);
+						} catch {
+							break; // fail-safe: a grader error never blocks the turn
+						}
+						if (process.env.VINCI_VERIFY_DEBUG === "1") {
+							process.stderr.write(`[vinci-verify] completion claim graded → verdict=${verdict}\n`);
+						}
+						if (verdict !== "needs-work") break; // ships / risky / none → claim stands
+
+						verifyReprompts++;
+						await this.agent.prompt(
+							vinciAutoNudge(
+								"You told the user the work is done, but an INDEPENDENT review of your ACTUAL uncommitted " +
+									"changes found concrete problems. Do not claim it's finished yet. Address only the demonstrated " +
+									"needs-work findings below. Use at most one focused inspection before making the smallest owning " +
+									"edit, then rerun the existing focused check directly. Do not broaden into speculative risks, add " +
+									"tests merely to demonstrate an already-passing seeded regression, or modify a new file unless the " +
+									"review demonstrates an actual defect in that file. A request to confirm evidence calls for inspection, not a new edit. " +
+									"If a point is a factual/currency claim, verify " +
+									"it with a tool (web_answer/library_docs) rather than asserting it:\n\n" +
+									findings,
+							),
+						);
+						while (await this._handlePostAgentRun()) {
+							await this.agent.continue();
+						}
+					}
+				}
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
@@ -1496,7 +1670,9 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (process.env.VINCI_CODE !== "1") {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		}
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(thinkingLevel);
@@ -1690,7 +1866,11 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
+		this._emit({
+			type: "compaction_start",
+			reason: "manual",
+			tokens: this.getContextUsage()?.tokens ?? undefined,
+		});
 
 		try {
 			if (!this.model) {
@@ -1936,6 +2116,9 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
+			// [vinci] Flag a threshold compaction so _runAgentPrompt can auto-continue the turn (the
+			// turn ends here and Pi normally waits for the user to type "continue"). VINCI_CODE only.
+			if (process.env.VINCI_CODE === "1") this._vinciThresholdCompacted = true;
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -1946,6 +2129,13 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
+		// [vinci] Pi's default keepRecentTokens (20k) is tuned for 128k models. On a small window
+		// (piccolo = 32k) it can't fit post-compaction context — so overflow recovery compacts,
+		// retries, still overflows, and hard-errors. Scale keepRecent to the actual window so the
+		// retry fits. min() → no-op on large windows (128k → floor(0.3*128k)=39k > 20k default).
+		if (process.env.VINCI_CODE === "1" && this.model?.contextWindow) {
+			settings.keepRecentTokens = Math.min(settings.keepRecentTokens, Math.floor(this.model.contextWindow * 0.3));
+		}
 		let started = false;
 
 		try {
@@ -1975,7 +2165,7 @@ export class AgentSession {
 				return false;
 			}
 
-			this._emit({ type: "compaction_start", reason });
+			this._emit({ type: "compaction_start", reason, tokens: preparation.tokensBefore });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
 
@@ -2130,6 +2320,9 @@ export class AgentSession {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
+		if (bindings.headlessNotify !== undefined) {
+			this._extensionHeadlessNotify = bindings.headlessNotify;
+		}
 		if (bindings.mode !== undefined) {
 			this._extensionMode = bindings.mode;
 		}
@@ -2205,7 +2398,7 @@ export class AgentSession {
 	}
 
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
-		runner.setUIContext(this._extensionUIContext, this._extensionMode);
+		runner.setUIContext(this._extensionUIContext, this._extensionMode, this._extensionHeadlessNotify);
 		runner.bindCommandContext(this._extensionCommandContextActions);
 
 		this._extensionErrorUnsubscriber?.();
@@ -2484,9 +2677,14 @@ export class AgentSession {
 		this._bindExtensionCore(this._extensionRunner);
 		this._applyExtensionBindings(this._extensionRunner);
 
+		// [vinci] Enable the structured search tools by default too — the friendly render layer already
+		// wraps them, and a small model navigates a codebase far better with grep/find/ls than by
+		// shelling out. Only the ACTIVE built-in set; extension tools are unaffected. Upstream when unset.
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: process.env.VINCI_CODE === "1"
+				? ["read", "bash", "edit", "write", "grep", "find", "ls"]
+				: ["read", "bash", "edit", "write"];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
@@ -2509,6 +2707,7 @@ export class AgentSession {
 
 		const hasBindings =
 			this._extensionUIContext ||
+			this._extensionHeadlessNotify ||
 			this._extensionCommandContextActions ||
 			this._extensionShutdownHandler ||
 			this._extensionErrorListener;
@@ -3026,8 +3225,13 @@ export class AgentSession {
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
+		const streamingMessage =
+			process.env.VINCI_CODE === "1" && this.state.streamingMessage?.role === "assistant"
+				? (this.state.streamingMessage as AssistantMessage)
+				: undefined;
 		const branchEntries = this.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		let useContentOnlyEstimate = false;
 
 		if (latestCompaction) {
 			// Check if there's a valid assistant usage after the compaction boundary
@@ -3048,15 +3252,24 @@ export class AgentSession {
 			}
 
 			if (!hasPostCompactionUsage) {
-				return { tokens: null, contextWindow, percent: null };
+				if (!streamingMessage) return { tokens: null, contextWindow, percent: null };
+				useContentOnlyEstimate = true;
 			}
 		}
 
 		const estimate = estimateContextTokens(this.messages);
-		const percent = (estimate.tokens / contextWindow) * 100;
+		const estimatedStreamingTokens = streamingMessage ? estimateTokens(streamingMessage) : 0;
+		const reportedStreamingTokens = streamingMessage ? calculateContextTokens(streamingMessage.usage) : 0;
+		const baseTokens = useContentOnlyEstimate
+			? this.messages.reduce((total, message) => total + estimateTokens(message), 0)
+			: estimate.tokens;
+		const tokens = streamingMessage
+			? Math.max(baseTokens + estimatedStreamingTokens, reportedStreamingTokens)
+			: estimate.tokens;
+		const percent = (tokens / contextWindow) * 100;
 
 		return {
-			tokens: estimate.tokens,
+			tokens,
 			contextWindow,
 			percent,
 		};

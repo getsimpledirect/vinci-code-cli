@@ -152,6 +152,7 @@ The last message in context must be `user` or `toolResult` (not `assistant`).
 | `message_end` | Message completes |
 | `tool_execution_start` | Tool begins |
 | `tool_execution_update` | Tool streams progress |
+| `tool_hooks_start` | Emitted between a tool's execution settling and its result-finalization hooks |
 | `tool_execution_end` | Tool completes |
 
 `Agent.subscribe()` listeners are awaited in registration order. `agent_end` means no more loop events will be emitted, but `await agent.waitForIdle()` and `await agent.prompt(...)` only settle after awaited `agent_end` listeners finish.

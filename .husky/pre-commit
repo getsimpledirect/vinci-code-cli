@@ -8,6 +8,11 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+node scripts/check-secrets.mjs
+if [ $? -ne 0 ]; then
+  exit 1
+fi
+
 # Run the check script (formatting, linting, and type checking)
 echo "Running formatting, linting, and type checking..."
 npm run check

@@ -335,7 +335,6 @@ export class Markdown implements Component {
 		switch (token.type) {
 			case "heading": {
 				const headingLevel = token.depth;
-				const headingPrefix = `${"#".repeat(headingLevel)} `;
 
 				// Build a heading-specific style context so inline tokens (codespan, bold, etc.)
 				// restore heading styling after their own ANSI resets instead of falling back to
@@ -352,8 +351,10 @@ export class Markdown implements Component {
 					stylePrefix: this.getStylePrefix(headingStyleFn),
 				};
 
-				const headingText = this.renderInlineTokens(token.tokens || [], headingStyleContext);
-				const styledHeading = headingLevel >= 3 ? headingStyleFn(headingPrefix) + headingText : headingText;
+				// All heading levels render clean-styled — no literal "#" markers. h3-h6 used to keep their
+				// raw "### " prefix (a non-programmer just saw stray hashes); they now match h1/h2 and read
+				// as headings via the bold heading style, not markup.
+				const styledHeading = this.renderInlineTokens(token.tokens || [], headingStyleContext);
 				lines.push(styledHeading);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after headings (unless space token follows)
@@ -377,7 +378,13 @@ export class Markdown implements Component {
 
 			case "code": {
 				const indent = this.theme.codeBlockIndent ?? "  ";
-				lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
+				// [vinci] Non-programmers read a literal ``` as breakage, so Vinci renders a fenced block
+				// as styled, indented lines with no delimiters and no language tag. Upstream pi keeps its
+				// fences: with VINCI_CODE unset this branch is byte-identical to before.
+				const vinciBareCodeBlock = process.env.VINCI_CODE === "1";
+				if (!vinciBareCodeBlock) {
+					lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
+				}
 				if (this.theme.highlightCode) {
 					const highlightedLines = this.theme.highlightCode(token.text, token.lang);
 					for (const hlLine of highlightedLines) {
@@ -387,10 +394,17 @@ export class Markdown implements Component {
 					// Split code by newlines and style each line
 					const codeLines = token.text.split("\n");
 					for (const codeLine of codeLines) {
-						lines.push(`${indent}${this.theme.codeBlock(codeLine)}`);
+						// [vinci] style the indent too, so the block reads as one shaded slab
+						lines.push(
+							vinciBareCodeBlock
+								? this.theme.codeBlock(`${indent}${codeLine}`)
+								: `${indent}${this.theme.codeBlock(codeLine)}`,
+						);
 					}
 				}
-				lines.push(this.theme.codeBlockBorder("```"));
+				if (!vinciBareCodeBlock) {
+					lines.push(this.theme.codeBlockBorder("```"));
+				}
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after code blocks (unless space token follows)
 				}

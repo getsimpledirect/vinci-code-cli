@@ -29,6 +29,30 @@ describe("provider retry classification", () => {
 		).toBe(false);
 	});
 
+	it("does not retry Vinci daily-cap or payment failures", () => {
+		for (const code of ["free_daily_cap", "payment_failed"]) {
+			expect(
+				isRetryableAssistantError(
+					fauxAssistantMessage("", {
+						stopReason: "error",
+						errorMessage: `429: {"error":{"code":"${code}"}}`,
+					}),
+				),
+			).toBe(false);
+		}
+	});
+
+	it("keeps Vinci capacity failures retryable", () => {
+		expect(
+			isRetryableAssistantError(
+				fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: '429: {"error":{"code":"capacity"}}',
+				}),
+			),
+		).toBe(true);
+	});
+
 	it("classifies assistant error messages", () => {
 		expect(
 			isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })),

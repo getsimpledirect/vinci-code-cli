@@ -1,14 +1,159 @@
-<p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
-</p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
-</p>
+<div align="center">
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="vinci/assets/logomark-inverse.svg" />
+  <img src="vinci/assets/logomark.svg" alt="Vinci logomark" width="120" />
+</picture>
+
+# Vinci Code
+
+A coding agent you can run with **your own provider key** — or with Vinci's managed service.<br/>Same guard rails either way.
+
+[![Node](https://img.shields.io/badge/Node-22.19%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
+[![License](https://img.shields.io/badge/License-MIT-2ECC71?style=flat-square)](LICENSE)
+[![Upstream](https://img.shields.io/badge/fork%20of-Pi-6C3483?style=flat-square)](https://github.com/badlogic/pi-mono)
+[![BYOK](https://img.shields.io/badge/BYOK-supported-0A84FF?style=flat-square)](vinci/PRIVACY.md)
+
+</div>
+
+**Vinci Code is a distribution of [Pi](https://pi.dev)** — a thin fork of the
+[Pi agent harness](https://github.com/badlogic/pi-mono) (MIT) by
+[Mario Zechner](https://github.com/badlogic), maintained under
+[SimpleDirect®](https://www.getsimpledirect.com) by Alpine Pacific Trading Inc. Pi's engine
+and packages are kept intact; Vinci adds an additive layer on top. Provenance, including the
+exact upstream commit this forked from, is in [`UPSTREAM.md`](UPSTREAM.md).
+
+<div align="center">
+
+<img src="vinci/assets/demo-byok.gif" alt="Vinci Code on a fresh checkout with nothing configured: --list-models already shows Anthropic, DeepSeek and Google models alongside Vinci's own classes, which sort first" width="900" />
+
+</div>
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    You["your terminal"] --> Guard
+
+    subgraph Local["on your machine — identical in both modes"]
+        direction LR
+        Guard[guard] --> Mask[secret&nbsp;redaction] --> Agent[agent&nbsp;loop]
+        Agent -.-> Receipts[("receipts<br/>checkpoints<br/>review")]
+    end
+
+    Agent -->|BYOK| Provider["your provider<br/>Anthropic · OpenAI · Google · Groq"]
+    Agent -->|Managed| Gateway["Vinci gateway"] --> Managed["a model Vinci selects"]
+
+    style Provider fill:#0A84FF,color:#fff
+    style Gateway fill:#6C3483,color:#fff
+```
+
+In **BYOK** the right-hand Vinci path does not exist — your key and your prompts go straight
+to your provider, and Vinci's servers are not involved. Everything in the grey box runs
+locally and is the same either way.
+
+## Two ways to run it
+
+| | **Direct / BYOK** | **Managed** |
+|---|---|---|
+| Vinci account | **not required** | required |
+| Provider | you choose | Vinci selects |
+| Your API key | stored locally; sent **only to your provider**, never to Vinci | you have none |
+| Vinci sees your prompts | **no** | yes, in transit |
+| Guard · receipts · checkpoints · review | ✅ | ✅ |
+
+## Installation
+
+```sh
+# From source — the path this repository supports (Node 22.19+)
+git clone https://github.com/getsimpledirect/vinci-code-cli
+cd vinci-code-cli
+npm install && bash vinci/build.sh
+./vinci/bin/vinci
+```
+
+```sh
+# Or the signed release (installs the built binary and self-updates)
+curl -fsSL https://vinci.getsimpledirect.com/install | sh
+```
+
+> There is no `vinci` npm package. The npm packages in this repo are **upstream Pi's**
+> (`@earendil-works/*`, binary `pi`) — installing those gives you Pi, not Vinci Code.
+
+## Quick start — bring your own key
+
+Nothing to configure. Install it, run it, pick a provider:
+
+```sh
+./vinci/bin/vinci
+
+/login      # pick Anthropic, OpenAI, Google, Groq, … or Vinci
+/model      # pick a model — foreign ones show their exact id and a provider badge
+```
+
+**No account, no environment variable, no sign-up.** Vinci's own classes are offered first, so
+signing in to Vinci stays one keystroke away if you want managed inference — but nothing makes
+you. Credentials are stored by Pi in `~/.pi/agent/auth.json`. Vinci Code adds no second credential
+store, and your key is sent **only to the provider you picked** — authenticating to them requires
+it — and never to Vinci.
+
+Want the lean, Vinci-only view back? `VINCI_SHOW_OTHER_PROVIDERS=0`, or `showOtherProviders:
+false` in settings.
+
+## What the Vinci layer adds
+
+| Capability | Status | What it does |
+|---|:---:|---|
+| Command guard | Shipped | Classifies destructive operations and confirms before running them |
+| Secret redaction | Shipped | Masks credentials before the terminal, diffs, previews, and `/feedback` + `/issue` egress |
+| Honest terminal states | Shipped | A run blocked awaiting permission says so, instead of reporting a read-only success |
+| Checkpoints | Shipped | Durable recovery points you can roll back to |
+| Review / accept | Shipped | A workflow for inspecting and accepting agent output |
+| Sandbox | Shipped | Bounded execution for agent-run commands |
+| BYOK | Shipped | Any Pi-supported provider, with every guard above still active |
+
+Layout, the branch model, and the patch inventory: [`vinci/README.md`](vinci/README.md).
+
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [`vinci/README.md`](vinci/README.md) | The Vinci layer in detail — extensions, layout, branch model |
+| [`vinci/PRIVACY.md`](vinci/PRIVACY.md) | Exactly what leaves your machine, in each mode |
+| [`SECURITY.md`](SECURITY.md) | Reporting a vulnerability; known limits |
+| [`UPSTREAM.md`](UPSTREAM.md) | Fork provenance and how to sync with Pi |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute |
+
+## Project status
+
+**Actively maintained** by a small team. Security fixes go to the latest release only — there
+is no LTS branch. APIs and settings may change before 1.0. Issues and pull requests are
+welcome.
+
+Security reports: [`SECURITY.md`](SECURITY.md). Report the *format* of a missed
+credential, never a live key.
+
+## License
+
+**MIT**, throughout — see [`LICENSE`](LICENSE).
+
+- Upstream Pi is © 2025 Mario Zechner, MIT. That notice is preserved verbatim.
+- Vinci's modifications are © 2026 Alpine Pacific Trading Inc., under the same MIT grant.
+- Third-party notices: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- "Vinci" and "SimpleDirect" are trademarks of Alpine Pacific Trading Inc.; the code grant
+  conveys **no** trademark rights. See [`TRADEMARKS.md`](TRADEMARKS.md) — if you fork and
+  ship this, rename it.
+
+There is no separately-licensed or source-available tier in this repository. Everything here
+is MIT.
+
+---
+
+## Upstream project
+
+The sections above this line describe Vinci Code. What follows is upstream Pi's own
+documentation, retained so this fork stays honest about what it is built on. Its
+badges, Discord and npm links point at **upstream Pi**, not at Vinci support.
 
 # Pi Agent Harness
 
@@ -87,10 +232,6 @@ You can also watch [this video](https://x.com/badlogicgames/status/2041151967695
 I regularly publish my own `pi-mono` work sessions here:
 
 - [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
-
-## License
-
-MIT
 
 <p align="center">
   <a href="https://pi.dev">pi.dev</a> domain graciously donated by

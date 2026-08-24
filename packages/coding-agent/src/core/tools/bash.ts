@@ -8,6 +8,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts"
 import { truncateToVisualLines } from "../../modes/interactive/components/visual-truncate.ts";
 import { theme } from "../../modes/interactive/theme/theme.ts";
 import { waitForChildProcess } from "../../utils/child-process.ts";
+import { formatDuration } from "../../utils/format-duration.ts";
 import {
 	getShellConfig,
 	getShellEnv,
@@ -16,6 +17,8 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import { vinciMaskEnabled, vinciMaskSecrets } from "../vinci-mask-secrets.ts";
+import { vinciSandboxWrap } from "../vinci-sandbox.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -156,8 +159,25 @@ export interface BashSpawnContext {
 export type BashSpawnHook = (context: BashSpawnContext) => BashSpawnContext;
 
 function resolveSpawnContext(command: string, cwd: string, spawnHook?: BashSpawnHook): BashSpawnContext {
-	const baseContext: BashSpawnContext = { command, cwd, env: { ...getShellEnv() } };
-	return spawnHook ? spawnHook(baseContext) : baseContext;
+	const shellEnv = { ...getShellEnv() };
+	if (process.env.VINCI_CODE === "1") {
+		for (const key of Object.keys(shellEnv)) {
+			if (
+				/(?:^|_)(?:API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_?KEY|ACCESS_?KEY|CLIENT_?SECRET|AUTH)(?:$|_)/i.test(
+					key,
+				) ||
+				key === "VINCI_SECURITY_NONCE"
+			) {
+				delete shellEnv[key];
+			}
+		}
+	}
+	const baseContext: BashSpawnContext = { command, cwd, env: shellEnv };
+	const hooked = spawnHook ? spawnHook(baseContext) : baseContext;
+	// VINCI_CODE: confine the command's filesystem writes to the workspace via an OS sandbox — an
+	// enforcement layer independent of the attention-dependent permission guards. Applied AFTER any
+	// spawnHook (so command prefixes are inside the sandbox too). No-op when disabled/unavailable.
+	return { ...hooked, command: vinciSandboxWrap(hooked.command, hooked.cwd) };
 }
 
 export interface BashToolOptions {
@@ -194,10 +214,6 @@ class BashResultRenderComponent extends Container {
 	};
 }
 
-function formatDuration(ms: number): string {
-	return `${(ms / 1000).toFixed(1)}s`;
-}
-
 function formatBashCall(args: { command?: string; timeout?: number } | undefined): string {
 	const command = str(args?.command);
 	const timeout = args?.timeout as number | undefined;
@@ -228,6 +244,13 @@ function rebuildBashResultRenderComponent(
 		if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
 			output = output.slice(0, footerStart).trimEnd();
 		}
+	}
+
+	// [vinci] mask secrets in the on-screen output (a `cat .env` / `printenv` / `grep KEY` would
+	// otherwise paint a live key across the screen — the exact shoulder-surf leak the masker exists to
+	// stop). Display-only: the model's own copy of the result keeps the real value. No-op unless enabled.
+	if (output && vinciMaskEnabled()) {
+		output = vinciMaskSecrets(output);
 	}
 
 	if (output) {

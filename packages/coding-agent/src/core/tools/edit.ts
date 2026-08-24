@@ -231,6 +231,10 @@ function getEditHeaderBg(
 	settledError: boolean | undefined,
 	theme: Theme,
 ): (text: string) => string {
+	// [vinci] No edit-panel background under VINCI_CODE — Vinci's theme repurposes the tool*Bg
+	// tokens as diff ROW tints (PATCHES §17/§18), so panels must not paint them (this was the one
+	// remaining site after tool-execution.ts).
+	if (process.env.VINCI_CODE === "1") return (text: string) => text;
 	if (preview) {
 		if ("error" in preview) {
 			return (text: string) => theme.bg("toolErrorBg", text);
@@ -299,6 +303,8 @@ export function createEditToolDefinition(
 		promptGuidelines: [
 			"Use edit for precise changes (edits[].oldText must match exactly)",
 			"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
+			// [vinci] Live Execa evidence: a 9B mixed imported-file blocks into one atomic edit.
+			"Every edits[] entry in one call must come from the same path. Never include text copied from an imported or sibling file; edit that file separately.",
 			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
 		],

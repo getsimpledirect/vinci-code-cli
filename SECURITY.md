@@ -1,87 +1,71 @@
-# Security Policy
+# Reporting a security issue in Vinci Code
 
-This document should guide you about understanding the security concept behind
-Pi and also where the boundaries are.
+This covers the **Vinci layer** — everything under `vinci/`, plus the Vinci-specific
+changes inside `packages/`. For issues in upstream Pi itself, see
+[`vinci/UPSTREAM-SECURITY.md`](vinci/UPSTREAM-SECURITY.md), which is Pi's own policy.
 
-In general Pi is a coding agent that runs locally within the security boundary
-of the user that is running it.  It's the responsibiltiy of the user to monitor
-its operations or to contain it within a container, virtual machine or other
-Sandbox solution.
+If you are not sure which applies, report it here. We would rather receive a
+misrouted report than none.
 
-Pi treats the local user account and files writable by that account as inside
-the same trust boundary as the Pi process itself.  If an attacker can modify files
-under the user's home directory, workspace, shell startup files, environment, or
-Pi configuration, they can generally influence Pi or other local developer tools.
-Reports that depend on such prior local write access are not security
-vulnerabilities unless they demonstrate how Pi grants that write access or crosses
-an operating-system privilege boundary.
+## How to report
 
-Pi relies on users installing trustworthy extensions and loading trustworthy
-skills and only to use pi within trusted repositories.  This is because files
-like `AGENTS.md` or instructions in comments can be used to prompt inject the
-coding agent trivially and this cannot be protected against.
+- Open a private report through **GitHub Security Advisories** on this repository, or
+- Email **security@getsimpledirect.com**
 
-## Reporting a Vulnerability
+Please do **not** open a public issue for a security-sensitive report.
 
-If you believe you found a security vulnerability in pi or another package in
-this repository, please report it privately by either:
+Include what you need to make it reproducible: version (`vinci --version`), OS, the
+steps, and what you expected instead. If a proof of concept involves a credential,
+describe it — do not paste the credential itself.
 
-- Emailing `security@earendil.com`, or
-- Opening a private report through GitHub Security Advisories for this repository
+## What we will do
 
-Please include:
+We aim to acknowledge within **3 business days** and to give an initial assessment
+within **10**. We will tell you plainly whether we consider it in scope, and we will
+credit you in the advisory unless you ask us not to.
 
-- A description of the issue and its impact
-- Steps to reproduce, proof of concept, or relevant logs
-- Affected package, version, commit, or configuration
-- Any known mitigations
+We are a small team. If a fix will take a while, we would rather say so than go quiet.
 
-Do not open a public issue for security-sensitive reports.  We will review
-reports and coordinate disclosure as appropriate.
+## Supported versions
 
-## Scope
+Only the **latest released version** receives security fixes. There is no long-term
+support branch. If you are pinned to an older version, the remedy is to upgrade.
 
-Security issues in the distributed packages, command-line tools, APIs, and
-repository code are in scope as well as earendil operated infrastricture
-on `pi.dev`.
+## Especially in scope
 
-## Out Of Scope
+Vinci Code executes commands and edits files on your machine, and can hold provider
+credentials. The areas where a bug matters most:
 
-- Local code execution or sandboxing behavior (the Pi coding agent intentionally does not have a sandbox)
-- Behavior of pi extensions or skills installed by the user
-- Risks from working in untrusted repositories
-- Risks from installing untrusted extensions, skills, packages, or tools
-- Isuses caused by non trustworthy MITM proxies
-- Public internet exposure of a Pi installation
-- Prompt injection attacks
-- Exposed secrets that are third-party/user-controlled credentials
-- Reports requiring the ability to create, modify, delete, or replace files,
-  directories, symlinks, environment variables, shell configuration, or other
-  user-controlled local state on the target machine. This includes `~/.pi`,
-  `~/.pi/agent/models.json`, workspace files, `AGENTS.md`, skills, extensions,
-  extension configuration, dotfiles, and files synchronized through NFS, roaming
-  profiles, or dotfile managers, unless the report shows how Pi itself grants
-  that access.
-- Issues caused by intentionally weakened user configuration.
-- Resource/DOS claims that require trusted local input/config against the pi coding agent.
-- Reports about malicious model output.
-- User-approved or user-initiated local actions presented as vulnerabilities.
+- **Secret leakage.** `packages/coding-agent/src/core/vinci-mask-secrets.ts` redacts
+  credentials before they reach the terminal, edit diffs, write previews, model prose,
+  print mode, and — importantly — before `/feedback` and `/issue` send anything off
+  your machine. A credential format it fails to recognise, or a sink it does not
+  cover, is a real finding. **Report the format, never a live key.**
+- **Guard bypass.** `vinci/extensions/vinci-guard.ts` classifies destructive commands
+  and requires confirmation. A phrasing that slips a destructive command past it is in
+  scope.
+- **Sandbox escape.** `packages/coding-agent/src/core/vinci-sandbox.ts`.
+- **BYOK credential handling.** With `showOtherProviders` enabled, your provider key
+  is used locally and stored by Pi in `~/.pi/agent/auth.json`. Anything that causes it
+  to be transmitted somewhere it should not be — including to Vinci — is in scope.
 
-## Notes for Reporters
+## Known limitations, so you do not spend time on them
 
-The most useful reports show a current, reproducible security boundary bypass
-with demonstrated impact.  Reports that only show expected local-agent behavior,
-prompt injection, or a malicious trusted extension/skill are not security
-vulnerabilities under this model.
+These are understood and documented, not undiscovered:
 
-For example, a report showing that malicious contents written to a trusted Pi
-configuration file cause Pi to execute commands, load attacker-controlled tools,
-send credentials to an attacker-controlled endpoint, or otherwise change behavior
-is out of scope.
+- **Session transcripts are stored unmasked on disk.** Masking is applied at display
+  and egress, not at rest. A transcript may therefore contain a credential you typed
+  or a file you read. Treat `~/.pi/agent/sessions/` as sensitive.
+- **The masker is pattern-based** and cannot recognise a credential with no
+  distinctive shape — a bare password, an internal hostname, a customer name. Its
+  covered formats are listed in `vinci-mask-secrets.ts`.
+- **An agent that runs commands can do what you can do.** Prompt injection from
+  untrusted file or web content is a real risk class. The guard reduces blast radius;
+  it does not eliminate it. Do not point it at content you do not trust and then
+  approve actions without reading them.
 
-When possible, include the exact affected path, package version or commit SHA,
-configuration, and a proof of concept against the latest release or latest
-`main`.  For dependency reports, include evidence that the shipped dependency is
-affected and that the issue is reachable through Pi.  For exposed-secret reports,
-include evidence that the credential is owned by Earendil or grants access to
-Earendil-operated infrastructure or services.
+## Out of scope
+
+Vulnerabilities in your own shell, editor, dotfiles or MCP servers, unless the report
+shows how Vinci Code itself grants the access. Also out of scope: findings that
+require an attacker who already has local code execution as your user.

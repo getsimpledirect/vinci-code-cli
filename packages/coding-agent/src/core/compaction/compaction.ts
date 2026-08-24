@@ -551,11 +551,16 @@ async function completeSummarization(
 	options: SimpleStreamOptions,
 	streamFn?: StreamFn,
 ): Promise<AssistantMessage> {
-	if (!streamFn) {
-		return completeSimple(model, context, options);
-	}
-	const stream = await streamFn(model, context, options);
-	return stream.result();
+	const response = streamFn
+		? await (await streamFn(model, context, options)).result()
+		: await completeSimple(model, context, options);
+	const reporter = (
+		globalThis as typeof globalThis & {
+			__vinciRecordTaskCall?: (response: AssistantMessage, source: string) => void;
+		}
+	).__vinciRecordTaskCall;
+	reporter?.(response, "compaction");
+	return response;
 }
 
 /**

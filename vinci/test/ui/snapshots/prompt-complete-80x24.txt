@@ -1,0 +1,17 @@
+  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.49
+  Vinci   ·   <repo>
+  ● connected   ·   /undo safety net   ·   Ctrl+T thinking   ·   /thinking speed
+
+
+
+ Explain this project
+
+
+ I found the entry point and mapped the project structure.
+
+
+╭ ✹ Ask Vinci ──────────────────────────────────────────────────── ● connected ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ▶ AUTO  ·  Vinci ─── <workspace>  ·  0% full · ↓ 15 ╯

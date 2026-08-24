@@ -92,6 +92,7 @@ export interface Settings {
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
+	showOtherProviders?: boolean; // Vinci mode only; default: TRUE — no account required
 	externalEditor?: string; // Command for Ctrl+G external editor; takes precedence over VISUAL/EDITOR
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
@@ -842,7 +843,33 @@ export class SettingsManager {
 	}
 
 	getHideThinkingBlock(): boolean {
-		return this.settings.hideThinkingBlock ?? false;
+		return this.settings.hideThinkingBlock ?? process.env.VINCI_CODE === "1";
+	}
+
+	/**
+	 * Whether providers other than Vinci's managed service are offered.
+	 *
+	 * DEFAULT: true. Vinci Code is an open-source client — anyone should be able to clone or
+	 * download it and start working with their own provider key, without creating an account.
+	 * The account requirement only ever existed because Vinci supplied the inference; requiring
+	 * a sign-up to use a client you already have on disk is hostile, and for a public repo it is
+	 * the first thing a new user hits.
+	 *
+	 * Vinci's own classes still sort FIRST in every picker, so the managed path stays the obvious
+	 * choice for anyone who wants it. Set `showOtherProviders: false` (or
+	 * VINCI_SHOW_OTHER_PROVIDERS=0) to get the lean, Vinci-only view back.
+	 */
+	getShowOtherProviders(): boolean {
+		if (process.env.VINCI_SHOW_OTHER_PROVIDERS !== undefined) {
+			return process.env.VINCI_SHOW_OTHER_PROVIDERS === "1";
+		}
+		return this.settings.showOtherProviders ?? true;
+	}
+
+	setShowOtherProviders(show: boolean): void {
+		this.globalSettings.showOtherProviders = show;
+		this.markModified("showOtherProviders");
+		this.save();
 	}
 
 	getExternalEditorCommand(): string | undefined {

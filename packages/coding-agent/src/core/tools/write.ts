@@ -6,6 +6,7 @@ import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import { vinciMaskEnabled, vinciMaskSecrets } from "../vinci-mask-secrets.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "./render-utils.ts";
@@ -136,7 +137,12 @@ function formatWriteCall(
 	cwd: string,
 ): string {
 	const rawPath = str(args?.file_path ?? args?.path);
-	const fileContent = str(args?.content);
+	// [vinci] mask secret-looking values before display (a fresh .env / config write). The real
+	// content is still what execute() writes to disk — this only affects the on-screen preview, so we
+	// also skip the highlight cache below (it was built from the unmasked content).
+	const masking = vinciMaskEnabled();
+	const rawContent = str(args?.content);
+	const fileContent = masking && rawContent ? vinciMaskSecrets(rawContent) : rawContent;
 	const pathDisplay = renderToolPath(rawPath, theme, cwd);
 	let text = `${theme.fg("toolTitle", theme.bold("write"))} ${pathDisplay}`;
 
@@ -145,7 +151,9 @@ function formatWriteCall(
 	} else if (fileContent) {
 		const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
 		const renderedLines = lang
-			? (cache?.highlightedLines ?? highlightCode(replaceTabs(normalizeDisplayText(fileContent)), lang))
+			? masking
+				? highlightCode(replaceTabs(normalizeDisplayText(fileContent)), lang) // re-highlight masked content, not the cache
+				: (cache?.highlightedLines ?? highlightCode(replaceTabs(normalizeDisplayText(fileContent)), lang))
 			: normalizeDisplayText(fileContent).split("\n");
 		const lines = trimTrailingEmptyLines(renderedLines);
 		const totalLines = lines.length;

@@ -1,6 +1,6 @@
 import { type AgentMessage, uuidv7 } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
 	appendFileSync,
 	closeSync,
@@ -26,15 +26,24 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import {
+	type SharedVinciTerminalUnverifiableState,
+	selectSharedVinciVerificationState,
+	VINCI_CORRUPTED_VERIFICATION_MESSAGE,
+	VINCI_VERIFICATION_ENTRY,
+	VINCI_VERIFICATION_SCHEMA_VERSION,
+} from "./vinci-grader.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
 	type: "session";
 	version?: number; // v1 sessions don't have this
+	/** Legacy end-marker framing format. New sessions use per-record start markers. */
+	frameFormat?: number;
 	id: string;
 	timestamp: string;
-	cwd: string;
+	cwd?: string;
 	parentSession?: string;
 }
 
@@ -167,6 +176,15 @@ export interface SessionContext {
 	model: { provider: string; modelId: string } | null;
 }
 
+export type SessionBranch = SessionEntry[] & {
+	/** Physical source line for each entry, aligned with the array. */
+	readonly recordLineNumbers?: readonly number[];
+	/** Newest physical source line that was malformed or truncated. */
+	readonly latestCorruptRecordLine?: number;
+	/** Whether parent traversal encountered an entry it had already visited. */
+	readonly hasTraversalCycle?: boolean;
+};
+
 export interface SessionInfo {
 	path: string;
 	id: string;
@@ -183,6 +201,20 @@ export interface SessionInfo {
 	allMessagesText: string;
 }
 
+export interface SessionParsingError {
+	kind: "truncated_tail" | "malformed_line";
+	/** One-based physical line number in the session file. */
+	lineNumber: number;
+	message: string;
+}
+
+export interface SessionFileLoadResult {
+	entries: FileEntry[];
+	entryLineNumbers: number[];
+	parsingErrors: SessionParsingError[];
+	endsWithNewline: boolean;
+}
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -197,6 +229,8 @@ export type ReadonlySessionManager = Pick<
 	| "buildContextEntries"
 	| "getHeader"
 	| "getEntries"
+	| "getParsingErrors"
+	| "hadCorruptEntries"
 	| "getTree"
 	| "getSessionName"
 >;
@@ -223,10 +257,18 @@ function generateId(byId: { has(id: string): boolean }): string {
 	return randomUUID();
 }
 
+function deriveV1EntryId(entry: SessionEntry, index: number, ids: Set<string>): string {
+	const serialized = JSON.stringify(entry);
+	for (let collision = 0; ; collision++) {
+		const digest = createHash("sha256").update(`${index}\0${collision}\0${serialized}`).digest("hex");
+		const id = digest.slice(0, 8);
+		if (!ids.has(id)) return id;
+	}
+}
+
 /** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
 function migrateV1ToV2(entries: FileEntry[]): void {
 	const ids = new Set<string>();
-	let prevId: string | null = null;
 
 	for (const entry of entries) {
 		if (entry.type === "session") {
@@ -234,11 +276,35 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 			continue;
 		}
 
-		entry.id = generateId(ids);
-		entry.parentId = prevId;
-		prevId = entry.id;
+		const legacyEntry = entry as SessionEntry & { id?: unknown };
+		if (typeof legacyEntry.id === "string") {
+			ids.add(legacyEntry.id);
+		}
+	}
 
-		// Convert firstKeptEntryIndex to firstKeptEntryId for compaction
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index];
+		if (entry.type === "session") continue;
+
+		const legacyEntry = entry as SessionEntry & { id?: unknown };
+		if (typeof legacyEntry.id !== "string") {
+			legacyEntry.id = deriveV1EntryId(entry, index, ids);
+			ids.add(legacyEntry.id);
+		}
+	}
+
+	let prevId: string | null = null;
+	for (const entry of entries) {
+		if (entry.type === "session") continue;
+
+		const legacyEntry = entry as SessionEntry & { parentId?: unknown };
+		if (legacyEntry.parentId !== null && typeof legacyEntry.parentId !== "string") {
+			legacyEntry.parentId = prevId;
+		}
+		prevId = entry.id;
+	}
+
+	for (const entry of entries) {
 		if (entry.type === "compaction") {
 			const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
 			if (typeof comp.firstKeptEntryIndex === "number") {
@@ -294,16 +360,12 @@ export function migrateSessionEntries(entries: FileEntry[]): void {
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const entries: FileEntry[] = [];
-	const lines = content.trim().split("\n");
+	const lines = content.split("\n");
+	const context = createSessionEntryParseContext();
 
-	for (const line of lines) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line) as FileEntry;
-			entries.push(entry);
-		} catch {
-			// Skip malformed lines
-		}
+	for (let index = 0; index < lines.length; index++) {
+		const result = parseSessionEntryLine(lines[index], index + 1, context, index < lines.length - 1);
+		if (result.entry) entries.push(result.entry);
 	}
 
 	return entries;
@@ -331,28 +393,107 @@ function buildSessionPath(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
-): SessionEntry[] {
+): { path: SessionEntry[]; cycleDetected: boolean } {
 	const index = buildEntryIndex(entries, byId);
 	let leaf: SessionEntry | undefined;
 	if (leafId === null) {
-		return [];
+		return { path: [], cycleDetected: false };
 	}
 	if (leafId) {
 		leaf = index.get(leafId);
 	}
 	leaf ??= entries[entries.length - 1];
 	if (!leaf) {
-		return [];
+		return { path: [], cycleDetected: false };
 	}
 
 	const path: SessionEntry[] = [];
+	const visited = new Set<string>();
 	let current: SessionEntry | undefined = leaf;
+	let cycleDetected = false;
 	while (current) {
+		if (visited.has(current.id)) {
+			cycleDetected = true;
+			break;
+		}
+		visited.add(current.id);
 		path.push(current);
 		current = current.parentId ? index.get(current.parentId) : undefined;
 	}
 	path.reverse();
-	return path;
+	return { path, cycleDetected };
+}
+
+function branchNeedsCorruptionSentinel(branch: SessionBranch): boolean {
+	return (
+		(branch.latestCorruptRecordLine !== undefined || branch.hasTraversalCycle === true) &&
+		selectSharedVinciVerificationState(branch)?.variant === "terminal-unverifiable"
+	);
+}
+
+function createCorruptionSentinel(
+	parentId: string | null,
+	ids: { has(id: string): boolean },
+): CustomEntry<SharedVinciTerminalUnverifiableState> {
+	return {
+		type: "custom",
+		customType: VINCI_VERIFICATION_ENTRY,
+		data: {
+			schemaVersion: VINCI_VERIFICATION_SCHEMA_VERSION,
+			variant: "terminal-unverifiable",
+			status: "failed",
+			summary: VINCI_CORRUPTED_VERIFICATION_MESSAGE,
+			mutationRevision: 1,
+			command: "",
+			commandKey: "",
+			checkClass: "behavioral",
+		},
+		id: generateId(ids),
+		parentId,
+		timestamp: new Date().toISOString(),
+	};
+}
+
+function appendCycleCorruptionSentinel(path: SessionEntry[], allEntries: SessionEntry[], cycleDetected: boolean): void {
+	if (!cycleDetected) return;
+	const selectedState = selectSharedVinciVerificationState(path);
+	if (
+		selectedState?.variant === "terminal-unverifiable" &&
+		selectedState.summary === VINCI_CORRUPTED_VERIFICATION_MESSAGE
+	) {
+		return;
+	}
+	const ids = new Set(allEntries.map((entry) => entry.id));
+	path.push(createCorruptionSentinel(path.at(-1)?.id ?? null, ids));
+}
+
+function loadedSessionBranch(loadResult: SessionFileLoadResult): SessionBranch {
+	const entries = loadResult.entries.filter((entry): entry is SessionEntry => entry.type !== "session");
+	const { path, cycleDetected } = buildSessionPath(entries);
+	appendCycleCorruptionSentinel(path, entries, cycleDetected);
+	const branch = path as SessionBranch;
+	const lineNumbersById = new Map<string, number>();
+	for (let index = 0; index < loadResult.entries.length; index++) {
+		const entry = loadResult.entries[index];
+		if (entry.type !== "session") {
+			lineNumbersById.set(entry.id, loadResult.entryLineNumbers[index]);
+		}
+	}
+	Object.defineProperties(branch, {
+		recordLineNumbers: {
+			value: branch.map((entry) => lineNumbersById.get(entry.id) ?? 0),
+			enumerable: false,
+		},
+		latestCorruptRecordLine: {
+			value: loadResult.parsingErrors.at(-1)?.lineNumber,
+			enumerable: false,
+		},
+		hasTraversalCycle: {
+			value: cycleDetected,
+			enumerable: false,
+		},
+	});
+	return branch;
 }
 
 function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
@@ -416,7 +557,7 @@ export function buildContextEntries(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionEntry[] {
-	const path = buildSessionPath(entries, leafId, byId);
+	const { path } = buildSessionPath(entries, leafId, byId);
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
@@ -459,7 +600,7 @@ export function buildSessionContext(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionContext {
-	const path = buildSessionPath(entries, leafId, byId);
+	const { path } = buildSessionPath(entries, leafId, byId);
 	const { thinkingLevel, model } = getSessionContextSettings(path);
 	const messages = buildContextEntries(entries, leafId, byId).flatMap(sessionEntryToContextMessages);
 	return { messages, thinkingLevel, model };
@@ -485,60 +626,266 @@ export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultA
 }
 
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
+const RECORD_START_PREFIX = '{"__vinci_record_start":true,';
+const LEGACY_DURABLE_RECORD_MARKER = "\t\t\t";
 
-function parseSessionEntryLine(line: string): FileEntry | null {
-	if (!line.trim()) return null;
-	try {
-		return JSON.parse(line) as FileEntry;
-	} catch {
-		// Skip malformed lines
-		return null;
+function serializeFileEntry(entry: FileEntry): string {
+	const serialized = JSON.stringify(entry);
+	return entry.type === "session" ? `${serialized}\n` : `${RECORD_START_PREFIX}${serialized.slice(1)}\n`;
+}
+
+interface SessionEntryLineResult {
+	entry: FileEntry | null;
+	error: SessionParsingError | null;
+}
+
+interface SessionEntryParseContext {
+	headerParsed: boolean;
+	legacyEndMarkerDeclared: boolean;
+	sessionVersion: number;
+}
+
+function createSessionEntryParseContext(): SessionEntryParseContext {
+	return {
+		headerParsed: false,
+		legacyEndMarkerDeclared: false,
+		sessionVersion: 1,
+	};
+}
+
+function parsingError(lineNumber: number, message: string, terminatedByNewline: boolean): SessionEntryLineResult {
+	const kind = terminatedByNewline ? "malformed_line" : "truncated_tail";
+	const surfacedMessage =
+		kind === "truncated_tail" && !/truncat/i.test(message) ? `Truncated session tail: ${message}` : message;
+	return { entry: null, error: { kind, lineNumber, message: surfacedMessage } };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateOptionalString(value: Record<string, unknown>, field: string): string | null {
+	return value[field] === undefined || typeof value[field] === "string" ? null : `${field} must be a string`;
+}
+
+function validateOptionalBoolean(value: Record<string, unknown>, field: string): string | null {
+	return value[field] === undefined || typeof value[field] === "boolean" ? null : `${field} must be a boolean`;
+}
+
+function validateSessionHeader(value: unknown): string | null {
+	if (!isRecord(value)) return "header must be an object";
+	if (value.type !== "session") return 'header type must be "session"';
+	if (typeof value.id !== "string") return "header id must be a string";
+	if (typeof value.timestamp !== "string") return "header timestamp must be a string";
+	if (value.cwd !== undefined && typeof value.cwd !== "string") return "header cwd must be a string";
+	if (value.version !== undefined && typeof value.version !== "number") return "header version must be a number";
+	if (value.frameFormat !== undefined && typeof value.frameFormat !== "number") {
+		return "header frameFormat must be a number";
+	}
+	if (value.parentSession !== undefined && typeof value.parentSession !== "string") {
+		return "header parentSession must be a string";
+	}
+	return null;
+}
+
+function validateAgentMessage(value: unknown, sessionVersion: number): string | null {
+	if (!isRecord(value)) return "message must be an object";
+	if (typeof value.role !== "string") return "message role must be a string";
+
+	switch (value.role) {
+		case "user":
+		case "assistant":
+		case "toolResult":
+		case "bashExecution":
+		case "custom":
+		case "branchSummary":
+		case "compactionSummary":
+			return null;
+		case "hookMessage":
+			return sessionVersion < 3 ? null : "message role is invalid: hookMessage";
+		default:
+			return `message role is invalid: ${value.role}`;
 	}
 }
 
-/** Exported for testing */
-export function loadEntriesFromFile(filePath: string): FileEntry[] {
+function validateSessionEntry(value: unknown, sessionVersion: number): string | null {
+	if (!isRecord(value)) return "entry must be an object";
+	if (typeof value.type !== "string") return "type must be a string";
+	if (typeof value.timestamp !== "string") return "timestamp must be a string";
+	if (sessionVersion >= 2) {
+		if (typeof value.id !== "string") return "id must be a string";
+		if (value.parentId !== null && typeof value.parentId !== "string") {
+			return "parentId must be a string or null";
+		}
+		if (value.parentId === value.id) return "parentId must not equal id";
+	}
+
+	switch (value.type) {
+		case "message":
+			return validateAgentMessage(value.message, sessionVersion);
+		case "thinking_level_change":
+			return typeof value.thinkingLevel === "string" ? null : "thinkingLevel must be a string";
+		case "model_change":
+			if (typeof value.provider !== "string") return "provider must be a string";
+			return typeof value.modelId === "string" ? null : "modelId must be a string";
+		case "compaction":
+			if (typeof value.summary !== "string") return "summary must be a string";
+			if (typeof value.tokensBefore !== "number") return "tokensBefore must be a number";
+			if (
+				typeof value.firstKeptEntryId !== "string" &&
+				!(sessionVersion < 2 && typeof value.firstKeptEntryIndex === "number")
+			) {
+				return sessionVersion < 2 ? "firstKeptEntryIndex must be a number" : "firstKeptEntryId must be a string";
+			}
+			return validateOptionalBoolean(value, "fromHook");
+		case "branch_summary":
+			if (typeof value.fromId !== "string") return "fromId must be a string";
+			if (typeof value.summary !== "string") return "summary must be a string";
+			return validateOptionalBoolean(value, "fromHook");
+		case "custom":
+			return typeof value.customType === "string" ? null : "customType must be a string";
+		case "custom_message":
+			if (typeof value.customType !== "string") return "customType must be a string";
+			if (
+				value.content !== undefined &&
+				value.content !== null &&
+				typeof value.content !== "string" &&
+				!Array.isArray(value.content)
+			) {
+				return "content must be a string, array, null, or undefined";
+			}
+			return value.display === undefined || typeof value.display === "boolean" ? null : "display must be a boolean";
+		case "label":
+			if (typeof value.targetId !== "string") return "targetId must be a string";
+			return validateOptionalString(value, "label");
+		case "session_info":
+			return validateOptionalString(value, "name");
+		default:
+			return `unknown entry type: ${value.type}`;
+	}
+}
+
+function parseSessionEntryLine(
+	line: string,
+	lineNumber: number,
+	context: SessionEntryParseContext,
+	terminatedByNewline: boolean,
+): SessionEntryLineResult {
+	if (line.endsWith("\r")) line = line.slice(0, -1);
+	if (line.trim().length === 0) return { entry: null, error: null };
+
+	if (context.headerParsed) {
+		if (line.startsWith(RECORD_START_PREFIX)) {
+			line = `{${line.slice(RECORD_START_PREFIX.length)}`;
+			if (!terminatedByNewline) {
+				return parsingError(lineNumber, "truncated framed session record", terminatedByNewline);
+			}
+		} else if (!terminatedByNewline && RECORD_START_PREFIX.startsWith(line)) {
+			return parsingError(lineNumber, "truncated framed session record prefix", terminatedByNewline);
+		} else if (context.legacyEndMarkerDeclared && line.endsWith(LEGACY_DURABLE_RECORD_MARKER)) {
+			line = line.slice(0, -LEGACY_DURABLE_RECORD_MARKER.length);
+		} else if (context.legacyEndMarkerDeclared && line.endsWith("\t")) {
+			return parsingError(lineNumber, "truncated legacy durable session record marker", terminatedByNewline);
+		}
+	}
+
+	try {
+		const value: unknown = JSON.parse(line);
+		if (!context.headerParsed) {
+			const validationError = validateSessionHeader(value);
+			if (validationError) {
+				return parsingError(lineNumber, `Invalid session header: ${validationError}`, terminatedByNewline);
+			}
+			const header = value as SessionHeader;
+			context.headerParsed = true;
+			context.legacyEndMarkerDeclared = header.frameFormat === 1;
+			context.sessionVersion = header.version ?? 1;
+			return { entry: header, error: null };
+		}
+
+		const validationError = validateSessionEntry(value, context.sessionVersion);
+		if (validationError) {
+			return parsingError(lineNumber, `Invalid session entry: ${validationError}`, terminatedByNewline);
+		}
+		return { entry: value as SessionEntry, error: null };
+	} catch (error) {
+		return parsingError(
+			lineNumber,
+			error instanceof Error ? `Invalid session JSON: ${error.message}` : "Invalid session JSON",
+			terminatedByNewline,
+		);
+	}
+}
+
+export function loadSessionFile(filePath: string): SessionFileLoadResult {
 	const resolvedFilePath = normalizePath(filePath);
-	if (!existsSync(resolvedFilePath)) return [];
+	if (!existsSync(resolvedFilePath)) {
+		return { entries: [], entryLineNumbers: [], parsingErrors: [], endsWithNewline: false };
+	}
 
 	const entries: FileEntry[] = [];
+	const entryLineNumbers: number[] = [];
+	const parsingErrors: SessionParsingError[] = [];
+	const context = createSessionEntryParseContext();
 	const fd = openSync(resolvedFilePath, "r");
+	let endsWithNewline = false;
 	try {
 		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
 		let pending = "";
+		let lineNumber = 1;
 
 		while (true) {
 			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
 			if (bytesRead === 0) break;
 
-			pending += decoder.write(buffer.subarray(0, bytesRead));
+			const decoded = decoder.write(buffer.subarray(0, bytesRead));
+			if (decoded.length > 0) endsWithNewline = decoded.endsWith("\n");
+			pending += decoded;
 			let lineStart = 0;
 			let newlineIndex = pending.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
-				if (entry) entries.push(entry);
+				const result = parseSessionEntryLine(pending.slice(lineStart, newlineIndex), lineNumber, context, true);
+				if (result.entry) {
+					entries.push(result.entry);
+					entryLineNumbers.push(lineNumber);
+				}
+				if (result.error) parsingErrors.push(result.error);
 				lineStart = newlineIndex + 1;
+				lineNumber++;
 				newlineIndex = pending.indexOf("\n", lineStart);
 			}
 			pending = pending.slice(lineStart);
 		}
 
-		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
-		if (finalEntry) entries.push(finalEntry);
+		const decodedEnd = decoder.end();
+		if (decodedEnd.length > 0) endsWithNewline = decodedEnd.endsWith("\n");
+		pending += decodedEnd;
+		const finalResult = parseSessionEntryLine(pending, lineNumber, context, false);
+		if (finalResult.entry) {
+			entries.push(finalResult.entry);
+			entryLineNumbers.push(lineNumber);
+		}
+		if (finalResult.error) parsingErrors.push(finalResult.error);
 	} finally {
 		closeSync(fd);
 	}
 
 	// Validate session header
-	if (entries.length === 0) return entries;
+	if (entries.length === 0) {
+		return { entries, entryLineNumbers, parsingErrors, endsWithNewline };
+	}
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
-		return [];
+		return { entries: [], entryLineNumbers: [], parsingErrors, endsWithNewline };
 	}
 
-	return entries;
+	return { entries, entryLineNumbers, parsingErrors, endsWithNewline };
+}
+
+/** Exported for testing and backward compatibility. */
+export function loadEntriesFromFile(filePath: string): FileEntry[] {
+	return loadSessionFile(filePath).entries;
 }
 
 function readSessionHeader(filePath: string): SessionHeader | null {
@@ -600,6 +947,9 @@ function extractTextContent(message: Message): string {
 	if (typeof content === "string") {
 		return content;
 	}
+	if (!Array.isArray(content)) {
+		return "";
+	}
 	return content
 		.filter((block): block is TextContent => block.type === "text")
 		.map((block) => block.text)
@@ -629,6 +979,7 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 		const allMessages: string[] = [];
 		let name: string | undefined;
 		let lastActivityTime: number | undefined;
+		const parseContext = createSessionEntryParseContext();
 
 		const rl = createInterface({
 			input: createReadStream(filePath, { encoding: "utf8" }),
@@ -636,7 +987,7 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 		});
 
 		for await (const line of rl) {
-			const entry = parseSessionEntryLine(line);
+			const entry = parseSessionEntryLine(line, 0, parseContext, true).entry;
 			if (!entry) continue;
 
 			if (!header) {
@@ -796,10 +1147,15 @@ export class SessionManager {
 	private persist: boolean;
 	private flushed: boolean = false;
 	private fileEntries: FileEntry[] = [];
+	private parsingErrors: SessionParsingError[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
+	private recordLineNumbersById: Map<string, number> = new Map();
+	private latestCorruptRecordLine: number | undefined;
+	private nextRecordLineNumber: number = 0;
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private needsRecordSeparator: boolean = false;
 
 	private constructor(
 		cwd: string,
@@ -826,7 +1182,10 @@ export class SessionManager {
 	setSessionFile(sessionFile: string): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			this.fileEntries = loadEntriesFromFile(this.sessionFile);
+			const loadResult = loadSessionFile(this.sessionFile);
+			this.fileEntries = loadResult.entries;
+			this.parsingErrors = loadResult.parsingErrors;
+			this.needsRecordSeparator = !loadResult.endsWithNewline && statSync(this.sessionFile).size > 0;
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -837,7 +1196,7 @@ export class SessionManager {
 				}
 				this.newSession();
 				this.sessionFile = explicitPath;
-				this._rewriteFile();
+				appendFileSync(explicitPath, serializeFileEntry(this.fileEntries[0]));
 				this.flushed = true;
 				return;
 			}
@@ -845,9 +1204,20 @@ export class SessionManager {
 			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
 			this.sessionId = header?.id ?? createSessionId();
 
-			if (migrateToCurrentVersion(this.fileEntries)) {
-				this._rewriteFile();
+			migrateToCurrentVersion(this.fileEntries);
+			this.recordLineNumbersById.clear();
+			for (let index = 0; index < this.fileEntries.length; index++) {
+				const entry = this.fileEntries[index];
+				if (entry.type !== "session") {
+					this.recordLineNumbersById.set(entry.id, loadResult.entryLineNumbers[index]);
+				}
 			}
+			this.latestCorruptRecordLine = loadResult.parsingErrors.at(-1)?.lineNumber;
+			this.nextRecordLineNumber = Math.max(
+				0,
+				...loadResult.entryLineNumbers,
+				...loadResult.parsingErrors.map((error) => error.lineNumber),
+			);
 
 			this._buildIndex();
 			this.flushed = true;
@@ -873,10 +1243,15 @@ export class SessionManager {
 			parentSession: options?.parentSession,
 		};
 		this.fileEntries = [header];
+		this.parsingErrors = [];
 		this.byId.clear();
+		this.recordLineNumbersById.clear();
+		this.latestCorruptRecordLine = undefined;
+		this.nextRecordLineNumber = 1;
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.needsRecordSeparator = false;
 		this.flushed = false;
 
 		if (this.persist) {
@@ -907,16 +1282,29 @@ export class SessionManager {
 		}
 	}
 
-	private _rewriteFile(): void {
+	private _resetRecordLineNumbers(): void {
+		this.recordLineNumbersById.clear();
+		for (let index = 0; index < this.fileEntries.length; index++) {
+			const entry = this.fileEntries[index];
+			if (entry.type !== "session") {
+				this.recordLineNumbersById.set(entry.id, index + 1);
+			}
+		}
+		this.latestCorruptRecordLine = undefined;
+		this.nextRecordLineNumber = this.fileEntries.length;
+	}
+
+	private _writeNewFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+		const fd = openSync(this.sessionFile, "wx");
 		try {
 			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				writeFileSync(fd, serializeFileEntry(entry));
 			}
 		} finally {
 			closeSync(fd);
 		}
+		this.needsRecordSeparator = false;
 	}
 
 	isPersisted(): boolean {
@@ -945,11 +1333,14 @@ export class SessionManager {
 
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
+		const serializedEntry = serializeFileEntry(entry);
+		const recordSeparator = this.needsRecordSeparator ? "\n" : "";
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				appendFileSync(this.sessionFile, `${recordSeparator}${serializedEntry}`);
+				this.needsRecordSeparator = false;
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -958,23 +1349,19 @@ export class SessionManager {
 		}
 
 		if (!this.flushed) {
-			const fd = openSync(this.sessionFile, "wx");
-			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
-			} finally {
-				closeSync(fd);
-			}
+			this._writeNewFile();
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			appendFileSync(this.sessionFile, `${recordSeparator}${serializedEntry}`);
+			this.needsRecordSeparator = false;
 		}
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
+		this.nextRecordLineNumber++;
+		this.recordLineNumbersById.set(entry.id, this.nextRecordLineNumber);
 		this.leafId = entry.id;
 		this._persist(entry);
 	}
@@ -1186,16 +1573,32 @@ export class SessionManager {
 	 * Includes all entry types (messages, compaction, model changes, etc.).
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
-	getBranch(fromId?: string): SessionEntry[] {
-		const path: SessionEntry[] = [];
-		const startId = fromId ?? this.leafId;
-		let current = startId ? this.byId.get(startId) : undefined;
-		while (current) {
-			path.push(current);
-			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+	getBranch(fromId?: string): SessionBranch {
+		const entries = this.getEntries();
+		let path: SessionEntry[] = [];
+		let cycleDetected = false;
+		if (fromId === undefined || this.byId.has(fromId)) {
+			const result = buildSessionPath(entries, fromId ?? this.leafId, this.byId);
+			path = result.path;
+			cycleDetected = result.cycleDetected;
 		}
-		path.reverse();
-		return path;
+		appendCycleCorruptionSentinel(path, entries, cycleDetected);
+		const branch = path as SessionBranch;
+		Object.defineProperties(branch, {
+			recordLineNumbers: {
+				value: branch.map((entry) => this.recordLineNumbersById.get(entry.id) ?? 0),
+				enumerable: false,
+			},
+			latestCorruptRecordLine: {
+				value: this.latestCorruptRecordLine,
+				enumerable: false,
+			},
+			hasTraversalCycle: {
+				value: cycleDetected,
+				enumerable: false,
+			},
+		});
+		return branch;
 	}
 
 	/**
@@ -1229,6 +1632,15 @@ export class SessionManager {
 	 */
 	getEntries(): SessionEntry[] {
 		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+	}
+
+	/** Get corruption detected while parsing the current session file. */
+	getParsingErrors(): SessionParsingError[] {
+		return this.parsingErrors.map((error) => ({ ...error }));
+	}
+
+	hadCorruptEntries(): boolean {
+		return this.parsingErrors.length > 0;
 	}
 
 	/**
@@ -1348,6 +1760,19 @@ export class SessionManager {
 			pathWithoutLabels.push({ ...entry, parentId: pathParentId });
 			pathParentId = entry.id;
 		}
+		const selectedPathState = selectSharedVinciVerificationState(pathWithoutLabels);
+		if (
+			branchNeedsCorruptionSentinel(path) &&
+			!(
+				selectedPathState?.variant === "terminal-unverifiable" &&
+				selectedPathState.summary === VINCI_CORRUPTED_VERIFICATION_MESSAGE
+			)
+		) {
+			const pathIds = new Set(pathWithoutLabels.map((entry) => entry.id));
+			const sentinel = createCorruptionSentinel(pathParentId, pathIds);
+			pathWithoutLabels.push(sentinel);
+			pathParentId = sentinel.id;
+		}
 
 		const newSessionId = createSessionId();
 		const timestamp = new Date().toISOString();
@@ -1394,6 +1819,9 @@ export class SessionManager {
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
+			this.parsingErrors = [];
+			this.needsRecordSeparator = false;
+			this._resetRecordLineNumbers();
 			this._buildIndex();
 
 			// Only write the file now if it contains an assistant message.
@@ -1403,7 +1831,7 @@ export class SessionManager {
 			// no-assistant guard later resets flushed to false.
 			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 			if (hasAssistant) {
-				this._rewriteFile();
+				this._writeNewFile();
 				this.flushed = true;
 			} else {
 				this.flushed = false;
@@ -1429,6 +1857,9 @@ export class SessionManager {
 		}
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 		this.sessionId = newSessionId;
+		this.parsingErrors = [];
+		this.needsRecordSeparator = false;
+		this._resetRecordLineNumbers();
 		this._buildIndex();
 		return undefined;
 	}
@@ -1452,7 +1883,7 @@ export class SessionManager {
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
 		const resolvedPath = resolvePath(path);
 		// Extract cwd from session header if possible, otherwise use process.cwd()
-		const entries = loadEntriesFromFile(resolvedPath);
+		const entries = loadSessionFile(resolvedPath).entries;
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 		const cwd = cwdOverride ?? header?.cwd ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
@@ -1495,7 +1926,8 @@ export class SessionManager {
 	): SessionManager {
 		const resolvedSourcePath = resolvePath(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
-		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
+		const sourceLoadResult = loadSessionFile(resolvedSourcePath);
+		const sourceEntries = sourceLoadResult.entries;
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
 		}
@@ -1504,6 +1936,8 @@ export class SessionManager {
 		if (!sourceHeader) {
 			throw new Error(`Cannot fork: source session has no header: ${resolvedSourcePath}`);
 		}
+		migrateToCurrentVersion(sourceEntries);
+		const needsCorruptionSentinel = branchNeedsCorruptionSentinel(loadedSessionBranch(sourceLoadResult));
 
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
 		if (!existsSync(dir)) {
@@ -1533,8 +1967,14 @@ export class SessionManager {
 		// Copy all non-header entries from source
 		for (const entry of sourceEntries) {
 			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
+				appendFileSync(newSessionFile, serializeFileEntry(entry));
 			}
+		}
+		if (needsCorruptionSentinel) {
+			const copiedEntries = sourceEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
+			const copiedIds = new Set(copiedEntries.map((entry) => entry.id));
+			const sentinel = createCorruptionSentinel(copiedEntries.at(-1)?.id ?? null, copiedIds);
+			appendFileSync(newSessionFile, serializeFileEntry(sentinel));
 		}
 
 		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);

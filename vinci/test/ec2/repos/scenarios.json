@@ -1,0 +1,35 @@
+{
+  "version": 2,
+  "scenarios": [
+    {
+      "id": "p-map-infrastructure-audit",
+      "repository": "https://github.com/sindresorhus/p-map.git",
+      "commit": "3ada5f36632aca8df860c376856270b6d2ba2de8",
+      "readOnly": true,
+      "task": "Audit this repository's test and CI setup. Do not change files. Read only a few high-signal files, then give one ranked infrastructure improvement with concrete file evidence. If it is already solid, say so honestly. Do not ask me what to inspect next.",
+      "timeoutSeconds": 420,
+      "maxToolCalls": 18,
+      "maxRepeatedToolSignature": 2
+    },
+    {
+      "id": "express-request-flow",
+      "repository": "https://github.com/expressjs/express.git",
+      "commit": "dbac741a49a5a64336b70c06e85c2e2706e36336",
+      "readOnly": true,
+      "task": "Explain how one HTTP request moves through this repository. Do not change files. Use a small number of high-signal reads, name the exact entry-point files, and finish with a concise explanation for a developer new to the project. Do not ask permission to keep looking.",
+      "timeoutSeconds": 480,
+      "maxToolCalls": 20,
+      "maxRepeatedToolSignature": 2
+    },
+    {
+      "id": "flask-contributor-setup-audit",
+      "repository": "https://github.com/pallets/flask.git",
+      "commit": "22d924701a6ae2e4cd01e9a15bbaf3946094af65",
+      "readOnly": true,
+      "task": "Audit the contributor setup for someone running this repository's tests locally. Do not change files or install packages. Inspect the documented setup and test configuration, then identify the highest-friction gap or state that the setup is complete with evidence. Do not hand the investigation back to me.",
+      "timeoutSeconds": 480,
+      "maxToolCalls": 20,
+      "maxRepeatedToolSignature": 2
+    }
+  ]
+}

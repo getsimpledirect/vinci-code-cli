@@ -6,6 +6,15 @@ pi --mode json "Your prompt"
 
 Outputs all session events as JSON lines to stdout. Useful for integrating pi into other tools or custom UIs.
 
+## Exit Codes
+
+- `0`: The provider transport succeeded and the persisted task outcome is final (`DONE` or `DONE_UNVERIFIED`).
+- `1`: The provider transport, stream, abort handling, or liveness watchdog failed.
+- `2`: No prompt was provided.
+- `3`: The provider transport succeeded, but the persisted task outcome is non-final (`BLOCKED` or `WAITING`).
+
+Transport failures and missing prompts take precedence over an extension-declared task outcome.
+
 ## Event Types
 
 Events are defined in [`AgentSessionEvent`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts#L102):
@@ -39,8 +48,11 @@ type AgentEvent =
   // Tool execution
   | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
   | { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
+  | { type: "tool_hooks_start"; toolCallId: string; toolName: string }
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
 ```
+
+`tool_hooks_start` is emitted between a tool's execution settling and its result-finalization hooks.
 
 ## Message Types
 

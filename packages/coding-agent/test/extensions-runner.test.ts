@@ -960,4 +960,40 @@ describe("ExtensionRunner", () => {
 			expect(errors[0].error).toContain("header handler boom");
 		});
 	});
+
+	describe("headless exit hint", () => {
+		it("clears a declared hint on the next agent_start, and rejects out-of-range values", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("agent_end", async (_event, ctx) => {
+						ctx.declareHeadlessExitHint?.(3);
+					});
+					pi.on("turn_start", async (_event, ctx) => {
+						globalThis.__hintErrors = [];
+						for (const bad of [0, 256, 1.5]) {
+							try { ctx.declareHeadlessExitHint?.(bad); } catch (e) { globalThis.__hintErrors.push(String(e)); }
+						}
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "hint.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			expect(runner.getHeadlessExitHint()).toBeUndefined();
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(runner.getHeadlessExitHint()).toBe(3);
+
+			// A later prompt's agent_start must clear the previous prompt's hint, so a stale
+			// exit-3 can never poison a run whose final prompt errored or succeeded cleanly.
+			await runner.emit({ type: "agent_start" });
+			expect(runner.getHeadlessExitHint()).toBeUndefined();
+
+			// Validation: 0, 256, and non-integers are rejected with a throw.
+			await runner.emit({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+			expect((globalThis as { __hintErrors?: string[] }).__hintErrors).toHaveLength(3);
+			expect(runner.getHeadlessExitHint()).toBeUndefined();
+		});
+	});
 });

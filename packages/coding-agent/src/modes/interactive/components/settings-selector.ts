@@ -721,8 +721,18 @@ export class SettingsSelectorComponent extends Container {
 		// Add borders
 		this.addChild(new DynamicBorder());
 
+		// [vinci] Simplicity: Vinci's users aren't pro programmers tuning transport protocols — Vinci
+		// handles the plumbing. Under VINCI_CODE show only genuine user PREFERENCES; everything else is
+		// Vinci-managed (thinking is on by default — see vinci/bin/vinci --thinking; reasoning stays
+		// visible). The orchestrator will adjust these dynamically + tell the user, rather than exposing
+		// hard toggles. Edit VINCI_SETTINGS to tweak.
+		// [vinci] show-images is a dead knob — every Vinci model is text-only (input: ["text"]),
+		// so images are never sent. Theme is the one real user preference; Vinci manages the rest.
+		const VINCI_SETTINGS = new Set(["theme"]);
+		const shownItems = process.env.VINCI_CODE === "1" ? items.filter((it) => VINCI_SETTINGS.has(it.id)) : items;
+
 		this.settingsList = new SettingsList(
-			items,
+			shownItems,
 			10,
 			getSettingsListTheme(),
 			(id, newValue) => {

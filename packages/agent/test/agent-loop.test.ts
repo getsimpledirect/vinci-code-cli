@@ -7,8 +7,8 @@ import {
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
+import { describe, expect, it, vi } from "vitest";
+import { agentLoop, agentLoopContinue, runAgentLoop, VINCI_STREAM_IDLE_TIMEOUT_MS } from "../src/agent-loop.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
@@ -81,6 +81,15 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 describe("agentLoop with AgentMessage", () => {
+	// The deadline refreshes only on a CONTENT event, so a provider composing a long tool-call
+	// argument without streaming partials looks identical to one that has died. At 60s that killed
+	// healthy large-file generations deterministically — measured live 2026-07-21: 8 idle timeouts
+	// to 2 start timeouts, every one on the same big SVG file. This value is the headroom that keeps
+	// those turns alive; lowering it again reintroduces that failure.
+	it("gives a stalled Vinci provider stream room for a long tool-call generation", () => {
+		expect(VINCI_STREAM_IDLE_TIMEOUT_MS).toBe(180_000);
+	});
+
 	it("should emit events with AgentMessage types", async () => {
 		const context: AgentContext = {
 			systemPrompt: "You are helpful.",
@@ -126,6 +135,192 @@ describe("agentLoop with AgentMessage", () => {
 		expect(eventTypes).toContain("message_end");
 		expect(eventTypes).toContain("turn_end");
 		expect(eventTypes).toContain("agent_end");
+	});
+
+	it("should not reset the Vinci first-content timeout for start or text_start events", async () => {
+		const previousStartTimeout = process.env.VINCI_STREAM_START_TIMEOUT_MS;
+		process.env.VINCI_STREAM_START_TIMEOUT_MS = "100";
+		vi.useFakeTimers();
+		try {
+			const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+			const config: AgentLoopConfig = {
+				model: { ...createModel(), provider: "vinci" },
+				convertToLlm: identityConverter,
+			};
+			const events: AgentEvent[] = [];
+			const streamFn = () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage([]) });
+				});
+				setTimeout(() => {
+					stream.push({ type: "text_start", contentIndex: 0, partial: createAssistantMessage([]) });
+				}, 80);
+				return stream;
+			};
+
+			const result = runAgentLoop(
+				[createUserMessage("Hello")],
+				context,
+				config,
+				(event) => {
+					events.push(event);
+				},
+				undefined,
+				streamFn,
+			);
+			let settled = false;
+			void result.then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+
+			await vi.advanceTimersByTimeAsync(99);
+			expect(settled).toBe(false);
+			await vi.advanceTimersByTimeAsync(1);
+			await expect(result).rejects.toThrow("Provider stream timed out after 100ms without a content event");
+			expect(events.some((event) => event.type === "message_start" && event.message.role === "assistant")).toBe(
+				true,
+			);
+			expect(events.some((event) => event.type === "message_end" && event.message.role === "assistant")).toBe(false);
+		} finally {
+			vi.useRealTimers();
+			if (previousStartTimeout === undefined) delete process.env.VINCI_STREAM_START_TIMEOUT_MS;
+			else process.env.VINCI_STREAM_START_TIMEOUT_MS = previousStartTimeout;
+		}
+	});
+
+	it("should reset the Vinci timeout for thinking, tool-call, and text content events", async () => {
+		const previousStartTimeout = process.env.VINCI_STREAM_START_TIMEOUT_MS;
+		const previousIdleTimeout = process.env.VINCI_STREAM_IDLE_TIMEOUT_MS;
+		process.env.VINCI_STREAM_START_TIMEOUT_MS = "100";
+		process.env.VINCI_STREAM_IDLE_TIMEOUT_MS = "60";
+		vi.useFakeTimers();
+		try {
+			const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+			const config: AgentLoopConfig = {
+				model: { ...createModel(), provider: "vinci" },
+				convertToLlm: identityConverter,
+			};
+			const userMessage = createUserMessage("Hello");
+			const finalMessage = createAssistantMessage([{ type: "text", text: "done" }]);
+			const result = runAgentLoop(
+				[userMessage],
+				context,
+				config,
+				async () => {},
+				undefined,
+				() => {
+					const stream = new MockAssistantStream();
+					queueMicrotask(() => stream.push({ type: "start", partial: createAssistantMessage([]) }));
+					setTimeout(() => {
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: 0,
+							delta: "thinking",
+							partial: createAssistantMessage([{ type: "thinking", thinking: "thinking" }]),
+						});
+					}, 80);
+					setTimeout(() => {
+						stream.push({
+							type: "toolcall_start",
+							contentIndex: 0,
+							partial: createAssistantMessage([{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }]),
+						});
+					}, 130);
+					setTimeout(() => {
+						stream.push({
+							type: "text_delta",
+							contentIndex: 0,
+							delta: "done",
+							partial: finalMessage,
+						});
+					}, 180);
+					setTimeout(() => stream.push({ type: "done", reason: "stop", message: finalMessage }), 230);
+					return stream;
+				},
+			);
+
+			await vi.advanceTimersByTimeAsync(230);
+			await expect(result).resolves.toEqual([userMessage, finalMessage]);
+		} finally {
+			vi.useRealTimers();
+			if (previousStartTimeout === undefined) delete process.env.VINCI_STREAM_START_TIMEOUT_MS;
+			else process.env.VINCI_STREAM_START_TIMEOUT_MS = previousStartTimeout;
+			if (previousIdleTimeout === undefined) delete process.env.VINCI_STREAM_IDLE_TIMEOUT_MS;
+			else process.env.VINCI_STREAM_IDLE_TIMEOUT_MS = previousIdleTimeout;
+		}
+	});
+
+	it("should not apply the Vinci provider watchdog while a local tool is running", async () => {
+		const previousStartTimeout = process.env.VINCI_STREAM_START_TIMEOUT_MS;
+		const previousIdleTimeout = process.env.VINCI_STREAM_IDLE_TIMEOUT_MS;
+		process.env.VINCI_STREAM_START_TIMEOUT_MS = "20";
+		process.env.VINCI_STREAM_IDLE_TIMEOUT_MS = "20";
+		vi.useFakeTimers();
+		try {
+			const toolSchema = Type.Object({});
+			const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+				name: "slow",
+				label: "Slow",
+				description: "Slow local tool",
+				parameters: toolSchema,
+				async execute() {
+					await new Promise<void>((resolve) => setTimeout(resolve, 100));
+					return { content: [{ type: "text", text: "finished" }], details: {} };
+				},
+			};
+			const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+			const config: AgentLoopConfig = {
+				model: { ...createModel(), provider: "vinci" },
+				convertToLlm: identityConverter,
+			};
+			let providerRequests = 0;
+			const result = runAgentLoop(
+				[createUserMessage("Run the slow tool")],
+				context,
+				config,
+				async () => {},
+				undefined,
+				() => {
+					const stream = new MockAssistantStream();
+					const requestIndex = providerRequests++;
+					queueMicrotask(() => {
+						if (requestIndex === 0) {
+							stream.push({
+								type: "done",
+								reason: "toolUse",
+								message: createAssistantMessage(
+									[{ type: "toolCall", id: "tool-1", name: "slow", arguments: {} }],
+									"toolUse",
+								),
+							});
+							return;
+						}
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: createAssistantMessage([{ type: "text", text: "done" }]),
+						});
+					});
+					return stream;
+				},
+			);
+
+			await vi.advanceTimersByTimeAsync(100);
+			await expect(result).resolves.toHaveLength(4);
+			expect(providerRequests).toBe(2);
+		} finally {
+			vi.useRealTimers();
+			if (previousStartTimeout === undefined) delete process.env.VINCI_STREAM_START_TIMEOUT_MS;
+			else process.env.VINCI_STREAM_START_TIMEOUT_MS = previousStartTimeout;
+			if (previousIdleTimeout === undefined) delete process.env.VINCI_STREAM_IDLE_TIMEOUT_MS;
+			else process.env.VINCI_STREAM_IDLE_TIMEOUT_MS = previousIdleTimeout;
+		}
 	});
 
 	it("should handle custom message types via convertToLlm", async () => {
@@ -304,6 +499,199 @@ describe("agentLoop with AgentMessage", () => {
 		expect(toolEnd).toBeDefined();
 		if (toolEnd?.type === "tool_execution_end") {
 			expect(toolEnd.isError).toBe(false);
+		}
+	});
+
+	it("should emit the hook boundary before afterToolCall and preserve the post-hook result", async () => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema, { source: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				return {
+					content: [{ type: "text", text: "original" }],
+					details: { source: "tool" },
+				};
+			},
+		};
+		const order: string[] = [];
+		const events: AgentEvent[] = [];
+
+		await runAgentLoop(
+			[createUserMessage("run the tool")],
+			{ systemPrompt: "", messages: [], tools: [tool] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				afterToolCall: async () => {
+					order.push("afterToolCall");
+					return {
+						content: [{ type: "text", text: "replaced" }],
+						details: { source: "hook" },
+						terminate: true,
+					};
+				},
+			},
+			(event) => {
+				events.push(event);
+				if (
+					event.type === "tool_execution_start" ||
+					event.type === "tool_hooks_start" ||
+					event.type === "tool_execution_end"
+				) {
+					order.push(event.type);
+				}
+			},
+			undefined,
+			() => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage(
+							[{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }],
+							"toolUse",
+						),
+					});
+				});
+				return stream;
+			},
+		);
+
+		expect(order).toEqual(["tool_execution_start", "tool_hooks_start", "afterToolCall", "tool_execution_end"]);
+		const end = events.find(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(end?.result).toEqual({
+			content: [{ type: "text", text: "replaced" }],
+			details: { source: "hook" },
+			terminate: true,
+		});
+		expect(end?.isError).toBe(false);
+	});
+
+	it("should emit tool_hooks_start exactly once without a hook and when the hook throws", async () => {
+		for (const hookBehavior of ["undefined", "throws"] as const) {
+			const toolSchema = Type.Object({});
+			const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo tool",
+				parameters: toolSchema,
+				async execute() {
+					return {
+						content: [{ type: "text", text: "done" }],
+						details: {},
+						terminate: hookBehavior === "undefined",
+					};
+				},
+			};
+			const events: AgentEvent[] = [];
+			let providerCall = 0;
+
+			await runAgentLoop(
+				[createUserMessage("run the tool")],
+				{ systemPrompt: "", messages: [], tools: [tool] },
+				{
+					model: createModel(),
+					convertToLlm: identityConverter,
+					afterToolCall:
+						hookBehavior === "throws"
+							? async () => {
+									throw new Error("hook failed");
+								}
+							: undefined,
+				},
+				(event) => {
+					events.push(event);
+				},
+				undefined,
+				() => {
+					const stream = new MockAssistantStream();
+					const currentCall = providerCall++;
+					queueMicrotask(() => {
+						const message =
+							currentCall === 0
+								? createAssistantMessage(
+										[{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }],
+										"toolUse",
+									)
+								: createAssistantMessage([{ type: "text", text: "finished" }]);
+						stream.push({ type: "done", reason: currentCall === 0 ? "toolUse" : "stop", message });
+					});
+					return stream;
+				},
+			);
+
+			expect(
+				events.filter((event) => event.type === "tool_hooks_start" && event.toolCallId === "tool-1"),
+			).toHaveLength(1);
+		}
+	});
+
+	it("should mark blocked Vinci tool results as private UI guidance", async () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		let executed = false;
+		try {
+			const toolSchema = Type.Object({ value: Type.String() });
+			const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo tool",
+				parameters: toolSchema,
+				async execute() {
+					executed = true;
+					return { content: [{ type: "text", text: "unexpected" }], details: {} };
+				},
+			};
+			const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: identityConverter,
+				beforeToolCall: async () => ({
+					block: true,
+					reason: "INTERNAL CONTROL: change strategy before trying this tool again.",
+				}),
+			};
+
+			let callIndex = 0;
+			const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, () => {
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const isToolTurn = callIndex === 0;
+					const message = isToolTurn
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+					mockStream.push({ type: "done", reason: isToolTurn ? "toolUse" : "stop", message });
+					callIndex++;
+				});
+				return mockStream;
+			});
+
+			for await (const _event of stream) {
+				// consume
+			}
+			const messages = await stream.result();
+			const result = messages.find((message) => message.role === "toolResult");
+			expect(executed).toBe(false);
+			expect(result?.role).toBe("toolResult");
+			if (result?.role === "toolResult") {
+				expect(result.isError).toBe(true);
+				expect(result.details).toEqual({ vinciBlocked: true });
+				expect(result.content).toEqual([
+					{ type: "text", text: "INTERNAL CONTROL: change strategy before trying this tool again." },
+				]);
+			}
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
 		}
 	});
 
@@ -1056,6 +1444,7 @@ describe("agentLoop with AgentMessage", () => {
 			"message_start",
 			"message_end",
 			"tool_execution_start",
+			"tool_hooks_start",
 			"tool_execution_end",
 			"message_start",
 			"message_end",

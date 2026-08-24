@@ -48,6 +48,24 @@ function formatSessionDate(date: Date): string {
 	return `${Math.floor(diffDays / 365)}y`;
 }
 
+// [vinci] "when" is the key signal for choosing a session to resume, so we spell it out in plain
+// language ("3m ago", "yesterday") and show it FIRST + emphasized in the row, instead of a terse
+// "3m" tucked at the far right.
+function formatAgo(date: Date): string {
+	const diffMs = Date.now() - date.getTime();
+	const m = Math.floor(diffMs / 60000);
+	const h = Math.floor(diffMs / 3600000);
+	const d = Math.floor(diffMs / 86400000);
+	if (m < 1) return "just now";
+	if (m < 60) return `${m}m ago`;
+	if (h < 24) return `${h}h ago`;
+	if (d === 1) return "yesterday";
+	if (d < 7) return `${d}d ago`;
+	if (d < 30) return `${Math.floor(d / 7)}w ago`;
+	if (d < 365) return `${Math.floor(d / 30)}mo ago`;
+	return `${Math.floor(d / 365)}y ago`;
+}
+
 function canonicalizePath(path: string | undefined): string | undefined {
 	if (!path) return path;
 	return _canonicalizePath(path);
@@ -128,6 +146,34 @@ class SessionSelectorHeader implements Component {
 	invalidate(): void {}
 
 	render(width: number): string[] {
+		// [vinci] a calm, minimal header — a plain title + ONE short hint line (resume / scope / delete /
+		// cancel), dropping the sort/named/regex/rename/path chrome that overwhelms a non-programmer.
+		// Confirm + status messages still take over the hint line.
+		if (process.env.VINCI_CODE === "1") {
+			const scope = this.scope === "current" ? "this folder" : "all projects";
+			const titleLine = truncateToWidth(
+				theme.bold("Pick up where you left off") + theme.fg("muted", `  ·  ${scope}`),
+				width,
+				"",
+			);
+			if (this.confirmingDeletePath !== null) {
+				const h = `Delete this session?  ${keyHint("tui.select.confirm", "yes")}  ·  ${keyHint("tui.select.cancel", "no")}`;
+				return [titleLine, theme.fg("error", truncateToWidth(h, width, "…"))];
+			}
+			if (this.statusMessage) {
+				const color = this.statusMessage.type === "error" ? "error" : "accent";
+				return [titleLine, theme.fg(color, truncateToWidth(this.statusMessage.message, width, "…"))];
+			}
+			const sep = theme.fg("muted", "   ·   ");
+			const hint = [
+				keyHint("tui.select.confirm", "resume"),
+				keyHint("tui.input.tab", "this folder / all"),
+				keyHint("app.session.delete", "delete"),
+				keyHint("tui.select.cancel", "cancel"),
+			].join(sep);
+			return [titleLine, truncateToWidth(hint, width, "…")];
+		}
+
 		const title = this.scope === "current" ? "Resume Session (Current Folder)" : "Resume Session (All)";
 		const leftText = theme.bold(title);
 
@@ -452,6 +498,25 @@ class SessionList implements Component, Focusable {
 			const isSelected = i === this.selectedIndex;
 			const isConfirmingDelete = session.path === this.confirmingDeletePath;
 			const isCurrent = this.isCurrentSessionPath(session.path);
+
+			// [vinci] simplified, time-first row — "‹when›  ‹name›". The "when" leads, in an accent
+			// colour, because it's how you actually pick which session to pick up. Name (auto-titled)
+			// or the first message if untitled; no tree prefix / message-count / right-aligned column.
+			if (process.env.VINCI_CODE === "1") {
+				const when = formatAgo(session.modified).padEnd(11);
+				const label = (session.name ?? session.firstMessage).replace(/[\x00-\x1f\x7f]/g, " ").trim();
+				const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
+				const whenCol = theme.fg(isConfirmingDelete ? "error" : "accent", when);
+				const availableForMsg = Math.max(10, width - 2 - 11 - 1);
+				let msg = truncateToWidth(label || "(empty session)", availableForMsg, "…");
+				if (isConfirmingDelete) msg = theme.fg("error", `${msg}  · delete?`);
+				else if (isCurrent) msg = theme.fg("warning", msg) + theme.fg("muted", " · current");
+				if (isSelected) msg = theme.bold(msg);
+				let vLine = `${cursor}${whenCol} ${msg}`;
+				if (isSelected) vLine = theme.bg("selectedBg", vLine);
+				lines.push(truncateToWidth(vLine, width));
+				continue;
+			}
 
 			// Build tree prefix
 			const prefix = this.buildTreePrefix(node);

@@ -343,6 +343,9 @@ export interface Harness {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
+	authStorage: AuthStorage;
+	modelRegistry: ModelRegistry;
+	resourceLoader: ResourceLoader;
 	/** Faux stream function state (call count, captured contexts). */
 	faux: FauxStreamFnState;
 	/** All events emitted by the session, in order. */
@@ -356,7 +359,8 @@ export interface Harness {
 }
 
 function createTempDir(): string {
-	const tempDir = join(tmpdir(), `pi-harness-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	const suffix = Math.random().toString(36).slice(2).padEnd(11, "0").slice(0, 11);
+	const tempDir = join(tmpdir(), `pi-harness-${Date.now()}-${suffix}`);
 	mkdirSync(tempDir, { recursive: true });
 	return tempDir;
 }
@@ -381,7 +385,7 @@ function createHarnessWithResourceLoader(
 		streamFn,
 	});
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = SessionManager.inMemory(tempDir);
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 
 	if (options.settings) {
@@ -390,7 +394,7 @@ function createHarnessWithResourceLoader(
 
 	const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 	authStorage.setRuntimeApiKey(model.provider, "faux-key");
-	const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+	const modelRegistry = ModelRegistry.create(authStorage, join(tempDir, "models.json"));
 
 	const session = new AgentSession({
 		agent,
@@ -419,6 +423,9 @@ function createHarnessWithResourceLoader(
 		agent,
 		sessionManager,
 		settingsManager,
+		authStorage,
+		modelRegistry,
+		resourceLoader,
 		faux: fauxState,
 		events,
 		eventsOfType<T extends AgentSessionEvent["type"]>(type: T) {
