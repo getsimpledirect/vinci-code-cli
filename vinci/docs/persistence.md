@@ -1,10 +1,10 @@
-# Session persistence contract
+# Session Persistence
 
 What the session JSONL guarantees, what it deliberately does not, and why. Ruled 2026-08-03
 (issue #38). Read this before proposing durability, framing, or checksum work — the cheap version
 was chosen on purpose.
 
-## The format
+## The Format
 
 One JSON object per line. The first line is the session header; every subsequent record carries a
 `__vinci_record_start` framing marker. Records are appended with `appendFileSync`; an existing
@@ -15,7 +15,7 @@ valid session file is never rewritten in place.
 parse lines with a bare `JSON.parse`. Anything that appends a checksum suffix, a binary frame, or
 any non-JSON text to a line breaks every one of those consumers at once.
 
-## What is guaranteed
+## What Is Guaranteed
 
 - **Process-kill survival.** `appendFileSync` returns after the data is in the page cache, so a
   `SIGKILL` — including the CLI being killed mid-turn — does not lose already-appended records.
@@ -31,7 +31,7 @@ any non-JSON text to a line breaks every one of those consumers at once.
 - **Fail-closed verification.** When corruption is newer than the newest valid verification
   snapshot, the shared scanner returns `terminal-unverifiable` rather than trusting stale state.
 
-## What is deliberately NOT guaranteed
+## What Is Deliberately Not Guaranteed
 
 - **Power-loss / kernel-panic durability.** No write path calls `fsync`. Adding one would put a
   disk flush on a path that fires on every message, tool result, checkpoint, and extension entry —
@@ -45,7 +45,7 @@ any non-JSON text to a line breaks every one of those consumers at once.
   *closed* session is supported; appending to a live one is out of contract. Two `SessionManager`
   instances on one file hold independent in-memory snapshots and will diverge.
 
-## If you are here to change this
+## Changing This Contract
 
 The framing already catches what a kill actually produces, and the disclosure gap is closed. Before
 adding fsync, checksums, or a sidecar, bring a concrete incident that the current contract failed to

@@ -1,4 +1,4 @@
-# Dev-environment workflow
+# Development Environment
 
 Internal doc. How to test Vinci Code against the non-production backend, and which testing
 lane to use for what. The *mechanics* of `VINCI_ENV=dev` (what it sets, what it isolates,
@@ -6,7 +6,7 @@ override precedence) are documented in the README's "Running against a non-produ
 section — this doc covers the workflow around it. The dev box itself (instances, deploys,
 secrets) is owned by vinci-chat `docs/DEPLOY.md` — details live there, not here.
 
-## The three testing lanes
+## The Three Testing Lanes
 
 | Lane | How | Use for |
 |---|---|---|
@@ -18,14 +18,14 @@ secrets) is owned by vinci-chat `docs/DEPLOY.md` — details live there, not her
 sessions also show the `▲ dev` header badge. If a bug report doesn't say which environment
 it came from, get the doctor output before filing.
 
-## First-time setup (once per machine)
+## First-Time Setup
 
 Run `/login vinci` inside a `VINCI_ENV=dev` session. Device pairing goes against the dev
 Platform instance and the key lands in the isolated dev config dir, so the prod credential
 is untouched — after this one login, dev and prod sessions coexist with no further ceremony.
 Your account must be on the dev box's signup allowlist (see vinci-chat `docs/DEPLOY.md`).
 
-## Coordinated backend + CLI changes
+## Coordinated Backend and CLI Changes
 
 When a CLI feature needs a gateway or Platform change:
 
@@ -38,7 +38,7 @@ When a CLI feature needs a gateway or Platform change:
 Never merge a CLI change that depends on a backend change still sitting on `dev` — prod
 users would hit the gap between the two merges.
 
-## What testing on dev does and doesn't cover
+## What Testing on Dev Does Not Cover
 
 Not exercisable on dev (by design of the dev box — see vinci-chat `docs/DEPLOY.md` for why):
 
@@ -57,7 +57,7 @@ Behavioral caveats while testing:
 - Transitional: installs whose bootstrap predates payload-updater-version 0.0.42 perform
   one prod update check on the first dev launch, before self-heal refreshes the shim.
 
-## What would extend this (not built)
+## What Would Extend This
 
 A dev *release* channel — signed dev artifacts, a `manifest-dev.json`, a second trust
 root, pre-release version grammar — was deliberately left out. Today the channel enum in

@@ -17,7 +17,7 @@ import { BorderedLoader, DynamicBorder, getMarkdownTheme } from "@earendil-works
 import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 // Shared grader core (untracked-aware diff + skeptical-of-unverified-claims prompt). See
-// lib/grader.ts and vinci/docs/VERIFICATION_SYSTEM.md.
+// lib/grader.ts and vinci/docs/verification.md.
 import { type CompleteOpts, gatherDiff, gatherTask, runReview } from "./lib/grader.ts";
 import {
   installVinciUsageAccumulator,

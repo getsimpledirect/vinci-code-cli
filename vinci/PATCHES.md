@@ -238,7 +238,7 @@ error, abort, or bounded no-progress limit returns control. This works with or w
 so users never have to type "continue" just to finish an audit.
 
 **Verification gate (Phase 2, same block, separate kill switch `VINCI_NO_VERIFY=1`):** the
-verification system's sticky, non-todo enforcement (see `vinci/docs/VERIFICATION_SYSTEM.md`). A 9B's
+verification system's sticky, non-todo enforcement (see `vinci/docs/verification.md`). A 9B's
 most dangerous move is announcing "done / all correct / up to date" on work it did **not** verify;
 Phase 1 catches it only when a `todo` plan reaches all-done. Phase 2 catches it anywhere: after the
 loop drains, if the turn settled on a **completion claim** (`looksLikeCompletionClaim`) with real

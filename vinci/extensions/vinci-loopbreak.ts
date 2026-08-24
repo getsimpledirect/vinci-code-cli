@@ -814,7 +814,7 @@ export default function (pi: ExtensionAPI) {
     // its last one, that's genuine progress: drop its repeat count so the fixation ladder restarts.
     // Deliberately conservative — ANY difference (digits included) counts as progress, and this only
     // ever makes the blocker MORE lenient (the action ceiling + turn-stop still backstop a true runaway).
-    // Matches vinci-degroove.ts's result-aware definition of "no progress" (PI_ARCHITECTURE.md §8).
+    // Matches vinci-degroove.ts's result-aware definition of "no progress" (architecture.md §8).
     const key = callKey(event.toolName, event.input);
     const sig = result.replace(/\s+/g, " ").trim();
     const prevSig = lastResultSig.get(key);

@@ -1,4 +1,6 @@
-# Pi architecture — a walkthrough for people who didn't design it
+# Pi Architecture
+
+A walkthrough of Pi's engine for people who did not design it.
 
 Vinci Code is a thin fork of Pi (`badlogic/pi-mono`). This doc is a comprehensive, module-by-module
 tour of Pi's actual architecture — not the `vinci/` layer (that's `vinci/README.md` +
@@ -16,7 +18,7 @@ review, and fail-closed reconciliation.
 
 ---
 
-## Module 1: The big picture
+## Module 1 — The Big Picture
 
 **Five packages, one clean dependency chain.** No cycles, no surprises:
 
@@ -70,7 +72,7 @@ returns an `AgentSession` → handed to either `InteractiveMode` (the TUI) or `r
 
 ---
 
-## Module 2: The request lifecycle — keystroke to model call to render
+## Module 2 — The Request Lifecycle
 
 One prompt, traced through every layer. Ten steps, each with a real file:line so you can go read
 the actual code, not a paraphrase.
@@ -161,7 +163,7 @@ agent-core loop that's *configured* (not owned) by the session — every extensi
 the session installed on the Agent instance before the loop ever started, and the UI is just another
 subscriber to the same event stream the session itself listens to.
 
-## Module 3: The message/tool protocol
+## Module 3 — The Message and Tool Protocol
 
 **Three families of message types, one funnel.** `packages/ai/src/types.ts:408` defines the WIRE
 type: `Message = UserMessage | AssistantMessage | ToolResultMessage` — that's literally what a
@@ -247,7 +249,7 @@ maintainers hit the exact same double-encoding bug against OTHER large models an
 **Worth a look later, not urgent:** whether `vinciCoerceArguments` and `prepareEditArguments` are
 now doing overlapping work worth consolidating — flagged for Module 8.
 
-## Module 4: The provider/API layer (`packages/ai`)
+## Module 4 — The Provider Layer
 
 **Two different words that both sound like "provider," and the distinction matters.** `api`
 (`Model.api`, `ai/types.ts:666`) names a WIRE PROTOCOL SHAPE — a small closed set:
@@ -305,7 +307,7 @@ future wire quirk specific to the Vinci gateway has to be added to `vinci-provid
 `compat` block — Pi's detection table has zero built-in knowledge of it and never will, since it's
 keyed on a domain string that isn't ours.
 
-## Module 5: AgentSession's own job — sessions, compaction, settings, modes
+## Module 5 — AgentSession's Own Job
 
 Module 2 already covered `AgentSession` as the thing that installs tool hooks and subscribes to
 the `Agent`'s event stream. This module is what it does WITH those events: persistence, compaction,
@@ -359,7 +361,7 @@ respected underneath, just not shown.
   retained only after verifier replay and reconciliation policy; no worktree failure can fall back to
   main's cwd.
 
-## Module 6: The extension system — Vinci's entire substrate
+## Module 6 — The Extension System
 
 Every `vinci/extensions/*.ts` file exports one function, `(pi: ExtensionAPI) => void`. That single
 object — `ExtensionAPI` (`extensions/types.ts:1159`) — is 100% of the surface area `vinci/` has to
@@ -438,7 +440,7 @@ Vinci does is one of exactly two shapes: *react* to something the loop was alrea
 whole product is additive because the extension surface was designed to make additive the only
 option.
 
-## Module 7: The TUI (`packages/tui`)
+## Module 7 — The TUI
 
 **The component model is deliberately minimal.** `Component` (`tui.ts:64`) is nearly the whole
 contract: `render(width: number): string[]` — given a terminal width, produce an array of
@@ -498,7 +500,7 @@ color and background color are independent ANSI codes, so a red-foreground remov
 sit on a red-background row without conflict; that's not a special trick, it's just how terminal
 color codes compose.
 
-## Module 8: The risk map — PATCHES.md as case studies, and what's still untested
+## Module 8 — The Risk Map
 
 The 20 patches aren't random — they cluster into five architectural bug classes, each pointing at
 one layer from Modules 1–7. Grouping them shows the PATTERN, and the pattern is what predicts

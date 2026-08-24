@@ -95,7 +95,7 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-// [vinci] Verification system Phase 2 — turn-end completion-claim gate. See vinci/docs/VERIFICATION_SYSTEM.md.
+// [vinci] Verification system Phase 2 — turn-end completion-claim gate. See vinci/docs/verification.md.
 import {
 	type GraderVerdict,
 	gatherDiff,
@@ -1078,7 +1078,7 @@ export class AgentSession {
 					}
 				}
 
-				// [vinci] Verification system Phase 2 (vinci/docs/VERIFICATION_SYSTEM.md): the turn-end
+				// [vinci] Verification system Phase 2 (vinci/docs/verification.md): the turn-end
 				// completion-claim gate. A 9B's most dangerous move is announcing "done / all correct / up
 				// to date" on work it did NOT verify — and outside the todo flow (Phase 1) nothing catches
 				// it. When the turn settles on such a claim WITH uncommitted changes, run the INDEPENDENT

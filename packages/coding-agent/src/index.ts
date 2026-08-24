@@ -321,7 +321,7 @@ export {
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
 // [vinci] shared grader core (verification system) — the SINGLE check used by both the core turn-end
-// enforcement and the vinci-review/vinci-todo extensions. See vinci/docs/VERIFICATION_SYSTEM.md.
+// enforcement and the vinci-review/vinci-todo extensions. See vinci/docs/verification.md.
 export {
 	GRADER_SYSTEM,
 	type GraderCompleteOpts,

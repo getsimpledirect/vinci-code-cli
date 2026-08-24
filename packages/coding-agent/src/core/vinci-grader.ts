@@ -1,5 +1,5 @@
 /**
- * [vinci] Shared grader core for the verification system (vinci/docs/VERIFICATION_SYSTEM.md).
+ * [vinci] Shared grader core for the verification system (vinci/docs/verification.md).
  *
  * These are the PURE primitives — no ExtensionContext, no session dependency — so they can be used
  * by BOTH the core turn-end enforcement (agent-session.ts §8 "Phase 2") AND the extension layer

@@ -1,5 +1,5 @@
 /**
- * Extension-side grader wrappers for the verification system (see vinci/docs/VERIFICATION_SYSTEM.md).
+ * Extension-side grader wrappers for the verification system (see vinci/docs/verification.md).
  *
  * The PRIMITIVES (untracked-aware diff, skeptical grader prompt, review call, verdict parsing) now
  * live in the coding-agent CORE (`core/vinci-grader.ts`, re-exported from the package) so that ONE

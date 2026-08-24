@@ -1,4 +1,6 @@
-# The verification system — making a small model's claims trustworthy
+# Verification System
+
+Making a small model's claims trustworthy.
 
 Vinci's first acceptance traces used a 9B; Fort now raises the model ceiling without changing the
 runtime problem. The recurring failure across real sessions is **overclaiming**: the model does
@@ -10,7 +12,7 @@ straight at it ("verify versions evenly") was added and the failure recurred the
 This doc is the design we build against. The principle: **trust the check, not the claim** — and make
 the check one the model cannot see-around or narrate-past.
 
-## The three flaws (grounded in the code, not theory)
+## The Three Flaws
 
 The `review_changes` grader (`vinci-review.ts`) is the right idea with three concrete holes, and they
 map 1:1 to observed failures:
@@ -34,7 +36,7 @@ map 1:1 to observed failures:
 5. Match cost to stakes — gate "done / up to date / correct", not "I read the file".
 6. Ground checkable facts in tools — "v4 is latest" is a lookup, not an opinion.
 
-## The loop
+## The Loop
 
 ```
 claim (done / all up to date / correct)
@@ -49,7 +51,7 @@ claim (done / all up to date / correct)
 
 The three fixes are the three flaws, in order. The shape is right; it leaks at each stage.
 
-## Where each piece lives (additive)
+## Where Each Piece Lives
 
 - **Flaw #1** — `lib/grader.ts` `gatherDiff()` includes untracked files
   (`git ls-files --others --exclude-standard`, content inlined as new-file blocks).
@@ -106,7 +108,7 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   records its response model as non-context provenance. Kill switches:
   `VINCI_NO_FACT_GROUNDING=1` and `VINCI_NO_FACT_GRADER=1`.
 
-## Honest boundary
+## Honest Boundary
 
 Reliably catches: claimed-done-but-diff/build-fails, graded-the-wrong-artifact, dismissed-the-check.
 Does NOT by itself catch deep architectural wrongness (S3-can't-host-SSR) unless the checker in flaw
@@ -121,7 +123,7 @@ Phase 3a retrieval-plus-attribution gate instead of blocking an otherwise ground
 shows the warning and the session retains the unavailable verdict. Sealed live calibration is still
 required for multi-claim coverage, false positives, latency, and cost.
 
-## Build phases
+## Build Phases
 
 - **Phase 1 (done):** flaw #1 (untracked) + flaw #2 (tool-grounded grader prompt) + flaw #3
   auto-run-on-done + reopen. Shared grader used by both `vinci-review` and `vinci-todo`.
