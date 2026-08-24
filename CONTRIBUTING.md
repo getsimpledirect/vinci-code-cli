@@ -63,3 +63,8 @@ an env var, so upstream merges stay clean — follow that convention.
 
 Bugs: open an issue. Security issues: **do not** open a public issue — see
 [`SECURITY.md`](SECURITY.md).
+
+## Code of conduct
+
+Participating here means agreeing to the [Code of Conduct](CODE_OF_CONDUCT.md).
+Concerns go to conduct@getsimpledirect.com, which is read privately.

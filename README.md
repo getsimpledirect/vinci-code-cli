@@ -123,6 +123,8 @@ Layout, the branch model, and the patch inventory: [`vinci/README.md`](vinci/REA
 | [`SECURITY.md`](SECURITY.md) | Reporting a vulnerability; known limits |
 | [`UPSTREAM.md`](UPSTREAM.md) | Fork provenance and how to sync with Pi |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute |
+| [`SUPPORT.md`](SUPPORT.md) | Where to take a bug, a question, or a billing issue |
+| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Expected conduct, and how to report a concern |
 
 ## Project status
 
