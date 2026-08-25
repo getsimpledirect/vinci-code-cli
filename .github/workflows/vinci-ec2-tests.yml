@@ -288,10 +288,29 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          aws autoscaling set-desired-capacity \
-            --auto-scaling-group-name "${AUTO_SCALING_GROUP}" \
-            --desired-capacity 0
-          aws s3 rm "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/" --recursive --only-show-errors
+          # Returning capacity to zero is the one step here that costs money if it silently fails.
+          # This block used `set -uo pipefail` with no `-e`, so a failed scale-down was followed by
+          # the S3 cleanup and the step exited with THAT command's status — reporting success while
+          # instances kept running and billing. continue-on-error then kept the whole run green.
+          # Retry it, judge it on its own result, and make a failure loud without blocking the run.
+          scaled=0
+          for attempt in 1 2 3; do
+            if aws autoscaling set-desired-capacity \
+              --auto-scaling-group-name "${AUTO_SCALING_GROUP}" --desired-capacity 0; then
+              scaled=1
+              break
+            fi
+            echo "scale-down attempt ${attempt} failed; retrying in 5s"
+            sleep 5
+          done
+          if [ "${scaled}" -ne 1 ]; then
+            echo "::error::Could not return ${AUTO_SCALING_GROUP} to desired-capacity 0 after 3"
+            echo "::error::  attempts. INSTANCES MAY STILL BE RUNNING AND BILLING — check the ASG."
+          fi
+          if ! aws s3 rm "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/" --recursive --only-show-errors; then
+            echo "::warning::Staging objects under runs/${RUN_KEY}/ were not removed."
+          fi
+          [ "${scaled}" -eq 1 ] || exit 1
 
       - name: Upload visual and diagnostic artifacts
         if: ${{ always() }}

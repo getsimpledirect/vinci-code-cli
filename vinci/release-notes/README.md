@@ -32,4 +32,15 @@ Publishing to the other repository needs a token with `contents: write` on
 `getsimpledirect/vinci-code-releases`, stored as the `PUBLIC_RELEASES_TOKEN` secret. The workflow's
 own `github.token` is scoped to this repository and cannot write to another one.
 
-Until that secret exists the step logs why it skipped and does nothing else. Releases are unaffected.
+That secret is **not currently configured**, so no note has ever reached the public tracker — the
+first thirty releases published none, and the step reported success every time because each skip
+path exited 0. It no longer does that:
+
+- a note exists but the token is missing → the step **fails** with an error annotation, because
+  work that was supposed to happen did not;
+- no note for the version → a warning, and the step exits cleanly. Writing notes stays optional;
+- neither → a warning. A missing token is not a fault when there is nothing to publish.
+
+The step is `continue-on-error`, so none of this can undo a release: by the time it runs, the
+signed artifacts are already uploaded. It fails loudly so the misconfiguration is visible, not so
+it blocks shipping.
