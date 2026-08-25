@@ -198,6 +198,22 @@ Full extension list and behaviour → **[`vinci/README.md`](vinci/README.md)**
 | [`SUPPORT.md`](SUPPORT.md) | Where to take a bug, a question, or a billing issue |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Expected conduct, and how to report a concern |
 
+## Releases
+
+This repository has no tags or GitHub releases, and that is deliberate rather than an
+oversight: builds are signed from a private repository whose AWS release role is deliberately
+not reachable from a public one. What you get instead:
+
+| What you want | Where it is |
+|---|---|
+| What version am I running | `vinci --version` — nothing is pinned in these docs, so it cannot go stale |
+| Release notes | [`vinci/release-notes/`](vinci/release-notes/) in this repository |
+| The build itself | the installer above, which verifies a signed manifest and its sha256 |
+| Bug reports and questions | [`SUPPORT.md`](SUPPORT.md) |
+
+`main` here is the source for the current release. It is published as a fast-forward, so an
+open pull request against it stays open.
+
 ## Project status
 
 **Actively maintained** by a small team. Security fixes go to the latest release only — there
