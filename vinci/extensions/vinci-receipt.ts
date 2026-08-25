@@ -153,12 +153,23 @@ function receiptWidget(outcome: Readonly<VinciTaskOutcome>, remoteVerdict?: any)
         "dim",
         `  ${formatVinciTaskUsage(outcome.usage)} · ${formatVinciTaskDuration(outcome.activeDurationMs)}`,
       );
-      const billing = theme.fg("dim", "  Billed total in Platform.");
+      // [#230] Only Vinci-managed turns are billed in Platform. On a turn served by the user's own
+      // provider the credential never reaches us and neither does the charge, so saying otherwise
+      // is wrong in the one line whose job is telling the user what a turn cost. usage.providers
+      // records who actually served it, so this follows the evidence rather than the sign-in
+      // state: a user can be signed in to Vinci and still run the turn on their own key.
+      const providers = outcome.usage.providers ?? [];
+      const foreign = providers.filter((name) => name && name !== "vinci");
+      const billing = providers.length === 0
+        ? undefined
+        : foreign.length === 0
+          ? theme.fg("dim", "  Billed total in Platform.")
+          : theme.fg("dim", `  Billed by ${[...new Set(foreign)].sort().join(", ")}, not Vinci.`);
       return [
         truncateToWidth(head, width, theme.fg("dim", "…")),
         truncateToWidth(detail, width, theme.fg("dim", "…")),
         truncateToWidth(usage, width, theme.fg("dim", "…")),
-        truncateToWidth(billing, width, theme.fg("dim", "…")),
+        ...(billing ? [truncateToWidth(billing, width, theme.fg("dim", "…"))] : []),
       ];
     },
     invalidate(): void {},

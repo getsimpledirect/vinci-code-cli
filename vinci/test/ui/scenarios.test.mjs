@@ -1,6 +1,6 @@
 import "./env.mjs";
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { afterEach, describe, test } from "vitest";
@@ -111,6 +111,15 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 		assert.match(await ui.screen(), /● signed in/);
 		assert.doesNotMatch(await ui.screen(), /● connected/);
 		await expectSnapshot("startup-connected-60x20", ui);
+	});
+
+	test("removing credentials refreshes a signed-in header to signed out", async () => {
+		const ui = await createUi({ connected: true });
+		assert.match(await ui.screen(), /● signed in/);
+		unlinkSync(join(ui.core.tempDir, "auth.json"));
+		ui.sendKeys("x", "\x7f");
+		assert.match(await ui.screen(), /\/login to connect/);
+		assert.doesNotMatch(await ui.screen(), /● signed in/);
 	});
 
 	// Was "exposes only the managed Forte class". The picker deliberately shows every managed class

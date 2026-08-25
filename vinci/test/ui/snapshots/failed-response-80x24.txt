@@ -12,7 +12,7 @@
   ! Stopped — needs you
   The local provider stopped responding.
   1 model call · 100 in / 50 out · 0% cached · ~$0.0000 estimated · <time> active
-  Billed total in Platform.
+  Billed by faux, not Vinci.
 
 ╭ ✹ Ask Vinci ───────────────────────────────────────────────────────── /login ╮
 │                                                                              │

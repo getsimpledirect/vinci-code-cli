@@ -530,6 +530,30 @@ assert.match(unverified, /2 model calls/);
 assert.match(unverified, /50% cached/);
 assert.match(unverified, /~\$0\.0300 estimated/);
 assert.match(unverified, /~\$0\.0300 estimated · 0s active\n  Billed total in Platform\./);
+
+// [#230] A turn served by the user's own provider is not billed in Platform - the credential never
+// reaches Vinci and neither does the charge. Before this, the receipt claimed Platform billing on
+// every turn, including the BYOK session recorded for the public README, where it was visibly wrong.
+{
+  const assistants = messages.filter((m) => m.role === "assistant");
+  const original = assistants.map((m) => m.provider);
+  const setProviders = (...names) => assistants.forEach((m, i) => { m.provider = names[i % names.length]; });
+
+  setProviders("openrouter");
+  const byok = await renderReceipt();
+  assert.doesNotMatch(byok, /Billed total in Platform/, "a BYOK turn must not claim Platform billing");
+  assert.match(byok, /Billed by openrouter, not Vinci\./);
+
+  // Mixed: if any leg was served elsewhere, Platform did not bill the whole turn.
+  setProviders("vinci", "openrouter");
+  const mixed = await renderReceipt();
+  assert.doesNotMatch(mixed, /Billed total in Platform/);
+  assert.match(mixed, /Billed by openrouter, not Vinci\./);
+
+  assistants.forEach((m, i) => { m.provider = original[i]; });
+  const restored = await renderReceipt();
+  assert.match(restored, /Billed total in Platform\./, "the managed path must be unchanged");
+}
 assert.match(unverified, /0s active/);
 
 verification.recordVinciVerification("npm run check", false, "1 test failed");

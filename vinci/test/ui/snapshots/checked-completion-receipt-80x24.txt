@@ -12,7 +12,7 @@
   ✓ Done  ·  1 file
   example.test.mjs  ·  check: node --test --test-reporter=dot example.test.mjs …
   3 model calls · 300 in / 150 out · 0% cached · ~$0.0000 estimated · <time> active
-  Billed total in Platform.
+  Billed by faux, not Vinci.
 
 ╭ ✹ Ask Vinci ──────────────────────────────────────────────────── ● connected ╮
 │                                                                              │

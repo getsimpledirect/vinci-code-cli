@@ -15,7 +15,7 @@
   ✓ Done  ·  1 file
   README.md  ·  Documentation change applied; no project check was required.  ·…
   2 model calls · 200 in / 100 out · 0% cached · ~$0.0000 estimated · <time> active
-  Billed total in Platform.
+  Billed by faux, not Vinci.
 
 ╭ ✹ Ask Vinci ──────────────────────────────────────────────────── ● connected ╮
 │                                                                              │

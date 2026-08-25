@@ -7,7 +7,7 @@
  */
 import { type ExtensionAPI, getAgentDir, type Theme } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, Image, type ImageTheme, truncateToWidth } from "@earendil-works/pi-tui";
-import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getVinciUiState, setVinciConnection } from "./lib/ui-state.ts";
@@ -27,6 +27,26 @@ function hasCredentials(): boolean {
   } catch {
     return false;
   }
+}
+
+// [#229] The connection state was read once at session_start, so /logout removed the credential
+// while the header kept reporting "signed in" - directly above the auth picker it had just
+// opened. Nothing anywhere set "signed-out" after startup. auth.json is re-parsed only when its
+// mtime moves, so a repaint costs one stat, and every route that changes credentials is caught:
+// the command, an expiring token, or the file being edited by hand.
+let credCache: { mtimeMs: number; present: boolean } | undefined;
+function hasCredentialsFresh(): boolean {
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(join(getAgentDir(), "auth.json")).mtimeMs;
+  } catch {
+    credCache = undefined;
+    return false;
+  }
+  if (credCache?.mtimeMs === mtimeMs) return credCache.present;
+  const present = hasCredentials();
+  credCache = { mtimeMs, present };
+  return present;
 }
 
 const THINKING_HINT_MARKER = ".vinci-thinking-hint-v1";
@@ -274,6 +294,16 @@ export default function (pi: ExtensionAPI) {
           // Read the model at render time so the header shows the REAL session model (it used to
           // hardcode the launch default — a /model switch left the header lying vs. the footer).
           const modelName = ctx.model?.name ?? ctx.model?.id ?? "Vinci Forte (GLM 5.2)";
+          // Same reason as the model name above: a value read once at startup goes stale in
+          // place. The connection state was set only at session_start, so /logout left the
+          // header saying "signed in" beside the auth picker it had just opened.
+          // Only the two credential-derived states are refreshed here. "connected" and
+          // "reconnect" are narrower facts earned by an actual request (vinci-shell sets them),
+          // and re-deriving those from a file on disk would throw away what the network proved.
+          const conn = getVinciUiState().connection;
+          if (conn === "signed-in" || conn === "signed-out") {
+            setVinciConnection(hasCredentialsFresh() ? "signed-in" : "signed-out");
+          }
           if (process.env.VINCI_HERO_HEADER !== "1") {
             return compactHeader(theme, modelName, width, ctx.cwd);
           }
