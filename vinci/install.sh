@@ -9,6 +9,26 @@ MANIFEST_URL="${VINCI_UPDATE_MANIFEST_URL:-https://vinci-assets.s3.ca-central-1.
 
 say() { printf '  %s\n' "$*"; }
 
+# A bin dir inside VINCI_HOME makes the shim a symlink to itself. The installer writes the launcher
+# under $VINCI_HOME and links $BIN_DIR/vinci at it; when $BIN_DIR is inside $VINCI_HOME those resolve
+# to the same path, and every later `vinci` call dies with "too many levels of symbolic links".
+# The defaults ($HOME/.vinci-code and $HOME/.local/bin) never collide, so only an explicit
+# VINCI_BIN_DIR reaches this. Refuse up front rather than leave a broken install behind.
+_vinci_abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$PWD/$1" ;; esac; }
+_VINCI_HOME_ABS="$(_vinci_abs "$VINCI_HOME")"; _VINCI_HOME_ABS="${_VINCI_HOME_ABS%/}"
+_VINCI_BIN_ABS="$(_vinci_abs "$BIN_DIR")"; _VINCI_BIN_ABS="${_VINCI_BIN_ABS%/}"
+_vinci_bin_inside_home=0
+[ "$_VINCI_BIN_ABS" = "$_VINCI_HOME_ABS" ] && _vinci_bin_inside_home=1
+case "$_VINCI_BIN_ABS/" in "$_VINCI_HOME_ABS"/*) _vinci_bin_inside_home=1 ;; esac
+if [ "$_vinci_bin_inside_home" = "1" ]; then
+  echo "VINCI_BIN_DIR must not be inside VINCI_HOME."
+  echo "  VINCI_HOME    = $_VINCI_HOME_ABS"
+  echo "  VINCI_BIN_DIR = $_VINCI_BIN_ABS"
+  echo "The shim would be a symlink to itself, and 'vinci' would fail with"
+  echo "'too many levels of symbolic links'. Point VINCI_BIN_DIR somewhere outside VINCI_HOME."
+  exit 1
+fi
+
 if ! command -v node >/dev/null 2>&1; then
   echo "Vinci Code needs Node.js v22.19 or newer."
   echo "Install it from https://nodejs.org (or 'brew install node'), then run this again."

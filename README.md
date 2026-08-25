@@ -5,9 +5,10 @@
   <img src="vinci/assets/logomark.svg" alt="Vinci logomark" width="120" />
 </picture>
 
-# Vinci Code
+# Vinci Code CLI
 
-A coding agent you can run with **your own provider key** — or with Vinci's managed service.<br/>Same guard rails either way.
+A terminal coding agent you can run with **your own provider key** — or with Vinci's managed
+service.<br/>Same guard rails either way.
 
 [![Node](https://img.shields.io/badge/Node-22.19%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/License-MIT-2ECC71?style=flat-square)](LICENSE)

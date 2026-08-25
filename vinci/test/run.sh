@@ -215,6 +215,7 @@ run_group byok-guards-integration env VINCI_CODE=1 node "${ROOT}/vinci/test/byok
 # Public docs must not teach an obsolete opt-in, link a repo readers cannot open, or pin a version.
 # Each of those actually shipped during the open-sourcing work and was caught by eye, not by a gate.
 run_group docs-accuracy-integration node "${ROOT}/vinci/test/docs-accuracy-integration.mjs"
+run_group install-guard-integration node "${ROOT}/vinci/test/install-guard-integration.mjs"
 run_group priority-integration node "${ROOT}/vinci/test/priority-integration.mjs"
 run_group update-integration node "${ROOT}/vinci/test/update-integration.mjs"
 # VINCI_ENV=dev: launcher resolution (dev URLs, isolated agent dir, updates off, explicit-env-wins,
