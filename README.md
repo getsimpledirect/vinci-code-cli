@@ -30,6 +30,15 @@ exact upstream commit this forked from, is in [`UPSTREAM.md`](UPSTREAM.md).
 
 </div>
 
+A real turn: Vinci narrates what it is doing in plain language, and every tool call reports what it
+actually did — how many items it inspected, how many lines it read — rather than declaring success.
+
+<div align="center">
+
+<img src="vinci/assets/screenshot-session.png" alt="Vinci Code exploring a repository: each step shows the action taken and its concrete result, interleaved with the agent's reasoning" width="900" />
+
+</div>
+
 ## How it fits together
 
 ```mermaid
@@ -142,6 +151,12 @@ Nothing to configure. Install it, run it, pick a provider:
 /login      # pick Anthropic, OpenAI, Google, Groq, … or Vinci
 /model      # pick a model — foreign ones show their exact id and a provider badge
 ```
+
+`/login` asks how you want to authenticate before it asks who with. "Use an API key" lists every
+provider Pi supports — 33 of them at the time of writing — each marked `unconfigured` until you
+add a key. A Vinci account is one of the options, never a prerequisite.
+
+<img src="vinci/assets/screenshot-auth.png" alt="The /login prompt: Select authentication method, offering Use a subscription or Use an API key" width="820" />
 
 **No account, no environment variable, no sign-up.** Vinci's own classes are offered first, so
 signing in to Vinci stays one keystroke away if you want managed inference — but nothing makes
