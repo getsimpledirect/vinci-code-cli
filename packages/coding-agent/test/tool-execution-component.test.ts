@@ -364,6 +364,299 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("done");
 	});
 
+	test("an isError rerun_check result never renders the success affordance", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		try {
+			const component = new ToolExecutionComponent(
+				"rerun_check",
+				"tool-rerun-error-passed",
+				{},
+				{},
+				createBaseToolDefinition("rerun_check"),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "Verifier crashed mid-run." }],
+					details: { tool: "rerun_check", passed: true, exitCode: 0, killed: false },
+					isError: true,
+				},
+				false,
+			);
+
+			const rendered = stripAnsi(component.render(120).join("\n"));
+			expect(rendered).toContain("└ !");
+			expect(rendered).not.toContain("└ ✓");
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	test("caps a long rerun_check summary at 60 cells", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		try {
+			const component = new ToolExecutionComponent(
+				"rerun_check",
+				"tool-rerun-long-summary",
+				{},
+				{},
+				createBaseToolDefinition("rerun_check"),
+				createFakeTui(),
+				process.cwd(),
+			);
+			const longFirstLine = `Recorded verifier passed after ${"a very long check description ".repeat(4)}finished.`;
+			component.updateResult(
+				{
+					content: [{ type: "text", text: longFirstLine }],
+					details: { tool: "rerun_check", passed: true, exitCode: 0, killed: false },
+					isError: false,
+				},
+				false,
+			);
+
+			const rendered = stripAnsi(component.render(200).join("\n"));
+			const summaryLine = rendered.split("\n").find((line) => line.includes("└ ✓")) ?? "";
+			const summary = summaryLine.split("└ ✓")[1]?.split("·")[0]?.trim() ?? "";
+			expect(summary.length).toBeLessThanOrEqual(60);
+			expect(summary.length).toBeGreaterThan(0);
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	test("renders a passed rerun_check with the Vinci success affordance", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		try {
+			const component = new ToolExecutionComponent(
+				"rerun_check",
+				"tool-rerun-passed",
+				{},
+				{},
+				createBaseToolDefinition("rerun_check"),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "Recorded verifier passed." }],
+					details: { tool: "rerun_check", passed: true, exitCode: 0, killed: false },
+					isError: false,
+				},
+				false,
+			);
+
+			const rendered = stripAnsi(component.render(120).join("\n"));
+			expect(rendered).toContain("└ ✓");
+			expect(rendered).not.toContain("└ !");
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	test("strips terminal title controls from collapsed rerun_check summaries", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		try {
+			const component = new ToolExecutionComponent(
+				"rerun_check",
+				"tool-rerun-osc-summary",
+				{},
+				{},
+				createBaseToolDefinition("rerun_check"),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "Safe\x1b]0;hijacked title\x07 summary." }],
+					details: { tool: "rerun_check", passed: true, exitCode: 0, killed: false },
+					isError: false,
+				},
+				false,
+			);
+
+			const rendered = component.render(120).join("\n");
+			expect(rendered).not.toContain("\x1b]0;hijacked title");
+			expect(stripAnsi(rendered)).toContain("Safe summary.");
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	test("renders a failed rerun_check with the Vinci failure affordance", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		try {
+			const component = new ToolExecutionComponent(
+				"rerun_check",
+				"tool-rerun-failed",
+				{},
+				{},
+				createBaseToolDefinition("rerun_check"),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "Recorded verifier failed." }],
+					details: { tool: "rerun_check", passed: false, exitCode: 1, killed: false },
+					isError: false,
+				},
+				false,
+			);
+
+			const rendered = stripAnsi(component.render(120).join("\n"));
+			expect(rendered).toContain("└ !");
+			expect(rendered).not.toContain("└ ✓");
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	test.each([
+		{
+			title: "stopped",
+			details: { tool: "rerun_check", passed: false, exitCode: 1, killed: true },
+			text: "Recorded verifier failed.",
+		},
+		{
+			title: "unsafe replay",
+			details: { tool: "rerun_check", passed: false, unsafeReplay: true, command: "npm test | cat" },
+			text: "The recorded verifier cannot be replayed safely as argv.",
+		},
+	])("renders a $title rerun_check neutrally", ({ title, details, text }) => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		try {
+			const component = new ToolExecutionComponent(
+				"rerun_check",
+				`tool-rerun-${title}`,
+				{},
+				{},
+				createBaseToolDefinition("rerun_check"),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [{ type: "text", text }],
+					details,
+					isError: false,
+				},
+				false,
+			);
+
+			const rendered = stripAnsi(component.render(120).join("\n"));
+			expect(rendered).toContain("└");
+			expect(rendered).not.toContain("└ ✓");
+			expect(rendered).not.toContain("└ !");
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	test.each([
+		{ title: "passed but killed", details: { passed: true, killed: true }, marker: "neutral" },
+		{ title: "passed but stopped", details: { passed: true, stopped: true }, marker: "neutral" },
+		{ title: "passed but unsafe to replay", details: { passed: true, unsafeReplay: true }, marker: "neutral" },
+		{ title: "failed", details: { passed: false }, marker: "failed" },
+		{ title: "passed", details: { passed: true }, marker: "passed" },
+		{ title: "missing details", details: undefined, marker: "neutral" },
+		{ title: "null details", details: null, marker: "neutral" },
+		{ title: "empty details", details: {}, marker: "neutral" },
+		{ title: "malformed details", details: "invalid", marker: "neutral" },
+		{ title: "null passed flag", details: { passed: null }, marker: "neutral" },
+		{ title: "malformed passed flag", details: { passed: "true" }, marker: "neutral" },
+		{ title: "malformed killed flag", details: { passed: true, killed: "true" }, marker: "neutral" },
+	] as const)("renders a $title rerun_check result with the $marker affordance", ({ title, details, marker }) => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		try {
+			const component = new ToolExecutionComponent(
+				"rerun_check",
+				`tool-rerun-shape-${title}`,
+				{},
+				{},
+				createBaseToolDefinition("rerun_check"),
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "Recorded verifier result." }],
+					details,
+					isError: false,
+				},
+				false,
+			);
+
+			const rendered = stripAnsi(component.render(120).join("\n"));
+			if (marker === "passed") {
+				expect(rendered).toContain("└ ✓");
+				expect(rendered).not.toContain("└ !");
+			} else if (marker === "failed") {
+				expect(rendered).toContain("└ !");
+				expect(rendered).not.toContain("└ ✓");
+			} else {
+				expect(rendered).toContain("└");
+				expect(rendered).not.toContain("└ ✓");
+				expect(rendered).not.toContain("└ !");
+			}
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
+	test("keeps blocked Vinci guidance out of custom tool renderers", () => {
+		const previousVinciCode = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+		try {
+			const toolDefinition: ToolDefinition = {
+				...createBaseToolDefinition(),
+				renderResult: (result) => {
+					const text = result.content.find((part) => part.type === "text");
+					return new Text(text?.type === "text" ? text.text : "", 0, 0);
+				},
+			};
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-private-block",
+				{},
+				{},
+				toolDefinition,
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "INTERNAL CONTROL: rewrite the strategy." }],
+					details: { vinciBlocked: true },
+					isError: true,
+				},
+				false,
+			);
+
+			const rendered = stripAnsi(component.render(120).join("\n"));
+			expect(rendered).toContain("Vinci paused this action before it ran.");
+			expect(rendered).not.toContain("INTERNAL CONTROL");
+			expect(rendered).not.toContain("rewrite the strategy");
+		} finally {
+			if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previousVinciCode;
+		}
+	});
+
 	test("trims trailing blank display lines from write previews", () => {
 		const component = new ToolExecutionComponent(
 			"write",

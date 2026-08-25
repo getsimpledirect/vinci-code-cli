@@ -323,6 +323,12 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				if (typeof chunk.model === "string" && chunk.model.length > 0 && chunk.model !== model.id) {
 					output.responseModel ||= chunk.model;
 				}
+				// Service tier actually served, when the provider echoes it (DeepInfra returns "priority"
+				// when priority was delivered, "default" otherwise). Surfaced as a subtle UI badge.
+				{
+					const tier = (chunk as { service_tier?: unknown }).service_tier;
+					if (typeof tier === "string" && tier.length > 0) output.serviceTier ||= tier;
+				}
 				if (chunk.usage) {
 					output.usage = parseChunkUsage(chunk.usage, model);
 				}
@@ -1033,7 +1039,13 @@ export function convertMessages(
 
 				// Always send tool result with text (or placeholder if only images)
 				const hasText = textResult.length > 0;
-				const toolResultText = hasText ? textResult : hasImages ? "(see attached image)" : "(no tool output)";
+				let toolResultText = hasText ? textResult : hasImages ? "(see attached image)" : "(no tool output)";
+				// [vinci] The completions wire has no error flag on tool results (unlike Anthropic's
+				// is_error), so a failed/blocked call reads exactly like a success — a small model can't
+				// tell the difference and happily retries the same call forever. Mark failures explicitly.
+				if (process.env.VINCI_CODE === "1" && toolMsg.isError) {
+					toolResultText = `ERROR — this tool call FAILED. Do not repeat it unchanged.\n${toolResultText}`;
+				}
 				// Some providers require the 'name' field in tool results
 				const toolResultMsg: ChatCompletionToolMessageParam = {
 					role: "tool",

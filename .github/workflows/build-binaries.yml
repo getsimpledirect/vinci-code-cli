@@ -3,7 +3,11 @@ name: Build Binaries
 on:
   push:
     tags:
-      - 'v*'
+      # Upstream's binary builder. `v*` also matches OUR release tags (`vinci-v0.0.35`), so every
+      # Vinci release spuriously triggered it — red on every release since 0.0.30 while the real
+      # release path (`vinci-release.yml`, which runs the hermetic `vinci/build.sh`) shipped fine.
+      # `v[0-9]*` matches upstream's `v0.12.0` without matching `vinci-v*`.
+      - 'v[0-9]*'
   workflow_dispatch:
     inputs:
       tag:
@@ -192,6 +196,11 @@ jobs:
   publish-npm:
     runs-on: ubuntu-latest
     needs: stage-github-release
+    # Publishes the `@earendil-works/*` packages, which are UPSTREAM's npm scope, not ours.
+    # Vinci ships a signed binary via `vinci-release.yml`; it never publishes npm packages.
+    # This guard keeps a stray `v0.x` tag on a fork from attempting to publish into someone
+    # else's namespace. The job is retained, unmodified otherwise, to keep upstream syncs clean.
+    if: github.repository == 'badlogic/pi-mono'
     environment: npm-publish
     permissions:
       contents: read

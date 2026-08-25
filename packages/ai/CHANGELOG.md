@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed event streams to reject when a producer closes before emitting a final result, preventing silent hangs and false-success exits after truncated provider responses.
 - Fixed GitHub Copilot device-code login polling to wait before the first token poll, avoiding incorrect device-code failures for some users after browser authorization ([#6187](https://github.com/earendil-works/pi/issues/6187)).
 - Fixed OAuth device-code polling to honor the server-provided `slow_down` interval instead of only applying the RFC 8628 5-second increment, so GitHub Copilot login recovers instead of appearing to hang when polls arrive early (e.g. WSL/VM clock drift) ([#6187](https://github.com/earendil-works/pi/issues/6187)).
 - Fixed OpenAI Codex user-agent construction to synchronously load Node OS metadata, avoiding a startup race that could report `pi (browser)` in Node/Bun.

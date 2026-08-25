@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# Vinci Code launcher — runs Pi with the Vinci brand layer (theme + header + provider),
+# all via explicit flags so nothing in the upstream tree is modified. Additive by design.
+#
+# From the repo root:  vinci/bin/vinci          (or symlink it onto your PATH as `vinci`)
+#
+# Auth today: export VINCI_API_KEY=vinci_live_… (issue at platform.getsimpledirect.com).
+# Auth soon (step 2): the "Connect to Vinci" pairing flow removes the key entirely —
+# see vinci/AUTH_PAIRING_PLAN.md.
+set -euo pipefail
+
+# Resolve the repo root from this script's location (works via symlink too).
+SELF="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+ROOT="$(cd "${SELF}/../.." && pwd)"
+VINCI="${ROOT}/vinci"
+
+# ── Self-heal the bootstrap updater ─────────────────────────────────────────────────────────────
+# The install shim runs $VINCI_HOME/updater/update.mjs — the BOOTSTRAP copy — for every command,
+# including the automatic before-launch update. Only the installer ever refreshed that copy, so an
+# updater fix could never reach an existing install: the update is performed BY the stale updater,
+# which by definition lacks the code that would replace itself. Observed after 0.0.35 — payloads
+# carried version-pruning added in #71 while the running bootstrap was months older and had none of
+# it, so nothing was ever pruned.
+#
+# This runs from the PAYLOAD, which the shim execs and which is always current after an update, so
+# it is the one place that can repair a bootstrap unable to repair itself. Refreshing only the
+# updater is sufficient: once it is current it performs the full bootstrap refresh (updater, shim,
+# key) on the next update.
+#
+# Deliberately placed before every early exit so any invocation heals. Entirely best-effort: a
+# failure must never delay or block a launch, so every step is guarded and silent.
+if [ "${VINCI_NO_BOOTSTRAP_HEAL:-}" != "1" ]; then
+  _vinci_home="${VINCI_HOME:-${HOME:-}/.vinci-code}"
+  _vinci_boot="${_vinci_home}/updater/update.mjs"
+  _vinci_embedded="${VINCI}/updater/update.mjs"
+  _vinci_updater_version() {
+    sed -n 's/^\/\/ payload-updater-version: \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$1" 2>/dev/null | tail -1
+  }
+  _vinci_version_is_newer() {
+    local _vinci_left_major _vinci_left_minor _vinci_left_patch
+    local _vinci_right_major _vinci_right_minor _vinci_right_patch
+    IFS=. read -r _vinci_left_major _vinci_left_minor _vinci_left_patch <<< "$1"
+    IFS=. read -r _vinci_right_major _vinci_right_minor _vinci_right_patch <<< "$2"
+    (( 10#${_vinci_left_major} > 10#${_vinci_right_major} )) && return 0
+    (( 10#${_vinci_left_major} < 10#${_vinci_right_major} )) && return 1
+    (( 10#${_vinci_left_minor} > 10#${_vinci_right_minor} )) && return 0
+    (( 10#${_vinci_left_minor} < 10#${_vinci_right_minor} )) && return 1
+    (( 10#${_vinci_left_patch} > 10#${_vinci_right_patch} ))
+  }
+  # Only the exact current payload may heal. A repo checkout and a directly executed retained
+  # payload must never push their updater over the newest trusted bootstrap.
+  if _vinci_root_physical="$(cd "${ROOT}" 2>/dev/null && pwd -P)" \
+     && _vinci_home_physical="$(cd "${_vinci_home}" 2>/dev/null && pwd -P)" \
+     && _vinci_current_physical="$(cd "${_vinci_home}/current" 2>/dev/null && pwd -P)"; then
+    case "${_vinci_root_physical}/" in
+      "${_vinci_home_physical}"/versions/*)
+        _vinci_embedded_version="$(_vinci_updater_version "${_vinci_embedded}")"
+        _vinci_boot_version="$(_vinci_updater_version "${_vinci_boot}")"
+        if [ "${_vinci_root_physical}" = "${_vinci_current_physical}" ] \
+           && [[ "${_vinci_embedded_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+           && { ! [[ "${_vinci_boot_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+                || _vinci_version_is_newer "${_vinci_embedded_version}" "${_vinci_boot_version}"; }; then
+          # A killed heal can leave its atomic-replace temp behind. Reap only regular files older
+          # than one hour, using lstat so a malicious or accidental symlink is never followed.
+          node -e '
+            const { lstatSync, readdirSync, unlinkSync } = require("node:fs");
+            const { join } = require("node:path");
+            const [directory, pid] = process.argv.slice(1);
+            for (const name of readdirSync(directory)) {
+              if (!/^update\.mjs\.heal-[0-9]+$/.test(name) || name === `update.mjs.heal-${pid}`) continue;
+              try {
+                const path = join(directory, name);
+                const details = lstatSync(path);
+                if (details.isFile() && Date.now() - details.mtimeMs > 60 * 60 * 1000) unlinkSync(path);
+              } catch {}
+            }
+          ' "${_vinci_home}/updater" "$$" 2>/dev/null || true
+          _vinci_tmp="${_vinci_boot}.heal-$$"
+          if cp "${_vinci_embedded}" "${_vinci_tmp}" 2>/dev/null \
+             && chmod 755 "${_vinci_tmp}" 2>/dev/null; then
+            mv -f "${_vinci_tmp}" "${_vinci_boot}" 2>/dev/null || rm -f "${_vinci_tmp}" 2>/dev/null || true
+          else
+            rm -f "${_vinci_tmp}" 2>/dev/null || true
+          fi
+        fi
+        ;;
+    esac
+  fi
+  unset -f _vinci_updater_version _vinci_version_is_newer 2>/dev/null || true
+  unset _vinci_home _vinci_boot _vinci_embedded _vinci_root_physical _vinci_home_physical \
+    _vinci_current_physical _vinci_embedded_version _vinci_boot_version _vinci_tmp 2>/dev/null || true
+fi
+
+# Load LOCAL, UNTRACKED secrets (Brave keys, etc.) if present — kept OUT of git, out of this repo
+# entirely, so a key never lands in a commit. Create ~/.vinci-code.env (chmod 600) with e.g.:
+#   BRAVE_SEARCH_API_KEY=…    → web_search uses Brave instead of the ZDR gateway
+#   BRAVE_ANSWERS_API_KEY=…   → web_answer (Brave Answers API; needs the separate Answers plan)
+# Unset = default ZDR gateway search; web_answer simply unavailable. Sourced HERE — before every
+# dispatch below (report-wrong, verify, --version, Pi) — so a profile-set VINCI_ENV applies to all
+# of them, not just the interactive path.
+# Isolated for the same reason as the shim (vinci/updater/vinci) — this file runs under
+# `set -euo pipefail`, so a user-editable profile sourced directly could take the launcher down
+# with it: a failing command exits silently, an unset reference exits 1, a bare `exit` ends the
+# process. Fixing only the shim would have left the second half of every launch just as exposed.
+# `set +eu` around the source does not help; `.` runs in this shell. The profile runs in a
+# subshell and only its exported variables come back.
+# ${HOME:-}, matching the shim. A bare ${HOME} under `set -u` aborts the launcher when HOME is
+# unset, which is the same class of failure this block exists to remove.
+VINCI_PROFILE="${HOME:-}/.vinci-code.env"
+if [ -f "$VINCI_PROFILE" ]; then
+  # Initialised before the parse check: the failure branch below never assigns it,
+  # and the next reference under `set -u` would kill the shell — turning a bad
+  # profile back into a dead launcher, which is the whole bug this block removes.
+  VINCI_PROFILE_EXPORTS=""
+  # Parse before running, same as the shim: it is the one check that behaves
+  # identically under bash and dash, and it stops either shell from half-applying
+  # a file it cannot read.
+  #
+  # THIS FILE NEEDS ITS OWN GATE, and an earlier version of this comment claimed
+  # it did not — "the shim already refused the launch, so by the time bin/vinci
+  # runs that gate has passed". False, and review caught it. vinci/README.md
+  # documents running this script directly and symlinking it onto PATH as
+  # `vinci` (lines 24, 163, 179), and on that path the shim never executes. A
+  # malformed profile would drop VINCI_ENV=dev and start the session against
+  # PROD, which is the exact leak the gate exists to close.
+  VINCI_PROFILE_UNCLEAN=0
+  if ! sh -n "$VINCI_PROFILE" 2>/dev/null; then
+    echo "Vinci could not parse $VINCI_PROFILE, so none of it was applied." >&2
+    VINCI_PROFILE_UNCLEAN=1
+    VINCI_PROFILE_EXPORTS=""
+  else
+    VINCI_PROFILE_EXPORTS=$(
+      set +eu
+      set -a
+      . "$VINCI_PROFILE" >&2
+      set +a
+      export -p
+    ) || VINCI_PROFILE_EXPORTS=""
+  fi
+  if [ -n "$VINCI_PROFILE_EXPORTS" ]; then
+    eval "$VINCI_PROFILE_EXPORTS" 2>/dev/null || VINCI_PROFILE_EXPORTS=""
+  fi
+  [ -n "$VINCI_PROFILE_EXPORTS" ] || VINCI_PROFILE_UNCLEAN=1
+  if [ -z "$VINCI_PROFILE_EXPORTS" ]; then
+    echo "Vinci ignored $VINCI_PROFILE; it produced no usable settings." >&2
+  fi
+  unset VINCI_PROFILE_EXPORTS
+fi
+
+# ── Supported environments (internal) ──────────────────────────────────────────────────────────
+# VINCI_ENV is the one-variable switch between backends: unset/`prod` (default, a no-op) and
+# `dev` (the Chat+Platform dev box). Dev must be safe to enter and impossible to leak into prod:
+#   • gateway + platform point at the dev box;
+#   • credentials/sessions are isolated under ~/.pi-dev/agent — ~/.pi/agent/auth.json has ONE
+#     slot per provider, so a dev /login would otherwise clobber the prod credential. BOTH
+#     override spellings are exported: the branded build reads VINCI_CODING_AGENT_DIR, but the
+#     global-`pi` fallback lane derives PI_CODING_AGENT_DIR from its own package name and would
+#     ignore the VINCI_* spelling — sending a dev /login into the PROD credential slot;
+#   • auto-update is disabled — no dev update channel exists, and a dev session must never
+#     touch prod update state.
+# Every export is guarded so an EXPLICITLY set variable always wins. This block runs AFTER the
+# ~/.vinci-code.env sourcing above (a profile file may set VINCI_ENV=dev) and BEFORE every
+# dispatch/exec path — report-wrong, verify, and Pi — so validation and the agent-dir isolation
+# apply uniformly, and the updater sees VINCI_UPDATE_DISABLED.
+case "${VINCI_ENV:-prod}" in
+  prod) ;;
+  dev)
+    export VINCI_ENV
+    [ -n "${VINCI_BASE_URL:-}" ] || export VINCI_BASE_URL="https://3.98.156.231.sslip.io/api/v1"
+    [ -n "${VINCI_PLATFORM_URL:-}" ] || export VINCI_PLATFORM_URL="https://platform.3.98.156.231.sslip.io"
+    [ -n "${VINCI_CODING_AGENT_DIR:-}" ] || export VINCI_CODING_AGENT_DIR="${HOME}/.pi-dev/agent"
+    [ -n "${PI_CODING_AGENT_DIR:-}" ] || export PI_CODING_AGENT_DIR="${VINCI_CODING_AGENT_DIR}"
+    [ -n "${VINCI_UPDATE_DISABLED:-}" ] || export VINCI_UPDATE_DISABLED=1
+    ;;
+  *)
+    echo "✗ Unknown VINCI_ENV: ${VINCI_ENV} — supported values are 'prod' (default) and 'dev'." >&2
+    exit 2
+    ;;
+esac
+
+# A false-completion report is local task instrumentation, not an agent run. Handle it before Pi,
+# provider, or authentication setup so reporting never spends credits or makes a network request.
+if [ "${1:-}" = "report-wrong" ]; then
+  shift
+  exec node "${VINCI}/scripts/report-wrong.mjs" "$@"
+fi
+
+# Verification is a standalone product command, not an agent run. Resolve it before Pi, provider,
+# or authentication setup and replace this process so VAC owns all three output streams and status.
+if [ "${1:-}" = "verify" ]; then
+  shift
+  if [ -n "${VAC_CLI_PATH:-}" ]; then
+    _vinci_vac_cli="${VAC_CLI_PATH}"
+  else
+    _vinci_vac_cli="$(command -v vac 2>/dev/null || true)"
+  fi
+  if [ -z "${_vinci_vac_cli}" ] || [ ! -x "${_vinci_vac_cli}" ] || [ -d "${_vinci_vac_cli}" ]; then
+    echo "Verification isn't set up yet. Install the Vinci Acceptance CLI, then run vinci verify again." >&2
+    exit 127
+  fi
+  exec "${_vinci_vac_cli}" "$@"
+fi
+
+# Vinci owns its version string. A bare Pi `--version` prints Pi's internal build number, not ours, so
+# answer with the branded version from identity.json before Pi ever loads (pure shell, no build needed).
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
+  ver="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${VINCI}/identity.json" 2>/dev/null | head -1)"
+  echo "${ver:-unknown}"
+  exit 0
+fi
+
+# Internal source qualification must execute the current working tree, never a stale dist build.
+# Normal product runs still prefer a locally built pi (packages/coding-agent/dist/cli.js), then the
+# globally installed `pi`. Build once from the REPO ROOT: `npm install && bash vinci/build.sh`
+# (vinci/build.sh compiles tui → ai → agent → coding-agent WITHOUT re-fetching ~1000 external model
+# catalogs — network-free + drift-free. Stock `npm run build` also works but re-fetches every time.)
+# NOTE: the env-gated core patches (see vinci/PATCHES.md) need this local build; the header/theme/
+# provider extensions work with a global pi too.
+# FAIL CLOSED ON A NORMAL LAUNCH, mirroring vinci/updater/vinci.
+#
+# Everything above is informational or recovery — report-wrong, verify,
+# --version — and stays reachable, because those are what a user needs when the
+# profile is the broken thing. Below this line a real session starts, and a real
+# session does not start on a profile we could not read: this file is where
+# VINCI_ENV=dev is set, so a dropped profile silently runs against PROD.
+#
+# Reached on the DIRECT path (vinci/bin/vinci run or symlinked as `vinci`, both
+# documented in vinci/README.md) where the shim never runs. Via the shim this is
+# redundant, and redundant is the correct amount here.
+if [ "${VINCI_PROFILE_UNCLEAN:-0}" -ne 0 ]; then
+  echo "Vinci will not start a session with a profile it could not fully read." >&2
+  echo "Fix or remove ${VINCI_PROFILE:-$HOME/.vinci-code.env}, then run Vinci again." >&2
+  echo "Recovery commands still work: vinci --version, vinci report-wrong." >&2
+  exit 78
+fi
+
+PI_LOCAL="${ROOT}/packages/coding-agent/dist/cli.js"
+PI_SOURCE="${ROOT}/packages/coding-agent/src/cli.ts"
+PI_TSX="${ROOT}/node_modules/.bin/tsx"
+if [ "${VINCI_SOURCE_CLI:-0}" = "1" ]; then
+  [ -x "${PI_TSX}" ] && [ -f "${PI_SOURCE}" ] || {
+    echo "✗ VINCI_SOURCE_CLI=1 requires the repository dependencies and coding-agent source" >&2
+    exit 1
+  }
+  PI=("${PI_TSX}" --tsconfig "${ROOT}/tsconfig.json" "${PI_SOURCE}")
+elif [ -f "${PI_LOCAL}" ]; then
+  PI=(node "${PI_LOCAL}")
+elif command -v pi >/dev/null 2>&1; then
+  PI=(pi)
+else
+  echo "✗ No pi binary found. From the repo root: npm install && bash vinci/build.sh" >&2
+  echo "  (or, without the core patches: npm i -g @earendil-works/pi-coding-agent)" >&2
+  exit 1
+fi
+
+# Enables the Vinci-only core tweaks (see vinci/PATCHES.md): /login goes straight to Vinci,
+# and Ctrl+C-twice-to-exit gets a friendlier window. Upstream behavior when unset.
+export VINCI_CODE=1
+
+# No update or telemetry phone-home. PI_OFFLINE disables Pi's version check, package-update nag, and
+# install telemetry. Vinci still needs fd + ripgrep to explore reliably on a fresh machine, so the
+# explicit bootstrap exception may fetch only those two binaries from their official GitHub releases.
+# Set VINCI_TOOL_BOOTSTRAP=0 to keep first-run startup completely offline.
+export PI_OFFLINE=1
+export VINCI_TOOL_BOOTSTRAP="${VINCI_TOOL_BOOTSTRAP:-1}"
+
+# Product-level resume syntax. Pi's durable session UUID is Vinci's task ID; translate the friendly
+# command onto the existing session loader instead of introducing a second task database.
+if [ "${1:-}" = "resume" ]; then
+  [ "$#" -ge 2 ] || { echo "Usage: vinci resume <task-id>" >&2; exit 2; }
+  _vinci_resume_id="$2"
+  shift 2
+  set -- --session "${_vinci_resume_id}" "$@"
+fi
+
+# Provider flags are OPEN by default: Vinci Code is an open-source client and should work the moment
+# you have it, with your own key and no account. Set VINCI_SHOW_OTHER_PROVIDERS=0 to restore the
+# managed-only boundary, where a user cannot bypass the stable Forte class. Every VINCI_CODE guard
+# stays active either way: sandbox, secret masking, result budget, degroove, keybindings.
+if [ "${VINCI_SHOW_OTHER_PROVIDERS:-1}" != "1" ]; then
+  for _vinci_arg in "$@"; do
+    case "${_vinci_arg}" in
+      --provider | --provider=* | --model | --model=* | --models | --models=* | --api-key | --api-key=*)
+        echo "✗ Vinci Code uses your account's managed Vinci model class; provider, model, and API-key overrides are not supported." >&2
+        echo "  To use your own provider key, enable BYOK: VINCI_SHOW_OTHER_PROVIDERS=1" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
+
+# Provider/model selection stays explicit for reproducible corpus runs. Vinci remains the managed
+# product default. Direct provider lanes are internal qualification paths, never user key settings.
+VINCI_PROVIDER="${VINCI_PROVIDER:-vinci}"
+# `auto` resolves server-side to the account's class (per-surface override → account default →
+# registry default), which is what makes a class chosen in Vinci Settings apply here. The concrete
+# ids stay accepted so a corpus run can pin one deliberately; identity.json's defaultModel and this
+# default are asserted equal by vinci/test/identity-contract.mjs, so they cannot drift apart.
+VINCI_MODEL="${VINCI_MODEL:-auto}"
+case "${VINCI_PROVIDER}" in
+  vinci)
+    case "${VINCI_MODEL}" in
+      auto|forte|fortissimo) ;;
+      *) echo "✗ Unknown Vinci model: ${VINCI_MODEL}" >&2; exit 2 ;;
+    esac
+    ;;
+  openrouter)
+    [[ "${VINCI_MODEL}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]] || {
+      echo "✗ Invalid OpenRouter model id: ${VINCI_MODEL}" >&2
+      exit 2
+    }
+    [ -n "${OPENROUTER_API_KEY:-}" ] || {
+      echo "✗ OPENROUTER_API_KEY is required for the OpenRouter acceptance lane" >&2
+      exit 2
+    }
+    ;;
+  deepinfra)
+    [ "${VINCI_MODEL}" = "zai-org/GLM-5.2" ] || {
+      echo "✗ The DeepInfra qualification lane is pinned to zai-org/GLM-5.2" >&2
+      exit 2
+    }
+    [ -n "${VINCI_INTERNAL_DEEPINFRA_API_KEY:-}" ] || {
+      echo "✗ VINCI_INTERNAL_DEEPINFRA_API_KEY is required for internal DeepInfra qualification" >&2
+      exit 2
+    }
+    export VINCI_DEEPINFRA_QUALIFICATION=1
+    ;;
+  *)
+    # Offline process-level regressions inject a faux provider without reopening public CLI flags.
+    [ "${VINCI_INTERNAL_PROVIDER_TEST:-0}" = "1" ] || {
+      echo "✗ Unsupported VINCI_PROVIDER: ${VINCI_PROVIDER}" >&2
+      exit 2
+    }
+    ;;
+esac
+
+# Start on a clean screen so the Vinci welcome opens at the top, not buried under prior terminal
+# output (build logs, the shell prompt, etc.). Only when attached to a real terminal.
+if [ -t 1 ]; then printf '\033[H\033[2J'; fi
+
+# Interactive run? (attached to a real terminal, not print/rpc/json). Only then do we sign off on exit.
+VINCI_INTERACTIVE=1
+{ [ -t 0 ] && [ -t 1 ]; } || VINCI_INTERACTIVE=0
+for _a in "$@"; do case "${_a}" in -p | --print | --mode) VINCI_INTERACTIVE=0 ;; esac; done
+
+# Not exec'd (so we regain control to print the bookend below). We run Pi in the BACKGROUND and `wait`,
+# with a trap that forwards a directed SIGTERM / terminal-close SIGHUP down to it — otherwise those kill
+# only this wrapper and leave node (its tool subprocesses + open model connection) orphaned, reparented
+# to init. Ctrl+C (SIGINT) is delivered by the tty to the whole foreground process group, so node still
+# gets it directly — we deliberately do NOT trap INT (that would double-signal Pi's Ctrl+C-twice flow).
+# `set +e` so a non-zero exit (e.g. 130 from Ctrl+C) doesn't abort before the bookend + the real code.
+set +e
+"${PI[@]}" \
+  --theme "${VINCI}/themes/vinci-dark.json" \
+  --theme "${VINCI}/themes/vinci-light.json" \
+  --extension "${VINCI}/extensions/vinci-provider.ts" \
+  --extension "${VINCI}/extensions/vinci-model-provenance.ts" \
+  --extension "${VINCI}/extensions/vinci-priority.ts" \
+  --extension "${VINCI}/extensions/vinci-queue.ts" \
+  --extension "${VINCI}/extensions/vinci-workspace.ts" \
+  --extension "${VINCI}/extensions/vinci-verification.ts" \
+  --extension "${VINCI}/extensions/vinci-accept.ts" \
+  --extension "${VINCI}/extensions/vinci-checkpoint.ts" \
+  --extension "${VINCI}/extensions/vinci-character.ts" \
+  --extension "${VINCI}/extensions/vinci-factcheck.ts" \
+  --extension "${VINCI}/extensions/vinci-plan.ts" \
+  --extension "${VINCI}/extensions/vinci-memory.ts" \
+  --extension "${VINCI}/extensions/vinci-header.ts" \
+  --extension "${VINCI}/extensions/vinci-council.ts" \
+  --extension "${VINCI}/extensions/vinci-advisor.ts" \
+  --extension "${VINCI}/extensions/vinci-orchestrate.ts" \
+  --extension "${VINCI}/extensions/vinci-crew.ts" \
+  --extension "${VINCI}/extensions/vinci-feedback.ts" \
+  --extension "${VINCI}/extensions/vinci-issue.ts" \
+  --extension "${VINCI}/extensions/vinci-todo.ts" \
+  --extension "${VINCI}/extensions/vinci-review.ts" \
+  --extension "${VINCI}/extensions/vinci-outcome.ts" \
+  --extension "${VINCI}/extensions/vinci-receipt.ts" \
+  --extension "${VINCI}/extensions/vinci-guard.ts" \
+  --extension "${VINCI}/extensions/vinci-scope.ts" \
+  --extension "${VINCI}/extensions/vinci-loopbreak.ts" \
+  --extension "${VINCI}/extensions/vinci-shell.ts" \
+  --extension "${VINCI}/extensions/vinci-undo.ts" \
+  --extension "${VINCI}/extensions/vinci-search.ts" \
+  --extension "${VINCI}/extensions/vinci-autoname.ts" \
+  --extension "${VINCI}/extensions/vinci-preview.ts" \
+  --extension "${VINCI}/extensions/vinci-render.ts" \
+  --extension "${VINCI}/extensions/vinci-compact.ts" \
+  --extension "${VINCI}/extensions/vinci-toolload.ts" \
+  --extension "${VINCI}/extensions/vinci-cachewatch.ts" \
+  --extension "${VINCI}/extensions/vinci-support.ts" \
+  --extension "${VINCI}/extensions/vinci-help.ts" \
+  --extension "${VINCI}/extensions/vinci-copy.ts" \
+  --extension "${VINCI}/extensions/vinci-completion-receipt.ts" \
+  --thinking high \
+  --provider "${VINCI_PROVIDER}" \
+  --model "${VINCI_MODEL}" \
+  "$@" <&0 &
+# `<&0` is REQUIRED: a non-interactive shell redirects a background job's stdin to /dev/null unless we
+# explicitly redirect it, and the TUI reading instant EOF would quit on launch. This re-inherits the
+# real terminal stdin so keystrokes reach Vinci.
+VINCI_CHILD=$!
+trap 'kill -TERM "${VINCI_CHILD}" 2>/dev/null' TERM HUP
+wait "${VINCI_CHILD}"; VINCI_EXIT=$?
+# If `wait` returned because a trapped signal fired (not because the child exited), keep waiting until
+# the child is actually reaped so we exit with its real status and never leave it running.
+while kill -0 "${VINCI_CHILD}" 2>/dev/null; do wait "${VINCI_CHILD}"; VINCI_EXIT=$?; done
+trap - TERM HUP
+
+# A warm brand bookend — the counterpart to the welcome hero — printed once after the session closes.
+if [ "${VINCI_INTERACTIVE}" = "1" ]; then
+  _sage=$'\033[38;2;184;197;176m'
+  _dim=$'\033[38;2;107;107;100m'
+  _rst=$'\033[0m'
+  printf '\n  %s𝐯𝟏𝐧𝐜𝟏%s  %s·  made, not generated.%s\n\n' "${_sage}" "${_rst}" "${_dim}" "${_rst}"
+fi
+exit "${VINCI_EXIT}"

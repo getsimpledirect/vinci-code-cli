@@ -20,6 +20,8 @@ export interface NormalizedProviderError {
 	status?: number;
 	/** Raw HTTP body reason, already trimmed and truncated to the cap. */
 	body?: string;
+	/** Machine-readable error code from the gateway, when present in structured bodies. */
+	code?: string;
 	/** `error.message`, or `safeJsonStringify(error)` for a non-`Error` throw. */
 	message: string;
 	/** True when `message` already contains the body (no separate body to add). */
@@ -43,11 +45,13 @@ export function normalizeProviderError(error: unknown): NormalizedProviderError 
 	const sdkError = error as SdkErrorShape;
 	const status = extractStatus(sdkError);
 	const body = extractBody(sdkError);
+	const code = extractCode(sdkError);
 	const messageCarriesBody = body === undefined || error.message.includes(body);
 
 	return {
 		status,
 		body,
+		code,
 		message: error.message,
 		messageCarriesBody,
 	} satisfies NormalizedProviderError;
@@ -87,6 +91,65 @@ function pickBodyText(error: SdkErrorShape): string | undefined {
 	const responseBody = error.$response?.body;
 	if (typeof responseBody === "string") return responseBody;
 	if (isNonEmptyObject(responseBody)) return safeJsonStringify(responseBody);
+	return undefined;
+}
+
+/**
+ * Extract machine-readable error code from the error body.
+ * Probes the same SDK field shapes as extractBody, looking for a `code` field.
+ */
+function extractCode(error: SdkErrorShape): string | undefined {
+	// Try nested error.error.code (OpenAI SDK nested format)
+	if (isNonEmptyObject(error.error) && typeof (error.error as any).error?.code === "string") {
+		return (error.error as any).error.code;
+	}
+
+	// Try error.error.code (direct nested format)
+	if (isNonEmptyObject(error.error) && typeof (error.error as any).code === "string") {
+		return (error.error as any).code;
+	}
+
+	// Try to parse body string as JSON and look for code
+	if (typeof error.body === "string") {
+		try {
+			const parsed = JSON.parse(error.body);
+			if (typeof parsed?.error?.code === "string") {
+				return parsed.error.code;
+			}
+			if (typeof parsed?.code === "string") {
+				return parsed.code;
+			}
+		} catch {
+			// Not JSON, continue
+		}
+	}
+
+	// Try $response.body as JSON string
+	const responseBody = error.$response?.body;
+	if (typeof responseBody === "string") {
+		try {
+			const parsed = JSON.parse(responseBody);
+			if (typeof parsed?.error?.code === "string") {
+				return parsed.error.code;
+			}
+			if (typeof parsed?.code === "string") {
+				return parsed.code;
+			}
+		} catch {
+			// Not JSON, continue
+		}
+	}
+
+	// Try $response.body as object
+	if (isNonEmptyObject(responseBody)) {
+		if (typeof (responseBody as any).error?.code === "string") {
+			return (responseBody as any).error.code;
+		}
+		if (typeof (responseBody as any).code === "string") {
+			return (responseBody as any).code;
+		}
+	}
+
 	return undefined;
 }
 

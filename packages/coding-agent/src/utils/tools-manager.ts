@@ -17,6 +17,18 @@ function isOfflineModeEnabled(): boolean {
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
+/** Vinci stays offline for update/telemetry traffic but may fetch its two required search binaries. */
+export function shouldBootstrapTools(env: NodeJS.ProcessEnv = process.env): boolean {
+	const offline = env.PI_OFFLINE;
+	const offlineEnabled = offline === "1" || offline?.toLowerCase() === "true" || offline?.toLowerCase() === "yes";
+	if (!offlineEnabled) return true;
+	const bootstrap = env.VINCI_TOOL_BOOTSTRAP;
+	return (
+		env.VINCI_CODE === "1" &&
+		(bootstrap === "1" || bootstrap?.toLowerCase() === "true" || bootstrap?.toLowerCase() === "yes")
+	);
+}
+
 interface ToolConfig {
 	name: string;
 	repo: string; // GitHub repo (e.g., "sharkdp/fd")
@@ -332,7 +344,7 @@ export async function ensureTool(tool: "fd" | "rg", silent: boolean = false): Pr
 	const config = TOOLS[tool];
 	if (!config) return undefined;
 
-	if (isOfflineModeEnabled()) {
+	if (isOfflineModeEnabled() && !shouldBootstrapTools()) {
 		if (!silent) {
 			console.log(chalk.yellow(`${config.name} not found. Offline mode enabled, skipping download.`));
 		}

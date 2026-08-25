@@ -21,8 +21,143 @@ import type {
 	AgentToolResult,
 	StreamFn,
 } from "./types.ts";
+import { vinciCoerceArguments } from "./vinci-coerce.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+
+/**
+ * VINCI_CODE only: small models occasionally emit a *synonym* for a real tool name — `editor` or
+ * `edit_file` for `edit`, `write_file` for `write`, `run_command` for `bash`, and so on. Upstream
+ * then fails the call with "Tool <name> not found", which for a non-programmer surfaces as an
+ * alarming red error plus a wasted round-trip (the model usually recovers on the next try, but the
+ * user has already seen the mess). We fold a known synonym onto the REAL tool name *before* the tool
+ * is resolved and before any extension tool hook fires. Two properties matter:
+ *   1. The call then succeeds on the first try (and the tool's own prepareArguments — e.g. edit's
+ *      JSON-string `edits` coercion — runs, which it can't when resolution fails on the name).
+ *   2. The guard / scope / loop-break hooks still see the CANONICAL name, so their name-keyed checks
+ *      (block bash `rm -rf`, confirm a wholesale `write` overwrite…) are NOT bypassed. An additive
+ *      alias *tool* would route around them — this deliberately does not.
+ * It only ever rewrites when the canonical tool actually exists in this turn's tool list, so it can
+ * never invent a capability. Fully gated: with VINCI_CODE unset, upstream Pi behavior is unchanged.
+ */
+const VINCI_TOOL_SYNONYMS: Record<string, string> = {
+	// → edit
+	editor: "edit",
+	edit_file: "edit",
+	editfile: "edit",
+	str_replace_editor: "edit",
+	str_replace_based_edit_tool: "edit",
+	apply_patch: "edit",
+	// → write
+	write_file: "write",
+	writefile: "write",
+	create_file: "write",
+	createfile: "write",
+	// → read
+	read_file: "read",
+	readfile: "read",
+	view_file: "read",
+	// → ls
+	list_files: "ls",
+	list_directory: "ls",
+	// → bash
+	run_command: "bash",
+	execute_command: "bash",
+	shell: "bash",
+};
+
+// START is time-to-first-content, which legitimately includes gateway queue-wait behind the shared
+// inference cluster's concurrency ceiling, big-context prefill, and a reasoning model thinking before
+// its first visible token. A live 0.0.10 customer saw a false "provider stopped responding" here while
+// the request was slow-but-alive (measured: DeepInfra itself is fast, so the delay is queue/prefill).
+// Give the first token generous room. IDLE was 60s on the measurement that "once tokens flow, gaps
+// are tiny (max ~5s)" — true for chat-shaped turns, FALSE for one large tool call. Measured in a live
+// session on 2026-07-21 (a React/SVG build): 8 idle timeouts against 2 start timeouts, all clustered
+// on generating one big file. The deadline below refreshes only on a CONTENT event, so a provider
+// composing a long tool-call argument without streaming partials reads as dead air and a healthy
+// request is killed mid-generation — exactly on the "build me a whole thing" tasks that show the
+// product at its best.
+//
+// 180s is a threshold change, not a cure: it buys headroom for large generations while still catching
+// a provider that has genuinely gone away. The real fix is a gateway heartbeat during dead-air (#23),
+// and a client that can tell "composing" from "gone" rather than inferring it from silence.
+const VINCI_STREAM_START_TIMEOUT_MS = 210_000;
+export const VINCI_STREAM_IDLE_TIMEOUT_MS = 180_000;
+
+function vinciTimeout(name: string, fallback: number): number {
+	const parsed = Number.parseInt(process.env[name] ?? "", 10);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function isVinciContentEvent(event: unknown): boolean {
+	if (typeof event !== "object" || event === null) return false;
+	const type = (event as { type?: unknown }).type;
+	if (type === "text_delta" || type === "thinking_delta") {
+		const delta = (event as { delta?: unknown }).delta;
+		return typeof delta === "string" && delta.length > 0;
+	}
+	return type === "toolcall_start" || type === "toolcall_delta" || type === "toolcall_end";
+}
+
+async function* withVinciStreamWatchdog<T>(source: AsyncIterable<T>, controller: AbortController): AsyncGenerator<T> {
+	const iterator = source[Symbol.asyncIterator]();
+	const startTimeoutMs = vinciTimeout("VINCI_STREAM_START_TIMEOUT_MS", VINCI_STREAM_START_TIMEOUT_MS);
+	const idleTimeoutMs = vinciTimeout("VINCI_STREAM_IDLE_TIMEOUT_MS", VINCI_STREAM_IDLE_TIMEOUT_MS);
+	let timeoutMs = startTimeoutMs;
+	let deadline = Date.now() + timeoutMs;
+	while (true) {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const next = await Promise.race([
+				iterator.next(),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() => reject(new Error(`Provider stream timed out after ${timeoutMs}ms without a content event`)),
+						Math.max(0, deadline - Date.now()),
+					);
+				}),
+			]);
+			if (next.done) return;
+			if (isVinciContentEvent(next.value)) {
+				timeoutMs = idleTimeoutMs;
+				deadline = Date.now() + timeoutMs;
+			}
+			yield next.value;
+		} catch (error) {
+			controller.abort();
+			throw error;
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+}
+
+export function vinciNormalizeToolName(name: string, tools: readonly AgentTool[] | undefined): string {
+	const canonical = VINCI_TOOL_SYNONYMS[name.toLowerCase()];
+	if (canonical && canonical !== name && tools?.some((t) => t.name === canonical)) {
+		return canonical;
+	}
+	return name;
+}
+
+/**
+ * Fold every tool call in a freshly produced assistant message onto the real tool name, in place,
+ * BEFORE the message is emitted — so the settled render, the transcript, tool resolution and the
+ * extension guard hooks all see the canonical name. No-op unless VINCI_CODE=1.
+ */
+function vinciNormalizeToolCalls(message: AssistantMessage, tools: readonly AgentTool[] | undefined): void {
+	if (process.env.VINCI_CODE !== "1") {
+		return;
+	}
+	for (const part of message.content) {
+		if (part.type === "toolCall") {
+			const canonical = vinciNormalizeToolName(part.name, tools);
+			if (canonical !== part.name) {
+				part.name = canonical;
+			}
+		}
+	}
+}
 
 /**
  * Start an agent loop with a new prompt message.
@@ -199,7 +334,8 @@ async function runLoop(
 				return;
 			}
 
-			// Check for tool calls
+			// Check for tool calls. (Under VINCI_CODE, hallucinated tool-name synonyms were already
+			// folded onto the real tool inside streamAssistantResponse, before this message was emitted.)
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 
 			const toolResults: ToolResultMessage[] = [];
@@ -301,16 +437,23 @@ async function streamAssistantResponse(
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 
+	const vinciStreamController = config.model.provider === "vinci" ? new AbortController() : undefined;
+	const responseSignal = vinciStreamController
+		? signal
+			? AbortSignal.any([signal, vinciStreamController.signal])
+			: vinciStreamController.signal
+		: signal;
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
-		signal,
+		signal: responseSignal,
 	});
+	const eventSource = vinciStreamController ? withVinciStreamWatchdog(response, vinciStreamController) : response;
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
 
-	for await (const event of response) {
+	for await (const event of eventSource) {
 		switch (event.type) {
 			case "start":
 				partialMessage = event.partial;
@@ -342,6 +485,7 @@ async function streamAssistantResponse(
 			case "done":
 			case "error": {
 				const finalMessage = await response.result();
+				vinciNormalizeToolCalls(finalMessage, context.tools); // [vinci] canonicalize hallucinated tool-name synonyms before emit
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {
@@ -357,6 +501,7 @@ async function streamAssistantResponse(
 	}
 
 	const finalMessage = await response.result();
+	vinciNormalizeToolCalls(finalMessage, context.tools); // [vinci] canonicalize hallucinated tool-name synonyms before emit
 	if (addedPartial) {
 		context.messages[context.messages.length - 1] = finalMessage;
 	} else {
@@ -414,6 +559,8 @@ async function executeToolCallsSequential(
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
+			// Immediate results skip finalizeExecutedToolCall, so no tool_hooks_start is emitted:
+			// no hooks run, and the tool_execution_end alone closes the watchdog's execution window.
 			finalized = {
 				toolCall,
 				result: preparation.result,
@@ -428,6 +575,7 @@ async function executeToolCallsSequential(
 				executed,
 				config,
 				signal,
+				emit,
 			);
 		}
 
@@ -490,6 +638,7 @@ async function executeToolCallsParallel(
 				executed,
 				config,
 				signal,
+				emit,
 			);
 			await emitToolExecutionEnd(finalized, emit);
 			return finalized;
@@ -576,7 +725,13 @@ async function prepareToolCall(
 	}
 
 	try {
-		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		// [vinci] Repair double-encoded arguments (a nested array arriving as a JSON string) before
+		// validation — a complete, correct edit was observed failing on exactly this. Schema-aware;
+		// no-op unless VINCI_CODE=1. See vinci-coerce.ts.
+		const coercedArguments = vinciCoerceArguments(tool.parameters, toolCall.arguments);
+		const coercedToolCall =
+			coercedArguments === toolCall.arguments ? toolCall : { ...toolCall, arguments: coercedArguments };
+		const preparedToolCall = prepareToolCallArguments(tool, coercedToolCall);
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);
 		if (config.beforeToolCall) {
 			const beforeResult = await config.beforeToolCall(
@@ -596,9 +751,14 @@ async function prepareToolCall(
 				};
 			}
 			if (beforeResult?.block) {
+				// [vinci] Mark blocked results so the TUI can replace private hook guidance with safe copy.
+				// The model still receives the real reason; upstream behavior is unchanged when Vinci is off.
 				return {
 					kind: "immediate",
-					result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"),
+					result: createErrorToolResult(
+						beforeResult.reason || "Tool execution was blocked",
+						process.env.VINCI_CODE === "1" ? { vinciBlocked: true } : undefined,
+					),
 					isError: true,
 				};
 			}
@@ -675,7 +835,14 @@ async function finalizeExecutedToolCall(
 	executed: ExecutedToolCallOutcome,
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
 ): Promise<FinalizedToolCallOutcome> {
+	await emit({
+		type: "tool_hooks_start",
+		toolCallId: prepared.toolCall.id,
+		toolName: prepared.toolCall.name,
+	});
+
 	let result = executed.result;
 	let isError = executed.isError;
 
@@ -713,10 +880,10 @@ async function finalizeExecutedToolCall(
 	};
 }
 
-function createErrorToolResult(message: string): AgentToolResult<any> {
+function createErrorToolResult(message: string, details: Record<string, unknown> = {}): AgentToolResult<any> {
 	return {
 		content: [{ type: "text", text: message }],
-		details: {},
+		details,
 	};
 }
 

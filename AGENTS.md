@@ -28,6 +28,7 @@
 - After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
 - Never run `npm run build` or `npm test` unless requested by the user.
 - Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root: `node ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`.
+- `packages/tui` does NOT use vitest — it uses the Node built-in runner (`node:test`). Vitest against a tui test file reports `No test files found, exiting with code 1`, which looks like a broken runner but is just the wrong tool. Run tui tests with `npm test -w @earendil-works/pi-tui`, or a single file with `cd packages/tui && node --test test/specific.test.ts`. Every other package (`agent`, `ai`, `coding-agent`) uses vitest.
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
@@ -66,7 +67,7 @@ If rebase conflicts occur:
 
 ## Issues and PRs
 
-See `CONTRIBUTING.md` for the contributor gate (auto-close workflows, `lgtm`/`lgtmi`, quality bar).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for which layer a change belongs in, the quality bar, and PR expectations.
 
 When reviewing PRs:
 
@@ -114,48 +115,33 @@ Rules:
 
 Attribution:
 
-- Internal (from issues): `Fixed foo bar ([#123](https://github.com/earendil-works/pi-mono/issues/123))`
-- External contributions: `Added feature X ([#456](https://github.com/earendil-works/pi-mono/pull/456) by [@username](https://github.com/username))`
+- Internal (from issues): `Fixed foo bar ([#123](https://github.com/getsimpledirect/vinci-code-cli/issues/123))`
+- External contributions: `Added feature X ([#456](https://github.com/getsimpledirect/vinci-code-cli/pull/456) by [@username](https://github.com/username))`
 
 ## Releasing
 
-**Lockstep versioning**: all packages share one version; every release updates all together. `patch` = fixes + additions, `minor` = breaking changes. No major releases.
+Vinci Code does **not** release the way upstream Pi does. Pi publishes npm packages under
+`@earendil-works/*`; Vinci ships a signed binary. Do not run `npm run release:*`,
+`npm run publish`, or `scripts/publish.mjs` - they target upstream's npm scope.
 
-1. **Update CHANGELOGs**: ask the user whether they ran the `/cl` prompt on the latest commit on `main`. If not, they must run `/cl` first to audit and update each package's `[Unreleased]` section before releasing.
+A release is cut by pushing a protected `vinci-v*` tag, which triggers
+`.github/workflows/vinci-release.yml`:
 
-2. **Local smoke test**: build an unpublished release and smoke test from outside the repo (so it can't resolve workspace files):
-   ```bash
-   npm run release:local -- --out /tmp/pi-local-release --force
-   cd /tmp
+1. **build-and-verify** - refuses any tag that is not `vinci-v*`, checks the tag matches the
+   built identity, packages an unsigned payload, and runs the offline harness against the
+   packaged artifact.
+2. **publish** - carries the *tested* payload forward (never a rebuild), assumes the release
+   role via OIDC, signs the tested archive, uploads the immutable artifact write-once,
+   verifies the staged object and the signed manifest, and publishes the manifest last as
+   the single activation point.
 
-   # Node package install smoke tests
-   /tmp/pi-local-release/node/pi --help
-   /tmp/pi-local-release/node/pi --version
-   /tmp/pi-local-release/node/pi --list-models
-   /tmp/pi-local-release/node/pi -p "Say exactly: ok"
-   /tmp/pi-local-release/node/pi
+Clients verify updates against the pinned public key in `vinci/updater/public-key.pem`.
 
-   # Bun binary smoke tests
-   /tmp/pi-local-release/bun/pi --help
-   /tmp/pi-local-release/bun/pi --version
-   /tmp/pi-local-release/bun/pi --list-models
-   /tmp/pi-local-release/bun/pi -p "Say exactly: ok"
-   /tmp/pi-local-release/bun/pi
-   ```
-   Verify both Node and Bun startup, model/account listing, interactive startup, and at least one real prompt with the intended default provider. The bare commands `/tmp/pi-local-release/node/pi` and `/tmp/pi-local-release/bun/pi` start interactive mode; run each in tmux, submit a prompt, and wait for the model reply before considering the interactive smoke test passed. Failures are release blockers unless the user explicitly accepts the risk.
+Release notes live in `vinci/release-notes/` and are mirrored to the public
+`getsimpledirect/vinci-code-releases` repository.
 
-3. **Run the release script**:
-   ```bash
-   PI_ALLOW_LOCKFILE_CHANGE=1 npm_config_min_release_age=0 npm run release:patch    # fixes + additions
-   PI_ALLOW_LOCKFILE_CHANGE=1 npm_config_min_release_age=0 npm run release:minor    # breaking changes
-   ```
-   Use `npm_config_min_release_age=0` only for the release command. The repo's normal npm age gate can otherwise block the release lockfile refresh when the current workspace package version was published recently. Review any lockfile or shrinkwrap diffs the release creates before push.
-
-   The release script bumps all package versions, updates changelogs, regenerates release artifacts, runs `npm run check`, commits `Release vX.Y.Z`, tags `vX.Y.Z`, adds fresh `## [Unreleased]` changelog sections, commits `Add [Unreleased] section for next cycle`, then pushes `main` and the tag. Do not rerun the release script after a tag was pushed.
-
-4. **CI publishes npm packages**: pushing the `vX.Y.Z` tag triggers `.github/workflows/build-binaries.yml`. The `publish-npm` job uses npm trusted publishing through GitHub Actions OIDC with environment `npm-publish`; no local `npm publish`, `npm whoami`, OTP, or WebAuthn flow is required.
-
-5. **If CI publish fails**: inspect the failed `publish-npm` job. The publish helper is idempotent and skips package versions already present on npm, so rerun the tag workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
+Signing-key handling and the operational runbook are documented in the internal ops
+repository, not here.
 
 ## User Override
 

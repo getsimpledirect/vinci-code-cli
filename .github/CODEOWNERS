@@ -1,0 +1,23 @@
+# Review is requested automatically from these owners.
+#
+# Most of packages/ is upstream Pi and changes there usually belong upstream
+# instead - see CONTRIBUTING.md. The Vinci layer and anything governing the
+# repository always get a maintainer's eyes.
+
+*                       @thegeorgepu @ayushnaikccino
+
+# The Vinci layer
+/vinci/                 @thegeorgepu @ayushnaikccino
+/packages/**/vinci-*.ts @thegeorgepu @ayushnaikccino
+
+# Release, CI and repository governance
+/.github/               @thegeorgepu @ayushnaikccino
+/scripts/               @thegeorgepu @ayushnaikccino
+
+# Licensing, provenance and policy - never change these casually
+/LICENSE                @thegeorgepu @ayushnaikccino
+/THIRD_PARTY_NOTICES.md @thegeorgepu @ayushnaikccino
+/TRADEMARKS.md          @thegeorgepu @ayushnaikccino
+/UPSTREAM.md            @thegeorgepu @ayushnaikccino
+/SECURITY.md            @thegeorgepu @ayushnaikccino
+/CODE_OF_CONDUCT.md     @thegeorgepu @ayushnaikccino

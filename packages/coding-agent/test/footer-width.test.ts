@@ -17,12 +17,16 @@ type AssistantUsage = {
 function createSession(options: {
 	sessionName: string;
 	modelId?: string;
+	modelName?: string;
 	provider?: string;
 	reasoning?: boolean;
+	responseModel?: string;
 	thinkingLevel?: string;
 	usage?: AssistantUsage;
 }): AgentSession {
-	const usage = options.usage;
+	const usage =
+		options.usage ??
+		(options.responseModel ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } : undefined);
 	const entries =
 		usage === undefined
 			? []
@@ -31,7 +35,10 @@ function createSession(options: {
 						type: "message",
 						message: {
 							role: "assistant",
+							model: options.modelId ?? "test-model",
+							provider: options.provider ?? "test",
 							usage,
+							responseModel: options.responseModel,
 						},
 					},
 				];
@@ -40,6 +47,7 @@ function createSession(options: {
 		state: {
 			model: {
 				id: options.modelId ?? "test-model",
+				name: options.modelName,
 				provider: options.provider ?? "test",
 				contextWindow: 200_000,
 				reasoning: options.reasoning ?? false,
@@ -140,5 +148,28 @@ describe("FooterComponent width handling", () => {
 
 		const statsLine = stripAnsi(footer.render(120)[1]);
 		expect(statsLine).toContain("CH25.0%");
+	});
+
+	it("shows the resolved Vinci class for an auto-selected model", () => {
+		const previous = process.env.VINCI_CODE;
+		process.env.VINCI_CODE = "1";
+
+		try {
+			const session = createSession({
+				sessionName: "",
+				modelId: "auto",
+				modelName: "Vinci",
+				provider: "vinci",
+				responseModel: "fortissimo",
+			});
+			const footer = new FooterComponent(session, createFooterData(1));
+
+			const statsLine = stripAnsi(footer.render(120)[1]);
+			expect(statsLine).toContain("Vinci Fortissimo");
+			expect(statsLine).not.toContain("Vinci Forte ");
+		} finally {
+			if (previous === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previous;
+		}
 	});
 });

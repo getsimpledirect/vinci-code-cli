@@ -9,6 +9,9 @@
 # Shell scripts should keep LF
 *.sh text eol=lf
 
+# Nested regression patches preserve upstream context whitespace by design.
+vinci/test/ec2/repos/fixtures/*.patch -whitespace
+
 # Common binary assets
 *.png binary
 *.jpg binary

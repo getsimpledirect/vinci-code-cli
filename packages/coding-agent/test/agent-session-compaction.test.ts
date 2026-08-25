@@ -193,7 +193,10 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 
 		const compactionEvents = events.filter((e) => e.type === "compaction_start" || e.type === "compaction_end");
 		expect(compactionEvents).toHaveLength(2);
-		expect(compactionEvents[0]).toEqual({ type: "compaction_start", reason: "manual" });
+		expect(compactionEvents[0]).toMatchObject({ type: "compaction_start", reason: "manual" });
+		expect(compactionEvents[0]?.type === "compaction_start" ? compactionEvents[0].tokens : undefined).toBeGreaterThan(
+			0,
+		);
 		expect(compactionEvents[1]).toMatchObject({
 			type: "compaction_end",
 			reason: "manual",

@@ -1,0 +1,31 @@
+diff --git a/lib/stdio/handle.js b/lib/stdio/handle.js
+--- a/lib/stdio/handle.js
++++ b/lib/stdio/handle.js
+@@ -61,10 +61,9 @@ const getFileDescriptor = ({stdioOption, fdNumber, options, isSync}) => {
+ // For example, `stdout: ['ignore']` behaves the same as `stdout: 'ignore'`.
+ const initializeStdioItems = ({stdioOption, fdNumber, options, optionName}) => {
+ 	const values = Array.isArray(stdioOption) ? stdioOption : [stdioOption];
+-	const inputStdioItems = handleInputOptions(options, fdNumber);
+ 	const initialStdioItems = [
+-		...omitInheritedStdin(values.map(value => initializeStdioItem(value, optionName)), inputStdioItems),
+-		...inputStdioItems,
++		...values.map(value => initializeStdioItem(value, optionName)),
++		...handleInputOptions(options, fdNumber),
+ 	];
+ 
+ 	const stdioItems = filterDuplicates(initialStdioItems);
+@@ -74,14 +73,6 @@ const initializeStdioItems = ({stdioOption, fdNumber, options, optionName}) => {
+ 	return {stdioItems, isStdioArray};
+ };
+ 
+-const omitInheritedStdin = (stdioItems, inputStdioItems) => inputStdioItems.length > 0 && isInheritedStdinOnly(stdioItems)
+-	? []
+-	: stdioItems;
+-
+-const isInheritedStdinOnly = stdioItems => stdioItems.length === 1
+-	&& stdioItems[0].type === 'native'
+-	&& stdioItems[0].value === 'inherit';
+-
+ const initializeStdioItem = (value, optionName) => ({
+ 	type: getStdioItemType(value, optionName),
+ 	value,

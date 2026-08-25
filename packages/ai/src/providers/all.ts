@@ -1,7 +1,7 @@
 import { createImagesModels, type ImagesProvider, type MutableImagesModels } from "../images-models.ts";
 import { MODELS } from "../models.generated.ts";
 import { type CreateModelsOptions, createModels, type MutableModels, type Provider } from "../models.ts";
-import type { Api, KnownProvider, Model } from "../types.ts";
+import type { Api, KnownProvider, Model, ModelThinkingLevel } from "../types.ts";
 import { amazonBedrockProvider } from "./amazon-bedrock.ts";
 import { antLingProvider } from "./ant-ling.ts";
 import { anthropicProvider } from "./anthropic.ts";
@@ -44,6 +44,8 @@ type BuiltinModelApi<
 	TModelId extends keyof (typeof MODELS)[TProvider],
 > = (typeof MODELS)[TProvider][TModelId] extends { api: infer TApi } ? (TApi extends Api ? TApi : never) : never;
 
+type BuiltinProviderApi<TProvider extends KnownProvider> = BuiltinModelApi<TProvider, keyof (typeof MODELS)[TProvider]>;
+
 /** Typed read of the generated built-in catalog. */
 export function getBuiltinModel<TProvider extends KnownProvider, TModelId extends keyof (typeof MODELS)[TProvider]>(
 	provider: TProvider,
@@ -64,6 +66,39 @@ export function getBuiltinModels<TProvider extends KnownProvider>(
 	return models
 		? (Object.values(models) as Model<BuiltinModelApi<TProvider, keyof (typeof MODELS)[TProvider]>>[])
 		: [];
+}
+
+export interface ModelCapabilityCriteria<TApi extends Api> {
+	api: TApi;
+	reasoning?: boolean;
+	thinkingLevel?: ModelThinkingLevel;
+	/**
+	 * Require that the model does NOT support this thinking level. Needed for negative tests, which
+	 * assert that an incapable model rejects a level: pinning such a model by name reintroduces the
+	 * catalog dependence this helper exists to remove, but selecting one that happens to SUPPORT the
+	 * level would silently void the assertion instead of failing it.
+	 */
+	excludesThinkingLevel?: ModelThinkingLevel;
+	excludeModelIds?: readonly string[];
+}
+
+export function findModelByCapability<TProvider extends KnownProvider, TApi extends BuiltinProviderApi<TProvider>>(
+	provider: TProvider,
+	criteria: ModelCapabilityCriteria<TApi>,
+): Model<TApi> {
+	const model = getBuiltinModels(provider).find(
+		(candidate): candidate is Model<TApi> =>
+			candidate.api === criteria.api &&
+			(criteria.reasoning === undefined || candidate.reasoning === criteria.reasoning) &&
+			(criteria.thinkingLevel === undefined || candidate.thinkingLevelMap?.[criteria.thinkingLevel] != null) &&
+			(criteria.excludesThinkingLevel === undefined ||
+				candidate.thinkingLevelMap?.[criteria.excludesThinkingLevel] == null) &&
+			!criteria.excludeModelIds?.includes(candidate.id),
+	);
+	if (!model) {
+		throw new Error(`No ${provider} model matches the requested capabilities`);
+	}
+	return model;
 }
 
 /** All built-in providers, freshly constructed. */

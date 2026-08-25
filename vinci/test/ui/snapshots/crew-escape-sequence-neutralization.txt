@@ -1,0 +1,24 @@
+  ✹  Vinci code   ·   you're inside an agent, not the main chat
+
+  Agent · agentname  ◐ working… · <time>
+  Task: Test escape handling
+  LIVE AGENT TRANSCRIPT SENTINEL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Message this agent:
+  >
+
+  Esc to close

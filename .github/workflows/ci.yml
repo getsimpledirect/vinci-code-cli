@@ -12,6 +12,11 @@ concurrency:
 
 jobs:
   build-check-test:
+    # PR #1 (`vinci` -> `main`) is the permanently-open fork-layer PR; it is never going to merge, so
+    # running upstream's CI against it produces a red check on every push to trunk forever. A check
+    # that is always red trains everyone to ignore it, which is how a real failure gets missed.
+    # Trunk's own gates are `vinci-tests` and `PR Gate`.
+    if: github.event_name != 'pull_request' || github.head_ref != 'vinci'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

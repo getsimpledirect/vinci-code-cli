@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { writeFileSync } from "fs";
+import { execFileSync } from "child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import type { ImagesModel } from "../src/types.ts";
@@ -8,6 +9,10 @@ import type { ImagesModel } from "../src/types.ts";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageRoot = join(__dirname, "..");
+const snapshotsDir = join(__dirname, "snapshots");
+const snapshotFilename = "openrouter-image-models.json";
+const snapshotPath = join(snapshotsDir, snapshotFilename);
+const refreshSnapshots = process.argv.includes("--refresh");
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 interface OpenRouterModelRecord {
@@ -26,11 +31,28 @@ interface OpenRouterModelRecord {
 	};
 }
 
-async function fetchOpenRouterImageModels(): Promise<ImagesModel<"openrouter-images">[]> {
+async function loadOpenRouterImageCatalog(): Promise<{ data?: OpenRouterModelRecord[] }> {
+	if (!refreshSnapshots) {
+		if (!existsSync(snapshotPath)) {
+			console.error(
+				`Snapshot ${snapshotFilename} not found. Run: npm --prefix packages/ai run generate-image-models:refresh`,
+			);
+			process.exit(1);
+		}
+		return JSON.parse(readFileSync(snapshotPath, "utf-8")) as { data?: OpenRouterModelRecord[] };
+	}
+
+	console.log("Fetching image models from OpenRouter API...");
+	const response = await fetch(`${OPENROUTER_BASE_URL}/models?output_modalities=image`);
+	const body = await response.text();
+	mkdirSync(snapshotsDir, { recursive: true });
+	writeFileSync(snapshotPath, body, "utf-8");
+	return JSON.parse(body) as { data?: OpenRouterModelRecord[] };
+}
+
+async function loadOpenRouterImageModels(): Promise<ImagesModel<"openrouter-images">[]> {
 	try {
-		console.log("Fetching image models from OpenRouter API...");
-		const response = await fetch(`${OPENROUTER_BASE_URL}/models?output_modalities=image`);
-		const data = (await response.json()) as { data?: OpenRouterModelRecord[] };
+		const data = await loadOpenRouterImageCatalog();
 		const models: ImagesModel<"openrouter-images">[] = [];
 
 		for (const model of data.data ?? []) {
@@ -72,6 +94,7 @@ async function fetchOpenRouterImageModels(): Promise<ImagesModel<"openrouter-ima
 		return models;
 	} catch (error) {
 		console.error("Failed to fetch OpenRouter image models:", error);
+		if (refreshSnapshots) throw error;
 		return [];
 	}
 }
@@ -118,11 +141,25 @@ ${providerEntries}
 }
 
 async function main(): Promise<void> {
-	const models = await fetchOpenRouterImageModels();
+	console.log(
+		refreshSnapshots
+			? "Refreshing image model catalog snapshot..."
+			: "Using committed snapshots (run generate-image-models:refresh to update)",
+	);
+	const models = await loadOpenRouterImageModels();
 	const output = generateImageModelsFile(models);
 	const outputPath = join(packageRoot, "src", "image-models.generated.ts");
 	writeFileSync(outputPath, output, "utf-8");
 	console.log(`Generated ${outputPath}`);
+	try {
+		execFileSync("npx", ["biome", "format", "--write", outputPath], {
+			stdio: "pipe",
+			cwd: packageRoot,
+		});
+	} catch (error) {
+		// Biome formatting is best-effort; don't fail if it errors
+		console.warn("Warning: biome formatting failed (non-fatal)");
+	}
 }
 
 main().catch((error) => {

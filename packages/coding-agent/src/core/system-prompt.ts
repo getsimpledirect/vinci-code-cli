@@ -122,7 +122,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	}
 
 	// Always include these
-	addGuideline("Be concise in your responses");
+	// [vinci] Vinci's character pack asks for step-by-step narration for non-programmers — a blanket
+	// "be concise" directly fights that on a small model, so Vinci drops it (the pack owns the voice).
+	if (process.env.VINCI_CODE !== "1") addGuideline("Be concise in your responses");
 	addGuideline("Show file paths clearly when working with files");
 
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");

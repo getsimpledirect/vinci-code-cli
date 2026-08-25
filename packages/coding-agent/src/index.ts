@@ -320,6 +320,21 @@ export {
 	type ProjectTrustStoreEntry,
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
+// [vinci] shared grader core (verification system) — the SINGLE check used by both the core turn-end
+// enforcement and the vinci-review/vinci-todo extensions. See vinci/docs/verification.md.
+export {
+	GRADER_SYSTEM,
+	type GraderCompleteOpts,
+	type GraderVerdict,
+	gatherDiff,
+	isBinary,
+	looksLikeCompletionClaim,
+	parseGraderVerdict,
+	runReview,
+	taskFromBranch,
+} from "./core/vinci-grader.ts";
+// [vinci] display-only secret masking, exported so the vinci-render extension can mask expanded tool output.
+export { vinciMaskEnabled, vinciMaskSecrets } from "./core/vinci-mask-secrets.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 // Run modes for programmatic SDK usage
@@ -389,8 +404,10 @@ export {
 	Theme,
 	type ThemeColor,
 } from "./modes/interactive/theme/theme.ts";
+export { sanitizeTerminalLabel } from "./terminal-utils.ts";
 // Clipboard utilities
 export { copyToClipboard } from "./utils/clipboard.ts";
+export { type FormatDurationOptions, formatDuration } from "./utils/format-duration.ts";
 export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.ts";
 export { convertToPng } from "./utils/image-convert.ts";
 export { formatDimensionNote, type ResizedImage, resizeImage } from "./utils/image-resize.ts";

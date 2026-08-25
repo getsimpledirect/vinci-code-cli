@@ -1,0 +1,24 @@
+  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.49
+  Vinci   ·   <repo>
+  ● connected   ·   /undo safety net   ·   Ctrl+T thinking   ·   /thinking speed
+
+
+
+ Update the README
+
+ ● Create README.md
+   └ ✓ saved · +1 −0 · ctrl+o for full diff
+    +  1 # Test project
+
+ I updated the README and left it ready for review.
+
+  ✓ Done  ·  1 file
+  README.md  ·  Documentation change applied; no project check was required.  ·…
+  2 model calls · 200 in / 100 out · 0% cached · ~$0.0000 estimated · <time> active
+  Billed total in Platform.
+
+╭ ✹ Ask Vinci ──────────────────────────────────────────────────── ● connected ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ▶ AUTO  ·  Vinci ─── <workspace>  ·  0% full · ↓ 15 ╯

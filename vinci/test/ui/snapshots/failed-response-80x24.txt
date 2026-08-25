@@ -1,0 +1,21 @@
+  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.49
+  Vinci   ·   <repo>
+  /login to connect   ·   /undo safety net   ·   Ctrl+T thinking   ·   /thinking
+
+
+
+ Run the checks
+
+
+ ▎ Error: The local provider stopped responding.
+
+  ! Stopped — needs you
+  The local provider stopped responding.
+  1 model call · 100 in / 50 out · 0% cached · ~$0.0000 estimated · <time> active
+  Billed total in Platform.
+
+╭ ✹ Ask Vinci ───────────────────────────────────────────────────────── /login ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ▶ AUTO  ·  Vinci ──── <workspace>  ·  0% full · ↓ 4 ╯

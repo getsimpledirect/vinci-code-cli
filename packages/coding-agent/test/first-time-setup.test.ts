@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { shouldRunFirstTimeSetup } from "../src/cli/startup-ui.ts";
-import { ENV_AGENT_DIR } from "../src/config.ts";
+import { isOfficialDistribution, shouldRunFirstTimeSetup } from "../src/cli/startup-ui.ts";
+import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, PACKAGE_NAME } from "../src/config.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 
 describe("shouldRunFirstTimeSetup", () => {
@@ -34,7 +34,14 @@ describe("shouldRunFirstTimeSetup", () => {
 	});
 
 	it("returns true when experimental, default agent dir, and no settings.json", () => {
-		expect(shouldRunFirstTimeSetup(settingsPath)).toBe(true);
+		// First-time setup is reserved for the official Pi distribution; forks/rebrands
+		// (piConfig.name set) must skip it regardless of the other conditions.
+		const official = isOfficialDistribution({
+			packageName: PACKAGE_NAME,
+			appName: APP_NAME,
+			configDirName: CONFIG_DIR_NAME,
+		});
+		expect(shouldRunFirstTimeSetup(settingsPath)).toBe(official);
 	});
 
 	it("returns false when experimental features are disabled", () => {

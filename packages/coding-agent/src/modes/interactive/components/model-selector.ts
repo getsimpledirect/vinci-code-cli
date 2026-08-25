@@ -164,6 +164,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
+		// [vinci] Default to the managed provider in Vinci mode while allowing users to expose their
+		// configured Pi providers without disabling Vinci's other guard rails. This component builds its
+		// own list, so the getModelCandidates() filter in interactive-mode doesn't reach it — filter here too.
+		if (process.env.VINCI_CODE === "1" && !this.settingsManager.getShowOtherProviders()) {
+			models = models.filter((m) => m.provider === "vinci");
+		}
+
 		this.allModels = this.sortModels(models);
 		this.scopedModels = this.scopedModels.map((scoped) => {
 			const refreshed = this.modelRegistry.find(scoped.model.provider, scoped.model.id);
@@ -183,8 +190,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		const sorted = [...models];
-		// Sort: current model first, then by provider
+		// Sort: Vinci first in managed mode, then current model, then provider.
 		sorted.sort((a, b) => {
+			if (process.env.VINCI_CODE === "1" && this.settingsManager.getShowOtherProviders()) {
+				const vinciOrder = Number(b.provider === "vinci") - Number(a.provider === "vinci");
+				if (vinciOrder !== 0) return vinciOrder;
+			}
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
 			if (aIsCurrent && !bIsCurrent) return -1;
@@ -245,17 +256,24 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
 
 			let line = "";
+			// [vinci] Keep friendly display names in both single-provider and mixed lists. The provider badge
+			// is redundant only in the default Vinci-only view; mixed lists need it to remain readable.
+			const vinci = process.env.VINCI_CODE === "1";
+			// [vinci] Friendly names are for the MANAGED catalog, where "Vinci Forte (GLM 5.2)" reads better
+			// than a raw id to a non-programmer. A BYOK user picking someone else's model needs the exact
+			// id — that is what they configured and what the provider will accept — so foreign entries
+			// keep their id alongside the provider badge.
+			const label = (vinci && item.model.provider === "vinci" && item.model.name) || item.id;
+			const showProviderBadge = !vinci || this.settingsManager.getShowOtherProviders();
 			if (isSelected) {
 				const prefix = theme.fg("accent", "→ ");
-				const modelText = `${item.id}`;
-				const providerBadge = theme.fg("muted", `[${item.provider}]`);
+				const providerBadge = showProviderBadge ? ` ${theme.fg("muted", `[${item.provider}]`)}` : "";
 				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${prefix + theme.fg("accent", modelText)} ${providerBadge}${checkmark}`;
+				line = `${prefix + theme.fg("accent", label)}${providerBadge}${checkmark}`;
 			} else {
-				const modelText = `  ${item.id}`;
-				const providerBadge = theme.fg("muted", `[${item.provider}]`);
+				const providerBadge = showProviderBadge ? ` ${theme.fg("muted", `[${item.provider}]`)}` : "";
 				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${modelText} ${providerBadge}${checkmark}`;
+				line = `  ${label}${providerBadge}${checkmark}`;
 			}
 
 			this.listContainer.addChild(new Text(line, 0, 0));
@@ -326,8 +344,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private handleSelect(model: Model<any>): void {
-		// Save as new default
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		// The Vinci launcher passes its managed `auto` model explicitly, which outranks saved defaults at
+		// startup. Preserve the managed no-persist path unless the user has exposed other providers.
+		if (process.env.VINCI_CODE !== "1" || this.settingsManager.getShowOtherProviders()) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		}
 		this.onSelectCallback(model);
 	}
 

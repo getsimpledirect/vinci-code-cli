@@ -1,0 +1,13 @@
+diff --git a/starlette/datastructures.py b/starlette/datastructures.py
+index 5b18d0f3..9e58e9a4 100644
+--- a/starlette/datastructures.py
++++ b/starlette/datastructures.py
+@@ -123,7 +123,7 @@ class URL:
+                 netloc = self.netloc
+                 _, _, hostname = netloc.rpartition("@")
+ 
+-                if hostname and hostname[-1] != "]":
++                if hostname[-1] != "]":
+                     hostname = hostname.rsplit(":", 1)[0]
+ 
+             netloc = hostname

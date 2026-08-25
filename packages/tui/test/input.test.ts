@@ -80,6 +80,21 @@ describe("Input component", () => {
 			const [line] = input.render(width);
 			assert.ok(line);
 			assert.ok(visibleWidth(line) <= width);
+
+			// The test is named for keeping the CURSOR visible, but previously asserted only that a
+			// line came back within the width — never where the caret landed. Setting
+			// `cursorDisplay = 0` paints the caret over the first visible grapheme for every
+			// scrolled input and passed unnoticed.
+			//
+			// The caret is inverse video: ESC[7m<grapheme>ESC[27m. After Ctrl-A and five right
+			// arrows the cursor is on index 5 of the value, so that is the grapheme it must cover.
+			const caret = /\x1b\[7m(.*?)\x1b\[27m/.exec(line);
+			assert.ok(caret, `no inverse-video caret was rendered in: ${JSON.stringify(line)}`);
+			assert.equal(
+				caret[1],
+				[...text][5],
+				`the caret must cover the grapheme at the logical cursor, not whatever is first on screen`,
+			);
 		});
 	});
 

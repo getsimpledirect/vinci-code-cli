@@ -1,0 +1,238 @@
+#!/usr/bin/env sh
+# Stable Vinci Code launcher. The installer keeps this outside versioned payloads so an update can
+# replace a broken release before it starts, without interrupting a task already in progress.
+set -eu
+
+# Local, untracked profile — the SAME file vinci/bin/vinci sources. It must load here too, BEFORE
+# the before-launch and doctor dispatches below: this shim runs the updater before the launcher
+# ever sources the profile, so a profile-set VINCI_ENV=dev would otherwise leave the prod
+# auto-update check running on every launch and make doctor report "prod" on an all-dev machine.
+#
+# TWO THINGS ABOUT THIS BLOCK ARE LOAD-BEARING, and both were wrong.
+#
+# ORDER. VINCI_HOME and UPDATER used to be resolved ABOVE this point, and a profile may set
+# VINCI_HOME. Sourcing reassigns the variable, but nothing recomputed UPDATER — so a profile-set
+# home produced a launch running the DEFAULT home's updater against the PROFILE home's payload.
+# Two installs in one launch, with the updater writing current/ and previous/ into the tree the
+# launcher does not execute from. Every path below is now derived strictly after the profile
+# loads; if you add another, add it below, not above.
+#
+# ISOLATION. This shim exists so an update can replace a broken release before it starts (see the
+# header). Sourcing a user-editable file directly under `set -eu` put that promise behind the
+# contents of that file. Measured, not guessed: a failing command exited 1 with NO message at all,
+# an unset reference exited 1, a syntax error exited 2, and a bare `exit` ended the launcher
+# outright — each leaving `vinci update`, `vinci rollback` and `vinci doctor` unreachable, which
+# is precisely when a user needs them.
+#
+# Wrapping the source in `set +eu` is NOT sufficient, and was tried first: `.` runs in THIS shell,
+# so `exit` in the profile still terminates it. The profile therefore runs in a SUBSHELL, and only
+# the variables it exported come back. Its own output goes to stderr so it stays visible without
+# corrupting the capture.
+#
+# WHAT THIS DOES AND DOES NOT BUY. Two reviews rejected earlier wordings here and both were
+# right, the second one after the first had already been "fixed" — so, measured:
+#
+#   contained now: a bare `exit`, a `set -e` abort, an unset-variable abort, a syntax error, and
+#                  any change to this shell's variables, options, cwd, umask, limits or traps.
+#   NOT contained: `kill -TERM $$` in the profile still ends this launcher (exit 143, measured);
+#                  so do writing files, network calls, and daemons that outlive the subshell.
+#
+# This is a ROBUSTNESS fix against a MALFORMED profile, not a security boundary against a hostile
+# one. The profile is arbitrary code running with the user's full privileges and always was; if it
+# is hostile you have already lost, and nothing here changes that. Do not cite this as a sandbox.
+VINCI_PROFILE_UNCLEAN=0
+VINCI_PROFILE="${HOME:-}/.vinci-code.env"
+if [ -f "$VINCI_PROFILE" ]; then
+  # Initialised before the parse check: the failure branch below never assigns it,
+  # and the next reference under `set -u` would kill the shell — turning a bad
+  # profile back into a dead launcher, which is the whole bug this block removes.
+  VINCI_PROFILE_EXPORTS=""
+  # PARSE IT BEFORE RUNNING IT. `sh -n` is the portable way to ask "is this file
+  # syntactically whole", and it is the only check here that behaves the same on
+  # bash-as-sh and dash.
+  #
+  # THE PROFILE MUST BE POSIX sh, and this is what makes that explicit. Two
+  # different shells read it: this shim is `sh` (dash on Linux) and the launcher
+  # it execs is bash. A bash-only construct — an array, most obviously — parses
+  # for the launcher and not for the shim, so it was never actually supported;
+  # before this change it killed the shim outright on Linux with a raw shell
+  # syntax error and exit 2. Now it is refused by name, with the recovery
+  # commands still available to fix it. That is a narrowing of what is accepted
+  # in appearance only; in substance it is the same set, honestly reported. Detecting PARTIAL application after the fact does not:
+  # bash aborts the sourcing and keeps the assignments above the fault, dash kills
+  # the subshell and keeps nothing. Rather than model two shells, refuse to source
+  # a file that does not parse — then neither shell gets the chance to half-apply it.
+  if ! sh -n "$VINCI_PROFILE" 2>/dev/null; then
+    echo "Vinci could not parse $VINCI_PROFILE, so none of it was applied." >&2
+    VINCI_PROFILE_UNCLEAN=1
+  else
+    VINCI_PROFILE_EXPORTS=$(
+      set +eu
+      set -a
+      . "$VINCI_PROFILE" >&2
+      set +a
+      export -p
+    ) || VINCI_PROFILE_EXPORTS=""
+  fi
+  if [ -n "$VINCI_PROFILE_EXPORTS" ]; then
+    # `export -p` output is always eval-able by the shell that produced it, which is this one.
+    eval "$VINCI_PROFILE_EXPORTS" 2>/dev/null || VINCI_PROFILE_EXPORTS=""
+  fi
+  # An empty capture means the sourcing subshell died — in practice a bare `exit`
+  # in the profile, which runs before `export -p` and takes the whole dump with it.
+  # Nothing applied, so this is unclean too.
+  [ -n "$VINCI_PROFILE_EXPORTS" ] || VINCI_PROFILE_UNCLEAN=1
+
+  # A command returning nonzero is NOT unclean and must not gate the launch. A
+  # profile ending in `[ -f ~/.keys ] && . ~/.keys` returns 1 whenever that file
+  # is absent, and the profile applied perfectly. An earlier draft of this gate
+  # keyed on the source's exit status and refused to start on exactly that shape.
+  if [ -z "$VINCI_PROFILE_EXPORTS" ]; then
+    # Reworded after review: the file WAS read. This fires when the capture came back empty, in
+    # practice because the profile ran `exit` so export -p never happened. "Could not read"
+    # pointed at a permissions problem, which is not what went wrong.
+    echo "Vinci ignored $VINCI_PROFILE; it produced no usable settings." >&2
+  fi
+  unset VINCI_PROFILE_EXPORTS
+fi
+
+VINCI_HOME="${VINCI_HOME:-$HOME/.vinci-code}"
+UPDATER="$VINCI_HOME/updater/update.mjs"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "Vinci Code needs Node.js v22.19 or newer. Install Node, then run Vinci again." >&2
+  exit 1
+fi
+if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)' 2>/dev/null; then
+  echo "Vinci Code needs Node.js v22.19 or newer; this machine has $(node -v 2>/dev/null || printf 'an unsupported version')." >&2
+  exit 1
+fi
+
+if [ ! -f "$UPDATER" ]; then
+  echo "Vinci Code's updater is missing. Re-run the Vinci installer." >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  --version)
+    shift
+    [ "$#" -eq 0 ] || { echo "Usage: vinci --version" >&2; exit 2; }
+    IDENTITY="$VINCI_HOME/current/vinci/identity.json"
+    [ -f "$IDENTITY" ] || { echo "Vinci Code has no active version. Re-run the installer." >&2; exit 1; }
+    exec node -e 'const identity=require(process.argv[1]); if(typeof identity.version!=="string") process.exit(1); console.log(identity.version)' "$IDENTITY"
+    ;;
+  update)
+    shift
+    if [ "${1:-}" = "--check" ]; then
+      shift
+      [ "$#" -eq 0 ] || { echo "Usage: vinci update [--check]" >&2; exit 2; }
+      exec node "$UPDATER" check
+    fi
+    [ "$#" -eq 0 ] || { echo "Usage: vinci update [--check]" >&2; exit 2; }
+    exec node "$UPDATER" update
+    ;;
+  rollback)
+    shift
+    [ "$#" -eq 0 ] || { echo "Usage: vinci rollback" >&2; exit 2; }
+    exec node "$UPDATER" rollback
+    ;;
+  doctor)
+    shift
+    [ "$#" -eq 0 ] || { echo "Usage: vinci doctor" >&2; exit 2; }
+    exec node "$UPDATER" doctor
+    ;;
+esac
+
+# FAIL CLOSED ON A NORMAL LAUNCH. Everything above this line is a recovery
+# command — --version, update, rollback, doctor — and those stay reachable by
+# design, because they are what a user needs when the profile is the thing that
+# is broken. From here down is a real session, and a real session does not start
+# on a profile we could not read.
+#
+# The reason is specific, not general caution. This profile is where VINCI_ENV=dev
+# is set. If it did not apply, the session runs against PROD — with the user's
+# dev intent silently dropped — and that is exactly the leak the dev-environment
+# switch exists to prevent. The shim cannot tell whether the lines it failed to
+# read were the ones that mattered, so it must not guess.
+#
+# This also removes an inconsistency CI exposed: on dash a syntax error discards
+# the whole profile, and an earlier version of this change treated that as a safe
+# outcome while the comment in vinci/bin/vinci called the same discard dangerous.
+# Both cannot be true. Refusing to launch is the half that survives.
+if [ "$VINCI_PROFILE_UNCLEAN" -ne 0 ]; then
+  echo "Vinci will not start a session with a profile it could not fully read." >&2
+  echo "Fix or remove $VINCI_PROFILE, then run Vinci again." >&2
+  echo "Recovery commands still work: vinci doctor, vinci update, vinci rollback." >&2
+  exit 78
+fi
+
+VINCI_UPDATER_TIMEOUT_MS_VALUE="${VINCI_UPDATER_TIMEOUT_MS:-330000}"
+case "$VINCI_UPDATER_TIMEOUT_MS_VALUE" in
+  ''|*[!0-9]*) VINCI_UPDATER_TIMEOUT_MS_VALUE=330000 ;;
+esac
+VINCI_UPDATER_TIMEOUT_MS_VALUE=$(printf '%s' "$VINCI_UPDATER_TIMEOUT_MS_VALUE" | sed 's/^0*//')
+[ -n "$VINCI_UPDATER_TIMEOUT_MS_VALUE" ] || VINCI_UPDATER_TIMEOUT_MS_VALUE=0
+if [ "${#VINCI_UPDATER_TIMEOUT_MS_VALUE}" -gt 7 ] || [ "$VINCI_UPDATER_TIMEOUT_MS_VALUE" -gt 3600000 ]; then
+  VINCI_UPDATER_TIMEOUT_MS_VALUE=3600000
+elif [ "$VINCI_UPDATER_TIMEOUT_MS_VALUE" -lt 1000 ]; then
+  VINCI_UPDATER_TIMEOUT_MS_VALUE=1000
+fi
+VINCI_UPDATER_TIMEOUT_SECONDS=$(( VINCI_UPDATER_TIMEOUT_MS_VALUE / 1000 ))
+VINCI_UPDATER_TIMEOUT_REMAINDER=$(( VINCI_UPDATER_TIMEOUT_MS_VALUE % 1000 ))
+if [ "$VINCI_UPDATER_TIMEOUT_REMAINDER" -ne 0 ]; then
+  VINCI_UPDATER_TIMEOUT_SECONDS="${VINCI_UPDATER_TIMEOUT_SECONDS}.$(printf '%03d' "$VINCI_UPDATER_TIMEOUT_REMAINDER")"
+fi
+
+# Monitor mode gives the updater its own process group. A timer signals this shell at the aggregate
+# deadline; the trap terminates the whole group so a hung download or child process cannot hold the
+# launch open. Explicit updater commands above exec directly and deliberately bypass this bound.
+set +e
+UPDATE_TIMED_OUT=0
+UPDATE_PID=
+trap 'UPDATE_TIMED_OUT=1; if [ -n "${UPDATE_PID}" ]; then kill -TERM "-${UPDATE_PID}" 2>/dev/null || kill -TERM "${UPDATE_PID}" 2>/dev/null; fi' USR1
+(
+  sleep "$VINCI_UPDATER_TIMEOUT_SECONDS"
+  kill -USR1 "$$" 2>/dev/null
+) </dev/null >/dev/null 2>&1 &
+UPDATE_TIMER_PID=$!
+# The updater must be its own process-group leader so the timeout can kill every descendant.
+# `set -m` is not reliable in non-interactive POSIX sh (dash on Linux never creates the group,
+# so a spawned child survives the kill — caught by CI). perl's POSIX setsid works identically
+# on macOS and Linux, and the harness already depends on this exact pattern (vinci/test/run.sh).
+perl -MPOSIX=setsid -e 'setsid() or die "setsid failed: $!"; exec @ARGV' node "$UPDATER" before-launch &
+UPDATE_PID=$!
+wait "$UPDATE_PID"
+UPDATE_STATUS=$?
+kill -TERM "-${UPDATE_TIMER_PID}" 2>/dev/null || kill -TERM "$UPDATE_TIMER_PID" 2>/dev/null
+wait "$UPDATE_TIMER_PID" 2>/dev/null
+# Guard against the timer firing in the gap between the updater exiting and the timer being
+# killed: only treat this as a timeout when wait was actually signal-interrupted (>128).
+# Without this, a real exit status - including a mandatory-update 75 - could be overwritten.
+if [ "$UPDATE_TIMED_OUT" -eq 1 ] && [ "$UPDATE_STATUS" -gt 128 ]; then
+  kill -TERM "-${UPDATE_PID}" 2>/dev/null || kill -TERM "$UPDATE_PID" 2>/dev/null
+  sleep 1
+  kill -KILL "-${UPDATE_PID}" 2>/dev/null || kill -KILL "$UPDATE_PID" 2>/dev/null
+  wait "$UPDATE_PID" 2>/dev/null
+  UPDATE_STATUS=0
+  echo "Vinci's update check timed out; continuing with the installed version." >&2
+fi
+trap - USR1
+set -e
+if [ "$UPDATE_STATUS" -eq 75 ]; then exit 75; fi
+if [ "$UPDATE_STATUS" -ne 0 ]; then
+  echo "Vinci's update check failed unexpectedly; continuing with the installed version." >&2
+fi
+
+PAYLOAD="$VINCI_HOME/current/vinci/bin/vinci"
+if [ ! -f "$PAYLOAD" ]; then
+  FALLBACK="$VINCI_HOME/previous/vinci/bin/vinci"
+  if [ -f "$FALLBACK" ]; then
+    echo "Vinci's active version is incomplete; using the previous version." >&2
+    PAYLOAD="$FALLBACK"
+  else
+    echo "Vinci Code has no runnable version. Re-run the installer." >&2
+    exit 1
+  fi
+fi
+
+exec bash "$PAYLOAD" "$@"

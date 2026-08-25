@@ -1,7 +1,8 @@
 import { type Component, Loader, type TUI } from "@earendil-works/pi-tui";
 import type { WorkingIndicatorOptions } from "../../../core/extensions/index.ts";
+import { formatDuration } from "../../../utils/format-duration.ts";
 import { theme } from "../theme/theme.ts";
-import { CountdownTimer } from "./countdown-timer.ts";
+import { CountdownTimer, ElapsedTimer } from "./countdown-timer.ts";
 import { keyText } from "./keybinding-hints.ts";
 
 export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSummary";
@@ -43,8 +44,12 @@ export class RetryStatusIndicator extends StatusIndicator {
 	private countdown: CountdownTimer | undefined;
 
 	constructor(ui: TUI, attempt: number, maxAttempts: number, delayMs: number) {
-		const retryMessage = (seconds: number) =>
-			`Retrying (${attempt}/${maxAttempts}) in ${seconds}s... (${keyText("app.interrupt")} to cancel)`;
+		const retryMessage = (seconds: number) => {
+			const duration = formatDuration(seconds * 1000);
+			return process.env.VINCI_CODE === "1"
+				? `Provider response paused — reconnecting (${attempt}/${maxAttempts}) in ${duration}... (${keyText("app.interrupt")} to cancel)`
+				: `Retrying (${attempt}/${maxAttempts}) in ${duration}... (${keyText("app.interrupt")} to cancel)`;
+		};
 		super(
 			"retry",
 			ui,
@@ -74,9 +79,18 @@ export class RetryStatusIndicator extends StatusIndicator {
 export type CompactionStatusReason = "manual" | "threshold" | "overflow";
 
 export class CompactionStatusIndicator extends StatusIndicator {
-	constructor(ui: TUI, reason: CompactionStatusReason) {
+	private elapsedTimer: ElapsedTimer | undefined;
+
+	constructor(ui: TUI, reason: CompactionStatusReason, tokens?: number) {
 		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
-		const label =
+		// [vinci] Reframe compaction as calm housekeeping (matches vinci-compact.ts) — no scary
+		// "Context overflow detected". Upstream wording when VINCI_CODE is unset.
+		const vinci = process.env.VINCI_CODE === "1";
+		const vinciLabel = (elapsedMs: number) => {
+			const tokenProgress = tokens === undefined ? "" : ` · ↓ ${formatTokens(tokens)} tokens`;
+			return `Tidying up our conversation… (${formatDuration(elapsedMs, { rounding: "floor" })}${tokenProgress}) ${cancelHint}`;
+		};
+		const upstreamLabel =
 			reason === "manual"
 				? `Compacting context... ${cancelHint}`
 				: `${reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
@@ -85,9 +99,24 @@ export class CompactionStatusIndicator extends StatusIndicator {
 			ui,
 			(spinner) => theme.fg("accent", spinner),
 			(text) => theme.fg("muted", text),
-			label,
+			vinci ? vinciLabel(0) : upstreamLabel,
 		);
+		if (vinci) this.elapsedTimer = new ElapsedTimer(ui, (elapsedMs) => this.setMessage(vinciLabel(elapsedMs)));
 	}
+
+	override dispose(): void {
+		this.elapsedTimer?.dispose();
+		this.elapsedTimer = undefined;
+		super.dispose();
+	}
+}
+
+function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
 }
 
 export class BranchSummaryStatusIndicator extends StatusIndicator {

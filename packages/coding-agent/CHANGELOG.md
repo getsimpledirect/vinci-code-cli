@@ -4,11 +4,38 @@
 
 ### Added
 
+- Added Vinci drag, clipboard-path, and `@path` image attachments through the managed Vinci Vision route.
+- Added fail-closed Vinci credential redaction, sensitive-read controls, sandbox enforcement, and one-command shell network grants.
+- Added Vinci runtime evidence state for dirty-worktree grounding, sticky direct-check results, truthful completion receipts, and visible queued user messages.
+- Added a one-time Vinci hint explaining that Ctrl+T shows or hides collapsed thinking.
+- Added Vinci harness guidance for suggesting narrow user-owned `!command` diagnostics from the input box.
+- Added explicit Vinci model selection and model-recorded repository corpus artifacts for reproducible 9B/27B comparisons.
 - Added public SDK exports for CLI-equivalent model and scoped-model resolution ([#6201](https://github.com/earendil-works/pi/issues/6201)).
 - Added extension entry renderers for persisted display-only session entries that are rendered in interactive mode without being sent to the model context.
+- Added optional terminal and process-handler injection to `InteractiveMode` for deterministic embedded and UI-test environments.
+
+### Changed
+
+- Changed Vinci to collapse model thinking by default while preserving the configurable thinking-visibility toggle.
 
 ### Fixed
 
+- Fixed Vinci advisor calls to reject literal shell substitutions and explicitly mark requests with missing review context as unreviewed.
+- Fixed Vinci completion verification to require focused behavioral tests and post-change diff inspection for routing, auth, retry, fallback, provider-stream, billing, and credential changes.
+- Fixed Vinci provider streams to tolerate one-minute idle gaps and distinguish provider silence from local connection failures in retries and completion receipts.
+- Fixed later Vinci response transforms from removing verifier-grounded completion receipts.
+- Fixed Vinci follow-up input to release stale automation stops immediately, bounded stopped-run summaries to one report, and required direct evidence for install and deployment claims.
+- Fixed Vinci source-ownership tracking to keep truncated shell reads pending and redirected scratch diagnostics to inline commands instead of outside-project writes.
+- Fixed Vinci's consequential confirmation dialogs to default to the safe decline option.
+- Fixed fresh Vinci installations to provision fd and ripgrep while keeping update and telemetry traffic offline.
+- Fixed Vinci advisory requests to remain read-only until implementation is explicitly authorized and blocked accidental whole-file replacement after failed edits.
+- Fixed Vinci recovery layers to honor one bounded-stop state, kept unapplied edits as sticky failure evidence, and treated installed dependency source as read-only diagnostic evidence.
+- Fixed Vinci's exploration loop guard to allow repository verification commands and treat failing tests as diagnostic evidence instead of malformed-action thrashing.
+- Fixed Vinci atomic edit failures to report per-entry matches, same-file guidance, and bounded current-file evidence without weakening strict writes.
+- Fixed Vinci coding guidance to always ground the exact workspace, inspect current changes before repository history, surface tracked dependency references, require candidate-source inspection before mutation, and preserve test exit status with direct focused checks.
+- Fixed Vinci JSON mode to mask structured event values before serialization, preserving valid JSON and numeric usage telemetry while still redacting nested secrets.
+- Fixed Vinci blocked-tool guidance to stay private in interactive tool rendering and aligned unrendered custom tools with Vinci's compact activity timeline.
+- Fixed Vinci completion review to include the prior conversational context behind shorthand approvals and numbered selections.
 - Fixed startup model selection to skip unauthenticated saved defaults so configured local custom models can be selected instead ([#6231](https://github.com/earendil-works/pi/issues/6231)).
 - Fixed Escape aborts to clear runs stuck in extension context hooks that ignore abort signals ([#6234](https://github.com/earendil-works/pi/issues/6234)).
 - Fixed the question extension example to run question tool calls sequentially so multiple questions in one assistant turn remain answerable ([#6189](https://github.com/earendil-works/pi/issues/6189)).

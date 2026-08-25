@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Fixed Vinci provider turns to time out and enter retry handling when a response stream stops producing events, instead of leaving the CLI to exit silently without a final answer.
+- Fixed Vinci-blocked tool results to carry a display-privacy marker without changing non-Vinci tool behavior.
 - Fixed harness split-turn compaction to serialize summary requests so single-concurrency providers are not asked to run overlapping generations ([#5536](https://github.com/earendil-works/pi/issues/5536)).
 - Fixed harness session storage short entry ids to use the random tail of the generated uuidv7 instead of the timestamp prefix, which was nearly constant between calls ([#6242](https://github.com/earendil-works/pi/issues/6242)).
 

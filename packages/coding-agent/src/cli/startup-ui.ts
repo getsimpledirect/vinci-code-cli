@@ -33,7 +33,7 @@ interface DistributionMetadata {
 	configDirName: string;
 }
 
-function isOfficialDistribution({ packageName, appName, configDirName }: DistributionMetadata): boolean {
+export function isOfficialDistribution({ packageName, appName, configDirName }: DistributionMetadata): boolean {
 	return (
 		packageName === OFFICIAL_PACKAGE_NAME &&
 		appName === OFFICIAL_APP_NAME &&

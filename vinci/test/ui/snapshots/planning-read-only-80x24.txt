@@ -1,0 +1,23 @@
+  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.49
+  Vinci   ·   <repo>
+  ● connected   ·   /undo safety net   ·   Ctrl+T thinking   ·   /thinking speed
+
+
+
+ Plan mode — exploring and designing without changing your project.
+
+
+ Let's plan this README update
+
+ ● Create IMPROVEMENT_PLAN.md
+   └ ! didn't work · ctrl+o to see why
+
+ I kept the plan in Vinci and left the project unchanged. Should the README
+ target users or contributors?
+
+
+╭ ◇ Plan with Vinci ────────────────────────────────────────────── ● connected ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ◇ PLAN  ·  Vinci ─── <workspace>  ·  0% full · ↓ 15 ╯

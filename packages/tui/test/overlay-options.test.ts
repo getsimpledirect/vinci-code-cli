@@ -48,13 +48,20 @@ describe("TUI overlay options", () => {
 			tui.start();
 			await renderAndFlush(tui, terminal);
 
-			// Should not crash, and no line should exceed terminal width
+			// Pin the truncation itself, not merely that rendering survived. The overlay declares
+			// width 20 and renders 100 columns of "X"; if the declared width is not enforced, the
+			// overlay overwrites the full 80-column terminal. The previous assertion here was
+			// `assert.ok(line !== undefined)` — it held with the truncation deleted entirely.
 			const viewport = terminal.getViewport();
-			for (const line of viewport) {
-				// visibleWidth not available here, but line length is a rough check
-				// The important thing is it didn't crash
-				assert.ok(line !== undefined);
-			}
+			const longestXRun = Math.max(
+				0,
+				...viewport.map((line) => Math.max(0, ...[...line.matchAll(/X+/g)].map((m) => m[0].length))),
+			);
+			assert.ok(longestXRun > 0, "the overlay should actually be painted");
+			assert.ok(
+				longestXRun <= 20,
+				`overlay must be truncated to its declared width of 20 columns, but a run of ${longestXRun} was rendered`,
+			);
 			tui.stop();
 		});
 

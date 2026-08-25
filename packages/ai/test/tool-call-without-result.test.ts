@@ -199,7 +199,7 @@ describe("Tool Call Without Result Tests", () => {
 	});
 
 	describe.skipIf(!process.env.ZAI_API_KEY)("zAI Provider", () => {
-		const model = getModel("zai", "glm-4.5-air");
+		const model = getModel("zai", "glm-4.7");
 
 		it("should filter out tool calls without corresponding tool results", { retry: 3, timeout: 30000 }, async () => {
 			await testToolCallWithoutResult(model);
@@ -255,7 +255,7 @@ describe("Tool Call Without Result Tests", () => {
 	});
 
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider", () => {
-		const model = getModel("kimi-coding", "kimi-k2-thinking");
+		const model = getModel("kimi-coding", "k3");
 
 		it("should filter out tool calls without corresponding tool results", { retry: 3, timeout: 30000 }, async () => {
 			await testToolCallWithoutResult(model);

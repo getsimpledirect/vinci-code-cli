@@ -127,6 +127,53 @@ describe("AgentSession concurrent prompt guard", () => {
 		return session;
 	}
 
+	// clearQueue() had NO test referencing it anywhere in the repo. It is what restores queued
+	// messages to the editor when a user aborts, so a silent regression loses their typed input.
+	//
+	// Verified unpinned by mutation: deleting the _emitQueueUpdate() call from clearQueue() left
+	// both packages/coding-agent/test/suite/agent-session-queue.test.ts (14 tests) and this file
+	// green. Paths are given in full deliberately — an earlier version of this comment named the
+	// file without its `test/suite/` directory and a reviewer could not locate it, which made a
+	// true claim look fabricated.
+	it("clearQueue returns the queued messages, empties both queues, and emits an update", async () => {
+		createSession();
+
+		const queueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
+		session.subscribe((event) => {
+			if (event.type === "queue_update") {
+				queueEvents.push({ steering: event.steering, followUp: event.followUp });
+			}
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(session.isStreaming).toBe(true);
+
+		await session.steer("steer one");
+		await session.followUp("follow one");
+
+		const eventsBeforeClear = queueEvents.length;
+		const cleared = session.clearQueue();
+
+		// Returns exactly what was queued, so an aborting user gets their text back.
+		expect(cleared.steering).toEqual(["steer one"]);
+		expect(cleared.followUp).toEqual(["follow one"]);
+
+		// Both queues are actually emptied — a second clear must yield nothing.
+		const second = session.clearQueue();
+		expect(second.steering).toEqual([]);
+		expect(second.followUp).toEqual([]);
+
+		// And the clear is announced, so any subscriber showing a queue indicator refreshes.
+		// Asserted on the emitted payload rather than merely on the event count: a count check
+		// would pass on any stray emission from elsewhere in the turn.
+		expect(queueEvents.length).toBeGreaterThan(eventsBeforeClear);
+		expect(queueEvents.at(-1)).toEqual({ steering: [], followUp: [] });
+
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
 	it("should throw when prompt() called while streaming", async () => {
 		createSession();
 

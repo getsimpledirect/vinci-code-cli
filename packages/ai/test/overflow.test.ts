@@ -30,6 +30,21 @@ function createErrorMessage(errorMessage: string): AssistantMessage {
 }
 
 describe("isContextOverflow", () => {
+	it("does not treat the Vinci billing request_too_large code as context overflow", () => {
+		const message = createErrorMessage("Your input exceeds the context window");
+		expect(isContextOverflow(message, 32768, "request_too_large")).toBe(false);
+	});
+
+	it("does not infer overflow from an unstructured request_too_large token", () => {
+		const message = createErrorMessage("413 request_too_large: Request exceeds the maximum size");
+		expect(isContextOverflow(message, 32768)).toBe(false);
+	});
+
+	it("still detects genuine context-window overflow when another code is present", () => {
+		const message = createErrorMessage("Your input exceeds the context window");
+		expect(isContextOverflow(message, 32768, "context_length_exceeded")).toBe(true);
+	});
+
 	it("detects explicit Ollama prompt-too-long errors", () => {
 		const message = createErrorMessage("400 `prompt too long; exceeded max context length by 100918 tokens`");
 		expect(isContextOverflow(message, 32768)).toBe(true);

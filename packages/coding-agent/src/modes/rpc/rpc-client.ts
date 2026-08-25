@@ -59,6 +59,13 @@ export class RpcClient {
 	private pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	private requestId = 0;
+	// [vinci] Event-waiters (waitForIdle/collectEvents) settle only on `agent_end`, so a child that
+	// dies — crash, SIGKILL, or a deliberate stop() — used to leave their promise pending AND their
+	// timeout timer armed and refed for its full duration (10 minutes for a crew helper). That timer
+	// alone keeps the Node event loop alive, which is how `vinci/test/run.sh` came to sit at 0% CPU
+	// after every check had passed. Every waiter registers its aborter here so the same code paths
+	// that already reject in-flight requests can settle waiters too.
+	private eventWaiterAborts: Set<(error: Error) => void> = new Set();
 	private stderr = "";
 	private exitError: Error | null = null;
 	private options: RpcClientOptions;
@@ -163,6 +170,11 @@ export class RpcClient {
 
 		this.process = null;
 		this.pendingRequests.clear();
+		// [vinci] The exit handler above normally does this, but stop() must not depend on it: an
+		// already-exited child never re-emits `exit`, and the SIGKILL fallback path resolves without
+		// one either. Leaving a waiter armed here is what kept a stopped helper's 10-minute timer
+		// holding the process open long after every agent was gone.
+		this.abortEventWaiters(this.exitError ?? new Error("Agent process was stopped."));
 	}
 
 	/**
@@ -447,14 +459,26 @@ export class RpcClient {
 	waitForIdle(timeout = 60000): Promise<void> {
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
-				unsubscribe();
+				settle();
 				reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.stderr}`));
 			}, timeout);
 
+			// [vinci] One teardown for every exit route (agent_end, timeout, process death) so the
+			// timer is always cleared and can never outlive the wait it was guarding.
+			const settle = () => {
+				clearTimeout(timer);
+				unsubscribe();
+				this.eventWaiterAborts.delete(abort);
+			};
+			const abort = (error: Error) => {
+				settle();
+				reject(error);
+			};
+			this.eventWaiterAborts.add(abort);
+
 			const unsubscribe = this.onEvent((event) => {
 				if (event.type === "agent_end") {
-					clearTimeout(timer);
-					unsubscribe();
+					settle();
 					resolve();
 				}
 			});
@@ -468,15 +492,27 @@ export class RpcClient {
 		return new Promise((resolve, reject) => {
 			const events: AgentEvent[] = [];
 			const timer = setTimeout(() => {
-				unsubscribe();
+				settle();
 				reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
 			}, timeout);
+
+			// [vinci] Same single teardown as waitForIdle: the collection timer is released on
+			// agent_end, on timeout, AND when the agent process goes away underneath the wait.
+			const settle = () => {
+				clearTimeout(timer);
+				unsubscribe();
+				this.eventWaiterAborts.delete(abort);
+			};
+			const abort = (error: Error) => {
+				settle();
+				reject(error);
+			};
+			this.eventWaiterAborts.add(abort);
 
 			const unsubscribe = this.onEvent((event) => {
 				events.push(event);
 				if (event.type === "agent_end") {
-					clearTimeout(timer);
-					unsubscribe();
+					settle();
 					resolve(events);
 				}
 			});
@@ -488,7 +524,15 @@ export class RpcClient {
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
 		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
+		try {
+			await this.prompt(message, images);
+		} catch (error) {
+			// [vinci] The collection promise is already live and now settles on process death too, so
+			// abandoning it here would surface as an unhandled rejection (it used to just hang forever,
+			// silently). Absorb it and report the send failure, which is the real cause.
+			eventsPromise.catch(() => {});
+			throw error;
+		}
 		return eventsPromise;
 	}
 
@@ -526,6 +570,21 @@ export class RpcClient {
 			pending.reject(error);
 		}
 		this.pendingRequests.clear();
+		// [vinci] A dead agent will never emit another `agent_end`, so anything waiting for one is
+		// waiting forever. Fail those waits with the same error the requests get — and, crucially,
+		// release their timers, which is what actually let the event loop drain.
+		this.abortEventWaiters(error);
+	}
+
+	/**
+	 * [vinci] Settle every outstanding waitForIdle/collectEvents wait. Iterates a copy: each abort
+	 * removes itself from the live set.
+	 */
+	private abortEventWaiters(error: Error): void {
+		for (const abort of [...this.eventWaiterAborts]) {
+			abort(error);
+		}
+		this.eventWaiterAborts.clear();
 	}
 
 	private async send(command: RpcCommandBody): Promise<RpcResponse> {

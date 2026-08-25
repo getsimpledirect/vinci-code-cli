@@ -1,0 +1,21 @@
+  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.49
+  Vinci   ·   <repo>
+  ● connected   ·   /undo safety net   ·   Ctrl+T thinking   ·   /thinking speed
+
+
+
+ Clean generated files
+
+ ● Confirm change
+
+▎ ──────────────────────────────────────────────────────────────────────────────
+▎
+▎  Vinci wants to delete generated files
+▎
+▌  → Allow once
+▎  Always allow this
+▎  Skip
+▎
+▎  ↑↓ navigate  enter select  escape/ctrl+c cancel
+▎
+▎ ──────────────────────────────────────────────────────────────────────────────

@@ -10,6 +10,10 @@ import { isValidThinkingLevel } from "../cli/args.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 
+export function isManagedVinciProvider(provider: string | undefined): boolean {
+	return provider?.toLowerCase() === "vinci";
+}
+
 /** Default model IDs for each known provider */
 export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
@@ -608,6 +612,13 @@ export async function findInitialModel(options: {
 		}
 	}
 
+	if (isManagedVinciProvider(defaultProvider)) {
+		const requested = defaultModelId ? `vinci/${defaultModelId}` : "the requested Vinci model";
+		throw new Error(
+			`Managed Vinci model ${requested} is unavailable. Vinci will not substitute a provider default or another model.`,
+		);
+	}
+
 	// 4. Try first available model with valid API key
 	const availableModels = await modelRegistry.getAvailable();
 
@@ -653,6 +664,12 @@ export async function restoreModelFromSession(
 
 	// Model not found or no API key - fall back
 	const reason = !restoredModel ? "model no longer exists" : "no auth configured";
+
+	if (isManagedVinciProvider(savedProvider)) {
+		throw new Error(
+			`Managed Vinci model vinci/${savedModelId} is unavailable (${reason}). Vinci will not substitute a different model for this session.`,
+		);
+	}
 
 	if (shouldPrintMessages) {
 		console.error(chalk.yellow(`Warning: Could not restore model ${savedProvider}/${savedModelId} (${reason}).`));

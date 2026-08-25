@@ -1,0 +1,12 @@
+diff --git a/packages/reactivity/src/watch.ts b/packages/reactivity/src/watch.ts
+index 9d4868715..6bc009985 100644
+--- a/packages/reactivity/src/watch.ts
++++ b/packages/reactivity/src/watch.ts
+@@ -241,7 +241,6 @@ export function watch(
+       // watch(source, cb)
+       const newValue = effect.run()
+       if (
+-        immediateFirstRun ||
+         deep ||
+         forceTrigger ||
+         (isMultiSource

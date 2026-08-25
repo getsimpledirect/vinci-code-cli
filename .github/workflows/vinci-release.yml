@@ -1,0 +1,294 @@
+name: Vinci Release
+
+# Ships a signed Vinci Code release from a protected vinci-v* TAG: build → harness → (approval) →
+# sign the TESTED archive → upload the immutable payload write-once → verify the staged S3 object →
+# verify the signed manifest locally → publish the manifest LAST (its single activation point) →
+# verify the live manifest byte-for-byte → GitHub Release. Publish waits for maintainer approval in
+# the protected `vinci-release` environment.
+#
+# SECURITY MODEL — release signing is documented in the internal ops repository:
+#   * Only a vinci-v* TAG ref can run this (asserted here AND in the IAM trust `ref` condition).
+#   * The OIDC role is scoped to exactly the one secret and the release S3 prefix.
+#   * Publish SIGNS the downloaded tested archive — it never rebuilds and never re-packages.
+#   * The immutable versioned artifact is uploaded write-once (S3 If-None-Match).
+#   * All `uses:` are pinned to full commit SHAs; the trailing comment is the human-readable version.
+
+on:
+  push:
+    tags:
+      - "vinci-v*"
+  workflow_dispatch: {}
+
+permissions: {}
+
+# GLOBAL, not per-tag: two releases must never run concurrently or they race the live sequence.
+concurrency:
+  group: vinci-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-verify:
+    # Org-only: needs the AWS OIDC trust that exists in getsimpledirect/vinci-code alone.
+    # Public and forked copies are structurally inert rather than failing noisily.
+    if: github.repository == 'getsimpledirect/vinci-code'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Refuse anything that is not a vinci-v* tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test "$REF_TYPE" = "tag" || { echo "release runs only on a tag ref"; exit 1; }
+          case "$REF_NAME" in
+            vinci-v*) : ;;
+            *) echo "tag is not a vinci-v* release tag"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.19"
+
+      - name: Tag must match the built identity (version is derived, never injected into shell)
+        id: meta
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${REF_NAME#vinci-v}"
+          case "$TAG_VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "tag version '$TAG_VERSION' is not X.Y.Z"; exit 1 ;;
+          esac
+          IDENTITY_VERSION="$(node -p "require('./vinci/identity.json').version")"
+          HEADER_VERSION="$(node -p "(require('fs').readFileSync('vinci/extensions/vinci-header.ts','utf8').match(/VINCI_VERSION = \"([^\"]*)\"/)||[])[1]||''")"
+          echo "tag=$TAG_VERSION identity=$IDENTITY_VERSION header=$HEADER_VERSION"
+          test "$TAG_VERSION" = "$IDENTITY_VERSION" || { echo "identity.json disagrees with the tag"; exit 1; }
+          test "$TAG_VERSION" = "$HEADER_VERSION" || { echo "vinci-header.ts disagrees with the tag"; exit 1; }
+          printf 'version=%s\n' "$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install, build, and package the UNSIGNED payload
+        run: |
+          set -euo pipefail
+          npm ci
+          bash vinci/build.sh
+          bash vinci/package.sh
+
+      - name: Full offline harness (smoke needs gateway auth; CI proves load + UI + unit)
+        run: VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh
+
+      # The harness above runs FROM THE REPO, where every source path resolves — so it structurally
+      # cannot see a shipped extension importing a file the tarball does not contain. 0.0.31 shipped
+      # broken exactly that way (an extension imported packages/coding-agent/src, which is not
+      # packaged) and died at startup with a green harness, two green CI legs and a green 50-run
+      # campaign behind it. Verify the ARTIFACT, not the repo.
+      - name: Verify the PACKAGED artifact loads (unpack the real tarball and resolve its imports)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/vinci-artifact-check
+          mkdir -p /tmp/vinci-artifact-check
+          tar -xzf "release/vinci-code-${{ steps.meta.outputs.version }}.tgz" -C /tmp/vinci-artifact-check
+          node vinci/test/packaged-artifact-check.mjs /tmp/vinci-artifact-check
+          # Belt and braces: the packaged CLI must answer --version without an extension-load error.
+          out="$(/tmp/vinci-artifact-check/vinci/bin/vinci --version 2>&1)" || true
+          printf '%s\n' "${out}"
+          case "${out}" in
+            *"Failed to load extension"*|*"Cannot find module"*)
+              echo "::error::The packaged CLI cannot load its extensions."; exit 1 ;;
+          esac
+
+      - name: Carry the TESTED payload to publish (publish signs this, never a rebuild)
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: vinci-release-payload
+          path: |
+            release/vinci-code-${{ steps.meta.outputs.version }}.tgz
+            release/vinci-code-${{ steps.meta.outputs.version }}.tgz.sha256
+            release/vinci-code.tgz
+            release/install.sh
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+    # Protected environment: publishing pauses here until the maintainer approves the run.
+    environment: vinci-release
+    permissions:
+      contents: write # create the GitHub Release for this tag
+      id-token: write # OIDC federation to the narrowly-scoped AWS release role
+    env:
+      VERSION: ${{ needs.build-and-verify.outputs.version }}
+      S3_BUCKET: vinci-assets
+      S3_PREFIX: vinci-code
+      MANIFEST_URL: https://vinci-assets.s3.ca-central-1.amazonaws.com/vinci-code/manifest-beta.json
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.19"
+
+      - name: Bring in the exact tested payload (not a rebuild)
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: vinci-release-payload
+          path: release
+
+      - name: Assume the release role (OIDC — no stored AWS credentials)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ vars.VINCI_RELEASE_ROLE_ARN }}
+          aws-region: ca-central-1
+
+      - name: Sign the TESTED archive (no rebuild) with a live-derived sequence
+        env:
+          MINIMUM_VERSION: ${{ vars.VINCI_MINIMUM_VERSION || '0.0.09' }}
+        run: |
+          set -euo pipefail
+          # Key lives only in RUNNER_TEMP (ephemeral single-use VM) and is removed on exit.
+          KEY_FILE="$(mktemp "${RUNNER_TEMP}/vinci-key.XXXXXX")"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          aws secretsmanager get-secret-value \
+            --secret-id vinci/code/update-signing-key \
+            --query SecretBinary --output text | base64 -d > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          # Live sequence: fetch, VERIFY signature against the repo trust root, validate as a safe
+          # integer — all inside Node. The value never enters shell arithmetic.
+          curl -fsSL "$MANIFEST_URL" > live-before.json
+          NEXT_SEQ="$(node --input-type=module <<'EOF'
+          import { readFileSync } from "node:fs";
+          import { createPublicKey, verify } from "node:crypto";
+          const m = JSON.parse(readFileSync("live-before.json", "utf8"));
+          const pk = createPublicKey(readFileSync("vinci/updater/public-key.pem"));
+          if (!verify(null, Buffer.from(JSON.stringify(m.signed)), pk, Buffer.from(m.signature, "base64")))
+            throw new Error("live manifest signature does not verify against the repo trust root");
+          const s = m.signed.sequence;
+          if (!Number.isSafeInteger(s) || s < 1) throw new Error(`bad live sequence: ${s}`);
+          process.stdout.write(String(s + 1));
+          EOF
+          )"
+          echo "next sequence: $NEXT_SEQ"
+
+          # Sign the DOWNLOADED artifact directly — create-update-manifest.mjs signs an existing
+          # --artifact, so nothing is rebuilt or re-tarred on this runner.
+          node vinci/scripts/create-update-manifest.mjs \
+            --artifact "release/vinci-code-${VERSION}.tgz" \
+            --artifact-url "https://${S3_BUCKET}.s3.ca-central-1.amazonaws.com/${S3_PREFIX}/vinci-code-${VERSION}.tgz" \
+            --version "$VERSION" \
+            --minimum-version "$MINIMUM_VERSION" \
+            --sequence "$NEXT_SEQ" \
+            --channel beta \
+            --mandatory false \
+            --private-key "$KEY_FILE" \
+            --public-key vinci/updater/public-key.pem \
+            --output release/manifest-beta.json
+
+      - name: Verify the SIGNED manifest against the tested archive BEFORE any upload
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF'
+          import { readFileSync } from "node:fs";
+          import { createPublicKey, verify, createHash } from "node:crypto";
+          const m = JSON.parse(readFileSync("release/manifest-beta.json", "utf8"));
+          const version = process.env.VERSION;
+          const pk = createPublicKey(readFileSync("vinci/updater/public-key.pem"));
+          if (!verify(null, Buffer.from(JSON.stringify(m.signed)), pk, Buffer.from(m.signature, "base64")))
+            throw new Error("freshly signed manifest does not verify against the repo trust root");
+          if (m.signed.version !== version) throw new Error(`manifest version ${m.signed.version} != ${version}`);
+          const local = createHash("sha256").update(readFileSync(`release/vinci-code-${version}.tgz`)).digest("hex");
+          if (local !== m.signed.artifact.sha256) throw new Error("manifest sha does not match the tested archive");
+          const expectedUrl = `https://${process.env.S3_BUCKET}.s3.ca-central-1.amazonaws.com/${process.env.S3_PREFIX}/vinci-code-${version}.tgz`;
+          if (m.signed.artifact.url !== expectedUrl) throw new Error(`manifest url ${m.signed.artifact.url} != ${expectedUrl}`);
+          console.log(`signed manifest verified locally: v${version} seq ${m.signed.sequence}`);
+          EOF
+
+      - name: Upload the immutable payload WRITE-ONCE (manifest not yet)
+        run: |
+          set -euo pipefail
+          B="$S3_BUCKET"; P="$S3_PREFIX"
+          # If-None-Match:* fails atomically if the versioned key already exists — a published
+          # version can never be silently overwritten (no TOCTOU HEAD-then-PUT window).
+          aws s3api put-object --bucket "$B" --key "$P/vinci-code-${VERSION}.tgz" \
+            --body "release/vinci-code-${VERSION}.tgz" --if-none-match "*"
+          aws s3api put-object --bucket "$B" --key "$P/vinci-code-${VERSION}.tgz.sha256" \
+            --body "release/vinci-code-${VERSION}.tgz.sha256" --if-none-match "*"
+          # Mutable pointers (must be overwritable): the compat copy and the installer.
+          aws s3 cp release/vinci-code.tgz "s3://$B/$P/"
+          aws s3 cp release/install.sh "s3://$B/$P/"
+
+      - name: Verify the STAGED S3 object matches the signed manifest before activating clients
+        run: |
+          set -euo pipefail
+          aws s3 cp "s3://${S3_BUCKET}/${S3_PREFIX}/vinci-code-${VERSION}.tgz" staged.tgz
+          node --input-type=module <<'EOF'
+          import { readFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          const m = JSON.parse(readFileSync("release/manifest-beta.json", "utf8"));
+          const staged = createHash("sha256").update(readFileSync("staged.tgz")).digest("hex");
+          if (staged !== m.signed.artifact.sha256) throw new Error("staged S3 artifact hash != signed manifest");
+          console.log(`staged payload verified: sha ${staged.slice(0, 12)}…`);
+          EOF
+
+      - name: Publish the manifest LAST — the single activation point
+        run: aws s3 cp release/manifest-beta.json "s3://${S3_BUCKET}/${S3_PREFIX}/"
+
+      - name: Verify the LIVE manifest is byte-for-byte the one we signed
+        run: |
+          set -euo pipefail
+          curl -fsSL "$MANIFEST_URL" > live-after.json
+          node --input-type=module <<'EOF'
+          import { readFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          const local = createHash("sha256").update(readFileSync("release/manifest-beta.json")).digest("hex");
+          const live = createHash("sha256").update(readFileSync("live-after.json")).digest("hex");
+          if (local !== live) throw new Error("live manifest bytes differ from the manifest we signed");
+          console.log("live manifest is byte-identical to the signed manifest");
+          EOF
+
+      - name: GitHub Release with the shipped artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --title "Vinci Code $VERSION" \
+            --generate-notes \
+            "release/vinci-code-${VERSION}.tgz" \
+            "release/vinci-code-${VERSION}.tgz.sha256" \
+            release/manifest-beta.json
+
+      # Publish user-facing notes to the PUBLIC tracker, where people who don't have access to this
+      # repository can read them. Deliberately last, and deliberately unable to fail the release: by
+      # this point the signed artifacts are uploaded and the release is cut, so a notes problem must
+      # never undo shipping. The step no-ops with an explanation when the notes file or the token is
+      # missing. See vinci/release-notes/README.md.
+      - name: Public release notes
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PUBLIC_REPO: getsimpledirect/vinci-code-releases
+        run: |
+          set -uo pipefail
+          notes="vinci/release-notes/${VERSION}.md"
+          if [ ! -f "$notes" ]; then
+            echo "no $notes — skipping the public note. Releases never block on this."
+            exit 0
+          fi
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PUBLIC_RELEASES_TOKEN is not set — skipping. See vinci/release-notes/README.md."
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$PUBLIC_REPO" \
+            --title "Vinci Code $VERSION" \
+            --notes-file "$notes"

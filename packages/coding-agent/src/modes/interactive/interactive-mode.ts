@@ -27,6 +27,7 @@ import type {
 	OverlayHandle,
 	OverlayOptions,
 	SlashCommand,
+	Terminal,
 } from "@earendil-works/pi-tui";
 import {
 	CombinedAutocompleteProvider,
@@ -83,6 +84,25 @@ import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
+
+// [vinci] The built-ins the lean `/` menu keeps under VINCI_CODE. Module-scoped because TWO
+// places need the same answer: the autocomplete filter below, and the built-in-conflict
+// diagnostic. When they disagreed, a Vinci extension that legitimately replaces a HIDDEN
+// built-in (/copy) was reported as conflicting on every launch — a scary "[Extension issues]"
+// panel about a collision the menu filter had already resolved.
+const VINCI_MENU_COMMANDS = new Set([
+	"login",
+	"logout",
+	"model",
+	"new",
+	"compact",
+	"resume",
+	"reload",
+	"quit",
+	"hotkeys",
+	"help",
+]);
+
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
@@ -97,11 +117,12 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
 import { ArminComponent } from "./components/armin.ts";
-import { AssistantMessageComponent } from "./components/assistant-message.ts";
+import { AssistantMessageComponent, vinciRetryFailureMessage } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BorderedLoader } from "./components/bordered-loader.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
+import { ContentOverlayComponent, getContentOverlayOptions } from "./components/content-overlay.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
 import { CustomMessageComponent } from "./components/custom-message.ts";
@@ -259,6 +280,11 @@ export function isApiKeyLoginProvider(
  * Options for InteractiveMode initialization.
  */
 export interface InteractiveModeOptions {
+	// [vinci] Default-preserving seam used by the offline Vinci UI regression harness (§22).
+	/** Terminal implementation. Defaults to the current process terminal. */
+	terminal?: Terminal;
+	/** Register process signal and uncaught-error handlers. Defaults to true. */
+	manageProcessSignals?: boolean;
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
 	/** Warning message if session model couldn't be restored */
@@ -411,7 +437,7 @@ export class InteractiveMode {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
 		});
 		this.version = VERSION;
-		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
+		this.ui = new TUI(options.terminal ?? new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
@@ -483,7 +509,16 @@ export class InteractiveMode {
 	}
 
 	private getBuiltInCommandConflictDiagnostics(extensionRunner: ExtensionRunner): ResourceDiagnostic[] {
-		const builtinNames = new Set(BUILTIN_SLASH_COMMANDS.map((command) => command.name));
+		// [vinci] Only a built-in the lean menu still SURFACES can really be shadowed. Under
+		// VINCI_CODE the menu is filtered to VINCI_MENU_COMMANDS, and autocomplete builds its
+		// conflict set from that same filtered list — so warning about a hidden built-in reports
+		// a collision that does not exist and that the user cannot act on.
+		const vinciCode = process.env.VINCI_CODE === "1";
+		const builtinNames = new Set(
+			BUILTIN_SLASH_COMMANDS.filter((command) => !vinciCode || VINCI_MENU_COMMANDS.has(command.name)).map(
+				(command) => command.name,
+			),
+		);
 		return extensionRunner
 			.getRegisteredCommands()
 			.filter((command) => builtinNames.has(command.name))
@@ -498,10 +533,31 @@ export class InteractiveMode {
 	}
 
 	private createBaseAutocompleteProvider(): AutocompleteProvider {
-		// Define commands for autocomplete
-		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.map((command) => ({
+		// Define commands for autocomplete.
+		// [vinci] Lean menu: show only the essentials + Vinci features in the `/` dropdown (VINCI_CODE,
+		// set by vinci/bin/vinci). Hidden built-ins still WORK if typed — this only declutters the menu.
+		// Extension commands (/council, /review, …) are added below and always show. Edit VINCI_MENU to tweak.
+		const VINCI_MENU = VINCI_MENU_COMMANDS;
+		// [vinci] Plain-language, on-brand descriptions for the menu a non-programmer browses — no
+		// "provider authentication", "session context", or "keybindings/extensions/skills" jargon.
+		const VINCI_DESCRIPTIONS: Record<string, string> = {
+			login: "Connect to Vinci",
+			logout: "Disconnect from Vinci",
+			model: "Choose which Vinci model to use",
+			new: "Start a fresh conversation",
+			compact: "Free up room by condensing this chat",
+			resume: "Pick up an earlier conversation",
+			reload: "Reload Vinci's settings",
+			quit: "Quit Vinci",
+			hotkeys: "Keyboard shortcuts",
+			help: "See what Vinci can do",
+		};
+		const vinciCode = process.env.VINCI_CODE === "1";
+		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.filter(
+			(command) => !vinciCode || VINCI_MENU.has(command.name),
+		).map((command) => ({
 			name: command.name,
-			description: command.description,
+			description: (vinciCode && VINCI_DESCRIPTIONS[command.name]) || command.description,
 		}));
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");
@@ -626,7 +682,9 @@ export class InteractiveMode {
 	async init(): Promise<void> {
 		if (this.isInitialized) return;
 
-		this.registerSignalHandlers();
+		if (this.options.manageProcessSignals !== false) {
+			this.registerSignalHandlers();
+		}
 
 		// Load changelog (only show new entries, skip for resumed sessions)
 		this.changelogMarkdown = this.getChangelogForDisplay();
@@ -1412,7 +1470,9 @@ export class InteractiveMode {
 			}
 		}
 
-		if (showListing) {
+		// [vinci] Suppress the [Context]/[Skills]/[Prompts]/[Extensions]/[Themes] startup dump for a
+		// clean product launch (VINCI_CODE, set by vinci/bin/vinci). Upstream shows it by default.
+		if (showListing && process.env.VINCI_CODE !== "1") {
 			const contextFiles = this.session.resourceLoader.getAgentsFiles().agentsFiles;
 			if (contextFiles.length > 0) {
 				this.loadedResourcesContainer.addChild(new Spacer(1));
@@ -2079,6 +2139,12 @@ export class InteractiveMode {
 			setHeader: (factory) => this.setExtensionHeader(factory),
 			setTitle: (title) => this.ui.terminal.setTitle(title),
 			custom: (factory, options) => this.showExtensionCustom(factory, options),
+			// [vinci] Let raw-input extensions yield overlay and editor-replacing modal focus.
+			isOverlayActive: () =>
+				this.ui.hasOverlay() ||
+				this.extensionSelector !== undefined ||
+				this.extensionInput !== undefined ||
+				this.extensionEditor !== undefined,
 			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
 			setEditorText: (text) => this.editor.setText(text),
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
@@ -2684,7 +2750,9 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
-			if (text === "/quit") {
+			// [vinci] /exit is the muscle-memory twin of /quit (observed live: it fell through to the
+			// model, which role-played "Goodbye! 👋" while the app kept running — #155).
+			if (text === "/quit" || text === "/exit") {
 				this.editor.setText("");
 				await this.shutdown();
 				return;
@@ -2972,7 +3040,7 @@ export class InteractiveMode {
 				this.defaultEditor.onEscape = () => {
 					this.session.abortCompaction();
 				};
-				this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason));
+				this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason, event.tokens));
 				this.ui.requestRender();
 				break;
 			}
@@ -3038,7 +3106,7 @@ export class InteractiveMode {
 				this.clearStatusIndicator("retry");
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
-					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+					this.showError(vinciRetryFailureMessage(event.attempt, event.finalError));
 				}
 				this.ui.requestRender();
 				break;
@@ -3306,6 +3374,36 @@ export class InteractiveMode {
 		});
 		this.renderProjectTrustWarningIfNeeded();
 
+		// [vinci] A resumed session's restored history is otherwise indistinguishable from live
+		// activity — it re-renders thinking and tool rows exactly as they streamed, which reads as
+		// "the CLI is doing things on its own" (#155, fooled a deliberate observer). Mark where the
+		// earlier conversation ends so new work visibly starts below the line.
+		if (process.env.VINCI_CODE === "1" && entries.some((entry) => entry.type === "message")) {
+			this.chatContainer.addChild(new Spacer(1));
+			this.chatContainer.addChild(
+				new Text(theme.fg("dim", "── resumed — everything above is from an earlier session ──"), 1, 0),
+			);
+		}
+
+		// [vinci #38] The loader recovers from a corrupt session tail by skipping unreadable records —
+		// correct, but silently: the user resumes a shortened conversation with no sign anything is
+		// missing. Say so in the same plain idiom as the divider.
+		const unreadable = this.sessionManager.getParsingErrors?.() ?? [];
+		if (process.env.VINCI_CODE === "1" && unreadable.length > 0) {
+			const count = unreadable.length === 1 ? "1 record" : `${unreadable.length} records`;
+			this.chatContainer.addChild(new Spacer(1));
+			this.chatContainer.addChild(
+				new Text(
+					theme.fg(
+						"warning",
+						`⚠ ${count} from this session couldn't be read and ${unreadable.length === 1 ? "was" : "were"} skipped — the restored conversation may be missing recent steps.`,
+					),
+					1,
+					0,
+				),
+			);
+		}
+
 		// Show compaction info if session was compacted
 		const allEntries = this.sessionManager.getEntries();
 		const compactionCount = allEntries.filter((e) => e.type === "compaction").length;
@@ -3360,11 +3458,16 @@ export class InteractiveMode {
 
 	private handleCtrlC(): void {
 		const now = Date.now();
-		if (now - this.lastSigintTime < 500) {
+		// [vinci] Ctrl+C twice to exit — widen the window (500ms → 1500ms under VINCI_CODE) so a
+		// natural double-tap exits instead of requiring a fast half-second double-press.
+		const windowMs = process.env.VINCI_CODE === "1" ? 1500 : 500;
+		if (now - this.lastSigintTime < windowMs) {
 			void this.shutdown();
 		} else {
 			this.clearEditor();
 			this.lastSigintTime = now;
+			// [vinci] Gentle nudge on the first press instead of a silent clear.
+			if (process.env.VINCI_CODE === "1") this.showStatus("Press Ctrl+C again to exit");
 		}
 	}
 
@@ -4202,13 +4305,28 @@ export class InteractiveMode {
 	}
 
 	private async getModelCandidates(): Promise<Model<any>[]> {
+		// [vinci] The scoped-model early return was UNFILTERED upstream and stayed unfiltered through
+		// the provider-visibility work, so a scoped session could surface non-Vinci models even in the
+		// managed default. Harmless while nothing could reach another provider; a real hole once BYOK
+		// exists. Filtered here so "managed default is Vinci-only" is true on every path, not most.
 		if (this.session.scopedModels.length > 0) {
-			return this.session.scopedModels.map((scoped) => scoped.model);
+			const scoped = this.session.scopedModels.map((entry) => entry.model);
+			if (process.env.VINCI_CODE !== "1") return scoped;
+			return this.settingsManager.getShowOtherProviders()
+				? scoped
+				: scoped.filter((model) => model.provider === "vinci");
 		}
 
 		this.session.modelRegistry.refresh();
 		try {
-			return await this.session.modelRegistry.getAvailable();
+			const models = await this.session.modelRegistry.getAvailable();
+			// [vinci] Default to the managed provider without making VINCI_CODE's security controls an
+			// obstacle to user-supplied provider keys. Upstream remains unchanged when VINCI_CODE is unset.
+			if (process.env.VINCI_CODE !== "1") return models;
+			if (!this.settingsManager.getShowOtherProviders()) {
+				return models.filter((model) => model.provider === "vinci");
+			}
+			return [...models].sort((a, b) => Number(b.provider === "vinci") - Number(a.provider === "vinci"));
 		} catch {
 			return [];
 		}
@@ -4780,6 +4898,14 @@ export class InteractiveMode {
 
 	private async showOAuthSelector(mode: "login" | "logout"): Promise<void> {
 		if (mode === "login") {
+			// [vinci] Managed-default sessions go straight to Vinci — no Anthropic/OpenAI/Copilot
+			// picker. BYOK sessions (showOtherProviders) get Pi's provider picker and its existing
+			// auth storage, while VINCI_CODE and every guard it gates stay enabled. Upstream
+			// (VINCI_CODE unset) is unchanged either way.
+			if (process.env.VINCI_CODE === "1" && !this.settingsManager.getShowOtherProviders()) {
+				void this.showLoginDialog("vinci", "Vinci");
+				return;
+			}
 			this.showLoginAuthTypeSelector();
 			return;
 		}
@@ -4866,12 +4992,18 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.footer.invalidate();
 		this.updateEditorBorderColor();
+		// [vinci] Post-login pointer (VINCI_CODE, set by vinci/bin/vinci): a non-programmer doesn't
+		// need the credentials-file path — close the login with the rest of the ecosystem instead.
+		const credentialsTail =
+			process.env.VINCI_CODE === "1"
+				? "You're connected. Vinci is also on the web and your phone — type /help for links."
+				: `Credentials saved to ${getAuthPath()}`;
 		if (selectedModel) {
-			this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`);
+			this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. ${credentialsTail}`);
 			void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
 			this.checkDaxnutsEasterEgg(selectedModel);
 		} else {
-			this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`);
+			this.showStatus(`${actionLabel}. ${credentialsTail}`);
 			if (selectionError) {
 				this.showError(selectionError);
 			} else {
@@ -5452,13 +5584,18 @@ export class InteractiveMode {
 						.join("\n\n")
 				: "No changelog entries found.";
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.ui.requestRender();
+		this.showContentOverlay("What's New", changelogMarkdown);
+	}
+
+	private showContentOverlay(title: string, body: string): void {
+		void this.showExtensionCustom(
+			(tui, _theme, _keybindings, done) =>
+				new ContentOverlayComponent(tui, title, body, this.getMarkdownThemeWithSettings(), () => done(undefined)),
+			{
+				overlay: true,
+				overlayOptions: () => getContentOverlayOptions(this.ui),
+			},
+		);
 	}
 
 	/**
@@ -5581,13 +5718,7 @@ export class InteractiveMode {
 			}
 		}
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.ui.requestRender();
+		this.showContentOverlay("Keyboard Shortcuts", hotkeys.trim());
 	}
 
 	private async handleClearCommand(): Promise<void> {
@@ -5775,6 +5906,8 @@ export class InteractiveMode {
 			this.ui.stop();
 			this.isInitialized = false;
 		}
-		this.unregisterSignalHandlers();
+		if (this.options.manageProcessSignals !== false) {
+			this.unregisterSignalHandlers();
+		}
 	}
 }

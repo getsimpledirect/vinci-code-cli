@@ -1,0 +1,136 @@
+# Automated gate for the Vinci Code layer. Identity, unit, and headless-xterm UI tests run offline;
+# SMOKE + native PTY layers need a Vinci login or local build and remain local release checks.
+# Scoped to the vinci branch so it never touches upstream CI.
+name: vinci-tests
+# NO `paths:` FILTER — deliberately, and do not reintroduce one.
+#
+# `offline (22)` and `offline (24)` are REQUIRED checks on `vinci`. A path filter and a required
+# check contradict each other: when the filter does not match, the workflow never starts, the
+# required check never reports, and GitHub blocks the PR forever with nothing left to run. The
+# symptom is a PR sitting at "Expected — waiting for status to be reported" with no failure to fix.
+#
+# This bit three times, and the first two fixes were to add another path:
+#   1. a CI-only PR could not satisfy its own checks  → ".github/workflows/**" added
+#   2. a test-only PR matched nothing                 → the test trees added
+#   3. a .gitignore-only PR matched nothing           → this
+# Each addition only moved the wall. Every path NOT listed is still unmergeable — README,
+# AGENTS.md, tsconfig, root package.json — so the enumeration can never be complete.
+#
+# The cost is running the harness (~5 min) on documentation-only PRs. That is cheaper than a
+# permanently unmergeable change, and far cheaper than the next person spending an hour working
+# out why a one-line edit will not merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  # biome + tsgo + the pinned-deps/shrinkwrap/install-lock checks. `ci.yml` runs these
+  # only for `branches: [main]`, so nothing gated them on a vinci-targeted PR: a
+  # contributor without the local pre-commit hook could land a type error or a lint
+  # failure. Single node — these checks are not version-sensitive, unlike the offline
+  # matrix below.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      # `check` now type-checks vinci/extensions, which imports @earendil-works/* by package name.
+      # Those resolve through each package's dist, so without a build every import fails TS2307 and
+      # every imported type degrades to an implicit any — hundreds of cascade errors. ci.yml already
+      # builds before check; this job did not.
+      - name: Build workspace
+        run: bash vinci/build.sh
+      - name: Package unsigned artifact
+        run: bash vinci/package.sh
+      # Keep the unpack procedure aligned with vinci-release.yml lines 91-93.
+      - name: Unpack packaged artifact
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/vinci-artifact-check
+          mkdir -p /tmp/vinci-artifact-check
+          tar -xzf release/vinci-code-*.tgz -C /tmp/vinci-artifact-check
+      # Match vinci-release.yml line 94 exactly so PRs validate the release artifact itself.
+      - name: Verify packaged artifact imports
+        run: node vinci/test/packaged-artifact-check.mjs /tmp/vinci-artifact-check
+      # Stronger than vinci-release.yml's belt-and-braces string match: the packaged CLI
+      # must exit 0 AND print exactly the version identity.json declares. Any other output
+      # (crash, extension-load error, wrong version) fails the PR — the 0.0.31 lesson is
+      # that only driving the artifact itself catches a broken tarball.
+      - name: Probe packaged CLI version
+        run: |
+          set -euo pipefail
+          expected="$(node -p "JSON.parse(require('fs').readFileSync('vinci/identity.json','utf8')).version")"
+          out="$(/tmp/vinci-artifact-check/vinci/bin/vinci --version 2>&1)" || {
+            printf '%s\n' "${out}"; echo "::error::Packaged CLI exited non-zero."; exit 1; }
+          printf '%s\n' "${out}"
+          if [ "${out}" != "${expected}" ]; then
+            echo "::error::Packaged CLI printed '${out}', expected '${expected}'."; exit 1
+          fi
+      - name: Lint, typecheck, and verify pinned deps
+        run: npm run check
+
+  # The upstream vitest suite (`npm test`) otherwise runs only for PRs targeting `main`
+  # (ci.yml), so a vinci-layer change that alters upstream-visible behavior — a new event, a
+  # new session field read — can strand upstream tests without any check going red. That
+  # happened twice before this leg existed (#153: #141's exit hint, #131's hook event), and
+  # was only caught when a mis-based PR ran ci.yml by accident. NOT a required check yet —
+  # flipping it required is a branch-protection decision.
+  upstream-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Build
+        run: npm run build
+      - name: Run upstream test suite
+        run: npm test
+
+  sandbox-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Build Vinci runtime
+        run: bash vinci/build.sh
+      - name: Run sandbox integration
+        run: node --experimental-strip-types vinci/test/sandbox-integration.mjs
+
+  offline:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ["22", "24"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Build Vinci runtime without external catalog refresh
+        run: bash vinci/build.sh
+      # Run all 47+ harness lanes so CI cannot drift from the local suite.
+      # Node 22 (floor): SMOKE skipped (offline), type-stripping integrations skipped (Node 23+ only).
+      # Node 24 (LTS): SMOKE skipped (offline), all type-stripping lanes execute (mask, sandbox, search,
+      # trust, preview, toolload, outcome, etc.). Each skipped lane prints a visible ⚠ marker; failures
+      # report the specific lane and reason so no coverage silently vanishes.
+      - name: Full Vinci test harness (Node ${{ matrix.node }})
+        run: VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh

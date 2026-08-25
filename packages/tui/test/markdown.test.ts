@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Chalk } from "chalk";
 import { Markdown } from "../src/components/markdown.ts";
@@ -543,8 +543,14 @@ describe("Markdown component", () => {
 			const lines = markdown.render(15);
 			const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
 
-			// Should not crash and should produce output
+			// `lines.length > 0` alone is satisfied by [""], and empty strings also satisfy the
+			// width bound below — so returning nothing for a narrow table passed both. Assert the
+			// cell CONTENT survives: a table too narrow to draw should degrade, not disappear.
 			assert.ok(lines.length > 0, "Should produce output");
+			const joined = plainLines.join("\n");
+			for (const cell of ["A", "B", "C", "1", "2", "3"]) {
+				assert.ok(joined.includes(cell), `narrow table dropped cell "${cell}" entirely:\n${joined}`);
+			}
 
 			// Lines should not exceed width
 			for (const line of plainLines) {
@@ -1375,10 +1381,20 @@ bar`,
 			const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
 			const joinedPlain = plainLines.join(" ");
 
-			// The content inside the tags should be visible
+			// The content inside the tags should be visible.
+			//
+			// This was a disjunction — `includes("hidden content") || includes("<thinking>")` — and
+			// the second arm is satisfied by rendering the opening tag ALONE. Dropping everything
+			// after the first inline HTML token therefore passed, which is the exact regression the
+			// test exists to catch (the comment above says so: "marked might treat it as HTML and
+			// hide the content"). Assert the content directly.
 			assert.ok(
-				joinedPlain.includes("hidden content") || joinedPlain.includes("<thinking>"),
-				"Should render HTML-like tags or their content as text, not hide them",
+				joinedPlain.includes("hidden content"),
+				`the text inside HTML-like tags must remain visible, got: ${joinedPlain}`,
+			);
+			assert.ok(
+				joinedPlain.includes("that should be visible"),
+				`text AFTER the closing tag must also survive, got: ${joinedPlain}`,
 			);
 		});
 
@@ -1438,5 +1454,50 @@ bar`,
 
 			assert.strictEqual(partial.render(80).length, complete.render(80).length);
 		});
+	});
+});
+
+// [vinci] Vinci renders fenced code as bare indented lines: a literal ``` reads as breakage to a
+// non-programmer. Gated on VINCI_CODE so upstream pi keeps its fences — the suite above proves the
+// default path is untouched, and this one proves the Vinci path. See issue #98.
+describe("Markdown component (VINCI_CODE=1)", () => {
+	const previous = process.env.VINCI_CODE;
+
+	beforeEach(() => {
+		process.env.VINCI_CODE = "1";
+	});
+
+	afterEach(() => {
+		if (previous === undefined) {
+			delete process.env.VINCI_CODE;
+		} else {
+			process.env.VINCI_CODE = previous;
+		}
+	});
+
+	it("renders fenced code without delimiters or a language line", () => {
+		const markdown = new Markdown("```js\nconsole.log('test');\n```", 0, 0, defaultMarkdownTheme);
+
+		const renderedLines = markdown.render(80).map((line) => line.trimEnd());
+
+		assert.deepStrictEqual(renderedLines.map(stripAnsi), ["  console.log('test');"]);
+		// the indent is styled too, so the block reads as one shaded slab
+		assert.strictEqual(renderedLines[0], chalk.green("  console.log('test');"));
+	});
+
+	it("renders a fence containing backticks without delimiters", () => {
+		const markdown = new Markdown("```md\nnot a closing fence:\n``\n```", 0, 0, defaultMarkdownTheme);
+
+		const lines = markdown.render(80).map((line) => stripAnsi(line).trimEnd());
+
+		assert.deepStrictEqual(lines, ["  not a closing fence:", "  ``"]);
+	});
+
+	it("keeps a streaming fence the same height as the completed one", () => {
+		const partial = new Markdown("```ts\nconst x = 1;\n``", 0, 0, defaultMarkdownTheme);
+		const complete = new Markdown("```ts\nconst x = 1;\n```", 0, 0, defaultMarkdownTheme);
+
+		assert.deepStrictEqual(partial.render(80).map(stripAnsi), complete.render(80).map(stripAnsi));
+		assert.strictEqual(partial.render(80).length, complete.render(80).length);
 	});
 });

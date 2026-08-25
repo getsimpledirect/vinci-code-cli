@@ -28,6 +28,40 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+function formatVinciClassName(modelId: string): string | undefined {
+	if (!/^[a-z][a-z0-9-]*$/.test(modelId) || modelId === "auto") return undefined;
+	const className = modelId
+		.split("-")
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(" ");
+	return `Vinci ${className}`;
+}
+
+function readVinciProvenance(data: unknown):
+	| {
+			event: string;
+			requestedModel: string;
+			resolvedModel?: string;
+	  }
+	| undefined {
+	if (typeof data !== "object" || data === null) return undefined;
+	const record = data as Record<string, unknown>;
+	if (typeof record.event !== "string" || typeof record.requested !== "object" || record.requested === null) {
+		return undefined;
+	}
+	const requested = record.requested as Record<string, unknown>;
+	if (requested.provider !== "vinci" || typeof requested.model !== "string") return undefined;
+	const resolved =
+		typeof record.resolved === "object" && record.resolved !== null
+			? (record.resolved as Record<string, unknown>)
+			: undefined;
+	return {
+		event: record.event,
+		requestedModel: requested.model,
+		resolvedModel: typeof resolved?.model === "string" ? resolved.model : undefined,
+	};
+}
+
 export function formatCwdForFooter(cwd: string, home: string | undefined): string {
 	if (!home) return cwd;
 
@@ -90,8 +124,18 @@ export class FooterComponent implements Component {
 		let totalCacheWrite = 0;
 		let totalCost = 0;
 		let latestCacheHitRate: number | undefined;
+		let resolvedVinciClass: string | undefined;
 
 		for (const entry of this.session.sessionManager.getEntries()) {
+			if (entry.type === "model_change") {
+				resolvedVinciClass = undefined;
+			} else if (entry.type === "custom" && entry.customType === "vinci-model-provenance") {
+				const provenance = readVinciProvenance(entry.data);
+				if (provenance?.requestedModel === "auto") {
+					if (provenance.event === "selected") resolvedVinciClass = undefined;
+					else if (provenance.event === "resolved") resolvedVinciClass = provenance.resolvedModel;
+				}
+			}
 			if (entry.type === "message" && entry.message.role === "assistant") {
 				totalInput += entry.message.usage.input;
 				totalOutput += entry.message.usage.output;
@@ -103,6 +147,13 @@ export class FooterComponent implements Component {
 					entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
 				latestCacheHitRate =
 					latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
+				if (
+					entry.message.provider === "vinci" &&
+					entry.message.model === "auto" &&
+					typeof entry.message.responseModel === "string"
+				) {
+					resolvedVinciClass = entry.message.responseModel;
+				}
 			}
 		}
 
@@ -164,10 +215,28 @@ export class FooterComponent implements Component {
 			statsParts.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
 		}
 
-		let statsLeft = statsParts.join(" ");
+		// [vinci] A consumer doesn't need token/cache/cost telemetry — just a calm "how full" cue, so
+		// they can see when Vinci will tidy up (compact). Everything else is hidden.
+		let statsLeft: string;
+		if (process.env.VINCI_CODE === "1") {
+			const color = contextPercentValue > 90 ? "error" : contextPercentValue > 70 ? "warning" : "dim";
+			statsLeft = contextPercent === "?" ? "" : theme.fg(color, `${Math.round(contextPercentValue)}% full`);
+		} else {
+			statsLeft = statsParts.join(" ");
+		}
 
-		// Add model name on the right side, plus thinking level if model supports it
-		const modelName = state.model?.id || "no-model";
+		// Add model name on the right side, plus thinking level if model supports it.
+		// [vinci] `auto` is labeled from the latest gateway provenance so the account-resolved class
+		// stays visible without turning the session-local choice into a persisted default.
+		const resolvedVinciName =
+			process.env.VINCI_CODE === "1" && state.model?.provider === "vinci" && state.model.id === "auto"
+				? formatVinciClassName(resolvedVinciClass ?? "")
+				: undefined;
+		const modelName =
+			resolvedVinciName ||
+			state.model?.name ||
+			state.model?.id ||
+			(process.env.VINCI_CODE === "1" ? "connecting…" : "no-model");
 
 		let statsLeftWidth = visibleWidth(statsLeft);
 

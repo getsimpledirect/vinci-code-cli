@@ -20,6 +20,7 @@ import {
 	truncateHead,
 	truncateLine,
 } from "./truncate.ts";
+import { vinciResultBudget, vinciResultBudgetEnabled } from "./vinci-result-budget.ts";
 
 const grepSchema = Type.Object({
 	pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
@@ -332,7 +333,11 @@ export function createGrepToolDefinition(
 
 							const rawOutput = outputLines.join("\n");
 							// Apply byte truncation. There is no line limit here because the match limit already capped rows.
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+							// [vinci] a tighter byte cap under VINCI_CODE keeps a large grep from flooding the 9B (#53).
+							const truncation = truncateHead(rawOutput, {
+								maxLines: Number.MAX_SAFE_INTEGER,
+								maxBytes: vinciResultBudgetEnabled() ? vinciResultBudget().maxBytes : undefined,
+							});
 							let output = truncation.content;
 							const details: GrepToolDetails = {};
 							// Build actionable notices for truncation and match limits.
@@ -344,7 +349,9 @@ export function createGrepToolDefinition(
 								details.matchLimitReached = effectiveLimit;
 							}
 							if (truncation.truncated) {
-								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+								notices.push(
+									`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit reached${vinciResultBudgetEnabled() ? ". Refine the pattern to narrow results" : ""}`,
+								);
 								details.truncation = truncation;
 							}
 							if (linesTruncated) {

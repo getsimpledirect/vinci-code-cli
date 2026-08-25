@@ -1,5 +1,5 @@
 import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../../../src/core/keybindings.ts";
 import { ModelSelectorComponent } from "../../../src/modes/interactive/components/model-selector.ts";
 import { ScopedModelsSelectorComponent } from "../../../src/modes/interactive/components/scoped-models-selector.ts";
@@ -100,5 +100,93 @@ describe("issue #3217 scoped model ordering", () => {
 		});
 
 		expect(orderedIds).toEqual([modelTwo.id, modelOne.id, modelThree.id]);
+	});
+
+	it("shows every registered Vinci model and keeps /model selection session-local", async () => {
+		const previous = process.env.VINCI_CODE;
+		const previousShow = process.env.VINCI_SHOW_OTHER_PROVIDERS;
+		process.env.VINCI_CODE = "1";
+		// This regression is about scoped-model ORDER and session-local selection, not provider
+		// visibility. Pin the managed-only view explicitly: providers are open by DEFAULT now, so
+		// relying on the default would make this assert on a mixed catalogue it was never about.
+		process.env.VINCI_SHOW_OTHER_PROVIDERS = "0";
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.authStorage.setRuntimeApiKey("vinci", "vinci-key");
+		harness.session.modelRegistry.registerProvider("vinci", {
+			baseUrl: "https://example.invalid",
+			apiKey: "vinci-key",
+			api: "openai-completions",
+			models: [
+				{
+					id: "auto",
+					name: "Vinci",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+				},
+				{
+					id: "forte",
+					name: "Vinci Forte",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+				},
+				{
+					id: "fortissimo",
+					name: "Vinci Fortissimo",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+				},
+			],
+		});
+
+		try {
+			const auto = harness.session.modelRegistry.find("vinci", "auto")!;
+			const fortissimo = harness.session.modelRegistry.find("vinci", "fortissimo")!;
+			const persist = vi.spyOn(harness.settingsManager, "setDefaultModelAndProvider");
+			const selected: string[] = [];
+			const selector = new ModelSelectorComponent(
+				createFakeTui(),
+				auto,
+				harness.settingsManager,
+				harness.session.modelRegistry,
+				[],
+				(model) => selected.push(model.id),
+				() => {},
+			);
+
+			await waitForAsyncRender();
+
+			const rendered = stripAnsi(selector.render(120).join("\n"));
+			expect(rendered).toContain("Vinci");
+			expect(rendered).toContain("Vinci Forte");
+			expect(rendered).toContain("Vinci Fortissimo");
+			expect(rendered).not.toContain(harness.getModel().id);
+
+			(
+				selector as unknown as {
+					handleSelect(model: typeof fortissimo): void;
+				}
+			).handleSelect(fortissimo);
+			expect(selected).toEqual(["fortissimo"]);
+			expect(persist).not.toHaveBeenCalled();
+
+			await harness.session.setModel(fortissimo);
+			expect(harness.session.model?.id).toBe("fortissimo");
+			expect(persist).not.toHaveBeenCalled();
+		} finally {
+			if (previous === undefined) delete process.env.VINCI_CODE;
+			else process.env.VINCI_CODE = previous;
+			if (previousShow === undefined) delete process.env.VINCI_SHOW_OTHER_PROVIDERS;
+			else process.env.VINCI_SHOW_OTHER_PROVIDERS = previousShow;
+		}
 	});
 });

@@ -70,7 +70,9 @@ export const KEYBINDINGS = {
 		description: "Suspend to background",
 	},
 	"app.thinking.cycle": {
-		defaultKeys: "shift+tab",
+		// [vinci] Vinci auto-manages thinking (on by default, orchestrator-managed — no user toggle),
+		// so free shift+tab for the Auto/Plan mode cycle (vinci-plan.ts). Upstream binding when unset.
+		defaultKeys: process.env.VINCI_CODE === "1" ? [] : "shift+tab",
 		description: "Cycle thinking level",
 	},
 	"app.model.cycleForward": {

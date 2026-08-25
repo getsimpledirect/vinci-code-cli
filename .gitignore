@@ -1,9 +1,16 @@
-node_modules/
+# No trailing slash. With one, this pattern matches DIRECTORIES ONLY, so a
+# node_modules SYMLINK — a file, as far as git is concerned — is not ignored and
+# `git add -A` will happily commit a link containing an absolute path from one
+# developer's machine. That is not hypothetical: it happened in two sibling repos
+# on 2026-07-29, and CI died on a bare "ENOTDIR: not a directory, mkdir
+# .../node_modules" because pnpm found the path already occupied by a non-directory.
+# Without the slash this covers both the real directory and a symlink, at any depth
+# (which is why the packages/* line below stays unnecessary).
+node_modules
 dist/
 *.log
 .DS_Store
 *.tsbuildinfo
-# packages/*/node_modules/
 packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
@@ -39,3 +46,21 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+release/
+
+# Terraform local state and downloaded providers
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+
+# Build output emitted beside the shared verification contract (tsgo maps it here because the
+# coding-agent build imports the vinci-owned source). The .js IS required at runtime by
+# packages/coding-agent/dist and is packaged from the build, but it is generated, never edited.
+vinci/extensions/lib/verification-contract.js
+vinci/extensions/lib/verification-contract.js.map
+vinci/extensions/lib/verification-contract.d.ts
+vinci/extensions/lib/verification-contract.d.ts.map

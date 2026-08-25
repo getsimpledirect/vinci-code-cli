@@ -1,6 +1,10 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, test } from "vitest";
-import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
+import {
+	AssistantMessageComponent,
+	vinciFriendlyError,
+	vinciRetryFailureMessage,
+} from "../src/modes/interactive/components/assistant-message.ts";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
@@ -33,6 +37,33 @@ function createAssistantMessage(
 }
 
 describe("AssistantMessageComponent", () => {
+	test("distinguishes provider stream silence from a local connection failure", () => {
+		expect(vinciFriendlyError("Provider stream timed out after 120000ms without an event", true)).toEqual({
+			text: "Vinci's provider stopped responding. Continue to retry from where it paused.",
+			tone: "muted",
+		});
+		expect(vinciRetryFailureMessage(3, "Provider stream timed out after 120000ms without an event", true)).toBe(
+			"Vinci's provider stopped responding after 3 attempts. Continue to retry from where it paused.",
+		);
+		expect(vinciFriendlyError("fetch failed: ENOTFOUND", true)?.text).toContain("check your connection");
+	});
+
+	test("a provider timeout / 5xx is owned as our fault, not blamed on the user's connection", () => {
+		// The exact customer-facing failure from the v0.0.10 report: a request timeout (server-side).
+		for (const err of ["Request timed out", "504 Gateway Timeout", "socket hang up", "ETIMEDOUT", "ECONNRESET"]) {
+			const friendly = vinciFriendlyError(err, true);
+			expect(friendly?.text).toContain("this is on our end");
+			expect(friendly?.text).not.toContain("check your connection");
+			expect(friendly?.text).toContain("progress is saved");
+		}
+		// …but a genuine client-network failure still gets the actionable "check your connection".
+		expect(vinciFriendlyError("ECONNREFUSED", true)?.text).toContain("check your connection");
+		// And the exhausted-retries line no longer leaks the raw "Retry failed after N attempts: …".
+		const retry = vinciRetryFailureMessage(3, "Request timed out", true);
+		expect(retry).toContain("this is on our end");
+		expect(retry).not.toMatch(/^Retry failed after/);
+	});
+
 	test("adds OSC 133 zone markers to assistant messages without tool calls", () => {
 		initTheme("dark");
 

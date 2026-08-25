@@ -1,0 +1,35 @@
+#!/bin/bash
+# Stub vac: deterministic responses keyed by subcommand/job_id.
+case "$1" in
+  verify)
+    printf '{"job_id":"vac_stub_1","argv":["%s"' "$1"; shift
+    for a in "$@"; do printf ',"%s"' "$a"; done
+    printf ']}
+'
+    exit 0
+    ;;
+  status)
+    echo '{"job_id":"'"$2"'","state":"COMPLETED"}'
+    exit 0
+    ;;
+  report)
+    if [ "$2" = "largeoutput" ]; then
+      python3 -c "import sys; sys.stdout.write('x' * 300000)"
+      exit 0
+    fi
+    echo '{"job_id":"'"$2"'","report":true}'
+    exit 0
+    ;;
+  cancel)
+    if [ "$2" = "fail-job" ]; then
+      echo '{"error":"cannot cancel a completed verification"}'
+      exit 3
+    fi
+    echo '{"cancelled":true,"job_id":"'"$2"'"}'
+    exit 0
+    ;;
+  *)
+    echo "Unknown action: $1" >&2
+    exit 1
+    ;;
+esac

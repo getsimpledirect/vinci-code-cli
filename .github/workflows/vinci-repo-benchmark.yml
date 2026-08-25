@@ -1,0 +1,232 @@
+name: vinci-repo-benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Agent under test"
+        required: true
+        default: "vinci"
+        type: choice
+        options:
+          - vinci
+          - codex
+          - claude
+      campaign_id:
+        description: "Stable campaign slug shared by all repetitions"
+        required: true
+        default: "launch-readiness"
+        type: string
+      repetition:
+        description: "Repetition number"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+      capture_ui:
+        description: "Capture the Express PTY journey (Vinci repetition 1 only)"
+        required: true
+        default: "no"
+        type: choice
+        options:
+          - "no"
+          - "yes"
+
+permissions: {}
+
+concurrency:
+  group: vinci-repo-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.VINCI_EC2_TEST_REGION || 'ca-central-1' }}
+      AWS_ROLE_ARN: ${{ vars.VINCI_EC2_TEST_ROLE_ARN }}
+      ARTIFACT_BUCKET: ${{ vars.VINCI_EC2_TEST_BUCKET }}
+      AUTO_SCALING_GROUP: ${{ vars.VINCI_EC2_TEST_ASG }}
+      RUN_KEY: benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+      PROVIDER: ${{ inputs.provider }}
+      MODEL: ${{ inputs.provider == 'vinci' && 'forte' || 'default' }}
+      CAMPAIGN_ID: ${{ inputs.campaign_id }}
+      REPETITION: ${{ inputs.repetition }}
+      CAPTURE_UI: ${{ inputs.capture_ui }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate benchmark configuration
+        run: |
+          set -euo pipefail
+          : "${AWS_ROLE_ARN:?Set VINCI_EC2_TEST_ROLE_ARN in GitHub Actions variables}"
+          : "${ARTIFACT_BUCKET:?Set VINCI_EC2_TEST_BUCKET in GitHub Actions variables}"
+          : "${AUTO_SCALING_GROUP:?Set VINCI_EC2_TEST_ASG in GitHub Actions variables}"
+          [[ "${PROVIDER}" =~ ^(vinci|codex|claude)$ ]]
+          [[ "${MODEL}" =~ ^(forte|default)$ ]]
+          [[ "${CAMPAIGN_ID}" =~ ^[a-z0-9][a-z0-9-]{2,60}$ ]]
+          [[ "${REPETITION}" =~ ^[1-5]$ ]]
+          [[ "${CAPTURE_UI}" =~ ^(yes|no)$ ]]
+          if [[ "${CAPTURE_UI}" == "yes" ]]; then
+            [[ "${PROVIDER}" == "vinci" && "${REPETITION}" == "1" ]]
+          fi
+
+      - name: Authenticate to AWS with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: vinci-benchmark-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 10800
+
+      - name: Remove a stale runner before starting
+        run: |
+          set -euo pipefail
+          aws autoscaling set-desired-capacity --auto-scaling-group-name "${AUTO_SCALING_GROUP}" --desired-capacity 0
+          for _ in $(seq 1 60); do
+            instances="$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "${AUTO_SCALING_GROUP}" --query 'AutoScalingGroups[0].Instances[].InstanceId' --output text)"
+            [[ -z "${instances}" || "${instances}" == "None" ]] && exit 0
+            sleep 5
+          done
+          echo "::error::The previous EC2 runner did not terminate within five minutes."
+          exit 1
+
+      - name: Stage source and dedicated credential
+        env:
+          VINCI_BENCHMARK_KEY: ${{ secrets.VINCI_EC2_TEST_API_KEY }}
+          CODEX_BENCHMARK_KEY: ${{ secrets.VINCI_BENCHMARK_OPENAI_API_KEY }}
+          CLAUDE_BENCHMARK_KEY: ${{ secrets.VINCI_BENCHMARK_ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          COPYFILE_DISABLE=1 tar \
+            --exclude=.git \
+            --exclude=node_modules \
+            --exclude='*/node_modules' \
+            --exclude='._*' \
+            --exclude='*/._*' \
+            --exclude='.DS_Store' \
+            --exclude='*/.DS_Store' \
+            --exclude=dist \
+            --exclude='*/dist' \
+            --exclude='.terraform' \
+            --exclude='*/.terraform' \
+            --exclude='*.tfstate' \
+            --exclude='*.tfstate.*' \
+            --exclude=vinci-test-artifacts \
+            -czf /tmp/vinci-source.tgz .
+          case "${PROVIDER}" in
+            vinci) key="${VINCI_BENCHMARK_KEY}" ;;
+            codex) key="${CODEX_BENCHMARK_KEY}" ;;
+            claude) key="${CLAUDE_BENCHMARK_KEY}" ;;
+          esac
+          : "${key:?Set the dedicated benchmark secret for ${PROVIDER}}"
+          umask 077
+          printf '%s' "${key}" >/tmp/vinci-benchmark-key
+          aws s3 cp /tmp/vinci-source.tgz "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/source.tgz" --only-show-errors
+          aws s3 cp /tmp/vinci-benchmark-key "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/credential" --only-show-errors
+          rm -f /tmp/vinci-benchmark-key
+
+      - name: Start disposable runner
+        run: |
+          set -euo pipefail
+          aws autoscaling set-desired-capacity --auto-scaling-group-name "${AUTO_SCALING_GROUP}" --desired-capacity 1
+          for _ in $(seq 1 60); do
+            instance_id="$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "${AUTO_SCALING_GROUP}" --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)"
+            if [[ -n "${instance_id}" && "${instance_id}" != "None" ]]; then
+              echo "INSTANCE_ID=${instance_id}" >>"${GITHUB_ENV}"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Auto Scaling did not launch a runner within five minutes."
+          exit 1
+
+      - name: Wait for Systems Manager
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 90); do
+            status="$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=${INSTANCE_ID}" --query 'InstanceInformationList[0].PingStatus' --output text)"
+            [[ "${status}" == "Online" ]] && exit 0
+            sleep 5
+          done
+          echo "::error::The EC2 runner did not become available through Systems Manager."
+          exit 1
+
+      - name: Run benchmark through Systems Manager
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          source_uri="s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/source.tgz"
+          credential_uri="s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/credential"
+          result_uri="s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/results.tgz"
+          evidence_uri="s3://${ARTIFACT_BUCKET}/evidence/${CAMPAIGN_ID}/${PROVIDER}/${REPETITION}/results.tgz"
+          remote_command="$(printf '%s\n' \
+            'set -euo pipefail' \
+            'for attempt in $(seq 1 120); do [[ -f /var/lib/vinci-runner/ready ]] && break; sleep 5; done' \
+            '[[ -f /var/lib/vinci-runner/ready ]] || { tail -200 /var/log/cloud-init-output.log; exit 70; }' \
+            'rm -rf /home/vinci/run && install -d -o vinci -g vinci -m 0755 /home/vinci/run' \
+            "aws s3 cp '${source_uri}' /tmp/vinci-source.tgz --only-show-errors" \
+            'tar -C /home/vinci/run -xzf /tmp/vinci-source.tgz' \
+            'chown -R vinci:vinci /home/vinci/run' \
+            "bash /home/vinci/run/vinci/test/ec2/benchmark-remote-run.sh '${result_uri}' '${credential_uri}' '${PROVIDER}' '${MODEL}' '${CAMPAIGN_ID}' '${REPETITION}' '${CAPTURE_UI}' '${evidence_uri}'")"
+          jq -n --arg command "${remote_command}" '{commands: [$command]}' >ssm-parameters.json
+          command_id="$(aws ssm send-command --instance-ids "${INSTANCE_ID}" --document-name AWS-RunShellScript --comment "Vinci benchmark ${CAMPAIGN_ID}/${PROVIDER}/${REPETITION}" --timeout-seconds 7200 --parameters file://ssm-parameters.json --query 'Command.CommandId' --output text)"
+          echo "SSM_COMMAND_ID=${command_id}" >>"${GITHUB_ENV}"
+          status="Pending"
+          for _ in $(seq 1 750); do
+            status="$(aws ssm get-command-invocation --command-id "${command_id}" --instance-id "${INSTANCE_ID}" --query Status --output text 2>/dev/null || echo Pending)"
+            case "${status}" in Success|Cancelled|TimedOut|Failed|Cancelling) break ;; esac
+            sleep 10
+          done
+          aws ssm get-command-invocation --command-id "${command_id}" --instance-id "${INSTANCE_ID}" >artifacts/ssm-command.json || true
+          [[ "${status}" == "Success" ]] || { echo "::error::Benchmark ended with Systems Manager status ${status}."; exit 1; }
+
+      - name: Download and sanitize metrics
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts/raw artifacts/sanitized
+          if aws s3 cp "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/results.tgz" /tmp/vinci-results.tgz --only-show-errors; then
+            tar -C artifacts/raw -xzf /tmp/vinci-results.tgz
+            find artifacts/raw -type f \( -name metrics.json -o -name summary.json \) -print0 | while IFS= read -r -d '' file; do
+              relative="${file#artifacts/raw/}"
+              mkdir -p "artifacts/sanitized/$(dirname "${relative}")"
+              jq 'walk(if type == "object" then del(.finalText, .adapter) else . end)' "${file}" >"artifacts/sanitized/${relative}"
+            done
+            cp artifacts/raw/environment.txt artifacts/sanitized/environment.txt 2>/dev/null || true
+          else
+            echo "Remote benchmark results were unavailable." >artifacts/sanitized/no-results.txt
+          fi
+
+      - name: Return capacity to zero and remove staging objects
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if [[ -n "${AUTO_SCALING_GROUP}" ]]; then
+            aws autoscaling set-desired-capacity --auto-scaling-group-name "${AUTO_SCALING_GROUP}" --desired-capacity 0
+          fi
+          if [[ -n "${ARTIFACT_BUCKET}" ]]; then
+            aws s3 rm "s3://${ARTIFACT_BUCKET}/runs/${RUN_KEY}/" --recursive --only-show-errors
+          fi
+
+      - name: Upload sanitized benchmark metrics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vinci-benchmark-${{ inputs.campaign_id }}-${{ inputs.provider }}-${{ inputs.repetition }}
+          path: artifacts/sanitized/
+          if-no-files-found: error
+          retention-days: 30

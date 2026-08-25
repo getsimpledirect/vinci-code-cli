@@ -52,6 +52,7 @@ import type {
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
 	SessionBeforeCompactResult,
+	SessionBeforeExitEvent,
 	SessionBeforeForkResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
@@ -202,6 +203,23 @@ export type ReloadHandler = () => Promise<void>;
 export type ShutdownHandler = () => void;
 
 /**
+ * Helper function to emit session_before_exit to extensions (one-shot modes only).
+ * Returns true if the event was emitted, false if there were no handlers.
+ */
+export async function emitSessionBeforeExitEvent(
+	extensionRunner: ExtensionRunner,
+	event: SessionBeforeExitEvent,
+): Promise<boolean> {
+	// Optional call: reduced hosts (tests, embedders) hand runPrintMode a minimal runner surface;
+	// a missing hasHandlers must read as "no handlers", not crash the exit path.
+	if (extensionRunner.hasHandlers?.("session_before_exit")) {
+		await extensionRunner.emit(event);
+		return true;
+	}
+	return false;
+}
+
+/**
  * Helper function to emit session_shutdown event to extensions.
  * Returns true if the event was emitted, false if there were no handlers.
  */
@@ -264,6 +282,7 @@ const noOpUIContext: ExtensionUIContext = {
 	setHeader: () => {},
 	setTitle: () => {},
 	custom: async () => undefined as never,
+	isOverlayActive: () => false, // [vinci] Headless modes never own an overlay.
 	pasteToEditor: () => {},
 	setEditorText: () => {},
 	getEditorText: () => "",
@@ -285,6 +304,7 @@ export class ExtensionRunner {
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
 	private uiContext: ExtensionUIContext;
+	private hasUIContext = false;
 	private mode: ExtensionMode = "print";
 	private cwd: string;
 	private sessionManager: SessionManager;
@@ -310,6 +330,7 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private headlessExitHint: number | undefined;
 
 	constructor(
 		extensions: Extension[],
@@ -419,8 +440,13 @@ export class ExtensionRunner {
 		this.reloadHandler = async () => {};
 	}
 
-	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ?? noOpUIContext;
+	setUIContext(
+		uiContext?: ExtensionUIContext,
+		mode: ExtensionMode = "print",
+		headlessNotify?: ExtensionUIContext["notify"],
+	): void {
+		this.uiContext = uiContext ?? (headlessNotify ? { ...noOpUIContext, notify: headlessNotify } : noOpUIContext);
+		this.hasUIContext = uiContext !== undefined;
 		this.mode = mode;
 	}
 
@@ -429,7 +455,7 @@ export class ExtensionRunner {
 	}
 
 	hasUI(): boolean {
-		return this.uiContext !== noOpUIContext;
+		return this.hasUIContext;
 	}
 
 	getExtensionPaths(): string[] {
@@ -642,6 +668,10 @@ export class ExtensionRunner {
 		this.shutdownHandler();
 	}
 
+	getHeadlessExitHint(): number | undefined {
+		return this.headlessExitHint;
+	}
+
 	/**
 	 * Create an ExtensionContext for use in event handlers and tool execution.
 	 * Context values are resolved at call time, so changes via bindCore/bindUI are reflected.
@@ -701,6 +731,13 @@ export class ExtensionRunner {
 			shutdown: () => {
 				runner.assertActive();
 				runner.shutdownHandler();
+			},
+			declareHeadlessExitHint: (exitCode) => {
+				runner.assertActive();
+				if (!Number.isInteger(exitCode) || exitCode < 1 || exitCode > 255) {
+					throw new Error("Headless exit hint must be an integer from 1 to 255");
+				}
+				runner.headlessExitHint = exitCode;
 			},
 			getContextUsage: () => {
 				runner.assertActive();
@@ -766,6 +803,7 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		if (event.type === "agent_start") this.headlessExitHint = undefined;
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
 

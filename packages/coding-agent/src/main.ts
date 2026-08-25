@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
@@ -38,13 +39,19 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import {
+	assertValidSessionId,
+	findMostRecentSession,
+	getDefaultSessionDir,
+	SessionManager,
+} from "./core/session-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
+import { armStartupLivenessWatchdog, markStartupPhase } from "./modes/print-mode.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
@@ -261,6 +268,19 @@ function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string,
 	}
 }
 
+// [vinci] is the most recent session recent + substantial enough to auto-resume on relaunch?
+// Cheap stat check (no full parse at boot): touched within the window and larger than a header alone,
+// so we don't silently reopen a stale or empty session.
+const VINCI_RESUME_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+function vinciWorthResuming(sessionPath: string): boolean {
+	try {
+		const st = statSync(sessionPath);
+		return Date.now() - st.mtimeMs < VINCI_RESUME_MAX_AGE_MS && st.size > 800;
+	} catch {
+		return false;
+	}
+}
+
 async function createSessionManager(
 	parsed: Args,
 	cwd: string,
@@ -343,6 +363,57 @@ async function createSessionManager(
 		const existingSession = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
 		if (existingSession) {
 			return SessionManager.open(existingSession.path, sessionDir);
+		}
+	}
+
+	// [vinci] on a fresh interactive relaunch, pick up the previous session for this project instead
+	// of always starting cold (uses Pi's own continueRecent). Skipped for print/json/rpc and
+	// --no-session, and opt-out via VINCI_NO_RESUME=1; the user can always start over with /new. The
+	// VINCI_RESUMED marker lets the UI show a branded "picked up where you left off" note.
+	if (
+		process.env.VINCI_CODE === "1" &&
+		process.env.VINCI_NO_RESUME !== "1" &&
+		!parsed.print &&
+		parsed.mode === undefined &&
+		// Only in a TRULY interactive launch. `parsed.print` is just the -p flag; a piped `echo hi | vinci`
+		// has no flag but resolveAppMode still treats non-TTY stdin/stdout as print — auto-resuming there
+		// would append the one-shot prompt to (and feed the full history of) the user's last session.
+		process.stdin.isTTY === true &&
+		process.stdout.isTTY === true &&
+		!parsed.noSession &&
+		!parsed.sessionId
+	) {
+		const dir = sessionDir ?? getDefaultSessionDir(cwd);
+		const recent = findMostRecentSession(dir, cwd);
+		if (recent && vinciWorthResuming(recent)) {
+			process.env.VINCI_RESUMED = "1";
+			// Open the EXACT session we validated. continueRecent() re-derives "most recent" and, for the
+			// default per-cwd dir, does so UNFILTERED — it can reopen a different, unvalidated (stale/empty
+			// or cross-project) file than the one vinciWorthResuming just approved.
+			return SessionManager.open(recent, sessionDir, cwd);
+		}
+	}
+
+	// [vinci #151] Headless deliberately does NOT auto-resume (the block above is interactive-only):
+	// a scripted caller must get the same run every time, and silently prepending an unrelated prior
+	// session would poison the context. That default is right, but it was invisible — so when a
+	// HUMAN runs a headless command in a directory that has prior sessions, say how to opt in.
+	// Gated on stderr being a TTY: piped/captured runs (CI, corpus harnesses, crew children) stay
+	// byte-clean, which matters because those captures get parsed.
+	if (
+		process.env.VINCI_CODE === "1" &&
+		!parsed.noSession &&
+		!parsed.sessionId &&
+		process.stderr.isTTY === true &&
+		(parsed.print || parsed.mode !== undefined || process.stdout.isTTY !== true)
+	) {
+		const dir = sessionDir ?? getDefaultSessionDir(cwd);
+		if (findMostRecentSession(dir, cwd)) {
+			console.error(
+				chalk.dim(
+					"Starting a fresh session. This project has earlier sessions — pass --continue to pick the last one up.",
+				),
+			);
 		}
 	}
 
@@ -532,6 +603,16 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	if (appMode === "print" || appMode === "json") {
+		// This bounds startup in the CLI process only. A bootstrap updater that runs as a separate
+		// Node process before this one on some launch paths remains an explicit residual for #138.
+		// INVARIANTS this arm depends on: (1) every post-arm path that skips runPrintMode
+		// (--help, --list-models, error paths) ends in process.exit, which clears the timer — a
+		// refactor to `return` would leave it pinning the event loop (the #12 exit-leak shape);
+		// (2) one main() per process — the module-level singleton is not re-entrancy-safe.
+		armStartupLivenessWatchdog();
+		markStartupPhase("watchdog armed");
+	}
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
@@ -546,9 +627,11 @@ export async function main(args: string[], options?: MainOptions) {
 	validateSessionIdFlags(parsed);
 
 	// Run migrations (pass cwd for project-local migrations)
+	markStartupPhase("running migrations");
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
 	time("runMigrations");
 
+	markStartupPhase("loading settings");
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
 
@@ -569,6 +652,7 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
+	markStartupPhase("opening session");
 	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
@@ -626,6 +710,7 @@ export async function main(args: string[], options?: MainOptions) {
 				parsed.projectTrustOverride ??
 				(!hasTrustRequiringResources || trustStore.get(cwd) === true));
 		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+		markStartupPhase("creating runtime services (auth, model registry, extensions)");
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
@@ -838,6 +923,7 @@ export async function main(args: string[], options?: MainOptions) {
 		await interactiveMode.run();
 	} else {
 		printTimings();
+		markStartupPhase("entering print mode");
 		const exitCode = await runPrintMode(runtime, {
 			mode: toPrintOutputMode(appMode),
 			messages: parsed.messages,

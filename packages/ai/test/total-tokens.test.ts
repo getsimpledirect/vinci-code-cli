@@ -404,22 +404,18 @@ describe("totalTokens field", () => {
 	// =========================================================================
 
 	describe.skipIf(!process.env.ZAI_API_KEY)("z.ai", () => {
-		it(
-			"glm-4.5-air - should return totalTokens equal to sum of components",
-			{ retry: 3, timeout: 60000 },
-			async () => {
-				const llm = getModel("zai", "glm-4.5-air");
+		it("glm-4.7 - should return totalTokens equal to sum of components", { retry: 3, timeout: 60000 }, async () => {
+			const llm = getModel("zai", "glm-4.7");
 
-				console.log(`\nz.ai / ${llm.id}:`);
-				const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.ZAI_API_KEY });
+			console.log(`\nz.ai / ${llm.id}:`);
+			const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.ZAI_API_KEY });
 
-				logUsage("First request", first);
-				logUsage("Second request", second);
+			logUsage("First request", first);
+			logUsage("Second request", second);
 
-				assertTotalTokensEqualsComponents(first);
-				assertTotalTokensEqualsComponents(second);
-			},
-		);
+			assertTotalTokensEqualsComponents(first);
+			assertTotalTokensEqualsComponents(second);
+		});
 	});
 
 	// =========================================================================
@@ -575,7 +571,7 @@ describe("totalTokens field", () => {
 			"kimi-k2-thinking - should return totalTokens equal to sum of components",
 			{ retry: 3, timeout: 60000 },
 			async () => {
-				const llm = getModel("kimi-coding", "kimi-k2-thinking");
+				const llm = getModel("kimi-coding", "k3");
 
 				console.log(`\nKimi For Coding / ${llm.id}:`);
 				const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.KIMI_API_KEY });

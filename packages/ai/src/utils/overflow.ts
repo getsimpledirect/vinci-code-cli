@@ -35,7 +35,6 @@ import type { AssistantMessage } from "../types.ts";
  */
 const OVERFLOW_PATTERNS = [
 	/prompt is too long/i, // Anthropic token overflow
-	/request_too_large/i, // Anthropic request byte-size overflow (HTTP 413)
 	/input is too long for requested model/i, // Amazon Bedrock
 	/exceeds the context window/i, // OpenAI (Completions & Responses API)
 	/exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i, // OpenAI-compatible proxies (LiteLLM)
@@ -87,7 +86,7 @@ const NON_OVERFLOW_PATTERNS = [
  * ## Reliability by Provider
  *
  * **Reliable detection (returns error with detectable message):**
- * - Anthropic: "prompt is too long: X tokens > Y maximum" or "request_too_large"
+ * - Anthropic: "prompt is too long: X tokens > Y maximum"
  * - OpenAI (Completions & Responses): "exceeds the context window", "exceeds the model's maximum context length of X tokens", or "exceeds model's maximum context length (X)"
  * - Google Gemini: "input token count exceeds the maximum"
  * - xAI (Grok): "maximum prompt length is X but request contains Y"
@@ -124,11 +123,18 @@ const NON_OVERFLOW_PATTERNS = [
  *
  * @param message - The assistant message to check
  * @param contextWindow - Optional context window size for detecting silent overflow (z.ai)
+ * @param code - Optional structured error code from the gateway (e.g. "request_too_large"). If present and equals "request_too_large", returns false (billing cap, not context overflow).
  * @returns true if the message indicates a context overflow
  */
-export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
+export function isContextOverflow(message: AssistantMessage, contextWindow?: number, code?: string): boolean {
 	// Case 1: Check error message patterns
 	if (message.stopReason === "error" && message.errorMessage) {
+		// If the structured code indicates a billing request_too_large (not context overflow),
+		// return false early. This distinguishes the billing ceiling from a genuine overflow.
+		if (code === "request_too_large") {
+			return false;
+		}
+
 		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
 		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));
 		if (!isNonOverflow && OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!))) {

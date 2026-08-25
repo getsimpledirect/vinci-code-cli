@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Questions
-    url: https://discord.com/invite/3cU7Bz4UPx
-    about: Ask questions on Discord instead of opening an issue
+  - name: Security report
+    url: https://github.com/getsimpledirect/vinci-code-cli/blob/main/SECURITY.md
+    about: Do not open a public issue for anything security-sensitive - follow the security policy
+  - name: Upstream Pi issue
+    url: https://github.com/badlogic/pi-mono/issues
+    about: Bugs in Pi's engine (most of packages/) belong upstream - see CONTRIBUTING.md

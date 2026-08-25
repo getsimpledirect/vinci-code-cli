@@ -1,6 +1,7 @@
 {
 	"name": "pi-monorepo",
 	"private": true,
+	"license": "MIT",
 	"type": "module",
 	"workspaces": [
 		"packages/*",
@@ -13,7 +14,8 @@
 	"scripts": {
 		"clean": "npm run clean --workspaces",
 		"build": "cd packages/tui && npm run build && cd ../ai && npm run build && cd ../agent && npm run build && cd ../coding-agent && npm run build && cd ../orchestrator && npm run build",
-		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:ts-imports && npm run check:shrinkwrap && npm run check:install-lock:coding-agent && tsgo --noEmit && npm run check:browser-smoke",
+		"check": "node scripts/check-all.mjs",
+		"check:extensions": "tsgo -p vinci/tsconfig.extensions.json",
 		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
 		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
@@ -36,7 +38,8 @@
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
 		"release:fix-links": "node scripts/release-notes.mjs fix-github-releases",
-		"prepare": "husky"
+		"prepare": "husky",
+		"check:secrets": "node scripts/check-secrets.mjs"
 	},
 	"devDependencies": {
 		"@anthropic-ai/sandbox-runtime": "0.0.26",
