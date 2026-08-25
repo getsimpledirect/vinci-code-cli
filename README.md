@@ -79,6 +79,12 @@ locally and is the same either way.
 | Sandbox | Shipped | Bounded execution for agent-run commands |
 | BYOK | Shipped | Any Pi-supported provider, with every guard above still active |
 
+The first row is the one worth seeing rather than taking on trust. Asked to delete a directory
+with `rm -rf`, it names the classification, prints the exact command it would run, and waits —
+with **no** selected. The directory in this capture still had all four files in it afterwards.
+
+<img src="vinci/assets/panel-guard.png" alt="Vinci Code pausing on a destructive command: it classifies the command as a recursive force delete, prints the exact command, asks whether to run it, and has &quot;No, don't&quot; selected" width="900" />
+
 Layout, the branch model, and the patch inventory: [`vinci/README.md`](vinci/README.md).
 
 ## Project structure
