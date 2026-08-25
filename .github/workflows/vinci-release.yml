@@ -279,16 +279,40 @@ jobs:
           PUBLIC_REPO: getsimpledirect/vinci-code-releases
         run: |
           set -uo pipefail
+          # This step is continue-on-error, so failing here is LOUD but never blocks a release:
+          # the signed artifacts are already uploaded by this point. It previously exited 0 on
+          # every skip path, which made "published nothing" indistinguishable from "published".
+          # Thirty releases reported success while getsimpledirect/vinci-code-releases stayed
+          # empty, because PUBLIC_RELEASES_TOKEN was never configured and nobody could see that
+          # from a green run. A step is green only if it actually published.
           notes="vinci/release-notes/${VERSION}.md"
+          fail=0
+          # A missing note is a WARNING, not a failure: shipping a patch without one is a real
+          # choice, and only 2 of the first 30 releases had a note. Making that red every time
+          # would train everyone to ignore this step, which is how the token misconfiguration
+          # below survived thirty green releases in the first place.
           if [ ! -f "$notes" ]; then
-            echo "no $notes — skipping the public note. Releases never block on this."
+            echo "::warning::No $notes, so no public note was published for ${VERSION}."
+            echo "Nothing to publish — exiting without contacting ${PUBLIC_REPO}."
             exit 0
           fi
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PUBLIC_RELEASES_TOKEN is not set — skipping. See vinci/release-notes/README.md."
-            exit 0
+            echo "::error::PUBLIC_RELEASES_TOKEN is not set, so no public note was published for"
+            echo "::error::  ${VERSION}. Set a token with write access to ${PUBLIC_REPO},"
+            echo "::error::  or remove this step. See vinci/release-notes/README.md."
+            fail=1
           fi
+          [ "$fail" -eq 0 ] || exit 1
+
           gh release create "$RELEASE_TAG" \
             --repo "$PUBLIC_REPO" \
             --title "Vinci Code $VERSION" \
             --notes-file "$notes"
+
+          # Do not take `gh release create` exiting 0 as proof. Read the release back: this is the
+          # only assertion here that a public reader can actually see the note.
+          if ! gh release view "$RELEASE_TAG" --repo "$PUBLIC_REPO" >/dev/null 2>&1; then
+            echo "::error::gh reported success but $RELEASE_TAG is not readable in $PUBLIC_REPO."
+            exit 1
+          fi
+          echo "Published $RELEASE_TAG to $PUBLIC_REPO."
