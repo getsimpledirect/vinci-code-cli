@@ -26,18 +26,13 @@ exact upstream commit this forked from, is in [`UPSTREAM.md`](UPSTREAM.md).
 
 <div align="center">
 
-<img src="vinci/assets/demo-byok.gif" alt="Vinci Code on a fresh checkout with nothing configured: --list-models already shows Anthropic, DeepSeek and Google models alongside Vinci's own classes, which sort first" width="900" />
+<img src="vinci/assets/demo-coding.gif" alt="A real coding turn on a user's own Anthropic key with no Vinci account: Vinci finds the ascending sort in sizes.py, changes it to sort descending, runs the script to prove the fix, and closes by saying the project has no test suite so nothing repeatable confirms it" width="900" />
 
 </div>
 
-A real turn: Vinci narrates what it is doing in plain language, and every tool call reports what it
-actually did — how many items it inspected, how many lines it read — rather than declaring success.
-
-<div align="center">
-
-<img src="vinci/assets/screenshot-session.png" alt="Vinci Code exploring a repository: each step shows the action taken and its concrete result, interleaved with the agent's reasoning" width="900" />
-
-</div>
+That is one unedited turn on a **user's own key** — the header reads `Anthropic: Claude Haiku 4.5`
+and `/login to connect`, because no Vinci account is involved. It ends the way every turn here
+ends: with what was actually verified, what was not, and what it cost.
 
 ## How it fits together
 
@@ -157,6 +152,11 @@ provider Pi supports — 33 of them at the time of writing — each marked `unco
 add a key. A Vinci account is one of the options, never a prerequisite.
 
 <img src="vinci/assets/screenshot-auth.png" alt="The /login prompt: Select authentication method, offering Use a subscription or Use an API key" width="820" />
+
+Providers are visible before you configure anything — on a fresh checkout `--list-models` already
+lists other providers' models next to Vinci's own classes, which simply sort first:
+
+<img src="vinci/assets/demo-byok.gif" alt="On a fresh checkout with nothing configured, vinci --list-models already shows Anthropic, DeepSeek and Google models alongside Vinci's own classes, which sort first" width="900" />
 
 **No account, no environment variable, no sign-up.** Vinci's own classes are offered first, so
 signing in to Vinci stays one keystroke away if you want managed inference — but nothing makes
