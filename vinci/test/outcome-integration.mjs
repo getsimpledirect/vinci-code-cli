@@ -109,8 +109,29 @@ ok("prompt keeps it short", /under ~?60 words/i.test(OUTCOME_SYSTEM));
     ]);
     assert.deepEqual([doneUnverified.outcome.state, doneUnverified.exitCode], ["DONE_UNVERIFIED", 0]);
 
+    const blockedBash = await run([
+      assistant("", [{ type: "toolCall", id: "bash-1", name: "bash", arguments: { command: "rm implementation.ts" } }]),
+      {
+        role: "toolResult",
+        toolCallId: "bash-1",
+        toolName: "bash",
+        content: [{ type: "text", text: "Vinci paused this action before it ran." }],
+        details: { vinciBlocked: true },
+        isError: true,
+        timestamp: Date.now(),
+      },
+      assistant("The destructive command was blocked, so no files changed."),
+    ]);
+    assert.deepEqual(
+      [blockedBash.outcome.state, blockedBash.outcome.reason, blockedBash.exitCode],
+      ["DONE", "No files changed: the attempted change did not go through.", 0],
+    );
+
     const done = await run([assistant("The requested read-only task is complete.")]);
-    assert.deepEqual([done.outcome.state, done.exitCode], ["DONE", 0]);
+    assert.deepEqual(
+      [done.outcome.state, done.outcome.reason, done.exitCode],
+      ["DONE", "The requested read-only task completed without project changes.", 0],
+    );
     console.log("  ✓ receipt outcomes map BLOCKED/WAITING to 3 and DONE states to 0");
   } finally {
     rmSync(cwd, { recursive: true, force: true });

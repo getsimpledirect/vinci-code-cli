@@ -64,8 +64,12 @@ Reproduced verbatim below, so this fork stays honest about what it is built on. 
 describes **upstream Pi**, not Vinci Code: its package names, install instructions,
 Discord and npm links all point at the upstream project, and none of them are Vinci
 support channels. It is kept here rather than in the README because it documents Pi.
-Heading levels are shifted down so it nests under this section; the text is otherwise
-unchanged.
+Heading levels are shifted down so it nests under this section. Four things are omitted
+rather than reproduced: Pi's logo block, its Discord and npm badges, its notice that new
+contributors' issues and PRs are auto-closed, and its own `## License` section. Pi's MIT
+licence is not dropped by that omission — it is recorded in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and in the root
+[`README.md`](README.md). Everything else is unchanged.
 
 ### Pi Agent Harness
 

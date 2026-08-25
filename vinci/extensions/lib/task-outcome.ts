@@ -196,20 +196,25 @@ function assistantMessages(messages: readonly unknown[]): MessageLike[] {
 }
 
 /**
- * Did this run ATTEMPT to change files? Read from the assistant's own edit/write tool calls, not
- * from the resulting file list (#215): a run whose writes were refused — by the workspace guard,
- * a permission gate, a failed match — changes nothing, and calling that "a read-only task" reports
- * the shape of the OUTCOME as if it were the shape of the REQUEST. A refused mutation is not a
- * read-only request that happened to touch nothing.
+ * Did this run ATTEMPT to change files? Read from the assistant's own edit/write tool calls and
+ * guard-blocked bash results, not from the resulting file list (#215): a run whose writes were
+ * refused — by the workspace guard, a permission gate, a failed match — changes nothing, and
+ * calling that "a read-only task" reports the shape of the OUTCOME as if it were the shape of the
+ * REQUEST. A refused mutation is not a read-only request that happened to touch nothing.
  */
 function attemptedFileChange(messages: readonly unknown[]): { attempted: boolean; failed: boolean } {
   const writeCallIds = new Set<string>();
+  const bashCallIds = new Set<string>();
   let attemptedWithoutId = false;
   for (const message of assistantMessages(messages)) {
     if (!Array.isArray(message.content)) continue;
     for (const part of message.content) {
       const content = record(part) as { type?: unknown; name?: unknown; id?: unknown } | undefined;
       if (content?.type !== "toolCall") continue;
+      if (content.name === "bash") {
+        if (typeof content.id === "string" && content.id) bashCallIds.add(content.id);
+        continue;
+      }
       if (content.name !== "edit" && content.name !== "write") continue;
       // Skip id-less calls rather than bucketing them under "": an unrelated id-less error result
       // would otherwise be read as this call's failure.
@@ -217,17 +222,26 @@ function attemptedFileChange(messages: readonly unknown[]): { attempted: boolean
       else attemptedWithoutId = true;
     }
   }
-  if (writeCallIds.size === 0) return { attempted: attemptedWithoutId, failed: false };
+  if (writeCallIds.size === 0 && bashCallIds.size === 0) {
+    return { attempted: attemptedWithoutId, failed: false };
+  }
   // A write can also SUCCEED and still leave changedFiles empty — an edit to a gitignored or
   // artifact-excluded path. Claiming "did not go through" there would be its own false statement,
   // so the failure claim is made only on recorded failure evidence.
   let failed = false;
   for (const entry of messages) {
     const message = record(entry) as
-      | { role?: unknown; toolCallId?: unknown; isError?: unknown; content?: unknown }
+      | { role?: unknown; toolCallId?: unknown; isError?: unknown; content?: unknown; details?: unknown }
       | undefined;
     if (message?.role !== "toolResult") continue;
-    if (typeof message.toolCallId !== "string" || !writeCallIds.has(message.toolCallId)) continue;
+    if (typeof message.toolCallId !== "string") continue;
+    if (bashCallIds.has(message.toolCallId)) {
+      if (message.isError === true && record(message.details)?.vinciBlocked === true) {
+        return { attempted: true, failed: true };
+      }
+      continue;
+    }
+    if (!writeCallIds.has(message.toolCallId)) continue;
     if (message.isError === true) {
       failed = true;
       continue;
@@ -243,7 +257,7 @@ function attemptedFileChange(messages: readonly unknown[]): { attempted: boolean
       .join("\n");
     if (vinciToolTextReportsFailure(text)) failed = true;
   }
-  return { attempted: true, failed };
+  return { attempted: attemptedWithoutId || writeCallIds.size > 0, failed };
 }
 
 function assistantText(message: MessageLike | undefined): string {

@@ -77,6 +77,12 @@ for (const file of files) {
 	const rel = file.slice(root.length + 1);
 	// Only VINCI-owned docs. Upstream Pi's own docs use (url)/(link) template placeholders and are
 	// not ours to police; policing them would make the guard noisy and it would get disabled.
+	// SCOPE NOTE: this allowlist gates LINK CHECKING ONLY. The false-claim rules above run over
+	// every discovered doc with no allowlist, so adding a name here changes link coverage and
+	// nothing else. Commit c22198e5 claimed AGENTS.md and .github/README.md "were never scanned",
+	// which is wrong — they were already scanned for false claims. Measured with a control:
+	// planting a broken link in AGENTS.md goes 0 -> caught across that change, while planting a
+	// false claim is caught 3 -> 3, i.e. unaffected.
 	if (!/^(vinci\/|README\.md|CONTRIBUTING\.md|SECURITY\.md|UPSTREAM\.md|TRADEMARKS\.md|THIRD_PARTY_NOTICES\.md|AGENTS\.md|\.github\/README\.md)/.test(rel)) continue;
 	if (rel.startsWith("vinci/UPSTREAM-") || rel.includes("CHANGELOG") || rel.includes("release-notes")) continue;
 	const text = readFileSync(file, "utf8");
