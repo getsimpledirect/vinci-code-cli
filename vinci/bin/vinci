@@ -129,17 +129,121 @@ if [ -f "$VINCI_PROFILE" ]; then
     VINCI_PROFILE_UNCLEAN=1
     VINCI_PROFILE_EXPORTS=""
   else
+    # THE SAME SENTINEL AS THE SHIM, and it belongs here for the same reason the
+    # fail-closed gate does: vinci/README.md documents running this file directly
+    # and symlinking it onto PATH, and on that path the shim never executes.
+    #
+    # I added the sentinel to the shim alone the first time. A `return 1` profile
+    # then applied its first lines and dropped the rest, silently, on the exact
+    # path a contributor is told to use — the identical shim-covered/direct-path-
+    # uncovered gap review had already caught once on this branch. Anything added
+    # to one of these two files needs a reason not to be in the other.
+    VINCI_PROFILE_WRAP=""
+    VINCI_PROFILE_TOKEN=""
+    VINCI_PROFILE_MADE=""
+    # SAY SO WHEN THE CHECK CANNOT RUN. If the temporary profile cannot be
+    # created or populated there is no sentinel and therefore no completeness
+    # signal, so a profile that returns part-way is applied without anyone
+    # noticing. Continuing is still right — refusing every launch because /tmp
+    # is full would be worse than the defect — but doing it SILENTLY made the
+    # guard weaker than its own description. The warning is the difference
+    # between a degraded check and an invisible one.
+    if VINCI_PROFILE_WRAP=$(mktemp 2>/dev/null); then
+      # Remembered separately: the failure branch below clears VINCI_PROFILE_WRAP,
+      # and cleanup keyed on that variable — so a temp file mktemp had already
+      # created was left on disk holding a partial copy of the profile, which may
+      # contain API keys.
+      VINCI_PROFILE_MADE="$VINCI_PROFILE_WRAP"
+      VINCI_PROFILE_TOKEN=$(basename "$VINCI_PROFILE_WRAP")
+      # TWO LEADING NEWLINES, and both are load-bearing.
+      #
+      # One was not enough. A profile whose last byte is a backslash with no
+      # trailing newline makes that injected newline a POSIX line CONTINUATION,
+      # so the sentinel joined the last assignment anyway:
+      # `BASE=https://vVINCI_PROFILE_COMPLETE=<token>` — corrupted, and passing
+      # as complete because the token was present inside the value it corrupted.
+      # Review found it after the one-newline fix had landed. Measured against
+      # one, two and three trailing backslashes: an odd count consumes the first
+      # newline, the second always terminates the line.
+      #
+      # A profile whose last line has no trailing
+      # newline fuses with the sentinel: `VINCI_ENV=dev` became
+      # `VINCI_ENV=devVINCI_PROFILE_COMPLETE=<token>`, which SET VINCI_ENV to that
+      # whole string AND passed as complete, because the token was present — in
+      # the corrupted value. Silent corruption that also defeated detection.
+      # CHECK BOTH WRITES SEPARATELY. `{ cat; printf; } > file || fail` tests only
+      # the LAST command in the group. On a genuinely full filesystem `cat` fails
+      # with ENOSPC while the 29-byte `printf` still fits, so the group returned 0,
+      # the wrap file held a truncated profile followed by the sentinel, the token
+      # came back, and incomplete settings reported as complete — silently, with
+      # the session potentially running against PROD and VINCI_ENV=dev dropped.
+      #
+      # Worse than the truncation this block detects, and "/tmp is full" is the
+      # exact scenario the comment above cites to justify continuing. Review
+      # measured it on a real filesystem with 4 KB free against a 5 KB profile.
+      if cat "$VINCI_PROFILE" > "$VINCI_PROFILE_WRAP" 2>/dev/null \
+        && printf '\n\nVINCI_PROFILE_COMPLETE=%s\n' "$VINCI_PROFILE_TOKEN" >> "$VINCI_PROFILE_WRAP" 2>/dev/null
+      then
+        :
+      else
+        # Clear the TOKEN too. Leaving it set meant the completeness check still
+        # ran against a source with no sentinel, so a healthy profile drew the
+        # "cannot check" warning and then a flatly contradictory "stopped reading
+        # part-way", and had its launch refused. Two messages about one file, one
+        # of them false.
+        VINCI_PROFILE_WRAP=""
+        VINCI_PROFILE_TOKEN=""
+      fi
+    fi
+    if [ -z "$VINCI_PROFILE_WRAP" ]; then
+      echo "Vinci could not prepare a temporary profile, so it cannot check whether" >&2
+      echo "$VINCI_PROFILE was read to the end; a profile that stops early will" >&2
+      echo "be applied in part without further warning." >&2
+    fi
+    VINCI_PROFILE_SOURCE="${VINCI_PROFILE_WRAP:-$VINCI_PROFILE}"
     VINCI_PROFILE_EXPORTS=$(
       set +eu
       set -a
-      . "$VINCI_PROFILE" >&2
+      . "$VINCI_PROFILE_SOURCE" >&2
       set +a
       export -p
     ) || VINCI_PROFILE_EXPORTS=""
+    [ -z "$VINCI_PROFILE_MADE" ] || rm -f "$VINCI_PROFILE_MADE"
+    # MATCH AN UNPREDICTABLE TOKEN, NOT THE SENTINEL'S NAME.
+    #
+    # Globbing the capture for `VINCI_PROFILE_COMPLETE=` was forgeable, and I
+    # confirmed it two ways before fixing. A profile containing the innocuous
+    # line `export DECOY="VINCI_PROFILE_COMPLETE=1"` and then returning early
+    # passed as complete, because the glob matched the decoy's VALUE. So did a
+    # profile that set VINCI_PROFILE_COMPLETE itself. Detection failed silently
+    # in exactly the case it exists for.
+    #
+    # The token is the mktemp basename: unique per invocation and unknowable to
+    # the file being sourced, so it cannot be written into the profile. Matching
+    # the token rather than the variable name is also quote-agnostic, which
+    # matters because dash and bash quote `export -p` output differently.
+    if [ -n "$VINCI_PROFILE_TOKEN" ]; then
+      case "${VINCI_PROFILE_EXPORTS}" in
+        *"$VINCI_PROFILE_TOKEN"*) ;;
+        *)
+          echo "Vinci stopped reading $VINCI_PROFILE part-way; it returns before the end." >&2
+          VINCI_PROFILE_UNCLEAN=1
+          ;;
+      esac
+    fi
+    unset VINCI_PROFILE_WRAP VINCI_PROFILE_SOURCE VINCI_PROFILE_MADE VINCI_PROFILE_TOKEN
   fi
+  # A REJECTED PROFILE APPLIES NOTHING. Truncated exports used to be eval'd
+  # anyway: `VINCI_HOME=/missing` followed by `return 1` overrode a VINCI_HOME
+  # set in the environment, sent the updater to the wrong path, and then the
+  # refusal said "any VINCI_HOME it sets was ignored" — false, in the message a
+  # user reads while trying to recover. Discarding here is what makes it true.
+  [ "$VINCI_PROFILE_UNCLEAN" -eq 0 ] || VINCI_PROFILE_EXPORTS=""
   if [ -n "$VINCI_PROFILE_EXPORTS" ]; then
     eval "$VINCI_PROFILE_EXPORTS" 2>/dev/null || VINCI_PROFILE_EXPORTS=""
   fi
+  # Bookkeeping, not configuration: it must not reach the session.
+  unset VINCI_PROFILE_COMPLETE
   [ -n "$VINCI_PROFILE_EXPORTS" ] || VINCI_PROFILE_UNCLEAN=1
   if [ -z "$VINCI_PROFILE_EXPORTS" ]; then
     echo "Vinci ignored $VINCI_PROFILE; it produced no usable settings." >&2

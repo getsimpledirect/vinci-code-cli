@@ -23,10 +23,10 @@ Two things stated up front rather than discovered:
   your own key. The guard, receipts, checkpoints and review all work identically. Signing in to
   Vinci is offered, never required — `VINCI_SHOW_OTHER_PROVIDERS=0` restores the managed-only view. See [`PRIVACY.md`](PRIVACY.md) for exactly
   what changes between the two modes — in BYOK, Vinci's servers are not in the path.
-- **Recognised secrets are masked before they are stored.** Redaction runs at the input
-  boundary, at every tool result, and on the provider request. What it cannot catch is a
-  credential its patterns do not recognise — that persists verbatim. Treat
-  `~/.pi/agent/sessions/` as sensitive.
+- **Recognised secrets in normal prompts and tool results are masked before the session
+  transcript is written.** The `!` shell shortcut is recorded outside those hooks, and large
+  bash output can spill raw to `$TMPDIR/pi-bash-*.log` before masking runs. Unrecognised formats
+  also persist verbatim. Treat both `~/.pi/agent/sessions/` and those temporary files as sensitive.
 
 Security reports: [`../SECURITY.md`](../SECURITY.md).
 
@@ -233,16 +233,18 @@ text-only Forte model receives a visual-evidence description rather than the raw
 Detected credentials are redacted before they reach the terminal, edit diffs, write previews, and
 the `/feedback` and `/issue` payloads that leave your machine.
 
-Redaction also runs *before* the transcript is written. `vinci-guard` transforms text you type
-at the `input` boundary, masks every tool result — files read and shell output alike — at the
-hook its own comment calls the "persistence/model boundary", and redacts the provider request
-as a last line of defence. Measured on 0.0.49: a synthetic key typed into the prompt, one read
-via the `read` tool, and one printed by `bash` were each absent from the stored session, with
-`<vinci-secret>` in their place.
+Redaction also runs *before* the session transcript is written for normal prompt input and tool
+results. `vinci-guard` transforms prompt text at the `input` boundary, masks tool results — files
+read and shell-tool output alike — at the hook its own comment calls the "persistence/model
+boundary", and redacts the provider request as a last line of defence. Measured on 0.0.49: a
+synthetic key typed into the prompt, one read via the `read` tool, and one printed by the `bash`
+tool were each absent from the stored session, with `<vinci-secret>` in their place.
 
-> 🔴 **The limit is pattern coverage, not timing.** A credential whose format the patterns do
-> not recognise is written to `~/.pi/agent/sessions/` verbatim, and sessions recorded before
-> these hooks existed were never masked. Treat that directory as sensitive.
+> 🔴 **Not every local persistence path crosses those hooks.** Output from the `!` shell shortcut
+> is recorded directly in the session JSONL, and large `bash` outputs can spill unmasked to
+> `$TMPDIR/pi-bash-*.log` before the tool-result hook runs. Credentials whose formats the patterns
+> do not recognise and sessions recorded before these hooks existed may also remain verbatim.
+> Treat both locations as sensitive and delete records you no longer need.
 
 Shell network access and credential reads require approval for one exact invocation. Run
 `/security` to inspect the active controls. `VINCI_NO_SANDBOX=1` is a developer bypass and weakens

@@ -14,7 +14,7 @@
 //      non-prod base URL) and is absent on the prod default.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -514,6 +514,474 @@ const directVersion = spawnSync("bash", [binVinci, "--version"], {
   input: "",
   env: directEnv,
 });
+// A PROFILE THAT RETURNS PART-WAY IS TRUNCATED, NOT CLEAN.
+//
+// `return N` at the top level of a sourced file stops the sourcing and hands N
+// back to `.`. The shell lives, `export -p` still runs, the capture is
+// non-empty — so the parse check cannot see it (it parses) and the
+// empty-capture check cannot either (the shell survived). The profile applies
+// its first lines, drops the rest, and reports nothing wrong. Review found this
+// after the parse check had already landed.
+//
+// The shim appends an assignment after the profile and requires it to arrive:
+// reached means the profile ran to the end. Identical under both shells.
+const returnHome = join(stage, "profile-early-return-home");
+mkdirSync(returnHome, { recursive: true });
+writeFileSync(
+  join(returnHome, ".vinci-code.env"),
+  "VINCI_ENV=dev\nreturn 1\nVINCI_BASE_URL=https://never-applied\n",
+);
+const returned = spawnSync("sh", [shim], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: { PATH: process.env.PATH, HOME: returnHome, VINCI_HOME: docHome, VINCI_UPDATER_TIMEOUT_MS: "30000" },
+});
+ok(
+  "a profile that returns before its end refuses the launch instead of applying half of itself",
+  returned.status === 78 && /part-way/.test(returned.stderr),
+  `status=${returned.status} stderr=${returned.stderr}`,
+);
+
+// AND THE SENTINEL MUST NOT REACH THE SESSION. It is bookkeeping; exporting it
+// would put a Vinci-internal variable into every launched agent's environment.
+const cleanSentinelHome = join(stage, "profile-sentinel-clean-home");
+mkdirSync(cleanSentinelHome, { recursive: true });
+writeFileSync(join(cleanSentinelHome, ".vinci-code.env"), "VINCI_ENV=dev\n");
+const sentinelCheck = spawnSync("sh", [shim, "doctor"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: { PATH: process.env.PATH, HOME: cleanSentinelHome, VINCI_HOME: docHome, VINCI_UPDATER_TIMEOUT_MS: "30000" },
+});
+// A PROFILE CANNOT FORGE COMPLETENESS.
+//
+// The first version of this check globbed the capture for the sentinel's NAME,
+// which any profile could put there. Confirmed two ways before fixing: a
+// profile containing the innocuous line `export DECOY="VINCI_PROFILE_COMPLETE=1"`
+// and then returning early passed as complete, because the glob matched the
+// decoy's VALUE — and so did one that simply set the sentinel itself. Detection
+// failed silently in exactly the case it exists for.
+//
+// The sentinel now carries an mktemp-derived token the profile cannot predict.
+for (const [label, line] of [
+  ["a decoy value containing the sentinel name", 'export DECOY="VINCI_PROFILE_COMPLETE=1"'],
+  ["the sentinel variable set by the profile itself", "export VINCI_PROFILE_COMPLETE=1"],
+]) {
+  const forgeHome = join(stage, `forge-${line.length}`);
+  mkdirSync(forgeHome, { recursive: true });
+  writeFileSync(join(forgeHome, ".vinci-code.env"), `VINCI_ENV=dev\n${line}\nreturn 1\nLATE=1\n`);
+  const forged = spawnSync("sh", [shim], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { PATH: process.env.PATH, HOME: forgeHome, VINCI_HOME: docHome, VINCI_UPDATER_TIMEOUT_MS: "30000" },
+  });
+  ok(
+    `${label} cannot forge completeness`,
+    forged.status === 78 && /part-way/.test(forged.stderr),
+    `status=${forged.status} stderr=${forged.stderr}`,
+  );
+}
+
+ok(
+  "a complete profile is not mistaken for a truncated one",
+  sentinelCheck.status === 0 && !/part-way/.test(sentinelCheck.stderr),
+  `status=${sentinelCheck.status} stderr=${sentinelCheck.stderr}`,
+);
+
+// A PROFILE WITH NO TRAILING NEWLINE MUST NOT FUSE WITH THE SENTINEL.
+//
+// `cat` of such a file leaves the last line open, so the appended sentinel
+// joined it: `VINCI_ENV=dev` became `VINCI_ENV=devVINCI_PROFILE_COMPLETE=<token>`,
+// which SET VINCI_ENV to that whole string and passed as complete, because the
+// token was present — inside the corrupted value. Silent corruption that also
+// defeated detection. Review found it; an earlier check of mine looked only at
+// the exit code and called this case clean.
+// WHEN THE CHECK CANNOT RUN, IT SAYS SO.
+//
+// Completeness detection needs a temp file. If mktemp fails there is no
+// sentinel, so a profile that returns part-way is applied without being
+// noticed. Continuing is right — refusing every launch because /tmp is full
+// would be worse than the defect — but doing it SILENTLY made the guard weaker
+// than its description, which is the failure this block has repeated at every
+// stage of its life.
+//
+// mktemp is made to fail by putting a stub earlier on PATH, which is exactly
+// how the shim resolves it.
+const mktempStubDir = join(stage, "mktemp-stub-bin");
+mkdirSync(mktempStubDir, { recursive: true });
+writeFileSync(join(mktempStubDir, "mktemp"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+
+const noTmpHome = join(stage, "profile-no-mktemp-home");
+mkdirSync(noTmpHome, { recursive: true });
+writeFileSync(join(noTmpHome, ".vinci-code.env"), "VINCI_ENV=dev\n");
+const noTmpEnv = {
+  PATH: `${mktempStubDir}:${process.env.PATH}`,
+  HOME: noTmpHome,
+  VINCI_HOME: docHome,
+  VINCI_UPDATER_TIMEOUT_MS: "30000",
+};
+const noTmp = spawnSync("sh", [shim, "doctor"], { encoding: "utf8", timeout: 60_000, env: noTmpEnv });
+ok(
+  "when it cannot verify completeness, the shim says so instead of degrading silently",
+  /cannot check whether/.test(noTmp.stderr) && noTmp.stderr.includes(join(noTmpHome, ".vinci-code.env")),
+  `status=${noTmp.status} stderr=${noTmp.stderr}`,
+);
+ok(
+  // Anchored, and the sentinel name required absent. `includes("Environment: dev")`
+  // is the idiom this file bans further down for exactly this reason: it matches
+  // a CORRUPTED `devVINCI_PROFILE_COMPLETE=<token>` that doctor itself labels
+  // INVALID. Review caught this reverting to the banned form.
+  "a failed mktemp does not lose a good profile",
+  noTmp.status === 0
+    && /Environment: dev(\s|$)/m.test(noTmp.stdout)
+    && !/VINCI_PROFILE_COMPLETE/.test(noTmp.stdout),
+  `status=${noTmp.status} stdout=${noTmp.stdout} stderr=${noTmp.stderr}`,
+);
+
+// A REAL LAUNCH, not `doctor`. The doctor arm `exec`s the updater twenty lines
+// ABOVE the fail-closed launch gate, so an assertion named "does not refuse the
+// launch" that runs doctor never reaches the gate at all. Review proved it: a
+// shim mutated to refuse every real session on mktemp failure still passed
+// 73/73. This runs the shim with no arguments, which is the path that gate sits on.
+const noTmpLaunchHome = join(stage, "no-mktemp-launch-home");
+mkdirSync(join(noTmpLaunchHome, "updater"), { recursive: true });
+mkdirSync(join(noTmpLaunchHome, "current", "vinci", "bin"), { recursive: true });
+copyFileSync(updater, join(noTmpLaunchHome, "updater", "update.mjs"));
+writeFileSync(
+  join(noTmpLaunchHome, "current", "vinci", "bin", "vinci"),
+  '#!/usr/bin/env bash\necho "PROFILE_GATE_PASSED"\n',
+  { mode: 0o755 },
+);
+const noTmpLaunch = spawnSync("sh", [shim], {
+  encoding: "utf8",
+  timeout: 60_000,
+  input: "",
+  env: { ...noTmpEnv, VINCI_HOME: noTmpLaunchHome },
+});
+ok(
+  "a failed mktemp does not refuse a real launch",
+  noTmpLaunch.status === 0
+    && /PROFILE_GATE_PASSED/.test(noTmpLaunch.stdout)
+    && /cannot check whether/.test(noTmpLaunch.stderr)
+    && !/will not start/.test(noTmpLaunch.stderr),
+  `status=${noTmpLaunch.status} stdout=${noTmpLaunch.stdout} stderr=${noTmpLaunch.stderr}`,
+);
+
+// bin/vinci CARRIES THE SAME WARNING AND NEEDS ITS OWN ASSERTIONS.
+//
+// This is the THIRD time on this branch that a fix landed in both launchers and
+// only the shim got tested — the fail-closed gate, then the early-return
+// sentinel, now this. Review proved it again: deleting bin/vinci's warning gave
+// 73/73, and making it unconditional gave 73/73. Both directions are pinned here.
+const noTmpBin = spawnSync("bash", [binVinci, "--version"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  input: "",
+  env: { PATH: `${mktempStubDir}:${process.env.PATH}`, HOME: noTmpHome },
+});
+ok(
+  "bin/vinci also says so when it cannot verify completeness",
+  noTmpBin.status === 0 && /cannot check whether/.test(noTmpBin.stderr),
+  `status=${noTmpBin.status} stderr=${noTmpBin.stderr}`,
+);
+const tmpOkayBin = spawnSync("bash", [binVinci, "--version"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  input: "",
+  env: { PATH: process.env.PATH, HOME: noTmpHome },
+});
+ok(
+  "bin/vinci stays quiet when completeness can be verified",
+  tmpOkayBin.status === 0 && !/cannot check whether/.test(tmpOkayBin.stderr),
+  `status=${tmpOkayBin.status} stderr=${tmpOkayBin.stderr}`,
+);
+
+// WHERE mktemp ACTUALLY WRITES, which is not always $TMPDIR.
+//
+// The wrapper-cleanup assertions below set TMPDIR and then check that directory
+// is empty. That binds on Linux, where GNU mktemp honours TMPDIR — and it is
+// VACUOUS on macOS, where mktemp ignores TMPDIR entirely (verified: even
+// `mktemp -t` writes to the per-user /var/folders directory). On a macOS dev
+// machine the assertion inspects a directory nothing was ever written to and
+// always passes. Proven by mutation: reverting the cleanup fix leaves a real
+// wrapper on disk and the suite still reports every check passing.
+//
+// So the check also asserts the property that actually matters — no file in the
+// REAL temp directory still holds the profile's contents. Matching on a
+// distinctive string from the fixture, rather than counting files, keeps it from
+// racing with unrelated processes.
+function realTempDir(env) {
+  const probe = spawnSync("sh", ["-c", 'F=$(mktemp) || exit 1; printf %s "$F"; rm -f "$F"'], {
+    encoding: "utf8",
+    env,
+  });
+  return probe.status === 0 && probe.stdout ? dirname(probe.stdout.trim()) : tmpdir();
+}
+function profileLeftovers(dir, needle) {
+  let names = [];
+  try {
+    names = readdirSync(dir).filter((name) => name.startsWith("tmp."));
+  } catch {
+    return [];
+  }
+  return names.filter((name) => {
+    try {
+      return readFileSync(join(dir, name), "utf8").includes(needle);
+    } catch {
+      return false;
+    }
+  });
+}
+
+// THE COPY CAN FAIL EVEN WHEN mktemp SUCCEEDS, and that used to be the worst
+// case of the three.
+//
+// `{ cat; printf; } > file || fail` tests only the LAST command. On a full
+// filesystem `cat` fails with ENOSPC while the 29-byte `printf` still fits, so
+// the group returned 0, the wrap file held ONLY the sentinel, the token came
+// back, and a profile discarded ENTIRELY reported as COMPLETE — silently, with
+// the session running against PROD. Review measured that on a real filesystem
+// with 4 KB free. Worse than the truncation this block detects, and in the very
+// scenario the warning cites to justify continuing.
+//
+// A `cat` that writes part of the file and then fails models ENOSPC exactly and
+// needs no privileged filesystem.
+const catStubDir = join(stage, "cat-stub-bin");
+mkdirSync(catStubDir, { recursive: true });
+writeFileSync(
+  join(catStubDir, "cat"),
+  '#!/bin/sh\n# models ENOSPC: partial write, then failure\nhead -c 40 "$1" 2>/dev/null\nexit 1\n',
+  { mode: 0o755 },
+);
+const badCopyHome = join(stage, "profile-copy-fails-home");
+mkdirSync(badCopyHome, { recursive: true });
+writeFileSync(join(badCopyHome, ".vinci-code.env"), "VINCI_ENV=dev\nVINCI_BASE_URL=https://dev\n");
+const badCopyShimTmp = join(stage, "profile-copy-fails-shim-tmp");
+mkdirSync(badCopyShimTmp, { recursive: true });
+const badCopy = spawnSync("sh", [shim, "doctor"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: {
+    PATH: `${catStubDir}:${process.env.PATH}`,
+    HOME: badCopyHome,
+    TMPDIR: badCopyShimTmp,
+    VINCI_HOME: docHome,
+    VINCI_UPDATER_TIMEOUT_MS: "30000",
+  },
+});
+ok(
+  "a failed copy is reported, not passed off as a verified-complete profile",
+  badCopy.status === 0
+    && /Environment: dev(\s|$)/m.test(badCopy.stdout)
+    && /could not prepare a temporary profile/.test(badCopy.stderr)
+    && !/produced no usable settings/.test(badCopy.stderr),
+  `status=${badCopy.status} stdout=${badCopy.stdout} stderr=${badCopy.stderr}`,
+);
+ok(
+  // The second half of the same defect: clearing WRAP but leaving TOKEN set made
+  // the completeness check run against a source with no sentinel, so a healthy
+  // profile drew "cannot check" AND a flatly contradictory "stopped reading
+  // part-way", then had its launch refused. Two messages about one file, one false.
+  "a failed copy does not also claim the profile stopped part-way",
+  !/part-way/.test(badCopy.stderr),
+  `stderr=${badCopy.stderr}`,
+);
+ok(
+  "the shim removes a partial wrapper that may contain profile secrets",
+  readdirSync(badCopyShimTmp).length === 0
+    && profileLeftovers(realTempDir({ PATH: process.env.PATH, HOME: badCopyHome }), "VINCI_BASE_URL=https://dev").length === 0,
+  `${readdirSync(badCopyShimTmp).join(", ")} | real=${profileLeftovers(realTempDir({ PATH: process.env.PATH, HOME: badCopyHome }), "VINCI_BASE_URL=https://dev").join(", ")}`,
+);
+const badCopyLaunch = spawnSync("sh", [shim], {
+  encoding: "utf8",
+  timeout: 60_000,
+  input: "",
+  env: {
+    PATH: `${catStubDir}:${process.env.PATH}`,
+    HOME: badCopyHome,
+    TMPDIR: badCopyShimTmp,
+    VINCI_HOME: noTmpLaunchHome,
+    VINCI_UPDATER_TIMEOUT_MS: "30000",
+  },
+});
+ok(
+  "a failed wrapper copy does not refuse a real launch",
+  badCopyLaunch.status === 0
+    && /PROFILE_GATE_PASSED/.test(badCopyLaunch.stdout)
+    && /could not prepare a temporary profile/.test(badCopyLaunch.stderr)
+    && !/part-way|will not start/.test(badCopyLaunch.stderr),
+  `status=${badCopyLaunch.status} stdout=${badCopyLaunch.stdout} stderr=${badCopyLaunch.stderr}`,
+);
+ok(
+  "the shim also cleans a partial wrapper on the real-launch path",
+  readdirSync(badCopyShimTmp).length === 0,
+  readdirSync(badCopyShimTmp).join(", "),
+);
+const badCopyBinTmp = join(stage, "profile-copy-fails-bin-tmp");
+mkdirSync(badCopyBinTmp, { recursive: true });
+const badCopyBin = spawnSync("bash", [launcher], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: {
+    PATH: `${catStubDir}:${stubDir}:${process.env.PATH}`,
+    HOME: badCopyHome,
+    TMPDIR: badCopyBinTmp,
+    VINCI_NO_BOOTSTRAP_HEAL: "1",
+  },
+});
+ok(
+  "bin/vinci also keeps a good profile when its wrapper copy fails",
+  badCopyBin.status === 0
+    && /ENV=dev(\s|$)/m.test(badCopyBin.stdout)
+    && /could not prepare a temporary profile/.test(badCopyBin.stderr)
+    && !/part-way|will not start/.test(badCopyBin.stderr),
+  `status=${badCopyBin.status} stdout=${badCopyBin.stdout} stderr=${badCopyBin.stderr}`,
+);
+ok(
+  "bin/vinci removes a partial wrapper that may contain profile secrets",
+  readdirSync(badCopyBinTmp).length === 0
+    && profileLeftovers(realTempDir({ PATH: process.env.PATH, HOME: badCopyHome }), "VINCI_BASE_URL=https://dev").length === 0,
+  `${readdirSync(badCopyBinTmp).join(", ")} | real=${profileLeftovers(realTempDir({ PATH: process.env.PATH, HOME: badCopyHome }), "VINCI_BASE_URL=https://dev").join(", ")}`,
+);
+
+// THE SCENARIO THE WARNING EXISTS FOR, which nothing asserted: a failing mktemp
+// AND a profile that stops early. That pairing is the whole point — the warning
+// says "a profile that stops early will be applied in part without further
+// warning", and this is the case where that sentence is doing work. With mktemp
+// working the same profile is refused; with it failing the profile applies in
+// part and only the warning marks it.
+const noTmpTruncHome = join(stage, "no-mktemp-truncated-home");
+mkdirSync(noTmpTruncHome, { recursive: true });
+writeFileSync(join(noTmpTruncHome, ".vinci-code.env"), "VINCI_ENV=dev\nreturn 0\nVINCI_BASE_URL=https://never\n");
+const truncNoTmp = spawnSync("sh", [shim, "doctor"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: { ...noTmpEnv, HOME: noTmpTruncHome },
+});
+const truncWithTmp = spawnSync("sh", [shim, "doctor"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: { PATH: process.env.PATH, HOME: noTmpTruncHome, VINCI_HOME: docHome, VINCI_UPDATER_TIMEOUT_MS: "30000" },
+});
+ok(
+  "a truncated profile is caught when mktemp works and only warned about when it does not",
+  /part-way/.test(truncWithTmp.stderr)
+    && !/part-way/.test(truncNoTmp.stderr)
+    && /cannot check whether/.test(truncNoTmp.stderr),
+  `withTmp=${truncWithTmp.stderr} noTmp=${truncNoTmp.stderr}`,
+);
+// And it must stay quiet when the check CAN run, or the warning is noise that
+// trains people to ignore it.
+const tmpOkay = spawnSync("sh", [shim, "doctor"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: { PATH: process.env.PATH, HOME: noTmpHome, VINCI_HOME: docHome, VINCI_UPDATER_TIMEOUT_MS: "30000" },
+});
+ok(
+  "no such warning when completeness can be verified",
+  tmpOkay.status === 0 && !/cannot check whether/.test(tmpOkay.stderr),
+  `status=${tmpOkay.status} stderr=${tmpOkay.stderr}`,
+);
+
+// A TRAILING BACKSLASH MUST NOT SWALLOW THE SEPARATOR.
+//
+// One injected newline was not enough. If the profile's last byte is a
+// backslash with no trailing newline, that newline becomes a POSIX line
+// CONTINUATION and the sentinel joins the last assignment anyway —
+// `BASE=https://intendedVINCI_PROFILE_COMPLETE=<token>`, corrupted AND passing
+// as complete, because the token sits inside the value it corrupted. Review
+// found this after the one-newline fix had landed. Two newlines: an odd number
+// of trailing backslashes consumes the first, the second always terminates.
+for (const [label, tail] of [["one", "\\"], ["two", "\\\\"], ["three", "\\\\\\"]]) {
+  const bsHome = join(stage, `profile-trailing-backslash-${label}`);
+  mkdirSync(bsHome, { recursive: true });
+  // VINCI_ENV is the LAST assignment on purpose: doctor prints it, so corruption
+  // is observable. An earlier version put the backslash on a BASE= line that
+  // nothing surfaces, so reverting the fix left this green — the fourth
+  // assertion on this branch that named a property it could not see.
+  writeFileSync(join(bsHome, ".vinci-code.env"), `BASE=https://intended\nVINCI_ENV=dev${tail}`);
+  for (const entry of ["shim", "bin"]) {
+    const run = spawnSync(entry === "shim" ? "sh" : "bash",
+      entry === "shim" ? [shim, "doctor"] : [binVinci, "--version"], {
+        encoding: "utf8",
+        timeout: 60_000,
+        input: "",
+        env: { PATH: process.env.PATH, HOME: bsHome, VINCI_HOME: docHome, VINCI_UPDATER_TIMEOUT_MS: "30000" },
+      });
+    ok(
+      `${label} trailing backslash via ${entry} does not fuse the sentinel into a value`,
+      // ONLY the sentinel check. An even number of trailing backslashes legally
+      // yields the value `dev\` — correct shell behaviour, not corruption — so
+      // asserting `Environment: dev` exactly was wrong and failed the two- and
+      // three-backslash cases. This binds because VINCI_ENV is the last
+      // assignment and doctor prints it, so a fused sentinel is visible.
+      !/VINCI_PROFILE_COMPLETE/.test(run.stdout + run.stderr),
+      `stdout=${run.stdout} stderr=${run.stderr}`,
+    );
+  }
+}
+
+const noNewlineHome = join(stage, "profile-no-trailing-newline-home");
+mkdirSync(noNewlineHome, { recursive: true });
+writeFileSync(join(noNewlineHome, ".vinci-code.env"), "VINCI_ENV=dev");
+const noNewline = spawnSync("sh", [shim, "doctor"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: { PATH: process.env.PATH, HOME: noNewlineHome, VINCI_HOME: docHome, VINCI_UPDATER_TIMEOUT_MS: "30000" },
+});
+ok(
+  // NOT `includes("Environment: dev")`. The corrupted value is
+  // `devVINCI_PROFILE_COMPLETE=<token>`, which CONTAINS "dev" — the loose
+  // assertion passed with the fix reverted, so it proved nothing. Match the
+  // value to end of token, and require the sentinel name to be absent entirely.
+  "a profile with no trailing newline keeps its last value intact",
+  noNewline.status === 0
+    && /Environment: dev(\s|$)/m.test(noNewline.stdout)
+    && !/VINCI_PROFILE_COMPLETE/.test(noNewline.stdout),
+  `status=${noNewline.status} stdout=${noNewline.stdout}`,
+);
+
+// A REJECTED PROFILE'S SETTINGS MUST NOT SURVIVE. A truncated profile setting
+// VINCI_HOME used to override the environment's, send the updater to the wrong
+// path, and then be described as "ignored" — false, in the message a user reads
+// while recovering.
+const poisonHome = join(stage, "profile-poison-home");
+mkdirSync(poisonHome, { recursive: true });
+writeFileSync(join(poisonHome, ".vinci-code.env"), "VINCI_HOME=/definitely/missing\nreturn 1\n");
+const poisoned = spawnSync("sh", [shim, "doctor"], {
+  encoding: "utf8",
+  timeout: 60_000,
+  env: { PATH: process.env.PATH, HOME: poisonHome, VINCI_HOME: docHome, VINCI_UPDATER_TIMEOUT_MS: "30000" },
+});
+ok(
+  "a rejected profile's VINCI_HOME really is ignored, so recovery still reaches the updater",
+  !/\/definitely\/missing/.test(poisoned.stderr + poisoned.stdout),
+  `stdout=${poisoned.stdout} stderr=${poisoned.stderr}`,
+);
+
+// THE DIRECT PATH NEEDS THE EARLY-RETURN CHECK TOO.
+//
+// Pinned separately from the shim's because a both-files revert lets one
+// failure mask the other — which is exactly how the missing bin/vinci gate
+// survived earlier on this branch, and how the missing sentinel survived the
+// first version of this commit.
+const directReturnHome = join(stage, "direct-bin-early-return-home");
+mkdirSync(directReturnHome, { recursive: true });
+writeFileSync(
+  join(directReturnHome, ".vinci-code.env"),
+  "VINCI_ENV=dev\nreturn 1\nVINCI_BASE_URL=https://never-applied\n",
+);
+const directReturned = spawnSync("bash", [binVinci], {
+  encoding: "utf8",
+  timeout: 60_000,
+  input: "",
+  env: { PATH: process.env.PATH, HOME: directReturnHome },
+});
+ok(
+  "running bin/vinci directly refuses a profile that returns part-way",
+  directReturned.status === 78 && /part-way/.test(directReturned.stderr),
+  `status=${directReturned.status} stderr=${directReturned.stderr}`,
+);
+
 ok(
   "running bin/vinci directly still answers --version with a malformed profile",
   directVersion.status === 0 && /^\d+\.\d+\.\d+/.test(directVersion.stdout.trim()),

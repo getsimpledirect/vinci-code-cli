@@ -53,11 +53,11 @@ credentials. The areas where a bug matters most:
 
 These are understood and documented, not undiscovered:
 
-- **Masking runs before storage, so pattern coverage is the real limit.** Text you type
-  and every tool result are redacted at the input and persistence boundaries, which is why
-  a credential you paste or a file the agent reads is masked on disk. A credential the
-  patterns do not match is stored verbatim, as are sessions recorded before this existed.
-  Treat `~/.pi/agent/sessions/` as sensitive.
+- **Normal prompt input and tool results are masked before the session transcript is written.**
+  The `!` shell shortcut is recorded outside those hooks, and large `bash` output can spill raw
+  to `$TMPDIR/pi-bash-*.log` before masking runs. A credential the patterns do not match is also
+  stored verbatim, as are sessions recorded before this existed. Treat both the temporary spill
+  files and `~/.pi/agent/sessions/` as sensitive.
 - **The masker is pattern-based** and cannot recognise a credential with no
   distinctive shape — a bare password, an internal hostname, a customer name. Its
   covered formats are listed in `vinci-mask-secrets.ts`.

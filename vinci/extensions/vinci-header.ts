@@ -125,7 +125,7 @@ const WORDMARK = process.env.VINCI_ASCII_WORDMARK === "1" ? PLAIN_WORDMARK : SER
 
 // Vinci Code's OWN version — deliberately simple to start; bump it when we ship something worth
 // iterating on. (NOT the underlying Pi version, which is an internal detail.)
-const VINCI_VERSION = "0.0.49";
+const VINCI_VERSION = "0.0.50";
 
 // The REAL Vinci logo — the full lockup (maker's-mark + the actual serif "v1nc1" wordmark), cream on a
 // TRANSPARENT background (rendered from the official SVG), for terminals that draw images (Ghostty /

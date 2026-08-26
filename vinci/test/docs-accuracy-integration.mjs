@@ -39,14 +39,13 @@ for (const file of files) {
 		// 3. Claims that were TRUE for a managed-only product and are FALSE for a BYOK client.
 		//    Each of these actually shipped in vinci/README.md and had to be corrected by hand.
 		for (const [pattern, why] of [
-			// Inverted 2026-08-24. This rule previously flagged "redacted before session persistence"
-			// as false. That statement is TRUE and has been since 2026-07-13: vinci-guard redacts at the
-			// `input` hook and at the `tool_result` hook its own comment calls the persistence boundary.
-			// Measured on 0.0.49 — a typed key, a `read` key and a `bash` key were all absent from the
-			// stored session. The guard was enforcing the wrong direction, so the false claim is the
-			// display+egress one.
-			[/redaction is applied at display and egress,? not at rest/i, "false: input and tool_result are redacted BEFORE the transcript is written"],
-			[/transcripts? (?:are|is) stored unmasked/i, "false: recognised secrets are masked before storage; the limit is pattern coverage"],
+			// Normal input and tool results are redacted before the session JSONL, but that is not a
+			// total at-rest guarantee: `!` results bypass the hooks and large bash output spills raw to
+			// $TMPDIR before the tool-result hook. Reject both obsolete extremes and the reassuring
+			// overclaim that pattern coverage is the only remaining limit.
+			[/redaction is applied at display and egress,? not at rest/i, "false: normal input and tool_result are redacted BEFORE the session transcript is written"],
+			[/the limit is pattern coverage,? not timing/i, "false: `!` results and large bash spill files bypass the persistence hook"],
+			[/masking (?:runs|happens) before storage,? so pattern coverage is the real limit/i, "false: some local persistence paths bypass the masking hooks"],
 			[/managed cloud product/i, "false: works with your own provider key too"],
 			[/(?:\/login|\/model)[^.\n]*show only Vinci/i, "false: every Pi provider is offered"],
 			[/Vinci is single-provider/i, "false: BYOK is supported"],
@@ -111,7 +110,7 @@ for (const file of files) {
 	const prose = readme.replace(/^```[\s\S]*?^```/gm, "");
 	const h1s = [...prose.matchAll(/^# (.+)$/gm)].map((m) => m[1].trim());
 	if (h1s.length > 1) {
-		violations.push(`README.md has ${h1s.length} top-level headings (${h1s.join(" / ")}); upstream docs belong in vinci/UPSTREAM-README.md`);
+		violations.push(`README.md has ${h1s.length} top-level headings (${h1s.join(" / ")}); upstream docs belong in UPSTREAM.md`);
 	}
 	if (/no built-in permission system|does not include a built-in permission system/.test(readme)) {
 		violations.push("README.md says there is no built-in permission system — Vinci Code ships the command guard and sandbox; that sentence is upstream Pi's");

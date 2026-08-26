@@ -73,11 +73,11 @@ OpenAI, OpenRouter, Groq, Hugging Face, AWS, GitHub, GitLab, Slack, Stripe and o
 
 🔴 **Two limits worth stating plainly:**
 
-1. **Masking happens before storage, but only for patterns it knows.** Text you type, and
-   every tool result, are redacted before the transcript is written — a credential you paste
-   or a file the agent reads is masked on disk. Anything the patterns miss is stored verbatim,
-   as are sessions recorded before this was in place. Treat that directory as sensitive;
-   delete old sessions you do not need.
+1. **Normal prompt input and tool results are masked before the session transcript is written.**
+   The `!` shell shortcut is recorded outside those hooks, and large `bash` output can spill raw
+   to `$TMPDIR/pi-bash-*.log` before masking runs. Anything the patterns miss is also stored
+   verbatim, as are sessions recorded before this was in place. Treat both the temporary spill
+   files and `~/.pi/agent/sessions/` as sensitive; delete records you do not need.
 2. **It is pattern-based.** A credential with no distinctive shape — a bare password,
    an internal hostname — will not be recognised. If you find a format it misses,
    that is a security report ([`SECURITY.md`](../SECURITY.md)); please send the *format*, not a

@@ -19,11 +19,35 @@ name: vinci-tests
 # The cost is running the harness (~5 min) on documentation-only PRs. That is cheaper than a
 # permanently unmergeable change, and far cheaper than the next person spending an hour working
 # out why a one-line edit will not merge.
+# pull_request USES branches-ignore, NOT an allowlist — for the same reason the
+# `paths:` filter above is gone.
+#
+# `offline (22)`, `offline (24)`, `check`, `sandbox-macos` and `upstream-suite`
+# are REQUIRED checks on `vinci`. An allowlist and a required check contradict
+# each other exactly as a path filter does: when the filter does not match, the
+# workflow never starts, the required check never reports, and the PR is blocked
+# with nothing left to run.
+#
+# This bit a fourth time, and the earlier three are listed above. `branches:
+# [vinci]` matched nothing for a PR STACKED on another feature branch — targeting
+# `feat/dev-env-mode`, which is how a fix to an unmerged branch has to be
+# proposed. Only `check-contributor` ran. Its author could not get the suite onto
+# the combined tree at all and verified it by hand on one machine, which is the
+# evidence CI exists to replace.
+#
+# `main` is excluded rather than `vinci` included, because `main` is the upstream
+# fork branch and has no `vinci/` directory — running this harness against it
+# would fail for reasons that have nothing to do with the change under review.
+# Excluding the one branch that must not run it keeps every future branch covered
+# by default, which an allowlist cannot.
+#
+# `push:` keeps its allowlist: a push is not gated on a required check, so the
+# contradiction does not arise, and the harness should not run on every branch.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches-ignore: [main]
 jobs:
   # biome + tsgo + the pinned-deps/shrinkwrap/install-lock checks. `ci.yml` runs these
   # only for `branches: [main]`, so nothing gated them on a vinci-targeted PR: a
