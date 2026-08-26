@@ -221,14 +221,18 @@ Full extension list and behaviour → **[`vinci/README.md`](vinci/README.md)**
 
 ## Releases
 
-This repository has no tags or GitHub releases, and that is deliberate rather than an
-oversight: builds are signed from a private repository whose AWS release role is deliberately
-not reachable from a public one. What you get instead:
+Releases are tagged `vinci-v*` and published on this repository.
+
+Signing happens in a private repository, because the AWS release role is deliberately not
+reachable from a public one. So a release is cut there and mirrored here: the tarball attached
+to a release is downloaded from the published URL and its checksum compared against the signed
+manifest before it is uploaded. Where the two could ever disagree, the manifest is the
+authority — it is what the installer actually verifies.
 
 | What you want | Where it is |
 |---|---|
 | What version am I running | `vinci --version` — nothing is pinned in these docs, so it cannot go stale |
-| Release notes | [`vinci/release-notes/`](vinci/release-notes/) in this repository |
+| What changed | the [releases page](https://github.com/getsimpledirect/vinci-code-cli/releases), and [`vinci/release-notes/`](vinci/release-notes/) |
 | The build itself | the installer above, which verifies a signed manifest and its sha256 |
 | Bug reports and questions | [`SUPPORT.md`](SUPPORT.md) |
 
