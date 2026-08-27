@@ -151,6 +151,8 @@ export function runVinci({ envelope, repoDir, sessionId }) {
       clearInterval(pollTimer);
       if (killTimer) clearTimeout(killTimer);
       const session = readSessionState(sessionDir, sessionId);
+      if (!limitTripped && session.costUsd >= envelope.budget_usd) limitTripped = "budget_usd";
+      if (!limitTripped && envelope.deadline && Date.now() >= Date.parse(envelope.deadline)) limitTripped = "deadline";
       resolveRun({
         exit_code: signalExitCode(code, signal),
         limit_tripped: limitTripped,
