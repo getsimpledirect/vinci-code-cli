@@ -140,4 +140,25 @@ test('parseEnvelope rejects duplicate headers', () => {
 });
 
 console.log(`\nWorker envelope tests: ${passed} passed, ${failed} failed`);
+
+test('parseEnvelope parses claim header', () => {
+  const result = parseEnvelope('repo: test/repo\nclaim: src/\n\nSpec');
+  assert.equal(result.claim, 'src/');
+});
+
+test('parseEnvelope defaults claim to .', () => {
+  const result = parseEnvelope('repo: test/repo\n\nSpec');
+  assert.equal(result.claim, '.');
+});
+
+test('parseEnvelope parses evidence_ref alias for ref', () => {
+  const result = parseEnvelope('repo: test/repo\nevidence_ref: job_abc123\n\nSpec');
+  assert.equal(result.ref, 'job_abc123');
+});
+
+test('parseEnvelope prefers evidence_ref over ref', () => {
+  const result = parseEnvelope('repo: test/repo\nref: job_old\nevidence_ref: job_new\n\nSpec');
+  assert.equal(result.ref, 'job_new');
+});
+
 if (failed > 0) process.exit(1);

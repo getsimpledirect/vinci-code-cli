@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Fake aws CLI for worker tests: records `aws s3 cp` invocations and exits with FAKE_AWS_EXIT (default 0).
+import { appendFileSync } from 'node:fs';
+
+const recordFile = process.env.FAKE_AWS_RECORD;
+const argv = process.argv.slice(2);
+if (recordFile) appendFileSync(recordFile, JSON.stringify({ argv, timestamp: new Date().toISOString() }) + '\n');
+process.exit(Number(process.env.FAKE_AWS_EXIT ?? '0'));

@@ -15,6 +15,8 @@ const HEADER_KEYS = new Set([
   "deadline",
   "ref",
   "branch",
+  "claim",
+  "evidence_ref",
 ]);
 
 function positiveNumber(value, name) {
@@ -60,6 +62,8 @@ export function parseEnvelope(body) {
   const spec = normalized.slice(separator + 2).trim();
   if (!spec) throw new Error("task spec must not be empty");
   const branchValue = values.get("branch");
+  const claim = values.get("claim") ?? ".";
+  const ref = values.get("evidence_ref") ?? values.get("ref");
 
   return {
     repo,
@@ -69,8 +73,9 @@ export function parseEnvelope(body) {
     budget_usd: budgetUsd,
     max_runtime_s: maxRuntimeS,
     deadline,
-    ref: values.get("ref"),
+    ref,
     branch: branchValue,
+    claim,
     spec,
   };
 }
@@ -102,13 +107,14 @@ export class TaskLifecycle {
         pr: null,
         publish: null,
         evidence: null,
-        branch: null,
         limit_tripped: null,
         vinci_version: null,
         provider: null,
         model: null,
         cost_usd: 0,
         terminal: false,
+        lease: null,
+        evidence_error: null,
       };
     }
   }
@@ -145,6 +151,8 @@ export class TaskLifecycle {
       model: task.envelope.model,
       cost_usd: 0,
       terminal: false,
+      lease: null,
+      evidence_error: null,
     };
     this.save();
     return { attempt: this.state.attempt, firstAttempt, sessionId };

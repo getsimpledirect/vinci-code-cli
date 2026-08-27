@@ -223,3 +223,5 @@ export function finalState({ envelope, exitCode, limitTripped, outcome, blocker,
   if (envelope.evidence === "none" || pr) return "COMPLETED";
   return "UNVERIFIED";
 }
+
+export { command };

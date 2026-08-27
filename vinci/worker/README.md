@@ -136,13 +136,10 @@ No new npm dependencies introduced; uses only node:* and global APIs.
   cursor.json                    # High-water mark per worker
   tasks/
     <id>.json                    # Lifecycle record
-  sessions/
-    <task-id>/                    # vinci JSONL read for outcomes and usage
   repos/
     <name>/                      # Cloned repo
+      sessions/                  # vinci JSONL read for outcomes and usage
 ```
-
-> All daemon-owned files (cursor, tasks, repos, sessions) live in state-dir, not the repo.
 
 ## Network Access
 
@@ -155,3 +152,42 @@ No new npm dependencies introduced; uses only node:* and global APIs.
 
 - vinci-gpu-control: docs/CONTRACT.md §16 (bus message contract)
 - vinci-code-cli: vinci/bin/vinci (main CLI, commands like `worker start`)
+
+## Stage 2: Authority and Governance (Optional)
+
+Stage 2 adds two opt-in hooks that enforce resource governance and audit trails. Both are inactive unless their environment variables are set; workers without Stage 2 configuration behave identically to Stage 1.
+
+### Governor Lease
+
+When `VINCI_GOVERNOR_TOKEN` is set AND `--governor <url>` is given:
+
+1. **Before `npm ci`**: The daemon calls `POST {governor}/v1/governor/claim-paths` with the task's claim path(s) (from envelope header `claim:`, default `.`)
+2. **On success (2xx)**: Authority is granted; lease details (claimed_at, paths, ttl) are recorded in the lifecycle
+3. **On refusal (403/409/422)**: Task transitions to BLOCKED; blocker message contains the Governor's rule text verbatim
+4. **Limit tightening**: If the Governor's work order carries smaller budget_usd or max_runtime_s or deadline, those tighter limits replace the envelope's
+
+**Deployment prerequisite:** Governor URL must be reachable only from inside the dev-box network; Stage 2 boxes need network access to the local listener. Token is never logged or exposed.
+
+### Evidence Upload
+
+When `VINCI_EVIDENCE_URI_PREFIX` is set (e.g. `s3://bucket/vinci/evidence/`):
+
+1. **After the run completes** (any terminal state): Build a deterministic bundle (session JSONL, git diff, result.json, runner log with last 200 lines)
+2. **Upload to S3**: `aws s3 cp --no-progress {bundle.tgz} {prefix}{task-id}/{sha256}.tgz`
+3. **For ledger refs (job_/exp_/bk_ prefix)**: POST evidence metadata to `{busUrl}/v1/evidence` with body `{job_ref, sha256, uri, kind: "bundle", bytes, produced_at}` using the worker's Bearer token
+4. **For non-ledger refs**: Skip the evidence bus POST (the server would reject it with 422); caller can include uri+sha256 in the final message if desired
+5. **Final bus post**: Carries `evidence_uri=...` and `evidence_sha256=...` in details (or `evidence_error=...` if upload failed); terminal state is never flipped to FAILED on evidence upload failure
+
+**Data model:**
+- Evidence bundle contains: session.jsonl (full session transcript), git.diff (origin/main...HEAD), result.json (lifecycle snapshot), runner.log (last 200 lines of daemon stderr)
+- Evidence metadata is immutable; duplicate uploads return 200 OK without re-storing
+- Non-ledger refs (e.g., "handoff:123") skip the evidence endpoint POST but their uri/sha256 still appear in the final status/blocker body
+
+**Deployment prerequisite:** AWS CLI on PATH; S3 bucket role with PutObject-only permissions; no read access to other buckets.
+
+### Envelope Headers (Stage 2)
+
+- `claim:` — Path or glob to claim from Governor (default `.`). Unknown headers still → blocker.
+- `evidence_ref:` — Alias for `ref` header; clarifies that this ref identifies evidence in the ledger.
+
+Both hooks are independent: you can use Governor lease without evidence upload, or evidence upload without Governor lease. If neither is configured, Stage 2 has zero overhead; the daemon behaves identically to Stage 1.

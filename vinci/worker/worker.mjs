@@ -12,8 +12,11 @@ import {
 import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
-import { finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
+import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle } from "./task.mjs";
+import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
+import { readSessionState } from "./session-read.mjs";
+import { uploadEvidence } from "./evidence.mjs";
 
 const version = (() => {
   try {
@@ -24,12 +27,12 @@ const version = (() => {
 })();
 
 function usage() {
-  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>]";
+  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>]";
 }
 
 function parseArgs(args) {
   if (args.shift() !== "start") throw new Error(usage());
-  const options = { once: false, pollSeconds: 60, stateDir: resolve(".vinci-worker-state") };
+  const options = { once: false, pollSeconds: 60, stateDir: resolve(".vinci-worker-state"), governor: null };
   const seen = new Set();
   while (args.length > 0) {
     const argument = args.shift();
@@ -39,7 +42,7 @@ function parseArgs(args) {
       options.once = true;
       continue;
     }
-    if (!["--id", "--server", "--poll-seconds", "--state-dir"].includes(argument)) {
+    if (!["--id", "--server", "--poll-seconds", "--state-dir", "--governor"].includes(argument)) {
       throw new Error(`unknown option: ${argument}\n${usage()}`);
     }
     if (seen.has(argument)) throw new Error(`duplicate option: ${argument}`);
@@ -49,6 +52,7 @@ function parseArgs(args) {
     if (argument === "--id") options.id = value;
     else if (argument === "--server") options.server = value;
     else if (argument === "--state-dir") options.stateDir = resolve(value);
+    else if (argument === "--governor") options.governor = value;
     else options.pollSeconds = Number(value);
   }
   if (!options.id) throw new Error("--id is required");
@@ -188,8 +192,27 @@ function acquireTaskClaim(stateDir, taskId) {
   }
 }
 
-async function postFinal(bus, message, envelope, state) {
+
+const daemonLogChunks = [];
+
+process.stderr.write = ((write) =>
+  function (chunk, ...args) {
+    daemonLogChunks.push(String(chunk));
+    if (daemonLogChunks.length > 200) daemonLogChunks.splice(0, daemonLogChunks.length - 200);
+    return write.apply(process.stderr, [chunk, ...args]);
+  })(process.stderr.write);
+
+function recentLogTail(limit) {
+  return daemonLogChunks.slice(-limit).join("").trim() || null;
+}
+
+async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
+  const evidenceDetails = evidence?.success
+    ? [`evidence_uri=${evidence.uri}`, `evidence_sha256=${evidence.sha256}`]
+    : evidence && !evidence.success
+      ? [`evidence_error=${evidence.error}`]
+      : [];
   const details = [
     `state=${state.state}`,
     `exit_code=${state.exit_code}`,
@@ -197,6 +220,7 @@ async function postFinal(bus, message, envelope, state) {
     state.limit_tripped ? `limit=${state.limit_tripped}` : undefined,
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
+    ...evidenceDetails,
   ]
     .filter(Boolean)
     .join(" ");
@@ -212,7 +236,7 @@ async function postFinal(bus, message, envelope, state) {
   }
 }
 
-async function processHandoff(bus, stateDir, message) {
+async function processHandoff(bus, stateDir, message, governorUrl) {
   const taskId = message.message_id;
   try {
     assertTaskId(taskId);
@@ -259,21 +283,57 @@ async function processHandoff(bus, stateDir, message) {
   }
 
   try {
-    const repository = await prepareRepository(stateDir, envelope.repo, taskId);
-    lifecycle.transition("RUNNING", { branch: repository.branch });
-    const run = await runVinci({
-      envelope,
-      repoDir: repository.repoDir,
+    // Stage 2: Governor lease (if configured)
+    let envelopeToUse = envelope;
+    if (governorUrl) {
+      const governorToken = process.env.VINCI_GOVERNOR_TOKEN;
+      const claimResult = await claimGovernorPaths({
+        governorUrl,
+        token: governorToken,
+        paths: [envelope.claim],
+        taskId,
+        attempt: attempt.attempt,
+      });
+
+      if (!claimResult) {
+        // Governor not configured, skip
+      } else if (!claimResult.success && claimResult.blocked) {
+        // Lease refused - block the task
+        lifecycle.transition("BLOCKED", {
+          outcome: { reason: claimResult.reason },
+        });
+        await bus.post("blocker", `task ${taskId} blocked`, `lease refused: ${claimResult.reason}`, {
+          inReplyTo: message.message_id,
+        });
+        return true;
+      } else if (!claimResult.success) {
+        // Lease connection error - fail with error message
+        lifecycle.transition("FAILED", {
+          outcome: { reason: claimResult.reason },
+          exit_code: 1,
+        });
+        await bus.post("blocker", `task ${taskId} failed`, `governor error: ${claimResult.reason}`, {
+          inReplyTo: message.message_id,
+        });
+        return true;
+      } else {
+        // Lease granted - record and tighten limits if Governor order info available
+        lifecycle.transition("CLAIMED", { lease: claimResult });
+        envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
+      }
+    }
+
+    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId);
+    lifecycle.transition("RUNNING");
+    const run = await runVinci({ envelope: envelopeToUse,
       stateDir,
-      taskId,
-      sessionId: attempt.sessionId,
-    });
+      taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
     const head = await readHead(repository.repoDir);
     lifecycle.transition("EVIDENCE_PENDING", { ...run, head, outcome: run.outcome ?? null });
-    const published = await publish({ envelope, ...repository, taskId });
+    const published = await publish({ envelope: envelopeToUse, ...repository, taskId });
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const state = finalState({
-      envelope,
+      envelope: envelopeToUse,
       exitCode: run.exit_code,
       limitTripped: run.limit_tripped,
       outcome: run.outcome,
@@ -281,10 +341,37 @@ async function processHandoff(bus, stateDir, message) {
       pr: published.pr,
     });
     lifecycle.transition(state, { ...published, outcome });
-    await postFinal(bus, message, envelope, lifecycle.snapshot());
+
+    // Stage 2: upload evidence bundle before the final bus post so uri/sha256 (or the
+    // failure) can ride in the post body. No-op when VINCI_EVIDENCE_URI_PREFIX is unset.
+    // sessionJsonl: session transcript from <state-dir>/sessions/<task-id>/ (outside the repo).
+    // gitDiff is against the task branch base; it may be empty when the run changed nothing.
+    // logTail: last 200 lines of the daemon's stderr so the bundle captures how the run ended.
+    const session = readSessionState(join(stateDir, "sessions", taskId), attempt.sessionId);
+    const sessionJsonl = session.path ? readFileSync(session.path, "utf8") : null;
+    const gitDiffResult = await command("git", [
+      "-C",
+      repository.repoDir,
+      "diff",
+      "origin/main...HEAD",
+    ], { allowFailure: true });
+    const gitDiff = gitDiffResult.status === 0 ? gitDiffResult.stdout : null;
+    const logTail = recentLogTail(200);
+    const evidenceResult = await uploadEvidence({
+      sessionJsonl,
+      gitDiff,
+      resultJson: lifecycle.snapshot(),
+      logTail,
+      uriPrefix: process.env.VINCI_EVIDENCE_URI_PREFIX,
+      taskId,
+      busUrl: bus.serverUrl,
+      busToken: bus.token,
+      ref: envelopeToUse.ref,
+    });
+    await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult);
   } catch (error) {
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
-    await postFinal(bus, message, envelope, lifecycle.snapshot());
+    await postFinal(bus, message, envelope, lifecycle.snapshot(), null);
   }
   return true;
 }
@@ -305,7 +392,7 @@ async function main() {
       let cursor = loadCursor(options.stateDir, options.id);
       const messages = await bus.poll(options.id, cursor);
       for (const message of messages) {
-        if (!(await processHandoff(bus, options.stateDir, message))) continue;
+        if (!(await processHandoff(bus, options.stateDir, message, options.governor))) continue;
         cursor = advanceCursor(cursor, message);
         saveCursor(options.stateDir, options.id, cursor);
       }
