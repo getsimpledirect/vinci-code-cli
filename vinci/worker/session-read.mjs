@@ -66,6 +66,7 @@ function taskOutcome(entry) {
 }
 
 function messageCostUsd(entry) {
+  if (entry?.message?.role !== "assistant") return 0;
   const total = entry?.message?.usage?.cost?.total;
   return typeof total === "number" && Number.isFinite(total) && total > 0 ? total : 0;
 }
@@ -85,7 +86,7 @@ export function readSessionState(sessionDir, sessionId) {
       hasUsageEntries = true;
       accumulatedCostUsd += usageValue(entry);
     }
-    if (entry?.type === "message") {
+    if (entry?.type === "message" && entry?.message?.role === "assistant") {
       messageUsageCostUsd += messageCostUsd(entry);
       messageEntries += 1;
     }
