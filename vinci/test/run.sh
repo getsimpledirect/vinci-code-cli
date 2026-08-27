@@ -749,7 +749,7 @@ run_group resultbudget-integration node "${ROOT}/vinci/test/resultbudget-integra
 
 echo
 # Worker daemon integration tests
-run_group worker-e2e-integration node "${ROOT}/vinci/test/worker-e2e-integration.mjs"
+run_group worker-envelope-integration node "${ROOT}/vinci/test/worker-e2e-integration.mjs"
 run_group worker-basic-integration node "${ROOT}/vinci/test/worker-basic-integration.mjs"
 
 echo "── UI (headless xterm + faux model) ──────────────────"
