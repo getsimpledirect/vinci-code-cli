@@ -323,7 +323,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       }
     }
 
-    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId);
+    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
     lifecycle.transition("RUNNING");
     const run = await runVinci({ envelope: envelopeToUse,
       stateDir,

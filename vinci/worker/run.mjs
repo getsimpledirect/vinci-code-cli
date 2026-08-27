@@ -79,10 +79,10 @@ function terminateProcessGroup(child, signal) {
   }
 }
 
-export async function prepareRepository(stateDir, repo, taskId) {
+export async function prepareRepository(stateDir, repo, taskId, branchOverride) {
   if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
-  const branch = `worker/${taskId}`;
+  const branch = branchOverride ?? `worker/${taskId}`;
   if (existsSync(repoDir)) {
     await command("git", ["-C", repoDir, "fetch", "origin"]);
   } else {
@@ -91,6 +91,42 @@ export async function prepareRepository(stateDir, repo, taskId) {
     await command("git", ["clone", `${base}/${repo}.git`, repoDir]);
   }
 
+  if (branchOverride) {
+    // Defense in depth: task.mjs validates too, but this function must be safe standalone.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(branch) || branch.includes("..") || /^refs[\/.]/.test(branch) || branch.includes("refs/") || branch.endsWith(".lock") || branch.endsWith("/") || branch === "HEAD") {
+      throw new Error(`envelope branch ${branch} is not a plain git branch name`);
+    }
+    // git itself is the authority on ref-name legality; ask it rather than trusting our regex alone.
+    const legal = await command("git", ["check-ref-format", "--branch", branch], { allowFailure: true });
+    if (legal.status !== 0) throw new Error(`envelope branch ${branch} is not a valid git branch name`);
+    // The envelope pinned the branch (e.g. continuing a held PR). It must exist on origin NOW —
+    // ls-remote asks origin live; a show-ref on refs/remotes/* would trust stale local copies
+    // of branches deleted upstream. Silent fallback would strand work next to its target.
+    const remote = await command(
+      "git",
+      ["-C", repoDir, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${branch}`],
+      { allowFailure: true },
+    );
+    if (remote.status !== 0) throw new Error(`envelope branch ${branch} not found on origin`);
+    const remoteTip = remote.stdout.split("\n")[0].split(/\s/)[0];
+    if (!/^[0-9a-f]{40}$/.test(remoteTip)) throw new Error(`unexpected ls-remote output for ${branch}`);
+    const local = await command(
+      "git",
+      ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
+      { allowFailure: true },
+    );
+    if (local.status === 0) {
+      // Never reset away local-only commits (a crashed prior attempt's work): -B is destructive.
+      const anc = await command(
+        "git",
+        ["-C", repoDir, "merge-base", "--is-ancestor", branch, remoteTip],
+        { allowFailure: true },
+      );
+      if (anc.status !== 0) throw new Error(`local branch ${branch} has commits not on origin; refusing to reset (divergence)`);
+    }
+    await command("git", ["-C", repoDir, "checkout", "-B", branch, remoteTip]);
+    return { branch, repoDir };
+  }
   const localBranch = await command(
     "git",
     ["-C", repoDir, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
@@ -189,7 +225,7 @@ export async function publish({ envelope, repoDir, branch, taskId, limitTripped 
   // work and its stated blocker are on the record (measured 2026-08-27: the first bus-dispatched
   // task committed a decision record + a blocker and nothing reached the remote).
   const blockerReason = await readHeadBlocker(repoDir);
-  const push = await command("git", ["-C", repoDir, "push", "--set-upstream", "origin", branch], {
+  const push = await command("git", ["-C", repoDir, "push", "--set-upstream", "origin", `refs/heads/${branch}:refs/heads/${branch}`], {
     allowFailure: true,
   });
   const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
