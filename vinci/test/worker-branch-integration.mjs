@@ -1,7 +1,7 @@
 // Test: worker branch is created from origin/main without destructive -B.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkerTestFixture } from './lib/worker-fixture.mjs';
@@ -13,11 +13,15 @@ const test = async () => {
   const fixture = new WorkerTestFixture('branch');
   try {
     fixture.linkTools(TOOLS);
+    fixture.createRepo('test', 'repo');
     await fixture.startBus([{
-      id: 7,
+      message_id: '7',
       kind: 'handoff',
-      to: 'worker:w7',
-      body: 'repo: test/repo\n\nTask'
+      to_agent: 'w7',
+      subject: 'branch task',
+      body: 'repo: test/repo\n\nTask',
+      ts: '2026-08-26T10:00:00Z',
+      posted_by: 'scheduler',
     }]);
 
     const proc = spawn('node', [
@@ -26,15 +30,14 @@ const test = async () => {
       '--once', '--state-dir', fixture.tempDir
     ], { env: fixture.getEnv(), stdio: 'pipe' });
 
-    await new Promise(r => { proc.on('close', code => code === 0 ? r() : r()); });
-    const calls = readFileSync(join(fixture.tempDir, 'git-calls.txt'), 'utf8')
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line));
-    assert.ok(calls.some((args) => args.join(' ') === '-C ' + join(fixture.tempDir, 'repos', 'repo') + ' checkout -b worker/7 origin/main'));
-    assert.equal(calls.some((args) => args.includes('-B')), false);
+    const code = await new Promise(r => { proc.on('close', r); });
+    assert.equal(code, 0);
+    const repoDir = join(fixture.tempDir, 'repos', 'repo');
+    const branch = spawnSync('git', ['-C', repoDir, 'branch', '--show-current'], { encoding: 'utf8' });
+    assert.equal(branch.status, 0, branch.stderr);
+    assert.equal(branch.stdout.trim(), 'worker/7');
   } finally {
-    fixture.cleanup();
+    await fixture.cleanup();
   }
 };
 

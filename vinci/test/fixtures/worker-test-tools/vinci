@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fake vinci for worker tests - records invocation and simulates behavior
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const recordFile = process.env.FAKE_VINCI_RECORD || '/tmp/fake-vinci-invocations.txt';
@@ -27,16 +27,50 @@ if (sessionDir && sessionId) {
   const writeUsage = process.env.FAKE_VINCI_USAGE === '1';
 
   appendFileSync(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
-  if (outcome) appendFileSync(sessionFile, JSON.stringify({
+  const outcomeEntry = (cost) => ({
     type: 'custom',
     customType: 'vinci-task-outcome',
-    data: { state: outcome, reason: process.env.FAKE_VINCI_REASON || 'fixture outcome' },
-  }) + '\n');
+    data: {
+      schemaVersion: 1,
+      taskId: sessionId,
+      state: outcome,
+      reason: process.env.FAKE_VINCI_REASON || 'fixture outcome',
+      changedFiles: [],
+      verificationStatus: 'passed',
+      verificationCommand: 'fixture check',
+      usage: {
+        modelCalls: cost > 0 ? 1 : 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        estimatedCostUsd: cost,
+        providers: ['fixture'],
+        models: ['fixture/model'],
+      },
+      recordedAt: new Date().toISOString(),
+    },
+  });
+
+  if (outcome) appendFileSync(sessionFile, JSON.stringify(outcomeEntry(0)) + '\n');
 
   // Write usage if requested
   if (writeUsage) {
-    appendFileSync(sessionFile, JSON.stringify({ usage: { value_usd: 9.99 } }) + '\n');
+    const fixturePath = process.env.FAKE_VINCI_SESSION_FIXTURE;
+    if (fixturePath) {
+      const fixtureEntries = readFileSync(fixturePath, 'utf8')
+        .replaceAll('SESSION_ID', sessionId)
+        .split('\n')
+        .filter((line) => line && JSON.parse(line).type !== 'session')
+        .join('\n');
+      appendFileSync(sessionFile, `${fixtureEntries}\n`);
+    } else {
+      appendFileSync(sessionFile, JSON.stringify(outcomeEntry(9.99)) + '\n');
+    }
   }
+
+  if (process.env.FAKE_VINCI_WORKTREE_BLOCKER === '1') writeFileSync(resolve('BLOCKER.md'), 'working tree only\n');
 
   // Sleep if requested
   if (sleepMs > 0) {
@@ -45,6 +79,11 @@ if (sessionDir && sessionId) {
       process.exit(143);
     });
     await new Promise((resolveSleep) => setTimeout(resolveSleep, sleepMs));
+  }
+
+  if (process.env.FAKE_VINCI_USAGE_AT_EXIT === '1') {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    appendFileSync(sessionFile, JSON.stringify(outcomeEntry(9.99)) + '\n');
   }
 
   // Exit with code if requested

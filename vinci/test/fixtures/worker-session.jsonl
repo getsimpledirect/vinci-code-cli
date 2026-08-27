@@ -1,0 +1,2 @@
+{"type":"session","id":"SESSION_ID"}
+{"type":"custom","customType":"vinci-task-outcome","data":{"schemaVersion":1,"taskId":"SESSION_ID","state":"DONE","reason":"1 passed in 0.00s","changedFiles":["src/example.ts"],"verificationStatus":"passed","verificationCommand":"npm run check","activeDurationMs":48947,"usage":{"modelCalls":11,"inputTokens":22407,"outputTokens":2081,"cachedTokens":44800,"cacheWriteTokens":0,"reasoningTokens":0,"estimatedCostUsd":9.99,"providers":["vinci"],"models":["redacted/model"]},"recordedAt":"2026-07-21T04:56:23.489Z"}}

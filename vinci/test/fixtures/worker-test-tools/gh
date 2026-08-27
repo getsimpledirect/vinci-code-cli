@@ -8,6 +8,11 @@ const argv = process.argv.slice(2);
 appendFileSync(recordFile, JSON.stringify({ argv, timestamp: new Date().toISOString() }) + '\n');
 if (process.env.FAKE_GH_EXIT) process.exit(Number(process.env.FAKE_GH_EXIT));
 
+if (process.env.FAKE_GH_OUTPUT !== undefined) {
+  console.log(process.env.FAKE_GH_OUTPUT);
+  process.exit(0);
+}
+
 // If this is a pr create command, print a fake URL
 if (argv.includes('create') && argv.includes('pr')) {
   console.log('https://github.com/test/repo/pull/123');

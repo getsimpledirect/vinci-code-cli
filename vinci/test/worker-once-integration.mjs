@@ -12,12 +12,15 @@ const test = async () => {
   const fixture = new WorkerTestFixture('once');
   try {
     fixture.linkTools(TOOLS);
+    fixture.createRepo('test', 'repo');
     await fixture.startBus([{
-      id: 1,
+      message_id: '1',
       kind: 'handoff',
-      to: 'worker:w1',
+      to_agent: 'w1',
+      subject: 'once task',
       body: 'repo: test/repo\nevidence: pr\n\nFix bug',
-      ref: 'job_abc'
+      ts: '2026-08-26T10:00:00Z',
+      posted_by: 'scheduler',
     }]);
 
     const env = fixture.getEnv();
@@ -46,7 +49,7 @@ const test = async () => {
     const posts = fixture.getPostedMessages();
     assert.equal(posts.length, 2, `expected 2 posts, got ${posts.length}`);
   } finally {
-    fixture.cleanup();
+    await fixture.cleanup();
   }
 };
 

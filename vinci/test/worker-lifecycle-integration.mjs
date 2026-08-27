@@ -18,7 +18,7 @@ function envelope(overrides = {}) {
     model: "z-ai/glm-5.2",
     budget_usd: "5",
     max_runtime_s: "30",
-    ref: "ledger-42",
+    ref: "job_42",
     ...overrides,
   };
   return `${Object.entries(headers)
@@ -30,9 +30,22 @@ async function fakeBus(body) {
   const posts = [];
   const server = createServer((request, response) => {
     assert.equal(request.headers.authorization, "Bearer test-token");
-    if (request.method === "GET" && request.url === "/v1/messages") {
+    if (request.method === "GET" && request.url?.startsWith("/v1/messages")) {
       response.setHeader("content-type", "application/json");
-      response.end(JSON.stringify([{ id: 1, kind: "handoff", to: "worker:t1", body }]));
+      response.end(JSON.stringify({
+        messages: [{
+          message_id: "1",
+          to_agent: "t1",
+          kind: "handoff",
+          subject: "lifecycle task",
+          body,
+          ts: "2026-08-26T10:00:00Z",
+          posted_by: "scheduler",
+        }],
+        total: 1,
+        limit: 100,
+        offset: 0,
+      }));
       return;
     }
     if (request.method === "POST" && request.url === "/v1/messages") {

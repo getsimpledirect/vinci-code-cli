@@ -13,14 +13,18 @@ const test = async () => {
   const fixture = new WorkerTestFixture('deps');
   try {
     fixture.linkTools(TOOLS);
+    fixture.createRepo('test', 'repo');
     const npmRecord = join(fixture.tempDir, 'npm-calls.txt');
     writeFileSync(npmRecord, '');
 
     await fixture.startBus([{
-      id: 6,
+      message_id: '6',
       kind: 'handoff',
-      to: 'worker:w6',
-      body: 'repo: test/repo\n\nTask'
+      to_agent: 'w6',
+      subject: 'dependency task',
+      body: 'repo: test/repo\n\nTask',
+      ts: '2026-08-26T10:00:00Z',
+      posted_by: 'scheduler',
     }]);
 
     const proc = spawn('node', [
@@ -32,7 +36,7 @@ const test = async () => {
     await new Promise(r => { proc.on('close', r); });
     assert.equal(existsSync(npmRecord) ? readFileSync(npmRecord, 'utf8') : '', '');
   } finally {
-    fixture.cleanup();
+    await fixture.cleanup();
   }
 };
 
