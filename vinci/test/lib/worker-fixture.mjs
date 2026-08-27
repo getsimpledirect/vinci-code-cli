@@ -17,6 +17,15 @@ export class WorkerTestFixture {
   constructor(testName) {
     this.testName = testName;
     this.tempDir = mkdtempSync(join(tmpdir(), `worker-test-${testName}-`));
+    // The daemon's first run starts its cursor at NOW (skip-history, learned live on
+    // 2026-08-27). Fixture handoffs carry historical timestamps, so seed an ancient cursor for
+    // every worker id the tests use; worker-first-run-cursor.mjs is the one test that must NOT
+    // have this seed and proves the skip-history rule.
+    if (!process.env.VINCI_TEST_NO_CURSOR_SEED) {
+      const ancient = { ts: "2000-01-01T00:00:00.000Z", message_ids: [] };
+      const cursors = Object.fromEntries(["exit-worker", "locked", "publisher", "t1", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8"].map((id) => [id, ancient]));
+      writeFileSync(join(this.tempDir, "cursor.json"), JSON.stringify(cursors, null, 2));
+    }
     this.reposDir = join(this.tempDir, "origins");
     this.toolsDir = join(this.tempDir, "tools");
     this.recordFile = join(this.tempDir, "vinci-calls.txt");

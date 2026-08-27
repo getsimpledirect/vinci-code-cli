@@ -84,7 +84,10 @@ export class BusClient {
     return [...messagesById.values()]
       .filter((message) => {
         if (message.kind !== "handoff") return false;
-        if (message.to_agent !== null && message.to_agent !== workerId) return false;
+        // Only handoffs ADDRESSED to this worker. A broadcast handoff (to_agent null) is not a
+        // task for every worker that can see it: on the first live start the daemon claimed 56
+        // historical broadcasts and posted a blocker for each (2026-08-27 11:16Z).
+        if (message.to_agent !== workerId) return false;
         if (cursorTs === null || message.ts > cursorTs) return true;
         return message.ts === cursorTs && !seenAtCursor.has(message.message_id);
       })

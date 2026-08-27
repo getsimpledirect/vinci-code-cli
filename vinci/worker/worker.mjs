@@ -79,9 +79,15 @@ function loadCursor(stateDir, workerId) {
       return cursor;
     }
   } catch {
-    // A missing or corrupt cursor starts an inclusive read from the beginning.
+    // fall through: missing or unreadable cursor file
   }
-  return null;
+  // A missing or corrupt cursor starts from NOW, never from the beginning: the bus holds
+  // thousands of historical rows and a fresh worker must not replay them (the first live
+  // start did exactly that, 2026-08-27 11:16Z). The initial cursor is persisted before the
+  // first poll so a crash between init and poll cannot reopen history.
+  const fresh = { ts: new Date().toISOString(), message_ids: [] };
+  saveCursor(stateDir, workerId, fresh);
+  return fresh;
 }
 
 function advanceCursor(cursor, message) {
@@ -307,6 +313,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(`vinci worker: ${error.message}\n`);
+  process.stderr.write(`vinci worker: ${error.message}${error?.cause ? ` (cause: ${error.cause.code ?? error.cause.message})` : ""}\n`);
   process.exitCode = error?.exitCode ?? 1;
 });

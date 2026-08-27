@@ -125,6 +125,9 @@ function taskState(stateDir) {
 
 async function scenario(name, body, env, verify, prepare) {
   const stateDir = mkdtempSync(join(tmpdir(), `vinci-worker-${name}-`));
+  // First-run cursor starts at NOW (skip-history); these scenarios serve historical handoffs,
+  // so seed an ancient cursor. worker-first-run-cursor.mjs proves the unseeded behaviour.
+  writeFileSync(join(stateDir, "cursor.json"), JSON.stringify({ t1: { ts: "2000-01-01T00:00:00.000Z", message_ids: [] } }));
   const bus = await fakeBus(body);
   try {
     if (prepare) prepare(stateDir);

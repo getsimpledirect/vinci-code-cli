@@ -23,11 +23,11 @@ try {
 
   const bus = new BusClient(fixture.busUrl(), "test-token", 2);
   const first = await bus.poll("w1", null);
-  assert.deepEqual(first.map((message) => message.message_id), ["1", "2"]);
+  assert.deepEqual(first.map((message) => message.message_id), ["1"], "broadcast handoff 2 must NOT be selected for w1");
   assert.deepEqual(fixture.getRequests.map(({ offset }) => offset), [0, 2], "poll must page with limit/offset");
 
   fixture.getRequests = [];
-  const reread = await bus.poll("w1", { ts: timestamp, message_ids: ["1", "2"] });
+  const reread = await bus.poll("w1", { ts: timestamp, message_ids: ["1"] });
   assert.deepEqual(reread, [], "inclusive equal-ts reread must dedupe by message_id");
   assert.deepEqual(fixture.getRequests.map(({ offset }) => offset), [0, 2]);
 
@@ -38,14 +38,14 @@ try {
   );
   const code = await new Promise((resolveClose) => child.once("close", resolveClose));
   assert.equal(code, 0);
-  assert.equal(fixture.getVinciCalls().length, 2, "direct and broadcast handoffs must run; other target must not");
+  assert.equal(fixture.getVinciCalls().length, 1, "only the handoff ADDRESSED to this worker runs; broadcast and other-target handoffs must not");
   assert.deepEqual(
     fixture.getPostedMessages().filter((post) => post.kind === "finding").map((post) => post.refs),
-    [["job_1"], ["exp_2"]],
+    [["job_1"]],
   );
   const cursor = JSON.parse(readFileSync(join(fixture.tempDir, "cursor.json"), "utf8")).w1;
   assert.equal(cursor.ts, timestamp);
-  assert.deepEqual(cursor.message_ids.sort(), ["1", "2"]);
+  assert.deepEqual(cursor.message_ids.sort(), ["1"]);
 } finally {
   await fixture.cleanup();
 }
