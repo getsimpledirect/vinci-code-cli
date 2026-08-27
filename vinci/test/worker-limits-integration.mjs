@@ -22,7 +22,7 @@ const test = async () => {
     await fixture.startBus([{
       message_id: '3',
       kind: 'handoff',
-      to_agent: 'w3',
+      to_agent: 'worker:w3',
       subject: 'runtime task',
       body: 'repo: test/repo\nmax_runtime_s: 0.05\n\nTask',
       ts: '2026-08-26T10:00:00Z',
@@ -49,7 +49,7 @@ const test = async () => {
     await fixture.startBus([{
       message_id: '8',
       kind: 'handoff',
-      to_agent: 'w8',
+      to_agent: 'worker:w8',
       subject: 'budget task',
       body: 'repo: test/repo\nbudget_usd: 1\n\nTask',
       ts: '2026-08-26T10:00:00Z',
@@ -84,7 +84,7 @@ const test = async () => {
     await fixture.startBus([{
       message_id: '4',
       kind: 'handoff',
-      to_agent: 'w4',
+      to_agent: 'worker:w4',
       subject: 'deadline task',
       body: `repo: test/repo\ndeadline: ${pastDeadline}\n\nTask`,
       ts: '2026-08-26T10:00:00Z',

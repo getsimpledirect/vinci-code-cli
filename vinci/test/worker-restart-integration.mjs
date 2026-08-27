@@ -17,7 +17,7 @@ const test = async () => {
     await fixture.startBus([{
       message_id: '2',
       kind: 'handoff',
-      to_agent: 'w2',
+      to_agent: 'worker:w2',
       subject: 'restart task',
       body: 'repo: test/repo\nmax_runtime_s: 60\nref: job_xyz\n\nTask',
       ts: '2026-08-26T10:00:00Z',

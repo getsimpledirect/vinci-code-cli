@@ -16,9 +16,9 @@ try {
   fixture.createRepo("test", "repo");
   fixture.linkTools(TOOLS);
   await fixture.startBus([
-    { message_id: "1", to_agent: "w1", kind: "handoff", subject: "direct", body: "repo: test/repo\nevidence: none\nref: job_1\n\nTask one", ts: timestamp, posted_by: "scheduler" },
+    { message_id: "1", to_agent: "worker:w1", kind: "handoff", subject: "direct", body: "repo: test/repo\nevidence: none\nref: job_1\n\nTask one", ts: timestamp, posted_by: "scheduler" },
     { message_id: "2", to_agent: null, kind: "handoff", subject: "broadcast", body: "repo: test/repo\nevidence: none\nref: exp_2\n\nTask two", ts: timestamp, posted_by: "scheduler" },
-    { message_id: "3", to_agent: "other", kind: "handoff", subject: "other", body: "repo: test/repo\nevidence: none\nref: bk_3\n\nIgnore", ts: timestamp, posted_by: "scheduler" },
+    { message_id: "3", to_agent: "worker:other", kind: "handoff", subject: "other", body: "repo: test/repo\nevidence: none\nref: bk_3\n\nIgnore", ts: timestamp, posted_by: "scheduler" },
   ]);
 
   const bus = new BusClient(fixture.busUrl(), "test-token", 2);

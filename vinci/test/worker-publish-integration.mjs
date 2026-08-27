@@ -16,7 +16,7 @@ async function scenario(name, repoOptions, env) {
     fixture.linkTools(TOOLS);
     await fixture.startBus([{
       message_id: name,
-      to_agent: "publisher",
+      to_agent: "worker:publisher",
       kind: "handoff",
       subject: name,
       body: "repo: test/repo\nevidence: pr\nref: job_publish\n\nTask",

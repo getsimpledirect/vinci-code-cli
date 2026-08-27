@@ -87,7 +87,9 @@ export class BusClient {
         // Only handoffs ADDRESSED to this worker. A broadcast handoff (to_agent null) is not a
         // task for every worker that can see it: on the first live start the daemon claimed 56
         // historical broadcasts and posted a blocker for each (2026-08-27 11:16Z).
-        if (message.to_agent !== workerId) return false;
+        // The bus principal is `worker:<id>`; --id is the bare id. Match the principal, not the
+        // bare id (the first live run matched nothing: to_agent "worker:box-1" vs "box-1").
+        if (message.to_agent !== `worker:${workerId}`) return false;
         if (cursorTs === null || message.ts > cursorTs) return true;
         return message.ts === cursorTs && !seenAtCursor.has(message.message_id);
       })

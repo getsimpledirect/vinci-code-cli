@@ -14,7 +14,7 @@ try {
   fixture.linkTools(TOOLS);
   await fixture.startBus([{
     message_id: "12",
-    to_agent: "exit-worker",
+    to_agent: "worker:exit-worker",
     kind: "handoff",
     subject: "exit budget",
     body: "repo: test/repo\nevidence: none\nbudget_usd: 1\n\nTask",

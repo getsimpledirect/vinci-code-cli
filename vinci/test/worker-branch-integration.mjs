@@ -17,7 +17,7 @@ const test = async () => {
     await fixture.startBus([{
       message_id: '7',
       kind: 'handoff',
-      to_agent: 'w7',
+      to_agent: 'worker:w7',
       subject: 'branch task',
       body: 'repo: test/repo\n\nTask',
       ts: '2026-08-26T10:00:00Z',

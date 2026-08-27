@@ -12,7 +12,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const LAUNCHER = join(ROOT, "vinci/bin/vinci");
 const TOOLS = join(ROOT, "vinci/test/fixtures/worker-test-tools");
 process.env.VINCI_TEST_NO_CURSOR_SEED = "1";
-const historical = { message_id: "old1", to_agent: "w1", kind: "handoff", subject: "old", body: "repo: test/repo\nevidence: none\n\nold task", ts: "2026-08-26T10:00:00Z", posted_by: "x" };
+const historical = { message_id: "old1", to_agent: "worker:w1", kind: "handoff", subject: "old", body: "repo: test/repo\nevidence: none\n\nold task", ts: "2026-08-26T10:00:00Z", posted_by: "x" };
 const f = new WorkerTestFixture("first-run-cursor");
 // async spawn: the fixture's fake bus lives in THIS event loop; a spawnSync would block it and
 // the daemon would see ECONNRESET (learned the hard way writing this test).

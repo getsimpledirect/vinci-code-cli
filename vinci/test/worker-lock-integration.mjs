@@ -41,7 +41,7 @@ try {
 
   fixture.busMessages = [{
     message_id: "11",
-    to_agent: "locked",
+    to_agent: "worker:locked",
     kind: "handoff",
     subject: "claimed elsewhere",
     body: "repo: test/repo\nevidence: none\nref: bk_11\n\nTask",

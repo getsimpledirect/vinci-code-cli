@@ -20,7 +20,7 @@ const test = async () => {
     await fixture.startBus([{
       message_id: '6',
       kind: 'handoff',
-      to_agent: 'w6',
+      to_agent: 'worker:w6',
       subject: 'dependency task',
       body: 'repo: test/repo\n\nTask',
       ts: '2026-08-26T10:00:00Z',

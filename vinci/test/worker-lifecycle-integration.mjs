@@ -35,7 +35,7 @@ async function fakeBus(body) {
       response.end(JSON.stringify({
         messages: [{
           message_id: "1",
-          to_agent: "t1",
+          to_agent: "worker:t1",
           kind: "handoff",
           subject: "lifecycle task",
           body,
