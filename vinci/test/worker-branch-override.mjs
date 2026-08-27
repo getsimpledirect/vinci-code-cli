@@ -69,3 +69,16 @@ await assert.rejects(
 );
 
 console.log("✓ worker-branch-override (hardened cases)");
+
+// (6) prepareRepository's OWN validator must bind standalone — hostile names rejected even when
+// the parse layer is bypassed entirely (this layer exists precisely for that bypass case).
+for (const hostile of ["refs/heads/x", "x:refs/heads/evil", "+main", "a..b", "x.lock", "HEAD"]) {
+  const sh = join(scratch, `state-h-${hostile.replace(/[^a-z]/gi, "_")}`); mkdirSync(sh);
+  await assert.rejects(
+    () => prepareRepository(sh, "acme/repo", "msg_h", hostile),
+    /not a plain git branch name|not a valid git branch name/,
+    `prepareRepository must reject hostile branch ${JSON.stringify(hostile)} standalone`,
+  );
+}
+
+console.log("✓ worker-branch-override (all cases incl. standalone validator)");
