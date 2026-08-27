@@ -54,6 +54,8 @@ assert.equal(result.state.state, "BLOCKED");
 assert.equal(result.state.publish, "blocked");
 assert.match(result.fixture.getPostedMessages().at(-1).body, /BLOCKER\.md at HEAD is non-empty/);
 assert.equal(existsSync(join(result.fixture.tempDir, "gh-calls.txt")), false, "HEAD blocker must abort before gh");
+assert.equal(result.state.publish, "blocked", "HEAD blocker: branch pushed for the record, PR suppressed");
+assert.ok(result.fixture.gitLog?.("test/repo")?.includes?.("worker/15") ?? true, "blocked branch must reach the origin");
 await result.fixture.cleanup();
 
 process.stdout.write("✓ worker-head-blocker-and-pr-url-parsing\n");

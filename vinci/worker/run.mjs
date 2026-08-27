@@ -185,12 +185,15 @@ export async function readHeadBlocker(repoDir) {
 }
 
 export async function publish({ envelope, repoDir, branch, taskId }) {
+  // A BLOCKER.md at HEAD suppresses only the PR. The branch is still pushed so the agent's
+  // work and its stated blocker are on the record (measured 2026-08-27: the first bus-dispatched
+  // task committed a decision record + a blocker and nothing reached the remote).
   const blockerReason = await readHeadBlocker(repoDir);
-  if (blockerReason) return { publish: "blocked", pr: null, blocker_reason: blockerReason };
   const push = await command("git", ["-C", repoDir, "push", "--set-upstream", "origin", branch], {
     allowFailure: true,
   });
   const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
+  if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
   if (push.status !== 0 || envelope.evidence !== "pr") return result;
 
   const created = await command(
