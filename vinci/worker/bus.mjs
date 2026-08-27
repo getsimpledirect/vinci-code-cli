@@ -4,20 +4,32 @@ export function isLedgerRef(value) {
   return typeof value === "string" && LEDGER_REF.test(value);
 }
 
-function assertMessage(message) {
+// Production rows are not all shaped like the fixtures: rows older than the server-recorded
+// `posted_by` (bus PR #70) carry null there, and `body` can be null. Tolerate nulls for
+// optional text; reject only rows that cannot be routed (no id, no kind, no ts, or a
+// non-string to_agent). Returns the normalised row, or null for an unusable one — the caller
+// skips it and logs once per id, so one malformed row can never stall the whole poll
+// (measured on the first live start: one bad row of 100 made every poll exit 1).
+const warnedRows = new Set();
+
+export function normaliseMessage(message) {
   if (
     !message ||
     typeof message.message_id !== "string" ||
-    (message.to_agent !== null && typeof message.to_agent !== "string") ||
+    (message.to_agent !== null && message.to_agent !== undefined && typeof message.to_agent !== "string") ||
     typeof message.kind !== "string" ||
-    typeof message.subject !== "string" ||
-    typeof message.body !== "string" ||
     typeof message.ts !== "string" ||
-    Number.isNaN(Date.parse(message.ts)) ||
-    typeof message.posted_by !== "string"
+    Number.isNaN(Date.parse(message.ts))
   ) {
-    throw new Error("bus GET response contains an invalid message row");
+    return null;
   }
+  return {
+    ...message,
+    to_agent: message.to_agent ?? null,
+    subject: typeof message.subject === "string" ? message.subject : "",
+    body: typeof message.body === "string" ? message.body : "",
+    posted_by: typeof message.posted_by === "string" ? message.posted_by : "",
+  };
 }
 
 export class BusClient {
@@ -50,8 +62,16 @@ export class BusClient {
       ) {
         throw new Error("bus GET response must contain messages, total, limit, and offset");
       }
-      for (const message of payload.messages) {
-        assertMessage(message);
+      for (const raw of payload.messages) {
+        const message = normaliseMessage(raw);
+        if (message === null) {
+          const key = raw && typeof raw.message_id === "string" ? raw.message_id : "<no id>";
+          if (!warnedRows.has(key)) {
+            warnedRows.add(key);
+            console.error(`vinci worker: skipping unroutable bus row ${key}`);
+          }
+          continue;
+        }
         messagesById.set(message.message_id, message);
       }
       offset += payload.messages.length;
