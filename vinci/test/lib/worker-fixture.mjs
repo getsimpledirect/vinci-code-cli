@@ -3,11 +3,12 @@ import { createServer } from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 export class WorkerTestFixture {
   constructor(testName) {
     this.testName = testName;
-    this.tempDir = mkdtempSync(`worker-test-${testName}-`);
+    this.tempDir = mkdtempSync(join(tmpdir(), `worker-test-${testName}-`));
     this.reposDir = join(this.tempDir, 'repos');
     this.toolsDir = join(this.tempDir, 'tools');
     this.recordFile = join(this.tempDir, 'vinci-calls.txt');
@@ -44,6 +45,11 @@ export class WorkerTestFixture {
     this.postedMessages = [];
 
     const server = createServer((req, res) => {
+      if (req.headers.authorization !== 'Bearer test-token') {
+        res.writeHead(401);
+        res.end();
+        return;
+      }
       if (req.method === 'GET' && req.url === '/v1/messages') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(this.busMessages));
@@ -76,7 +82,7 @@ export class WorkerTestFixture {
 
   linkTools(toolsSource) {
     mkdirSync(this.toolsDir, { recursive: true });
-    const tools = ['vinci', 'npm', 'gh'];
+    const tools = ['vinci', 'npm', 'gh', 'git'];
     for (const tool of tools) {
       spawnSync('ln', ['-sf', join(toolsSource, tool), join(this.toolsDir, tool)], { stdio: 'pipe' });
     }
@@ -86,9 +92,12 @@ export class WorkerTestFixture {
     const env = {
       ...process.env,
       VINCI_BUS_TOKEN: 'test-token',
-      VINCI_WORKER_GIT_BASE: `file://${this.reposDir}/`,
       PATH: `${this.toolsDir}:${process.env.PATH}`,
       FAKE_VINCI_RECORD: this.recordFile,
+      FAKE_GIT_RECORD: join(this.tempDir, 'git-calls.txt'),
+      FAKE_GH_RECORD: join(this.tempDir, 'gh-calls.txt'),
+      HOME: join(this.tempDir, 'home'),
+      VINCI_NO_BOOTSTRAP_HEAL: '1',
     };
     Object.assign(env, overrides);
     return env;

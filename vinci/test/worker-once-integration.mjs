@@ -6,11 +6,11 @@ import { WorkerTestFixture } from './lib/worker-fixture.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const TOOLS = join(ROOT, 'vinci/test/fixtures/worker-test-tools');
+const LAUNCHER = join(ROOT, 'vinci/bin/vinci');
 
 const test = async () => {
   const fixture = new WorkerTestFixture('once');
   try {
-    fixture.createRepo('test', 'repo');
     fixture.linkTools(TOOLS);
     await fixture.startBus([{
       id: 1,
@@ -21,15 +21,15 @@ const test = async () => {
     }]);
 
     const env = fixture.getEnv();
-    
+
     // Verify fake vinci is first on PATH
     const whichResult = spawnSync('bash', ['-c', 'which vinci'], { env, encoding: 'utf8' });
     const vinciPath = whichResult.stdout.trim();
     assert(vinciPath.includes('tools'), `vinci should be from tools dir, got: ${vinciPath}`);
 
-    const proc = spawn('node', [
-      join(ROOT, 'vinci/worker/worker.mjs'),
-      'start', '--id', 'w1', '--server', fixture.busUrl(),
+    const proc = spawn('bash', [
+      LAUNCHER,
+      'worker', 'start', '--id', 'w1', '--server', fixture.busUrl(),
       '--once', '--state-dir', fixture.tempDir
     ], { env, stdio: 'pipe' });
 
@@ -38,7 +38,10 @@ const test = async () => {
     });
 
     const calls = fixture.getVinciCalls();
-    assert(calls.length >= 1, `vinci not invoked (got ${calls.length} calls)`);
+    assert(
+      calls.length >= 1,
+      `vinci not invoked (got ${calls.length} calls; posts=${JSON.stringify(fixture.getPostedMessages())})`,
+    );
 
     const posts = fixture.getPostedMessages();
     assert.equal(posts.length, 2, `expected 2 posts, got ${posts.length}`);

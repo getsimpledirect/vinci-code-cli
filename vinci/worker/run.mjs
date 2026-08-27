@@ -1,12 +1,34 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { accessSync, constants, existsSync, mkdirSync } from "node:fs";
+import { delimiter, dirname, join, resolve } from "node:path";
 
 import { readSessionState } from "./session-read.mjs";
 
+function resolveBin(name) {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    const candidate = resolve(directory || ".", name);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  throw new Error(`Executable not found on PATH: ${name}`);
+}
+
 function command(commandName, args, options = {}) {
   return new Promise((resolveCommand, rejectCommand) => {
-    const child = spawn(commandName, args, {
+    let executable;
+    try {
+      executable = resolveBin(commandName);
+    } catch (error) {
+      if (options.allowFailure) {
+        resolveCommand({ status: null, signal: null, stdout: "", stderr: error.message });
+      } else {
+        rejectCommand(error);
+      }
+      return;
+    }
+    const child = spawn(executable, args, {
       cwd: options.cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -82,7 +104,7 @@ export function runVinci({ envelope, repoDir, sessionId }) {
 
   return new Promise((resolveRun) => {
     const child = spawn(
-      "vinci",
+      resolveBin("vinci"),
       [
         "-p",
         "--session-id",

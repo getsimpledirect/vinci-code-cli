@@ -1,7 +1,7 @@
 // Test: max_runtime_s kills, budget kills, deadline blocks
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { join, dirname, readFileSync } from 'node:path';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkerTestFixture } from './lib/worker-fixture.mjs';
 
