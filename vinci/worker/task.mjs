@@ -17,6 +17,8 @@ const HEADER_KEYS = new Set([
   "branch",
   "claim",
   "evidence_ref",
+  "fork",
+  "upstream",
 ]);
 
 function positiveNumber(value, name) {
@@ -76,6 +78,13 @@ export function parseEnvelope(body) {
       throw new Error("branch must be a plain git branch name (letters, digits, ._/-; no leading -/+, no .., no refs/ prefix, no refspec syntax)");
     }
   }
+  const forkValue = values.get("fork") ?? "false";
+  if (forkValue !== "true" && forkValue !== "false") throw new Error('fork must be exactly "true" or "false"');
+  const fork = forkValue === "true";
+  const upstreamValue = values.get("upstream");
+  if (upstreamValue !== undefined && !fork) throw new Error("upstream is only valid with fork: true");
+  if (upstreamValue !== undefined && !REPO.test(upstreamValue)) throw new Error("upstream must be in org/name form");
+  const upstream = fork ? (upstreamValue ?? repo) : undefined;
   const claim = values.get("claim") ?? ".";
   const ref = values.get("evidence_ref") ?? values.get("ref");
 
@@ -88,6 +97,8 @@ export function parseEnvelope(body) {
     max_runtime_s: maxRuntimeS,
     deadline,
     ref,
+    fork,
+    upstream,
     branch: branchValue,
     claim,
     spec,

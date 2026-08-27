@@ -180,3 +180,29 @@ test('parseEnvelope accepts a 40-hex branch name (documented decision)', () => {
   assert.equal(parseEnvelope(`repo: t/r\nbranch: ${hex}\n\nSpec`).branch, hex);
 });
 
+
+// Fork lane (harness-fix proposals): fork:/upstream: headers. fork is a strict boolean;
+// upstream names the PR target repo and is only meaningful on a fork task.
+test('parseEnvelope defaults fork to false and upstream to undefined', () => {
+  const r = parseEnvelope('repo: t/r\n\nSpec');
+  assert.equal(r.fork, false); assert.equal(r.upstream, undefined);
+});
+test('parseEnvelope parses fork: true with upstream defaulting to repo', () => {
+  const r = parseEnvelope('repo: getsimpledirect/vinci-code-cli\nfork: true\n\nSpec');
+  assert.equal(r.fork, true); assert.equal(r.upstream, 'getsimpledirect/vinci-code-cli');
+});
+test('parseEnvelope parses an explicit upstream on a fork task', () => {
+  const r = parseEnvelope('repo: t/r\nfork: true\nupstream: up/stream\n\nSpec');
+  assert.equal(r.upstream, 'up/stream');
+});
+for (const bad of ['yes', '1', 'TRUE', 'True', '']) {
+  test(`parseEnvelope rejects fork value ${JSON.stringify(bad)}`, () => {
+    assert.throws(() => parseEnvelope(`repo: t/r\nfork: ${bad}\n\nSpec`), /fork/);
+  });
+}
+test('parseEnvelope rejects upstream without fork: true', () => {
+  assert.throws(() => parseEnvelope('repo: t/r\nupstream: up/stream\n\nSpec'), /upstream/);
+});
+test('parseEnvelope rejects a malformed upstream', () => {
+  assert.throws(() => parseEnvelope('repo: t/r\nfork: true\nupstream: not a repo\n\nSpec'), /upstream/);
+});
