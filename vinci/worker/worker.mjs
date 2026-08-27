@@ -330,7 +330,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
     const head = await readHead(repository.repoDir);
     lifecycle.transition("EVIDENCE_PENDING", { ...run, head, outcome: run.outcome ?? null });
-    const published = await publish({ envelope: envelopeToUse, ...repository, taskId });
+    const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId });
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const state = finalState({
       envelope: envelopeToUse,
