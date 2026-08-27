@@ -43,3 +43,30 @@ await assert.rejects(
 );
 
 console.log("✓ worker-branch-override");
+
+// (4) stale remote-tracking ref: branch deleted on origin AFTER an earlier fetch must not
+// satisfy the existence check (a show-ref on refs/remotes/origin/* would wrongly pass).
+const s4 = join(scratch, "state4"); mkdirSync(s4);
+await prepareRepository(s4, "acme/repo", "msg_seed", "worker/msg_existing"); // populates remote refs
+execFileSync("git", ["-C", join(origin, "repo.git"), "update-ref", "-d", "refs/heads/worker/msg_existing"]);
+await assert.rejects(
+  () => prepareRepository(s4, "acme/repo", "msg_stale", "worker/msg_existing"),
+  /not found on origin/,
+  "a branch deleted on origin must fail even when a stale refs/remotes copy survives locally",
+);
+// restore for later cases
+execFileSync("git", ["-C", join(origin, "repo.git")].concat(["update-ref", "refs/heads/worker/msg_existing", heldTip]));
+
+// (5) local divergence: local-only commits on the override branch must never be silently reset away.
+const s5 = join(scratch, "state5"); mkdirSync(s5);
+const d5 = await prepareRepository(s5, "acme/repo", "msg_div", "worker/msg_existing");
+git(d5.repoDir, "config", "user.email", "t@t"); git(d5.repoDir, "config", "user.name", "t");
+writeFileSync(join(d5.repoDir, "local-only.txt"), "unpushed\n");
+git(d5.repoDir, "add", "."); git(d5.repoDir, "commit", "-qm", "local-only work");
+await assert.rejects(
+  () => prepareRepository(s5, "acme/repo", "msg_div2", "worker/msg_existing"),
+  /local|ancestor|diverg/i,
+  "an existing local branch with commits not on origin must fail loudly, not be reset",
+);
+
+console.log("✓ worker-branch-override (hardened cases)");

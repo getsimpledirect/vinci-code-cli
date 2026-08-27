@@ -162,3 +162,13 @@ test('parseEnvelope prefers evidence_ref over ref', () => {
 });
 
 if (failed > 0) process.exit(1);
+
+// Branch header hardening: a branch value is a git ref NAME, never a refspec or option.
+test('parseEnvelope accepts a normal branch', () => {
+  assert.equal(parseEnvelope('repo: t/r\nbranch: worker/msg_abc\n\nSpec').branch, 'worker/msg_abc');
+});
+for (const hostile of ['+main', '-x', 'a:b', 'a..b', 'refs/heads/x', 'a b', '--force']) {
+  test(`parseEnvelope rejects hostile branch ${JSON.stringify(hostile)}`, () => {
+    assert.throws(() => parseEnvelope(`repo: t/r\nbranch: ${hostile}\n\nSpec`), /branch/);
+  });
+}

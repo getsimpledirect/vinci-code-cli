@@ -62,6 +62,12 @@ export function parseEnvelope(body) {
   const spec = normalized.slice(separator + 2).trim();
   if (!spec) throw new Error("task spec must not be empty");
   const branchValue = values.get("branch");
+  if (branchValue !== undefined) {
+    const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+    if (!BRANCH.test(branchValue) || branchValue.includes("..") || branchValue.startsWith("refs/")) {
+      throw new Error("branch must be a plain git branch name (letters, digits, ._/-; no leading -/+, no .., no refs/ prefix, no refspec syntax)");
+    }
+  }
   const claim = values.get("claim") ?? ".";
   const ref = values.get("evidence_ref") ?? values.get("ref");
 
