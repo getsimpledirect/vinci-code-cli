@@ -32,6 +32,7 @@ export class WorkerTestFixture {
     this.postedMessages = [];
     this.rejectedPosts = [];
     this.busMessages = [];
+    this.evidencePosts = [];
     this.getRequests = [];
     this.busServer = null;
     this.busPort = 0;
@@ -67,6 +68,7 @@ export class WorkerTestFixture {
     this.postedMessages = [];
     this.rejectedPosts = [];
     this.getRequests = [];
+    this.evidencePosts = [];
 
     const server = createServer((request, response) => {
       if (request.headers.authorization !== "Bearer test-token") {
@@ -107,6 +109,27 @@ export class WorkerTestFixture {
         });
         return;
       }
+      if (request.method === "POST" && url.pathname === "/v1/evidence") {
+        let body = "";
+        request.setEncoding("utf8");
+        request.on("data", (chunk) => {
+          body += chunk;
+        });
+        request.on("end", () => {
+          const evidence = JSON.parse(body);
+          const invalidRefs = (evidence.refs ?? []).filter((ref) => !LEDGER_REF.test(ref));
+          if (invalidRefs.length > 0) {
+            this.rejectedPosts.push(evidence);
+            response.writeHead(422, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: `invalid refs: ${invalidRefs.join(", ")}` }));
+            return;
+          }
+          this.evidencePosts.push(evidence);
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify({ ok: true }));
+        });
+        return;
+      }
       response.writeHead(404);
       response.end();
     });
@@ -122,7 +145,7 @@ export class WorkerTestFixture {
 
   linkTools(toolsSource) {
     mkdirSync(this.toolsDir, { recursive: true });
-    for (const tool of ["vinci", "npm", "gh"]) {
+    for (const tool of ["vinci", "npm", "gh", "aws"]) {
       symlinkSync(join(toolsSource, tool), join(this.toolsDir, tool));
     }
   }
@@ -155,6 +178,10 @@ export class WorkerTestFixture {
 
   getPostedMessages() {
     return this.postedMessages;
+  }
+
+  getEvidencePosts() {
+    return this.evidencePosts;
   }
 
   async cleanup() {
