@@ -139,7 +139,6 @@ test('parseEnvelope rejects duplicate headers', () => {
   assert.throws(() => parseEnvelope('repo: test/repo\nrepo: other/repo\n\nSpec'), /duplicate/);
 });
 
-console.log(`\nWorker envelope tests: ${passed} passed, ${failed} failed`);
 
 test('parseEnvelope parses claim header', () => {
   const result = parseEnvelope('repo: test/repo\nclaim: src/\n\nSpec');
@@ -161,7 +160,6 @@ test('parseEnvelope prefers evidence_ref over ref', () => {
   assert.equal(result.ref, 'job_new');
 });
 
-if (failed > 0) process.exit(1);
 
 // Branch header hardening: a branch value is a git ref NAME, never a refspec or option.
 test('parseEnvelope accepts a normal branch', () => {
@@ -206,3 +204,6 @@ test('parseEnvelope rejects upstream without fork: true', () => {
 test('parseEnvelope rejects a malformed upstream', () => {
   assert.throws(() => parseEnvelope('repo: t/r\nfork: true\nupstream: not a repo\n\nSpec'), /upstream/);
 });
+
+console.log(`\nWorker envelope tests: ${passed} passed, ${failed} failed`);
+if (failed > 0) process.exit(1);
