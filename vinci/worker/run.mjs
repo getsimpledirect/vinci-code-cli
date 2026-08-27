@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants, mkdirSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 
 import { readSessionState } from "./session-read.mjs";
