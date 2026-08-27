@@ -136,10 +136,13 @@ No new npm dependencies introduced; uses only node:* and global APIs.
   cursor.json                    # High-water mark per worker
   tasks/
     <id>.json                    # Lifecycle record
+  sessions/
+    <task-id>/                    # vinci JSONL read for outcomes and usage
   repos/
     <name>/                      # Cloned repo
-      sessions/                  # vinci JSONL read for outcomes and usage
 ```
+
+> All daemon-owned files (cursor, tasks, repos, sessions) live in state-dir, not the repo.
 
 ## Network Access
 

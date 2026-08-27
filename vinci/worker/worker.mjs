@@ -260,8 +260,14 @@ async function processHandoff(bus, stateDir, message) {
 
   try {
     const repository = await prepareRepository(stateDir, envelope.repo, taskId);
-    lifecycle.transition("RUNNING");
-    const run = await runVinci({ envelope, repoDir: repository.repoDir, sessionId: attempt.sessionId });
+    lifecycle.transition("RUNNING", { branch: repository.branch });
+    const run = await runVinci({
+      envelope,
+      repoDir: repository.repoDir,
+      stateDir,
+      taskId,
+      sessionId: attempt.sessionId,
+    });
     const head = await readHead(repository.repoDir);
     lifecycle.transition("EVIDENCE_PENDING", { ...run, head, outcome: run.outcome ?? null });
     const published = await publish({ envelope, ...repository, taskId });

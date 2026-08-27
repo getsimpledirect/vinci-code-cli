@@ -102,6 +102,7 @@ export class TaskLifecycle {
         pr: null,
         publish: null,
         evidence: null,
+        branch: null,
         limit_tripped: null,
         vinci_version: null,
         provider: null,
