@@ -184,7 +184,7 @@ export async function readHeadBlocker(repoDir) {
   return contents.status === 0 && contents.stdout.trim() ? "BLOCKER.md at HEAD is non-empty" : null;
 }
 
-export async function publish({ envelope, repoDir, branch, taskId }) {
+export async function publish({ envelope, repoDir, branch, taskId, limitTripped }) {
   // A BLOCKER.md at HEAD suppresses only the PR. The branch is still pushed so the agent's
   // work and its stated blocker are on the record (measured 2026-08-27: the first bus-dispatched
   // task committed a decision record + a blocker and nothing reached the remote).
@@ -194,6 +194,7 @@ export async function publish({ envelope, repoDir, branch, taskId }) {
   });
   const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
   if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
+  if (limitTripped) return result;
   if (push.status !== 0 || envelope.evidence !== "pr") return result;
 
   const created = await command(
