@@ -235,8 +235,9 @@ run_group issue-integration node "${ROOT}/vinci/test/issue-integration.mjs"
 run_group billing-codes-integration node "${ROOT}/vinci/test/billing-codes-integration.mjs"
 run_group no-downgrade-integration node "${ROOT}/vinci/test/no-downgrade-integration.mjs"
 run_group units node "${ROOT}/vinci/test/units.mjs"
-run_group worker-session-read node "${ROOT}/vinci/test/worker-session-read.mjs"
-run_group worker-integration node "${ROOT}/vinci/test/worker-integration.mjs"
+run_group worker-envelope-integration node "${ROOT}/vinci/test/worker-envelope-integration.mjs"
+run_group worker-once-integration node "${ROOT}/vinci/test/worker-once-integration.mjs"
+run_group worker-lifecycle-integration node "${ROOT}/vinci/test/worker-lifecycle-integration.mjs"
 # Print-mode liveness: every prompt gets a fresh idle watchdog, all session activity resets it,
 # tool execution suspends it, invalid timeout configuration falls back safely, and cleanup cancels it.
 run_group print-mode-liveness node --experimental-strip-types --input-type=module --eval '
@@ -748,10 +749,6 @@ run_group crew-integration node "${ROOT}/vinci/test/crew-integration.mjs"
 run_group resultbudget-integration node "${ROOT}/vinci/test/resultbudget-integration.mjs"
 
 echo
-# Worker daemon integration tests
-run_group worker-envelope-integration node "${ROOT}/vinci/test/worker-e2e-integration.mjs"
-run_group worker-basic-integration node "${ROOT}/vinci/test/worker-basic-integration.mjs"
-
 echo "── UI (headless xterm + faux model) ──────────────────"
 # The trailing path is a filter, not a file: vitest still globs the whole root, and background
 # Agents keep their git worktrees at .claude/worktrees/ INSIDE the repo. Those copies have no

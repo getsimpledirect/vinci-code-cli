@@ -123,5 +123,21 @@ test('parseEnvelope requires blank line', () => {
   }, /blank line/);
 });
 
+test('parseEnvelope rejects invalid budget', () => {
+  assert.throws(() => parseEnvelope('repo: test/repo\nbudget_usd: 0\n\nSpec'), /budget_usd/);
+});
+
+test('parseEnvelope rejects invalid runtime', () => {
+  assert.throws(() => parseEnvelope('repo: test/repo\nmax_runtime_s: nope\n\nSpec'), /max_runtime_s/);
+});
+
+test('parseEnvelope rejects non-UTC deadlines', () => {
+  assert.throws(() => parseEnvelope('repo: test/repo\ndeadline: 2026-08-26T12:00:00-04:00\n\nSpec'), /UTC/);
+});
+
+test('parseEnvelope rejects duplicate headers', () => {
+  assert.throws(() => parseEnvelope('repo: test/repo\nrepo: other/repo\n\nSpec'), /duplicate/);
+});
+
 console.log(`\nWorker envelope tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

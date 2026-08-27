@@ -1,397 +1,181 @@
-// Spawn and manage vinci process with limits and publishing
-import { spawnSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { readSessionOutcome, readSessionUsage } from './session-read.mjs';
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 
-export class TaskRunner {
-  constructor(stateDir, taskEnvelope, taskLifecycle, busClient) {
-    this.stateDir = stateDir;
-    this.envelope = taskEnvelope;
-    this.lifecycle = taskLifecycle;
-    this.busClient = busClient;
-    this.repoDir = join(stateDir, 'repos', taskEnvelope.repo.split('/').pop());
-    this.logsDir = join(stateDir, 'logs');
-    mkdirSync(this.logsDir, { recursive: true });
-  }
+import { readSessionState } from "./session-read.mjs";
 
-  async run() {
-    const taskState = this.lifecycle.getState();
-    const sessionId = taskState.session_id;
-    const attempt = taskState.attempt;
+function command(commandName, args, options = {}) {
+  return new Promise((resolveCommand, rejectCommand) => {
+    const child = spawn(commandName, args, {
+      cwd: options.cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    let settled = false;
+    child.once("error", (error) => {
+      settled = true;
+      if (options.allowFailure) resolveCommand({ status: null, signal: null, stdout: "", stderr: error.message });
+      else rejectCommand(error);
+    });
+    child.once("close", (status, signal) => {
+      if (settled) return;
+      settled = true;
+      const result = { status, signal, stdout: stdout.trim(), stderr: stderr.trim() };
+      if (status === 0 || options.allowFailure) resolveCommand(result);
+      else rejectCommand(new Error(`${commandName} ${args.join(" ")} failed: ${stderr.trim() || signal || status}`));
+    });
+  });
+}
 
+function signalExitCode(code, signal) {
+  if (typeof code === "number") return code;
+  if (signal === "SIGTERM") return 143;
+  if (signal === "SIGKILL") return 137;
+  return 1;
+}
+
+function terminateProcessGroup(child, signal) {
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
     try {
-      // Parse and validate envelope
-      const errors = this.envelope.validate();
-      if (errors.length) {
-        await this.busClient.post('blocker', 
-          `task ${this.envelope.taskId} blocked`,
-          `Invalid envelope: ${errors.join('; ')}`,
-          this.envelope.ref ? [this.envelope.ref] : undefined);
-        this.lifecycle.update({ state: 'BLOCKED', terminal: true });
+      child.kill(signal);
+    } catch {}
+  }
+}
+
+export async function prepareRepository(stateDir, repo, taskId) {
+  const repoDir = join(stateDir, "repos", repo.split("/")[1]);
+  const branch = `worker/${taskId}`;
+  if (existsSync(repoDir)) {
+    await command("git", ["-C", repoDir, "fetch", "origin"]);
+  } else {
+    mkdirSync(dirname(repoDir), { recursive: true });
+    await command("git", ["clone", `https://github.com/${repo}.git`, repoDir]);
+  }
+
+  const localBranch = await command(
+    "git",
+    ["-C", repoDir, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+    { allowFailure: true },
+  );
+  if (localBranch.status === 0) await command("git", ["-C", repoDir, "checkout", branch]);
+  else await command("git", ["-C", repoDir, "checkout", "-b", branch, "origin/main"]);
+  return { branch, repoDir };
+}
+
+export function runVinci({ envelope, repoDir, sessionId }) {
+  const sessionDir = join(repoDir, "sessions");
+  const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
+  const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
+  mkdirSync(sessionDir, { recursive: true });
+
+  return new Promise((resolveRun) => {
+    const child = spawn(
+      "vinci",
+      [
+        "-p",
+        "--session-id",
+        sessionId,
+        "--session-dir",
+        "sessions",
+        "--provider",
+        envelope.provider,
+        "--model",
+        envelope.model,
+        "--tools",
+        "read,grep,find,ls,bash,edit,write",
+        envelope.spec,
+      ],
+      { cwd: repoDir, detached: true, env: process.env, stdio: ["ignore", "inherit", "inherit"] },
+    );
+    let limitTripped = null;
+    let killTimer;
+    let settled = false;
+
+    const tripLimit = (limit) => {
+      if (limitTripped || settled) return;
+      limitTripped = limit;
+      terminateProcessGroup(child, "SIGTERM");
+      killTimer = setTimeout(() => terminateProcessGroup(child, "SIGKILL"), killGraceMs);
+      killTimer.unref();
+    };
+
+    const runtimeTimer = setTimeout(() => tripLimit("max_runtime_s"), envelope.max_runtime_s * 1000);
+    runtimeTimer.unref();
+    const pollTimer = setInterval(() => {
+      if (envelope.deadline && Date.now() >= Date.parse(envelope.deadline)) {
+        tripLimit("deadline");
         return;
       }
+      if (readSessionState(sessionDir, sessionId).costUsd >= envelope.budget_usd) tripLimit("budget_usd");
+    }, pollMs);
+    pollTimer.unref();
 
-      // Claim the task
-      this.lifecycle.transitionTo('CLAIMED');
-      await this.busClient.post('status', 
-        `claimed ${this.envelope.taskId} attempt ${attempt}`,
-        `Worker claimed task ${this.envelope.taskId}`);
-
-      // Clone/fetch repo
-      await this.ensureRepo();
-
-      // Setup dependencies if needed
-      const depResult = await this.setupDependencies();
-      if (!depResult.success) {
-        await this.busClient.post('blocker',
-          `task ${this.envelope.taskId} failed`,
-          `Dependencies installation failed: ${depResult.reason}`,
-          this.envelope.ref ? [this.envelope.ref] : undefined);
-        this.lifecycle.update({ state: 'FAILED', terminal: true, limit_tripped: 'deps' });
-        return;
-      }
-
-      // Checkout branch
-      await this.ensureBranch();
-
-      // Spawn vinci process
-      this.lifecycle.transitionTo('RUNNING');
-      const runResult = await this.spawnVinci(sessionId);
-      this.lifecycle.update(runResult);
-
-      // Read outcome
-      const outcome = readSessionOutcome(join(this.stateDir, 'sessions'), sessionId);
-      const costUsd = readSessionUsage(join(this.stateDir, 'sessions'), sessionId);
-      this.lifecycle.update({ outcome, cost_usd: costUsd });
-
-      // Publish work
-      await this.publish();
-
-      // Determine final state
-      const finalState = this.determineFinalState(runResult, outcome);
-      this.lifecycle.update({ state: finalState, terminal: true });
-
-      // Post final result
-      await this.postFinalResult(finalState, outcome, runResult, costUsd);
-
-    } catch (err) {
-      console.error(`Task run failed: ${err.message}`);
-      this.lifecycle.update({ state: 'FAILED', terminal: true });
-      try {
-        await this.busClient.post('blocker',
-          `task ${this.envelope.taskId} failed`,
-          `Worker error: ${err.message}`,
-          this.envelope.ref ? [this.envelope.ref] : undefined);
-      } catch {
-        // Best effort
-      }
-    }
-  }
-
-  async ensureRepo() {
-    if (existsSync(join(this.repoDir, '.git'))) {
-      // Fetch updates
-      const result = spawnSync('git', ['fetch', '-q', 'origin'], {
-        cwd: this.repoDir,
-        stdio: 'pipe',
+    const finish = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(runtimeTimer);
+      clearInterval(pollTimer);
+      if (killTimer) clearTimeout(killTimer);
+      const session = readSessionState(sessionDir, sessionId);
+      resolveRun({
+        exit_code: signalExitCode(code, signal),
+        limit_tripped: limitTripped,
+        cost_usd: session.costUsd,
+        outcome: session.outcome,
       });
-      if (result.status !== 0) {
-        throw new Error(`git fetch failed: ${result.stderr?.toString() || 'unknown'}`);
-      }
-    } else {
-      // Clone repo
-      mkdirSync(dirname(this.repoDir), { recursive: true });
-      const url = `https://github.com/${this.envelope.repo}.git`;
-      const args = process.env.GH_TOKEN 
-        ? ['clone', '-q', url, this.repoDir]
-        : ['clone', '-q', url, this.repoDir];
-      
-      const result = spawnSync('git', args, { stdio: 'pipe' });
-      if (result.status !== 0) {
-        throw new Error(`git clone failed: ${result.stderr?.toString() || 'unknown'}`);
-      }
-    }
-  }
+    };
+    child.once("error", () => finish(1, null));
+    child.once("close", finish);
+  });
+}
 
-  async setupDependencies() {
-    const packageLock = join(this.repoDir, 'package-lock.json');
-    const nodeModules = join(this.repoDir, 'node_modules');
+export async function readHead(repoDir) {
+  const result = await command("git", ["-C", repoDir, "rev-parse", "HEAD"], { allowFailure: true });
+  return result.status === 0 ? result.stdout : null;
+}
 
-    if (existsSync(packageLock) && !existsSync(nodeModules)) {
-      const logFile = join(this.logsDir, `${this.envelope.taskId}.npm.log`);
-      const result = spawnSync('npm', ['ci', '--no-audit', '--no-fund'], {
-        cwd: this.repoDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+export async function publish({ envelope, repoDir, branch, taskId }) {
+  const push = await command("git", ["-C", repoDir, "push", "--set-upstream", "origin", branch], {
+    allowFailure: true,
+  });
+  const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
+  if (push.status !== 0 || envelope.evidence !== "pr" || existsSync(join(repoDir, "BLOCKER.md"))) return result;
 
-      writeFileSync(logFile, result.stdout?.toString() || '');
-      if (result.stderr) {
-        writeFileSync(logFile, result.stderr?.toString() || '', { flag: 'a' });
-      }
+  const created = await command(
+    "gh",
+    [
+      "pr",
+      "create",
+      "--base",
+      "main",
+      "--head",
+      branch,
+      "--title",
+      `Worker task ${taskId}`,
+      "--body",
+      `Unattended Vinci worker result for task ${taskId}.`,
+    ],
+    { cwd: repoDir, allowFailure: true },
+  );
+  if (created.status === 0 && /^https?:\/\//.test(created.stdout)) result.pr = created.stdout.split("\n").at(-1);
+  return result;
+}
 
-      if (result.status !== 0) {
-        return { success: false, reason: 'npm ci failed' };
-      }
-    }
-
-    return { success: true };
-  }
-
-  async ensureBranch() {
-    const branchExists = spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${this.envelope.branch}`], {
-      cwd: this.repoDir,
-      stdio: 'pipe',
-    }).status === 0;
-
-    if (branchExists) {
-      const result = spawnSync('git', ['checkout', '-q', this.envelope.branch], {
-        cwd: this.repoDir,
-        stdio: 'pipe',
-      });
-      if (result.status !== 0) {
-        throw new Error(`git checkout ${this.envelope.branch} failed`);
-      }
-    } else {
-      const result = spawnSync('git', ['checkout', '-q', '-b', this.envelope.branch, 'origin/main'], {
-        cwd: this.repoDir,
-        stdio: 'pipe',
-      });
-      if (result.status !== 0) {
-        throw new Error(`git checkout -b ${this.envelope.branch} failed`);
-      }
-    }
-  }
-
-  async spawnVinci(sessionId) {
-    const prompt = `Unattended worker run. Commit work on the current branch. Do not push or open PR.\n\n${this.envelope.spec}`;
-    
-    return new Promise((resolve) => {
-      let exitCode = null;
-      let childPid = null;
-      let limitTripped = null;
-      let timed = false;
-      const startTime = Date.now();
-      const maxRuntime = this.envelope.max_runtime_s * 1000;
-      const budget = this.envelope.budget_usd;
-
-      const proc = spawn('vinci', [
-        '-p',
-        '--session-id', sessionId,
-        '--session-dir', join(this.stateDir, 'sessions'),
-        '--provider', this.envelope.provider,
-        '--model', this.envelope.model,
-        '--tools', 'read,grep,find,ls,bash,edit,write',
-        prompt,
-      ], {
-        cwd: this.repoDir,
-        stdio: 'pipe',
-        detached: true, // Process group
-      });
-
-      childPid = proc.pid;
-
-      const limitChecker = setInterval(() => {
-        if (timed) return;
-
-        const elapsed = Date.now() - startTime;
-
-        // Check deadline
-        if (this.envelope.deadline) {
-          const deadlineTime = new Date(this.envelope.deadline).getTime();
-          if (Date.now() >= deadlineTime) {
-            limitTripped = 'deadline';
-            process.kill(-childPid, 'SIGTERM');
-            timed = true;
-          }
-        }
-
-        // Check max_runtime_s
-        if (elapsed >= maxRuntime) {
-          limitTripped = 'max_runtime_s';
-          process.kill(-childPid, 'SIGTERM');
-          timed = true;
-          setTimeout(() => {
-            try { process.kill(-childPid, 'SIGKILL'); } catch {}
-          }, 30000);
-        }
-
-        // Check budget
-        const cost = readSessionUsage(join(this.stateDir, 'sessions'), sessionId);
-        if (cost > budget) {
-          limitTripped = 'budget';
-          process.kill(-childPid, 'SIGTERM');
-          timed = true;
-          setTimeout(() => {
-            try { process.kill(-childPid, 'SIGKILL'); } catch {}
-          }, 30000);
-        }
-      }, 15000);
-
-      proc.on('close', (code) => {
-        clearInterval(limitChecker);
-        exitCode = code;
-
-        // Get head commit
-        const headResult = spawnSync('git', ['rev-parse', 'HEAD'], {
-          cwd: this.repoDir,
-          stdio: 'pipe',
-        });
-        const head = headResult.status === 0 ? headResult.stdout.toString().trim() : '';
-
-        // Get vinci version
-        const versionResult = spawnSync('vinci', ['--version'], { stdio: 'pipe' });
-        const version = versionResult.status === 0 ? versionResult.stdout.toString().trim() : 'unknown';
-
-        resolve({
-          exit_code: exitCode,
-          head,
-          vinci_version: version,
-          provider: this.envelope.provider,
-          model: this.envelope.model,
-          limit_tripped: limitTripped,
-        });
-      });
-
-      proc.on('error', (err) => {
-        clearInterval(limitChecker);
-        resolve({
-          exit_code: 1,
-          head: '',
-          vinci_version: 'unknown',
-          provider: this.envelope.provider,
-          model: this.envelope.model,
-          limit_tripped: limitTripped,
-        });
-      });
-    });
-  }
-
-  async publish() {
-    if (!process.env.GH_TOKEN) return;
-
-    // Check if commits exist ahead of origin/main
-    const checkResult = spawnSync('git', ['rev-list', '--count', 'origin/main..HEAD'], {
-      cwd: this.repoDir,
-      stdio: 'pipe',
-    });
-    const aheadCount = parseInt(checkResult.stdout.toString().trim(), 10) || 0;
-
-    if (aheadCount === 0) return;
-
-    // Push branch
-    const pushResult = spawnSync('git', ['push', '-u', 'origin', this.envelope.branch], {
-      cwd: this.repoDir,
-      stdio: 'pipe',
-    });
-
-    if (pushResult.status !== 0) {
-      this.lifecycle.update({ publish: 'push-failed' });
-      return;
-    }
-
-    this.lifecycle.update({ publish: 'pushed' });
-
-    // If evidence==pr, create/find PR
-    if (this.envelope.evidence === 'pr') {
-      const blockerExists = existsSync(join(this.repoDir, 'BLOCKER.md'));
-      if (blockerExists) return;
-
-      // Check if PR exists
-      const prResult = spawnSync('gh', ['pr', 'list', '--head', this.envelope.branch, '--json', 'url', '-q', '.[0].url'], {
-        cwd: this.repoDir,
-        stdio: 'pipe',
-      });
-      let prUrl = prResult.stdout?.toString().trim();
-
-      if (!prUrl) {
-        // Create PR
-        const titleResult = spawnSync('git', ['log', '-1', '--format=%s'], {
-          cwd: this.repoDir,
-          stdio: 'pipe',
-        });
-        const title = titleResult.stdout?.toString().trim() || 'Worker task';
-
-        const bodyResult = spawnSync('git', ['log', '--reverse', '--format=%s%n%n%b', 'origin/main..HEAD'], {
-          cwd: this.repoDir,
-          stdio: 'pipe',
-        });
-        let body = bodyResult.stdout?.toString().trim() || '';
-        const state = this.lifecycle.getState();
-        body += `\n\nUnattended Vinci Worker run (task ${this.envelope.taskId}, attempt ${state.attempt}, ${this.envelope.provider}/${this.envelope.model}, vinci ${state.vinci_version}). Not merged by the worker.`;
-
-        const createResult = spawnSync('gh', ['pr', 'create', '--base', 'main', '--head', this.envelope.branch, '--title', title, '--body', body], {
-          cwd: this.repoDir,
-          stdio: 'pipe',
-        });
-        prUrl = createResult.stdout?.toString().trim();
-      }
-
-      if (prUrl) {
-        this.lifecycle.update({ pr: prUrl });
-      }
-    }
-  }
-
-  determineFinalState(runResult, outcome) {
-    // Check for failures
-    if (runResult.exit_code !== 0 || runResult.limit_tripped) {
-      return 'FAILED';
-    }
-
-    // Check for blocked
-    if (outcome === 'BLOCKED' || outcome === 'WAITING') {
-      return 'BLOCKED';
-    }
-
-    const blockerExists = existsSync(join(this.repoDir, 'BLOCKER.md'));
-    if (blockerExists) {
-      return 'BLOCKED';
-    }
-
-    // Check for evidence
-    if (this.envelope.evidence === 'none') {
-      return 'COMPLETED';
-    }
-
-    if (this.envelope.evidence === 'pr') {
-      const state = this.lifecycle.getState();
-      if (state.pr) {
-        return 'COMPLETED';
-      }
-    }
-
-    return 'UNVERIFIED';
-  }
-
-  async postFinalResult(finalState, outcome, runResult, costUsd) {
-    const state = this.lifecycle.getState();
-
-    if (finalState === 'COMPLETED' && this.envelope.ref) {
-      await this.busClient.post('finding',
-        `task ${this.envelope.taskId} completed`,
-        `Outcome: ${outcome}. Head: ${runResult.head}. Cost: $${costUsd.toFixed(2)}.`,
-        [this.envelope.ref]);
-    } else if (finalState === 'BLOCKED') {
-      const reason = outcome ? `Agent reported: ${outcome}` : 'BLOCKER.md at HEAD or limit tripped';
-      await this.busClient.post('blocker',
-        `task ${this.envelope.taskId} blocked`,
-        reason,
-        this.envelope.ref ? [this.envelope.ref] : undefined);
-    } else if (finalState === 'FAILED') {
-      let reason = `Exit code: ${runResult.exit_code}`;
-      if (runResult.limit_tripped) {
-        reason += `, Limit: ${runResult.limit_tripped}`;
-      }
-      reason += `, Cost: $${costUsd.toFixed(2)}`;
-      await this.busClient.post('blocker',
-        `task ${this.envelope.taskId} failed`,
-        reason,
-        this.envelope.ref ? [this.envelope.ref] : undefined);
-    } else if (finalState === 'UNVERIFIED') {
-      await this.busClient.post('status',
-        `task ${this.envelope.taskId} unverified`,
-        `Evidence requirement not met (evidence: ${this.envelope.evidence}). Head: ${runResult.head}.`);
-    }
-  }
+export function finalState({ envelope, exitCode, limitTripped, outcome, blocker, pr }) {
+  if (exitCode !== 0 || limitTripped) return "FAILED";
+  if (outcome?.state === "BLOCKED" || outcome?.state === "WAITING" || blocker) return "BLOCKED";
+  if (envelope.evidence === "none" || pr) return "COMPLETED";
+  return "UNVERIFIED";
 }

@@ -2,13 +2,7 @@
 
 Standalone Node program that polls an HTTP bus for work handoffs, spawns unattended `vinci -p` runs, monitors limits (runtime, budget, deadline), and publishes results back to the bus.
 
-## Authority and Governance
-
-**NOT Governor-managed.** Authority comes from:
-1. An enabled handoff message on the bus (kind=="handoff", to=="worker:<id>")
-2. This machine's static envelope (allowed repos, allowed tools)
-
-The daemon manages one task at a time, blocking until it completes or fails.
+The daemon processes one handoff at a time and blocks until that task reaches a terminal state.
 
 ## Setup
 
@@ -53,16 +47,16 @@ WantedBy=multi-user.target
 ## How It Works
 
 1. **Poll**: GET /v1/messages (filtered to kind=="handoff", to=="worker:<id>")
-2. **Parse**: Task envelope with headers (repo, evidence, provider, model, budget, timeout, deadline, branch)
+2. **Parse**: Task envelope with headers (repo, evidence, provider, model, budget, timeout, deadline, ref)
 3. **Claim**: POST status "claimed <id> attempt N" to bus
-4. **Setup**: Clone/fetch repo, ensure branch, install dependencies if needed (npm ci)
+4. **Setup**: Clone/fetch the repo and reuse or create `worker/<task-id>` from `origin/main`
 5. **Run**: Spawn `vinci -p --session-id <id> --tools read,grep,find,ls,bash,edit,write "<spec>"`
 6. **Limits**:
    - `max_runtime_s`: SIGTERM then SIGKILL after 30s
    - `budget_usd`: Poll session JSONL every 15s; kill if cost exceeds budget
    - `deadline`: Check before start and each poll; kill if past
 7. **Outcome**: Read task-outcome from session JSONL (DONE, DONE-UNVERIFIED, WAITING, BLOCKED)
-8. **Publish**: Push branch to origin; if evidence==pr and no BLOCKER.md, create/find PR
+8. **Publish**: Push branch to origin; if evidence==pr and no BLOCKER.md, create a PR
 9. **Report**: Post finding (COMPLETED), blocker (BLOCKED/FAILED), or status (UNVERIFIED)
 
 ## Task Envelope
@@ -78,7 +72,6 @@ budget_usd: 5.0                    (default)
 max_runtime_s: 14400               (default; 4 hours)
 deadline: 2026-08-26T12:00:00Z    (optional ISO-8601 UTC)
 ref: ledger_id                     (optional; for finding refs)
-branch: worker/custom              (optional; default: worker/<id>)
 
 <blank line>
 
@@ -131,7 +124,6 @@ Minimal:
 - Node 22+
 - Global `fetch` (Node 22)
 - Git
-- `npm ci` (if package-lock.json exists in cloned repos)
 - `gh` CLI (for PR operations)
 - `vinci` binary on PATH
 
@@ -146,11 +138,7 @@ No new npm dependencies introduced; uses only node:* and global APIs.
     <id>.json                    # Lifecycle record
   repos/
     <name>/                      # Cloned repo
-  sessions/
-    <id>/
-      session.jsonl              # vinci -p output (read for outcomes/usage)
-  logs/
-    <id>.npm.log                 # npm ci output (if run)
+      sessions/                  # vinci JSONL read for outcomes and usage
 ```
 
 ## Network Access

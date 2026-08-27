@@ -7,21 +7,30 @@ export class BusClient {
     this.token = token;
   }
 
-  async poll(workerId, cursor = "") {
+  async poll(workerId, cursor = null) {
     const url = `${this.serverUrl}/v1/messages`;
     const response = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
     if (!response.ok) throw new Error(`bus GET ${url} failed: ${response.status} ${await response.text()}`);
     const payload = await response.json();
     const messages = Array.isArray(payload) ? payload : payload?.messages;
     if (!Array.isArray(messages)) throw new Error("bus GET response must be an array or contain messages");
+    const afterCursor = (id) => {
+      if (cursor === null || cursor === undefined || cursor === "") return true;
+      if (typeof id === "number" && typeof cursor === "number") return id > cursor;
+      return String(id) > String(cursor);
+    };
     return messages
       .filter(
         (message) =>
           message?.kind === "handoff" &&
           message.to === `worker:${workerId}` &&
-          String(message.id) > String(cursor),
+          afterCursor(message.id),
       )
-      .sort((left, right) => String(left.id).localeCompare(String(right.id)));
+      .sort((left, right) =>
+        typeof left.id === "number" && typeof right.id === "number"
+          ? left.id - right.id
+          : String(left.id).localeCompare(String(right.id)),
+      );
   }
 
   async post(kind, subject, body, options = {}) {
