@@ -1,8 +1,11 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync } from "node:fs";
+import { accessSync, constants, mkdirSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 
 import { readSessionState } from "./session-read.mjs";
+
+const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const PR_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
 
 function resolveBin(name) {
   for (const directory of (process.env.PATH ?? "").split(delimiter)) {
@@ -77,13 +80,15 @@ function terminateProcessGroup(child, signal) {
 }
 
 export async function prepareRepository(stateDir, repo, taskId) {
+  if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
   const branch = `worker/${taskId}`;
   if (existsSync(repoDir)) {
     await command("git", ["-C", repoDir, "fetch", "origin"]);
   } else {
     mkdirSync(dirname(repoDir), { recursive: true });
-    await command("git", ["clone", `https://github.com/${repo}.git`, repoDir]);
+    const base = (process.env.VINCI_WORKER_GIT_BASE ?? "https://github.com/").replace(/\/+$/, "");
+    await command("git", ["clone", `${base}/${repo}.git`, repoDir]);
   }
 
   const localBranch = await command(
@@ -170,12 +175,23 @@ export async function readHead(repoDir) {
   return result.status === 0 ? result.stdout : null;
 }
 
+export async function readHeadBlocker(repoDir) {
+  const exists = await command("git", ["-C", repoDir, "cat-file", "-e", "HEAD:BLOCKER.md"], {
+    allowFailure: true,
+  });
+  if (exists.status !== 0) return null;
+  const contents = await command("git", ["-C", repoDir, "show", "HEAD:BLOCKER.md"], { allowFailure: true });
+  return contents.status === 0 && contents.stdout.trim() ? "BLOCKER.md at HEAD is non-empty" : null;
+}
+
 export async function publish({ envelope, repoDir, branch, taskId }) {
+  const blockerReason = await readHeadBlocker(repoDir);
+  if (blockerReason) return { publish: "blocked", pr: null, blocker_reason: blockerReason };
   const push = await command("git", ["-C", repoDir, "push", "--set-upstream", "origin", branch], {
     allowFailure: true,
   });
   const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
-  if (push.status !== 0 || envelope.evidence !== "pr" || existsSync(join(repoDir, "BLOCKER.md"))) return result;
+  if (push.status !== 0 || envelope.evidence !== "pr") return result;
 
   const created = await command(
     "gh",
@@ -193,13 +209,14 @@ export async function publish({ envelope, repoDir, branch, taskId }) {
     ],
     { cwd: repoDir, allowFailure: true },
   );
-  if (created.status === 0 && /^https?:\/\//.test(created.stdout)) result.pr = created.stdout.split("\n").at(-1);
+  if (created.status === 0) result.pr = created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null;
   return result;
 }
 
 export function finalState({ envelope, exitCode, limitTripped, outcome, blocker, pr }) {
   if (exitCode !== 0 || limitTripped) return "FAILED";
   if (outcome?.state === "BLOCKED" || outcome?.state === "WAITING" || blocker) return "BLOCKED";
+  if (outcome?.state === "DONE_UNVERIFIED") return "UNVERIFIED";
   if (envelope.evidence === "none" || pr) return "COMPLETED";
   return "UNVERIFIED";
 }

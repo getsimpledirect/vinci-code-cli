@@ -1,8 +1,17 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 
-import { BusClient } from "./bus.mjs";
+import { BusClient, isLedgerRef } from "./bus.mjs";
 import { finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle } from "./task.mjs";
 
@@ -60,10 +69,27 @@ function cursorPath(stateDir) {
 function loadCursor(stateDir, workerId) {
   try {
     const cursors = JSON.parse(readFileSync(cursorPath(stateDir), "utf8"));
-    return cursors?.[workerId] ?? "";
+    const cursor = cursors?.[workerId];
+    if (
+      cursor &&
+      typeof cursor.ts === "string" &&
+      Array.isArray(cursor.message_ids) &&
+      cursor.message_ids.every((id) => typeof id === "string")
+    ) {
+      return cursor;
+    }
   } catch {
-    return "";
+    // A missing or corrupt cursor starts an inclusive read from the beginning.
   }
+  return null;
+}
+
+function advanceCursor(cursor, message) {
+  if (!cursor || message.ts > cursor.ts) return { ts: message.ts, message_ids: [message.message_id] };
+  if (message.ts === cursor.ts) {
+    return { ts: cursor.ts, message_ids: [...new Set([...cursor.message_ids, message.message_id])] };
+  }
+  return cursor;
 }
 
 function saveCursor(stateDir, workerId, cursor) {
@@ -78,8 +104,86 @@ function saveCursor(stateDir, workerId, cursor) {
   renameSync(temporary, path);
 }
 
+function pidIsLive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function acquireDaemonLock(stateDir, workerId) {
+  const path = join(stateDir, "daemon.lock");
+  const contents = `${JSON.stringify({ pid: process.pid, id: workerId, started_at: new Date().toISOString() })}\n`;
+  while (true) {
+    try {
+      const descriptor = openSync(path, "wx", 0o600);
+      try {
+        writeFileSync(descriptor, contents);
+      } finally {
+        closeSync(descriptor);
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try {
+          const owner = JSON.parse(readFileSync(path, "utf8"));
+          if (owner?.pid === process.pid) unlinkSync(path);
+        } catch {}
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let owner;
+      try {
+        owner = JSON.parse(readFileSync(path, "utf8"));
+      } catch {}
+      if (pidIsLive(owner?.pid)) {
+        const lockError = new Error(`daemon lock ${path} is owned by live pid ${owner.pid}`);
+        lockError.exitCode = 75;
+        throw lockError;
+      }
+      const stale = `${path}.stale-${process.pid}-${Date.now()}`;
+      try {
+        renameSync(path, stale);
+        unlinkSync(stale);
+      } catch (renameError) {
+        if (renameError?.code !== "ENOENT") throw renameError;
+      }
+    }
+  }
+}
+
+function acquireTaskClaim(stateDir, taskId) {
+  const path = join(stateDir, "tasks", `${taskId}.claim`);
+  mkdirSync(join(stateDir, "tasks"), { recursive: true });
+  while (true) {
+    try {
+      mkdirSync(path);
+      writeFileSync(join(path, "pid"), `${process.pid}\n`, { mode: 0o600 });
+      return true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let ownerPid;
+      try {
+        ownerPid = Number(readFileSync(join(path, "pid"), "utf8").trim());
+      } catch {}
+      if (pidIsLive(ownerPid)) return false;
+      const stale = `${path}.stale-${process.pid}-${Date.now()}`;
+      try {
+        renameSync(path, stale);
+        rmSync(stale, { recursive: true, force: true });
+      } catch (renameError) {
+        if (renameError?.code !== "ENOENT") throw renameError;
+      }
+    }
+  }
+}
+
 async function postFinal(bus, message, envelope, state) {
-  const subject = `task ${message.id} ${state.state.toLowerCase()}`;
+  const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   const details = [
     `state=${state.state}`,
     `exit_code=${state.exit_code}`,
@@ -90,11 +194,9 @@ async function postFinal(bus, message, envelope, state) {
   ]
     .filter(Boolean)
     .join(" ");
-  const options = { inReplyTo: message.id };
-  if (state.state === "COMPLETED") {
-    options.refs = [envelope.ref ?? `handoff:${message.id}`];
-    if (state.pr) options.refs.push(state.pr);
-    if (state.head) options.refs.push(`commit:${state.head}`);
+  const options = { inReplyTo: message.message_id };
+  if (state.state === "COMPLETED" && isLedgerRef(envelope.ref)) {
+    options.refs = [envelope.ref];
     await bus.post("finding", subject, details, options);
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
     const reason = state.outcome?.reason ? `${details} reason=${state.outcome.reason}` : details;
@@ -105,16 +207,17 @@ async function postFinal(bus, message, envelope, state) {
 }
 
 async function processHandoff(bus, stateDir, message) {
-  const taskId = String(message.id);
+  const taskId = message.message_id;
   try {
     assertTaskId(taskId);
   } catch (error) {
-    await bus.post("blocker", `task ${taskId} blocked`, error.message, { inReplyTo: message.id });
-    return;
+    await bus.post("blocker", `task ${taskId} blocked`, error.message, { inReplyTo: message.message_id });
+    return true;
   }
 
   const lifecycle = new TaskLifecycle(stateDir, taskId);
-  if (lifecycle.isTerminal()) return;
+  if (lifecycle.isTerminal()) return true;
+  if (!acquireTaskClaim(stateDir, taskId)) return false;
 
   let envelope;
   try {
@@ -124,25 +227,28 @@ async function processHandoff(bus, stateDir, message) {
       { id: taskId, envelope: { evidence: null, provider: null, model: null } },
       version,
     );
-    lifecycle.transition("BLOCKED", {
+    const state = /^repo must be/.test(error.message) ? "FAILED" : "BLOCKED";
+    lifecycle.transition(state, {
       limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
       outcome: { reason: error.message },
     });
-    await bus.post("blocker", `task ${taskId} blocked`, error.message, { inReplyTo: message.id });
-    return;
+    await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, `state=${state} reason=${error.message}`, {
+      inReplyTo: message.message_id,
+    });
+    return true;
   }
 
   const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version);
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
-    await bus.post("blocker", `task ${taskId} blocked`, "deadline is in the past", { inReplyTo: message.id });
-    return;
+    await bus.post("blocker", `task ${taskId} blocked`, "deadline is in the past", { inReplyTo: message.message_id });
+    return true;
   }
 
   lifecycle.transition("CLAIMED");
   if (attempt.firstAttempt) {
     await bus.post("status", `task ${taskId} claimed`, `claimed ${taskId} attempt ${attempt.attempt}`, {
-      inReplyTo: message.id,
+      inReplyTo: message.message_id,
     });
   }
 
@@ -153,38 +259,54 @@ async function processHandoff(bus, stateDir, message) {
     const head = await readHead(repository.repoDir);
     lifecycle.transition("EVIDENCE_PENDING", { ...run, head, outcome: run.outcome ?? null });
     const published = await publish({ envelope, ...repository, taskId });
+    const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const state = finalState({
       envelope,
       exitCode: run.exit_code,
       limitTripped: run.limit_tripped,
       outcome: run.outcome,
-      blocker: existsSync(join(repository.repoDir, "BLOCKER.md")),
+      blocker: Boolean(published.blocker_reason),
       pr: published.pr,
     });
-    lifecycle.transition(state, published);
+    lifecycle.transition(state, { ...published, outcome });
     await postFinal(bus, message, envelope, lifecycle.snapshot());
   } catch (error) {
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
     await postFinal(bus, message, envelope, lifecycle.snapshot());
   }
+  return true;
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   mkdirSync(options.stateDir, { recursive: true });
-  const bus = new BusClient(options.server, options.token);
-  do {
-    const cursor = loadCursor(options.stateDir, options.id);
-    const messages = await bus.poll(options.id, cursor);
-    for (const message of messages) {
-      await processHandoff(bus, options.stateDir, message);
-      saveCursor(options.stateDir, options.id, message.id);
-    }
-    if (!options.once) await new Promise((resolveWait) => setTimeout(resolveWait, options.pollSeconds * 1000));
-  } while (!options.once);
+  const releaseLock = acquireDaemonLock(options.stateDir, options.id);
+  const handleSignal = () => {
+    releaseLock();
+    process.exit(0);
+  };
+  process.once("SIGTERM", handleSignal);
+  process.once("SIGINT", handleSignal);
+  try {
+    const bus = new BusClient(options.server, options.token);
+    do {
+      let cursor = loadCursor(options.stateDir, options.id);
+      const messages = await bus.poll(options.id, cursor);
+      for (const message of messages) {
+        if (!(await processHandoff(bus, options.stateDir, message))) continue;
+        cursor = advanceCursor(cursor, message);
+        saveCursor(options.stateDir, options.id, cursor);
+      }
+      if (!options.once) await new Promise((resolveWait) => setTimeout(resolveWait, options.pollSeconds * 1000));
+    } while (!options.once);
+  } finally {
+    process.off("SIGTERM", handleSignal);
+    process.off("SIGINT", handleSignal);
+    releaseLock();
+  }
 }
 
 main().catch((error) => {
   process.stderr.write(`vinci worker: ${error.message}\n`);
-  process.exitCode = 1;
+  process.exitCode = error?.exitCode ?? 1;
 });

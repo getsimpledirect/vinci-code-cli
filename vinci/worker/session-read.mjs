@@ -52,17 +52,16 @@ function fileForSession(sessionDir, sessionId) {
 }
 
 function usageValue(entry) {
-  const usage = entry?.message?.usage ?? entry?.usage ?? (entry?.kind === "usage" ? entry : undefined);
-  return typeof usage?.value_usd === "number" && Number.isFinite(usage.value_usd) && usage.value_usd >= 0
-    ? usage.value_usd
+  const usage = entry?.data?.usage;
+  return typeof usage?.estimatedCostUsd === "number" &&
+    Number.isFinite(usage.estimatedCostUsd) &&
+    usage.estimatedCostUsd >= 0
+    ? usage.estimatedCostUsd
     : 0;
 }
 
 function taskOutcome(entry) {
   if (entry?.type === "custom" && entry.customType === "vinci-task-outcome" && entry.data) return entry.data;
-  if (entry?.kind === "task_outcome" && entry.value) {
-    return typeof entry.value === "string" ? { state: entry.value } : entry.value;
-  }
   return undefined;
 }
 
@@ -70,13 +69,21 @@ export function readSessionState(sessionDir, sessionId) {
   const session = fileForSession(sessionDir, sessionId);
   if (!session) return { costUsd: 0, outcome: undefined, path: undefined };
 
-  let costUsd = 0;
+  let accumulatedCostUsd = 0;
+  let outcomeCostUsd;
   let outcome;
   for (const entry of session.entries) {
-    costUsd += usageValue(entry);
-    outcome = taskOutcome(entry) ?? outcome;
+    if (entry?.type === "custom" && entry.customType === "vinci-task-usage") {
+      accumulatedCostUsd += usageValue(entry);
+    }
+    const currentOutcome = taskOutcome(entry);
+    if (currentOutcome) {
+      outcome = currentOutcome;
+      const cost = usageValue(entry);
+      if (cost > 0 || currentOutcome?.usage?.estimatedCostUsd === 0) outcomeCostUsd = cost;
+    }
   }
-  return { costUsd, outcome, path: session.path };
+  return { costUsd: outcomeCostUsd ?? accumulatedCostUsd, outcome, path: session.path };
 }
 
 export function readSessionOutcome(sessionDir, sessionId) {
