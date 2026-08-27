@@ -167,8 +167,16 @@ if (failed > 0) process.exit(1);
 test('parseEnvelope accepts a normal branch', () => {
   assert.equal(parseEnvelope('repo: t/r\nbranch: worker/msg_abc\n\nSpec').branch, 'worker/msg_abc');
 });
-for (const hostile of ['+main', '-x', 'a:b', 'a..b', 'refs/heads/x', 'a b', '--force']) {
+for (const hostile of ['+main', '-x', 'a:b', 'a..b', 'refs/heads/x', 'refs//x', 'refs.foo/x', 'a b', '--force', 'a@{b}', 'a~b', 'a^b', 'a?b', 'a*b', 'a[b', 'a\\b', 'trail/', 'x.lock', 'HEAD']) {
   test(`parseEnvelope rejects hostile branch ${JSON.stringify(hostile)}`, () => {
     assert.throws(() => parseEnvelope(`repo: t/r\nbranch: ${hostile}\n\nSpec`), /branch/);
   });
 }
+
+// A 40-hex name is a LEGAL branch name; ambiguity is avoided because checkout uses the
+// ls-remote-resolved sha and pushes use explicit refs/heads refspecs. Pin the decision.
+test('parseEnvelope accepts a 40-hex branch name (documented decision)', () => {
+  const hex = 'a'.repeat(40);
+  assert.equal(parseEnvelope(`repo: t/r\nbranch: ${hex}\n\nSpec`).branch, hex);
+});
+

@@ -64,7 +64,15 @@ export function parseEnvelope(body) {
   const branchValue = values.get("branch");
   if (branchValue !== undefined) {
     const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
-    if (!BRANCH.test(branchValue) || branchValue.includes("..") || branchValue.startsWith("refs/")) {
+    if (
+      !BRANCH.test(branchValue) ||
+      branchValue.includes("..") ||
+      /^refs[\/.]/.test(branchValue) ||
+      branchValue.includes("refs/") ||
+      branchValue.endsWith(".lock") ||
+      branchValue.endsWith("/") ||
+      branchValue === "HEAD"
+    ) {
       throw new Error("branch must be a plain git branch name (letters, digits, ._/-; no leading -/+, no .., no refs/ prefix, no refspec syntax)");
     }
   }

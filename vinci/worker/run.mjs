@@ -93,9 +93,12 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
 
   if (branchOverride) {
     // Defense in depth: task.mjs validates too, but this function must be safe standalone.
-    if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(branch) || branch.includes("..") || branch.startsWith("refs/")) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(branch) || branch.includes("..") || /^refs[\/.]/.test(branch) || branch.includes("refs/") || branch.endsWith(".lock") || branch.endsWith("/") || branch === "HEAD") {
       throw new Error(`envelope branch ${branch} is not a plain git branch name`);
     }
+    // git itself is the authority on ref-name legality; ask it rather than trusting our regex alone.
+    const legal = await command("git", ["check-ref-format", "--branch", branch], { allowFailure: true });
+    if (legal.status !== 0) throw new Error(`envelope branch ${branch} is not a valid git branch name`);
     // The envelope pinned the branch (e.g. continuing a held PR). It must exist on origin NOW —
     // ls-remote asks origin live; a show-ref on refs/remotes/* would trust stale local copies
     // of branches deleted upstream. Silent fallback would strand work next to its target.
@@ -105,7 +108,8 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
       { allowFailure: true },
     );
     if (remote.status !== 0) throw new Error(`envelope branch ${branch} not found on origin`);
-    const remoteTip = remote.stdout.split(/\s/)[0];
+    const remoteTip = remote.stdout.split("\n")[0].split(/\s/)[0];
+    if (!/^[0-9a-f]{40}$/.test(remoteTip)) throw new Error(`unexpected ls-remote output for ${branch}`);
     const local = await command(
       "git",
       ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],

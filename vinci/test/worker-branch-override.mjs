@@ -42,7 +42,6 @@ await assert.rejects(
   "a missing override branch must fail loudly",
 );
 
-console.log("✓ worker-branch-override");
 
 // (4) stale remote-tracking ref: branch deleted on origin AFTER an earlier fetch must not
 // satisfy the existence check (a show-ref on refs/remotes/origin/* would wrongly pass).
