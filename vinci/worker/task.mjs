@@ -14,6 +14,7 @@ const HEADER_KEYS = new Set([
   "max_runtime_s",
   "deadline",
   "ref",
+  "branch",
 ]);
 
 function positiveNumber(value, name) {
@@ -58,6 +59,7 @@ export function parseEnvelope(body) {
   }
   const spec = normalized.slice(separator + 2).trim();
   if (!spec) throw new Error("task spec must not be empty");
+  const branchValue = values.get("branch");
 
   return {
     repo,
@@ -68,6 +70,7 @@ export function parseEnvelope(body) {
     max_runtime_s: maxRuntimeS,
     deadline,
     ref: values.get("ref"),
+    branch: branchValue,
     spec,
   };
 }
