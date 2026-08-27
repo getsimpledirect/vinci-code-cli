@@ -65,16 +65,29 @@ function taskOutcome(entry) {
   return undefined;
 }
 
+function messageCostUsd(entry) {
+  const total = entry?.message?.usage?.cost?.total;
+  return typeof total === "number" && Number.isFinite(total) && total > 0 ? total : 0;
+}
+
 export function readSessionState(sessionDir, sessionId) {
   const session = fileForSession(sessionDir, sessionId);
   if (!session) return { costUsd: 0, outcome: undefined, path: undefined };
 
   let accumulatedCostUsd = 0;
+  let hasUsageEntries = false;
+  let messageUsageCostUsd = 0;
+  let messageEntries = 0;
   let outcomeCostUsd;
   let outcome;
   for (const entry of session.entries) {
     if (entry?.type === "custom" && entry.customType === "vinci-task-usage") {
+      hasUsageEntries = true;
       accumulatedCostUsd += usageValue(entry);
+    }
+    if (entry?.type === "message") {
+      messageUsageCostUsd += messageCostUsd(entry);
+      messageEntries += 1;
     }
     const currentOutcome = taskOutcome(entry);
     if (currentOutcome) {
@@ -83,7 +96,13 @@ export function readSessionState(sessionDir, sessionId) {
       if (cost > 0 || currentOutcome?.usage?.estimatedCostUsd === 0) outcomeCostUsd = cost;
     }
   }
-  return { costUsd: outcomeCostUsd ?? accumulatedCostUsd, outcome, path: session.path };
+  const messageFallbackCostUsd = messageUsageCostUsd > 0 || messageEntries > 0 ? messageUsageCostUsd : 0;
+  // Precedence: explicit outcome cost > accumulated vinci-task-usage (>0 or entries present) > sum of
+  // message-usage costs (killed sessions carry their cost only in message entries).
+  const costUsd =
+    outcomeCostUsd ??
+    (hasUsageEntries || accumulatedCostUsd > 0 ? accumulatedCostUsd : messageFallbackCostUsd);
+  return { costUsd, outcome, path: session.path };
 }
 
 export function readSessionOutcome(sessionDir, sessionId) {
