@@ -325,7 +325,9 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
 
     const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId);
     lifecycle.transition("RUNNING");
-    const run = await runVinci({ envelope: envelopeToUse, repoDir: repository.repoDir, sessionId: attempt.sessionId });
+    const run = await runVinci({ envelope: envelopeToUse,
+      stateDir,
+      taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
     const head = await readHead(repository.repoDir);
     lifecycle.transition("EVIDENCE_PENDING", { ...run, head, outcome: run.outcome ?? null });
     const published = await publish({ envelope: envelopeToUse, ...repository, taskId });
@@ -342,10 +344,10 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
 
     // Stage 2: upload evidence bundle before the final bus post so uri/sha256 (or the
     // failure) can ride in the post body. No-op when VINCI_EVIDENCE_URI_PREFIX is unset.
-    // sessionJsonl: session transcript found by session id within the repo's sessions dir.
+    // sessionJsonl: session transcript from <state-dir>/sessions/<task-id>/ (outside the repo).
     // gitDiff is against the task branch base; it may be empty when the run changed nothing.
     // logTail: last 200 lines of the daemon's stderr so the bundle captures how the run ended.
-    const session = readSessionState(join(repository.repoDir, "sessions"), attempt.sessionId);
+    const session = readSessionState(join(stateDir, "sessions", taskId), attempt.sessionId);
     const sessionJsonl = session.path ? readFileSync(session.path, "utf8") : null;
     const gitDiffResult = await command("git", [
       "-C",

@@ -101,8 +101,8 @@ export async function prepareRepository(stateDir, repo, taskId) {
   return { branch, repoDir };
 }
 
-export function runVinci({ envelope, repoDir, sessionId }) {
-  const sessionDir = join(repoDir, "sessions");
+export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
+  const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
   mkdirSync(sessionDir, { recursive: true });
@@ -115,7 +115,7 @@ export function runVinci({ envelope, repoDir, sessionId }) {
         "--session-id",
         sessionId,
         "--session-dir",
-        "sessions",
+        sessionDir,
         "--provider",
         envelope.provider,
         "--model",
