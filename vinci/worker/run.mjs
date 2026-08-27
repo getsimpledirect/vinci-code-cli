@@ -79,10 +79,10 @@ function terminateProcessGroup(child, signal) {
   }
 }
 
-export async function prepareRepository(stateDir, repo, taskId) {
+export async function prepareRepository(stateDir, repo, taskId, branchOverride) {
   if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
-  const branch = `worker/${taskId}`;
+  const branch = branchOverride ?? `worker/${taskId}`;
   if (existsSync(repoDir)) {
     await command("git", ["-C", repoDir, "fetch", "origin"]);
   } else {
@@ -91,6 +91,18 @@ export async function prepareRepository(stateDir, repo, taskId) {
     await command("git", ["clone", `${base}/${repo}.git`, repoDir]);
   }
 
+  if (branchOverride) {
+    // The envelope pinned the branch (e.g. continuing a held PR). It must exist on origin:
+    // silently falling back to a fresh branch would strand the work next to, not on, its target.
+    const remote = await command(
+      "git",
+      ["-C", repoDir, "show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
+      { allowFailure: true },
+    );
+    if (remote.status !== 0) throw new Error(`envelope branch ${branch} not found on origin`);
+    await command("git", ["-C", repoDir, "checkout", "-B", branch, `origin/${branch}`]);
+    return { branch, repoDir };
+  }
   const localBranch = await command(
     "git",
     ["-C", repoDir, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
