@@ -46,8 +46,11 @@ name: vinci-tests
 on:
   push:
     branches: [main]
+  # Runs on every pull request, INCLUDING those targeting main: the `main` ruleset
+  # requires this workflow's jobs as status checks, and a check that never runs on
+  # PRs to main made every such PR unmergeable without an admin bypass (found on
+  # PR #3, 2026-08-27). The push trigger stays main-only.
   pull_request:
-    branches-ignore: [main]
 jobs:
   # biome + tsgo + the pinned-deps/shrinkwrap/install-lock checks. `ci.yml` runs these
   # only for `branches: [main]`, so nothing gated them on a vinci-targeted PR: a

@@ -305,6 +305,13 @@ if [ "${1:-}" = "verify" ]; then
   exec "${_vinci_vac_cli}" "$@"
 fi
 
+# The worker is a standalone daemon command. Dispatch it before --version and before Pi/provider
+# setup so it needs only Node, its bus token, and the credentials used by its child processes.
+if [ "${1:-}" = "worker" ]; then
+  shift
+  exec node "${VINCI}/worker/worker.mjs" "$@"
+fi
+
 # Vinci owns its version string. A bare Pi `--version` prints Pi's internal build number, not ours, so
 # answer with the branded version from identity.json before Pi ever loads (pure shell, no build needed).
 if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then

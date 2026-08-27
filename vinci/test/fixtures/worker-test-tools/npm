@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+// Fake npm for worker tests
+import { appendFileSync } from 'node:fs';
+
+const recordFile = process.env.FAKE_NPM_RECORD || '/tmp/fake-npm-invocations.txt';
+const argv = process.argv.slice(2);
+
+appendFileSync(recordFile, JSON.stringify({ argv, timestamp: new Date().toISOString() }) + '\n');
+
+if (process.env.FAKE_NPM_EXIT) {
+  process.exit(parseInt(process.env.FAKE_NPM_EXIT, 10));
+}
+process.exit(0);

@@ -235,6 +235,19 @@ run_group issue-integration node "${ROOT}/vinci/test/issue-integration.mjs"
 run_group billing-codes-integration node "${ROOT}/vinci/test/billing-codes-integration.mjs"
 run_group no-downgrade-integration node "${ROOT}/vinci/test/no-downgrade-integration.mjs"
 run_group units node "${ROOT}/vinci/test/units.mjs"
+# Worker daemon: every vinci/test/worker-*.mjs runs, discovered by glob so a new file cannot be
+# silently omitted (a hand-maintained list here once registered 3 of 13 while the other 10 were
+# red on the production bus contract). Zero matches is a failure, not a pass.
+worker_test_count=0
+for worker_test in "${ROOT}"/vinci/test/worker-*.mjs; do
+  [ -e "${worker_test}" ] || continue
+  worker_test_count=$((worker_test_count + 1))
+  run_group "$(basename "${worker_test}" .mjs)" node "${worker_test}"
+done
+if [ "${worker_test_count}" -eq 0 ]; then
+  echo "run.sh: no worker tests found under vinci/test/worker-*.mjs" >&2
+  exit 1
+fi
 # Print-mode liveness: every prompt gets a fresh idle watchdog, all session activity resets it,
 # tool execution suspends it, invalid timeout configuration falls back safely, and cleanup cancels it.
 run_group print-mode-liveness node --experimental-strip-types --input-type=module --eval '
