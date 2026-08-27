@@ -1,0 +1,23 @@
+#!/usr/bin/env node
+// Fake gh for worker tests
+import { appendFileSync } from 'node:fs';
+
+const recordFile = process.env.FAKE_GH_RECORD || '/tmp/fake-gh-invocations.txt';
+const argv = process.argv.slice(2);
+
+appendFileSync(recordFile, JSON.stringify({ argv, timestamp: new Date().toISOString() }) + '\n');
+if (process.env.FAKE_GH_EXIT) process.exit(Number(process.env.FAKE_GH_EXIT));
+
+// If this is a pr create command, print a fake URL
+if (argv.includes('create') && argv.includes('pr')) {
+  console.log('https://github.com/test/repo/pull/123');
+  process.exit(0);
+}
+
+// If this is a pr list command, print empty list
+if (argv.includes('list') && argv.includes('--head')) {
+  console.log('');
+  process.exit(0);
+}
+
+process.exit(0);
