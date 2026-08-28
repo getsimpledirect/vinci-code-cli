@@ -243,7 +243,7 @@ await test('T3 lease ttl caps max_runtime_s and is recorded in the snapshot', as
   try {
     fixture.createRepo('test', 'repo');
     fixture.linkTools(TOOLS);
-    await fixture.startBus([handoff('16', 'w6', 'repo: test/repo\nevidence: none\n\nTask')]);
+    await fixture.startBus([handoff('16', 'w6', 'repo: test/repo\nevidence: pr\n\nTask')]);
     const { code } = await runWorker(fixture, 'w6', ['--governor', governor.url], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
     assert.equal(code, 0);
     const snapshot = state(fixture, '16');
@@ -405,7 +405,7 @@ await test('T4c --require-governor with --governor starts and governs', async ()
   try {
     fixture.createRepo('test', 'repo');
     fixture.linkTools(TOOLS);
-    await fixture.startBus([handoff('19', 'w8', 'repo: test/repo\nevidence: none\n\nTask')]);
+    await fixture.startBus([handoff('19', 'w8', 'repo: test/repo\nevidence: pr\n\nTask')]);
     const { code } = await runWorker(fixture, 'w8', ['--require-governor', '--governor', governor.url], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
     assert.equal(code, 0);
     assert.equal(state(fixture, '19').state, 'COMPLETED');

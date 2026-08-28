@@ -58,7 +58,7 @@ test('TaskLifecycle persists lease field', () => {
       paths: ['.', 'src/'],
       ttl: 3600,
     };
-    lifecycle.transition('CLAIMED', { lease: leaseData });
+    lifecycle.record({ lease: leaseData });
     const state = lifecycle.snapshot();
     assert.deepEqual(state.lease.paths, ['.', 'src/']);
     assert.equal(state.lease.ttl, 3600);
@@ -73,7 +73,8 @@ test('TaskLifecycle persists evidence_error field', () => {
   try {
     const lifecycle = new TaskLifecycle(tempDir, 'task4');
     lifecycle.startAttempt({ id: 'task4', envelope: { evidence: 'pr', provider: 'openrouter', model: 'glm' } }, '1.0');
-    lifecycle.transition('COMPLETED', {
+    lifecycle.transition('RUNNING');
+    lifecycle.transition('UNVERIFIED', {
       evidence_error: 'S3 upload failed: 403 Access Denied',
     });
     const state = lifecycle.snapshot();

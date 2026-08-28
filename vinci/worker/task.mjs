@@ -5,6 +5,26 @@ const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const TERMINAL_STATES = new Set(["COMPLETED", "UNVERIFIED", "BLOCKED", "FAILED"]);
+// Lifecycle table (W0.3). Every transition() is checked against it; anything not listed throws.
+// PENDING  -> RUNNING immediately before the child is spawned, or straight to BLOCKED/FAILED
+//             when the task fails fast (past deadline, envelope error, governor refusal).
+// RUNNING  -> exactly one terminal state, written only AFTER the evidence bundle was attempted.
+// terminal -> nothing: a finished task is immutable; the daemon skips it on restart.
+const TRANSITIONS = new Map([
+  ["PENDING", new Set(["RUNNING", "BLOCKED", "FAILED"])],
+  ["RUNNING", new Set(TERMINAL_STATES)],
+  ["COMPLETED", new Set()],
+  ["UNVERIFIED", new Set()],
+  ["BLOCKED", new Set()],
+  ["FAILED", new Set()],
+]);
+export const LIFECYCLE_STATES = Object.freeze([...TRANSITIONS.keys()]);
+
+export function assertTransition(from, to) {
+  if (!TRANSITIONS.has(from)) throw new Error(`unknown lifecycle state: ${from}`);
+  if (!TRANSITIONS.has(to)) throw new Error(`unknown lifecycle state: ${to}`);
+  if (!TRANSITIONS.get(from).has(to)) throw new Error(`illegal transition ${from} → ${to}`);
+}
 const HEADER_KEYS = new Set([
   "repo",
   "evidence",
@@ -130,6 +150,7 @@ export class TaskLifecycle {
         lease: null,
         evidence_error: null,
         harness_stop: null,
+        evidence_result_state: null,
       };
     }
   }
@@ -145,6 +166,7 @@ export class TaskLifecycle {
   }
 
   startAttempt(task, vinciVersion) {
+    if (this.isTerminal()) throw new Error(`cannot start an attempt on terminal state ${this.state.state}`);
     const firstAttempt = !(Number.isInteger(this.state.attempt) && this.state.attempt > 0);
     const sessionId = typeof this.state.session_id === "string" && this.state.session_id ? this.state.session_id : task.id;
     this.state = {
@@ -169,17 +191,33 @@ export class TaskLifecycle {
       lease: null,
       evidence_error: null,
       harness_stop: null,
+      evidence_result_state: null,
     };
     this.save();
     return { attempt: this.state.attempt, firstAttempt, sessionId };
   }
 
-  transition(state, fields = {}) {
-    this.state = { ...this.state, ...fields, state };
+  // Update published fields without changing state (lease grant, run results before publish).
+  record(fields = {}) {
+    if (this.isTerminal()) throw new Error(`illegal update of terminal state ${this.state.state}`);
+    this.state = { ...this.state, ...fields, state: this.state.state };
+    this.save();
+  }
+
+  // The snapshot transition(state, fields) WOULD write, validated against the table but not
+  // saved. The worker uploads this as result.json BEFORE committing the terminal state.
+  plan(state, fields = {}) {
+    assertTransition(this.state.state, state);
+    const next = { ...this.state, ...fields, state };
     if (TERMINAL_STATES.has(state)) {
-      this.state.finished_at = new Date().toISOString();
-      this.state.terminal = true;
+      next.finished_at = typeof fields.finished_at === "string" ? fields.finished_at : new Date().toISOString();
+      next.terminal = true;
     }
+    return next;
+  }
+
+  transition(state, fields = {}) {
+    this.state = this.plan(state, fields);
     this.save();
   }
 
