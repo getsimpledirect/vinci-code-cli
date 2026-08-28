@@ -18,6 +18,8 @@ import { Type } from "typebox";
 // check, not the claim. See lib/grader.ts and vinci/docs/verification.md.
 import { gradeChanges } from "./lib/grader.ts";
 import { getVinciAutomationStop, sendVinciControl } from "./lib/control.ts";
+import { clearVinciHardStop, recordVinciHardStop, vinciTaskIdOf } from "./lib/hard-stop.ts";
+import { isVinciUnattended } from "./lib/unattended.ts";
 import { getVinciUiState, setVinciPlan } from "./lib/ui-state.ts";
 import { installVinciUsageAccumulator } from "./lib/usage-accumulator.ts";
 import {
@@ -313,6 +315,7 @@ export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) 
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    clearVinciHardStop();
     currentPlan = [];
     automaticContinues = 0;
     stalledAutoContinues = 0;
@@ -326,6 +329,7 @@ export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) 
     // A mid-stream keystroke or another extension's steer is not the user answering the pause:
     // resetting reviewPaused on those silently voided the "automation paused" promise (round-2 P1-4).
     if (event?.source === "extension" || event?.streamingBehavior) return undefined;
+    clearVinciHardStop();
     automaticContinues = 0;
     reviewReopens = 0;
     reviewPaused = false;
@@ -334,14 +338,22 @@ export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) 
 
   // A failed repair review is a user-visible stop state, not another autonomous retry state. Keep
   // reads available so Vinci can explain the evidence, but freeze mutations until the user responds.
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx) => {
     if (
       getVinciAutomationStop().stopped &&
       event.toolName !== "todo" &&
       (REVIEW_MUTATING_TOOLS.has(event.toolName) ||
         (event.toolName === "bash" && planCommandMutates(String((event.input as { command?: unknown }).command ?? ""))))
     ) {
-      return { block: true, reason: "Vinci stopped autonomous changes after repeated no-progress attempts. Wait for the user's next instruction." };
+      // [#5] "Wait for the user's next instruction" is a contradiction in an unattended run: nobody
+      // can answer, and the model — locked out of every mutation — went on to narrate completion
+      // over uncommitted work. Say what is actually happening, and record the stop so the outcome
+      // record closes as BLOCKED no matter what the closing message claims (lib/hard-stop.ts).
+      const reason = isVinciUnattended(ctx)
+        ? "Vinci stopped autonomous changes after repeated no-progress attempts (unattended run: ending the task as BLOCKED)."
+        : "Vinci stopped autonomous changes after repeated no-progress attempts. Wait for the user's next instruction.";
+      recordVinciHardStop(vinciTaskIdOf(ctx), "latch", reason);
+      return { block: true, reason };
     }
     if (
       reviewPaused &&
