@@ -4,8 +4,8 @@
 // have run on one exact build set (build skew between the two worker boxes, and between worker
 // and server, has already caused live failures).
 import { spawnSync } from "node:child_process";
-import { readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -43,24 +43,27 @@ function readText(path) {
   }
 }
 
-// Walk up from `start` to the nearest entry named `.git` of ANY kind. Returns null only when no
-// such entry exists on the way to the filesystem root (not a checkout at all); otherwise
-// `{ root, entry }` where `root` is the checkout root (the directory holding `.git`) — even
-// when the entry turns out to be unusable, because "a `.git` is here but cannot be read" is an
+// The daemon's own package root: this file is `<root>/vinci/worker/build.mjs` and the version
+// is `<root>/vinci/identity.json`, so the root is two levels above the worker dir.
+export function packageRoot(dir = dirname(fileURLToPath(import.meta.url))) {
+  return resolve(dir, "../..");
+}
+
+// The `.git` entry (of ANY kind) at `root` ONLY — never a parent's. A packaged daemon installed
+// under some unrelated repository (say `/opt/.git` above `/opt/vinci/…`) must not report that
+// repository's commit as its own build, so discovery does not walk up: a `.git` anywhere
+// above the package root is treated as ABSENT (a packaged install, bare version). Returns
+// null when there is no entry at `root`; otherwise `{ root, entry, kind }` — even when the
+// entry turns out to be unusable, because "a `.git` is here but cannot be read" is an
 // unresolved checkout, not a packaged install.
-export function findGitEntry(start) {
-  let dir = resolve(start);
-  for (;;) {
-    const entry = join(dir, ".git");
-    try {
-      const stat = statSync(entry);
-      return { root: dir, entry, kind: stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other" };
-    } catch {
-      // no entry here; keep walking
-    }
-    const parent = dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
+export function findGitEntry(root) {
+  const dir = resolve(root);
+  const entry = join(dir, ".git");
+  try {
+    const stat = statSync(entry);
+    return { root: dir, entry, kind: stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other" };
+  } catch {
+    return null;
   }
 }
 
@@ -85,9 +88,10 @@ export function resolveGitDirs({ root, entry, kind }) {
   return { gitDir, commonDir: common ? resolve(gitDir, common) : gitDir };
 }
 
-// Back-compat wrapper: entry lookup + pointer resolution in one step (null when either fails).
-export function findGitDir(start) {
-  const found = findGitEntry(start);
+// Entry lookup + pointer resolution in one step (null when either fails). `root` is the
+// directory holding `.git`, never a descendant of it.
+export function findGitDir(root) {
+  const found = findGitEntry(root);
   return found ? resolveGitDirs(found) : null;
 }
 
@@ -102,10 +106,32 @@ function readPackedRef(commonDir, ref) {
   return null;
 }
 
-// A ref name we are willing to open as a file: `refs/...` segments of safe characters, never
-// `..` (a hostile ref cannot walk out of the git dir).
-const REF_NAME = /^refs\/(?:[\w.@-]+\/)*[\w.@-]+$/;
+// A ref name we are willing to open as a file: `refs/` followed by non-empty segments of safe
+// characters, where no segment is `.` or `..` (a hostile ref cannot name a path outside the
+// git dir). Checked BEFORE any filesystem access.
+const REF_SEGMENT = /^[\w@-][\w.@-]*$/;
+function isSafeRefName(ref) {
+  const segments = ref.split("/");
+  if (segments.length < 2 || segments[0] !== "refs") return false;
+  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== ".." && REF_SEGMENT.test(segment));
+}
 const MAX_REF_HOPS = 8;
+
+// The text of the loose ref `ref` under `baseDir`, or null when there is none — or when the
+// file the name leads to does not actually live under `baseDir` (a symlink or any other route
+// out of the git dir): fail closed, never read a file outside the checkout's own git dir.
+function readContainedRef(baseDir, ref) {
+  let base;
+  let target;
+  try {
+    base = realpathSync(baseDir);
+    target = realpathSync(join(baseDir, ref));
+  } catch {
+    return null;
+  }
+  if (!target.startsWith(base + sep)) return null;
+  return readText(target);
+}
 
 // Resolve one ref VALUE (the text of HEAD or of a ref file) to a 40-hex sha. A detached value
 // is the sha itself; `ref: <name>` is followed — loose file (per-worktree dir first, then the
@@ -118,9 +144,9 @@ function resolveRefValue({ gitDir, commonDir }, value, visited = new Set()) {
   const symbolic = /^ref:\s*(\S+)$/.exec(text);
   if (!symbolic) return null;
   const ref = symbolic[1];
-  if (!REF_NAME.test(ref) || visited.has(ref) || visited.size >= MAX_REF_HOPS) return null;
+  if (!isSafeRefName(ref) || visited.has(ref) || visited.size >= MAX_REF_HOPS) return null;
   visited.add(ref);
-  const next = readText(join(gitDir, ref)) ?? readText(join(commonDir, ref)) ?? readPackedRef(commonDir, ref);
+  const next = readContainedRef(gitDir, ref) ?? readContainedRef(commonDir, ref) ?? readPackedRef(commonDir, ref);
   if (next === null) return null;
   return resolveRefValue({ gitDir, commonDir }, next, visited);
 }
@@ -138,8 +164,9 @@ export function readHeadCommit(dirs) {
 // `{ version, commit, dirty, source, unresolved }` for the checkout THIS file runs from. Never
 // throws.
 //   version:    identity.json version (the existing `vinci_version`)
-//   commit:     full 40-hex HEAD sha read from the checkout's `.git` files (never via git exec),
-//               or null when this is not a git checkout or HEAD could not be resolved
+//   commit:     full 40-hex HEAD sha read from the `.git` at the package root (`<root>/vinci/
+//               worker/build.mjs` => `<root>/.git`; never via git exec, never a parent's
+//               `.git`), or null when this is not a git checkout or HEAD could not be resolved
 //   dirty:      true when `git status --porcelain --untracked-files=no` is non-empty, false
 //               when clean, null when unknown (git missing or refusing — best-effort only).
 //               Untracked files are ignored on purpose: the default state dir
@@ -155,11 +182,12 @@ export function buildIdentity(dir = dirname(fileURLToPath(import.meta.url))) {
   const version = readVersion(dir);
   let found = null;
   try {
-    found = findGitEntry(dir);
+    found = findGitEntry(packageRoot(dir));
   } catch {
     found = null;
   }
-  // ABSENT: no `.git` entry anywhere above this file — a packaged install, nothing to resolve.
+  // ABSENT: no `.git` entry at the package root — a packaged install, nothing to resolve. (A
+  // `.git` further up belongs to some other repository and is ignored on purpose.)
   if (!found) return { version, commit: null, dirty: null, source: "package", unresolved: false };
   // PRESENT: from here on, a null commit is an unresolved checkout, never a packaged install.
   let commit = null;

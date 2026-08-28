@@ -203,14 +203,17 @@ What is recorded, and where:
   (`buildIdentity()`): `{ version, commit, dirty, source, unresolved }`. `version` is
   `identity.json`'s version (the string task records always carried as `vinci_version`, which
   is kept); `commit` is the HEAD sha of the checkout the daemon runs from, read directly from
-  the checkout's files — `.git/HEAD` (a `gitdir:` pointer file is followed for a linked
-  worktree), then the branch's loose ref, then `packed-refs`, following symbolic refs
-  recursively (at most 8 hops; a cycle resolves to nothing) — never via `git` exec, so an
+  the checkout's files — the `.git` at the package root ONLY (`<root>/vinci/worker/build.mjs`
+  looks at `<root>/.git`; a `.git` further up belongs to some other repository and is treated
+  as absent), `HEAD` (a `gitdir:` pointer file is followed for a linked worktree), then the
+  branch's loose ref, then `packed-refs`, following symbolic refs recursively (at most 8 hops;
+  a cycle, a ref name with `.`/`..`/empty segments, or a ref file that does not really live
+  under the git dir resolves to nothing) — never via `git` exec, so an
   unprivileged daemon on a root-owned checkout still resolves it (#17: git's "dubious
   ownership" refusal used to silently degrade the identity to a version string). It is `null`
-  when there is no `.git` entry at all (a packaged install: `source: "package"`,
-  `unresolved: false`) OR when a `.git` entry exists but HEAD could not be resolved — unborn
-  branch, unreadable HEAD, malformed or dangling `gitdir:` pointer, symbolic-ref cycle
+  when there is no `.git` entry at the package root (a packaged install: `source: "package"`,
+  `unresolved: false`) OR when a `.git` entry exists there but HEAD could not be resolved —
+  unborn branch, unreadable HEAD, malformed or dangling `gitdir:` pointer, symbolic-ref cycle
   (`source: "package"`, `unresolved: true`). `dirty` is whether
   `git -c safe.directory=<checkout root> status --porcelain --untracked-files=no` is non-empty
   (the exact root, which every git with `safe.directory` honours; the `*` wildcard needs
