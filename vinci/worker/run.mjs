@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 
 import { readSessionState } from "./session-read.mjs";
@@ -85,6 +85,29 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
   const branch = branchOverride ?? `worker/${taskId}`;
   if (existsSync(repoDir)) {
     await command("git", ["-C", repoDir, "fetch", "origin"]);
+    // Shared-tree quarantine: a prior run that ended without committing (honest BLOCKED/
+    // UNVERIFIED, or a kill) leaves tracked modifications and untracked files that make every
+    // later checkout fail ("would be overwritten"). Preserve, never discard — a failed task's
+    // working tree can be the only copy of its work — then hand this task a clean tree.
+    const dirty = await command("git", ["-C", repoDir, "status", "--porcelain"], { allowFailure: true });
+    const lines = (dirty.stdout ?? "").split("\n").filter((l) => l.trim());
+    if (lines.length > 0) {
+      const debrisDir = join(stateDir, "debris", taskId);
+      mkdirSync(debrisDir, { recursive: true });
+      writeFileSync(join(debrisDir, "status.txt"), lines.join("\n") + "\n");
+      const patch = await command("git", ["-C", repoDir, "diff", "HEAD"], { allowFailure: true });
+      writeFileSync(join(debrisDir, "tracked.patch"), patch.stdout ?? "");
+      for (const line of lines) {
+        if (!line.startsWith("??")) continue;
+        const rel = line.slice(3).trim();
+        const from = join(repoDir, rel);
+        const to = join(debrisDir, "untracked", rel);
+        mkdirSync(dirname(to), { recursive: true });
+        try { renameSync(from, to); } catch { /* a vanished path is already gone; status.txt records it */ }
+      }
+      await command("git", ["-C", repoDir, "reset", "--hard", "HEAD"], { allowFailure: true });
+      await command("git", ["-C", repoDir, "clean", "-fd"], { allowFailure: true });
+    }
   } else {
     mkdirSync(dirname(repoDir), { recursive: true });
     const base = (process.env.VINCI_WORKER_GIT_BASE ?? "https://github.com/").replace(/\/+$/, "");
@@ -250,6 +273,15 @@ export async function publish({ envelope, repoDir, branch, taskId, limitTripped 
     { cwd: repoDir, allowFailure: true },
   );
   if (created.status === 0) result.pr = created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null;
+  if (result.pr === null) {
+    // A PR may already exist for this branch (by-reference tasks continue held PRs); an
+    // existing PR IS the evidence — creation failing must not classify the task UNVERIFIED.
+    const listed = await command("gh", ["pr", "list", "--head", branch, "--state", "open", "--json", "url"], { cwd: repoDir, allowFailure: true });
+    try {
+      const parsed = JSON.parse(listed.stdout ?? "[]");
+      if (Array.isArray(parsed) && parsed[0]?.url) result.pr = parsed[0].url;
+    } catch { /* no JSON, no PR */ }
+  }
   return result;
 }
 
