@@ -17,15 +17,20 @@ const TOOLS = join(ROOT, "vinci/test/fixtures/worker-test-tools");
 const WORKER = join(ROOT, "vinci/worker/worker.mjs");
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
+// Every test runs even after a failure so a mutation shows every test it kills, not the first.
+let failed = 0;
 async function test(name, fn) {
   try {
     await fn();
     console.log(`✓ worker-build-identity: ${name}`);
   } catch (error) {
+    failed += 1;
     console.error(`✗ worker-build-identity: ${name}: ${error.stack ?? error.message}`);
-    process.exit(1);
   }
 }
+process.on("beforeExit", () => {
+  if (failed > 0) process.exitCode = 1;
+});
 
 function runOnce(fixture, workerId) {
   const proc = spawn(
