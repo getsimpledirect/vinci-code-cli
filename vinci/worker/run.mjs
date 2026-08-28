@@ -99,10 +99,15 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
       const debrisDir = join(stateDir, "debris", taskId);
       mkdirSync(debrisDir, { recursive: true });
       writeFileSync(join(debrisDir, "status.txt"), entries.join("\n") + "\n");
+      // Archive gates: a failed capture must abort BEFORE reset/clean destroys the source.
+      // git apply also requires a trailing newline the harness's stdout handling can strip.
+      const asPatch = (t) => (t && !t.endsWith("\n") ? t + "\n" : (t ?? ""));
       const patch = await command("git", ["-C", repoDir, "diff", "HEAD"], { allowFailure: true });
-      writeFileSync(join(debrisDir, "tracked.patch"), patch.stdout ?? "");
+      if (patch.status !== 0) throw new Error("quarantine: tracked-diff capture failed; refusing to clean");
+      writeFileSync(join(debrisDir, "tracked.patch"), asPatch(patch.stdout));
       const staged = await command("git", ["-C", repoDir, "diff", "--cached"], { allowFailure: true });
-      writeFileSync(join(debrisDir, "staged.patch"), staged.stdout ?? "");
+      if (staged.status !== 0) throw new Error("quarantine: staged-diff capture failed; refusing to clean");
+      writeFileSync(join(debrisDir, "staged.patch"), asPatch(staged.stdout));
       for (const entry of entries) {
         if (!entry.startsWith("??")) continue;
         const rel = entry.slice(3);
