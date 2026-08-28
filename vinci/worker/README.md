@@ -66,7 +66,7 @@ Exit code zero alone means nothing. The final state is the first matching row:
 | # | Observed | Final state | Notes |
 |---|----------|-------------|-------|
 | 1 | exit code != 0, or a limit tripped (`budget_usd`, `max_runtime_s`, `deadline`) | `FAILED` | |
-| 2 | any harness stop in the session JSONL (`HARNESS_STOP_PATTERNS` in `session-read.mjs`) | `BLOCKED` | wins even when the outcome entry says DONE and a PR was created; `harness_stop: {count, reason}` is written to the task file and the blocker post says `stop=instrument` with the stop reason |
+| 2 | any harness stop in the session JSONL (an `isError` toolResult with `details.vinciBlocked: true`; the `HARNESS_STOP_PATTERNS` substrings in `session-read.mjs` are the fallback for sessions without the marker) | `BLOCKED` | wins even when the outcome entry says DONE and a PR was created; `harness_stop: {count, reason}` is written to the task file and the blocker post says `stop=instrument` with the stop reason |
 | 3 | outcome `BLOCKED` / `WAITING`, or a non-empty `BLOCKER.md` at HEAD | `BLOCKED` | |
 | 4 | outcome `DONE_UNVERIFIED` | `UNVERIFIED` | |
 | 5 | outcome `DONE` **and** a PR exists | `COMPLETED` | the only route to COMPLETED |
@@ -122,7 +122,7 @@ State file `<state-dir>/tasks/<id>.json`:
 }
 ```
 
-`harness_stop` is `null` unless a harness stop decided the state (row 2 above); then it is `{ "count": <stops>, "reason": "<first stop text>" }`.
+`harness_stop` is `{ "count": <stops>, "reason": "<first stop text>" }` whenever a harness stop occurred in the session, regardless of final state (a FAILED run's blocker post also carries `harness_stops=<N>`); it decides the state (row 2 above) only when nothing outranks it. `null` when no stop occurred.
 
 **Restart behavior:**
 - If `terminal=true`: skip (already done)

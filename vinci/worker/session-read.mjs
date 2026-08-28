@@ -92,9 +92,13 @@ function toolResultText(entry) {
 
 // Only error-flagged tool results count: a blocked call is always isError=true, whereas a successful
 // grep/cat over the extension sources would echo the same strings without being a stop.
+// Authoritative signal: details.vinciBlocked === true — the marker the agent loop sets when an
+// extension blocks a call (packages/agent/src/agent-loop.ts), independent of the reason wording.
+// The substring patterns are a legacy fallback for sessions written by builds without the marker.
 function harnessStopReason(entry) {
   if (entry?.message?.isError !== true) return undefined;
   const text = toolResultText(entry);
+  if (entry.message?.details?.vinciBlocked === true) return text || "Tool execution was blocked";
   if (!text) return undefined;
   return HARNESS_STOP_PATTERNS.some((pattern) => text.includes(pattern)) ? text : undefined;
 }

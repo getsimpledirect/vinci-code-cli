@@ -239,7 +239,9 @@ async function postFinal(bus, message, envelope, state, evidence) {
       options,
     );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
-    const reason = state.outcome?.reason ? `${details} reason=${state.outcome.reason}` : details;
+    // A FAILED run may also have hit a harness stop; surface the count so the ledger can attribute it.
+    const stops = state.harness_stop ? `${details} harness_stops=${state.harness_stop.count}` : details;
+    const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
     await bus.post("blocker", subject, reason, options);
   } else {
     await bus.post("status", subject, details, options);
@@ -351,12 +353,11 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       pr: published.pr,
       harnessStops,
     });
-    // Record the instrument stop on the task whenever it decided the state, so the snapshot (and the
-    // evidence bundle's result.json) carry the machine-observed reason next to the model's narrative.
+    // Record the instrument stop on the task whenever one occurred — even when exit/limit outranked it
+    // — so the snapshot (and the evidence bundle's result.json) carry the machine-observed reason next
+    // to the model's narrative and the soak ledger can see that a latch also fired on a FAILED run.
     const harnessStop =
-      state === "BLOCKED" && harnessStops.length > 0
-        ? { count: harnessStops.length, reason: harnessStops[0].reason }
-        : null;
+      harnessStops.length > 0 ? { count: harnessStops.length, reason: harnessStops[0].reason } : null;
     lifecycle.transition(state, { ...published, outcome, harness_stop: harnessStop });
 
     // Stage 2: upload evidence bundle before the final bus post so uri/sha256 (or the
