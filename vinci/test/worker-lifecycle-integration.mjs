@@ -28,7 +28,15 @@ function envelope(overrides = {}) {
 
 async function fakeBus(body) {
   const posts = [];
+  const onlinePosts = [];
   const server = createServer((request, response) => {
+    // W0.5: GET /v1/version is unauthenticated by contract; this bus does not serve it, so the
+    // daemon records `server_build={error}` and still starts.
+    if (request.method === "GET" && request.url === "/v1/version") {
+      response.statusCode = 404;
+      response.end();
+      return;
+    }
     assert.equal(request.headers.authorization, "Bearer test-token");
     if (request.method === "GET" && request.url?.startsWith("/v1/messages")) {
       response.setHeader("content-type", "application/json");
@@ -55,7 +63,11 @@ async function fakeBus(body) {
         raw += chunk;
       });
       request.on("end", () => {
-        posts.push(JSON.parse(raw));
+        const post = JSON.parse(raw);
+        // The per-start `worker <id> online` status (W0.5) is not a task post; keep the
+        // per-task kind sequences below exact by recording it separately.
+        if (/ online$/.test(post.subject)) onlinePosts.push(post);
+        else posts.push(post);
         response.setHeader("content-type", "application/json");
         response.end("{}");
       });
@@ -67,6 +79,7 @@ async function fakeBus(body) {
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   return {
     posts,
+    onlinePosts,
     server,
     url: `http://127.0.0.1:${server.address().port}`,
   };

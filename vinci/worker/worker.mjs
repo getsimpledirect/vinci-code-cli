@@ -17,14 +17,14 @@ import { assertTaskId, parseEnvelope, TaskLifecycle } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
 import { readSessionState } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
+import { buildIdentity, fetchServerBuild, formatServerBuild, formatWorkerBuild } from "./build.mjs";
 
-const version = (() => {
-  try {
-    return JSON.parse(readFileSync(new URL("../identity.json", import.meta.url), "utf8")).version;
-  } catch {
-    return "unknown";
-  }
-})();
+// W0.5: the exact build this daemon runs from, computed once at startup. `version` keeps the
+// identity.json string that task records always carried as `vinci_version`.
+const workerBuild = buildIdentity();
+const version = workerBuild.version;
+// Filled at startup from GET <server>/v1/version (or `{ error }`); stamped on every task.
+let serverBuild = { error: "not fetched" };
 
 function usage() {
   return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor]";
@@ -227,6 +227,13 @@ function recentLogTail(limit) {
   return daemonLogChunks.slice(-limit).join("").trim() || null;
 }
 
+// W0.5: EVERY terminal post — postFinal and each early terminal blocker (envelope error, past
+// deadline, governor refusal/unavailability, invalid task id) — goes through this one formatter
+// so no terminal record on the bus can omit which build produced it.
+function terminalPostBody(details) {
+  return `${details} worker_build=${formatWorkerBuild(workerBuild)}`;
+}
+
 async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
@@ -252,10 +259,11 @@ async function postFinal(bus, message, envelope, state, evidence) {
   ]
     .filter(Boolean)
     .join(" ");
+  const body = terminalPostBody(details);
   const options = { inReplyTo: message.message_id };
   if (state.state === "COMPLETED" && isLedgerRef(envelope.ref)) {
     options.refs = [envelope.ref];
-    await bus.post("finding", subject, details, options);
+    await bus.post("finding", subject, body, options);
   } else if (state.state === "BLOCKED" && state.harness_stop) {
     // An instrument stop: the harness refused the agent's work mid-run. Say so explicitly so the
     // soak ledger attributes the block to the instrument, not to the model's own narrative.
@@ -263,7 +271,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     await bus.post(
       "blocker",
       subject,
-      `${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`,
+      terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`),
       options,
     );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
@@ -273,9 +281,9 @@ async function postFinal(bus, message, envelope, state, evidence) {
       ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
       : details;
     const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
-    await bus.post("blocker", subject, reason, options);
+    await bus.post("blocker", subject, terminalPostBody(reason), options);
   } else {
-    await bus.post("status", subject, details, options);
+    await bus.post("status", subject, body, options);
   }
 }
 
@@ -284,7 +292,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
   try {
     assertTaskId(taskId);
   } catch (error) {
-    await bus.post("blocker", `task ${taskId} blocked`, error.message, { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(error.message), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -299,22 +307,23 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     lifecycle.startAttempt(
       { id: taskId, envelope: { evidence: null, provider: null, model: null } },
       version,
+      { workerBuild, serverBuild },
     );
     const state = /^repo must be/.test(error.message) ? "FAILED" : "BLOCKED";
     lifecycle.transition(state, {
       limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
       outcome: { reason: error.message },
     });
-    await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, `state=${state} reason=${error.message}`, {
+    await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
       inReplyTo: message.message_id,
     });
     return true;
   }
 
-  const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version);
+  const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild });
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
-    await bus.post("blocker", `task ${taskId} blocked`, "deadline is in the past", { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -348,7 +357,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
         const governor = claimResult?.refused === true ? "refused" : "unavailable";
         const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
-        await bus.post("blocker", `task ${taskId} blocked`, `${label}: ${reason}`, {
+        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
           inReplyTo: message.message_id,
         });
         return true;
@@ -456,6 +465,15 @@ async function main() {
   process.once("SIGINT", handleSignal);
   try {
     const bus = new BusClient(options.server, options.token);
+    // W0.5: record the server's build next to our own and announce both ONCE per daemon start,
+    // before the first poll. A failed /v1/version fetch is recorded, never fatal: the bus
+    // token check and the first poll already gate startup.
+    serverBuild = await fetchServerBuild(options.server);
+    await bus.post(
+      "status",
+      `worker ${options.id} online`,
+      `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)}`,
+    );
     do {
       let cursor = loadCursor(options.stateDir, options.id);
       const messages = await bus.poll(options.id, cursor);

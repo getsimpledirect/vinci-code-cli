@@ -47,7 +47,9 @@ const test = async () => {
     );
 
     const posts = fixture.getPostedMessages();
-    assert.equal(posts.length, 2, `expected 2 posts, got ${posts.length}`);
+    // W0.5: one `worker <id> online` post per daemon start, then claimed + final for the task.
+    assert.equal(posts.length, 3, `expected 3 posts (online, claimed, final), got ${posts.length}`);
+    assert.equal(posts[0].subject, 'worker w1 online');
   } finally {
     await fixture.cleanup();
   }

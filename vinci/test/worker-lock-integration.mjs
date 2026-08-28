@@ -34,6 +34,14 @@ try {
   assert.equal(secondCode, 75);
   assert.match(secondStderr, /daemon lock.*live pid/i);
   assert.equal(fixture.getRequests.length, getsBeforeSecond, "refused daemon must never touch the bus");
+  // W0.5: a lock-refused daemon must not announce itself either: no online post and no
+  // /v1/version fetch beyond the first daemon's single one.
+  assert.equal(fixture.versionRequests, 1, "refused daemon must not fetch /v1/version");
+  assert.equal(
+    fixture.getPostedMessages().filter((post) => / online$/.test(post.subject)).length,
+    1,
+    "refused daemon must not post an online status",
+  );
 
   first.kill("SIGTERM");
   await new Promise((resolveClose) => first.once("close", resolveClose));
@@ -54,7 +62,12 @@ try {
   const liveClaimRun = spawn("node", [...args, "--once"], { env: fixture.getEnv(), stdio: "pipe" });
   assert.equal(await new Promise((resolveClose) => liveClaimRun.once("close", resolveClose)), 0);
   assert.equal(fixture.getVinciCalls().length, 0);
-  assert.equal(fixture.getPostedMessages().length, 0, "live task owner must suppress duplicate claim posts");
+  // Only the per-start `worker <id> online` posts (W0.5) may exist: no claim, no final.
+  assert.equal(
+    fixture.getPostedMessages().filter((post) => !/ online$/.test(post.subject)).length,
+    0,
+    "live task owner must suppress duplicate claim posts",
+  );
 
   writeFileSync(join(claim, "pid"), "99999999\n");
   const deadClaimRun = spawn("node", [...args, "--once"], { env: fixture.getEnv(), stdio: "pipe" });

@@ -191,6 +191,42 @@ No new npm dependencies introduced; uses only node:* and global APIs.
       sessions/                  # vinci JSONL read for outcomes and usage
 ```
 
+## Build identity (W0.5)
+
+Build skew between the two worker boxes, and between a worker and the gpu-control server, has
+already caused live failures, so every record names the exact build that produced it. Nothing
+here gates startup: identity is a record, not a check.
+
+What is recorded, and where:
+
+- `worker_build` — computed ONCE at daemon start by `vinci/worker/build.mjs`
+  (`buildIdentity()`): `{ version, commit, dirty, source }`. `version` is `identity.json`'s
+  version (the string task records always carried as `vinci_version`, which is kept);
+  `commit` is `git rev-parse HEAD` of the checkout the daemon runs from (`null` when not a git
+  checkout or git is unavailable, then `source` is `"package"` instead of `"git"`); `dirty`
+  is whether `git status --porcelain --untracked-files=no` is non-empty (`null` when unknown).
+- `server_build` — the verbatim payload of `GET <server>/v1/version` (unauthenticated; 3 s
+  timeout; vinci-gpu-control reports `git_sha`, `dirty`, `server_code_sha256`, …), fetched once
+  at daemon start. On any failure it is `{ "error": "<why>" }` and the daemon still starts.
+- Both are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:
+  `worker_build` is stored as `{ version, commit, dirty }` (`source` is omitted) and
+  `server_build` as the payload verbatim (or `{ error }`). The task record is what ships as the
+  evidence bundle's `result.json`, so the same two fields appear there.
+- Every terminal bus post — the final post from a run AND the early blockers (envelope error,
+  past deadline, governor refusal/unavailability) — carries `worker_build=…` via one shared
+  formatter in `worker.mjs` (`terminalPostBody`).
+- The bus sees them twice: the daemon's single `worker <id> online` status post at start
+  (`worker_build=<commit or version>[-dirty] worker_version=<version>
+  server_build=<server commit | unknown: <error>>`, posted once per start, before the first
+  poll, in `--once` mode too; a daemon that refuses to start — lock held, exit 75, or missing
+  Governor, exit 78 — never announces itself and never fetches `/v1/version`), and
+  `worker_build=<commit or version>[-dirty]` on every terminal task post.
+
+The post-fix soak requires ONE exact build set: both worker boxes must show the same
+`worker_build` (no `-dirty`) and the same `server_build` in their `online` posts before the
+cohort counts. A cohort whose task records carry two different `worker_build` values is two
+cohorts.
+
 ## Network Access
 
 - Outbound HTTPS to bus (`--server`)

@@ -73,7 +73,10 @@ function assertBlockedBeforeWork(fixture, taskId, reasonPattern, classification 
   const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
   assert(blocker, 'a blocker must be posted');
   const body = blocker.body ?? JSON.stringify(blocker);
-  assert.match(body, reasonPattern);
+  // W0.5: every terminal post ends with ` worker_build=<commit-or-version>[-dirty]`; assert it,
+  // then match the reason pattern (some are `$`-anchored) on the body without that tag.
+  assert.match(body, / worker_build=\S+$/, `blocker must end with worker_build=, got: ${body}`);
+  assert.match(body.replace(/ worker_build=\S+$/, ''), reasonPattern);
   const expectedLabel = classification === 'refused' ? 'Governor refused the lease' : 'Governor unavailable/invalid';
   const otherLabel = classification === 'refused' ? 'Governor unavailable/invalid' : 'Governor refused the lease';
   assert(body.includes(expectedLabel), `blocker must carry "${expectedLabel}", got: ${body}`);
@@ -317,6 +320,9 @@ await test('T4 --require-governor without --governor exits 78 before polling', a
     assert.match(stderr, /Governor is required .* no --governor/);
     assert.equal(fixture.getRequests.length, 0, 'must not poll the bus');
     assert.equal(fixture.getPostedMessages().length, 0);
+    // W0.5: refusing to start means no online announcement and no /v1/version fetch.
+    assert.equal(fixture.versionRequests, 0, 'must not fetch /v1/version');
+    assert.equal(fixture.getPostedMessages().filter((p) => / online$/.test(p.subject)).length, 0, 'must not post online');
     assert.equal(existsSync(join(fixture.tempDir, 'daemon.lock')), false, 'must refuse before taking the daemon lock');
   } finally {
     await fixture.cleanup();
