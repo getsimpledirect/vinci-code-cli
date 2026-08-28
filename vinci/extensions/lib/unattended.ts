@@ -112,18 +112,37 @@ const FINALIZATION_SUBCOMMANDS = new Set(["add", "commit", "status", "diff"]);
 const FINALIZATION_ALLOWED_GLOBALS = new Set(["--no-pager"]);
 
 // Post-subcommand options that open an editor, an interactive prompt, or an external program, or
-// write a file — none of which a finalization step in an unattended run may do (WARN-1). Long
-// options are matched by name (with or without `=value`); the letters are checked inside combined
-// short clusters (`-pm`), so `-p` cannot hide behind another flag.
+// write a file — none of which a finalization step in an unattended run may do (WARN-1) — plus,
+// for commit, the forms that make a commit trivial or history-rewriting: `--allow-empty`,
+// `--allow-empty-message`, `--amend`, `--no-verify`/`-n`, and message reuse (`-C`/`--reuse-message`,
+// `-c`/`--reedit-message`). A landed commit RESOLVES a refusal-class hard stop
+// (lib/hard-stop.ts), so an empty or rewriting commit must never count as one (PR #15 review
+// note). `git add -n`/`--dry-run` stages nothing and is refused for the same reason. Long options
+// are matched by name (with or without `=value`); the letters are checked inside combined short
+// clusters (`-pm`, `-nm`), so a flag cannot hide behind another.
 const DENIED_LONG_OPTIONS: Record<string, readonly string[]> = {
-  add: ["--patch", "--interactive", "--edit", "--pathspec-from-file"],
-  commit: ["--edit", "--template", "--reedit-message", "--patch", "--interactive", "--pathspec-from-file", "--fixup", "--squash"],
+  add: ["--patch", "--interactive", "--edit", "--pathspec-from-file", "--dry-run"],
+  commit: [
+    "--edit",
+    "--template",
+    "--reedit-message",
+    "--reuse-message",
+    "--patch",
+    "--interactive",
+    "--pathspec-from-file",
+    "--fixup",
+    "--squash",
+    "--allow-empty",
+    "--allow-empty-message",
+    "--amend",
+    "--no-verify",
+  ],
   diff: ["--textconv", "--ext-diff", "--output", "--no-index"],
   status: [],
 };
 const DENIED_SHORT_LETTERS: Record<string, string> = {
-  add: "pie",
-  commit: "etcpi",
+  add: "pien",
+  commit: "etcCpin",
   diff: "",
   status: "",
 };

@@ -162,8 +162,7 @@ try {
       finalization('git commit -m "fix: record hard stops (#5, #6)"') &&
       finalization("git status --short") &&
       finalization("git diff --cached --stat") &&
-      finalization("git commit --amend --no-edit") &&
-      finalization("git commit -C HEAD --no-edit") &&
+      finalization("git commit --no-edit -m x") &&
       finalization("git commit -F msg.txt"),
   );
   check(
@@ -221,6 +220,33 @@ try {
       !finalization("git commit --squash HEAD"),
   );
   check("a denied letter inside a combined short cluster is still refused", !finalization("git commit -pm x") && !finalization("git add -pA") && !finalization("git commit -me x"));
+  // PR #15 review note: a landed commit resolves a refusal-class hard stop, so trivial, empty,
+  // rewriting, or hook-skipping commits must never be finalization-shaped — and never resolve one.
+  const trivialCommits = [
+    "git commit --allow-empty -m x",
+    "git commit --allow-empty-message -m ''",
+    "git commit --amend -m x",
+    "git commit --amend --no-edit",
+    "git commit --no-verify -m x",
+    "git commit -n -m x",
+    "git commit -nm x",
+    "git commit -C HEAD",
+    "git commit -C HEAD --no-edit",
+    "git commit --reuse-message=HEAD",
+    "git commit -c HEAD",
+    "git commit --reedit-message HEAD",
+    "git add -n file",
+    "git add --dry-run file",
+  ];
+  for (const command of trivialCommits) {
+    hardStop.clearVinciHardStop("task-trivial");
+    hardStop.recordVinciHardStop("task-trivial", "reserve", "refused");
+    const resolved = hardStop.resolveVinciHardStopByFinalization(context("task-trivial", false), command);
+    check(`\`${command}\` is refused and does not resolve a hard stop`, !finalization(command) && resolved === false && hardStop.getVinciHardStop("task-trivial")?.source === "reserve");
+  }
+  hardStop.clearVinciHardStop("task-trivial");
+  hardStop.recordVinciHardStop("task-trivial", "reserve", "refused");
+  check("control: a real commit still resolves the stop", hardStop.resolveVinciHardStopByFinalization(context("task-trivial", false), "git commit --no-edit -m x") === true && hardStop.getVinciHardStop("task-trivial") === undefined);
   check(
     "diff: --textconv, --ext-diff, --output, --no-index are refused",
     !finalization("git diff --textconv -- src/runtime.ts") && !finalization("git diff --ext-diff") && !finalization("git diff --output=/tmp/x") && !finalization("git diff --no-index a b"),
