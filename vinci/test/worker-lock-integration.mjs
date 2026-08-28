@@ -34,6 +34,14 @@ try {
   assert.equal(secondCode, 75);
   assert.match(secondStderr, /daemon lock.*live pid/i);
   assert.equal(fixture.getRequests.length, getsBeforeSecond, "refused daemon must never touch the bus");
+  // W0.5: a lock-refused daemon must not announce itself either: no online post and no
+  // /v1/version fetch beyond the first daemon's single one.
+  assert.equal(fixture.versionRequests, 1, "refused daemon must not fetch /v1/version");
+  assert.equal(
+    fixture.getPostedMessages().filter((post) => / online$/.test(post.subject)).length,
+    1,
+    "refused daemon must not post an online status",
+  );
 
   first.kill("SIGTERM");
   await new Promise((resolveClose) => first.once("close", resolveClose));

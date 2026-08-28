@@ -227,6 +227,13 @@ function recentLogTail(limit) {
   return daemonLogChunks.slice(-limit).join("").trim() || null;
 }
 
+// W0.5: EVERY terminal post — postFinal and each early terminal blocker (envelope error, past
+// deadline, governor refusal/unavailability, invalid task id) — goes through this one formatter
+// so no terminal record on the bus can omit which build produced it.
+function terminalPostBody(details) {
+  return `${details} worker_build=${formatWorkerBuild(workerBuild)}`;
+}
+
 async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
@@ -248,15 +255,15 @@ async function postFinal(bus, message, envelope, state, evidence) {
     state.limit_tripped ? `limit=${state.limit_tripped}` : undefined,
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
-    `worker_build=${formatWorkerBuild(workerBuild)}`,
     ...evidenceDetails,
   ]
     .filter(Boolean)
     .join(" ");
+  const body = terminalPostBody(details);
   const options = { inReplyTo: message.message_id };
   if (state.state === "COMPLETED" && isLedgerRef(envelope.ref)) {
     options.refs = [envelope.ref];
-    await bus.post("finding", subject, details, options);
+    await bus.post("finding", subject, body, options);
   } else if (state.state === "BLOCKED" && state.harness_stop) {
     // An instrument stop: the harness refused the agent's work mid-run. Say so explicitly so the
     // soak ledger attributes the block to the instrument, not to the model's own narrative.
@@ -264,7 +271,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     await bus.post(
       "blocker",
       subject,
-      `${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`,
+      terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`),
       options,
     );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
@@ -274,9 +281,9 @@ async function postFinal(bus, message, envelope, state, evidence) {
       ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
       : details;
     const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
-    await bus.post("blocker", subject, reason, options);
+    await bus.post("blocker", subject, terminalPostBody(reason), options);
   } else {
-    await bus.post("status", subject, details, options);
+    await bus.post("status", subject, body, options);
   }
 }
 
@@ -285,7 +292,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
   try {
     assertTaskId(taskId);
   } catch (error) {
-    await bus.post("blocker", `task ${taskId} blocked`, error.message, { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(error.message), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -307,7 +314,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
       outcome: { reason: error.message },
     });
-    await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, `state=${state} reason=${error.message}`, {
+    await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
       inReplyTo: message.message_id,
     });
     return true;
@@ -316,7 +323,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
   const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild });
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
-    await bus.post("blocker", `task ${taskId} blocked`, "deadline is in the past", { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -350,7 +357,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
         const governor = claimResult?.refused === true ? "refused" : "unavailable";
         const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
-        await bus.post("blocker", `task ${taskId} blocked`, `${label}: ${reason}`, {
+        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
           inReplyTo: message.message_id,
         });
         return true;

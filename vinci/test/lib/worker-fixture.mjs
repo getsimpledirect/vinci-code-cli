@@ -45,6 +45,8 @@ export class WorkerTestFixture {
       dirty: false,
     };
     this.serveVersion = true;
+    // When > 0, /v1/version answers only after this many ms (to exercise the daemon's timeout).
+    this.versionDelayMs = 0;
     this.versionRequests = 0;
     this.busServer = null;
     this.busPort = 0;
@@ -90,8 +92,12 @@ export class WorkerTestFixture {
           response.end();
           return;
         }
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify(this.serverBuild));
+        const answer = () => {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify(this.serverBuild));
+        };
+        if (this.versionDelayMs > 0) setTimeout(answer, this.versionDelayMs).unref();
+        else answer();
         return;
       }
       if (request.headers.authorization !== "Bearer test-token") {
