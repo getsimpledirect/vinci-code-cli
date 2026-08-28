@@ -114,6 +114,13 @@ export function parseEnvelope(body) {
   };
 }
 
+// The task-record shape of a vinciBinaryVersion() result: `{ version, path }`, `{ error }`, or null.
+export function vinciBinaryRecord(binary) {
+  if (!binary || typeof binary !== "object") return null;
+  if (binary.error) return { error: binary.error };
+  return { version: binary.version, path: binary.path };
+}
+
 export class TaskLifecycle {
   constructor(stateDir, taskId) {
     assertTaskId(taskId);
@@ -145,6 +152,7 @@ export class TaskLifecycle {
         vinci_version: null,
         worker_build: null,
         server_build: null,
+        vinci_binary: null,
         provider: null,
         model: null,
         cost_usd: 0,
@@ -167,9 +175,15 @@ export class TaskLifecycle {
     return this.state.terminal === true || TERMINAL_STATES.has(this.state.state);
   }
 
-  // builds (W0.5): `{ workerBuild: { version, commit, dirty, source }, serverBuild: <payload|{error}> }`.
-  // `vinci_version` is kept for compatibility; `worker_build` / `server_build` name the exact
-  // builds that produced this record and ride into result.json unchanged.
+  // builds (W0.5): `{ workerBuild: { version, commit, dirty, source }, serverBuild: <payload|{error}>,
+  // vinciBinary: { version, path } | { error } }`.
+  // `vinci_version` is kept for compatibility and is the DAEMON CHECKOUT's identity.json version
+  // (same as worker_build.version) — it is NOT the version of the `vinci` binary that ran the
+  // task; that is `vinci_binary` (#18). At startAttempt it is the daemon's LAST OBSERVED probe
+  // (what an early blocker that never spawns gets); a task that reaches the spawn re-probes
+  // immediately before it and overwrites the field via record({ vinci_binary }).
+  // `worker_build` / `server_build` name the exact builds that produced this record and ride
+  // into result.json unchanged.
   startAttempt(task, vinciVersion, builds = {}) {
     if (this.isTerminal()) throw new Error(`cannot start an attempt on terminal state ${this.state.state}`);
     const firstAttempt = !(Number.isInteger(this.state.attempt) && this.state.attempt > 0);
@@ -193,6 +207,7 @@ export class TaskLifecycle {
         ? { version: builds.workerBuild.version, commit: builds.workerBuild.commit, dirty: builds.workerBuild.dirty }
         : null,
       server_build: builds.serverBuild ?? null,
+      vinci_binary: vinciBinaryRecord(builds.vinciBinary),
       provider: task.envelope.provider,
       model: task.envelope.model,
       cost_usd: 0,

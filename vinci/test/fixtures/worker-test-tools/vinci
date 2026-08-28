@@ -1,9 +1,54 @@
 #!/usr/bin/env node
 // Fake vinci for worker tests - records invocation and simulates behavior
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const recordFile = process.env.FAKE_VINCI_RECORD || '/tmp/fake-vinci-invocations.txt';
+
+// #18: the fake launcher's "install" is `$HOME/fake-vinci-version.json` (HOME is the only thing
+// the daemon's minimal probe env lets through besides PATH/TMPDIR/LANG):
+//   { "version": "0.0.51", "exit": 0, "sleep": 0, "record": "<file>",
+//     "flips": [{ "whenExists": "<path>", "version": "0.0.52", "exit": 0 }] }
+// The answer is the base fields, overridden in order by every flip whose marker path exists — a
+// test makes "the operator updated the launcher between X and Y" happen by pointing a flip at a
+// file that Y creates. `record` (when set) receives one line per --version probe with the whole
+// env the probe ran under, so a test can prove exactly which variables reached the launcher.
+// Missing file => 0.0.0-fake.
+const installFile = resolve(process.env.HOME || '/nonexistent', 'fake-vinci-version.json');
+function readInstall() {
+  let install = { version: '0.0.0-fake', exit: 0, sleep: 0 };
+  try {
+    install = { ...install, ...JSON.parse(readFileSync(installFile, 'utf8')) };
+  } catch {}
+  for (const flip of install.flips ?? []) {
+    if (flip.whenExists && existsSync(flip.whenExists)) install = { ...install, ...flip, flips: install.flips };
+  }
+  return install;
+}
+
+if (process.argv[2] === '--version') {
+  const install = readInstall();
+  if (install.record) appendFileSync(install.record, JSON.stringify({ argv: process.argv.slice(2), env: process.env }) + '\n');
+  if (install.sleep > 0) await new Promise((resolveSleep) => setTimeout(resolveSleep, install.sleep));
+  if (install.exit !== 0) {
+    process.stderr.write('fake vinci: version probe failed\n');
+    process.exit(install.exit);
+  }
+  process.stdout.write(`${install.version}\n`);
+  process.exit(0);
+}
+
+// #18: like the real shim, a launch self-updates BEFORE the payload executes — unless the caller
+// set VINCI_UPDATE_DISABLED=1, which the daemon must always do for a task spawn. A test sets
+// FAKE_VINCI_SELF_UPDATE_TO to the version an un-disabled launcher would update itself to; the
+// invocation record carries the version the payload then actually ran as.
+if (process.env.FAKE_VINCI_SELF_UPDATE_TO && process.env.VINCI_UPDATE_DISABLED !== '1') {
+  const install = readInstall();
+  mkdirSync(resolve(installFile, '..'), { recursive: true });
+  writeFileSync(installFile, JSON.stringify({ ...install, version: process.env.FAKE_VINCI_SELF_UPDATE_TO, flips: [] }) + '\n');
+}
+const executedVersion = readInstall().version;
+
 const sessionDir = process.argv.indexOf('--session-dir') >= 0 ? process.argv[process.argv.indexOf('--session-dir') + 1] : undefined;
 const sessionId = process.argv.indexOf('--session-id') >= 0 ? process.argv[process.argv.indexOf('--session-id') + 1] : undefined;
 
@@ -11,9 +56,10 @@ const sessionId = process.argv.indexOf('--session-id') >= 0 ? process.argv[proce
 const invocation = {
   argv: process.argv.slice(2),
   timestamp: new Date().toISOString(),
+  version: executedVersion,
+  updateDisabled: process.env.VINCI_UPDATE_DISABLED ?? null,
 };
 appendFileSync(recordFile, JSON.stringify(invocation) + '\n');
-
 // If there's a session dir and session ID, write the outcome JSONL
 if (sessionDir && sessionId) {
   const sessPath = resolve(sessionDir, sessionId);

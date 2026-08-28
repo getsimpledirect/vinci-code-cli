@@ -164,6 +164,9 @@ State file `<state-dir>/tasks/<id>.json`:
   "limit_tripped": null,
   "harness_stop": null,
   "vinci_version": "0.42.0",
+  "worker_build": { "version": "0.42.0", "commit": "<40-hex>", "dirty": false },
+  "server_build": { "git_sha": "<40-hex>", "dirty": false },
+  "vinci_binary": { "version": "0.42.1", "path": "/home/worker/.local/bin/vinci" },
   "provider": "openrouter",
   "model": "z-ai/glm-5.2",
   "cost_usd": 2.15,
@@ -273,28 +276,61 @@ What is recorded, and where:
   attempt and not retried. Worst case 5 s, so a hung server cannot delay the first
   poll past 6 s. On any failure it is `{ "error": "<why>", "attempts": <n> }` and the daemon
   still starts.
-- Both are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:
+- `vinci_binary` (#18) — `{ version, path }` from running `<vinci on PATH> --version`
+  (`vinciBinaryVersion()` in `build.mjs`; the binary is resolved exactly the way `runVinci`
+  resolves the one it spawns; 10 s timeout; the answer must be one `x.y.z[-pre]` token or it
+  is recorded as `unparseable version: …`). The probe runs under a minimal environment —
+  `PATH`, `HOME`, `TMPDIR`, `LANG` and `VINCI_UPDATE_DISABLED=1` only — never the daemon's,
+  which carries the bus/Governor tokens and provider/GitHub/AWS credentials. This is the
+  launcher payload that actually runs tasks and it is legitimately different from
+  `worker_build`: the daemon runs from a checkout, the launcher is updated on its own. It is
+  probed at daemon start (the `online` post's value) AND immediately before every spawn —
+  after the Governor lease and the clone — and that pre-spawn value is what the task record
+  carries. On any failure it is `{ "error": "<why>" }` and the daemon still starts.
+- Post-incident rule (the release that could not launch): **a task never runs under a self-updating launcher.** `runVinci` spawns
+  with `VINCI_UPDATE_DISABLED=1`, so nothing can swap the payload between the pre-spawn probe
+  and the run — the recorded `vinci_binary` is the executed binary by construction. Updating
+  the launcher on a worker box is an operator action (`vinci update`, as the deploy recipe
+  already does), never something a task triggers.
+- `vinci_version` is kept for compatibility and is the DAEMON CHECKOUT's `identity.json`
+  version (identical to `worker_build.version`). It is NOT the version of the binary that ran
+  the task — the incident that motivated this was a task record naming the daemon checkout's
+  version on a box whose launcher had already been updated to the next release. Read
+  `vinci_binary` for that.
+- All of them are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:
   `worker_build` is stored as `{ version, commit, dirty }` (`source` is omitted) and
-  `server_build` as the payload verbatim (or `{ error }`). The task record is what ships as the
-  evidence bundle's `result.json`, so the same two fields appear there.
+  `server_build` as the payload verbatim (or `{ error }`), `vinci_binary` as `{ version, path }`
+  (or `{ error }`). The task record is what ships as the evidence bundle's `result.json`, so the
+  same fields appear there.
 - Every terminal bus post — the final post from a run AND the early blockers (envelope error,
-  past deadline, governor refusal/unavailability) — carries `worker_build=…` via one shared
-  formatter in `worker.mjs` (`terminalPostBody`).
+  past deadline, governor refusal/unavailability) — carries `worker_build=…` and
+  `vinci_binary=…` via one shared formatter in `worker.mjs` (`terminalPostBody`).
 - The bus sees them twice: the daemon's single `worker <id> online` status post at start
   (`worker_build=<build>[-dirty] worker_version=<version>
-  server_build=<server commit | unknown: <error>>`, posted once per start, before the first
+  server_build=<server commit | unknown: <error>> vinci_binary=<version | unknown: <error>>`,
+  posted once per start, before the first
   poll, in `--once` mode too; a daemon that refuses to start — lock held, exit 75, or missing
   Governor, exit 78 — never announces itself and never fetches `/v1/version`), and
-  `worker_build=<build>[-dirty]` on every terminal task post. `<build>` is the 40-hex commit
+  `worker_build=<build>[-dirty] vinci_binary=<…>` on every terminal task post. `<build>` is the 40-hex commit
   for a resolved checkout, the bare `<version>` only for a packaged install (no `.git`), and
   the explicit `<version>-UNRESOLVED` for a checkout whose HEAD could not be read — a bare
   version on a machine that runs from a checkout is a defect, never a fallback, and must not be
   mistakable for a resolved identity.
+- Drift signal: the last ANNOUNCED binary is persisted in `<state-dir>/vinci-binary.json`.
+  Whenever a probe (at start or before a spawn) returns a version different from it, the
+  daemon posts ONE `status` `worker <id> vinci binary changed <old> -> <new>` and only then
+  updates the file — so a failed post is retried before the next task or at the next start,
+  and a change that lands while the daemon is down is still announced exactly once. Only
+  version -> version changes are announced (A -> B -> A is two); a probe `{ error }` is
+  recorded on the task but never announced and never resets the last-announced value. The
+  first successful probe on a box is the baseline and is not announced. A cohort with such a
+  post in it ran on two binaries.
 
 The post-fix soak requires ONE exact build set: both worker boxes must show the same
-`worker_build` (no `-dirty`) and the same `server_build` in their `online` posts before the
-cohort counts. A cohort whose task records carry two different `worker_build` values is two
-cohorts.
+`worker_build` (no `-dirty`), the same `server_build` AND the same `vinci_binary=` in their
+`online` posts before the cohort counts, and no `vinci binary changed` post may appear while it
+runs. A cohort whose task records carry two different `worker_build` or `vinci_binary` values
+is two cohorts.
 
 ## Network Access
 

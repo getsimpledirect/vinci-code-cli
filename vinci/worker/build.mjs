@@ -4,11 +4,25 @@
 // have run on one exact build set (build skew between the two worker boxes, and between worker
 // and server, has already caused live failures).
 import { spawnSync } from "node:child_process";
-import { readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
+import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
+
+// The one PATH resolver for every executable the worker spawns (run.mjs imports it from here).
+// It lives in this file so that vinciBinaryVersion() resolves `vinci` EXACTLY the way runVinci
+// does, and so that build.mjs stays standalone (it is copied alone into bare temp dirs by tests).
+export function resolveBin(name) {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    const candidate = resolve(directory || ".", name);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  throw new Error(`Executable not found on PATH: ${name}`);
+}
 
 // `git` is used ONLY for `dirty` (best-effort). `commit` never depends on it: the daemon runs
 // as an unprivileged user on a root-owned checkout, where git refuses with "dubious ownership"
@@ -266,4 +280,68 @@ export async function fetchServerBuild(
     }
     return payload;
   }
+}
+
+// #18: the version of the `vinci` BINARY the daemon will spawn, which is NOT the same thing as
+// buildIdentity(): the daemon runs from a checkout (identity.json + git), while `vinci` on PATH
+// is the installed launcher, whose payload self-updates independently. The 0.0.51 incident was
+// exactly this: task records said `vinci_version: 0.0.51` (the checkout) while the launcher that
+// actually ran was 0.0.52. So ask the binary itself, resolved the same way runVinci resolves it.
+// Never throws; never mutates the install: `VINCI_UPDATE_DISABLED=1` stops the launcher from
+// self-updating while it answers, so a version probe can never be the thing that changes the
+// version. Returns `{ version, path }` or `{ error }`.
+//
+// The probe runs under a MINIMAL env (probeEnv), never the daemon's: the daemon's environment
+// carries the bus token, the Governor token, provider keys, GitHub and AWS credentials, and a
+// `--version` answer needs none of them. Only PATH (so the launcher finds node/bash), HOME
+// (its install root), TMPDIR and LANG cross over, plus VINCI_UPDATE_DISABLED=1.
+const PROBE_ENV_ALLOWLIST = ["PATH", "HOME", "TMPDIR", "LANG"];
+export function probeEnv(base = process.env) {
+  const env = {};
+  for (const key of PROBE_ENV_ALLOWLIST) if (base[key] !== undefined) env[key] = base[key];
+  env.VINCI_UPDATE_DISABLED = "1";
+  return env;
+}
+
+// A version is one token: `<major>.<minor>.<patch>[-<prerelease>]`. Anything else (a banner, a
+// help text, a shell error printed to stdout) is not a version and is recorded as an error, so
+// a task record can never carry prose where a comparable version belongs.
+const VERSION_TOKEN = /^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$/;
+
+export function vinciBinaryVersion({ timeoutMs = 10_000, name = "vinci" } = {}) {
+  let path;
+  try {
+    path = resolveBin(name);
+  } catch (error) {
+    return { error: error?.message ?? String(error) };
+  }
+  try {
+    const result = spawnSync(path, ["--version"], {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      env: probeEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (result.error) {
+      const detail = result.error.code === "ETIMEDOUT" ? `timeout after ${timeoutMs}ms` : result.error.message;
+      return { error: `${path} --version failed: ${detail}` };
+    }
+    if (result.status !== 0) {
+      const tail = (result.stderr || result.stdout || "").trim().split("\n").pop() ?? "";
+      return { error: `${path} --version exited ${result.status ?? `signal ${result.signal}`}${tail ? `: ${tail}` : ""}` };
+    }
+    const version = (result.stdout ?? "").split("\n").map((line) => line.trim()).find(Boolean) ?? "";
+    if (!version) return { error: `${path} --version printed nothing` };
+    if (!VERSION_TOKEN.test(version)) return { error: `unparseable version: ${version.slice(0, 40)}` };
+    return { version, path };
+  } catch (error) {
+    return { error: `${path} --version failed: ${error?.message ?? String(error)}` };
+  }
+}
+
+// The bus form of vinciBinaryVersion(): `<version>` or `unknown: <error>`.
+export function formatVinciBinary(binary) {
+  if (!binary || typeof binary !== "object") return "unknown";
+  if (binary.error) return `unknown: ${binary.error}`;
+  return binary.version ?? "unknown";
 }
