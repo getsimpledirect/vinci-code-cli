@@ -178,6 +178,10 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
   assert.deepEqual(t5.state.harness_stop, { count: 2, reason: RESERVE_REASON }, "T5: the stop is recorded even though exit code outranked it");
   assert.equal(t5.posts.at(-1).kind, "blocker");
   assert.match(t5.posts.at(-1).body, /state=FAILED .*harness_stops=2/, "T5: FAILED post carries the stop count");
+  assert.ok(
+    t5.posts.at(-1).body.includes(`harness_stop_reason=${RESERVE_REASON}`),
+    `T5: FAILED post must carry the stop reason: ${t5.posts.at(-1).body}`,
+  );
   assert.doesNotMatch(t5.posts.at(-1).body, /stop=instrument/, "T5: the FAILED post is not attributed to an instrument stop");
 }
 

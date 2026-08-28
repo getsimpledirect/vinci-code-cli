@@ -239,8 +239,11 @@ async function postFinal(bus, message, envelope, state, evidence) {
       options,
     );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
-    // A FAILED run may also have hit a harness stop; surface the count so the ledger can attribute it.
-    const stops = state.harness_stop ? `${details} harness_stops=${state.harness_stop.count}` : details;
+    // A FAILED run may also have hit a harness stop; surface count AND reason so the ledger can
+    // attribute it. harness_stop_reason is the instrument's text; reason= stays the outcome narrative.
+    const stops = state.harness_stop
+      ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
+      : details;
     const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
     await bus.post("blocker", subject, reason, options);
   } else {
