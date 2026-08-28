@@ -123,12 +123,17 @@ export async function uploadEvidence({
       });
 
       if (!postResult.ok) {
+        // The bundle landed in S3 but the ledger never learned about it: the task is NOT
+        // evidenced. success stays false so the worker downgrades COMPLETED -> UNVERIFIED.
+        const postError = `Bus POST failed: ${postResult.status}`;
         return {
-          success: true,
+          success: false,
           uploaded: true,
           uri: s3Uri,
           sha256,
-          postError: `Bus POST failed: ${postResult.status}`,
+          bytes,
+          postError,
+          error: postError,
         };
       }
     }

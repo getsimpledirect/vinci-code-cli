@@ -1,6 +1,8 @@
 // Test: evidence final body carries uri/sha256; ledger ref posts evidence to the bus.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkerTestFixture } from './lib/worker-fixture.mjs';
@@ -20,6 +22,42 @@ async function runOnce(fixture, handoffs, envOverrides = {}) {
   const code = await new Promise(r => { proc.on('close', r); });
   if (code !== 0) { console.error(stderr); }
   assert.equal(code, 0);
+}
+
+function taskFile(fixture, id) {
+  return JSON.parse(readFileSync(join(fixture.tempDir, 'tasks', `${id}.json`), 'utf8'));
+}
+
+// The fake aws records `s3 cp --no-progress <bundle.tgz> <uri>`; read result.json back out of
+// the bundle the worker actually handed to the uploader.
+function uploadedResultJson(fixture) {
+  const calls = readFileSync(join(fixture.tempDir, 'aws-calls.txt'), 'utf8')
+    .split('\n')
+    .filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line));
+  assert.equal(calls.length, 1, 'exactly one aws s3 cp is expected');
+  const tarPath = calls[0].argv[3];
+  assert.match(tarPath, /\.tgz$/);
+  const out = mkdtempSync(join(tmpdir(), 'evidence-bundle-'));
+  try {
+    const tar = spawnSync('tar', ['xzf', tarPath, '-C', out], { encoding: 'utf8' });
+    assert.equal(tar.status, 0, tar.stderr);
+    return JSON.parse(readFileSync(join(out, 'result.json'), 'utf8'));
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+}
+
+function handoff(body) {
+  return {
+    message_id: '5',
+    kind: 'handoff',
+    to_agent: 'worker:w5',
+    subject: 'evidence task',
+    body,
+    ts: '2026-08-26T10:00:00Z',
+    posted_by: 'scheduler',
+  };
 }
 
 const testRun = async (name, fn) => {
@@ -92,6 +130,137 @@ await testRun('ledger ref records the evidence POST before the final finding', a
     assert.match(final.body, / evidence_uri=s3:\/\/bucket\/vinci-evidence\/5\/[0-9a-f]{64}\.tgz/);
     assert.match(final.body, / evidence_sha256=[0-9a-f]{64}/, 'final body must carry evidence uri+sha256 even on success');
     assert.doesNotMatch(final.body, /evidence_error/, 'successful upload must not report evidence_error');
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// W0.2: evidence before terminal. When evidence is configured and does not fully land, a
+// COMPLETED claim is downgraded to UNVERIFIED and the record on disk says so.
+await testRun('S3 upload failure with evidence configured downgrades COMPLETED to UNVERIFIED', async () => {
+  const fixture = new WorkerTestFixture('evidence-upload-fail');
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await runOnce(fixture, [handoff('repo: test/repo\nevidence: pr\nref: job_5\n\nTask')], {
+      FAKE_VINCI_OUTCOME: 'DONE',
+      VINCI_EVIDENCE_URI_PREFIX: 's3://bucket/vinci-evidence/',
+      FAKE_AWS_EXIT: '1',
+      FAKE_AWS_RECORD: join(fixture.tempDir, 'aws-calls.txt'),
+    });
+
+    const onDisk = taskFile(fixture, '5');
+    assert.equal(onDisk.state, 'UNVERIFIED', 'task file must show UNVERIFIED, not COMPLETED');
+    assert.equal(onDisk.terminal, true);
+    assert.equal(onDisk.evidence_error, 'S3 upload failed');
+    assert.equal(onDisk.pr, 'https://github.com/test/repo/pull/123', 'published fields survive the downgrade');
+    assert.equal(fixture.getEvidencePosts().length, 0, 'no metadata POST after a failed upload');
+
+    const final = fixture.getPostedMessages().at(-1);
+    assert.equal(final.kind, 'status', 'UNVERIFIED must not post a finding');
+    assert.equal(final.refs, undefined);
+    assert.match(final.subject, /^task 5 unverified$/);
+    assert.match(final.body, /^state=UNVERIFIED /);
+    assert.match(final.body, / evidence_error=S3 upload failed/);
+    assert.doesNotMatch(final.body, /state=COMPLETED/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+await testRun('metadata POST failure (upload ok) downgrades COMPLETED to UNVERIFIED with the error in the body', async () => {
+  const fixture = new WorkerTestFixture('evidence-post-fail');
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    fixture.evidencePostStatus = 500;
+    await runOnce(fixture, [handoff('repo: test/repo\nevidence: pr\nref: job_5\n\nTask')], {
+      FAKE_VINCI_OUTCOME: 'DONE',
+      VINCI_EVIDENCE_URI_PREFIX: 's3://bucket/vinci-evidence/',
+      FAKE_AWS_RECORD: join(fixture.tempDir, 'aws-calls.txt'),
+    });
+
+    assert.equal(fixture.getEvidencePosts().length, 0);
+    assert.equal(fixture.rejectedPosts.length, 1, 'the metadata POST was attempted and refused');
+    const onDisk = taskFile(fixture, '5');
+    assert.equal(onDisk.state, 'UNVERIFIED');
+    assert.equal(onDisk.evidence_error, 'Bus POST failed: 500');
+
+    const final = fixture.getPostedMessages().at(-1);
+    assert.equal(final.kind, 'status');
+    assert.equal(final.refs, undefined, 'no ledger finding without ledger evidence');
+    assert.match(final.body, /^state=UNVERIFIED /);
+    assert.match(final.body, / evidence_uri=s3:\/\/bucket\/vinci-evidence\/5\/[0-9a-f]{64}\.tgz/, 'the bundle did reach S3');
+    assert.match(final.body, / evidence_error=Bus POST failed: 500/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+await testRun('BLOCKED keeps its state on evidence failure but records evidence_error', async () => {
+  const fixture = new WorkerTestFixture('evidence-blocked-fail');
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await runOnce(fixture, [handoff('repo: test/repo\nevidence: pr\nref: job_5\n\nTask')], {
+      FAKE_VINCI_OUTCOME: 'BLOCKED',
+      VINCI_EVIDENCE_URI_PREFIX: 's3://bucket/vinci-evidence/',
+      FAKE_AWS_EXIT: '1',
+      FAKE_AWS_RECORD: join(fixture.tempDir, 'aws-calls.txt'),
+    });
+    const onDisk = taskFile(fixture, '5');
+    assert.equal(onDisk.state, 'BLOCKED');
+    assert.equal(onDisk.evidence_error, 'S3 upload failed');
+    const final = fixture.getPostedMessages().at(-1);
+    assert.equal(final.kind, 'blocker');
+    assert.match(final.body, / evidence_error=S3 upload failed/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+await testRun('evidence not configured: COMPLETED is unchanged and no bundle is attempted', async () => {
+  const fixture = new WorkerTestFixture('evidence-unconfigured');
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await runOnce(fixture, [handoff('repo: test/repo\nevidence: pr\nref: job_5\n\nTask')], {
+      FAKE_VINCI_OUTCOME: 'DONE',
+      FAKE_AWS_EXIT: '1',
+      FAKE_AWS_RECORD: join(fixture.tempDir, 'aws-calls.txt'),
+    });
+    const onDisk = taskFile(fixture, '5');
+    assert.equal(onDisk.state, 'COMPLETED');
+    assert.equal(onDisk.evidence_error, null);
+    assert.throws(() => readFileSync(join(fixture.tempDir, 'aws-calls.txt')), { code: 'ENOENT' }, 'aws must not be invoked');
+    const final = fixture.getPostedMessages().at(-1);
+    assert.equal(final.kind, 'finding');
+    assert.deepEqual(final.refs, ['job_5']);
+    assert.doesNotMatch(final.body, /evidence_/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+await testRun('the uploaded result.json carries the final state, not PENDING/RUNNING', async () => {
+  const fixture = new WorkerTestFixture('evidence-result-json');
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await runOnce(fixture, [handoff('repo: test/repo\nevidence: pr\nref: job_5\n\nTask')], {
+      FAKE_VINCI_OUTCOME: 'DONE',
+      VINCI_EVIDENCE_URI_PREFIX: 's3://bucket/vinci-evidence/',
+      FAKE_AWS_RECORD: join(fixture.tempDir, 'aws-calls.txt'),
+    });
+    const uploaded = uploadedResultJson(fixture);
+    const onDisk = taskFile(fixture, '5');
+    assert.equal(onDisk.state, 'COMPLETED');
+    assert.equal(uploaded.state, 'COMPLETED', 'result.json must carry the terminal state');
+    assert.equal(uploaded.terminal, true);
+    assert.equal(uploaded.pr, onDisk.pr);
+    assert.equal(uploaded.head, onDisk.head);
+    assert.equal(uploaded.finished_at, onDisk.finished_at, 'the uploaded snapshot is the one committed');
+    assert.equal(uploaded.exit_code, 0);
   } finally {
     await fixture.cleanup();
   }

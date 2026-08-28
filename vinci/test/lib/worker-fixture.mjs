@@ -34,6 +34,8 @@ export class WorkerTestFixture {
     this.busMessages = [];
     this.evidencePosts = [];
     this.getRequests = [];
+    // When set (e.g. 500), every /v1/evidence POST answers with that status instead of 200.
+    this.evidencePostStatus = null;
     this.busServer = null;
     this.busPort = 0;
     mkdirSync(this.reposDir, { recursive: true });
@@ -122,6 +124,12 @@ export class WorkerTestFixture {
             this.rejectedPosts.push(evidence);
             response.writeHead(422, { "content-type": "application/json" });
             response.end(JSON.stringify({ error: `invalid refs: ${invalidRefs.join(", ")}` }));
+            return;
+          }
+          if (this.evidencePostStatus) {
+            this.rejectedPosts.push(evidence);
+            response.writeHead(this.evidencePostStatus, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: `forced ${this.evidencePostStatus}` }));
             return;
           }
           this.evidencePosts.push(evidence);

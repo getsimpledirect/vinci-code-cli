@@ -106,9 +106,31 @@ State file `<state-dir>/tasks/<id>.json`:
 }
 ```
 
+**Transition table** (enforced by `TaskLifecycle.transition`; anything not listed throws
+`illegal transition <from> → <to>`, and unknown state names throw):
+
+| From | To | When |
+|------|----|------|
+| `PENDING` | `RUNNING` | immediately before the `vinci` child is spawned |
+| `PENDING` | `BLOCKED`, `FAILED` | fail-fast before spawn: envelope error, past deadline, Governor refusal/error |
+| `RUNNING` | `COMPLETED`, `UNVERIFIED`, `BLOCKED`, `FAILED` | the run finished, the branch was published, and the evidence bundle was attempted |
+| any terminal | (nothing) | a finished task is immutable; a failure after the terminal write (e.g. the final bus post) surfaces to the daemon loop instead of rewriting the record |
+
+Field-only updates (Governor lease, run results before publish) go through `record()` and never
+change `state`. `RUNNING` is non-terminal, so a daemon that dies mid-run resumes the task on
+restart exactly as before.
+
+**Evidence before terminal:** the terminal state is written only *after* the evidence bundle was
+attempted. The daemon computes the intended final state, builds the exact snapshot it is about to
+commit, ships that snapshot as `result.json`, and only then transitions. If evidence is configured
+(`VINCI_EVIDENCE_URI_PREFIX` set) and either the S3 upload or the `/v1/evidence` metadata POST
+fails, `COMPLETED` is downgraded to `UNVERIFIED` and `evidence_error` records the failure;
+`BLOCKED`/`FAILED` keep their state but still record `evidence_error`. When evidence is not
+configured nothing changes (no downgrade), so soak boxes may run without it.
+
 **Restart behavior:**
 - If `terminal=true`: skip (already done)
-- If `terminal=false`: increment `attempt`, keep same `session_id`, resume
+- If `terminal=false` (`PENDING`/`RUNNING`): increment `attempt`, keep same `session_id`, resume
 
 ## Credentials
 
@@ -172,11 +194,12 @@ When `VINCI_GOVERNOR_TOKEN` is set AND `--governor <url>` is given:
 
 When `VINCI_EVIDENCE_URI_PREFIX` is set (e.g. `s3://bucket/vinci/evidence/`):
 
-1. **After the run completes** (any terminal state): Build a deterministic bundle (session JSONL, git diff, result.json, runner log with last 200 lines)
+1. **After the run and publish, before the terminal state is written**: Build a deterministic bundle (session JSONL, git diff, result.json = the snapshot about to be committed, runner log with last 200 lines)
 2. **Upload to S3**: `aws s3 cp --no-progress {bundle.tgz} {prefix}{task-id}/{sha256}.tgz`
 3. **For ledger refs (job_/exp_/bk_ prefix)**: POST evidence metadata to `{busUrl}/v1/evidence` with body `{job_ref, sha256, uri, kind: "bundle", bytes, produced_at}` using the worker's Bearer token
 4. **For non-ledger refs**: Skip the evidence bus POST (the server would reject it with 422); caller can include uri+sha256 in the final message if desired
-5. **Final bus post**: Carries `evidence_uri=...` and `evidence_sha256=...` in details (or `evidence_error=...` if upload failed); terminal state is never flipped to FAILED on evidence upload failure
+5. **Terminal write**: an upload failure or a non-2xx metadata POST downgrades `COMPLETED` → `UNVERIFIED` and sets `evidence_error`; `BLOCKED`/`FAILED` keep their state and record `evidence_error` (see Lifecycle)
+6. **Final bus post**: Carries `evidence_uri=...` and `evidence_sha256=...` whenever the bundle reached S3, plus `evidence_error=...` whenever evidence was attempted and did not fully land; a downgraded task posts `status`, never a ledger `finding`
 
 **Data model:**
 - Evidence bundle contains: session.jsonl (full session transcript), git.diff (origin/main...HEAD), result.json (lifecycle snapshot), runner.log (last 200 lines of daemon stderr)
