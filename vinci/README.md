@@ -148,6 +148,12 @@ Vinci Code has its **own** version, separate from the underlying Pi version. To 
   active duration, input/output/cache tokens, provider/model provenance, and a clearly labeled local
   cost estimate. `/usage` shows it again; `vinci report-wrong <task-id>` records a false completion
   locally; Account → Usage in a Vinci app remains authoritative for account credits.
+- **Unattended mode** — in `vinci -p` (no TTY) the harness never asks for an instruction nobody can
+  give: the no-progress latch ends the task as `BLOCKED` with an unattended-stop reason, any such
+  hard stop outranks a closing "done" in the task record, and local `git add`/`git commit`/`git
+  status`/`git diff` are exempt from the action reserve because the commit is the deliverable
+  (`git push`, `gh`, and network commands are not — the daemon publishes). See
+  `docs/verification.md` → "Unattended mode".
 - **Vinci Council** — for a hard decision, weighs it from 4 independent lenses in parallel,
   then combines them (agree/disagree/confidence). Automatic (the model calls
   `convene_council`) or manual (`/council <question>`).

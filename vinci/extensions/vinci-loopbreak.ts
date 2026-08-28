@@ -33,6 +33,8 @@ import { relative, resolve } from "node:path";
 import { classifyCompletionResult, complete, type UserMessage } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { clearVinciAutomationStop, requestVinciAutomationStop, sendVinciControl } from "./lib/control.ts";
+import { clearVinciHardStop, recordVinciHardStop, vinciTaskIdOf } from "./lib/hard-stop.ts";
+import { isVinciFinalizationCommand, isVinciUnattended } from "./lib/unattended.ts";
 import { isPendingVinciSourceOwnershipInspection } from "./lib/source-ownership-state.ts";
 import { getVinciUiState } from "./lib/ui-state.ts";
 import {
@@ -561,7 +563,10 @@ export default function (pi: ExtensionAPI) {
   const failedMutationCalls = new Set<string>(); // a byte-identical failed edit/write cannot succeed on retry
   const recent: Step[] = []; // rolling (call, result) history for escalation context
 
-  pi.on("session_start", async () => clearVinciAutomationStop());
+  pi.on("session_start", async () => {
+    clearVinciAutomationStop();
+    clearVinciHardStop();
+  });
 
   // agent_start fires once per user prompt — reset the per-turn counters (keep `task`, set on input).
   // EXCEPTION: user continuations and extension-owned recovery turns are the same task, so their
@@ -609,7 +614,10 @@ export default function (pi: ExtensionAPI) {
     if (!text) return;
     // Only a REAL new prompt lifts the stop: a mid-stream keystroke ("wait, what?") un-latching a
     // firm stop resumed the exact frozen loop with a fresh call budget (round-2 audit P1-4).
-    if (event.source !== "extension" && !event.streamingBehavior) clearVinciAutomationStop();
+    if (event.source !== "extension" && !event.streamingBehavior) {
+      clearVinciAutomationStop();
+      clearVinciHardStop();
+    }
     // Read-only bash calls never touch `calls`, so recovery inputs mid-navigation must also see
     // the navigation counter or they reset the turn and re-grant the whole budget (round-12 P0).
     carryRepeats =
@@ -957,6 +965,19 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason: verificationState.summary };
     }
     const readOnlyNavigation = READ_ONLY_TOOLS.has(tool);
+    // [#6] In an unattended run `git add` / `git commit` IS the deliverable (the daemon publishes),
+    // so the two action reserves below never refuse a finalization-shaped command there. The
+    // predicate is the single definition in lib/unattended.ts: local git only, never push/gh/network.
+    // Interactively the reserve still applies — but refusing a finalization step is then a hard stop
+    // the outcome record must reflect (lib/hard-stop.ts), not a nudge the narrative can talk past.
+    const finalizationCommand = tool === "bash" && isVinciFinalizationCommand(command);
+    const finalizationExempt = finalizationCommand && isVinciUnattended(ctx);
+    const reserveRefusal = (reason: string): { block: true; reason: string } => {
+      if (finalizationCommand) {
+        recordVinciHardStop(vinciTaskIdOf(ctx), "reserve", `${reason} The refused step was the finalization command \`${command.slice(0, 80)}\`.`);
+      }
+      return { block: true, reason };
+    };
     calls += 1;
     if (!readOnlyNavigation) actionCalls += 1;
     if (!readOnlyNavigation && actionCalls > TURN_CALL_CEILING) {
@@ -1056,7 +1077,8 @@ export default function (pi: ExtensionAPI) {
       !META_TOOLS.has(tool) &&
       !GROUNDING_TOOLS.has(tool) &&
       !readOnlyNavigation &&
-      !requiredOwnershipInspection
+      !requiredOwnershipInspection &&
+      !finalizationExempt
     ) {
       if (preMutationVerification && !preMutationVerificationUsed) {
         preMutationVerificationUsed = true;
@@ -1066,7 +1088,7 @@ export default function (pi: ExtensionAPI) {
           if (ctx.hasUI) ctx.ui.notify("Vinci has enough evidence — reserving the remaining actions for the fix.", "info");
           sendVinciControl(pi, "vinci-mutation-runway", MUTATION_RUNWAY_STEER);
         }
-        return { block: true, reason: "Vinci reserved the remaining actions for implementation or an answer." };
+        return reserveRefusal("Vinci reserved the remaining actions for implementation or an answer.");
       }
     }
 
@@ -1087,12 +1109,13 @@ export default function (pi: ExtensionAPI) {
       !META_TOOLS.has(tool) &&
       !GROUNDING_TOOLS.has(tool) &&
       !readOnlyNavigation &&
-      !verificationCall
+      !verificationCall &&
+      !finalizationExempt
     ) {
       postMutationInspections++;
       if (postMutationInspections > POST_MUTATION_INSPECTION_LIMIT) {
         sendVinciControl(pi, "vinci-post-mutation-runway", POST_MUTATION_STEER);
-        return { block: true, reason: "Vinci reserved the remaining actions for verification or the final answer." };
+        return reserveRefusal("Vinci reserved the remaining actions for verification or the final answer.");
       }
     }
 

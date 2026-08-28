@@ -1,4 +1,5 @@
 import { formatDuration } from "./format-duration.ts";
+import { getVinciHardStop } from "./hard-stop.ts";
 import {
   addVinciAccumulatedUsage,
   getVinciTaskUsageSnapshot,
@@ -552,7 +553,18 @@ export function classifyVinciTaskState(
 
 export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcome {
   const changedFiles = [...new Set(input.changedFiles)].sort();
-  const terminal = classifyVinciTaskState(input.messages, changedFiles, input.verification);
+  const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification);
+  // [#5/#6] A hard stop (the no-progress latch, or the action reserve refusing a finalization step)
+  // is a machine fact that outranks the narrative: the model's closing "done" — and even a remote
+  // VERIFIED_PASS — cannot turn a frozen session into DONE or DONE_UNVERIFIED. Observed live: the
+  // latch locked every mutation, the record said DONE with changedFiles, the tree held uncommitted
+  // work. Applies in every mode; WAITING/BLOCKED already carry the non-success exit and keep their
+  // own, more specific reason.
+  const hardStop = getVinciHardStop(input.taskId);
+  const terminal =
+    hardStop && (classified.state === "DONE" || classified.state === "DONE_UNVERIFIED")
+      ? { state: "BLOCKED" as const, reason: hardStop.reason.slice(0, 240) }
+      : classified;
   const usageMessages = input.usageMessages ?? input.messages;
   const streamUsage = summarizeAssistantUsage(usageMessages);
   const responseKeys = assistantResponseKeys(usageMessages);
