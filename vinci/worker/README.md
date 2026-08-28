@@ -102,26 +102,42 @@ Unknown headers → blocker posted, task not run.
 ### Branch continuation (`branch:` header)
 
 Without `branch:` the daemon works on `worker/<taskId>` off `origin/main`. With `branch:` the
-envelope pins an existing branch (e.g. the head of a held PR). `prepareRepository` fetches that
-branch **explicitly by refspec** — `git fetch origin +refs/heads/<branch>:refs/remotes/origin/<branch>` —
-and resolves the tip from the local `origin/<branch>` after the fetch. A plain `git fetch origin`
-is only as wide as `remote.origin.fetch`; a repo cache cloned with `--single-branch`/`--depth`
-never receives other branches from it, and the tip `ls-remote` reports is then an object the clone
-does not have (soak cohort 2, 2026-08-28: `--branch worker/msg_b5e63707` on both boxes). Exactly
-three outcomes, each with its own reason so the ledger and the operator attribution follow it:
+envelope pins an existing branch (e.g. the head of a held PR). Order of operations, fixed:
+validate the name → ask origin live (`git ls-remote --exit-code --heads origin refs/heads/<branch>`)
+**before any fetch or clone** → `git fetch origin +refs/heads/<branch>:refs/remotes/origin/<branch>`
+(explicit refspec; the branch path never runs a general `git fetch origin` first) → resolve the tip
+from the local `origin/<branch>` → ancestry check → `checkout -B`. Exactly three outcomes, each with
+its own reason so the ledger and the operator attribution follow it:
 
 | State on origin / locally | Result | Reason text |
 |---|---|---|
-| (a) branch absent on origin (asked live via `ls-remote`, never a cached `refs/remotes/*`) | **BLOCKED before spawn**, cost 0, no session — regardless of any local branch of that name | `envelope branch <branch> not found on origin`; if a stale local branch existed it is renamed aside to `stale/<branch>-<UTC stamp>` (never deleted) and the reason appends `(stale local branch <branch> at <sha> renamed aside to stale/<branch>-<stamp>)` |
+| (a) branch absent on origin (live `ls-remote`, never a cached `refs/remotes/*`) | **BLOCKED before spawn**, cost 0, no session, **no fetch/clone performed** — regardless of any local branch of that name | `envelope branch <branch> not found on origin`; a stale local branch is renamed aside to `stale/<branch>-<UTC stamp>-<6 hex>` (never deleted) and the reason appends `(stale local branch <branch> at <sha> renamed aside to stale/…)` |
 | (b) branch on origin; local branch absent, or an ancestor of the remote tip | checkout at the remote tip (a fast-forward when the local branch existed) | — |
 | (c) branch on origin; local branch has commits not on the remote tip | **refused**, local commits untouched | `local branch <branch> at <localSha> has commits not on origin/<branch> at <remoteTip>; refusing to reset (divergence)` |
 
+**Never-pushed residue on path (c).** Soak cohort 2 rows 11/11b (2026-08-28) were a genuine
+divergence: a Night-1 local `worker/<id>` (2 ahead / 82 behind origin's rebuilt PR head) that had
+never been pushed. When ALL of the following hold, the local branch is renamed aside to
+`stale/<branch>-<stamp>-<hex>` (never deleted) and the attempt is **still refused**, with the reason
+extended by `; never-pushed residue renamed aside to stale/… — retry continues at origin/<branch>`,
+so the next attempt proceeds at the remote tip:
+
+1. the local branch does not track `origin/<branch>` (`branch.<b>.remote`/`.merge` are not
+   `origin`/`refs/heads/<b>` — a pushed branch carries that upstream; the daemon's own default path
+   leaves the upstream at `origin/main`, which is not evidence of a push);
+2. after `git fetch --prune origin`, no origin head contains the local tip
+   (`git for-each-ref --contains=<localSha> refs/remotes/origin` is empty);
+3. every commit in `<remoteTip>..<localSha>` is unreachable from every origin head
+   (`git rev-list --count <remoteTip>..<localSha> --not --remotes=origin` equals the range count).
+
+A branch that tracks `origin/<branch>`, or whose commits live on any other origin head, is refused
+and left exactly where it is. Any error in these checks ⇒ no rename, plain refusal.
+
 Origin unreachable is reported as `git ls-remote origin failed for <branch>: …`, never as
-not-found or divergence. A branch that exists on origin but still cannot be resolved locally after
-the explicit fetch is `envelope branch <branch> exists on origin but fetch did not materialize
-origin/<branch> locally`. Proof on a box: `git -C <state-dir>/repos/<name> config --get-all
-remote.origin.fetch` — anything narrower than `+refs/heads/*:refs/remotes/origin/*` is the
-single-branch cache shape that made the plain fetch insufficient.
+not-found or divergence. A branch that exists on origin but cannot be resolved locally after the
+explicit fetch is `envelope branch <branch> exists on origin but fetch did not materialize
+origin/<branch> locally`. The pre-existing `reset --hard`/`clean -fd` quarantine of the shared
+checkout is unchanged here (Wave 1 clean-room item).
 
 ## Lifecycle
 
