@@ -229,11 +229,18 @@ function recentLogTail(limit) {
 
 async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
-  const evidenceDetails = evidence?.success
-    ? [`evidence_uri=${evidence.uri}`, `evidence_sha256=${evidence.sha256}`]
-    : evidence && !evidence.success
-      ? [`evidence_error=${evidence.error}`]
-      : [];
+  // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
+  // set by uploadEvidence solely after a successful `aws s3 cp`); a failed upload also carries
+  // the intended uri, which must NOT be advertised. evidence_error is present whenever evidence
+  // was attempted and did not fully land (upload or metadata POST).
+  const landed = evidence?.uploaded === true;
+  const evidenceDetails = evidence
+    ? [
+        landed ? `evidence_uri=${evidence.uri}` : undefined,
+        landed ? `evidence_sha256=${evidence.sha256}` : undefined,
+        evidence.success ? undefined : `evidence_error=${evidence.error}`,
+      ]
+    : [];
   const details = [
     `state=${state.state}`,
     `exit_code=${state.exit_code}`,
@@ -306,7 +313,6 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     return true;
   }
 
-  lifecycle.transition("CLAIMED");
   if (attempt.firstAttempt) {
     await bus.post("status", `task ${taskId} claimed`, `claimed ${taskId} attempt ${attempt.attempt}`, {
       inReplyTo: message.message_id,
@@ -346,7 +352,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       // Lease granted: tighten the envelope (budget, max_runtime_s, deadline, and the lease
       // ttl as a runtime cap) and record both the lease and the effective runtime limit.
       envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
-      lifecycle.transition("CLAIMED", {
+      lifecycle.record({
         lease: { ...claimResult, effective_max_runtime_s: envelopeToUse.max_runtime_s },
       });
     }
@@ -357,11 +363,11 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       stateDir,
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
     const head = await readHead(repository.repoDir);
-    lifecycle.transition("EVIDENCE_PENDING", { ...run, head, outcome: run.outcome ?? null });
+    lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
     const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId });
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const harnessStops = run.harness_stops ?? [];
-    const state = finalState({
+    const intendedState = finalState({
       exitCode: run.exit_code,
       limitTripped: run.limit_tripped,
       outcome: run.outcome,
@@ -372,16 +378,24 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     // Record the instrument stop on the task whenever it decided the state, so the snapshot (and the
     // evidence bundle's result.json) carry the machine-observed reason next to the model's narrative.
     const harnessStop =
-      state === "BLOCKED" && harnessStops.length > 0
+      intendedState === "BLOCKED" && harnessStops.length > 0
         ? { count: harnessStops.length, reason: harnessStops[0].reason }
         : null;
-    lifecycle.transition(state, { ...published, outcome, harness_stop: harnessStop });
 
-    // Stage 2: upload evidence bundle before the final bus post so uri/sha256 (or the
-    // failure) can ride in the post body. No-op when VINCI_EVIDENCE_URI_PREFIX is unset.
+    // W0.2 evidence before terminal: the terminal state is written only AFTER the evidence
+    // bundle was attempted. `planned` is the exact snapshot that will be committed (state +
+    // published fields) and is what ships as result.json. No-op when
+    // VINCI_EVIDENCE_URI_PREFIX is unset (soak boxes may run without evidence).
     // sessionJsonl: session transcript from <state-dir>/sessions/<task-id>/ (outside the repo).
     // gitDiff is against the task branch base; it may be empty when the run changed nothing.
     // logTail: last 200 lines of the daemon's stderr so the bundle captures how the run ended.
+    const planned = lifecycle.plan(intendedState, { ...published, outcome, evidence_error: null, harness_stop: harnessStop });
+    // The bundle is built BEFORE anything is committed, so result.json is marked as a
+    // pre-terminal snapshot: `state` is the intended state, `committed_state` is null and
+    // `terminal` is false. A bundle-alone reader therefore never sees a committed COMPLETED;
+    // the committed state lives only in the task file, which also records
+    // `evidence_result_state` so a downgrade after upload is machine-detectable.
+    const resultJson = { ...planned, snapshot: "pre-terminal", committed_state: null, terminal: false };
     const session = readSessionState(join(stateDir, "sessions", taskId), attempt.sessionId);
     const sessionJsonl = session.path ? readFileSync(session.path, "utf8") : null;
     const gitDiffResult = await command("git", [
@@ -395,7 +409,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     const evidenceResult = await uploadEvidence({
       sessionJsonl,
       gitDiff,
-      resultJson: lifecycle.snapshot(),
+      resultJson,
       logTail,
       uriPrefix: process.env.VINCI_EVIDENCE_URI_PREFIX,
       taskId,
@@ -403,8 +417,23 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       busToken: bus.token,
       ref: envelopeToUse.ref,
     });
+
+    // Evidence was attempted and did not fully land (S3 upload or /v1/evidence POST failed):
+    // a COMPLETED claim without evidence is not a completed claim -> UNVERIFIED.
+    // BLOCKED/FAILED keep their state but record why evidence is missing.
+    const evidenceError = evidenceResult && !evidenceResult.success ? evidenceResult.error : null;
+    const state = evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
+    lifecycle.transition(state, {
+      ...planned,
+      evidence_error: evidenceError,
+      // State the uploaded result.json names as intended; differs from `state` after a downgrade.
+      evidence_result_state: evidenceResult ? intendedState : null,
+    });
     await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult);
   } catch (error) {
+    // A terminal state is immutable: if the failure happened after it was committed (e.g. the
+    // final bus post), surface the error to the daemon loop instead of rewriting the record.
+    if (lifecycle.isTerminal()) throw error;
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
     await postFinal(bus, message, envelope, lifecycle.snapshot(), null);
   }
