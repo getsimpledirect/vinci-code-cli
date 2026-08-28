@@ -1,0 +1,12 @@
+{
+  "schema": "vinci.containment-broker.native-admission/v3",
+  "admitted": false,
+  "platform": "linux",
+  "protocol_header_sha256": "3181d8a47a692a70588685a36fe8a8eb4ab097db4609b616cd347f9f31ad4e7f",
+  "trampoline_source_sha256": "7bd5d60bb7757d01a7a94b3ca199d8094689278ca3706cdaf357232bd504b757",
+  "launcher_source_sha256": "aca424e94e6bac8c9b99fb3b5f9f6c511a9e627a9424b2c72cbd5c7c3bf35136",
+  "binary_sha256": null,
+  "linux_build_receipt": null,
+  "linux_test_receipt": null,
+  "reason": "No admitted Linux build or real-host containment evidence exists. Runtime launch is refused."
+}
