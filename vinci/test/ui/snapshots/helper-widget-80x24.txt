@@ -1,4 +1,4 @@
-  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.50
+  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.51
   Vinci   ·   <repo>
   /login to connect   ·   /undo safety net   ·   Ctrl+T thinking   ·   /thinking
 
