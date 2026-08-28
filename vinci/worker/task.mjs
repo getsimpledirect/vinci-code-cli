@@ -149,6 +149,7 @@ export class TaskLifecycle {
         terminal: false,
         lease: null,
         evidence_error: null,
+        harness_stop: null,
         evidence_result_state: null,
       };
     }
@@ -189,6 +190,7 @@ export class TaskLifecycle {
       terminal: false,
       lease: null,
       evidence_error: null,
+      harness_stop: null,
       evidence_result_state: null,
     };
     this.save();

@@ -139,9 +139,11 @@ async function scenario(name, body, env, verify, prepare) {
   }
 }
 
+// evidence: pr so the resumed attempt can still reach COMPLETED (W0.4: evidence: none now ends
+// UNVERIFIED — exit 0 alone is not completion); the restart invariants are what this scenario pins.
 await scenario(
   "restart",
-  envelope(),
+  envelope({ evidence: "pr" }),
   {},
   ({ bus, state, vinciRecord }) => {
     assert.equal(state.attempt, 2);
