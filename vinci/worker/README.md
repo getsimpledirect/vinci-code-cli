@@ -200,14 +200,26 @@ here gates startup: identity is a record, not a check.
 What is recorded, and where:
 
 - `worker_build` — computed ONCE at daemon start by `vinci/worker/build.mjs`
-  (`buildIdentity()`): `{ version, commit, dirty, source }`. `version` is `identity.json`'s
-  version (the string task records always carried as `vinci_version`, which is kept);
-  `commit` is `git rev-parse HEAD` of the checkout the daemon runs from (`null` when not a git
-  checkout or git is unavailable, then `source` is `"package"` instead of `"git"`); `dirty`
-  is whether `git status --porcelain --untracked-files=no` is non-empty (`null` when unknown).
-- `server_build` — the verbatim payload of `GET <server>/v1/version` (unauthenticated; 3 s
-  timeout; vinci-gpu-control reports `git_sha`, `dirty`, `server_code_sha256`, …), fetched once
-  at daemon start. On any failure it is `{ "error": "<why>" }` and the daemon still starts.
+  (`buildIdentity()`): `{ version, commit, dirty, source, unresolved }`. `version` is
+  `identity.json`'s version (the string task records always carried as `vinci_version`, which
+  is kept); `commit` is the HEAD sha of the checkout the daemon runs from, read directly from
+  the checkout's files — `.git/HEAD` (a `gitdir:` pointer file is followed for a linked
+  worktree), then the branch's loose ref, then `packed-refs` — never via `git` exec, so an
+  unprivileged daemon on a root-owned checkout still resolves it (#17: git's "dubious
+  ownership" refusal used to silently degrade the identity to a version string). It is `null`
+  when there is no `.git` at all (a packaged install: `source: "package"`, `unresolved: false`)
+  OR when a `.git` exists but HEAD could not be resolved — unborn branch, unreadable ref
+  (`source: "package"`, `unresolved: true`). `dirty` is whether
+  `git -c safe.directory=* status --porcelain --untracked-files=no` is non-empty; it is
+  best-effort and `null` (unknown) whenever git is missing or refuses — never `false` by
+  default.
+- `server_build` — the verbatim payload of `GET <server>/v1/version` (unauthenticated;
+  vinci-gpu-control reports `git_sha`, `dirty`, `server_code_sha256`, …), fetched once at
+  daemon start with a 2 s timeout per attempt and ONE retry after 1 s on a timeout or network
+  error (a cold first request has timed out and then answered in 43 ms on restart; a non-2xx or
+  non-JSON answer is not retried). Worst case 5 s, so a hung server cannot delay the first
+  poll past 6 s. On any failure it is `{ "error": "<why>", "attempts": <n> }` and the daemon
+  still starts.
 - Both are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:
   `worker_build` is stored as `{ version, commit, dirty }` (`source` is omitted) and
   `server_build` as the payload verbatim (or `{ error }`). The task record is what ships as the
@@ -216,11 +228,15 @@ What is recorded, and where:
   past deadline, governor refusal/unavailability) — carries `worker_build=…` via one shared
   formatter in `worker.mjs` (`terminalPostBody`).
 - The bus sees them twice: the daemon's single `worker <id> online` status post at start
-  (`worker_build=<commit or version>[-dirty] worker_version=<version>
+  (`worker_build=<build>[-dirty] worker_version=<version>
   server_build=<server commit | unknown: <error>>`, posted once per start, before the first
   poll, in `--once` mode too; a daemon that refuses to start — lock held, exit 75, or missing
   Governor, exit 78 — never announces itself and never fetches `/v1/version`), and
-  `worker_build=<commit or version>[-dirty]` on every terminal task post.
+  `worker_build=<build>[-dirty]` on every terminal task post. `<build>` is the 40-hex commit
+  for a resolved checkout, the bare `<version>` only for a packaged install (no `.git`), and
+  the explicit `<version>-UNRESOLVED` for a checkout whose HEAD could not be read — a bare
+  version on a machine that runs from a checkout is a defect, never a fallback, and must not be
+  mistakable for a resolved identity.
 
 The post-fix soak requires ONE exact build set: both worker boxes must show the same
 `worker_build` (no `-dirty`) and the same `server_build` in their `online` posts before the
