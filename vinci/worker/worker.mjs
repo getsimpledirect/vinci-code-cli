@@ -208,12 +208,15 @@ function recentLogTail(limit) {
 
 async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
-  // uri/sha256 ride along whenever the bundle reached S3 (even if the metadata POST then
-  // failed); evidence_error is present whenever evidence was attempted and did not fully land.
+  // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
+  // set by uploadEvidence solely after a successful `aws s3 cp`); a failed upload also carries
+  // the intended uri, which must NOT be advertised. evidence_error is present whenever evidence
+  // was attempted and did not fully land (upload or metadata POST).
+  const landed = evidence?.uploaded === true;
   const evidenceDetails = evidence
     ? [
-        evidence.uri ? `evidence_uri=${evidence.uri}` : undefined,
-        evidence.sha256 ? `evidence_sha256=${evidence.sha256}` : undefined,
+        landed ? `evidence_uri=${evidence.uri}` : undefined,
+        landed ? `evidence_sha256=${evidence.sha256}` : undefined,
         evidence.success ? undefined : `evidence_error=${evidence.error}`,
       ]
     : [];
@@ -352,6 +355,12 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     // gitDiff is against the task branch base; it may be empty when the run changed nothing.
     // logTail: last 200 lines of the daemon's stderr so the bundle captures how the run ended.
     const planned = lifecycle.plan(intendedState, { ...published, outcome, evidence_error: null });
+    // The bundle is built BEFORE anything is committed, so result.json is marked as a
+    // pre-terminal snapshot: `state` is the intended state, `committed_state` is null and
+    // `terminal` is false. A bundle-alone reader therefore never sees a committed COMPLETED;
+    // the committed state lives only in the task file, which also records
+    // `evidence_result_state` so a downgrade after upload is machine-detectable.
+    const resultJson = { ...planned, snapshot: "pre-terminal", committed_state: null, terminal: false };
     const session = readSessionState(join(stateDir, "sessions", taskId), attempt.sessionId);
     const sessionJsonl = session.path ? readFileSync(session.path, "utf8") : null;
     const gitDiffResult = await command("git", [
@@ -365,7 +374,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     const evidenceResult = await uploadEvidence({
       sessionJsonl,
       gitDiff,
-      resultJson: planned,
+      resultJson,
       logTail,
       uriPrefix: process.env.VINCI_EVIDENCE_URI_PREFIX,
       taskId,
@@ -379,7 +388,12 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     // BLOCKED/FAILED keep their state but record why evidence is missing.
     const evidenceError = evidenceResult && !evidenceResult.success ? evidenceResult.error : null;
     const state = evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
-    lifecycle.transition(state, { ...planned, evidence_error: evidenceError });
+    lifecycle.transition(state, {
+      ...planned,
+      evidence_error: evidenceError,
+      // State the uploaded result.json names as intended; differs from `state` after a downgrade.
+      evidence_result_state: evidenceResult ? intendedState : null,
+    });
     await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult);
   } catch (error) {
     // A terminal state is immutable: if the failure happened after it was committed (e.g. the

@@ -102,7 +102,9 @@ State file `<state-dir>/tasks/<id>.json`:
   "provider": "openrouter",
   "model": "z-ai/glm-5.2",
   "cost_usd": 2.15,
-  "terminal": true
+  "terminal": true,
+  "evidence_error": null,
+  "evidence_result_state": "COMPLETED"
 }
 ```
 
@@ -122,7 +124,10 @@ restart exactly as before.
 
 **Evidence before terminal:** the terminal state is written only *after* the evidence bundle was
 attempted. The daemon computes the intended final state, builds the exact snapshot it is about to
-commit, ships that snapshot as `result.json`, and only then transitions. If evidence is configured
+commit, ships that snapshot as `result.json` (marked `"snapshot": "pre-terminal"`,
+`"committed_state": null`, `"terminal": false` — a bundle never asserts a committed state; the
+task file records `evidence_result_state`, the state the bundle names, so a post-upload downgrade
+is machine-detectable as `evidence_result_state !== state`), and only then transitions. If evidence is configured
 (`VINCI_EVIDENCE_URI_PREFIX` set) and either the S3 upload or the `/v1/evidence` metadata POST
 fails, `COMPLETED` is downgraded to `UNVERIFIED` and `evidence_error` records the failure;
 `BLOCKED`/`FAILED` keep their state but still record `evidence_error`. When evidence is not
@@ -199,7 +204,7 @@ When `VINCI_EVIDENCE_URI_PREFIX` is set (e.g. `s3://bucket/vinci/evidence/`):
 3. **For ledger refs (job_/exp_/bk_ prefix)**: POST evidence metadata to `{busUrl}/v1/evidence` with body `{job_ref, sha256, uri, kind: "bundle", bytes, produced_at}` using the worker's Bearer token
 4. **For non-ledger refs**: Skip the evidence bus POST (the server would reject it with 422); caller can include uri+sha256 in the final message if desired
 5. **Terminal write**: an upload failure or a non-2xx metadata POST downgrades `COMPLETED` → `UNVERIFIED` and sets `evidence_error`; `BLOCKED`/`FAILED` keep their state and record `evidence_error` (see Lifecycle)
-6. **Final bus post**: Carries `evidence_uri=...` and `evidence_sha256=...` whenever the bundle reached S3, plus `evidence_error=...` whenever evidence was attempted and did not fully land; a downgraded task posts `status`, never a ledger `finding`
+6. **Final bus post**: Carries `evidence_uri=...` and `evidence_sha256=...` only when `aws s3 cp` succeeded (`uploaded: true`; a failed upload never advertises its intended uri), plus `evidence_error=...` whenever evidence was attempted and did not fully land; a downgraded task posts `status`, never a ledger `finding`
 
 **Data model:**
 - Evidence bundle contains: session.jsonl (full session transcript), git.diff (origin/main...HEAD), result.json (lifecycle snapshot), runner.log (last 200 lines of daemon stderr)

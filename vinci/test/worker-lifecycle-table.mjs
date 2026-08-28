@@ -159,7 +159,14 @@ test("a RUNNING record reloaded from disk is non-terminal and resumes into a new
     assert.equal(reloaded.snapshot().state, "PENDING");
     reloaded.transition("RUNNING");
     reloaded.transition("COMPLETED");
-    assert.equal(new TaskLifecycle(dir, "resume").isTerminal(), true);
+    const done = new TaskLifecycle(dir, "resume");
+    assert.equal(done.isTerminal(), true);
+    assert.throws(
+      () => done.startAttempt({ id: "resume", envelope: ENVELOPE }, "test"),
+      { message: "cannot start an attempt on terminal state COMPLETED" },
+      "startAttempt guards terminal records itself",
+    );
+    assert.equal(done.snapshot().attempt, 2, "a refused attempt must not bump the counter");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

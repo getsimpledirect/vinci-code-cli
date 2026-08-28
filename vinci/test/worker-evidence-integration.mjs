@@ -163,6 +163,9 @@ await testRun('S3 upload failure with evidence configured downgrades COMPLETED t
     assert.match(final.body, /^state=UNVERIFIED /);
     assert.match(final.body, / evidence_error=S3 upload failed/);
     assert.doesNotMatch(final.body, /state=COMPLETED/);
+    assert.doesNotMatch(final.body, /evidence_uri=/, 'a bundle that never landed must not be advertised');
+    assert.doesNotMatch(final.body, /evidence_sha256=/, 'a bundle that never landed must not be advertised');
+    assert.equal(onDisk.evidence_result_state, 'COMPLETED', 'the intended state is recorded next to the committed one');
   } finally {
     await fixture.cleanup();
   }
@@ -185,6 +188,14 @@ await testRun('metadata POST failure (upload ok) downgrades COMPLETED to UNVERIF
     const onDisk = taskFile(fixture, '5');
     assert.equal(onDisk.state, 'UNVERIFIED');
     assert.equal(onDisk.evidence_error, 'Bus POST failed: 500');
+    assert.equal(onDisk.evidence_result_state, 'COMPLETED', 'disagreement with the bundle is explicit on disk');
+
+    // The bundle that DID land must not claim a committed COMPLETED the record does not hold.
+    const uploaded = uploadedResultJson(fixture);
+    assert.equal(uploaded.snapshot, 'pre-terminal');
+    assert.equal(uploaded.committed_state, null);
+    assert.equal(uploaded.terminal, false, 'a pre-terminal bundle never asserts terminal');
+    assert.equal(uploaded.state, 'COMPLETED', 'the intended state is still named, as the disk record says');
 
     const final = fixture.getPostedMessages().at(-1);
     assert.equal(final.kind, 'status');
@@ -232,6 +243,7 @@ await testRun('evidence not configured: COMPLETED is unchanged and no bundle is 
     const onDisk = taskFile(fixture, '5');
     assert.equal(onDisk.state, 'COMPLETED');
     assert.equal(onDisk.evidence_error, null);
+    assert.equal(onDisk.evidence_result_state, null, 'no evidence attempted, nothing to compare');
     assert.throws(() => readFileSync(join(fixture.tempDir, 'aws-calls.txt')), { code: 'ENOENT' }, 'aws must not be invoked');
     const final = fixture.getPostedMessages().at(-1);
     assert.equal(final.kind, 'finding');
@@ -255,8 +267,11 @@ await testRun('the uploaded result.json carries the final state, not PENDING/RUN
     const uploaded = uploadedResultJson(fixture);
     const onDisk = taskFile(fixture, '5');
     assert.equal(onDisk.state, 'COMPLETED');
-    assert.equal(uploaded.state, 'COMPLETED', 'result.json must carry the terminal state');
-    assert.equal(uploaded.terminal, true);
+    assert.equal(uploaded.state, 'COMPLETED', 'result.json must carry the final state');
+    assert.equal(uploaded.snapshot, 'pre-terminal');
+    assert.equal(uploaded.committed_state, null);
+    assert.equal(uploaded.terminal, false, 'the bundle is built before the terminal write');
+    assert.equal(onDisk.evidence_result_state, 'COMPLETED');
     assert.equal(uploaded.pr, onDisk.pr);
     assert.equal(uploaded.head, onDisk.head);
     assert.equal(uploaded.finished_at, onDisk.finished_at, 'the uploaded snapshot is the one committed');

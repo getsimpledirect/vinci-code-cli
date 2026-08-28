@@ -149,6 +149,7 @@ export class TaskLifecycle {
         terminal: false,
         lease: null,
         evidence_error: null,
+        evidence_result_state: null,
       };
     }
   }
@@ -164,6 +165,7 @@ export class TaskLifecycle {
   }
 
   startAttempt(task, vinciVersion) {
+    if (this.isTerminal()) throw new Error(`cannot start an attempt on terminal state ${this.state.state}`);
     const firstAttempt = !(Number.isInteger(this.state.attempt) && this.state.attempt > 0);
     const sessionId = typeof this.state.session_id === "string" && this.state.session_id ? this.state.session_id : task.id;
     this.state = {
@@ -187,6 +189,7 @@ export class TaskLifecycle {
       terminal: false,
       lease: null,
       evidence_error: null,
+      evidence_result_state: null,
     };
     this.save();
     return { attempt: this.state.attempt, firstAttempt, sessionId };
