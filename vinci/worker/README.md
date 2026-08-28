@@ -287,15 +287,16 @@ What is recorded, and where:
   probed at daemon start (the `online` post's value) AND immediately before every spawn —
   after the Governor lease and the clone — and that pre-spawn value is what the task record
   carries. On any failure it is `{ "error": "<why>" }` and the daemon still starts.
-- Post-0.0.51 rule: **a task never runs under a self-updating launcher.** `runVinci` spawns
+- Post-incident rule (the release that could not launch): **a task never runs under a self-updating launcher.** `runVinci` spawns
   with `VINCI_UPDATE_DISABLED=1`, so nothing can swap the payload between the pre-spawn probe
   and the run — the recorded `vinci_binary` is the executed binary by construction. Updating
   the launcher on a worker box is an operator action (`vinci update`, as the deploy recipe
   already does), never something a task triggers.
 - `vinci_version` is kept for compatibility and is the DAEMON CHECKOUT's `identity.json`
   version (identical to `worker_build.version`). It is NOT the version of the binary that ran
-  the task — the 0.0.51 incident was a task record saying `vinci_version: "0.0.51"` on a box
-  whose launcher was verified at 0.0.52. Read `vinci_binary` for that.
+  the task — the incident that motivated this was a task record naming the daemon checkout's
+  version on a box whose launcher had already been updated to the next release. Read
+  `vinci_binary` for that.
 - All of them are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:
   `worker_build` is stored as `{ version, commit, dirty }` (`source` is omitted) and
   `server_build` as the payload verbatim (or `{ error }`), `vinci_binary` as `{ version, path }`
