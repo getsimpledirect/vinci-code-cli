@@ -1,0 +1,98 @@
+{
+  "issuedAt": "2026-08-25T09:30:00.000Z",
+  "expiresAt": "2026-09-01T09:30:00.000Z",
+  "id": "wo-vec-2",
+  "schemaVersion": 3,
+  "contractVersion": 2,
+  "supersedes": {
+    "amendmentId": "am-vec-2.1",
+    "contractVersion": 1
+  },
+  "request": "Migrate the billing webhook handler to the new Stripe API version.",
+  "scope": "src/billing/webhooks only. Includes the production deploy of that service; excludes any change to plan pricing.",
+  "acceptanceCriteria": [
+    {
+      "id": "c.replay",
+      "statement": "Every event in the 30-day replay set is handled identically before and after.",
+      "verifiedBy": "Differential replay harness, exit 0."
+    },
+    {
+      "id": "c.deploy",
+      "statement": "The service is deployed and healthy for 15 minutes.",
+      "verifiedBy": "Deploy pipeline health gate."
+    }
+  ],
+  "grantedAuthority": [
+    "edit files under src/billing/webhooks",
+    "run the replay harness",
+    "trigger the staging and production deploy pipelines",
+    "tool:bash",
+    "repo:github.com/getsimpledirect/vinci-chat",
+    "branch:feat/vector-2"
+  ],
+  "attentionBudget": {
+    "interruptions": 5,
+    "decisions": 3,
+    "onExhaustion": "escalate"
+  },
+  "requestedBy": {
+    "kind": "policy",
+    "policyId": "billing-upgrade-2026Q3",
+    "policyVersion": 4
+  },
+  "owner": {
+    "kind": "user",
+    "userId": "owner-billing"
+  },
+  "riskClassification": {
+    "level": "high",
+    "consequentialClasses": [
+      "deployment",
+      "billing_modification"
+    ],
+    "rationale": "Touches the path that records payments; a regression is a financial event."
+  },
+  "verifier": {
+    "kind": "independent",
+    "verifierId": "verifier-replay-1",
+    "independence": "separate-system"
+  },
+  "rollbackConditions": [
+    {
+      "trigger": "5xx rate above 1% for 2 minutes after deploy",
+      "action": "revert_to_checkpoint",
+      "checkpointRequired": true
+    },
+    {
+      "trigger": "replay harness reports any divergence",
+      "action": "abort",
+      "checkpointRequired": false
+    }
+  ],
+  "escalationRules": [
+    {
+      "when": "verifier_unavailable",
+      "to": {
+        "kind": "user",
+        "userId": "owner-billing"
+      },
+      "within": 600
+    },
+    {
+      "when": "policy_undetermined",
+      "to": {
+        "kind": "user",
+        "userId": "owner-billing"
+      },
+      "within": 600
+    },
+    {
+      "when": "budget_exhausted",
+      "to": {
+        "kind": "user",
+        "userId": "cfo-1"
+      },
+      "within": 3600
+    }
+  ]
+}

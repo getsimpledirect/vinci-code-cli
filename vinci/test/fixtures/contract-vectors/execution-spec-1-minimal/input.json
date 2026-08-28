@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "workOrderId": "wo-vec-1",
+  "workOrderDigest": "8ba697a58de4eae4ae5405c74659424ac878f5107700cbd0b0001638bca379e2",
+  "repository": {
+    "host": "github.com",
+    "owner": "getsimpledirect",
+    "name": "vinci-contracts"
+  },
+  "baseRef": "main",
+  "baseCommit": "60bd211000000000000000000000000000000000",
+  "targetBranch": "feat/vector-1",
+  "modelClass": "forte",
+  "resourceBounds": {
+    "budgetMicrousd": 12500000,
+    "maxRuntimeS": 3600,
+    "deadline": "2026-08-23T14:00:00.000Z"
+  },
+  "tools": [
+    "read",
+    "edit",
+    "bash"
+  ],
+  "inputArtifacts": [
+    {
+      "id": "design-note",
+      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "requiredCapabilities": [
+    "structuredEvidence",
+    "safeResume"
+  ],
+  "output": "branch",
+  "evidence": {
+    "required": true
+  },
+  "promotion": "pull_request",
+  "issuedAt": "2026-08-23T12:05:00.000Z"
+}
