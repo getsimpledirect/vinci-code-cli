@@ -135,30 +135,66 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
     // git itself is the authority on ref-name legality; ask it rather than trusting our regex alone.
     const legal = await command("git", ["check-ref-format", "--branch", branch], { allowFailure: true });
     if (legal.status !== 0) throw new Error(`envelope branch ${branch} is not a valid git branch name`);
-    // The envelope pinned the branch (e.g. continuing a held PR). It must exist on origin NOW —
-    // ls-remote asks origin live; a show-ref on refs/remotes/* would trust stale local copies
-    // of branches deleted upstream. Silent fallback would strand work next to its target.
+    // The envelope pinned the branch (e.g. continuing a held PR). Three cases, three different
+    // reasons — the ledger and the operator attribution follow the reason (issue #19):
+    //   (a) absent on origin       ⇒ "not found on origin" (BLOCKED before spawn, cost 0), regardless
+    //       of any stale local branch of that name, which is renamed aside and named, never deleted;
+    //   (b) local is an ancestor    ⇒ fast-forward to the remote tip;
+    //   (c) local has commits not on the remote tip ⇒ refuse (divergence), naming both SHAs.
+    // Existence is asked of origin LIVE (ls-remote): a show-ref on refs/remotes/* would trust stale
+    // local copies of branches deleted upstream. Silent fallback would strand work next to its target.
     const remote = await command(
       "git",
       ["-C", repoDir, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${branch}`],
       { allowFailure: true },
     );
-    if (remote.status !== 0) throw new Error(`envelope branch ${branch} not found on origin`);
-    const remoteTip = remote.stdout.split("\n")[0].split(/\s/)[0];
-    if (!/^[0-9a-f]{40}$/.test(remoteTip)) throw new Error(`unexpected ls-remote output for ${branch}`);
     const local = await command(
       "git",
       ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
       { allowFailure: true },
     );
-    if (local.status === 0) {
+    const localSha = local.status === 0 ? local.stdout : null;
+    if (remote.status !== 0) {
+      // ls-remote --exit-code: 2 = ref not found; anything else is origin unreachable, a different fact.
+      if (remote.status !== 2) throw new Error(`git ls-remote origin failed for ${branch}: ${remote.stderr || remote.status}`);
+      let aside = "";
+      if (localSha) {
+        // Case (a) with a stale local branch (an earlier attempt's work): preserve it under a name
+        // the record can cite, so the next attempt of this task does not trip over it.
+        const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+        const asideName = `stale/${branch}-${stamp}`;
+        await command("git", ["-C", repoDir, "branch", "-m", branch, asideName]);
+        aside = ` (stale local branch ${branch} at ${localSha} renamed aside to ${asideName})`;
+      }
+      throw new Error(`envelope branch ${branch} not found on origin${aside}`);
+    }
+    // Materialize the branch explicitly, by full refspec, BEFORE resolving its tip. The general
+    // `fetch origin` above is only as wide as remote.origin.fetch — a single-branch/shallow clone
+    // (`+refs/heads/main:refs/remotes/origin/main`) fetches nothing else, and ls-remote's SHA then
+    // names an object the clone does not have: merge-base fails with "Not a valid commit name" and
+    // was misreported as divergence (soak cohort 2, 2026-08-28, both boxes).
+    await command("git", ["-C", repoDir, "fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    const fetched = await command(
+      "git",
+      ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
+      { allowFailure: true },
+    );
+    if (fetched.status !== 0 || !/^[0-9a-f]{40}$/.test(fetched.stdout)) {
+      throw new Error(`envelope branch ${branch} exists on origin but fetch did not materialize origin/${branch} locally`);
+    }
+    const remoteTip = fetched.stdout;
+    if (localSha) {
       // Never reset away local-only commits (a crashed prior attempt's work): -B is destructive.
       const anc = await command(
         "git",
-        ["-C", repoDir, "merge-base", "--is-ancestor", branch, remoteTip],
+        ["-C", repoDir, "merge-base", "--is-ancestor", `refs/heads/${branch}`, remoteTip],
         { allowFailure: true },
       );
-      if (anc.status !== 0) throw new Error(`local branch ${branch} has commits not on origin; refusing to reset (divergence)`);
+      if (anc.status === 1) {
+        throw new Error(`local branch ${branch} at ${localSha} has commits not on origin/${branch} at ${remoteTip}; refusing to reset (divergence)`);
+      }
+      if (anc.status !== 0) throw new Error(`ancestry check failed for ${branch} (${localSha} vs origin/${branch} ${remoteTip}): ${anc.stderr || anc.status}`);
+      // Case (b): local is an ancestor (or equal) ⇒ -B is a fast-forward to the remote tip.
     }
     await command("git", ["-C", repoDir, "checkout", "-B", branch, remoteTip]);
     return { branch, repoDir };

@@ -90,6 +90,7 @@ budget_usd: 5.0                    (default)
 max_runtime_s: 14400               (default; 4 hours)
 deadline: 2026-08-26T12:00:00Z    (optional ISO-8601 UTC)
 ref: ledger_id                     (optional; for finding refs)
+branch: worker/msg_abc123          (optional; continue an EXISTING branch on origin — see Branch continuation)
 
 <blank line>
 
@@ -97,6 +98,30 @@ ref: ledger_id                     (optional; for finding refs)
 ```
 
 Unknown headers → blocker posted, task not run.
+
+### Branch continuation (`branch:` header)
+
+Without `branch:` the daemon works on `worker/<taskId>` off `origin/main`. With `branch:` the
+envelope pins an existing branch (e.g. the head of a held PR). `prepareRepository` fetches that
+branch **explicitly by refspec** — `git fetch origin +refs/heads/<branch>:refs/remotes/origin/<branch>` —
+and resolves the tip from the local `origin/<branch>` after the fetch. A plain `git fetch origin`
+is only as wide as `remote.origin.fetch`; a repo cache cloned with `--single-branch`/`--depth`
+never receives other branches from it, and the tip `ls-remote` reports is then an object the clone
+does not have (soak cohort 2, 2026-08-28: `--branch worker/msg_b5e63707` on both boxes). Exactly
+three outcomes, each with its own reason so the ledger and the operator attribution follow it:
+
+| State on origin / locally | Result | Reason text |
+|---|---|---|
+| (a) branch absent on origin (asked live via `ls-remote`, never a cached `refs/remotes/*`) | **BLOCKED before spawn**, cost 0, no session — regardless of any local branch of that name | `envelope branch <branch> not found on origin`; if a stale local branch existed it is renamed aside to `stale/<branch>-<UTC stamp>` (never deleted) and the reason appends `(stale local branch <branch> at <sha> renamed aside to stale/<branch>-<stamp>)` |
+| (b) branch on origin; local branch absent, or an ancestor of the remote tip | checkout at the remote tip (a fast-forward when the local branch existed) | — |
+| (c) branch on origin; local branch has commits not on the remote tip | **refused**, local commits untouched | `local branch <branch> at <localSha> has commits not on origin/<branch> at <remoteTip>; refusing to reset (divergence)` |
+
+Origin unreachable is reported as `git ls-remote origin failed for <branch>: …`, never as
+not-found or divergence. A branch that exists on origin but still cannot be resolved locally after
+the explicit fetch is `envelope branch <branch> exists on origin but fetch did not materialize
+origin/<branch> locally`. Proof on a box: `git -C <state-dir>/repos/<name> config --get-all
+remote.origin.fetch` — anything narrower than `+refs/heads/*:refs/remotes/origin/*` is the
+single-branch cache shape that made the plain fetch insufficient.
 
 ## Lifecycle
 
