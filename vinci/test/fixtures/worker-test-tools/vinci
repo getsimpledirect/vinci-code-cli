@@ -4,6 +4,36 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path';
 
 const recordFile = process.env.FAKE_VINCI_RECORD || '/tmp/fake-vinci-invocations.txt';
+
+// `vinci --version` (#18): answered BEFORE the invocation is recorded so getVinciCalls() keeps
+// counting only real runs. The version comes from FAKE_VINCI_VERSION_FILE (read on every call, so a
+// test can change it between tasks) or FAKE_VINCI_VERSION, default 0.0.0-fake. Each probe is
+// appended to FAKE_VINCI_VERSION_RECORD (when set) with the env the daemon passed, so a test can
+// prove VINCI_UPDATE_DISABLED=1 reached the launcher. FAKE_VINCI_VERSION_EXIT=<n> fails the probe;
+// FAKE_VINCI_VERSION_SLEEP=<ms> hangs it.
+if (process.argv[2] === '--version') {
+  if (process.env.FAKE_VINCI_VERSION_RECORD) {
+    appendFileSync(
+      process.env.FAKE_VINCI_VERSION_RECORD,
+      JSON.stringify({ argv: process.argv.slice(2), updateDisabled: process.env.VINCI_UPDATE_DISABLED ?? null }) + '\n',
+    );
+  }
+  const sleep = parseInt(process.env.FAKE_VINCI_VERSION_SLEEP || '0', 10);
+  if (sleep > 0) await new Promise((resolveSleep) => setTimeout(resolveSleep, sleep));
+  const exit = parseInt(process.env.FAKE_VINCI_VERSION_EXIT || '0', 10);
+  if (exit !== 0) {
+    process.stderr.write('fake vinci: version probe failed\n');
+    process.exit(exit);
+  }
+  let version = process.env.FAKE_VINCI_VERSION || '0.0.0-fake';
+  if (process.env.FAKE_VINCI_VERSION_FILE) {
+    try {
+      version = readFileSync(process.env.FAKE_VINCI_VERSION_FILE, 'utf8').trim() || version;
+    } catch {}
+  }
+  process.stdout.write(`${version}\n`);
+  process.exit(0);
+}
 const sessionDir = process.argv.indexOf('--session-dir') >= 0 ? process.argv[process.argv.indexOf('--session-dir') + 1] : undefined;
 const sessionId = process.argv.indexOf('--session-id') >= 0 ? process.argv[process.argv.indexOf('--session-id') + 1] : undefined;
 
@@ -68,6 +98,11 @@ if (sessionDir && sessionId) {
     } else {
       appendFileSync(sessionFile, JSON.stringify(outcomeEntry(9.99)) + '\n');
     }
+  }
+
+  // #18: simulate the launcher self-updating DURING a run — the next `--version` answers differently.
+  if (process.env.FAKE_VINCI_SELF_UPDATE_TO && process.env.FAKE_VINCI_VERSION_FILE) {
+    writeFileSync(process.env.FAKE_VINCI_VERSION_FILE, `${process.env.FAKE_VINCI_SELF_UPDATE_TO}\n`);
   }
 
   if (process.env.FAKE_VINCI_WORKTREE_BLOCKER === '1') writeFileSync(resolve('BLOCKER.md'), 'working tree only\n');

@@ -1,22 +1,12 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 
+import { resolveBin } from "./build.mjs";
 import { readSessionState } from "./session-read.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const PR_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
-
-function resolveBin(name) {
-  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
-    const candidate = resolve(directory || ".", name);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {}
-  }
-  throw new Error(`Executable not found on PATH: ${name}`);
-}
 
 function command(commandName, args, options = {}) {
   return new Promise((resolveCommand, rejectCommand) => {
@@ -318,4 +308,4 @@ export function finalState({ exitCode, limitTripped, outcome, blocker, pr, harne
   return "UNVERIFIED";
 }
 
-export { command };
+export { command, resolveBin };

@@ -17,14 +17,38 @@ import { assertTaskId, parseEnvelope, TaskLifecycle } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
 import { readSessionState } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
-import { buildIdentity, fetchServerBuild, formatServerBuild, formatWorkerBuild } from "./build.mjs";
+import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
 
 // W0.5: the exact build this daemon runs from, computed once at startup. `version` keeps the
-// identity.json string that task records always carried as `vinci_version`.
+// identity.json string that task records always carried as `vinci_version` — it is the DAEMON
+// CHECKOUT's version, not the version of the `vinci` binary that runs tasks (see vinciBinary).
 const workerBuild = buildIdentity();
 const version = workerBuild.version;
 // Filled at startup from GET <server>/v1/version (or `{ error }`); stamped on every task.
 let serverBuild = { error: "not fetched" };
+// #18: `<PATH vinci> --version`, i.e. the launcher payload that actually runs tasks. Computed at
+// startup AND re-checked before every task (the launcher self-updates between tasks), so the
+// value stamped on a task record is the binary that ran THAT task. `{ version, path }` or
+// `{ error }`; the last observed value also drives the once-per-change drift post.
+let vinciBinary = { error: "not checked" };
+
+// Re-read the binary version before a task; when it differs from the last observed value, post the
+// drift ONCE per change (`worker <id> vinci binary changed <old> -> <new>`) — the signal the 0.0.51
+// incident lacked. The refreshed value is what startAttempt stamps on the task record.
+async function recheckVinciBinary(bus, workerId) {
+  const previous = formatVinciBinary(vinciBinary);
+  const current = vinciBinaryVersion();
+  vinciBinary = current;
+  const now = formatVinciBinary(current);
+  if (now !== previous) {
+    await bus.post(
+      "status",
+      `worker ${workerId} vinci binary changed ${previous} -> ${now}`,
+      `vinci_binary=${now} previous=${previous} path=${current.path ?? "unknown"} worker_build=${formatWorkerBuild(workerBuild)}`,
+    );
+  }
+  return current;
+}
 
 function usage() {
   return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor]";
@@ -231,7 +255,7 @@ function recentLogTail(limit) {
 // deadline, governor refusal/unavailability, invalid task id) — goes through this one formatter
 // so no terminal record on the bus can omit which build produced it.
 function terminalPostBody(details) {
-  return `${details} worker_build=${formatWorkerBuild(workerBuild)}`;
+  return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
 
 async function postFinal(bus, message, envelope, state, evidence) {
@@ -287,7 +311,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
   }
 }
 
-async function processHandoff(bus, stateDir, message, governorUrl) {
+async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   const taskId = message.message_id;
   try {
     assertTaskId(taskId);
@@ -300,6 +324,11 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
   if (lifecycle.isTerminal()) return true;
   if (!acquireTaskClaim(stateDir, taskId)) return false;
 
+  // #18: ask the binary what it is BEFORE this task's record is created and before anything is
+  // spawned, so the record, every terminal post and the drift signal all name the binary that
+  // will run this task — not the one that was on PATH when the daemon started.
+  await recheckVinciBinary(bus, workerId);
+
   let envelope;
   try {
     envelope = parseEnvelope(message.body);
@@ -307,7 +336,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     lifecycle.startAttempt(
       { id: taskId, envelope: { evidence: null, provider: null, model: null } },
       version,
-      { workerBuild, serverBuild },
+      { workerBuild, serverBuild, vinciBinary },
     );
     const state = /^repo must be/.test(error.message) ? "FAILED" : "BLOCKED";
     lifecycle.transition(state, {
@@ -320,7 +349,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     return true;
   }
 
-  const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild });
+  const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild, vinciBinary });
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
     await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
@@ -469,16 +498,18 @@ async function main() {
     // before the first poll. A failed /v1/version fetch is recorded, never fatal: the bus
     // token check and the first poll already gate startup.
     serverBuild = await fetchServerBuild(options.server);
+    // #18: and the version of the `vinci` binary this daemon will spawn (never fatal either).
+    vinciBinary = vinciBinaryVersion();
     await bus.post(
       "status",
       `worker ${options.id} online`,
-      `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)}`,
+      `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`,
     );
     do {
       let cursor = loadCursor(options.stateDir, options.id);
       const messages = await bus.poll(options.id, cursor);
       for (const message of messages) {
-        if (!(await processHandoff(bus, options.stateDir, message, options.governor))) continue;
+        if (!(await processHandoff(bus, options.stateDir, message, options.governor, options.id))) continue;
         cursor = advanceCursor(cursor, message);
         saveCursor(options.stateDir, options.id, cursor);
       }

@@ -118,6 +118,9 @@ State file `<state-dir>/tasks/<id>.json`:
   "limit_tripped": null,
   "harness_stop": null,
   "vinci_version": "0.42.0",
+  "worker_build": { "version": "0.42.0", "commit": "<40-hex>", "dirty": false },
+  "server_build": { "git_sha": "<40-hex>", "dirty": false },
+  "vinci_binary": { "version": "0.42.1", "path": "/home/worker/.local/bin/vinci" },
   "provider": "openrouter",
   "model": "z-ai/glm-5.2",
   "cost_usd": 2.15,
@@ -208,24 +211,43 @@ What is recorded, and where:
 - `server_build` — the verbatim payload of `GET <server>/v1/version` (unauthenticated; 3 s
   timeout; vinci-gpu-control reports `git_sha`, `dirty`, `server_code_sha256`, …), fetched once
   at daemon start. On any failure it is `{ "error": "<why>" }` and the daemon still starts.
-- Both are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:
-  `worker_build` is stored as `{ version, commit, dirty }` (`source` is omitted) and
-  `server_build` as the payload verbatim (or `{ error }`). The task record is what ships as the
-  evidence bundle's `result.json`, so the same two fields appear there.
+- `vinci_binary` (#18) — `{ version, path }` from running `<vinci on PATH> --version`
+  (`vinciBinaryVersion()` in `build.mjs`; the binary is resolved exactly the way `runVinci`
+  resolves the one it spawns; 10 s timeout; run with `VINCI_UPDATE_DISABLED=1` so asking the
+  version can never trigger the launcher's self-update). This is the launcher payload that
+  actually runs tasks and it is legitimately different from `worker_build`: the daemon runs from
+  a checkout, the launcher self-updates on its own. It is computed at daemon start AND
+  re-checked before every task, because the launcher can update between two tasks. On any
+  failure it is `{ "error": "<why>" }` and the daemon still starts.
+- `vinci_version` is kept for compatibility and is the DAEMON CHECKOUT's `identity.json`
+  version (identical to `worker_build.version`). It is NOT the version of the binary that ran
+  the task — the 0.0.51 incident was a task record saying `vinci_version: "0.0.51"` on a box
+  whose launcher was verified at 0.0.52. Read `vinci_binary` for that.
+- All of them are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:
+  `worker_build` is stored as `{ version, commit, dirty }` (`source` is omitted),
+  `server_build` as the payload verbatim (or `{ error }`), `vinci_binary` as `{ version, path }`
+  (or `{ error }`). The task record is what ships as the evidence bundle's `result.json`, so the
+  same fields appear there.
 - Every terminal bus post — the final post from a run AND the early blockers (envelope error,
-  past deadline, governor refusal/unavailability) — carries `worker_build=…` via one shared
-  formatter in `worker.mjs` (`terminalPostBody`).
+  past deadline, governor refusal/unavailability) — carries `worker_build=…` and
+  `vinci_binary=…` via one shared formatter in `worker.mjs` (`terminalPostBody`).
 - The bus sees them twice: the daemon's single `worker <id> online` status post at start
   (`worker_build=<commit or version>[-dirty] worker_version=<version>
-  server_build=<server commit | unknown: <error>>`, posted once per start, before the first
-  poll, in `--once` mode too; a daemon that refuses to start — lock held, exit 75, or missing
-  Governor, exit 78 — never announces itself and never fetches `/v1/version`), and
-  `worker_build=<commit or version>[-dirty]` on every terminal task post.
+  server_build=<server commit | unknown: <error>> vinci_binary=<version | unknown: <error>>`,
+  posted once per start, before the first poll, in `--once` mode too; a daemon that refuses to
+  start — lock held, exit 75, or missing Governor, exit 78 — never announces itself and never
+  fetches `/v1/version`), and `worker_build=<commit or version>[-dirty] vinci_binary=<…>` on
+  every terminal task post.
+- Drift signal: when the per-task re-check finds a different binary version than the last one
+  observed (the startup value, or the previous task's), the daemon posts ONE `status`
+  `worker <id> vinci binary changed <old> -> <new>` per change, before that task's record is
+  created. A cohort with such a post in it ran on two binaries.
 
 The post-fix soak requires ONE exact build set: both worker boxes must show the same
-`worker_build` (no `-dirty`) and the same `server_build` in their `online` posts before the
-cohort counts. A cohort whose task records carry two different `worker_build` values is two
-cohorts.
+`worker_build` (no `-dirty`), the same `server_build` AND the same `vinci_binary=` in their
+`online` posts before the cohort counts, and no `vinci binary changed` post may appear while it
+runs. A cohort whose task records carry two different `worker_build` or `vinci_binary` values
+is two cohorts.
 
 ## Network Access
 
