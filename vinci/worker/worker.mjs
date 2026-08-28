@@ -249,6 +249,16 @@ async function postFinal(bus, message, envelope, state, evidence) {
   if (state.state === "COMPLETED" && isLedgerRef(envelope.ref)) {
     options.refs = [envelope.ref];
     await bus.post("finding", subject, details, options);
+  } else if (state.state === "BLOCKED" && state.harness_stop) {
+    // An instrument stop: the harness refused the agent's work mid-run. Say so explicitly so the
+    // soak ledger attributes the block to the instrument, not to the model's own narrative.
+    const stop = state.harness_stop;
+    await bus.post(
+      "blocker",
+      subject,
+      `${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`,
+      options,
+    );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
     const reason = state.outcome?.reason ? `${details} reason=${state.outcome.reason}` : details;
     await bus.post("blocker", subject, reason, options);
@@ -350,15 +360,22 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     lifecycle.transition("EVIDENCE_PENDING", { ...run, head, outcome: run.outcome ?? null });
     const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId });
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
+    const harnessStops = run.harness_stops ?? [];
     const state = finalState({
-      envelope: envelopeToUse,
       exitCode: run.exit_code,
       limitTripped: run.limit_tripped,
       outcome: run.outcome,
       blocker: Boolean(published.blocker_reason),
       pr: published.pr,
+      harnessStops,
     });
-    lifecycle.transition(state, { ...published, outcome });
+    // Record the instrument stop on the task whenever it decided the state, so the snapshot (and the
+    // evidence bundle's result.json) carry the machine-observed reason next to the model's narrative.
+    const harnessStop =
+      state === "BLOCKED" && harnessStops.length > 0
+        ? { count: harnessStops.length, reason: harnessStops[0].reason }
+        : null;
+    lifecycle.transition(state, { ...published, outcome, harness_stop: harnessStop });
 
     // Stage 2: upload evidence bundle before the final bus post so uri/sha256 (or the
     // failure) can ride in the post body. No-op when VINCI_EVIDENCE_URI_PREFIX is unset.
