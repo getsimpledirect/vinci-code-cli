@@ -18,9 +18,11 @@ const bin = join(scratch, "bin"); mkdirSync(bin);
 writeFileSync(join(bin, "git"), `#!/bin/bash\nif [ "$1" = "-C" ] && [ "$3" = "push" ]; then exit 0; fi\nexec /usr/bin/git "$@"\n`);
 writeFileSync(join(bin, "gh"), `#!/bin/bash\nif [ "$1 $2" = "pr create" ]; then echo "a pull request for branch already exists" >&2; exit 1; fi\nif [ "$1 $2" = "pr list" ]; then echo '[{"url":"https://github.com/test/repo/pull/777"}]'; exit 0; fi\nexit 1\n`);
 chmodSync(join(bin, "git"), 0o755); chmodSync(join(bin, "gh"), 0o755);
-process.env.PATH = bin + ":" + process.env.PATH;
+const OLD_PATH = process.env.PATH;
+process.env.PATH = bin + ":" + OLD_PATH;
 
 const result = await publish({ envelope: { evidence: "pr" }, repoDir, branch: "worker/msg_x", taskId: "msg_x" });
 assert.equal(result.publish, "pushed");
 assert.equal(result.pr, "https://github.com/test/repo/pull/777", "an existing PR must be discovered and count as evidence");
+process.env.PATH = OLD_PATH;
 console.log("PASS worker-publish-existing-pr");
