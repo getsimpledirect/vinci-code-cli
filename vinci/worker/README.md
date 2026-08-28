@@ -90,6 +90,7 @@ budget_usd: 5.0                    (default)
 max_runtime_s: 14400               (default; 4 hours)
 deadline: 2026-08-26T12:00:00Z    (optional ISO-8601 UTC)
 ref: ledger_id                     (optional; for finding refs)
+branch: worker/msg_abc123          (optional; continue an EXISTING branch on origin — see Branch continuation)
 
 <blank line>
 
@@ -97,6 +98,51 @@ ref: ledger_id                     (optional; for finding refs)
 ```
 
 Unknown headers → blocker posted, task not run.
+
+### Branch continuation (`branch:` header)
+
+Without `branch:` the daemon works on `worker/<taskId>` off `origin/main`. With `branch:` the
+envelope pins an existing branch (e.g. the head of a held PR). Order of operations, fixed:
+validate the name → ask origin live (`git ls-remote --exit-code --heads origin refs/heads/<branch>`)
+**before any fetch or clone** → `git fetch origin +refs/heads/<branch>:refs/remotes/origin/<branch>`
+(explicit refspec; the branch path never runs a general `git fetch origin` first) → resolve the tip
+from the local `origin/<branch>` → ancestry check → `checkout -B`. Exactly three outcomes, each with
+its own reason so the ledger and the operator attribution follow it:
+
+| State on origin / locally | Result | Reason text |
+|---|---|---|
+| (a) branch absent on origin (live `ls-remote`, never a cached `refs/remotes/*`) | **BLOCKED before spawn**, cost 0, no session, **no fetch/clone performed** — regardless of any local branch of that name | `envelope branch <branch> not found on origin`; a stale local branch is renamed aside to `stale/<branch>-<UTC stamp>-<6 hex>` (never deleted) and the reason appends `(stale local branch <branch> at <sha> renamed aside to stale/…)` |
+| (b) branch on origin; local branch absent, or an ancestor of the remote tip | checkout at the remote tip (a fast-forward when the local branch existed) | — |
+| (c) branch on origin; local branch has commits not on the remote tip | **refused**, local commits untouched | `local branch <branch> at <localSha> has commits not on origin/<branch> at <remoteTip>; refusing to reset (divergence)` |
+
+**Never-pushed residue on path (c).** Soak cohort 2 rows 11/11b (2026-08-28) were a genuine
+divergence: a Night-1 local `worker/<id>` (2 ahead / 82 behind origin's rebuilt PR head) that had
+never been pushed. When ALL of the following hold, the local branch is renamed aside to
+`stale/<branch>-<stamp>-<hex>` (never deleted) and the attempt is **still refused**, with the reason
+extended by `; never-pushed residue renamed aside to stale/… — retry continues at origin/<branch>`,
+so the next attempt proceeds at the remote tip:
+
+1. the local branch does not track `origin/<branch>` (`branch.<b>.remote`/`.merge` are not
+   `origin`/`refs/heads/<b>` — a pushed branch carries that upstream; the daemon's own default path
+   leaves the upstream at `origin/main`, which is not evidence of a push);
+2. after `git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'` (ALL origin heads by
+   explicit refspec — a `--single-branch` cache would otherwise never see a head outside its
+   refspec and misclassify work pushed there), no origin head contains the local tip
+   (`git for-each-ref --contains=<localSha> refs/remotes/origin` is empty); if the branch has ANY
+   configured upstream whose remote-tracking ref is still unresolvable after that fetch, the
+   attempt is refused without a rename and the reason appends
+   `; upstream <remote>/<merge> of <branch> is not resolvable on origin; not treating it as never-pushed`;
+3. every commit in `<remoteTip>..<localSha>` is unreachable from every origin head
+   (`git rev-list --count <remoteTip>..<localSha> --not --remotes=origin` equals the range count).
+
+A branch that tracks `origin/<branch>`, or whose commits live on any other origin head, is refused
+and left exactly where it is. Any error in these checks ⇒ no rename, plain refusal.
+
+Origin unreachable is reported as `git ls-remote origin failed for <branch>: …`, never as
+not-found or divergence. A branch that exists on origin but cannot be resolved locally after the
+explicit fetch is `envelope branch <branch> exists on origin but fetch did not materialize
+origin/<branch> locally`. The pre-existing `reset --hard`/`clean -fd` quarantine of the shared
+checkout is unchanged here (Wave 1 clean-room item).
 
 ## Lifecycle
 
@@ -203,14 +249,33 @@ here gates startup: identity is a record, not a check.
 What is recorded, and where:
 
 - `worker_build` — computed ONCE at daemon start by `vinci/worker/build.mjs`
-  (`buildIdentity()`): `{ version, commit, dirty, source }`. `version` is `identity.json`'s
-  version (the string task records always carried as `vinci_version`, which is kept);
-  `commit` is `git rev-parse HEAD` of the checkout the daemon runs from (`null` when not a git
-  checkout or git is unavailable, then `source` is `"package"` instead of `"git"`); `dirty`
-  is whether `git status --porcelain --untracked-files=no` is non-empty (`null` when unknown).
-- `server_build` — the verbatim payload of `GET <server>/v1/version` (unauthenticated; 3 s
-  timeout; vinci-gpu-control reports `git_sha`, `dirty`, `server_code_sha256`, …), fetched once
-  at daemon start. On any failure it is `{ "error": "<why>" }` and the daemon still starts.
+  (`buildIdentity()`): `{ version, commit, dirty, source, unresolved }`. `version` is
+  `identity.json`'s version (the string task records always carried as `vinci_version`, which
+  is kept); `commit` is the HEAD sha of the checkout the daemon runs from, read directly from
+  the checkout's files — the `.git` at the package root ONLY (`<root>/vinci/worker/build.mjs`
+  looks at `<root>/.git`; a `.git` further up belongs to some other repository and is treated
+  as absent), `HEAD` (a `gitdir:` pointer file is followed for a linked worktree), then the
+  branch's loose ref, then `packed-refs`, following symbolic refs recursively (at most 8 hops;
+  a cycle, a ref name with `.`/`..`/empty segments, or a ref file that does not really live
+  under the git dir resolves to nothing) — never via `git` exec, so an
+  unprivileged daemon on a root-owned checkout still resolves it (#17: git's "dubious
+  ownership" refusal used to silently degrade the identity to a version string). It is `null`
+  when there is no `.git` entry at the package root (a packaged install: `source: "package"`,
+  `unresolved: false`) OR when a `.git` entry exists there but HEAD could not be resolved —
+  unborn branch, unreadable HEAD, malformed or dangling `gitdir:` pointer, symbolic-ref cycle
+  (`source: "package"`, `unresolved: true`). `dirty` is whether
+  `git -c safe.directory=<checkout root> status --porcelain --untracked-files=no` is non-empty
+  (the exact root, which every git with `safe.directory` honours; the `*` wildcard needs
+  >= 2.35.3); it is best-effort and `null` (unknown) whenever git is missing or refuses —
+  never `false` by default.
+- `server_build` — the verbatim payload of `GET <server>/v1/version` (unauthenticated;
+  vinci-gpu-control reports `git_sha`, `dirty`, `server_code_sha256`, …), fetched once at
+  daemon start with a 2 s timeout per attempt and ONE retry after 1 s on a timeout or network
+  error (a cold first request has timed out and then answered in 43 ms on restart). Anything the
+  server actually answered — non-2xx, a non-JSON or non-object body — is recorded on the first
+  attempt and not retried. Worst case 5 s, so a hung server cannot delay the first
+  poll past 6 s. On any failure it is `{ "error": "<why>", "attempts": <n> }` and the daemon
+  still starts.
 - `vinci_binary` (#18) — `{ version, path }` from running `<vinci on PATH> --version`
   (`vinciBinaryVersion()` in `build.mjs`; the binary is resolved exactly the way `runVinci`
   resolves the one it spawns; 10 s timeout; the answer must be one `x.y.z[-pre]` token or it
@@ -232,7 +297,7 @@ What is recorded, and where:
   the task — the 0.0.51 incident was a task record saying `vinci_version: "0.0.51"` on a box
   whose launcher was verified at 0.0.52. Read `vinci_binary` for that.
 - All of them are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:
-  `worker_build` is stored as `{ version, commit, dirty }` (`source` is omitted),
+  `worker_build` is stored as `{ version, commit, dirty }` (`source` is omitted) and
   `server_build` as the payload verbatim (or `{ error }`), `vinci_binary` as `{ version, path }`
   (or `{ error }`). The task record is what ships as the evidence bundle's `result.json`, so the
   same fields appear there.
@@ -240,12 +305,16 @@ What is recorded, and where:
   past deadline, governor refusal/unavailability) — carries `worker_build=…` and
   `vinci_binary=…` via one shared formatter in `worker.mjs` (`terminalPostBody`).
 - The bus sees them twice: the daemon's single `worker <id> online` status post at start
-  (`worker_build=<commit or version>[-dirty] worker_version=<version>
+  (`worker_build=<build>[-dirty] worker_version=<version>
   server_build=<server commit | unknown: <error>> vinci_binary=<version | unknown: <error>>`,
-  posted once per start, before the first poll, in `--once` mode too; a daemon that refuses to
-  start — lock held, exit 75, or missing Governor, exit 78 — never announces itself and never
-  fetches `/v1/version`), and `worker_build=<commit or version>[-dirty] vinci_binary=<…>` on
-  every terminal task post.
+  posted once per start, before the first
+  poll, in `--once` mode too; a daemon that refuses to start — lock held, exit 75, or missing
+  Governor, exit 78 — never announces itself and never fetches `/v1/version`), and
+  `worker_build=<build>[-dirty] vinci_binary=<…>` on every terminal task post. `<build>` is the 40-hex commit
+  for a resolved checkout, the bare `<version>` only for a packaged install (no `.git`), and
+  the explicit `<version>-UNRESOLVED` for a checkout whose HEAD could not be read — a bare
+  version on a machine that runs from a checkout is a defect, never a fallback, and must not be
+  mistakable for a resolved identity.
 - Drift signal: the last ANNOUNCED binary is persisted in `<state-dir>/vinci-binary.json`.
   Whenever a probe (at start or before a spawn) returns a version different from it, the
   daemon posts ONE `status` `worker <id> vinci binary changed <old> -> <new>` and only then
