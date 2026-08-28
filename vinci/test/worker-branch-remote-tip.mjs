@@ -308,6 +308,66 @@ const seedNarrowCache = (stateDir) => {
   console.log("✓ (5b) production sequence: divergence + residue renamed; retry proceeds; ancestor fast-forwards");
 }
 
+// (5c) Narrow cache + upstream outside the cache refspec. A local branch tracking origin/rescued
+// (a head the --single-branch refspec never fetches) whose commits were pushed there ⇒ refused,
+// NOT renamed — the containment check must fetch ALL origin heads explicitly to see it. The same
+// shape with commits genuinely unpushed ⇒ renamed. An upstream that does not resolve on origin
+// even after that fetch ⇒ fail closed: refused, not renamed, upstream named.
+{
+  const remoteTip = pushHeld("worker/msg_narrow", "narrow.txt");
+  const s = join(scratch, "s5c"); mkdirSync(s);
+  const repoDir = seedNarrowCache(s);
+  await prepareRepository(s, "acme/repo", "msg_t5f", "worker/msg_narrow");
+  const localTip = commitLocal(repoDir, "rescued.txt");
+  git(repoDir, "push", "-q", "origin", "refs/heads/worker/msg_narrow:refs/heads/rescued");
+  git(repoDir, "config", "branch.worker/msg_narrow.remote", "origin");
+  git(repoDir, "config", "branch.worker/msg_narrow.merge", "refs/heads/rescued");
+  assert.equal(gitFails(repoDir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/rescued"), true, "precondition: the upstream head is outside the cache refspec");
+  git(repoDir, "checkout", "-q", "main");
+  await assert.rejects(
+    () => prepareRepository(s, "acme/repo", "msg_t5g", "worker/msg_narrow"),
+    (error) => {
+      assert.match(error.message, new RegExp(`^local branch worker/msg_narrow at ${localTip} has commits not on origin/worker/msg_narrow at ${remoteTip}; refusing to reset \\(divergence\\)$`), error.message);
+      return true;
+    },
+  );
+  assert.equal(git(repoDir, "rev-parse", "refs/heads/worker/msg_narrow"), localTip, "pushed-elsewhere work must stay in place");
+  assert.equal(staleRefs(repoDir), "", "work pushed to a head outside the cache refspec is NOT residue");
+
+  // Same shape (tracks origin/rescued, a head outside the cache refspec), commits genuinely
+  // unpushed: origin/rescued exists (resolvable) but contains none of them ⇒ residue ⇒ renamed.
+  git(repoDir, "branch", "-f", "worker/msg_narrow", remoteTip);
+  git(repoDir, "checkout", "-q", "worker/msg_narrow");
+  const unpushedTip = commitLocal(repoDir, "unpushed.txt");
+  git(repoDir, "checkout", "-q", "main");
+  await assert.rejects(
+    () => prepareRepository(s, "acme/repo", "msg_t5h", "worker/msg_narrow"),
+    (error) => {
+      assert.match(error.message, new RegExp(`^local branch worker/msg_narrow at ${unpushedTip} has commits not on origin/worker/msg_narrow at ${remoteTip}; refusing to reset \\(divergence\\); never-pushed residue renamed aside to ${STALE}`), error.message);
+      return true;
+    },
+  );
+  assert.match(staleRefs(repoDir), new RegExp(`^${STALE} ${unpushedTip}$`), "unpushed residue tracking a resolvable upstream is renamed");
+  const dRetry = await prepareRepository(s, "acme/repo", "msg_t5i", "worker/msg_narrow");
+  assert.equal(git(dRetry.repoDir, "rev-parse", "HEAD"), remoteTip);
+
+  // Upstream configured but unresolvable on origin (head never existed / deleted) ⇒ fail closed.
+  git(repoDir, "checkout", "-q", "main");
+  git(repoDir, "branch", "-f", "worker/msg_narrow", unpushedTip);
+  git(repoDir, "config", "branch.worker/msg_narrow.remote", "origin");
+  git(repoDir, "config", "branch.worker/msg_narrow.merge", "refs/heads/gone");
+  await assert.rejects(
+    () => prepareRepository(s, "acme/repo", "msg_t5j", "worker/msg_narrow"),
+    (error) => {
+      assert.match(error.message, /refusing to reset \(divergence\); upstream origin\/refs\/heads\/gone of worker\/msg_narrow is not resolvable on origin; not treating it as never-pushed$/, error.message);
+      return true;
+    },
+  );
+  assert.equal(git(repoDir, "rev-parse", "refs/heads/worker/msg_narrow"), unpushedTip, "unresolvable upstream ⇒ left in place");
+  assert.equal(git(repoDir, "for-each-ref", "refs/heads/stale/").split("\n").length, 1, "no second stale ref");
+  console.log("✓ (5c) narrow cache: pushed-elsewhere refused/not renamed; unpushed renamed; unresolvable upstream fails closed");
+}
+
 // (6) Plain clone, branch created after the last fetch ⇒ also picked up (no regression).
 {
   const s = join(scratch, "s6"); mkdirSync(s);

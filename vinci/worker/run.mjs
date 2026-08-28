@@ -107,29 +107,43 @@ export async function renameBranchAside(repoDir, branch, { stamp, nonce } = {}) 
   throw new Error(`could not find a free stale/ name for ${branch}`);
 }
 
-// Never-pushed residue predicate (divergence path). True only when ALL hold: (ii) the local branch
-// does not track origin/<branch> (a branch that was pushed carries that upstream from
-// `push --set-upstream`; the daemon's own default path `checkout -b worker/<id> origin/main`
-// leaves the upstream at origin/MAIN, which is not evidence of a push), (iii) no live origin head
-// contains its tip and no commit in <remoteTip>..<localSha> is reachable from any origin head.
-// Any check error ⇒ false (refuse as before, rename nothing). Remote-tracking refs are refreshed
-// (pruned) first so "origin head" means origin NOW, not a stale local copy.
-async function isNeverPushedResidue(repoDir, branch, localSha, remoteTip) {
+// Never-pushed residue classification (divergence path). Returns { residue: true } only when ALL
+// hold: (ii) the local branch does not track origin/<branch> (a branch that was pushed carries that
+// upstream from `push --set-upstream`; the daemon's own default path `checkout -b worker/<id>
+// origin/main` leaves the upstream at origin/MAIN, which is not evidence of a push), (iii) no live
+// origin head contains its tip and no commit in <remoteTip>..<localSha> is reachable from any
+// origin head. ALL origin heads are fetched by explicit full refspec first: a narrow-refspec cache
+// (--single-branch) would otherwise leave a head outside its refspec invisible and misclassify
+// work pushed there as never-pushed. If the branch has ANY configured upstream whose
+// remote-tracking ref is still unresolvable after that fetch, fail closed: { residue: false,
+// note } naming it. Any check error ⇒ { residue: false } (refuse as before, rename nothing).
+async function classifyDivergedLocal(repoDir, branch, localSha, remoteTip) {
   const upstreamRemote = await command("git", ["-C", repoDir, "config", "--get", `branch.${branch}.remote`], { allowFailure: true });
   const upstreamMerge = await command("git", ["-C", repoDir, "config", "--get", `branch.${branch}.merge`], { allowFailure: true });
-  for (const probe of [upstreamRemote, upstreamMerge]) if (probe.status !== 0 && probe.status !== 1) return false;
+  for (const probe of [upstreamRemote, upstreamMerge]) if (probe.status !== 0 && probe.status !== 1) return { residue: false };
+  const hasUpstream = upstreamRemote.status === 0 || upstreamMerge.status === 0;
   const tracksItself = upstreamRemote.status === 0 && upstreamMerge.status === 0 && upstreamRemote.stdout === "origin" && upstreamMerge.stdout === `refs/heads/${branch}`;
-  if (tracksItself) return false;
-  const refresh = await command("git", ["-C", repoDir, "fetch", "--prune", "origin"], { allowFailure: true });
-  if (refresh.status !== 0) return false;
+  if (tracksItself) return { residue: false };
+  const refresh = await command("git", ["-C", repoDir, "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"], { allowFailure: true });
+  if (refresh.status !== 0) return { residue: false };
+  if (hasUpstream) {
+    const upstreamLabel = `${upstreamRemote.stdout || "?"}/${upstreamMerge.stdout || "?"}`;
+    const trackingRef = upstreamRemote.stdout === "origin" && upstreamMerge.stdout.startsWith("refs/heads/")
+      ? `refs/remotes/origin/${upstreamMerge.stdout.slice("refs/heads/".length)}`
+      : null;
+    const resolvable = trackingRef
+      ? await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", trackingRef], { allowFailure: true })
+      : { status: 1 };
+    if (resolvable.status !== 0) return { residue: false, note: `upstream ${upstreamLabel} of ${branch} is not resolvable on origin; not treating it as never-pushed` };
+  }
   const containing = await command("git", ["-C", repoDir, "for-each-ref", `--contains=${localSha}`, "refs/remotes/origin"], { allowFailure: true });
-  if (containing.status !== 0 || containing.stdout) return false;
+  if (containing.status !== 0 || containing.stdout) return { residue: false };
   const range = await command("git", ["-C", repoDir, "rev-list", "--count", `${remoteTip}..${localSha}`], { allowFailure: true });
   const unreachable = await command("git", ["-C", repoDir, "rev-list", "--count", `${remoteTip}..${localSha}`, "--not", "--remotes=origin"], { allowFailure: true });
-  if (range.status !== 0 || unreachable.status !== 0) return false;
+  if (range.status !== 0 || unreachable.status !== 0) return { residue: false };
   const rangeCount = Number(range.stdout);
-  if (!Number.isInteger(rangeCount) || rangeCount < 1) return false;
-  return unreachable.stdout === range.stdout;
+  if (!Number.isInteger(rangeCount) || rangeCount < 1) return { residue: false };
+  return { residue: unreachable.stdout === range.stdout };
 }
 
 export async function prepareRepository(stateDir, repo, taskId, branchOverride) {
@@ -256,11 +270,12 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
         // behind origin's rebuilt PR head, no upstream, on no origin head): move it aside so the
         // NEXT attempt can continue at origin/<branch>. This attempt is still refused — the rename
         // is a fact the record must carry, not something to paper over.
-        if (await isNeverPushedResidue(repoDir, branch, localSha, remoteTip)) {
+        const verdict = await classifyDivergedLocal(repoDir, branch, localSha, remoteTip);
+        if (verdict.residue) {
           const asideName = await renameBranchAside(repoDir, branch);
           throw new Error(`${reason}; never-pushed residue renamed aside to ${asideName} — retry continues at origin/${branch}`);
         }
-        throw new Error(reason);
+        throw new Error(verdict.note ? `${reason}; ${verdict.note}` : reason);
       }
       if (anc.status !== 0) throw new Error(`ancestry check failed for ${branch} (${localSha} vs origin/${branch} ${remoteTip}): ${anc.stderr || anc.status}`);
       // Case (b): local is an ancestor (or equal) ⇒ -B is a fast-forward to the remote tip.

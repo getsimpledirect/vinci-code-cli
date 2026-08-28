@@ -125,8 +125,13 @@ so the next attempt proceeds at the remote tip:
 1. the local branch does not track `origin/<branch>` (`branch.<b>.remote`/`.merge` are not
    `origin`/`refs/heads/<b>` — a pushed branch carries that upstream; the daemon's own default path
    leaves the upstream at `origin/main`, which is not evidence of a push);
-2. after `git fetch --prune origin`, no origin head contains the local tip
-   (`git for-each-ref --contains=<localSha> refs/remotes/origin` is empty);
+2. after `git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'` (ALL origin heads by
+   explicit refspec — a `--single-branch` cache would otherwise never see a head outside its
+   refspec and misclassify work pushed there), no origin head contains the local tip
+   (`git for-each-ref --contains=<localSha> refs/remotes/origin` is empty); if the branch has ANY
+   configured upstream whose remote-tracking ref is still unresolvable after that fetch, the
+   attempt is refused without a rename and the reason appends
+   `; upstream <remote>/<merge> of <branch> is not resolvable on origin; not treating it as never-pushed`;
 3. every commit in `<remoteTip>..<localSha>` is unreachable from every origin head
    (`git rev-list --count <remoteTip>..<localSha> --not --remotes=origin` equals the range count).
 
