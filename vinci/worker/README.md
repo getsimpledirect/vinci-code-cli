@@ -9,7 +9,8 @@ The daemon processes one handoff at a time and blocks until that task reaches a 
 ```bash
 vinci worker start --id <worker-id> \
   --server http://bus.example.com:8000 \
-  [--once] [--poll-seconds 60] [--state-dir ~/.vinci-worker-state]
+  [--once] [--poll-seconds 60] [--state-dir ~/.vinci-worker-state] \
+  [--governor http://governor:8100] [--require-governor]
 ```
 
 **Required:**
@@ -21,6 +22,8 @@ vinci worker start --id <worker-id> \
 - `--once`: Process one handoff and exit (useful for testing)
 - `--poll-seconds`: Poll interval (default 60)
 - `--state-dir`: Persistent state directory (default `.vinci-worker-state`)
+- `--governor`: Governor URL (Stage 2). Once set, every task needs a granted lease — see "Governor Lease (fail-closed)"
+- `--require-governor` (or `VINCI_WORKER_REQUIRE_GOVERNOR=1`): refuse to start (exit 78) unless `--governor` is configured
 
 ## Supervision
 
@@ -102,7 +105,9 @@ State file `<state-dir>/tasks/<id>.json`:
   "provider": "openrouter",
   "model": "z-ai/glm-5.2",
   "cost_usd": 2.15,
-  "terminal": true
+  "terminal": true,
+  "lease": { "claimed_at": "...", "paths": ["."], "ttl": 3600, "effective_max_runtime_s": 3600 },
+  "evidence_error": null
 }
 ```
 
@@ -113,6 +118,7 @@ State file `<state-dir>/tasks/<id>.json`:
 ## Credentials
 
 - `VINCI_BUS_TOKEN`: Bearer auth to bus (/v1/messages)
+- `VINCI_GOVERNOR_TOKEN`: Session auth to the Governor; required whenever `--governor` is set (a task with a Governor URL and no token is BLOCKED, never run)
 - `GH_TOKEN`: (optional) GitHub machine user token for cloning/pushing private repos and creating PRs
 - `OPENROUTER_API_KEY`: (or provider-specific key) via vinci's standard configuration
 
@@ -157,14 +163,20 @@ No new npm dependencies introduced; uses only node:* and global APIs.
 
 Stage 2 adds two opt-in hooks that enforce resource governance and audit trails. Both are inactive unless their environment variables are set; workers without Stage 2 configuration behave identically to Stage 1.
 
-### Governor Lease
+### Governor Lease (fail-closed)
 
-When `VINCI_GOVERNOR_TOKEN` is set AND `--governor <url>` is given:
+The Governor is configured by `--governor <url>` plus the `VINCI_GOVERNOR_TOKEN` env. Once a
+Governor URL is configured, **the only thing that lets a task clone a repository or spawn a
+model is a granted lease.** There is no fail-open path. Exactly these rules apply:
 
-1. **Before `npm ci`**: The daemon calls `POST {governor}/v1/governor/claim-paths` with the task's claim path(s) (from envelope header `claim:`, default `.`)
-2. **On success (2xx)**: Authority is granted; lease details (claimed_at, paths, ttl) are recorded in the lifecycle
-3. **On refusal (403/409/422)**: Task transitions to BLOCKED; blocker message contains the Governor's rule text verbatim
-4. **Limit tightening**: If the Governor's work order carries smaller budget_usd or max_runtime_s or deadline, those tighter limits replace the envelope's
+1. **When to claim**: before the repository is cloned and before `vinci -p` is spawned, the daemon calls `POST {governor}/v1/governor/claim-paths` with the task's claim path(s) (envelope header `claim:`, default `.`), `Authorization: Session <token>`, `Idempotency-Key: <task-id>/<attempt>`.
+2. **URL set, token missing**: the task is **BLOCKED** with reason `governor token missing (VINCI_GOVERNOR_TOKEN)`, a `blocker` is posted, and the Governor is not contacted. The task never runs ungoverned.
+3. **Governor unreachable, network error, body that is not a JSON object, or any HTTP status other than 200 / 403 / 409 / 422**: the task is **BLOCKED**; the reason carries the status or the error (`Governor connection failed: ECONNREFUSED`, `Governor returned invalid JSON (status 200): ...`, `Governor returned a malformed body (status 200): ...`, `Governor error: unexpected status 500 ...`). The blocker post is prefixed `Governor unavailable/invalid:` and the task snapshot records `outcome.governor = "unavailable"`. Never "proceed".
+4. **Refusal (403 / 409 / 422)**: the task is **BLOCKED**; the blocker post is prefixed `Governor refused the lease:` followed by the Governor's `reason` text verbatim, and the snapshot records `outcome.governor = "refused"`. Refusal and unavailability are never conflated.
+5. **Granted (200)**: a 200 is a lease only if its body is a JSON object whose `ttl` is a JSON number that is finite and greater than 0. There is no default ttl: `0`, negative, a string such as `"60"`, `null`, or a missing `ttl` ⇒ **BLOCKED** with reason `Governor lease invalid: ttl=<value>` (no clone, no spawn). A valid lease (`claimed_at`, `paths`, `ttl`, and any `budget_usd` / `max_runtime_s` / `deadline` from the work order) is recorded in the lifecycle's `lease` field, and the limits are tightened before the run starts.
+6. **Lease TTL is enforced**: the run's effective `max_runtime_s` is `min(envelope max_runtime_s, work-order max_runtime_s, lease ttl seconds)`; because every granted lease carries a validated ttl, the runtime timer that sends SIGTERM (then SIGKILL after the grace period) always fires no later than the lease ttl after the model is spawned. Time spent cloning before the spawn is not counted against the ttl. The value actually used is recorded as `lease.effective_max_runtime_s` in the task snapshot. Smaller `budget_usd` and earlier `deadline` from the work order also replace the envelope's.
+
+**Requiring a Governor.** By default the daemon still starts without `--governor` (the production Governor canary is currently off; Wave 1 flips this default). To make an ungoverned start impossible today, pass `--require-governor` or set `VINCI_WORKER_REQUIRE_GOVERNOR=1`: if no `--governor <url>` is configured the daemon refuses to start, writes the reason to stderr, and exits with code **78** (`EX_CONFIG`). This is the first check after option parsing — it runs before the `VINCI_BUS_TOKEN` check, before the daemon lock is taken (an existing `daemon.lock` is not read or touched), and before any bus request — so the exit code is 78 regardless of what else is missing.
 
 **Deployment prerequisite:** Governor URL must be reachable only from inside the dev-box network; Stage 2 boxes need network access to the local listener. Token is never logged or exposed.
 

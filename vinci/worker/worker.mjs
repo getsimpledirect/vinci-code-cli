@@ -27,19 +27,29 @@ const version = (() => {
 })();
 
 function usage() {
-  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>]";
+  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor]";
 }
 
-function parseArgs(args) {
+// EX_CONFIG (sysexits.h): the daemon refused to start because its configuration is incomplete.
+const EXIT_CONFIG = 78;
+
+function parseArgs(args, env = process.env) {
   if (args.shift() !== "start") throw new Error(usage());
-  const options = { once: false, pollSeconds: 60, stateDir: resolve(".vinci-worker-state"), governor: null };
+  const options = {
+    once: false,
+    pollSeconds: 60,
+    stateDir: resolve(".vinci-worker-state"),
+    governor: null,
+    requireGovernor: env.VINCI_WORKER_REQUIRE_GOVERNOR === "1",
+  };
   const seen = new Set();
   while (args.length > 0) {
     const argument = args.shift();
-    if (argument === "--once") {
+    if (argument === "--once" || argument === "--require-governor") {
       if (seen.has(argument)) throw new Error(`duplicate option: ${argument}`);
       seen.add(argument);
-      options.once = true;
+      if (argument === "--once") options.once = true;
+      else options.requireGovernor = true;
       continue;
     }
     if (!["--id", "--server", "--poll-seconds", "--state-dir", "--governor"].includes(argument)) {
@@ -55,13 +65,24 @@ function parseArgs(args) {
     else if (argument === "--governor") options.governor = value;
     else options.pollSeconds = Number(value);
   }
+  if (options.requireGovernor && !options.governor) {
+    // W0.1: a Governor was REQUIRED but none configured. Refuse to start rather than run a
+    // single ungoverned poll. This is the FIRST check after option parsing — ahead of the bus
+    // token, id/server validation, the daemon lock and any bus request — so the exit code is
+    // 78 regardless of what else is missing.
+    const configError = new Error(
+      "a Governor is required (--require-governor / VINCI_WORKER_REQUIRE_GOVERNOR=1) but no --governor <url> was given; refusing to start",
+    );
+    configError.exitCode = EXIT_CONFIG;
+    throw configError;
+  }
   if (!options.id) throw new Error("--id is required");
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.id)) throw new Error("invalid worker id");
   if (!options.server) throw new Error("--server is required");
   if (!Number.isFinite(options.pollSeconds) || options.pollSeconds <= 0) {
     throw new Error("--poll-seconds must be a positive number");
   }
-  const token = process.env.VINCI_BUS_TOKEN;
+  const token = env.VINCI_BUS_TOKEN;
   if (!token) throw new Error("VINCI_BUS_TOKEN is required");
   return { ...options, token };
 }
@@ -283,7 +304,10 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
   }
 
   try {
-    // Stage 2: Governor lease (if configured)
+    // Stage 2: Governor lease (if configured). FAIL-CLOSED (W0.1): with a Governor URL set,
+    // the task proceeds to clone/spawn ONLY on a granted lease. A missing token, an
+    // unreachable Governor, a network error, a non-JSON body, an unexpected status, or a
+    // missing decision all BLOCK the task here, before prepareRepository and runVinci.
     let envelopeToUse = envelope;
     if (governorUrl) {
       const governorToken = process.env.VINCI_GOVERNOR_TOKEN;
@@ -295,32 +319,26 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
         attempt: attempt.attempt,
       });
 
-      if (!claimResult) {
-        // Governor not configured, skip
-      } else if (!claimResult.success && claimResult.blocked) {
-        // Lease refused - block the task
-        lifecycle.transition("BLOCKED", {
-          outcome: { reason: claimResult.reason },
-        });
-        await bus.post("blocker", `task ${taskId} blocked`, `lease refused: ${claimResult.reason}`, {
+      if (!claimResult?.success) {
+        // Two classifications, never conflated: a REFUSAL is a Governor decision (403/409/422,
+        // rule text verbatim); everything else is the Governor being unavailable or its answer
+        // being unusable. Both BLOCK; the soak ledger attributes them differently.
+        const reason = claimResult?.reason ?? "governor returned no lease decision";
+        const governor = claimResult?.refused === true ? "refused" : "unavailable";
+        const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
+        lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
+        await bus.post("blocker", `task ${taskId} blocked`, `${label}: ${reason}`, {
           inReplyTo: message.message_id,
         });
         return true;
-      } else if (!claimResult.success) {
-        // Lease connection error - fail with error message
-        lifecycle.transition("FAILED", {
-          outcome: { reason: claimResult.reason },
-          exit_code: 1,
-        });
-        await bus.post("blocker", `task ${taskId} failed`, `governor error: ${claimResult.reason}`, {
-          inReplyTo: message.message_id,
-        });
-        return true;
-      } else {
-        // Lease granted - record and tighten limits if Governor order info available
-        lifecycle.transition("CLAIMED", { lease: claimResult });
-        envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
       }
+
+      // Lease granted: tighten the envelope (budget, max_runtime_s, deadline, and the lease
+      // ttl as a runtime cap) and record both the lease and the effective runtime limit.
+      envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
+      lifecycle.transition("CLAIMED", {
+        lease: { ...claimResult, effective_max_runtime_s: envelopeToUse.max_runtime_s },
+      });
     }
 
     const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
