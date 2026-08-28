@@ -3,14 +3,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
-import { buildIdentity, fetchServerBuild, findGitDir, formatWorkerBuild, readHeadCommit } from "../worker/build.mjs";
+import { buildIdentity, fetchServerBuild, findGitDir, findGitEntry, formatWorkerBuild, readHeadCommit, resolveGitDirs } from "../worker/build.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const TOOLS = join(ROOT, "vinci/test/fixtures/worker-test-tools");
@@ -410,11 +410,12 @@ await test("T10 git refuses (dubious ownership, simulated by PATH-shadowing git)
     assert.equal(identity.unresolved, false);
     assert.equal(identity.dirty, null, `git refused, so dirty is unknown, never false: ${JSON.stringify(identity)}`);
     assert.equal(mod.formatWorkerBuild(identity), head);
-    // The one git call that was made carried safe.directory=* (the real fix for the box), and
-    // no git call was made for the commit.
+    // The one git call that was made carried the EXACT checkout root as safe.directory (an exact
+    // path is honoured by every git that has safe.directory; the `*` wildcard needs >= 2.35.3),
+    // and no git call was made for the commit.
     const calls = readFileSync(argvLog, "utf8").trim().split("\n").filter((line) => !/^rev-parse HEAD$/.test(line));
     assert.equal(calls.length, 1, `expected exactly one git call (status), got: ${calls.join(" | ")}`);
-    assert.match(calls[0], /^-c safe\.directory=\* -C \S+ status --porcelain --untracked-files=no$/, calls[0]);
+    assert.equal(calls[0], `-c safe.directory=${repo.root} -C ${join(repo.root, "worker")} status --porcelain --untracked-files=no`);
   } finally {
     process.env.PATH = originalPath;
     rmSync(repo.root, { recursive: true, force: true });
@@ -513,6 +514,132 @@ await test("T12 fetchServerBuild retries once after ~1 s on timeout: a first req
     }
   } finally {
     server.closeAllConnections();
+    await new Promise((resolveClose) => server.close(resolveClose));
+  }
+});
+
+await test("T13 a .git that is PRESENT but unusable (malformed pointer, dangling pointer, unreadable HEAD) is unresolved, never a bare version", async () => {
+  const cases = [];
+  const mk = (prefix) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+    cpSync(join(ROOT, "vinci/worker/build.mjs"), join(root, "worker/build.mjs"));
+    cpSync(join(ROOT, "vinci/identity.json"), join(root, "identity.json"));
+    cases.push(root);
+    return root;
+  };
+  try {
+    // (a) `.git` is a file that is not a `gitdir:` pointer.
+    const malformed = mk("worker-build-badptr-");
+    writeFileSync(join(malformed, ".git"), "this is not a pointer\n");
+    // (b) `.git` points at a directory that does not exist.
+    const dangling = mk("worker-build-dangling-");
+    writeFileSync(join(dangling, ".git"), `gitdir: ${join(dangling, "nowhere/.git/worktrees/x")}\n`);
+    // (c) `.git/HEAD` cannot be read: mode 000 as a normal user (root can read anything, so
+    //     there a directory named HEAD stands in — readFileSync fails with EISDIR).
+    const unreadable = mk("worker-build-nohead-");
+    mkdirSync(join(unreadable, ".git/refs/heads"), { recursive: true });
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      mkdirSync(join(unreadable, ".git/HEAD"));
+    } else {
+      writeFileSync(join(unreadable, ".git/HEAD"), "ref: refs/heads/main\n");
+      chmodSync(join(unreadable, ".git/HEAD"), 0o000);
+      assert.throws(() => readFileSync(join(unreadable, ".git/HEAD")), "fixture: HEAD must be unreadable");
+    }
+
+    for (const [name, root] of [["malformed pointer", malformed], ["dangling pointer", dangling], ["unreadable HEAD", unreadable]]) {
+      const mod = await import(pathToFileURL(join(root, "worker/build.mjs")).href);
+      const found = mod.findGitEntry(join(root, "worker"));
+      assert.ok(found, `${name}: the .git entry must be found`);
+      assert.equal(found.root, root, name);
+      const identity = mod.buildIdentity();
+      assert.equal(identity.commit, null, `${name}: ${JSON.stringify(identity)}`);
+      assert.equal(identity.source, "package", name);
+      assert.equal(identity.unresolved, true, `${name}: a present-but-unusable .git is UNRESOLVED, not absent: ${JSON.stringify(identity)}`);
+      assert.equal(mod.formatWorkerBuild(identity), `${here.version}-UNRESOLVED`, name);
+    }
+    assert.equal(resolveGitDirs(findGitEntry(malformed)), null);
+    assert.equal(resolveGitDirs(findGitEntry(dangling)), null);
+    // And the control: NO .git entry at all stays a package (unresolved:false, bare version).
+    const absent = mk("worker-build-absent-");
+    const absentMod = await import(pathToFileURL(join(absent, "worker/build.mjs")).href);
+    assert.equal(absentMod.findGitEntry(join(absent, "worker")), null);
+    const packaged = absentMod.buildIdentity();
+    assert.deepEqual(packaged, { version: here.version, commit: null, dirty: null, source: "package", unresolved: false });
+    assert.equal(absentMod.formatWorkerBuild(packaged), here.version);
+  } finally {
+    for (const root of cases) {
+      try {
+        chmodSync(join(root, ".git/HEAD"), 0o644);
+      } catch {
+        // not every case has a HEAD file
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+await test("T14 symbolic refs are followed recursively: HEAD -> refs/heads/x -> refs/heads/y resolves; a cycle => null, no hang", async () => {
+  const repo = makeRepo("worker-build-symref-");
+  try {
+    writeFileSync(join(repo.root, "a.txt"), "a\n");
+    repo.git("add", "-A");
+    repo.git("commit", "-q", "-m", "one");
+    const head = repo.git("rev-parse", "HEAD");
+    const mod = await repo.load();
+    // Two hops, built with git itself: x is a symbolic ref to main, HEAD points at x.
+    repo.git("symbolic-ref", "refs/heads/x", "refs/heads/main");
+    repo.git("symbolic-ref", "HEAD", "refs/heads/x");
+    assert.equal(readFileSync(join(repo.root, ".git/HEAD"), "utf8").trim(), "ref: refs/heads/x", "fixture");
+    assert.equal(readFileSync(join(repo.root, ".git/refs/heads/x"), "utf8").trim(), "ref: refs/heads/main", "fixture");
+    assert.equal(repo.git("rev-parse", "HEAD"), head, "fixture: git itself resolves the chain");
+    const twoHop = mod.buildIdentity();
+    assert.equal(twoHop.commit, head, JSON.stringify(twoHop));
+    assert.equal(twoHop.source, "git");
+    // Three hops through a PACKED tail: main is packed, x and y stay loose.
+    repo.git("symbolic-ref", "refs/heads/y", "refs/heads/x");
+    repo.git("symbolic-ref", "HEAD", "refs/heads/y");
+    repo.git("pack-refs", "--all");
+    assert.equal(existsSync(join(repo.root, ".git/refs/heads/main")), false, "fixture: main must be packed");
+    assert.equal(mod.buildIdentity().commit, head);
+
+    // A cycle: x -> y -> x. Must answer null promptly, never recurse forever.
+    writeFileSync(join(repo.root, ".git/refs/heads/x"), "ref: refs/heads/y\n");
+    writeFileSync(join(repo.root, ".git/refs/heads/y"), "ref: refs/heads/x\n");
+    const startedAt = Date.now();
+    const cycle = mod.buildIdentity();
+    assert.ok(Date.now() - startedAt < 1000, "a cycle must not hang");
+    assert.equal(cycle.commit, null, JSON.stringify(cycle));
+    assert.equal(cycle.unresolved, true);
+    // git itself sees a broken HEAD as unborn and reports every tracked file, hence `-dirty`.
+    assert.match(mod.formatWorkerBuild(cycle), new RegExp(`^${here.version.replace(/\./g, "\\.")}-UNRESOLVED(-dirty)?$`));
+    // A chain deeper than the hop limit (r0 -> r1 -> ... -> r9 -> sha) also yields null.
+    for (let i = 0; i < 9; i += 1) writeFileSync(join(repo.root, `.git/refs/heads/r${i}`), `ref: refs/heads/r${i + 1}\n`);
+    writeFileSync(join(repo.root, ".git/refs/heads/r9"), `${head}\n`);
+    writeFileSync(join(repo.root, ".git/HEAD"), "ref: refs/heads/r0\n");
+    assert.equal(mod.readHeadCommit(mod.findGitDir(repo.root)), null, "10 hops exceeds the limit of 8");
+    writeFileSync(join(repo.root, ".git/HEAD"), "ref: refs/heads/r5\n");
+    assert.equal(mod.readHeadCommit(mod.findGitDir(repo.root)), head, "5 hops is within the limit");
+    // A ref name that tries to escape the git dir is refused.
+    writeFileSync(join(repo.root, ".git/HEAD"), "ref: refs/../../HEAD\n");
+    assert.equal(mod.readHeadCommit(mod.findGitDir(repo.root)), null);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+await test("T15 a 200 with a malformed JSON body is a server answer: recorded as {error, attempts:1}, NOT retried", async () => {
+  let requests = 0;
+  const server = createHttpServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end("{not json");
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  try {
+    const result = await fetchServerBuild(`http://127.0.0.1:${server.address().port}`, { timeoutMs: 500, retryDelayMs: 50 });
+    assert.deepEqual(result, { error: `GET http://127.0.0.1:${server.address().port}/v1/version returned a non-JSON body`, attempts: 1 });
+    assert.equal(requests, 1, "a malformed body must not be retried");
+  } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
   }
 });

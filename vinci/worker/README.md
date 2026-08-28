@@ -204,20 +204,24 @@ What is recorded, and where:
   `identity.json`'s version (the string task records always carried as `vinci_version`, which
   is kept); `commit` is the HEAD sha of the checkout the daemon runs from, read directly from
   the checkout's files — `.git/HEAD` (a `gitdir:` pointer file is followed for a linked
-  worktree), then the branch's loose ref, then `packed-refs` — never via `git` exec, so an
+  worktree), then the branch's loose ref, then `packed-refs`, following symbolic refs
+  recursively (at most 8 hops; a cycle resolves to nothing) — never via `git` exec, so an
   unprivileged daemon on a root-owned checkout still resolves it (#17: git's "dubious
   ownership" refusal used to silently degrade the identity to a version string). It is `null`
-  when there is no `.git` at all (a packaged install: `source: "package"`, `unresolved: false`)
-  OR when a `.git` exists but HEAD could not be resolved — unborn branch, unreadable ref
+  when there is no `.git` entry at all (a packaged install: `source: "package"`,
+  `unresolved: false`) OR when a `.git` entry exists but HEAD could not be resolved — unborn
+  branch, unreadable HEAD, malformed or dangling `gitdir:` pointer, symbolic-ref cycle
   (`source: "package"`, `unresolved: true`). `dirty` is whether
-  `git -c safe.directory=* status --porcelain --untracked-files=no` is non-empty; it is
-  best-effort and `null` (unknown) whenever git is missing or refuses — never `false` by
-  default.
+  `git -c safe.directory=<checkout root> status --porcelain --untracked-files=no` is non-empty
+  (the exact root, which every git with `safe.directory` honours; the `*` wildcard needs
+  >= 2.35.3); it is best-effort and `null` (unknown) whenever git is missing or refuses —
+  never `false` by default.
 - `server_build` — the verbatim payload of `GET <server>/v1/version` (unauthenticated;
   vinci-gpu-control reports `git_sha`, `dirty`, `server_code_sha256`, …), fetched once at
   daemon start with a 2 s timeout per attempt and ONE retry after 1 s on a timeout or network
-  error (a cold first request has timed out and then answered in 43 ms on restart; a non-2xx or
-  non-JSON answer is not retried). Worst case 5 s, so a hung server cannot delay the first
+  error (a cold first request has timed out and then answered in 43 ms on restart). Anything the
+  server actually answered — non-2xx, a non-JSON or non-object body — is recorded on the first
+  attempt and not retried. Worst case 5 s, so a hung server cannot delay the first
   poll past 6 s. On any failure it is `{ "error": "<why>", "attempts": <n> }` and the daemon
   still starts.
 - Both are written into the task record (`<state-dir>/tasks/<id>.json`) by `startAttempt`:

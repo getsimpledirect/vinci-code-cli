@@ -12,13 +12,14 @@ const FULL_SHA = /^[0-9a-f]{40}$/;
 
 // `git` is used ONLY for `dirty` (best-effort). `commit` never depends on it: the daemon runs
 // as an unprivileged user on a root-owned checkout, where git refuses with "dubious ownership"
-// (#17), so the commit is read from the checkout's own files instead. `safe.directory=*` is
-// passed as command-line config (which git treats as protected, like the system config) so
-// that `dirty` still answers on such a checkout; when git is missing or still refuses, the
-// caller records `null` (unknown), never `false`.
-function git(args, cwd) {
+// (#17), so the commit is read from the checkout's own files instead. The checkout root is
+// passed as `safe.directory` command-line config (which git treats as protected, like the
+// system config) so that `dirty` still answers on such a checkout; an exact path is accepted
+// by every git that has `safe.directory` at all (the `*` wildcard needs >= 2.35.3). When git
+// is missing or still refuses, the caller records `null` (unknown), never `false`.
+function git(args, cwd, safeDirectory) {
   try {
-    const result = spawnSync("git", ["-c", "safe.directory=*", "-C", cwd, ...args], { encoding: "utf8", timeout: 5000 });
+    const result = spawnSync("git", ["-c", `safe.directory=${safeDirectory}`, "-C", cwd, ...args], { encoding: "utf8", timeout: 5000 });
     if (result.error || result.status !== 0) return null;
     return result.stdout;
   } catch {
@@ -42,33 +43,52 @@ function readText(path) {
   }
 }
 
-// Walk up from `start` to the nearest `.git`. A directory is the repository itself; a FILE is a
-// `gitdir: <path>` pointer (a linked worktree or a submodule), in which case `gitDir` is the
-// per-worktree dir (HEAD lives there) and `commonDir` the main repository (`refs/heads/*` and
-// `packed-refs` live there; git records it in `<gitDir>/commondir`). Returns null when `start`
-// is not inside any checkout.
-export function findGitDir(start) {
+// Walk up from `start` to the nearest entry named `.git` of ANY kind. Returns null only when no
+// such entry exists on the way to the filesystem root (not a checkout at all); otherwise
+// `{ root, entry }` where `root` is the checkout root (the directory holding `.git`) — even
+// when the entry turns out to be unusable, because "a `.git` is here but cannot be read" is an
+// unresolved checkout, not a packaged install.
+export function findGitEntry(start) {
   let dir = resolve(start);
   for (;;) {
-    const candidate = join(dir, ".git");
-    let stat = null;
+    const entry = join(dir, ".git");
     try {
-      stat = statSync(candidate);
+      const stat = statSync(entry);
+      return { root: dir, entry, kind: stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other" };
     } catch {
-      stat = null;
-    }
-    if (stat?.isDirectory()) return { gitDir: candidate, commonDir: candidate };
-    if (stat?.isFile()) {
-      const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(readText(candidate) ?? "");
-      if (!pointer) return null;
-      const gitDir = resolve(dir, pointer[1]);
-      const common = readText(join(gitDir, "commondir"))?.trim();
-      return { gitDir, commonDir: common ? resolve(gitDir, common) : gitDir };
+      // no entry here; keep walking
     }
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;
   }
+}
+
+// `{ gitDir, commonDir }` for a `.git` entry. A directory is the repository itself; a FILE is a
+// `gitdir: <path>` pointer (a linked worktree or a submodule), in which case `gitDir` is the
+// per-worktree dir (HEAD lives there) and `commonDir` the main repository (`refs/heads/*` and
+// `packed-refs` live there; git records it in `<gitDir>/commondir`). Returns null when the
+// entry is unusable: an unreadable or malformed pointer file, or a pointer whose target is not
+// a directory.
+export function resolveGitDirs({ root, entry, kind }) {
+  if (kind === "dir") return { gitDir: entry, commonDir: entry };
+  if (kind !== "file") return null;
+  const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(readText(entry) ?? "");
+  if (!pointer) return null;
+  const gitDir = resolve(root, pointer[1]);
+  try {
+    if (!statSync(gitDir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const common = readText(join(gitDir, "commondir"))?.trim();
+  return { gitDir, commonDir: common ? resolve(gitDir, common) : gitDir };
+}
+
+// Back-compat wrapper: entry lookup + pointer resolution in one step (null when either fails).
+export function findGitDir(start) {
+  const found = findGitEntry(start);
+  return found ? resolveGitDirs(found) : null;
 }
 
 function readPackedRef(commonDir, ref) {
@@ -82,21 +102,37 @@ function readPackedRef(commonDir, ref) {
   return null;
 }
 
+// A ref name we are willing to open as a file: `refs/...` segments of safe characters, never
+// `..` (a hostile ref cannot walk out of the git dir).
+const REF_NAME = /^refs\/(?:[\w.@-]+\/)*[\w.@-]+$/;
+const MAX_REF_HOPS = 8;
+
+// Resolve one ref VALUE (the text of HEAD or of a ref file) to a 40-hex sha. A detached value
+// is the sha itself; `ref: <name>` is followed — loose file (per-worktree dir first, then the
+// common dir), then `packed-refs` — recursively, since a branch may itself be symbolic
+// (`HEAD -> refs/heads/x -> refs/heads/y`). A cycle, a chain deeper than MAX_REF_HOPS, an
+// unsafe name, or a value that is neither a sha nor a ref yields null.
+function resolveRefValue({ gitDir, commonDir }, value, visited = new Set()) {
+  const text = (value ?? "").trim();
+  if (FULL_SHA.test(text)) return text;
+  const symbolic = /^ref:\s*(\S+)$/.exec(text);
+  if (!symbolic) return null;
+  const ref = symbolic[1];
+  if (!REF_NAME.test(ref) || visited.has(ref) || visited.size >= MAX_REF_HOPS) return null;
+  visited.add(ref);
+  const next = readText(join(gitDir, ref)) ?? readText(join(commonDir, ref)) ?? readPackedRef(commonDir, ref);
+  if (next === null) return null;
+  return resolveRefValue({ gitDir, commonDir }, next, visited);
+}
+
 // HEAD of the checkout at `gitDir` as a 40-hex sha, reading the checkout's files directly (no
-// git exec, so no ownership check): `HEAD` is either a detached sha or `ref: <ref>`; a ref is
-// looked up as a loose file (per-worktree dir first, then the common dir) and then in
-// `packed-refs`. Returns null when HEAD cannot be resolved to a full sha — an unborn branch,
-// a truncated file, or a shape this reader does not understand.
-export function readHeadCommit({ gitDir, commonDir }) {
-  const head = readText(join(gitDir, "HEAD"))?.trim();
-  if (!head) return null;
-  let value = head;
-  const symbolic = /^ref:\s*(\S+)/.exec(head);
-  if (symbolic) {
-    const ref = symbolic[1];
-    value = readText(join(gitDir, ref))?.trim() ?? readText(join(commonDir, ref))?.trim() ?? readPackedRef(commonDir, ref) ?? "";
-  }
-  return FULL_SHA.test(value) ? value : null;
+// git exec, so no ownership check). Returns null when HEAD cannot be resolved to a full sha —
+// an unborn branch, an unreadable or truncated file, a symbolic-ref cycle, or a shape this
+// reader does not understand.
+export function readHeadCommit(dirs) {
+  const head = readText(join(dirs.gitDir, "HEAD"));
+  if (head === null) return null;
+  return resolveRefValue(dirs, head);
 }
 
 // `{ version, commit, dirty, source, unresolved }` for the checkout THIS file runs from. Never
@@ -110,25 +146,30 @@ export function readHeadCommit({ gitDir, commonDir }) {
 //               (`.vinci-worker-state`) may sit inside the checkout and must not make every
 //               build read as dirty.
 //   source:     "git" when the commit was resolved, otherwise "package"
-//   unresolved: true when a `.git` exists but `commit` could not be resolved from it — a
-//               checkout whose identity is unknown, which is NOT the same as a packaged
-//               install and is announced as such (`<version>-UNRESOLVED`, see formatWorkerBuild)
+//   unresolved: true when a `.git` entry EXISTS but `commit` could not be resolved from it —
+//               unborn branch, unreadable HEAD, malformed or dangling `gitdir:` pointer,
+//               symbolic-ref cycle. A checkout whose identity is unknown is NOT a packaged
+//               install and is announced as such (`<version>-UNRESOLVED`, see
+//               formatWorkerBuild). Only a checkout with NO `.git` entry at all is a package.
 export function buildIdentity(dir = dirname(fileURLToPath(import.meta.url))) {
   const version = readVersion(dir);
-  let gitDirs = null;
+  let found = null;
   try {
-    gitDirs = findGitDir(dir);
+    found = findGitEntry(dir);
   } catch {
-    gitDirs = null;
+    found = null;
   }
-  if (!gitDirs) return { version, commit: null, dirty: null, source: "package", unresolved: false };
+  // ABSENT: no `.git` entry anywhere above this file — a packaged install, nothing to resolve.
+  if (!found) return { version, commit: null, dirty: null, source: "package", unresolved: false };
+  // PRESENT: from here on, a null commit is an unresolved checkout, never a packaged install.
   let commit = null;
   try {
-    commit = readHeadCommit(gitDirs);
+    const dirs = resolveGitDirs(found);
+    commit = dirs ? readHeadCommit(dirs) : null;
   } catch {
     commit = null;
   }
-  const status = git(["status", "--porcelain", "--untracked-files=no"], dir);
+  const status = git(["status", "--porcelain", "--untracked-files=no"], dir, found.root);
   const dirty = status === null ? null : status.trim().length > 0;
   if (!commit) return { version, commit: null, dirty, source: "package", unresolved: true };
   return { version, commit, dirty, source: "git", unresolved: false };
@@ -158,9 +199,10 @@ export function formatServerBuild(serverBuild) {
 // timeout, non-2xx, non-JSON) returns `{ error, attempts }` and the daemon still starts — build
 // identity is a record, not a gate.
 //
-// A timeout or network error is retried ONCE after `retryDelayMs` (#17: the first request
-// after a cold start timed out and the very next one answered in 43 ms — cold TLS/DNS); a
-// non-2xx or non-JSON answer is a server answer and is not retried. Worst case is
+// ONLY a fetch failure (timeout or network error) is retried, ONCE after `retryDelayMs` (#17:
+// the first request after a cold start timed out and the very next one answered in 43 ms —
+// cold TLS/DNS). Anything the server actually answered — non-2xx, a body that is not JSON or
+// not an object — is recorded on the first attempt and not retried. Worst case is
 // `attempts * timeoutMs + retryDelayMs` = 2 * 2000 + 1000 = 5 s, under the 6 s bound that keeps
 // a hung server from delaying the first poll.
 export const SERVER_BUILD_TIMEOUT_MS = 2000;
@@ -175,18 +217,25 @@ export async function fetchServerBuild(
   let attempt = 0;
   for (;;) {
     attempt += 1;
+    let response;
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-      if (!response.ok) return { error: `GET ${url} failed: ${response.status}`, attempts: attempt };
-      const payload = await response.json();
-      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-        return { error: `GET ${url} returned a non-object body`, attempts: attempt };
-      }
-      return payload;
+      response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
     } catch (error) {
       const detail = error?.name === "TimeoutError" ? `timeout after ${timeoutMs}ms` : error?.cause?.code ?? error?.message ?? String(error);
       if (attempt >= attempts) return { error: `GET ${url} failed: ${detail}`, attempts: attempt };
       await new Promise((resolveDelay) => setTimeout(resolveDelay, retryDelayMs));
+      continue;
     }
+    if (!response.ok) return { error: `GET ${url} failed: ${response.status}`, attempts: attempt };
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      return { error: `GET ${url} returned a non-JSON body`, attempts: attempt };
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return { error: `GET ${url} returned a non-object body`, attempts: attempt };
+    }
+    return payload;
   }
 }
