@@ -44,14 +44,29 @@ const LATCH_REASON =
       ["Wait for the user's next instruction", "Vinci reserved the remaining actions", "Vinci stopped autonomous changes"],
     );
 
-    // A successful (non-error) tool result that merely echoes the string is NOT a stop.
+    // A successful (non-error) tool result that merely echoes the string is NOT a stop — even with
+    // the marker present, isError is required.
     const echoed = excerpt.replaceAll('"isError":true', '"isError":false');
     writeFileSync(join(directory, "session.jsonl"), echoed);
     assert.deepEqual(readSessionState(directory, sessionId).harnessStops, [], "only error-flagged results count");
 
-    // Mutation guard: changing the stop text removes the observation entirely.
-    writeFileSync(join(directory, "session.jsonl"), excerpt.replaceAll("Vinci reserved", "Vinci observed"));
-    assert.deepEqual(readSessionState(directory, sessionId).harnessStops, []);
+    // details.vinciBlocked is authoritative: a reworded reason is still detected while the marker is set.
+    const reworded = excerpt.replaceAll("Vinci reserved", "Vinci observed");
+    writeFileSync(join(directory, "session.jsonl"), reworded);
+    assert.deepEqual(
+      readSessionState(directory, sessionId).harnessStops.map((stop) => stop.index),
+      [1, 2],
+      "vinciBlocked marker must detect a stop whose reason no longer matches any pattern",
+    );
+
+    // Legacy fallback: without the marker the substrings still detect the original wording ...
+    const unmarked = excerpt.replaceAll('"details":{"vinciBlocked":true},', "");
+    writeFileSync(join(directory, "session.jsonl"), unmarked);
+    assert.equal(readSessionState(directory, sessionId).harnessStops.length, 2, "pattern fallback for sessions without the marker");
+
+    // ... and with neither the marker nor a pattern there is no observation.
+    writeFileSync(join(directory, "session.jsonl"), unmarked.replaceAll("Vinci reserved", "Vinci observed"));
+    assert.deepEqual(readSessionState(directory, sessionId).harnessStops, [], "no marker and no pattern is not a stop");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -160,9 +175,14 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
   const t5 = await runScenario("t5", "w5", { evidence: "pr", sessionFixture: HARNESS_STOP_FIXTURE, env: { FAKE_VINCI_EXIT: "1" } });
   assert.equal(t5.state.state, "FAILED");
   assert.equal(t5.state.exit_code, 1);
-  assert.equal(t5.state.harness_stop, null, "T5: harness_stop is recorded only when it decided the state");
+  assert.deepEqual(t5.state.harness_stop, { count: 2, reason: RESERVE_REASON }, "T5: the stop is recorded even though exit code outranked it");
   assert.equal(t5.posts.at(-1).kind, "blocker");
-  assert.doesNotMatch(t5.posts.at(-1).body, /stop=instrument/);
+  assert.match(t5.posts.at(-1).body, /state=FAILED .*harness_stops=2/, "T5: FAILED post carries the stop count");
+  assert.ok(
+    t5.posts.at(-1).body.includes(`harness_stop_reason=${RESERVE_REASON}`),
+    `T5: FAILED post must carry the stop reason: ${t5.posts.at(-1).body}`,
+  );
+  assert.doesNotMatch(t5.posts.at(-1).body, /stop=instrument/, "T5: the FAILED post is not attributed to an instrument stop");
 }
 
 // --- finalState precedence (pure) ----------------------------------------------------------------

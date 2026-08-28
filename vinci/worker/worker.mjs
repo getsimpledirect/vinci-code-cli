@@ -267,7 +267,12 @@ async function postFinal(bus, message, envelope, state, evidence) {
       options,
     );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
-    const reason = state.outcome?.reason ? `${details} reason=${state.outcome.reason}` : details;
+    // A FAILED run may also have hit a harness stop; surface count AND reason so the ledger can
+    // attribute it. harness_stop_reason is the instrument's text; reason= stays the outcome narrative.
+    const stops = state.harness_stop
+      ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
+      : details;
+    const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
     await bus.post("blocker", subject, reason, options);
   } else {
     await bus.post("status", subject, details, options);
@@ -375,12 +380,11 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       pr: published.pr,
       harnessStops,
     });
-    // Record the instrument stop on the task whenever it decided the state, so the snapshot (and the
-    // evidence bundle's result.json) carry the machine-observed reason next to the model's narrative.
+    // Record the instrument stop on the task whenever one occurred — even when exit/limit outranked it
+    // — so the snapshot (and the evidence bundle's result.json) carry the machine-observed reason next
+    // to the model's narrative and the soak ledger can see that a latch also fired on a FAILED run.
     const harnessStop =
-      intendedState === "BLOCKED" && harnessStops.length > 0
-        ? { count: harnessStops.length, reason: harnessStops[0].reason }
-        : null;
+      harnessStops.length > 0 ? { count: harnessStops.length, reason: harnessStops[0].reason } : null;
 
     // W0.2 evidence before terminal: the terminal state is written only AFTER the evidence
     // bundle was attempted. `planned` is the exact snapshot that will be committed (state +
