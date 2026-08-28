@@ -707,6 +707,9 @@ run_group automation-stop-integration node "${ROOT}/vinci/test/automation-stop-i
 run_group todo-stall-integration node "${ROOT}/vinci/test/todo-stall-integration.mjs"
 # Structural loop/safety regressions use jiti so they run on the Node 22 CI floor too.
 run_group loopbreak-integration node "${ROOT}/vinci/test/loopbreak-integration.mjs"
+# #5/#6: no harness contradictions in unattended (`vinci -p`) runs — latch wording, hard stop ⇒ BLOCKED,
+# finalization git commands exempt from the reserve (never push/network).
+run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-harness-integration.mjs"
 run_group guard-integration node "${ROOT}/vinci/test/guard-integration.mjs"
 # Masked content (<vinci-secret>) can never match or overwrite raw file bytes.
 run_group mask-edit-integration node "${ROOT}/vinci/test/mask-edit-integration.mjs"

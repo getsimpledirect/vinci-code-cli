@@ -1,4 +1,5 @@
 import { formatDuration } from "./format-duration.ts";
+import { getVinciHardStop } from "./hard-stop.ts";
 import {
   addVinciAccumulatedUsage,
   getVinciTaskUsageSnapshot,
@@ -95,6 +96,10 @@ export type VinciTaskOutcome = {
   /** Additive client-accounting detail; future server-authoritative usage can replace this source. */
   assistantUsage?: VinciTaskUsage;
   assistantResponseKeys?: string[];
+  /** [#5/#6] The machine stop that forced this record to BLOCKED, when one did. Carried on the
+   *  record so a later display (the receipt, a resumed session) can never remap it back to a
+   *  success state from a remote verdict — the registry itself is process-local. */
+  hardStop?: { source: string; reason: string };
   recordedAt: string;
 };
 
@@ -552,7 +557,18 @@ export function classifyVinciTaskState(
 
 export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcome {
   const changedFiles = [...new Set(input.changedFiles)].sort();
-  const terminal = classifyVinciTaskState(input.messages, changedFiles, input.verification);
+  const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification);
+  // [#5/#6] A hard stop (the no-progress latch, or any harness refusal of a finalization step) is
+  // a machine fact that outranks the narrative: the model's closing "done" — and even a remote
+  // VERIFIED_PASS — cannot turn a frozen session into DONE or DONE_UNVERIFIED, and a closing
+  // question does not make it WAITING either (review BLOCK-4: every mode, every state). Observed
+  // live: the latch locked every mutation, the record said DONE with changedFiles, the tree held
+  // uncommitted work. An already-BLOCKED classification keeps its own, more specific reason.
+  const hardStop = getVinciHardStop(input.taskId);
+  const terminal =
+    hardStop && classified.state !== "BLOCKED"
+      ? { state: "BLOCKED" as const, reason: hardStop.reason.slice(0, 240) }
+      : classified;
   const usageMessages = input.usageMessages ?? input.messages;
   const streamUsage = summarizeAssistantUsage(usageMessages);
   const responseKeys = assistantResponseKeys(usageMessages);
@@ -577,6 +593,7 @@ export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcom
     supplementalUsage,
     assistantUsage: streamUsage,
     assistantResponseKeys: [...responseKeys],
+    ...(hardStop ? { hardStop: { source: hardStop.source, reason: hardStop.reason } } : {}),
     recordedAt: (input.now ?? new Date()).toISOString(),
   };
 }

@@ -102,11 +102,20 @@ export function getLatestRemoteVerdict(): RemoteAcceptanceVerdict | undefined {
 /** Pure display decision for D10 (wave5.md decision 4): a non-staled remote
  *  verdict overrides the local outcome; a staled one adds context only. */
 export function remoteVerdictDisplay(
-  outcome: Readonly<Pick<VinciTaskOutcome, "state" | "reason">>,
+  outcome: Readonly<Pick<VinciTaskOutcome, "state" | "reason" | "hardStop">>,
   remoteVerdict?: { status?: string; staled?: boolean; summary?: string },
 ): { state: string; reason: string } {
   let displayState: string = outcome.state;
   let displayReason = outcome.reason;
+  // [#5/#6, review BLOCK-5] A BLOCKED that a hard stop forced is a fact about THIS session's
+  // ability to finish; a remote VERIFIED_PASS speaks to the snapshot it verified, not to the
+  // commit the harness refused. The verdict may sit alongside, the state stays BLOCKED.
+  if (outcome.hardStop && outcome.state === "BLOCKED") {
+    if (remoteVerdict && !remoteVerdict.staled && remoteVerdict.summary) {
+      displayReason = `${outcome.reason}\nRemote verification reported: ${remoteVerdict.summary}`;
+    }
+    return { state: displayState, reason: displayReason };
+  }
   if (remoteVerdict && !remoteVerdict.staled) {
     const mappedState = mapRemoteVerdictToState(remoteVerdict.status);
     if (mappedState) {
