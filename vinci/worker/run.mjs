@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { accessSync, constants, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 
@@ -79,12 +80,122 @@ function terminateProcessGroup(child, signal) {
   }
 }
 
+function validateBranchName(branch) {
+  // Defense in depth: task.mjs validates too, but this function must be safe standalone.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(branch) || branch.includes("..") || /^refs[\/.]/.test(branch) || branch.includes("refs/") || branch.endsWith(".lock") || branch.endsWith("/") || branch === "HEAD") {
+    throw new Error(`envelope branch ${branch} is not a plain git branch name`);
+  }
+}
+
+// Move a local branch out of the way under stale/<branch>-<UTC stamp>-<6 hex>. Never deletes: a
+// stale branch can be the only copy of an earlier attempt's work. The nonce keeps two renames in
+// the same second apart; the destination is verified absent before `branch -m` (which would
+// otherwise refuse, or with -M clobber). `stamp`/`nonce` are injectable for tests only.
+export async function renameBranchAside(repoDir, branch, { stamp, nonce } = {}) {
+  const stampText = stamp ?? new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  let candidateNonce = nonce;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const asideName = `stale/${branch}-${stampText}-${candidateNonce ?? randomBytes(3).toString("hex")}`;
+    const taken = await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${asideName}`], { allowFailure: true });
+    if (taken.status === 0) {
+      candidateNonce = null; // collision: draw a fresh nonce, never overwrite
+      continue;
+    }
+    await command("git", ["-C", repoDir, "branch", "-m", branch, asideName]);
+    return asideName;
+  }
+  throw new Error(`could not find a free stale/ name for ${branch}`);
+}
+
+// Never-pushed residue classification (divergence path). Returns { residue: true } only when ALL
+// hold: (ii) the local branch does not track origin/<branch> (a branch that was pushed carries that
+// upstream from `push --set-upstream`; the daemon's own default path `checkout -b worker/<id>
+// origin/main` leaves the upstream at origin/MAIN, which is not evidence of a push), (iii) no live
+// origin head contains its tip and no commit in <remoteTip>..<localSha> is reachable from any
+// origin head. ALL origin heads are fetched by explicit full refspec first: a narrow-refspec cache
+// (--single-branch) would otherwise leave a head outside its refspec invisible and misclassify
+// work pushed there as never-pushed. If the branch has ANY configured upstream whose
+// remote-tracking ref is still unresolvable after that fetch, fail closed: { residue: false,
+// note } naming it. Any check error ⇒ { residue: false } (refuse as before, rename nothing).
+async function classifyDivergedLocal(repoDir, branch, localSha, remoteTip) {
+  const upstreamRemote = await command("git", ["-C", repoDir, "config", "--get", `branch.${branch}.remote`], { allowFailure: true });
+  const upstreamMerge = await command("git", ["-C", repoDir, "config", "--get", `branch.${branch}.merge`], { allowFailure: true });
+  for (const probe of [upstreamRemote, upstreamMerge]) if (probe.status !== 0 && probe.status !== 1) return { residue: false };
+  const hasUpstream = upstreamRemote.status === 0 || upstreamMerge.status === 0;
+  const tracksItself = upstreamRemote.status === 0 && upstreamMerge.status === 0 && upstreamRemote.stdout === "origin" && upstreamMerge.stdout === `refs/heads/${branch}`;
+  if (tracksItself) return { residue: false };
+  const refresh = await command("git", ["-C", repoDir, "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"], { allowFailure: true });
+  if (refresh.status !== 0) return { residue: false };
+  if (hasUpstream) {
+    const upstreamLabel = `${upstreamRemote.stdout || "?"}/${upstreamMerge.stdout || "?"}`;
+    const trackingRef = upstreamRemote.stdout === "origin" && upstreamMerge.stdout.startsWith("refs/heads/")
+      ? `refs/remotes/origin/${upstreamMerge.stdout.slice("refs/heads/".length)}`
+      : null;
+    const resolvable = trackingRef
+      ? await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", trackingRef], { allowFailure: true })
+      : { status: 1 };
+    if (resolvable.status !== 0) return { residue: false, note: `upstream ${upstreamLabel} of ${branch} is not resolvable on origin; not treating it as never-pushed` };
+  }
+  const containing = await command("git", ["-C", repoDir, "for-each-ref", `--contains=${localSha}`, "refs/remotes/origin"], { allowFailure: true });
+  if (containing.status !== 0 || containing.stdout) return { residue: false };
+  const range = await command("git", ["-C", repoDir, "rev-list", "--count", `${remoteTip}..${localSha}`], { allowFailure: true });
+  const unreachable = await command("git", ["-C", repoDir, "rev-list", "--count", `${remoteTip}..${localSha}`, "--not", "--remotes=origin"], { allowFailure: true });
+  if (range.status !== 0 || unreachable.status !== 0) return { residue: false };
+  const rangeCount = Number(range.stdout);
+  if (!Number.isInteger(rangeCount) || rangeCount < 1) return { residue: false };
+  return { residue: unreachable.stdout === range.stdout };
+}
+
 export async function prepareRepository(stateDir, repo, taskId, branchOverride) {
   if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
   const branch = branchOverride ?? `worker/${taskId}`;
-  if (existsSync(repoDir)) {
-    await command("git", ["-C", repoDir, "fetch", "origin"]);
+  const base = (process.env.VINCI_WORKER_GIT_BASE ?? "https://github.com/").replace(/\/+$/, "");
+  const cloneUrl = `${base}/${repo}.git`;
+  const cached = existsSync(repoDir);
+
+  if (branchOverride) {
+    validateBranchName(branch);
+    // git itself is the authority on ref-name legality; ask it rather than trusting our regex alone.
+    const legal = await command("git", ["check-ref-format", "--branch", branch], { allowFailure: true });
+    if (legal.status !== 0) throw new Error(`envelope branch ${branch} is not a valid git branch name`);
+    // The envelope pinned the branch (e.g. continuing a held PR). Three cases, three different
+    // reasons — the ledger and the operator attribution follow the reason (issue #19):
+    //   (a) absent on origin       ⇒ "not found on origin" (BLOCKED before spawn, cost 0), regardless
+    //       of any stale local branch of that name, which is renamed aside and named, never deleted;
+    //   (b) local is an ancestor    ⇒ fast-forward to the remote tip;
+    //   (c) local has commits not on the remote tip ⇒ refuse (divergence), naming both SHAs.
+    // Existence is asked of origin LIVE (ls-remote) and BEFORE any fetch or clone: a fetch failure
+    // must not mask case (a), and case (a) performs no transfer at all. A show-ref on refs/remotes/*
+    // would trust stale local copies of branches deleted upstream.
+    const remote = await command(
+      "git",
+      cached
+        ? ["-C", repoDir, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${branch}`]
+        : ["ls-remote", "--exit-code", "--heads", cloneUrl, `refs/heads/${branch}`],
+      { allowFailure: true },
+    );
+    if (remote.status !== 0) {
+      // ls-remote --exit-code: 2 = ref not found; anything else is origin unreachable, a different fact.
+      if (remote.status !== 2) throw new Error(`git ls-remote origin failed for ${branch}: ${remote.stderr || remote.status}`);
+      let aside = "";
+      const local = cached
+        ? await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { allowFailure: true })
+        : { status: 1, stdout: "" };
+      if (local.status === 0) {
+        // Case (a) with a stale local branch (an earlier attempt's work): preserve it under a name
+        // the record can cite, so the next attempt of this task does not trip over it.
+        const asideName = await renameBranchAside(repoDir, branch);
+        aside = ` (stale local branch ${branch} at ${local.stdout} renamed aside to ${asideName})`;
+      }
+      throw new Error(`envelope branch ${branch} not found on origin${aside}`);
+    }
+  }
+
+  if (cached) {
+    // The default path works off origin/main and needs it fresh. The branch path fetches its
+    // branch explicitly below (after the not-found gate) and never runs a general fetch first.
+    if (!branchOverride) await command("git", ["-C", repoDir, "fetch", "origin"]);
     // Shared-tree quarantine: a prior run that ended without committing (honest BLOCKED/
     // UNVERIFIED, or a kill) leaves tracked modifications and untracked files that make every
     // later checkout fail ("would be overwritten"). Preserve, never discard — a failed task's
@@ -123,42 +234,51 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
     }
   } else {
     mkdirSync(dirname(repoDir), { recursive: true });
-    const base = (process.env.VINCI_WORKER_GIT_BASE ?? "https://github.com/").replace(/\/+$/, "");
-    await command("git", ["clone", `${base}/${repo}.git`, repoDir]);
+    await command("git", ["clone", cloneUrl, repoDir]);
   }
 
   if (branchOverride) {
-    // Defense in depth: task.mjs validates too, but this function must be safe standalone.
-    if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(branch) || branch.includes("..") || /^refs[\/.]/.test(branch) || branch.includes("refs/") || branch.endsWith(".lock") || branch.endsWith("/") || branch === "HEAD") {
-      throw new Error(`envelope branch ${branch} is not a plain git branch name`);
-    }
-    // git itself is the authority on ref-name legality; ask it rather than trusting our regex alone.
-    const legal = await command("git", ["check-ref-format", "--branch", branch], { allowFailure: true });
-    if (legal.status !== 0) throw new Error(`envelope branch ${branch} is not a valid git branch name`);
-    // The envelope pinned the branch (e.g. continuing a held PR). It must exist on origin NOW —
-    // ls-remote asks origin live; a show-ref on refs/remotes/* would trust stale local copies
-    // of branches deleted upstream. Silent fallback would strand work next to its target.
-    const remote = await command(
+    // Materialize the branch explicitly, by full refspec, BEFORE resolving its tip, and resolve
+    // the tip from the LOCAL clone: ls-remote's SHA is a name origin knows, not necessarily an
+    // object this clone has (a general fetch is only as wide as remote.origin.fetch).
+    await command("git", ["-C", repoDir, "fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    const fetched = await command(
       "git",
-      ["-C", repoDir, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${branch}`],
+      ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
       { allowFailure: true },
     );
-    if (remote.status !== 0) throw new Error(`envelope branch ${branch} not found on origin`);
-    const remoteTip = remote.stdout.split("\n")[0].split(/\s/)[0];
-    if (!/^[0-9a-f]{40}$/.test(remoteTip)) throw new Error(`unexpected ls-remote output for ${branch}`);
+    if (fetched.status !== 0 || !/^[0-9a-f]{40}$/.test(fetched.stdout)) {
+      throw new Error(`envelope branch ${branch} exists on origin but fetch did not materialize origin/${branch} locally`);
+    }
+    const remoteTip = fetched.stdout;
     const local = await command(
       "git",
       ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
       { allowFailure: true },
     );
-    if (local.status === 0) {
+    const localSha = local.status === 0 ? local.stdout : null;
+    if (localSha) {
       // Never reset away local-only commits (a crashed prior attempt's work): -B is destructive.
       const anc = await command(
         "git",
-        ["-C", repoDir, "merge-base", "--is-ancestor", branch, remoteTip],
+        ["-C", repoDir, "merge-base", "--is-ancestor", `refs/heads/${branch}`, remoteTip],
         { allowFailure: true },
       );
-      if (anc.status !== 0) throw new Error(`local branch ${branch} has commits not on origin; refusing to reset (divergence)`);
+      if (anc.status === 1) {
+        const reason = `local branch ${branch} at ${localSha} has commits not on origin/${branch} at ${remoteTip}; refusing to reset (divergence)`;
+        // Never-pushed residue (soak cohort 2 rows 11/11b: a Night-1 local branch, 2 ahead / 82
+        // behind origin's rebuilt PR head, no upstream, on no origin head): move it aside so the
+        // NEXT attempt can continue at origin/<branch>. This attempt is still refused — the rename
+        // is a fact the record must carry, not something to paper over.
+        const verdict = await classifyDivergedLocal(repoDir, branch, localSha, remoteTip);
+        if (verdict.residue) {
+          const asideName = await renameBranchAside(repoDir, branch);
+          throw new Error(`${reason}; never-pushed residue renamed aside to ${asideName} — retry continues at origin/${branch}`);
+        }
+        throw new Error(verdict.note ? `${reason}; ${verdict.note}` : reason);
+      }
+      if (anc.status !== 0) throw new Error(`ancestry check failed for ${branch} (${localSha} vs origin/${branch} ${remoteTip}): ${anc.stderr || anc.status}`);
+      // Case (b): local is an ancestor (or equal) ⇒ -B is a fast-forward to the remote tip.
     }
     await command("git", ["-C", repoDir, "checkout", "-B", branch, remoteTip]);
     return { branch, repoDir };
