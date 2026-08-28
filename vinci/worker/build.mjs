@@ -105,6 +105,24 @@ export async function fetchServerBuild(serverUrl, { timeoutMs = 3000 } = {}) {
 // Never throws; never mutates the install: `VINCI_UPDATE_DISABLED=1` stops the launcher from
 // self-updating while it answers, so a version probe can never be the thing that changes the
 // version. Returns `{ version, path }` or `{ error }`.
+//
+// The probe runs under a MINIMAL env (probeEnv), never the daemon's: the daemon's environment
+// carries the bus token, the Governor token, provider keys, GitHub and AWS credentials, and a
+// `--version` answer needs none of them. Only PATH (so the launcher finds node/bash), HOME
+// (its install root), TMPDIR and LANG cross over, plus VINCI_UPDATE_DISABLED=1.
+const PROBE_ENV_ALLOWLIST = ["PATH", "HOME", "TMPDIR", "LANG"];
+export function probeEnv(base = process.env) {
+  const env = {};
+  for (const key of PROBE_ENV_ALLOWLIST) if (base[key] !== undefined) env[key] = base[key];
+  env.VINCI_UPDATE_DISABLED = "1";
+  return env;
+}
+
+// A version is one token: `<major>.<minor>.<patch>[-<prerelease>]`. Anything else (a banner, a
+// help text, a shell error printed to stdout) is not a version and is recorded as an error, so
+// a task record can never carry prose where a comparable version belongs.
+const VERSION_TOKEN = /^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$/;
+
 export function vinciBinaryVersion({ timeoutMs = 10_000, name = "vinci" } = {}) {
   let path;
   try {
@@ -116,7 +134,7 @@ export function vinciBinaryVersion({ timeoutMs = 10_000, name = "vinci" } = {}) 
     const result = spawnSync(path, ["--version"], {
       encoding: "utf8",
       timeout: timeoutMs,
-      env: { ...process.env, VINCI_UPDATE_DISABLED: "1" },
+      env: probeEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     if (result.error) {
@@ -129,6 +147,7 @@ export function vinciBinaryVersion({ timeoutMs = 10_000, name = "vinci" } = {}) 
     }
     const version = (result.stdout ?? "").split("\n").map((line) => line.trim()).find(Boolean) ?? "";
     if (!version) return { error: `${path} --version printed nothing` };
+    if (!VERSION_TOKEN.test(version)) return { error: `unparseable version: ${version.slice(0, 40)}` };
     return { version, path };
   } catch (error) {
     return { error: `${path} --version failed: ${error?.message ?? String(error)}` };

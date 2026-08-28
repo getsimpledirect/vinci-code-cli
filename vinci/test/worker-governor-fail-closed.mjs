@@ -74,9 +74,10 @@ function assertBlockedBeforeWork(fixture, taskId, reasonPattern, classification 
   assert(blocker, 'a blocker must be posted');
   const body = blocker.body ?? JSON.stringify(blocker);
   // W0.5 + #18: every terminal post ends with ` worker_build=<commit-or-version>[-dirty]
-  // vinci_binary=<version | unknown: <error>>`; assert it, then match the reason pattern (some
-  // are `$`-anchored) on the body without those tags.
-  const buildTail = / worker_build=\S+ vinci_binary=.+$/;
+  // vinci_binary=<version>`; the fixture's probe succeeds here, so the version is one token
+  // (the `unknown: <error>` form is covered by worker-binary-version.mjs). Assert the tail, then
+  // match the reason pattern (some are `$`-anchored) on the body without it.
+  const buildTail = / worker_build=\S+ vinci_binary=\S+$/;
   assert.match(body, buildTail, `blocker must end with worker_build= vinci_binary=, got: ${body}`);
   assert.match(body.replace(buildTail, ''), reasonPattern);
   const expectedLabel = classification === 'refused' ? 'Governor refused the lease' : 'Governor unavailable/invalid';

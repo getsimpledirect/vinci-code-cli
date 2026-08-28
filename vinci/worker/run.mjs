@@ -186,7 +186,17 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
         "read,grep,find,ls,bash,edit,write",
         envelope.spec,
       ],
-      { cwd: repoDir, detached: true, env: process.env, stdio: ["ignore", "inherit", "inherit"] },
+      // Post-0.0.51 rule (#18): a task NEVER runs under a self-updating launcher. The daemon
+      // probes `vinci --version` immediately before this spawn and records it as the task's
+      // `vinci_binary`; with VINCI_UPDATE_DISABLED=1 the launcher cannot swap its payload between
+      // that probe and this run, so the recorded version IS the executed version by construction.
+      // Updates are an operator action (`vinci update`, as the deploy recipe already does).
+      {
+        cwd: repoDir,
+        detached: true,
+        env: { ...process.env, VINCI_UPDATE_DISABLED: "1" },
+        stdio: ["ignore", "inherit", "inherit"],
+      },
     );
     let limitTripped = null;
     let killTimer;

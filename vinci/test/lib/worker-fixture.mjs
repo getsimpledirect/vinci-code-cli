@@ -36,6 +36,10 @@ export class WorkerTestFixture {
     this.getRequests = [];
     // When set (e.g. 500), every /v1/evidence POST answers with that status instead of 200.
     this.evidencePostStatus = null;
+    // When set to a RegExp, every /v1/messages POST whose subject matches answers 500 and is
+    // recorded in failedPosts instead of postedMessages (to exercise post-failure retry paths).
+    this.failPostSubjects = null;
+    this.failedPosts = [];
     // GET /v1/version (unauthenticated, like vinci-gpu-control). Set serveVersion=false to make
     // the route 404 so the daemon records `{ error }` instead of a build.
     this.serverBuild = {
@@ -130,6 +134,12 @@ export class WorkerTestFixture {
             this.rejectedPosts.push(message);
             response.writeHead(422, { "content-type": "application/json" });
             response.end(JSON.stringify({ error: `invalid refs: ${invalidRefs.join(", ")}` }));
+            return;
+          }
+          if (this.failPostSubjects && this.failPostSubjects.test(message.subject ?? "")) {
+            this.failedPosts.push(message);
+            response.writeHead(500, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: "fixture: post refused" }));
             return;
           }
           this.postedMessages.push(message);

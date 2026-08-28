@@ -13,7 +13,7 @@ import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
-import { assertTaskId, parseEnvelope, TaskLifecycle } from "./task.mjs";
+import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
 import { readSessionState } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
@@ -26,28 +26,60 @@ const workerBuild = buildIdentity();
 const version = workerBuild.version;
 // Filled at startup from GET <server>/v1/version (or `{ error }`); stamped on every task.
 let serverBuild = { error: "not fetched" };
-// #18: `<PATH vinci> --version`, i.e. the launcher payload that actually runs tasks. Computed at
-// startup AND re-checked before every task (the launcher self-updates between tasks), so the
-// value stamped on a task record is the binary that ran THAT task. `{ version, path }` or
-// `{ error }`; the last observed value also drives the once-per-change drift post.
+// #18: `<PATH vinci> --version`, i.e. the launcher payload that actually runs tasks. Probed at
+// startup (the `online` post's value) AND immediately before every spawn (the value the task
+// record carries, see processHandoff), because an operator can update the launcher between
+// tasks. `{ version, path }` or `{ error }`. This is the LAST OBSERVED probe: it is what early
+// terminal posts (which never spawn) report, and what terminalPostBody prints.
 let vinciBinary = { error: "not checked" };
 
-// Re-read the binary version before a task; when it differs from the last observed value, post the
-// drift ONCE per change (`worker <id> vinci binary changed <old> -> <new>`) — the signal the 0.0.51
-// incident lacked. The refreshed value is what startAttempt stamps on the task record.
-async function recheckVinciBinary(bus, workerId) {
-  const previous = formatVinciBinary(vinciBinary);
-  const current = vinciBinaryVersion();
-  vinciBinary = current;
-  const now = formatVinciBinary(current);
-  if (now !== previous) {
+// Drift signal (#18), persisted so it survives restarts: `<state-dir>/vinci-binary.json` holds
+// the last ANNOUNCED `{ version, path }`. Rules:
+//   - only a version -> version change is announced (`worker <id> vinci binary changed A -> B`,
+//     once per change; A -> B -> A is two changes);
+//   - a probe `{ error }` is recorded on the task but never announced and never resets the
+//     last-announced value, so a flaky probe cannot fake a drift or hide the next real one;
+//   - the first successful probe on a box is the baseline: persisted, not announced;
+//   - the file is written only AFTER the post succeeded, so a failed post is retried before the
+//     next task (or at the next start) instead of being lost.
+const ANNOUNCED_BINARY_FILE = "vinci-binary.json";
+
+function readAnnouncedBinary(stateDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(stateDir, ANNOUNCED_BINARY_FILE), "utf8"));
+    return typeof parsed?.version === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeAnnouncedBinary(stateDir, binary) {
+  const target = join(stateDir, ANNOUNCED_BINARY_FILE);
+  const temporary = `${target}.tmp-${process.pid}`;
+  writeFileSync(temporary, `${JSON.stringify({ version: binary.version, path: binary.path, announced_at: new Date().toISOString() }, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, target);
+}
+
+async function announceBinaryChange(bus, stateDir, workerId) {
+  if (!vinciBinary || vinciBinary.error) return false;
+  const last = readAnnouncedBinary(stateDir);
+  if (!last) {
+    writeAnnouncedBinary(stateDir, vinciBinary);
+    return false;
+  }
+  if (last.version === vinciBinary.version) return false;
+  try {
     await bus.post(
       "status",
-      `worker ${workerId} vinci binary changed ${previous} -> ${now}`,
-      `vinci_binary=${now} previous=${previous} path=${current.path ?? "unknown"} worker_build=${formatWorkerBuild(workerBuild)}`,
+      `worker ${workerId} vinci binary changed ${last.version} -> ${vinciBinary.version}`,
+      `vinci_binary=${vinciBinary.version} previous=${last.version} path=${vinciBinary.path} worker_build=${formatWorkerBuild(workerBuild)}`,
     );
+  } catch (error) {
+    process.stderr.write(`vinci worker: vinci binary change post failed, will retry before the next task: ${error.message}\n`);
+    return false;
   }
-  return current;
+  writeAnnouncedBinary(stateDir, vinciBinary);
+  return true;
 }
 
 function usage() {
@@ -324,11 +356,6 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   if (lifecycle.isTerminal()) return true;
   if (!acquireTaskClaim(stateDir, taskId)) return false;
 
-  // #18: ask the binary what it is BEFORE this task's record is created and before anything is
-  // spawned, so the record, every terminal post and the drift signal all name the binary that
-  // will run this task — not the one that was on PATH when the daemon started.
-  await recheckVinciBinary(bus, workerId);
-
   let envelope;
   try {
     envelope = parseEnvelope(message.body);
@@ -401,6 +428,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     }
 
     const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
+    // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
+    // which can take long enough for an operator update to land — and stamp the task with it.
+    // runVinci spawns with VINCI_UPDATE_DISABLED=1, so nothing can change between this probe
+    // and the run: the recorded version is the executed version.
+    vinciBinary = vinciBinaryVersion();
+    lifecycle.record({ vinci_binary: vinciBinaryRecord(vinciBinary) });
+    await announceBinaryChange(bus, stateDir, workerId);
     lifecycle.transition("RUNNING");
     const run = await runVinci({ envelope: envelopeToUse,
       stateDir,
@@ -505,6 +539,9 @@ async function main() {
       `worker ${options.id} online`,
       `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`,
     );
+    // A change since the last announced binary (e.g. an update while the daemon was down, or a
+    // change whose post failed before a restart) is announced here, once.
+    await announceBinaryChange(bus, options.stateDir, options.id);
     do {
       let cursor = loadCursor(options.stateDir, options.id);
       const messages = await bus.poll(options.id, cursor);
