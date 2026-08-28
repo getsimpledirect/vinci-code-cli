@@ -3,7 +3,7 @@
 // refuses to start without --governor.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -48,9 +48,10 @@ async function startGovernor(respond) {
   };
 }
 
-function runWorker(fixture, workerId, extraArgs, envOverrides, { stripGovernorToken = false } = {}) {
+function runWorker(fixture, workerId, extraArgs, envOverrides, { stripGovernorToken = false, stripBusToken = false } = {}) {
   const env = fixture.getEnv(envOverrides);
   if (stripGovernorToken) delete env.VINCI_GOVERNOR_TOKEN;
+  if (stripBusToken) delete env.VINCI_BUS_TOKEN;
   const proc = spawn('node', [WORKER, 'start', '--id', workerId, '--server', fixture.busUrl(), '--once', '--state-dir', fixture.tempDir, ...extraArgs], {
     env,
     stdio: 'pipe',
@@ -60,7 +61,7 @@ function runWorker(fixture, workerId, extraArgs, envOverrides, { stripGovernorTo
   return new Promise((r) => proc.on('close', (code) => r({ code, stderr })));
 }
 
-function assertBlockedBeforeWork(fixture, taskId, reasonPattern) {
+function assertBlockedBeforeWork(fixture, taskId, reasonPattern, classification = 'unavailable') {
   const snapshot = state(fixture, taskId);
   assert.equal(snapshot.state, 'BLOCKED', `expected BLOCKED, got ${snapshot.state} (${JSON.stringify(snapshot.outcome)})`);
   assert.equal(snapshot.terminal, true);
@@ -68,9 +69,15 @@ function assertBlockedBeforeWork(fixture, taskId, reasonPattern) {
   assert.equal(snapshot.lease, null, 'no lease may be recorded on a blocked task');
   assert.equal(fixture.getVinciCalls().length, 0, 'model must not be spawned');
   assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'repository must not be cloned');
+  assert.equal(snapshot.outcome.governor, classification, 'outcome.governor must classify refusal vs unavailability');
   const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
   assert(blocker, 'a blocker must be posted');
-  assert.match(blocker.body ?? JSON.stringify(blocker), reasonPattern);
+  const body = blocker.body ?? JSON.stringify(blocker);
+  assert.match(body, reasonPattern);
+  const expectedLabel = classification === 'refused' ? 'Governor refused the lease' : 'Governor unavailable/invalid';
+  const otherLabel = classification === 'refused' ? 'Governor unavailable/invalid' : 'Governor refused the lease';
+  assert(body.includes(expectedLabel), `blocker must carry "${expectedLabel}", got: ${body}`);
+  assert(!body.includes(otherLabel), `blocker must not carry "${otherLabel}"`);
   return snapshot;
 }
 
@@ -176,12 +183,48 @@ await test('T2d governor 409 refusal blocks with rule text', async () => {
     fixture.linkTools(TOOLS);
     await fixture.startBus([handoff('15', 'w5', 'repo: test/repo\nevidence: none\n\nTask')]);
     await runWorker(fixture, 'w5', ['--governor', governor.url], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
-    assertBlockedBeforeWork(fixture, '15', /path already leased to worker:other/);
+    assertBlockedBeforeWork(fixture, '15', /path already leased to worker:other/, 'refused');
   } finally {
     await governor.close();
     await fixture.cleanup();
   }
 });
+
+// T2e: a 200 whose ttl cannot bound the run is NOT a lease. No default ttl exists. Each case
+// must BLOCK with the ttl echoed, no clone, no spawn. (NaN is not JSON; it is sent raw and hits
+// the invalid-JSON path — also covered so a "NaN" body can never slip through as a lease.)
+const INVALID_TTL_CASES = [
+  { name: 'ttl=0', raw: JSON.stringify({ paths: ['.'], ttl: 0 }), pattern: /Governor lease invalid: ttl=0$/ },
+  { name: 'ttl=-1', raw: JSON.stringify({ paths: ['.'], ttl: -1 }), pattern: /Governor lease invalid: ttl=-1$/ },
+  { name: 'ttl="60" (string)', raw: JSON.stringify({ paths: ['.'], ttl: '60' }), pattern: /Governor lease invalid: ttl="60"$/ },
+  { name: 'ttl=null', raw: JSON.stringify({ paths: ['.'], ttl: null }), pattern: /Governor lease invalid: ttl=null$/ },
+  { name: 'ttl missing', raw: JSON.stringify({ paths: ['.'] }), pattern: /Governor lease invalid: ttl=undefined$/ },
+  { name: 'ttl=NaN (raw, not JSON)', raw: '{"paths":["."],"ttl":NaN}', pattern: /Governor returned invalid JSON \(status 200\)/ },
+  { name: 'ttl=1e309 (Infinity after parse)', raw: '{"paths":["."],"ttl":1e309}', pattern: /Governor lease invalid: ttl=null$/ },
+  { name: 'malformed 200 body (JSON array)', raw: '["."]', pattern: /Governor returned a malformed body \(status 200\)/ },
+  { name: 'malformed 200 body (JSON string)', raw: '"granted"', pattern: /Governor returned a malformed body \(status 200\)/ },
+];
+let ttlCase = 30;
+for (const { name, raw, pattern } of INVALID_TTL_CASES) {
+  const taskId = String(ttlCase++);
+  await test(`T2e 200 with ${name} blocks`, async () => {
+    const fixture = new WorkerTestFixture('gov-bad-ttl');
+    const governor = await startGovernor((_request, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(raw);
+    });
+    try {
+      fixture.createRepo('test', 'repo');
+      fixture.linkTools(TOOLS);
+      await fixture.startBus([handoff(taskId, 'w5', 'repo: test/repo\nevidence: none\n\nTask')]);
+      await runWorker(fixture, 'w5', ['--governor', governor.url], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
+      assertBlockedBeforeWork(fixture, taskId, pattern);
+    } finally {
+      await governor.close();
+      await fixture.cleanup();
+    }
+  });
+}
 
 // T3: lease ttl 60 with the envelope default max_runtime_s 14400 => effective limit 60, recorded.
 await test('T3 lease ttl caps max_runtime_s and is recorded in the snapshot', async () => {
@@ -275,6 +318,64 @@ await test('T4 --require-governor without --governor exits 78 before polling', a
     assert.equal(fixture.getRequests.length, 0, 'must not poll the bus');
     assert.equal(fixture.getPostedMessages().length, 0);
     assert.equal(existsSync(join(fixture.tempDir, 'daemon.lock')), false, 'must refuse before taking the daemon lock');
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// T4d: the Governor requirement is checked BEFORE the bus token, so a box missing BOTH still
+// exits 78 (not the generic 1 for VINCI_BUS_TOKEN).
+await test('T4d --require-governor without --governor AND without VINCI_BUS_TOKEN exits 78', async () => {
+  const fixture = new WorkerTestFixture('gov-required-nobus');
+  try {
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([]);
+    const { code, stderr } = await runWorker(fixture, 'w8', ['--require-governor'], {}, { stripBusToken: true });
+    assert.equal(code, 78, `expected exit 78, got ${code}: ${stderr}`);
+    assert.match(stderr, /Governor is required/);
+    assert.doesNotMatch(stderr, /VINCI_BUS_TOKEN is required/);
+    assert.equal(fixture.getRequests.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// T4e: the requirement is checked BEFORE the daemon lock: with a live daemon.lock already held
+// (which alone would exit 75) the exit is still 78 and the lock is byte-for-byte untouched.
+await test('T4e --require-governor without --governor exits 78 and leaves a live daemon.lock untouched', async () => {
+  const fixture = new WorkerTestFixture('gov-required-lock');
+  try {
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([]);
+    const lockPath = join(fixture.tempDir, 'daemon.lock');
+    // This test process is a live pid, so the lock is "owned by a live daemon".
+    const lockContents = `${JSON.stringify({ pid: process.pid, id: 'w8', started_at: '2026-08-26T00:00:00.000Z' })}\n`;
+    writeFileSync(lockPath, lockContents, { mode: 0o600 });
+    const before = statSync(lockPath);
+    await new Promise((r) => setTimeout(r, 20));
+    const { code, stderr } = await runWorker(fixture, 'w8', ['--require-governor'], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
+    assert.equal(code, 78, `expected exit 78, got ${code}: ${stderr}`);
+    assert.doesNotMatch(stderr, /daemon lock/);
+    assert.equal(readFileSync(lockPath, 'utf8'), lockContents, 'lock contents must be unchanged');
+    const after = statSync(lockPath);
+    assert.equal(after.mtimeMs, before.mtimeMs, 'lock mtime must be unchanged');
+    assert.equal(after.ino, before.ino, 'lock inode must be unchanged (not replaced)');
+    assert.equal(fixture.getRequests.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// T4f: control for T4e — WITHOUT --require-governor the same live lock exits 75, proving the lock
+// path is reachable and T4e's 78 comes from ordering, not from the lock check being absent.
+await test('T4f control: live daemon.lock without --require-governor exits 75', async () => {
+  const fixture = new WorkerTestFixture('gov-lock-control');
+  try {
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([]);
+    writeFileSync(join(fixture.tempDir, 'daemon.lock'), `${JSON.stringify({ pid: process.pid, id: 'w8' })}\n`, { mode: 0o600 });
+    const { code } = await runWorker(fixture, 'w8', [], {});
+    assert.equal(code, 75);
   } finally {
     await fixture.cleanup();
   }

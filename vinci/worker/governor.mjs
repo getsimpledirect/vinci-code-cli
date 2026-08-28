@@ -7,13 +7,31 @@
 // only when no Governor URL is configured at all (Stage 1 behaviour).
 export const GOVERNOR_TOKEN_MISSING = "governor token missing (VINCI_GOVERNOR_TOKEN)";
 
-function blocked(reason) {
-  return { success: false, blocked: true, reason };
+// Every non-success result is `blocked: true` and carries exactly one classification so the
+// daemon (and the soak ledger reading its blocker posts) can tell a Governor DECISION from a
+// Governor FAILURE:
+//   refused: true  — the Governor answered 403/409/422 and refused the lease (its rule text rides
+//                    verbatim in `reason`)
+//   error: true    — no usable decision: missing token, unreachable, network error, non-JSON or
+//                    malformed body, unexpected status, or a lease without a valid ttl
+function refused(reason) {
+  return { success: false, blocked: true, refused: true, error: false, reason };
+}
+
+function unavailable(reason) {
+  return { success: false, blocked: true, refused: false, error: true, reason };
+}
+
+// A lease is a lease only with a finite, positive, numeric ttl. There is deliberately NO default:
+// `0`, negative, NaN, a string, null, or a missing field all mean the response cannot bound the
+// run, and an unbounded run is exactly what the Governor exists to prevent.
+function validTtl(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
 export async function claimGovernorPaths({ governorUrl, token, paths, taskId, attempt }) {
   if (!governorUrl) return null;
-  if (!token) return blocked(GOVERNOR_TOKEN_MISSING);
+  if (!token) return unavailable(GOVERNOR_TOKEN_MISSING);
 
   const url = `${governorUrl}/v1/governor/claim-paths`;
   const idempotencyKey = `${taskId}/${attempt}`;
@@ -31,25 +49,28 @@ export async function claimGovernorPaths({ governorUrl, token, paths, taskId, at
       body: JSON.stringify(body),
     });
   } catch (error) {
-    return blocked(`Governor connection failed: ${error?.cause?.code ?? error.message}`);
+    return unavailable(`Governor connection failed: ${error?.cause?.code ?? error.message}`);
   }
 
   let responseBody;
   try {
     responseBody = await response.json();
   } catch (error) {
-    return blocked(`Governor returned invalid JSON (status ${response.status}): ${error.message}`);
+    return unavailable(`Governor returned invalid JSON (status ${response.status}): ${error.message}`);
   }
-  if (!responseBody || typeof responseBody !== "object") {
-    return blocked(`Governor returned a non-object body (status ${response.status})`);
+  if (!responseBody || typeof responseBody !== "object" || Array.isArray(responseBody)) {
+    return unavailable(`Governor returned a malformed body (status ${response.status}): ${JSON.stringify(responseBody)}`);
   }
 
   if (response.status === 200) {
+    if (!validTtl(responseBody.ttl)) {
+      return unavailable(`Governor lease invalid: ttl=${JSON.stringify(responseBody.ttl)}`);
+    }
     return {
       success: true,
       claimed_at: new Date().toISOString(),
       paths: responseBody.paths || paths,
-      ttl: responseBody.ttl || 3600,
+      ttl: responseBody.ttl,
       budget_usd: responseBody.budget_usd,
       max_runtime_s: responseBody.max_runtime_s,
       deadline: responseBody.deadline,
@@ -58,11 +79,11 @@ export async function claimGovernorPaths({ governorUrl, token, paths, taskId, at
 
   // Explicit refusal: the Governor's rule text rides verbatim into the blocker.
   if (response.status === 403 || response.status === 409 || response.status === 422) {
-    return blocked(responseBody.reason || `Lease refused (${response.status})`);
+    return refused(responseBody.reason || `Lease refused (${response.status})`);
   }
 
   // Any other status is not a decision; never proceed on it.
-  return blocked(`Governor error: unexpected status ${response.status} ${responseBody.reason || "unknown"}`);
+  return unavailable(`Governor error: unexpected status ${response.status} ${responseBody.reason || "unknown"}`);
 }
 
 function positiveSeconds(value) {
@@ -81,7 +102,8 @@ export function tightenEnvelopeLimits(envelope, governorOrder) {
 
   // The lease TTL is a hard runtime cap: a task must never outlive its lease. The effective
   // limit is the smallest of the envelope's max_runtime_s, the Governor's work-order
-  // max_runtime_s, and the lease ttl (seconds).
+  // max_runtime_s, and the lease ttl (seconds; already validated finite-positive by
+  // claimGovernorPaths, re-checked here so the function is safe standalone).
   const runtimeCaps = [governorOrder.max_runtime_s, governorOrder.ttl]
     .map(positiveSeconds)
     .filter((seconds) => seconds !== null && seconds < tightened.max_runtime_s);

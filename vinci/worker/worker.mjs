@@ -65,6 +65,17 @@ function parseArgs(args, env = process.env) {
     else if (argument === "--governor") options.governor = value;
     else options.pollSeconds = Number(value);
   }
+  if (options.requireGovernor && !options.governor) {
+    // W0.1: a Governor was REQUIRED but none configured. Refuse to start rather than run a
+    // single ungoverned poll. This is the FIRST check after option parsing — ahead of the bus
+    // token, id/server validation, the daemon lock and any bus request — so the exit code is
+    // 78 regardless of what else is missing.
+    const configError = new Error(
+      "a Governor is required (--require-governor / VINCI_WORKER_REQUIRE_GOVERNOR=1) but no --governor <url> was given; refusing to start",
+    );
+    configError.exitCode = EXIT_CONFIG;
+    throw configError;
+  }
   if (!options.id) throw new Error("--id is required");
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.id)) throw new Error("invalid worker id");
   if (!options.server) throw new Error("--server is required");
@@ -73,15 +84,6 @@ function parseArgs(args, env = process.env) {
   }
   const token = env.VINCI_BUS_TOKEN;
   if (!token) throw new Error("VINCI_BUS_TOKEN is required");
-  if (options.requireGovernor && !options.governor) {
-    // W0.1: a Governor was REQUIRED but none configured. Refuse to start rather than run a
-    // single ungoverned poll. Checked before the daemon lock and before any bus request.
-    const configError = new Error(
-      "a Governor is required (--require-governor / VINCI_WORKER_REQUIRE_GOVERNOR=1) but no --governor <url> was given; refusing to start",
-    );
-    configError.exitCode = EXIT_CONFIG;
-    throw configError;
-  }
   return { ...options, token };
 }
 
@@ -318,9 +320,13 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       });
 
       if (!claimResult?.success) {
+        // Two classifications, never conflated: a REFUSAL is a Governor decision (403/409/422,
+        // rule text verbatim); everything else is the Governor being unavailable or its answer
+        // being unusable. Both BLOCK; the soak ledger attributes them differently.
         const reason = claimResult?.reason ?? "governor returned no lease decision";
-        const label = claimResult?.blocked ? "lease refused" : "governor error";
-        lifecycle.transition("BLOCKED", { outcome: { reason } });
+        const governor = claimResult?.refused === true ? "refused" : "unavailable";
+        const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
+        lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
         await bus.post("blocker", `task ${taskId} blocked`, `${label}: ${reason}`, {
           inReplyTo: message.message_id,
         });
