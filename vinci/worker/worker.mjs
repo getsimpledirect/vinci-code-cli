@@ -27,19 +27,29 @@ const version = (() => {
 })();
 
 function usage() {
-  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>]";
+  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor]";
 }
 
-function parseArgs(args) {
+// EX_CONFIG (sysexits.h): the daemon refused to start because its configuration is incomplete.
+const EXIT_CONFIG = 78;
+
+function parseArgs(args, env = process.env) {
   if (args.shift() !== "start") throw new Error(usage());
-  const options = { once: false, pollSeconds: 60, stateDir: resolve(".vinci-worker-state"), governor: null };
+  const options = {
+    once: false,
+    pollSeconds: 60,
+    stateDir: resolve(".vinci-worker-state"),
+    governor: null,
+    requireGovernor: env.VINCI_WORKER_REQUIRE_GOVERNOR === "1",
+  };
   const seen = new Set();
   while (args.length > 0) {
     const argument = args.shift();
-    if (argument === "--once") {
+    if (argument === "--once" || argument === "--require-governor") {
       if (seen.has(argument)) throw new Error(`duplicate option: ${argument}`);
       seen.add(argument);
-      options.once = true;
+      if (argument === "--once") options.once = true;
+      else options.requireGovernor = true;
       continue;
     }
     if (!["--id", "--server", "--poll-seconds", "--state-dir", "--governor"].includes(argument)) {
@@ -55,13 +65,24 @@ function parseArgs(args) {
     else if (argument === "--governor") options.governor = value;
     else options.pollSeconds = Number(value);
   }
+  if (options.requireGovernor && !options.governor) {
+    // W0.1: a Governor was REQUIRED but none configured. Refuse to start rather than run a
+    // single ungoverned poll. This is the FIRST check after option parsing — ahead of the bus
+    // token, id/server validation, the daemon lock and any bus request — so the exit code is
+    // 78 regardless of what else is missing.
+    const configError = new Error(
+      "a Governor is required (--require-governor / VINCI_WORKER_REQUIRE_GOVERNOR=1) but no --governor <url> was given; refusing to start",
+    );
+    configError.exitCode = EXIT_CONFIG;
+    throw configError;
+  }
   if (!options.id) throw new Error("--id is required");
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.id)) throw new Error("invalid worker id");
   if (!options.server) throw new Error("--server is required");
   if (!Number.isFinite(options.pollSeconds) || options.pollSeconds <= 0) {
     throw new Error("--poll-seconds must be a positive number");
   }
-  const token = process.env.VINCI_BUS_TOKEN;
+  const token = env.VINCI_BUS_TOKEN;
   if (!token) throw new Error("VINCI_BUS_TOKEN is required");
   return { ...options, token };
 }
@@ -208,11 +229,18 @@ function recentLogTail(limit) {
 
 async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
-  const evidenceDetails = evidence?.success
-    ? [`evidence_uri=${evidence.uri}`, `evidence_sha256=${evidence.sha256}`]
-    : evidence && !evidence.success
-      ? [`evidence_error=${evidence.error}`]
-      : [];
+  // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
+  // set by uploadEvidence solely after a successful `aws s3 cp`); a failed upload also carries
+  // the intended uri, which must NOT be advertised. evidence_error is present whenever evidence
+  // was attempted and did not fully land (upload or metadata POST).
+  const landed = evidence?.uploaded === true;
+  const evidenceDetails = evidence
+    ? [
+        landed ? `evidence_uri=${evidence.uri}` : undefined,
+        landed ? `evidence_sha256=${evidence.sha256}` : undefined,
+        evidence.success ? undefined : `evidence_error=${evidence.error}`,
+      ]
+    : [];
   const details = [
     `state=${state.state}`,
     `exit_code=${state.exit_code}`,
@@ -228,8 +256,23 @@ async function postFinal(bus, message, envelope, state, evidence) {
   if (state.state === "COMPLETED" && isLedgerRef(envelope.ref)) {
     options.refs = [envelope.ref];
     await bus.post("finding", subject, details, options);
+  } else if (state.state === "BLOCKED" && state.harness_stop) {
+    // An instrument stop: the harness refused the agent's work mid-run. Say so explicitly so the
+    // soak ledger attributes the block to the instrument, not to the model's own narrative.
+    const stop = state.harness_stop;
+    await bus.post(
+      "blocker",
+      subject,
+      `${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`,
+      options,
+    );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
-    const reason = state.outcome?.reason ? `${details} reason=${state.outcome.reason}` : details;
+    // A FAILED run may also have hit a harness stop; surface count AND reason so the ledger can
+    // attribute it. harness_stop_reason is the instrument's text; reason= stays the outcome narrative.
+    const stops = state.harness_stop
+      ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
+      : details;
+    const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
     await bus.post("blocker", subject, reason, options);
   } else {
     await bus.post("status", subject, details, options);
@@ -275,7 +318,6 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     return true;
   }
 
-  lifecycle.transition("CLAIMED");
   if (attempt.firstAttempt) {
     await bus.post("status", `task ${taskId} claimed`, `claimed ${taskId} attempt ${attempt.attempt}`, {
       inReplyTo: message.message_id,
@@ -283,7 +325,10 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
   }
 
   try {
-    // Stage 2: Governor lease (if configured)
+    // Stage 2: Governor lease (if configured). FAIL-CLOSED (W0.1): with a Governor URL set,
+    // the task proceeds to clone/spawn ONLY on a granted lease. A missing token, an
+    // unreachable Governor, a network error, a non-JSON body, an unexpected status, or a
+    // missing decision all BLOCK the task here, before prepareRepository and runVinci.
     let envelopeToUse = envelope;
     if (governorUrl) {
       const governorToken = process.env.VINCI_GOVERNOR_TOKEN;
@@ -295,32 +340,26 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
         attempt: attempt.attempt,
       });
 
-      if (!claimResult) {
-        // Governor not configured, skip
-      } else if (!claimResult.success && claimResult.blocked) {
-        // Lease refused - block the task
-        lifecycle.transition("BLOCKED", {
-          outcome: { reason: claimResult.reason },
-        });
-        await bus.post("blocker", `task ${taskId} blocked`, `lease refused: ${claimResult.reason}`, {
+      if (!claimResult?.success) {
+        // Two classifications, never conflated: a REFUSAL is a Governor decision (403/409/422,
+        // rule text verbatim); everything else is the Governor being unavailable or its answer
+        // being unusable. Both BLOCK; the soak ledger attributes them differently.
+        const reason = claimResult?.reason ?? "governor returned no lease decision";
+        const governor = claimResult?.refused === true ? "refused" : "unavailable";
+        const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
+        lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
+        await bus.post("blocker", `task ${taskId} blocked`, `${label}: ${reason}`, {
           inReplyTo: message.message_id,
         });
         return true;
-      } else if (!claimResult.success) {
-        // Lease connection error - fail with error message
-        lifecycle.transition("FAILED", {
-          outcome: { reason: claimResult.reason },
-          exit_code: 1,
-        });
-        await bus.post("blocker", `task ${taskId} failed`, `governor error: ${claimResult.reason}`, {
-          inReplyTo: message.message_id,
-        });
-        return true;
-      } else {
-        // Lease granted - record and tighten limits if Governor order info available
-        lifecycle.transition("CLAIMED", { lease: claimResult });
-        envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
       }
+
+      // Lease granted: tighten the envelope (budget, max_runtime_s, deadline, and the lease
+      // ttl as a runtime cap) and record both the lease and the effective runtime limit.
+      envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
+      lifecycle.record({
+        lease: { ...claimResult, effective_max_runtime_s: envelopeToUse.max_runtime_s },
+      });
     }
 
     const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
@@ -329,24 +368,38 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       stateDir,
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
     const head = await readHead(repository.repoDir);
-    lifecycle.transition("EVIDENCE_PENDING", { ...run, head, outcome: run.outcome ?? null });
+    lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
     const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId });
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
-    const state = finalState({
-      envelope: envelopeToUse,
+    const harnessStops = run.harness_stops ?? [];
+    const intendedState = finalState({
       exitCode: run.exit_code,
       limitTripped: run.limit_tripped,
       outcome: run.outcome,
       blocker: Boolean(published.blocker_reason),
       pr: published.pr,
+      harnessStops,
     });
-    lifecycle.transition(state, { ...published, outcome });
+    // Record the instrument stop on the task whenever one occurred — even when exit/limit outranked it
+    // — so the snapshot (and the evidence bundle's result.json) carry the machine-observed reason next
+    // to the model's narrative and the soak ledger can see that a latch also fired on a FAILED run.
+    const harnessStop =
+      harnessStops.length > 0 ? { count: harnessStops.length, reason: harnessStops[0].reason } : null;
 
-    // Stage 2: upload evidence bundle before the final bus post so uri/sha256 (or the
-    // failure) can ride in the post body. No-op when VINCI_EVIDENCE_URI_PREFIX is unset.
+    // W0.2 evidence before terminal: the terminal state is written only AFTER the evidence
+    // bundle was attempted. `planned` is the exact snapshot that will be committed (state +
+    // published fields) and is what ships as result.json. No-op when
+    // VINCI_EVIDENCE_URI_PREFIX is unset (soak boxes may run without evidence).
     // sessionJsonl: session transcript from <state-dir>/sessions/<task-id>/ (outside the repo).
     // gitDiff is against the task branch base; it may be empty when the run changed nothing.
     // logTail: last 200 lines of the daemon's stderr so the bundle captures how the run ended.
+    const planned = lifecycle.plan(intendedState, { ...published, outcome, evidence_error: null, harness_stop: harnessStop });
+    // The bundle is built BEFORE anything is committed, so result.json is marked as a
+    // pre-terminal snapshot: `state` is the intended state, `committed_state` is null and
+    // `terminal` is false. A bundle-alone reader therefore never sees a committed COMPLETED;
+    // the committed state lives only in the task file, which also records
+    // `evidence_result_state` so a downgrade after upload is machine-detectable.
+    const resultJson = { ...planned, snapshot: "pre-terminal", committed_state: null, terminal: false };
     const session = readSessionState(join(stateDir, "sessions", taskId), attempt.sessionId);
     const sessionJsonl = session.path ? readFileSync(session.path, "utf8") : null;
     const gitDiffResult = await command("git", [
@@ -360,7 +413,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     const evidenceResult = await uploadEvidence({
       sessionJsonl,
       gitDiff,
-      resultJson: lifecycle.snapshot(),
+      resultJson,
       logTail,
       uriPrefix: process.env.VINCI_EVIDENCE_URI_PREFIX,
       taskId,
@@ -368,8 +421,23 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
       busToken: bus.token,
       ref: envelopeToUse.ref,
     });
+
+    // Evidence was attempted and did not fully land (S3 upload or /v1/evidence POST failed):
+    // a COMPLETED claim without evidence is not a completed claim -> UNVERIFIED.
+    // BLOCKED/FAILED keep their state but record why evidence is missing.
+    const evidenceError = evidenceResult && !evidenceResult.success ? evidenceResult.error : null;
+    const state = evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
+    lifecycle.transition(state, {
+      ...planned,
+      evidence_error: evidenceError,
+      // State the uploaded result.json names as intended; differs from `state` after a downgrade.
+      evidence_result_state: evidenceResult ? intendedState : null,
+    });
     await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult);
   } catch (error) {
+    // A terminal state is immutable: if the failure happened after it was committed (e.g. the
+    // final bus post), surface the error to the daemon loop instead of rewriting the record.
+    if (lifecycle.isTerminal()) throw error;
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
     await postFinal(bus, message, envelope, lifecycle.snapshot(), null);
   }

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 
 import { readSessionState } from "./session-read.mjs";
@@ -85,6 +85,42 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
   const branch = branchOverride ?? `worker/${taskId}`;
   if (existsSync(repoDir)) {
     await command("git", ["-C", repoDir, "fetch", "origin"]);
+    // Shared-tree quarantine: a prior run that ended without committing (honest BLOCKED/
+    // UNVERIFIED, or a kill) leaves tracked modifications and untracked files that make every
+    // later checkout fail ("would be overwritten"). Preserve, never discard — a failed task's
+    // working tree can be the only copy of its work — then hand this task a clean tree.
+    // -z: NUL-separated, UNQUOTED paths — the plain porcelain form quotes names with
+    // spaces/specials, and a quoted path fails the rename while clean -fd then deletes
+    // the real file: the exact loss this code exists to prevent.
+    const dirty = await command("git", ["-C", repoDir, "status", "--porcelain", "-z"], { allowFailure: true });
+    const entries = (dirty.stdout ?? "").split("\0").filter((l) => l.length > 1);
+    if (entries.length > 0) {
+      if (!/^[A-Za-z0-9._-]+$/.test(taskId)) throw new Error(`unsafe taskId for debris path: ${taskId}`);
+      const debrisDir = join(stateDir, "debris", taskId);
+      mkdirSync(debrisDir, { recursive: true });
+      writeFileSync(join(debrisDir, "status.txt"), entries.join("\n") + "\n");
+      // Archive gates: a failed capture must abort BEFORE reset/clean destroys the source.
+      // git apply also requires a trailing newline the harness's stdout handling can strip.
+      const asPatch = (t) => (t && !t.endsWith("\n") ? t + "\n" : (t ?? ""));
+      const patch = await command("git", ["-C", repoDir, "diff", "HEAD"], { allowFailure: true });
+      if (patch.status !== 0) throw new Error("quarantine: tracked-diff capture failed; refusing to clean");
+      writeFileSync(join(debrisDir, "tracked.patch"), asPatch(patch.stdout));
+      const staged = await command("git", ["-C", repoDir, "diff", "--cached"], { allowFailure: true });
+      if (staged.status !== 0) throw new Error("quarantine: staged-diff capture failed; refusing to clean");
+      writeFileSync(join(debrisDir, "staged.patch"), asPatch(staged.stdout));
+      for (const entry of entries) {
+        if (!entry.startsWith("??")) continue;
+        const rel = entry.slice(3);
+        const from = join(repoDir, rel);
+        const to = join(debrisDir, "untracked", rel);
+        mkdirSync(dirname(to), { recursive: true });
+        try { renameSync(from, to); } catch (e) {
+          if (e?.code !== "ENOENT") throw e; // any other failure must abort BEFORE clean -fd deletes the file
+        }
+      }
+      await command("git", ["-C", repoDir, "reset", "--hard", "HEAD"], { allowFailure: true });
+      await command("git", ["-C", repoDir, "clean", "-fd"], { allowFailure: true });
+    }
   } else {
     mkdirSync(dirname(repoDir), { recursive: true });
     const base = (process.env.VINCI_WORKER_GIT_BASE ?? "https://github.com/").replace(/\/+$/, "");
@@ -199,6 +235,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
         limit_tripped: limitTripped,
         cost_usd: session.costUsd,
         outcome: session.outcome,
+        harness_stops: session.harnessStops,
       });
     };
     child.once("error", () => finish(1, null));
@@ -250,14 +287,34 @@ export async function publish({ envelope, repoDir, branch, taskId, limitTripped 
     { cwd: repoDir, allowFailure: true },
   );
   if (created.status === 0) result.pr = created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null;
+  const createErr = `${created.stderr ?? ""}${created.stdout ?? ""}`;
+  if (result.pr === null && (created.status === 0 || /already exists|already has|pull request for/i.test(createErr))) {
+    // A PR may already exist for this branch (by-reference tasks continue held PRs); an
+    // existing PR IS the evidence — creation failing must not classify the task UNVERIFIED.
+    // Auth/network failures do NOT take this path: they stay visible as pr:null.
+    const listed = await command("gh", ["pr", "list", "--head", branch, "--state", "open", "--json", "url"], { cwd: repoDir, allowFailure: true });
+    try {
+      const parsed = JSON.parse(listed.stdout ?? "[]");
+      if (Array.isArray(parsed) && parsed[0]?.url) result.pr = parsed[0].url;
+    } catch { /* no JSON, no PR */ }
+  }
   return result;
 }
 
-export function finalState({ envelope, exitCode, limitTripped, outcome, blocker, pr }) {
+// Outcome precedence — machine-observed events outrank the model's narrative about itself
+// (issues #5/#6: the harness refused the required work mid-run and the outcome entry still said DONE).
+//   1. non-zero exit or a tripped limit                         => FAILED
+//   2. any harness stop in the session (see HARNESS_STOP_PATTERNS) => BLOCKED, even over DONE + PR
+//   3. outcome BLOCKED/WAITING, or BLOCKER.md at HEAD            => BLOCKED
+//   4. outcome DONE_UNVERIFIED                                    => UNVERIFIED
+//   5. outcome DONE and a PR exists                               => COMPLETED
+//   6. anything else (incl. evidence: none, exit 0 alone)         => UNVERIFIED (produced, unassessed)
+export function finalState({ exitCode, limitTripped, outcome, blocker, pr, harnessStops }) {
   if (exitCode !== 0 || limitTripped) return "FAILED";
+  if (Array.isArray(harnessStops) && harnessStops.length > 0) return "BLOCKED";
   if (outcome?.state === "BLOCKED" || outcome?.state === "WAITING" || blocker) return "BLOCKED";
   if (outcome?.state === "DONE_UNVERIFIED") return "UNVERIFIED";
-  if (envelope.evidence === "none" || pr) return "COMPLETED";
+  if (outcome?.state === "DONE" && pr) return "COMPLETED";
   return "UNVERIFIED";
 }
 
