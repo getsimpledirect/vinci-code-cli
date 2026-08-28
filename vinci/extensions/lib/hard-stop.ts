@@ -2,19 +2,31 @@
  * Hard-stop registry — issues #5 and #6.
  *
  * A machine stop that froze the agent's ability to finish (the no-progress latch in vinci-todo, or
- * the loopbreak action reserve refusing a finalization step such as `git commit`) is a FACT about
- * the session that outranks whatever the model says afterwards. Observed live 2026-08-27: the latch
- * locked every mutation, the model wrote "done", and the task-outcome record said DONE over a tree
- * of uncommitted work. The site that blocks records the stop here; `buildVinciTaskOutcome` reads it
- * and refuses to emit DONE / DONE_UNVERIFIED for that task — in every mode, not just unattended.
+ * any harness refusal of a finalization step such as `git commit`) is a FACT about the session that
+ * outranks whatever the model says afterwards. Observed live 2026-08-27: the latch locked every
+ * mutation, the model wrote "done", and the task-outcome record said DONE over a tree of
+ * uncommitted work. The site that blocks records the stop here; `buildVinciTaskOutcome` reads it
+ * and refuses to close that task as anything but BLOCKED — in every mode, not just unattended.
  *
  * Keyed by task (session) id and held on `globalThis`, like the automation-stop latch in
- * `control.ts`, because isolated extension loaders must all see the same registry. Cleared by the
- * next REAL user instruction (an extension steer or a mid-stream keystroke is not one) and on
- * session start — the same release rules as the automation stop.
+ * `control.ts`, because isolated extension loaders must all see the same registry. Cleared for the
+ * CURRENT task only (never the whole registry) by the next REAL user instruction — an extension
+ * steer or a mid-stream keystroke is not one — and on session start, the same release rules as the
+ * automation stop. A refusal-class stop is also RESOLVED by a later successful finalization command
+ * (the model retried without the refused option, and the commit landed): the stop was a fact about
+ * one attempt, not about the session's end state. The latch is never resolved this way — it freezes
+ * every mutation, so nothing can land under it.
  */
+import { isVinciFinalizationCommand } from "./unattended.ts";
 
-export type VinciHardStopSource = "latch" | "reserve";
+export type VinciHardStopSource =
+  | "latch" // vinci-todo: the no-progress automation stop froze mutations
+  | "reserve" // vinci-loopbreak: an action reserve refused a finalization step
+  | "ceiling" // vinci-loopbreak: the per-turn action ceiling refused a finalization step
+  | "error-streak" // vinci-loopbreak: the consecutive-failure stop refused a finalization step
+  | "fixation" // vinci-loopbreak: an identical-repeat block refused a finalization step
+  | "review-pause" // vinci-todo: the failed-review pause refused a finalization step
+  | "guard"; // vinci-guard: the safety guard refused a finalization step
 
 export type VinciHardStop = {
   taskId: string;
@@ -44,10 +56,10 @@ export function getVinciHardStop(taskId: string): Readonly<VinciHardStop> | unde
   return hardStopStore.stops.get(taskId);
 }
 
-/** Clear one task's stop, or every stop when no id is given (session start / a new user instruction). */
-export function clearVinciHardStop(taskId?: string): void {
-  if (taskId === undefined) hardStopStore.stops.clear();
-  else hardStopStore.stops.delete(taskId);
+/** Clear ONE task's stop. Every caller passes the task it is running under (WARN-2: a session start
+ *  or user instruction in one task must not erase another task's recorded stop). */
+export function clearVinciHardStop(taskId: string): void {
+  hardStopStore.stops.delete(taskId);
 }
 
 /** The task id an extension context is running under; "" when the harness has no session manager. */
@@ -57,4 +69,45 @@ export function vinciTaskIdOf(ctx: { sessionManager?: { getSessionId?: () => str
   } catch {
     return "";
   }
+}
+
+type StopContext = { sessionManager?: { getSessionId?: () => string } } | undefined;
+
+/**
+ * The ONE place every refusal path reports through (review BLOCK-3). If `command` is a
+ * finalization-shaped bash command, the refusal is a hard stop for the task and is recorded with
+ * the refusing site's reason and the command it refused; otherwise nothing is recorded. Returns
+ * whether a stop was recorded, so a site can keep its own block shape.
+ */
+export function recordFinalizationRefusal(ctx: StopContext, source: VinciHardStopSource, command: string, reason: string): boolean {
+  if (!isVinciFinalizationCommand(command)) return false;
+  recordVinciHardStop(vinciTaskIdOf(ctx), source, `${reason} The refused step was the finalization command \`${command.slice(0, 80)}\`.`);
+  return true;
+}
+
+/** `recordFinalizationRefusal` plus the block result itself — for sites whose refusal is a plain block. */
+export function refuseFinalization(
+  ctx: StopContext,
+  source: VinciHardStopSource,
+  command: string,
+  reason: string,
+): { block: true; reason: string } {
+  recordFinalizationRefusal(ctx, source, command, reason);
+  return { block: true, reason };
+}
+
+/**
+ * A finalization command SUCCEEDED for this task after a refusal-class stop: the refusal was one
+ * attempt's fact, not the session's end state (a `git add -A` refused for breadth, then
+ * `git add file && git commit` landed). Resolve the stop so the record can close on the real
+ * outcome. The latch is never resolved here — nothing can land under it.
+ */
+export function resolveVinciHardStopByFinalization(ctx: StopContext, command: string): boolean {
+  const taskId = vinciTaskIdOf(ctx);
+  const stop = hardStopStore.stops.get(taskId);
+  if (!stop || stop.source === "latch") return false;
+  // Only a landed stage/commit resolves it — a successful `git status` proves nothing landed.
+  if (!isVinciFinalizationCommand(command) || !/\bgit(?:\s+--no-pager)?\s+(?:add|commit)\b/.test(command)) return false;
+  hardStopStore.stops.delete(taskId);
+  return true;
 }

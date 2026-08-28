@@ -88,14 +88,22 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   extension that behaves differently without one detects it the same way, `isVinciUnattended(ctx)`
   in `lib/unattended.ts` (Pi's `ctx.hasUI`, false in print mode). Three consequences: (1) the
   no-progress latch blocks with an *unattended stop* reason ("… (unattended run: ending the task as
-  BLOCKED)") instead of asking for an instruction nobody can give; (2) a latch block — or the action
-  reserve refusing a finalization step — is recorded as a **hard stop** in `lib/hard-stop.ts`, keyed
-  by task, and `buildVinciTaskOutcome` then refuses to close that task as `DONE` / `DONE_UNVERIFIED`
-  in any mode: the record becomes `BLOCKED` with the stop text as its reason, whatever the closing
-  message claims; (3) unattended, finalization-shaped bash commands — `git add`, `git commit`,
-  `git status`, `git diff`, local git only (`isVinciFinalizationCommand`) — are exempt from both
-  action reserves because the commit *is* the deliverable; `git push`, `gh`, and anything
-  network-shaped stay reserved (the worker daemon publishes). Interactively the reserve is unchanged.
+  BLOCKED)") instead of asking for an instruction nobody can give; (2) a latch block — or ANY harness
+  refusal of a finalization step (the action reserves, the per-turn action ceiling, the error-streak
+  and identical-repeat stops, the failed-review pause, the safety guard's checkpoint/broad-stage/
+  secret gates) — is recorded through one helper as a **hard stop** in `lib/hard-stop.ts`, keyed by
+  task, carried on the outcome record, and `buildVinciTaskOutcome` then refuses to close that task as
+  anything but `BLOCKED` in any mode and from any state (`DONE`, `DONE_UNVERIFIED`, `WAITING`), with
+  the stop text as its reason, whatever the closing message claims — and the receipt never remaps a
+  hard-stop `BLOCKED` back to `DONE` on a remote `VERIFIED_PASS` (the verdict is noted alongside). A
+  later *landed* stage/commit resolves a refusal-class stop (the model retried without the refused
+  option); the latch is never resolved that way. The next real user instruction or a session start
+  clears only the current task's stop. (3) Unattended, finalization-shaped bash commands — `git add`,
+  `git commit`, `git status`, `git diff`; local git only; no `-C`/config-injecting globals, no
+  editor/interactive/external-program options (`isVinciFinalizationCommand`, which shares its argv
+  parser with the guard's checkpoint gate) — pass both action reserves, the action ceiling, and the
+  latch, because the commit *is* the deliverable; `git push`, `gh`, and anything network-shaped stay
+  reserved (the worker daemon publishes). Interactively every gate is unchanged.
 - **Source ownership** — `vinci-scope.ts` treats `node_modules` as read-only diagnostic evidence,
   blocks direct edits there, and mechanically appends bounded `git grep` evidence for tracked project
   imports, wrappers, and configuration before a project-level fix. A mutation is blocked until every

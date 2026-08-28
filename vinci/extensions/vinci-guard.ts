@@ -17,6 +17,8 @@ import {
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { recordVinciConfirmationGate, sendVinciControl } from "./lib/control.ts";
+import { recordFinalizationRefusal } from "./lib/hard-stop.ts";
+import { parseLocalGitSegment } from "./lib/unattended.ts";
 import { attachImagesFromText } from "./lib/images.ts";
 import { redactSecrets, redactSecretsDeep } from "./lib/secrets.ts";
 import { planCommandMutates } from "./vinci-plan.ts";
@@ -258,7 +260,12 @@ export function shellRiskText(command: string): string {
 
 /** Git index/history changes are deliberate checkpoints, not a routine implementation detail. */
 export function isGitStageOrCommit(command: string): boolean {
-  return shellSegments(command).some((segment) => /^(?:git\s+)(?:add|commit)\b/i.test(commandBody(segment)));
+  // Shared argv parser with the loopbreak reserve exemption (review BLOCK-1): `git -C .. commit`
+  // and `git --no-pager commit` are commits here exactly as they are there.
+  return shellSegments(command).some((segment) => {
+    const parsed = parseLocalGitSegment(commandBody(segment));
+    return parsed !== null && (parsed.subcommand === "add" || parsed.subcommand === "commit");
+  });
 }
 
 /** The user must explicitly ask for staging or committing in the current request. Asking to PUSH
@@ -898,11 +905,18 @@ export default function (pi: ExtensionAPI) {
           "vinci-broad-git-block",
           "Broad git staging was blocked. Inspect git status, then stage only the exact files changed for the current task. Never use git add ., git add -A, git add --all, git add *, or git commit -a.",
         );
+        // [#6, review BLOCK-3] Every guard refusal of a finalization step is a recorded hard stop; a
+        // later landed stage/commit resolves it (lib/hard-stop.ts).
+        recordFinalizationRefusal(ctx, "guard", cmd, "Vinci blocked broad git staging.");
         return { block: true, reason: "Vinci blocked broad git staging. Stage only explicit files from the current task." };
       }
 
       if (isGitStageOrCommit(riskText) && !gitCheckpointApproved) {
-        if (!ctx.hasUI) return blockHeadless("save a git checkpoint (stage or commit changes)");
+        if (!ctx.hasUI) {
+          const held = blockHeadless("save a git checkpoint (stage or commit changes)");
+          recordFinalizationRefusal(ctx, "guard", cmd, held.reason);
+          return held;
+        }
         const ok = await confirmSafely(
           ctx,
           "Vinci — save a git checkpoint?",
@@ -914,6 +928,7 @@ export default function (pi: ExtensionAPI) {
             "vinci-unrequested-git-block",
             "The user did not authorize a git checkpoint. Leave the working tree and index alone, report the changed files, and do not retry git add or git commit.",
           );
+          recordFinalizationRefusal(ctx, "guard", cmd, "Blocked — the user did not ask Vinci to stage or commit changes.");
           return { block: true, reason: "Blocked — the user did not ask Vinci to stage or commit changes." };
         }
         gitCheckpointApproved = true;
@@ -963,11 +978,14 @@ export default function (pi: ExtensionAPI) {
       const named = isCommitSecrets(riskText);
       const swept = !named && isBroadGitStage(riskText) ? secretsAboutToBeStaged(ctx.cwd) : [];
       if (named || swept.length) {
-        if (!ctx.hasUI)
-          return blockHeadless(
+        if (!ctx.hasUI) {
+          const held = blockHeadless(
             "commit secret files to git",
             `If they shouldn't be in git, add ${swept.length ? swept.join(", ") : "them"} to .gitignore and commit the rest.`,
           );
+          recordFinalizationRefusal(ctx, "guard", cmd, held.reason);
+          return held;
+        }
         const which = swept.length ? `\n\nThis would sweep in: ${swept.join(", ")}` : "";
         const ok = await confirmSafely(
           ctx,
@@ -976,7 +994,9 @@ export default function (pi: ExtensionAPI) {
         );
         if (!ok) {
           ctx.ui.notify("Kept your secrets out of git.", "info");
-          return { block: true, reason: `Blocked — the user declined to commit secret files (leak risk).${swept.length ? ` Add ${swept.join(", ")} to .gitignore first.` : " Add them to .gitignore instead."}` };
+          const declined = `Blocked — the user declined to commit secret files (leak risk).${swept.length ? ` Add ${swept.join(", ")} to .gitignore first.` : " Add them to .gitignore instead."}`;
+          recordFinalizationRefusal(ctx, "guard", cmd, declined);
+          return { block: true, reason: declined };
         }
         return undefined;
       }

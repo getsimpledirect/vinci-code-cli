@@ -33,7 +33,13 @@ import { relative, resolve } from "node:path";
 import { classifyCompletionResult, complete, type UserMessage } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { clearVinciAutomationStop, requestVinciAutomationStop, sendVinciControl } from "./lib/control.ts";
-import { clearVinciHardStop, recordVinciHardStop, vinciTaskIdOf } from "./lib/hard-stop.ts";
+import {
+  clearVinciHardStop,
+  recordFinalizationRefusal,
+  refuseFinalization,
+  resolveVinciHardStopByFinalization,
+  vinciTaskIdOf,
+} from "./lib/hard-stop.ts";
 import { isVinciFinalizationCommand, isVinciUnattended } from "./lib/unattended.ts";
 import { isPendingVinciSourceOwnershipInspection } from "./lib/source-ownership-state.ts";
 import { getVinciUiState } from "./lib/ui-state.ts";
@@ -563,9 +569,9 @@ export default function (pi: ExtensionAPI) {
   const failedMutationCalls = new Set<string>(); // a byte-identical failed edit/write cannot succeed on retry
   const recent: Step[] = []; // rolling (call, result) history for escalation context
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
     clearVinciAutomationStop();
-    clearVinciHardStop();
+    clearVinciHardStop(vinciTaskIdOf(ctx));
   });
 
   // agent_start fires once per user prompt — reset the per-turn counters (keep `task`, set on input).
@@ -609,14 +615,14 @@ export default function (pi: ExtensionAPI) {
   // Capture the user's request (before agent processing) so a stronger teammate knows the goal.
   // A continue-ish message carries the repeat counters (see agent_start) and does NOT overwrite the
   // real task — "continue" as escalation context would tell a stronger teammate nothing.
-  pi.on("input", async (event) => {
+  pi.on("input", async (event, ctx) => {
     const text = event.text?.trim();
     if (!text) return;
     // Only a REAL new prompt lifts the stop: a mid-stream keystroke ("wait, what?") un-latching a
     // firm stop resumed the exact frozen loop with a fresh call budget (round-2 audit P1-4).
     if (event.source !== "extension" && !event.streamingBehavior) {
       clearVinciAutomationStop();
-      clearVinciHardStop();
+      clearVinciHardStop(vinciTaskIdOf(ctx));
     }
     // Read-only bash calls never touch `calls`, so recovery inputs mid-navigation must also see
     // the navigation counter or they reset the turn and re-grant the whole budget (round-12 P0).
@@ -814,6 +820,12 @@ export default function (pi: ExtensionAPI) {
         /could not find the exact text|no changes|validation failed|overlap|must match exactly|didn'?t match|required propert/i.test(result) ||
         /page doesn'?t exist|couldn'?t (?:read|reach|resolve)|took too long to load|resolves to an internal/i.test(result));
     errorStreak = failed && !READ_ONLY_TOOLS.has(event.toolName) ? errorStreak + 1 : 0;
+    // [#6] A refused `git add -A` followed by a landed `git add file && git commit` is a finished
+    // task, not a stopped one: a SUCCESSFUL finalization command resolves a refusal-class hard stop
+    // (never the latch — nothing can land under it).
+    if (!failed && event.toolName === "bash") {
+      resolveVinciHardStopByFinalization(ctx, String((event.input as { command?: unknown }).command ?? ""));
+    }
 
     // Result-aware fixation: the identical-call counter (`seen`) is keyed on tool+args only, so three
     // `bash: npm test` calls with the SAME command but DIFFERENT output (polling a rebuild, re-running
@@ -853,6 +865,10 @@ export default function (pi: ExtensionAPI) {
     // separate recovery block below so it never escalates into abandoning the task.
     const fixation = async (key: string, n: number) => {
       interventions += 1;
+      // [#6, review BLOCK-3] An identical-repeat block of a finalization step is a hard stop.
+      if (tool === "bash") {
+        recordFinalizationRefusal(ctx, "fixation", String((event.input as { command?: unknown }).command ?? ""), "Vinci stopped a repeated identical action.");
+      }
       // TRY_DIFFERENT prescribes advisor/convene_council — arm the one-shot ceiling exemption so
       // the prescription isn't immediately blocked by the per-turn ceiling (round-2 audit P2-6).
       fixationAdvisorExemption = true;
@@ -970,18 +986,16 @@ export default function (pi: ExtensionAPI) {
     // predicate is the single definition in lib/unattended.ts: local git only, never push/gh/network.
     // Interactively the reserve still applies — but refusing a finalization step is then a hard stop
     // the outcome record must reflect (lib/hard-stop.ts), not a nudge the narrative can talk past.
-    const finalizationCommand = tool === "bash" && isVinciFinalizationCommand(command);
-    const finalizationExempt = finalizationCommand && isVinciUnattended(ctx);
-    const reserveRefusal = (reason: string): { block: true; reason: string } => {
-      if (finalizationCommand) {
-        recordVinciHardStop(vinciTaskIdOf(ctx), "reserve", `${reason} The refused step was the finalization command \`${command.slice(0, 80)}\`.`);
-      }
-      return { block: true, reason };
-    };
+    const finalizationExempt = tool === "bash" && isVinciUnattended(ctx) && isVinciFinalizationCommand(command);
     calls += 1;
     if (!readOnlyNavigation) actionCalls += 1;
     if (!readOnlyNavigation && actionCalls > TURN_CALL_CEILING) {
       if (upgradeAllowance) return undefined;
+      // [#6, review BLOCK-2] The ceiling ran before the reserve exemption, so an unattended commit
+      // after 25 actions was refused with a different message — the same defect. Unattended, the
+      // finalization step passes the ceiling too (it does not count as investigation; the turn
+      // still ends on the answer). Interactively the refusal stands and is a recorded hard stop.
+      if (finalizationExempt) return undefined;
       if (!finalVerificationUsed && (tool === "rerun_check" || isDirectVerificationCommand(command))) {
         finalVerificationUsed = true;
         return undefined;
@@ -992,6 +1006,7 @@ export default function (pi: ExtensionAPI) {
         fixationAdvisorExemption = false;
         return undefined;
       }
+      if (tool === "bash") recordFinalizationRefusal(ctx, "ceiling", command, "Vinci hit its per-turn action limit before finishing.");
       return firmBlock(
         ctx,
         "Vinci's been at this a while — telling it to stop and answer. Press Ctrl+C if you want to step in.",
@@ -1088,7 +1103,7 @@ export default function (pi: ExtensionAPI) {
           if (ctx.hasUI) ctx.ui.notify("Vinci has enough evidence — reserving the remaining actions for the fix.", "info");
           sendVinciControl(pi, "vinci-mutation-runway", MUTATION_RUNWAY_STEER);
         }
-        return reserveRefusal("Vinci reserved the remaining actions for implementation or an answer.");
+        return refuseFinalization(ctx, "reserve", command, "Vinci reserved the remaining actions for implementation or an answer.");
       }
     }
 
@@ -1099,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
       errorStreak = 0;
       if (ctx.hasUI) ctx.ui.notify("Several edits in a row failed — stopping to explain.", "info");
       sendVinciControl(pi, "vinci-error-streak", ERROR_STEER);
-      return { block: true, reason: "Vinci paused after several failed actions." };
+      return refuseFinalization(ctx, "error-streak", command, "Vinci paused after several failed actions.");
     }
 
     if (
@@ -1115,7 +1130,7 @@ export default function (pi: ExtensionAPI) {
       postMutationInspections++;
       if (postMutationInspections > POST_MUTATION_INSPECTION_LIMIT) {
         sendVinciControl(pi, "vinci-post-mutation-runway", POST_MUTATION_STEER);
-        return reserveRefusal("Vinci reserved the remaining actions for verification or the final answer.");
+        return refuseFinalization(ctx, "reserve", command, "Vinci reserved the remaining actions for verification or the final answer.");
       }
     }
 

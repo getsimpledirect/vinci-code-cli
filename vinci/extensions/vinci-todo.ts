@@ -18,8 +18,8 @@ import { Type } from "typebox";
 // check, not the claim. See lib/grader.ts and vinci/docs/verification.md.
 import { gradeChanges } from "./lib/grader.ts";
 import { getVinciAutomationStop, sendVinciControl } from "./lib/control.ts";
-import { clearVinciHardStop, recordVinciHardStop, vinciTaskIdOf } from "./lib/hard-stop.ts";
-import { isVinciUnattended } from "./lib/unattended.ts";
+import { clearVinciHardStop, recordVinciHardStop, refuseFinalization, vinciTaskIdOf } from "./lib/hard-stop.ts";
+import { isVinciFinalizationCommand, isVinciUnattended } from "./lib/unattended.ts";
 import { getVinciUiState, setVinciPlan } from "./lib/ui-state.ts";
 import { installVinciUsageAccumulator } from "./lib/usage-accumulator.ts";
 import {
@@ -315,7 +315,7 @@ export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) 
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    clearVinciHardStop();
+    clearVinciHardStop(vinciTaskIdOf(ctx));
     currentPlan = [];
     automaticContinues = 0;
     stalledAutoContinues = 0;
@@ -325,11 +325,11 @@ export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) 
     updatePlanUi(ctx, currentPlan);
   });
 
-  pi.on("input", async (event) => {
+  pi.on("input", async (event, ctx) => {
     // A mid-stream keystroke or another extension's steer is not the user answering the pause:
     // resetting reviewPaused on those silently voided the "automation paused" promise (round-2 P1-4).
     if (event?.source === "extension" || event?.streamingBehavior) return undefined;
-    clearVinciHardStop();
+    clearVinciHardStop(vinciTaskIdOf(ctx));
     automaticContinues = 0;
     reviewReopens = 0;
     reviewPaused = false;
@@ -339,11 +339,18 @@ export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) 
   // A failed repair review is a user-visible stop state, not another autonomous retry state. Keep
   // reads available so Vinci can explain the evidence, but freeze mutations until the user responds.
   pi.on("tool_call", async (event, ctx) => {
+    const command = event.toolName === "bash" ? String((event.input as { command?: unknown }).command ?? "") : "";
+    // [#6] The loopbreak ceiling latches the automation stop, and this latch then refused the commit
+    // the ceiling had just let through (found by the full-stack test, not by either module alone).
+    // Unattended, a finalization step is not the "autonomous change" the latch exists to stop: the
+    // work already made may land locally; the hard stop already recorded (if any) still closes the
+    // record as BLOCKED, and the daemon decides publishing. Interactively the latch is unchanged.
+    const finalizationExempt = Boolean(command) && isVinciUnattended(ctx) && isVinciFinalizationCommand(command);
     if (
       getVinciAutomationStop().stopped &&
       event.toolName !== "todo" &&
-      (REVIEW_MUTATING_TOOLS.has(event.toolName) ||
-        (event.toolName === "bash" && planCommandMutates(String((event.input as { command?: unknown }).command ?? ""))))
+      !finalizationExempt &&
+      (REVIEW_MUTATING_TOOLS.has(event.toolName) || (Boolean(command) && planCommandMutates(command)))
     ) {
       // [#5] "Wait for the user's next instruction" is a contradiction in an unattended run: nobody
       // can answer, and the model — locked out of every mutation — went on to narrate completion
@@ -365,7 +372,13 @@ export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) 
         "vinci-plan-review-paused",
         "Automation is paused after a repeated review failure. Do not make more changes. Read-only diagnostics and direct verification remain available so you can explain the evidence accurately.",
       );
-      return { block: true, reason: "Vinci paused further changes after independent review still found unresolved issues." };
+      // [#6, review BLOCK-3] Refusing the commit here is a hard stop like any other refusal.
+      return refuseFinalization(
+        ctx,
+        "review-pause",
+        String((event.input as { command?: unknown }).command ?? ""),
+        "Vinci paused further changes after independent review still found unresolved issues.",
+      );
     }
     if (!reviewPaused || !REVIEW_MUTATING_TOOLS.has(event.toolName)) return undefined;
     sendVinciControl(
