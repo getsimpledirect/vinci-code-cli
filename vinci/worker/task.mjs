@@ -143,6 +143,8 @@ export class TaskLifecycle {
         evidence: null,
         limit_tripped: null,
         vinci_version: null,
+        worker_build: null,
+        server_build: null,
         provider: null,
         model: null,
         cost_usd: 0,
@@ -165,7 +167,10 @@ export class TaskLifecycle {
     return this.state.terminal === true || TERMINAL_STATES.has(this.state.state);
   }
 
-  startAttempt(task, vinciVersion) {
+  // builds (W0.5): `{ workerBuild: { version, commit, dirty, source }, serverBuild: <payload|{error}> }`.
+  // `vinci_version` is kept for compatibility; `worker_build` / `server_build` name the exact
+  // builds that produced this record and ride into result.json unchanged.
+  startAttempt(task, vinciVersion, builds = {}) {
     if (this.isTerminal()) throw new Error(`cannot start an attempt on terminal state ${this.state.state}`);
     const firstAttempt = !(Number.isInteger(this.state.attempt) && this.state.attempt > 0);
     const sessionId = typeof this.state.session_id === "string" && this.state.session_id ? this.state.session_id : task.id;
@@ -184,6 +189,10 @@ export class TaskLifecycle {
       evidence: task.envelope.evidence,
       limit_tripped: null,
       vinci_version: vinciVersion,
+      worker_build: builds.workerBuild
+        ? { version: builds.workerBuild.version, commit: builds.workerBuild.commit, dirty: builds.workerBuild.dirty }
+        : null,
+      server_build: builds.serverBuild ?? null,
       provider: task.envelope.provider,
       model: task.envelope.model,
       cost_usd: 0,

@@ -36,6 +36,16 @@ export class WorkerTestFixture {
     this.getRequests = [];
     // When set (e.g. 500), every /v1/evidence POST answers with that status instead of 200.
     this.evidencePostStatus = null;
+    // GET /v1/version (unauthenticated, like vinci-gpu-control). Set serveVersion=false to make
+    // the route 404 so the daemon records `{ error }` instead of a build.
+    this.serverBuild = {
+      component: "vinci-gpu-server",
+      git_sha: "f1e7a2e0c0ffee00000000000000000000000abc",
+      git_sha_source: "git",
+      dirty: false,
+    };
+    this.serveVersion = true;
+    this.versionRequests = 0;
     this.busServer = null;
     this.busPort = 0;
     mkdirSync(this.reposDir, { recursive: true });
@@ -73,6 +83,17 @@ export class WorkerTestFixture {
     this.evidencePosts = [];
 
     const server = createServer((request, response) => {
+      if (request.method === "GET" && request.url === "/v1/version") {
+        this.versionRequests += 1;
+        if (!this.serveVersion) {
+          response.writeHead(404);
+          response.end();
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(this.serverBuild));
+        return;
+      }
       if (request.headers.authorization !== "Bearer test-token") {
         response.writeHead(401);
         response.end();

@@ -17,14 +17,14 @@ import { assertTaskId, parseEnvelope, TaskLifecycle } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
 import { readSessionState } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
+import { buildIdentity, fetchServerBuild, formatServerBuild, formatWorkerBuild } from "./build.mjs";
 
-const version = (() => {
-  try {
-    return JSON.parse(readFileSync(new URL("../identity.json", import.meta.url), "utf8")).version;
-  } catch {
-    return "unknown";
-  }
-})();
+// W0.5: the exact build this daemon runs from, computed once at startup. `version` keeps the
+// identity.json string that task records always carried as `vinci_version`.
+const workerBuild = buildIdentity();
+const version = workerBuild.version;
+// Filled at startup from GET <server>/v1/version (or `{ error }`); stamped on every task.
+let serverBuild = { error: "not fetched" };
 
 function usage() {
   return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor]";
@@ -248,6 +248,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     state.limit_tripped ? `limit=${state.limit_tripped}` : undefined,
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
+    `worker_build=${formatWorkerBuild(workerBuild)}`,
     ...evidenceDetails,
   ]
     .filter(Boolean)
@@ -299,6 +300,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     lifecycle.startAttempt(
       { id: taskId, envelope: { evidence: null, provider: null, model: null } },
       version,
+      { workerBuild, serverBuild },
     );
     const state = /^repo must be/.test(error.message) ? "FAILED" : "BLOCKED";
     lifecycle.transition(state, {
@@ -311,7 +313,7 @@ async function processHandoff(bus, stateDir, message, governorUrl) {
     return true;
   }
 
-  const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version);
+  const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild });
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
     await bus.post("blocker", `task ${taskId} blocked`, "deadline is in the past", { inReplyTo: message.message_id });
@@ -456,6 +458,15 @@ async function main() {
   process.once("SIGINT", handleSignal);
   try {
     const bus = new BusClient(options.server, options.token);
+    // W0.5: record the server's build next to our own and announce both ONCE per daemon start,
+    // before the first poll. A failed /v1/version fetch is recorded, never fatal: the bus
+    // token check and the first poll already gate startup.
+    serverBuild = await fetchServerBuild(options.server);
+    await bus.post(
+      "status",
+      `worker ${options.id} online`,
+      `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)}`,
+    );
     do {
       let cursor = loadCursor(options.stateDir, options.id);
       const messages = await bus.poll(options.id, cursor);

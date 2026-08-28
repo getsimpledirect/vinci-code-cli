@@ -54,7 +54,12 @@ try {
   const liveClaimRun = spawn("node", [...args, "--once"], { env: fixture.getEnv(), stdio: "pipe" });
   assert.equal(await new Promise((resolveClose) => liveClaimRun.once("close", resolveClose)), 0);
   assert.equal(fixture.getVinciCalls().length, 0);
-  assert.equal(fixture.getPostedMessages().length, 0, "live task owner must suppress duplicate claim posts");
+  // Only the per-start `worker <id> online` posts (W0.5) may exist: no claim, no final.
+  assert.equal(
+    fixture.getPostedMessages().filter((post) => !/ online$/.test(post.subject)).length,
+    0,
+    "live task owner must suppress duplicate claim posts",
+  );
 
   writeFileSync(join(claim, "pid"), "99999999\n");
   const deadClaimRun = spawn("node", [...args, "--once"], { env: fixture.getEnv(), stdio: "pipe" });
