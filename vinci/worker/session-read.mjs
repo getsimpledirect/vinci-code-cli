@@ -65,6 +65,44 @@ function taskOutcome(entry) {
   return undefined;
 }
 
+// Machine-observed hard stops. A tool call an extension refused is serialized by the agent loop as a
+// toolResult message whose text IS the extension's block reason (packages/agent/src/agent-loop.ts
+// createErrorToolResult; details.vinciBlocked marks it under VINCI_CODE=1):
+//   {"type":"message","message":{"role":"toolResult","toolCallId":"...","toolName":"bash",
+//     "content":[{"type":"text","text":"Vinci reserved the remaining actions for implementation or an answer."}],
+//     "details":{"vinciBlocked":true},"isError":true,"timestamp":...}}
+// Anchored on stable substrings of the reasons vinci-todo.ts (no-progress latch) and vinci-loopbreak.ts
+// (mutation / post-mutation runway) emit. Case-sensitive. Shared with the harness side so the two
+// halves cannot drift apart silently.
+export const HARNESS_STOP_PATTERNS = Object.freeze([
+  "Wait for the user's next instruction",
+  "Vinci reserved the remaining actions",
+  "Vinci stopped autonomous changes",
+]);
+
+function toolResultText(entry) {
+  if (entry?.type !== "message" || entry?.message?.role !== "toolResult") return undefined;
+  const content = Array.isArray(entry.message.content) ? entry.message.content : [];
+  return content
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
+// Only error-flagged tool results count: a blocked call is always isError=true, whereas a successful
+// grep/cat over the extension sources would echo the same strings without being a stop.
+// Authoritative signal: details.vinciBlocked === true — the marker the agent loop sets when an
+// extension blocks a call (packages/agent/src/agent-loop.ts), independent of the reason wording.
+// The substring patterns are a legacy fallback for sessions written by builds without the marker.
+function harnessStopReason(entry) {
+  if (entry?.message?.isError !== true) return undefined;
+  const text = toolResultText(entry);
+  if (entry.message?.details?.vinciBlocked === true) return text || "Tool execution was blocked";
+  if (!text) return undefined;
+  return HARNESS_STOP_PATTERNS.some((pattern) => text.includes(pattern)) ? text : undefined;
+}
+
 function messageCostUsd(entry) {
   if (entry?.message?.role !== "assistant") return 0;
   const total = entry?.message?.usage?.cost?.total;
@@ -73,7 +111,7 @@ function messageCostUsd(entry) {
 
 export function readSessionState(sessionDir, sessionId) {
   const session = fileForSession(sessionDir, sessionId);
-  if (!session) return { costUsd: 0, outcome: undefined, path: undefined };
+  if (!session) return { costUsd: 0, outcome: undefined, harnessStops: [], path: undefined };
 
   let accumulatedCostUsd = 0;
   let hasUsageEntries = false;
@@ -81,6 +119,11 @@ export function readSessionState(sessionDir, sessionId) {
   let messageEntries = 0;
   let outcomeCostUsd;
   let outcome;
+  const harnessStops = [];
+  session.entries.forEach((entry, index) => {
+    const stop = harnessStopReason(entry);
+    if (stop) harnessStops.push({ index, reason: stop });
+  });
   for (const entry of session.entries) {
     if (entry?.type === "custom" && entry.customType === "vinci-task-usage") {
       hasUsageEntries = true;
@@ -103,7 +146,7 @@ export function readSessionState(sessionDir, sessionId) {
   const costUsd =
     outcomeCostUsd ??
     (hasUsageEntries || accumulatedCostUsd > 0 ? accumulatedCostUsd : messageFallbackCostUsd);
-  return { costUsd, outcome, path: session.path };
+  return { costUsd, outcome, harnessStops, path: session.path };
 }
 
 export function readSessionOutcome(sessionDir, sessionId) {

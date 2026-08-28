@@ -58,9 +58,24 @@ WantedBy=multi-user.target
    - `max_runtime_s`: SIGTERM then SIGKILL after 30s
    - `budget_usd`: Poll session JSONL every 15s; kill if cost exceeds budget
    - `deadline`: Check before start and each poll; kill if past
-7. **Outcome**: Read task-outcome from session JSONL (DONE, DONE-UNVERIFIED, WAITING, BLOCKED)
+7. **Outcome**: Read task-outcome from session JSONL (DONE, DONE-UNVERIFIED, WAITING, BLOCKED) **and** every harness stop — a tool call the harness refused (`vinci-todo` no-progress latch, `vinci-loopbreak` reserved-actions refusal), serialized as an `isError` toolResult whose text is the block reason
 8. **Publish**: Push branch to origin; if evidence==pr and no BLOCKER.md, create a PR
 9. **Report**: Post finding (COMPLETED), blocker (BLOCKED/FAILED), or status (UNVERIFIED)
+
+### Outcome precedence (machine-observed events outrank the model's narrative)
+
+Exit code zero alone means nothing. The final state is the first matching row:
+
+| # | Observed | Final state | Notes |
+|---|----------|-------------|-------|
+| 1 | exit code != 0, or a limit tripped (`budget_usd`, `max_runtime_s`, `deadline`) | `FAILED` | a co-occurring harness stop is still recorded: `harness_stop` on the task file, and `harness_stops=<N> harness_stop_reason=<first stop text>` in the blocker post |
+| 2 | any harness stop in the session JSONL (an `isError` toolResult with `details.vinciBlocked: true`; the `HARNESS_STOP_PATTERNS` substrings in `session-read.mjs` are the fallback for sessions without the marker) | `BLOCKED` | wins even when the outcome entry says DONE and a PR was created; `harness_stop: {count, reason}` is written to the task file and the blocker post says `stop=instrument` with the stop reason |
+| 3 | outcome `BLOCKED` / `WAITING`, or a non-empty `BLOCKER.md` at HEAD | `BLOCKED` | |
+| 4 | outcome `DONE_UNVERIFIED` | `UNVERIFIED` | |
+| 5 | outcome `DONE` **and** a PR exists | `COMPLETED` | the only route to COMPLETED |
+| 6 | anything else (outcome `DONE` without a PR, `evidence: none`, no outcome entry) | `UNVERIFIED` | produced, unassessed |
+
+Why: issues #5 and #6 — the harness refused the agent's required work mid-run (`git commit` refused six times; the no-progress latch told a non-existent user to send the next instruction) and the session still exited 0 with a DONE outcome. The stop the harness recorded is the fact; the outcome entry is the model's story about itself.
 
 ## Task Envelope
 
@@ -68,7 +83,7 @@ Handoff message body (line-oriented headers, blank line, then spec):
 
 ```
 repo: org/repo
-evidence: pr|none                  (default: pr)
+evidence: pr|none                  (default: pr; `none` skips PR creation — the task then ends UNVERIFIED, never COMPLETED)
 provider: openrouter|...           (default: openrouter)
 model: z-ai/glm-5.2               (default)
 budget_usd: 5.0                    (default)
@@ -101,6 +116,7 @@ State file `<state-dir>/tasks/<id>.json`:
   "publish": "pushed",
   "evidence": "pr",
   "limit_tripped": null,
+  "harness_stop": null,
   "vinci_version": "0.42.0",
   "provider": "openrouter",
   "model": "z-ai/glm-5.2",
@@ -110,6 +126,8 @@ State file `<state-dir>/tasks/<id>.json`:
   "evidence_error": null
 }
 ```
+
+`harness_stop` is `{ "count": <stops>, "reason": "<first stop text>" }` whenever a harness stop occurred in the session, regardless of final state (a FAILED run's blocker post also carries `harness_stops=<N> harness_stop_reason=<first stop text>`, distinct from `reason=`, which stays the outcome narrative); it decides the state (row 2 above) only when nothing outranks it. `null` when no stop occurred.
 
 **Restart behavior:**
 - If `terminal=true`: skip (already done)
