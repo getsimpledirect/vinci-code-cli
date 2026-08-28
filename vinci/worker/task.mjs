@@ -1,6 +1,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { executionSpecDigest, workOrderDigest } from "./contracts/digest.mjs";
+
 const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
@@ -45,6 +47,24 @@ function positiveNumber(value, name) {
   return number;
 }
 
+// The plain-branch rule (PR #8): shared by the prose `branch:` header and the digest form's
+// targetBranch, so a contract cannot route a checkout or push anywhere the header could not.
+export function assertPlainBranch(branchValue, name = "branch") {
+  const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+  if (
+    typeof branchValue !== "string" ||
+    !BRANCH.test(branchValue) ||
+    branchValue.includes("..") ||
+    /^refs[\/.]/.test(branchValue) ||
+    branchValue.includes("refs/") ||
+    branchValue.endsWith(".lock") ||
+    branchValue.endsWith("/") ||
+    branchValue === "HEAD"
+  ) {
+    throw new Error(`${name} must be a plain git branch name (letters, digits, ._/-; no leading -/+, no .., no refs/ prefix, no refspec syntax)`);
+  }
+}
+
 export function assertTaskId(taskId) {
   if (!TASK_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
 }
@@ -82,20 +102,7 @@ export function parseEnvelope(body) {
   const spec = normalized.slice(separator + 2).trim();
   if (!spec) throw new Error("task spec must not be empty");
   const branchValue = values.get("branch");
-  if (branchValue !== undefined) {
-    const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
-    if (
-      !BRANCH.test(branchValue) ||
-      branchValue.includes("..") ||
-      /^refs[\/.]/.test(branchValue) ||
-      branchValue.includes("refs/") ||
-      branchValue.endsWith(".lock") ||
-      branchValue.endsWith("/") ||
-      branchValue === "HEAD"
-    ) {
-      throw new Error("branch must be a plain git branch name (letters, digits, ._/-; no leading -/+, no .., no refs/ prefix, no refspec syntax)");
-    }
-  }
+  if (branchValue !== undefined) assertPlainBranch(branchValue, "branch");
   const claim = values.get("claim") ?? ".";
   const ref = values.get("evidence_ref") ?? values.get("ref");
 
@@ -112,6 +119,219 @@ export function parseEnvelope(body) {
     claim,
     spec,
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Handoff by reference (Wave 1B): the DIGEST form.
+//
+// A handoff body whose first non-blank character is `{` is a handoff TRIPLE
+//   { "work_order_id", "contract_digest", "execution_spec_digest" }
+// — exactly those three keys, nothing else (an extra key is a malformed handoff, not an
+// extension point). Anything that does not start with `{` is the legacy prose envelope above.
+// Every term the worker runs under is then reachable from the Governor's pinned registry
+// (`GET /v1/governor/contracts/{work_order_id}`) and cannot be swapped without one of the three
+// values changing — provided the worker RECOMPUTES both digests from what the registry served
+// and refuses on any mismatch. materializeEnvelope is that check; it is pure so the refusal
+// reasons can be pinned by tests without a bus.
+// ---------------------------------------------------------------------------------------------
+const TRIPLE_KEYS = ["work_order_id", "contract_digest", "execution_spec_digest"];
+const DIGEST = /^[0-9a-f]{64}$/;
+const COMMIT = /^[0-9a-f]{40}$/;
+const WORK_ORDER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+// modelClass -> the (provider, model) the daemon spawns `vinci -p` with. EXPLICIT and closed: a
+// class name the table does not know is BLOCKED (`unknown_model_class`), never passed through
+// as a model id. The class names are the managed-provider model ids (`vinci` provider: `forte`,
+// `fortissimo`; `auto` is deliberately absent — a contract names a class, not "whatever the
+// account resolves to"). A spec `provider` pin overrides the provider, never the model id.
+export const MODEL_CLASSES = Object.freeze({
+  forte: Object.freeze({ provider: "vinci", model: "forte" }),
+  fortissimo: Object.freeze({ provider: "vinci", model: "fortissimo" }),
+});
+
+export function isDigestHandoff(body) {
+  return typeof body === "string" && body.trimStart().startsWith("{");
+}
+
+class HandoffRefusal extends Error {
+  constructor(code, message) {
+    super(`${code}: ${message}`);
+    this.code = code;
+  }
+}
+
+function refuse(code, message) {
+  throw new HandoffRefusal(code, message);
+}
+
+export function parseHandoffTriple(body) {
+  if (!isDigestHandoff(body)) refuse("malformed_handoff", "a digest handoff is a JSON object");
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch (error) {
+    refuse("malformed_handoff", `handoff triple is not valid JSON: ${error.message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) refuse("malformed_handoff", "handoff triple is not an object");
+  const keys = Object.keys(parsed).sort();
+  const expected = [...TRIPLE_KEYS].sort();
+  if (keys.length !== expected.length || keys.some((key, i) => key !== expected[i])) {
+    const extra = keys.filter((key) => !TRIPLE_KEYS.includes(key));
+    const missing = TRIPLE_KEYS.filter((key) => !keys.includes(key));
+    refuse(
+      "malformed_handoff",
+      `handoff triple carries exactly {${TRIPLE_KEYS.join(", ")}}` +
+        (extra.length ? `; unexpected: ${extra.join(", ")}` : "") +
+        (missing.length ? `; missing: ${missing.join(", ")}` : ""),
+    );
+  }
+  const { work_order_id, contract_digest, execution_spec_digest } = parsed;
+  if (typeof work_order_id !== "string" || !WORK_ORDER_ID.test(work_order_id)) refuse("malformed_handoff", "work_order_id is an identifier");
+  if (typeof contract_digest !== "string" || !DIGEST.test(contract_digest)) refuse("malformed_handoff", "contract_digest is a lowercase hex SHA-256");
+  if (typeof execution_spec_digest !== "string" || !DIGEST.test(execution_spec_digest)) refuse("malformed_handoff", "execution_spec_digest is a lowercase hex SHA-256");
+  return { work_order_id, contract_digest, execution_spec_digest };
+}
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+// The candidate specs a registry answer carries: `execution_specs[]` when present, else the
+// singular `execution_spec`. Both shapes are what gpu-control's contract_routes.py serves.
+function candidateSpecs(registry) {
+  if (Array.isArray(registry.execution_specs)) return registry.execution_specs.filter(isRecord);
+  return isRecord(registry.execution_spec) ? [registry.execution_spec] : [];
+}
+
+// Turn a verified (triple, registry answer) pair into the envelope the rest of the daemon runs.
+// Throws a HandoffRefusal (`.code` is the refusal reason) on ANY disagreement; the daemon maps
+// every one of them to BLOCKED before a clone and before a model spawn. Order of checks:
+//   1. the served work order reproduces contract_digest      (contract_digest_mismatch)
+//   2. one served spec reproduces execution_spec_digest     (execution_spec_digest_mismatch)
+//   3. that spec names this order by id AND digest          (binding_mismatch)
+//   4. materialization: host, model class, branch, bounds   (per-field reasons)
+// A digest is recomputed from the record AS SERVED (canonical bytes of the JSON the registry
+// returned); nothing from the triple is trusted until the record it names reproduces it.
+export function materializeEnvelope(triple, registry) {
+  if (!isRecord(registry)) refuse("registry_malformed", "registry answer is not an object");
+  const order = registry.work_order;
+  if (!isRecord(order)) refuse("registry_malformed", "registry answer carries no work_order");
+
+  // 1. contract identity
+  const contractDigest = workOrderDigest(order);
+  if (contractDigest !== triple.contract_digest) {
+    refuse("contract_digest_mismatch", `served work order digests to ${contractDigest.slice(0, 8)}, handoff names ${triple.contract_digest.slice(0, 8)}`);
+  }
+
+  // 2. execution-spec identity: select by recomputed digest, never by position
+  const specs = candidateSpecs(registry);
+  if (specs.length === 0) refuse("registry_malformed", "registry answer carries no execution spec");
+  const spec = specs.find((candidate) => {
+    try {
+      return executionSpecDigest(candidate) === triple.execution_spec_digest;
+    } catch {
+      return false;
+    }
+  });
+  if (!spec) {
+    refuse("execution_spec_digest_mismatch", `none of ${specs.length} served spec(s) digests to ${triple.execution_spec_digest.slice(0, 8)}`);
+  }
+
+  // 3. binding: the spec was compiled from exactly this order, and the order is the one asked for
+  if (order.id !== triple.work_order_id) refuse("binding_mismatch", `served work order is ${order.id}, handoff names ${triple.work_order_id}`);
+  if (spec.workOrderId !== triple.work_order_id) refuse("binding_mismatch", `spec names work order ${spec.workOrderId}, handoff names ${triple.work_order_id}`);
+  if (spec.workOrderDigest !== triple.contract_digest) {
+    refuse("binding_mismatch", "spec was compiled from a different version of this work order (workOrderDigest != contract_digest)");
+  }
+
+  // 4. materialize
+  const repository = spec.repository;
+  if (!isRecord(repository)) refuse("invalid_spec_field", "repository is an object");
+  if (repository.host !== "github.com") refuse("unsupported_repository_host", `repository host ${JSON.stringify(repository.host)} is not github.com`);
+  const repo = `${repository.owner}/${repository.name}`;
+  if (typeof repository.owner !== "string" || typeof repository.name !== "string" || !REPO.test(repo)) {
+    refuse("invalid_spec_field", "repository owner/name must form org/name");
+  }
+  if (typeof spec.modelClass !== "string" || !Object.hasOwn(MODEL_CLASSES, spec.modelClass)) {
+    refuse("unknown_model_class", `modelClass ${JSON.stringify(spec.modelClass)} is not in the worker's class table (${Object.keys(MODEL_CLASSES).join(", ")})`);
+  }
+  const modelClass = MODEL_CLASSES[spec.modelClass];
+  let provider = modelClass.provider;
+  if (spec.provider !== undefined) {
+    if (typeof spec.provider !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(spec.provider)) refuse("invalid_spec_field", "provider is an identifier");
+    provider = spec.provider;
+  }
+  try {
+    assertPlainBranch(spec.targetBranch, "targetBranch");
+  } catch (error) {
+    refuse("invalid_spec_field", error.message);
+  }
+  if (typeof spec.baseCommit !== "string" || !COMMIT.test(spec.baseCommit)) refuse("invalid_spec_field", "baseCommit is a full 40-character lowercase hex SHA-1");
+  const bounds = spec.resourceBounds;
+  if (!isRecord(bounds)) refuse("invalid_spec_field", "resourceBounds is an object");
+  if (!Number.isSafeInteger(bounds.budgetMicrousd) || bounds.budgetMicrousd < 0) refuse("invalid_spec_field", "budgetMicrousd is a non-negative safe integer");
+  if (!Number.isSafeInteger(bounds.maxRuntimeS) || bounds.maxRuntimeS <= 0) refuse("invalid_spec_field", "maxRuntimeS is a positive integer");
+  if (typeof bounds.deadline !== "string" || !UTC_TIMESTAMP.test(bounds.deadline) || Number.isNaN(Date.parse(bounds.deadline))) {
+    refuse("invalid_spec_field", "deadline is an ISO-8601 UTC timestamp");
+  }
+  if (spec.output !== "branch" && spec.output !== "patch" && spec.output !== "artifact" && spec.output !== "none") refuse("invalid_spec_field", "output is one of branch, patch, artifact, none");
+  if (spec.promotion !== "pull_request" && spec.promotion !== "none") refuse("invalid_spec_field", "promotion is one of pull_request, none");
+  if (!isRecord(spec.evidence) || typeof spec.evidence.required !== "boolean") refuse("invalid_spec_field", "evidence.required is boolean");
+  // A pull request is promotion, not evidence: the daemon's `evidence: pr` (open a PR, and a PR
+  // is what COMPLETED requires) is materialized ONLY for a branch output promoted by pull
+  // request. Every other output/promotion pair is `none` and the publisher never opens a PR.
+  const promotesPr = spec.promotion === "pull_request" && spec.output === "branch";
+  const evidence = promotesPr && spec.evidence.required ? "pr" : "none";
+  // The spec text handed to `vinci -p` is the work order's `request` (WorkOrder v3: durable
+  // intent; `scope` and `acceptanceCriteria` ride along beneath it so the agent sees them).
+  if (typeof order.request !== "string" || !order.request.trim()) refuse("invalid_spec_field", "work order request text is empty");
+  const specText = renderRequest(order);
+
+  return {
+    envelope: {
+      repo,
+      evidence,
+      provider,
+      model: modelClass.model,
+      budget_usd: bounds.budgetMicrousd / 1e6,
+      max_runtime_s: bounds.maxRuntimeS,
+      deadline: bounds.deadline,
+      ref: undefined,
+      branch: spec.targetBranch,
+      claim: ".",
+      spec: specText,
+      promotion: spec.promotion,
+      output: spec.output,
+      base_commit: spec.baseCommit,
+    },
+    contract: {
+      work_order_id: triple.work_order_id,
+      contract_digest: contractDigest,
+      execution_spec_digest: triple.execution_spec_digest,
+      base_commit: spec.baseCommit,
+      base_ref: typeof spec.baseRef === "string" ? spec.baseRef : null,
+      promotion: spec.promotion,
+      output: spec.output,
+      model_class: spec.modelClass,
+    },
+  };
+}
+
+function renderRequest(order) {
+  const lines = [order.request.trim()];
+  if (typeof order.scope === "string" && order.scope.trim()) lines.push("", `Scope: ${order.scope.trim()}`);
+  const criteria = Array.isArray(order.acceptanceCriteria) ? order.acceptanceCriteria : [];
+  const statements = criteria
+    .filter((c) => isRecord(c) && typeof c.statement === "string" && c.statement.trim())
+    .map((c) => `- ${typeof c.id === "string" ? `${c.id}: ` : ""}${c.statement.trim()}`);
+  if (statements.length > 0) lines.push("", "Acceptance criteria:", ...statements);
+  return lines.join("\n");
+}
+
+// `contract=<work_order_id>@<digest8>` for every terminal post of a digest-form task; null for prose.
+export function contractTag(record) {
+  if (!record || typeof record.work_order_id !== "string" || typeof record.contract_digest !== "string") return null;
+  return `contract=${record.work_order_id}@${record.contract_digest.slice(0, 8)}`;
 }
 
 // The task-record shape of a vinciBinaryVersion() result: `{ version, path }`, `{ error }`, or null.
@@ -161,6 +381,11 @@ export class TaskLifecycle {
         evidence_error: null,
         harness_stop: null,
         evidence_result_state: null,
+        work_order_id: null,
+        contract_digest: null,
+        execution_spec_digest: null,
+        base_commit: null,
+        promotion: null,
       };
     }
   }
@@ -216,6 +441,12 @@ export class TaskLifecycle {
       evidence_error: null,
       harness_stop: null,
       evidence_result_state: null,
+      // Wave 1B: set by record() once a digest-form handoff has been materialized; null for prose.
+      work_order_id: null,
+      contract_digest: null,
+      execution_spec_digest: null,
+      base_commit: null,
+      promotion: null,
     };
     this.save();
     return { attempt: this.state.attempt, firstAttempt, sessionId };
