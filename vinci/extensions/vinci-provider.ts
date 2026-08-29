@@ -20,11 +20,78 @@ const PLATFORM_URL = VINCI_PLATFORM_BASE_URL;
 const DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai";
 const FORT_MODEL_ID = "zai-org/GLM-5.2";
 const FAR_FUTURE = 4102444800000; // 2100 — the minted key doesn't expire, so never auto-refresh.
-const VINCI_BUDGET_ERROR =
-  /\b402\b|budget[_ -]?exhausted|insufficient[_ -]?quota|out of credits?|credit is used up|free allowance is used up|per-request spending limit/i;
+const VINCI_TERMINAL_BUDGET_ERROR =
+  /budget[_ -]?exhausted|insufficient[_ -]?quota|out of credits?|credit is used up|free allowance is used up|per-request spending limit/i;
 const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const MAX_RETRY_AFTER_MS = 300_000;
+const MAX_IN_FLIGHT_RETRIES = 3;
+const MAX_TOTAL_402_RETRIES = 10;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function boundedRetryAfterMs(value: string | null | undefined, fallbackSeconds: number): number {
+  const seconds = Number(value);
+  return Math.min((Number.isFinite(seconds) && seconds >= 0 ? seconds : fallbackSeconds) * 1000, MAX_RETRY_AFTER_MS);
+}
+
+export function vinciAffordableTokenLimit(errorBodyOrMessage: string | undefined): number | undefined {
+  const canonicalMatch = errorBodyOrMessage?.match(
+    /You requested up to ([0-9][0-9,]*) tokens, but can only afford ([0-9][0-9,]*)(?![0-9,])/i,
+  );
+  const abbreviatedMatch = errorBodyOrMessage?.match(/\bcan (?:only )?afford ([0-9][0-9,]*) tokens?\b/i);
+  const numericTexts = canonicalMatch
+    ? [canonicalMatch[1], canonicalMatch[2]]
+    : abbreviatedMatch
+      ? [abbreviatedMatch[1]]
+      : undefined;
+  if (!numericTexts) return undefined;
+  if (!numericTexts.every((value) => /^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(value))) return undefined;
+  const tokenCounts = numericTexts.map((value) => Number(value.replaceAll(",", "")));
+  return tokenCounts.every(Number.isSafeInteger) ? tokenCounts.at(-1) : undefined;
+}
+
+function parsedErrorBody(errorBodyOrMessage: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(errorBodyOrMessage);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function isInFlightBudgetExhausted(errorBodyOrMessage: string): boolean {
+  return /in_flight_budget_exhausted/i.test(errorBodyOrMessage);
+}
+
+export function vinciRetryAfterMs(
+  errorBodyOrMessage: string | undefined,
+  retryAfterHeader?: string | null,
+): number | undefined {
+  let retryAfter = retryAfterHeader;
+  if (!retryAfter && errorBodyOrMessage) {
+    const parsed = parsedErrorBody(errorBodyOrMessage);
+    const metadata = parsed?.metadata;
+    if (typeof metadata === "object" && metadata !== null) {
+      const headers = (metadata as Record<string, unknown>).headers;
+      if (typeof headers === "object" && headers !== null) {
+        const value = Object.entries(headers as Record<string, unknown>).find(
+          ([name]) => name.toLowerCase() === "retry-after",
+        )?.[1];
+        if (typeof value === "string") retryAfter = value;
+      }
+    }
+  }
+  if (!retryAfter) return undefined;
+  return boundedRetryAfterMs(retryAfter, 5);
+}
+
+function terminalBudgetMessage(taskId: string): string {
+  const resume = SAFE_TASK_ID.test(taskId) ? `, then run \`vinci resume ${taskId}\`` : "";
+  return (
+    "BLOCKED: budget — Vinci usage credits are unavailable for this request. Your checkpoint is saved. " +
+    `Review or restore credits at ${VINCI_BILLING_URL}${resume}.`
+  );
+}
 
 /**
  * Per-class rates in USD per million tokens, mirroring vinci-chat/config/classes.yaml. They differ
@@ -75,14 +142,22 @@ function vinciClassModel(id: string, name: string) {
 export function vinciBudgetBlockedMessage(errorBodyOrMessage: string | undefined, taskId: string): string | undefined {
   if (!errorBodyOrMessage) return undefined;
 
+  if (
+    isInFlightBudgetExhausted(errorBodyOrMessage) ||
+    vinciAffordableTokenLimit(errorBodyOrMessage) !== undefined
+  ) {
+    return undefined;
+  }
+
   // Try to parse as JSON and extract structured code
   let code: string | undefined;
-  try {
-    const parsed = JSON.parse(errorBodyOrMessage);
-    code = parsed.error?.code || parsed.code;
-  } catch {
-    // Not JSON, continue with text matching
+  const parsed = parsedErrorBody(errorBodyOrMessage);
+  const structuredError = parsed?.error;
+  if (typeof structuredError === "object" && structuredError !== null) {
+    const errorCode = (structuredError as Record<string, unknown>).code;
+    if (typeof errorCode === "string") code = errorCode;
   }
+  if (!code && typeof parsed?.code === "string") code = parsed.code;
 
   // Route based on structured code if present
   if (code) {
@@ -102,12 +177,8 @@ export function vinciBudgetBlockedMessage(errorBodyOrMessage: string | undefined
   }
 
   // Fallback to legacy text-based detection for older gateways / non-structured paths
-  if (!VINCI_BUDGET_ERROR.test(errorBodyOrMessage)) return undefined;
-  const resume = SAFE_TASK_ID.test(taskId) ? `, then run \`vinci resume ${taskId}\`` : "";
-  return (
-    "BLOCKED: budget — Vinci usage credits are unavailable for this request. Your checkpoint is saved. " +
-    `Review or restore credits at ${VINCI_BILLING_URL}${resume}.`
-  );
+  if (!/\b402\b/.test(errorBodyOrMessage) && !VINCI_TERMINAL_BUDGET_ERROR.test(errorBodyOrMessage)) return undefined;
+  return terminalBudgetMessage(taskId);
 }
 
 /**
@@ -151,7 +222,7 @@ async function loginVinci(callbacks: OAuthLoginCallbacks): Promise<OAuthCredenti
 
     if (res.status === 429) {
       // Rate-limited — honor Retry-After and keep polling.
-      intervalMs = Math.max(intervalMs, (Number(res.headers.get("retry-after")) || 5) * 1000);
+      intervalMs = Math.max(intervalMs, boundedRetryAfterMs(res.headers.get("retry-after"), 5));
       continue;
     }
 
@@ -180,6 +251,13 @@ async function loginVinci(callbacks: OAuthLoginCallbacks): Promise<OAuthCredenti
 }
 
 export default function (pi: ExtensionAPI) {
+  let pending402RetryAfterMs: number | undefined;
+  let retryDelayMs: number | undefined;
+  let affordableTokenLimit: number | undefined;
+  let affordabilityRetryAttempted = false;
+  let inFlightRetryCount = 0;
+  let total402RetryCount = 0;
+
   pi.registerProvider("vinci", {
     name: "Vinci (SimpleDirect)",
     baseUrl: BASE_URL,
@@ -237,6 +315,42 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  pi.on("after_provider_response", (event, ctx) => {
+    if (ctx.model?.provider !== "vinci") return;
+    if (event.status >= 200 && event.status < 300) {
+      pending402RetryAfterMs = undefined;
+      retryDelayMs = undefined;
+      affordableTokenLimit = undefined;
+      affordabilityRetryAttempted = false;
+      inFlightRetryCount = 0;
+      return;
+    }
+    if (event.status !== 402) {
+      pending402RetryAfterMs = undefined;
+      return;
+    }
+    const retryAfter = Object.entries(event.headers).find(([name]) => name.toLowerCase() === "retry-after")?.[1];
+    pending402RetryAfterMs = vinciRetryAfterMs(undefined, retryAfter);
+  });
+
+  pi.on("before_provider_request", async (event, ctx) => {
+    if (ctx.model?.provider !== "vinci") return;
+    if (retryDelayMs !== undefined) {
+      const delayMs = retryDelayMs;
+      retryDelayMs = undefined;
+      await sleep(delayMs);
+    }
+    if (affordableTokenLimit === undefined || typeof event.payload !== "object" || event.payload === null) return;
+    const payload = event.payload as Record<string, unknown>;
+    const currentMaxTokens = payload.max_tokens;
+    const maxTokens = affordableTokenLimit;
+    affordableTokenLimit = undefined;
+    return {
+      ...payload,
+      max_tokens: typeof currentMaxTokens === "number" ? Math.min(currentMaxTokens, maxTokens) : maxTokens,
+    };
+  });
+
   // Normalize managed-gateway terminal errors into actionable CLI states. Budget failures never
   // route around the account ledger: the durable Pi session is the checkpoint and resume target.
   const VINCI_OVERFLOW = /maximum context length|context window|too long/i;
@@ -245,6 +359,48 @@ export default function (pi: ExtensionAPI) {
     if (m.role !== "assistant" || m.stopReason !== "error") return;
     if (m.provider !== "vinci" && ctx.model?.provider !== "vinci") return;
     const em = m.errorMessage ?? "";
+    if (isInFlightBudgetExhausted(em)) {
+      if (inFlightRetryCount < MAX_IN_FLIGHT_RETRIES && total402RetryCount < MAX_TOTAL_402_RETRIES) {
+        inFlightRetryCount++;
+        total402RetryCount++;
+        retryDelayMs = pending402RetryAfterMs ?? vinciRetryAfterMs(em);
+        pending402RetryAfterMs = undefined;
+        return {
+          message: {
+            ...m,
+            errorMessage: `OpenRouter's in-flight request limit is temporary; please retry your request on this same model (${inFlightRetryCount}/${MAX_IN_FLIGHT_RETRIES}).`,
+          },
+        };
+      }
+      pending402RetryAfterMs = undefined;
+      return {
+        message: {
+          ...m,
+          errorMessage:
+            total402RetryCount >= MAX_TOTAL_402_RETRIES
+              ? `BLOCKED: provider — Vinci stopped retrying after ${MAX_TOTAL_402_RETRIES} HTTP 402 retries in this session. Your checkpoint is saved.`
+              : `BLOCKED: provider — OpenRouter's in-flight request limit did not clear after ${MAX_IN_FLIGHT_RETRIES} retries. Your checkpoint is saved.`,
+        },
+      };
+    }
+    const affordableTokens = vinciAffordableTokenLimit(em);
+    if (affordableTokens !== undefined) {
+      pending402RetryAfterMs = undefined;
+      if (!affordabilityRetryAttempted && total402RetryCount < MAX_TOTAL_402_RETRIES) {
+        affordabilityRetryAttempted = true;
+        total402RetryCount++;
+        affordableTokenLimit = affordableTokens;
+        return {
+          message: {
+            ...m,
+            errorMessage: `OpenRouter can serve this request with max_tokens=${affordableTokens}; please retry your request once on this same model with the reduced limit.`,
+          },
+        };
+      }
+      affordableTokenLimit = undefined;
+      return { message: { ...m, errorMessage: terminalBudgetMessage(ctx.sessionManager.getSessionId()) } };
+    }
+    pending402RetryAfterMs = undefined;
     const budgetMessage = vinciBudgetBlockedMessage(em, ctx.sessionManager.getSessionId());
     if (budgetMessage) return { message: { ...m, errorMessage: budgetMessage } };
 

@@ -26,9 +26,9 @@ assert.ok(classifyVinciModelError, "classifyVinciModelError must be exported");
 const withStatus = (status) => Object.assign(new Error(`status ${status}`), { status });
 
 // ---- account failures must never look retryable -----------------------------------------
-// These are the ones that must NOT trigger a cheaper-model fallback. 402 is out of credit,
-// 403 is a refused entitlement, 401 is a dead credential, 429 is a cap. Falling back on any
-// of them would route around billing and hand the user a worse model as the "fix".
+// These are the ones that must NOT trigger a cheaper-model fallback. A status-only 402 is true
+// out-of-credit; body-marked in-flight and affordability 402s may retry the same model. 403 is a
+// refused entitlement, 401 is a dead credential, and 429 is a cap. None warrants a downgrade.
 for (const status of [401, 402, 403, 429]) {
   assert.strictEqual(
     classifyVinciModelError(withStatus(status)),
