@@ -1038,9 +1038,9 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
   //   MUST succeed (else BLOCKED base_ref_unavailable) → `merge-base --is-ancestor <baseCommit>
   //   refs/remotes/origin/<baseRef>` (else BLOCKED base_commit_unreachable; there is NO fallback
   //   to local objects: a commit this clone happens to hold is not a base origin vouches for) →
-  //   WARN-2: `ls-remote` origin/<targetBranch> and refuse `already_published` when it already
-  //   carries this execution spec's output (BEFORE the spawn, on a cold box as well as a warm
-  //   one) → F5: an existing local <targetBranch> goes through PR #22's handling (never-pushed
+  //   WARN-2: `ls-remote` origin/<targetBranch> and refuse `target_branch_ahead_of_base` when it
+  //   has moved past baseCommit (BEFORE the spawn, on a cold box as well as a warm one)
+  //   → F5: an existing local <targetBranch> goes through PR #22's handling (never-pushed
   //   residue renamed aside, a tracked/diverged branch refused) → only then `checkout -B`.
   if (baseCommit) {
     if (typeof baseCommit !== "string" || !/^[0-9a-f]{40}$/.test(baseCommit)) {
@@ -1073,19 +1073,28 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
       throw blocked("base_commit_unreachable", `base_commit_unreachable: base_commit ${baseCommit.slice(0, 8)} is not an ancestor of origin/${baseRef} (as fetched)`);
     }
 
-    // WARN-2: a RE-RUN of a spec that has already been published. Ask ORIGIN, before the spawn.
+    // WARN-2: the targetBranch this spec pins has already moved. Ask ORIGIN, before the spawn.
     //
     // Two things were wrong before this probe. On a warm box the only thing that noticed was the
     // local-branch divergence check below, which called it `branch_diverged` — false, because the
-    // commits it refuses to reset away are this contract's OWN output, not somebody else's work.
-    // On a COLD box (fresh state dir, fresh clone) there was no local branch at all, so nothing
-    // refused: the model was spawned and paid for and only the final push failed.
+    // commits it refuses to reset away may be this contract's OWN output. On a COLD box (fresh
+    // state dir, fresh clone) there was no local branch at all, so nothing refused: the model was
+    // spawned and paid for and only the final push failed.
     //
-    // THE PREDICATE. targetBranch and baseCommit are both fixed by the execution spec, so they
-    // are fixed by its digest. An origin branch of this exact name that DESCENDS from this exact
-    // baseCommit, and is not simply sitting at it, is the output of a run of this spec. Not
-    // "someone else moved the branch": a branch built on a different base is not an ancestor
-    // relationship and is left alone here (the push refuses it later, as before).
+    // WHAT THIS CHECK ACTUALLY OBSERVES, and nothing more: origin has a branch of this name, it
+    // is not sitting at `baseCommit`, and it DESCENDS from `baseCommit`. That is a fact about
+    // refs. It is NOT proof of authorship. The commonest cause is this spec's own earlier run,
+    // but a human — or a different spec pinning the same base — pushing to that branch name
+    // produces the identical ref topology, and the worker cannot tell them apart: it authors no
+    // commits itself (the model does), so there is no trailer, note or footer of its own to read
+    // back. The refusal therefore reports the OBSERVATION and enumerates the two readings; it
+    // does not assert which one holds. Naming it `already_published` made the record claim an
+    // identity nothing had checked — the same defect class this fix exists to close.
+    //
+    // Either reading needs the same repair (a new spec, or a new targetBranch) and the refusal is
+    // correct in both: that push would have failed anyway, and this way it costs no model spend.
+    // A branch built on a DIFFERENT base is not an ancestor relationship, is not this spec's
+    // business, and is left alone here (the push refuses it later, as before).
     if (specDigest) {
       const remoteTip = await command("git", ["-C", repoDir, "ls-remote", "--heads", "origin", `refs/heads/${branch}`], { allowFailure: true });
       if (remoteTip.status !== 0) throw new Error(`git ls-remote origin failed for ${branch}: ${remoteTip.stderr || remoteTip.status}`);
@@ -1098,8 +1107,8 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
         const carries = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", baseCommit, `refs/remotes/origin/${branch}`], { allowFailure: true });
         if (carries.status === 0) {
           throw blocked(
-            "already_published",
-            `already_published: origin/${branch} already carries the output of execution_spec ${specDigest.slice(0, 8)}; a re-run needs a new spec or a new targetBranch`,
+            "target_branch_ahead_of_base",
+            `target_branch_ahead_of_base: origin/${branch} has advanced past base_commit ${baseCommit.slice(0, 8)}, which spec ${specDigest.slice(0, 8)} pins; if that is this spec's own output the run is already published, otherwise the branch is in use — either way a re-run needs a new spec or a new targetBranch`,
           );
         }
         if (carries.status !== 1) throw new Error(`ancestry check failed for origin/${branch} (vs base_commit ${baseCommit}): ${carries.stderr || carries.status}`);

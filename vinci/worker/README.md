@@ -320,15 +320,24 @@ operations, fixed:
 4. `git merge-base --is-ancestor <baseCommit> refs/remotes/origin/<baseRef>` must hold, else
    **BLOCKED `base_commit_unreachable`** — there is NO fallback to local objects: a commit the
    cache happens to hold (an earlier local-only commit, say) is not a base origin vouches for;
-4b. **RE-RUN of a published spec.** `git ls-remote origin refs/heads/<targetBranch>`: if origin
-   already has that branch and it DESCENDS from this spec's `baseCommit` (and is not simply
-   sitting at it), the run is **BLOCKED `already_published`** — before the spawn, and on a cold
-   box as well as a warm one. `targetBranch` and `baseCommit` are both fixed by the execution
-   spec, so a branch of that name built on that base is that spec's own output; a re-run needs a
-   new spec or a new `targetBranch`. Previously only a warm box noticed, and called it
-   `branch_diverged` — false, because the commits it refused to reset were this contract's own
-   output; on a cold box nothing refused at all and the model was spawned and paid for before
-   the push failed;
+4b. **The pinned `targetBranch` has already moved.** `git ls-remote origin
+   refs/heads/<targetBranch>`: if origin has that branch, it is not sitting at `baseCommit`, and
+   it DESCENDS from `baseCommit`, the run is **BLOCKED `target_branch_ahead_of_base`** — before
+   the spawn, and on a cold box as well as a warm one.
+
+   That condition is a fact about refs and the refusal says only that. It is **not** proof of
+   authorship: the commonest cause is this spec's own earlier run, but a human — or a different
+   spec pinning the same base — pushing to that branch name produces the identical ref topology,
+   and the worker cannot tell them apart (it authors no commits itself, so there is no trailer or
+   footer of its own to read back). The reason enumerates both readings rather than asserting
+   one. Either way the repair is the same, and the refusal is right in both: that push would have
+   failed anyway, and refusing here costs no model spend.
+
+   Previously only a warm box noticed at all, and called it `branch_diverged` — false, because
+   the commits it refused to reset may be this contract's own output; on a cold box nothing
+   refused and the model was spawned and paid for before the push failed. The first version of
+   this check then over-corrected and called it `already_published`, which claimed an identity
+   nothing had checked;
 5. an existing local `targetBranch` goes through the branch-continuation rules above
    (PR #22): an ancestor of `baseCommit` is simply reset; never-pushed residue (no upstream, on
    no origin head) is renamed aside to `stale/<branch>-<stamp>-<hex>` (never deleted) and the
@@ -373,7 +382,7 @@ The digest form BLOCKs with one of these machine-readable `.code`s, in check ord
 | `provider_mismatch` | the spec's `provider` pin differs from the configured provider for its class |
 | `invalid_spec_field` / `no_tools` / `capability_unsupported` | a materialized field the worker cannot serve (empty tools; any `requiredCapabilities` — the worker advertises none) |
 | `invalid_bounds` | `budget_usd <= 0`, `max_runtime_s <= 0`, or a deadline already in the past — before ANY git call; the reason NAMES the field that tripped and its value |
-| `base_ref_unavailable` / `base_commit_unreachable` / `already_published` / `branch_diverged` | the base checkout (see above) |
+| `base_ref_unavailable` / `base_commit_unreachable` / `target_branch_ahead_of_base` / `branch_diverged` | the base checkout (see above) |
 
 A successful digest handoff stamps the task record with `work_order_id`, `contract_digest`
 (long form), `execution_spec_digest`, `base_commit`, `base_ref`, `promotion`, `output`,

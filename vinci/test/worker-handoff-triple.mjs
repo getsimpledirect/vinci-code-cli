@@ -385,14 +385,16 @@ try {
     assert.equal(f.getVinciCalls().length, vinciRuns, "@file table: the digest handoff runs");
     assert.match(postsFor("m-classes-file"), /state=COMPLETED/, "@file table: the class resolves and the task completes");
     // WARN-2: m-classes carries the HAPPY PATH's triple — the same execution spec, already run
-    // and already pushed. That is a re-run of a published spec, and it must say so: not
-    // `branch_diverged` (the commits it refuses to touch are this contract's own output), and
-    // named against the spec digest so the operator knows a new spec or a new targetBranch is
-    // what is needed.
+    // and already pushed. The refusal must report the OBSERVATION (origin/feat/vector-1 has moved
+    // past the base_commit this spec pins) and not `branch_diverged`, whose commits may be this
+    // contract's own output. It names both the base and the spec digest so the operator can tell
+    // which reading applies; it does NOT assert that the branch is this spec's output — see the
+    // human-pushed case below, which is byte-identical to the worker.
     assert.match(postsFor("m-classes"), /state=BLOCKED/, "the m-classes handoff that the three refused daemons never touched is processed by this pass");
-    assert.match(postsFor("m-classes"), new RegExp(`already_published: origin/feat/vector-1 already carries the output of execution_spec ${happySpecDigest.slice(0, 8)}; a re-run needs a new spec or a new targetBranch`));
-    assert.doesNotMatch(postsFor("m-classes"), /branch_diverged/, "a re-run of a published spec is NOT a divergence");
-    assert.equal(f.getVinciCalls().length, vinciRuns, "already_published must never spawn");
+    assert.match(postsFor("m-classes"), new RegExp(`target_branch_ahead_of_base: origin/feat/vector-1 has advanced past base_commit ${baseCommit.slice(0, 8)}, which spec ${happySpecDigest.slice(0, 8)} pins; if that is this spec's own output the run is already published, otherwise the branch is in use — either way a re-run needs a new spec or a new targetBranch`));
+    assert.doesNotMatch(postsFor("m-classes"), /branch_diverged/, "a branch that has moved on origin is NOT a local divergence");
+    assert.doesNotMatch(postsFor("m-classes"), /already carries the output of/, "the record must not claim an authorship the worker never checked");
+    assert.equal(f.getVinciCalls().length, vinciRuns, "target_branch_ahead_of_base must never spawn");
     // Unset ⇒ prose-only: start, but BLOCK every digest handoff before any transfer.
     f.busMessages.push(handoff("m-noclasses", happyTriple));
     r = await run({ env: { VINCI_WORKER_MODEL_CLASSES: "" } });
@@ -592,8 +594,8 @@ try {
     // (c) a local <targetBranch> that TRACKS origin/<targetBranch> and is ahead of base_commit
     //     is refused (branch_diverged) and left exactly where it is; no checkout -B ran.
     //     origin/feat/tracked is pushed AT base_commit and left there, so this stays a pure
-    //     local-divergence case: WARN-2's already_published probe (which fires only when the
-    //     ORIGIN branch has moved past base_commit) must not be what refuses it.
+    //     local-divergence case: WARN-2's target_branch_ahead_of_base probe (which fires only
+    //     when the ORIGIN branch has moved past base_commit) must not be what refuses it.
     git(repoDir, "checkout", "-qb", "feat/tracked", baseCommit);
     git(repoDir, "push", "-q", "-u", "origin", "feat/tracked");
     assert.equal(git(contractBare, "rev-parse", "refs/heads/feat/tracked"), baseCommit, "precondition: origin/feat/tracked sits AT base_commit");
@@ -611,7 +613,7 @@ try {
     assert.equal(r.status, 0, r.stderr);
     assert.equal(f.getVinciCalls().length, vinciRuns, "a diverged tracked branch must never spawn");
     assert.match(postsFor("m-tracked"), /branch_diverged: local branch feat\/tracked at .* has commits not on base_commit .*; refusing to reset \(divergence\)/);
-    assert.doesNotMatch(postsFor("m-tracked"), /already_published/, "origin has not moved past base_commit: this is a local divergence, not a published re-run");
+    assert.doesNotMatch(postsFor("m-tracked"), /target_branch_ahead_of_base/, "origin has not moved past base_commit: this is a local divergence, not a moved branch");
     assert.equal(taskState("m-tracked").state, "BLOCKED");
     assert.equal(git(repoDir, "rev-parse", "feat/tracked"), trackedTip, "the tracked branch is left in place");
     assert.doesNotMatch(staleRefs(), /feat\/tracked/, "a tracked branch is never renamed aside");
@@ -771,8 +773,9 @@ try {
     assert.equal(f.getVinciCalls().length, vinciRuns, "a cold-box re-run of a published spec must never spawn");
     assert.equal(pushes().length, 0, `and must never push: ${JSON.stringify(pushes())}`);
     const coldPosts = postsFor("m-cold");
-    assert.match(coldPosts, new RegExp(`already_published: origin/feat/vector-1 already carries the output of execution_spec ${happySpecDigest.slice(0, 8)}; a re-run needs a new spec or a new targetBranch`));
+    assert.match(coldPosts, new RegExp(`target_branch_ahead_of_base: origin/feat/vector-1 has advanced past base_commit ${baseCommit.slice(0, 8)}, which spec ${happySpecDigest.slice(0, 8)} pins; if that is this spec's own output the run is already published, otherwise the branch is in use — either way a re-run needs a new spec or a new targetBranch`));
     assert.doesNotMatch(coldPosts, /branch_diverged/, "there is no local branch to diverge on a cold box");
+    assert.doesNotMatch(coldPosts, /already carries the output of/, "the record must not claim an authorship the worker never checked");
     assert.match(coldPosts, new RegExp(`contract=wo-vec-1@${contractDigest.slice(0, 8)}`), "the refusal carries the contract tag");
     assert.equal(JSON.parse(readFileSync(join(coldState, "tasks", "m-cold.json"), "utf8")).state, "BLOCKED");
     // The probe is not a general veto: a FRESH targetBranch on the same cold box still runs.
@@ -784,6 +787,49 @@ try {
     assert.equal(f.getVinciCalls().length, vinciRuns, "an unpublished targetBranch still runs");
     assert.match(postsFor("m-cold-ok"), /state=COMPLETED/);
     f.busMessages = warmMessages;
+  }
+
+  // --- WARN-2 (honesty): the SAME ref topology, produced by a HUMAN ---------------------------
+  // The reviewer's repro for the follow-up WARN. No worker has ever run this spec: a person
+  // pushed a commit to the branch name it pins, from the base it pins, before the handoff was
+  // processed. To the worker this is byte-identical to its own earlier output — it authors no
+  // commits, so there is no trailer or footer of its own to read back — and the first version of
+  // this refusal called it `already_published`, i.e. asserted an authorship nothing had checked.
+  //
+  // The behaviour is right (refuse before spend; that push would have failed anyway). What must
+  // hold is that the RECORD says only what was observed.
+  {
+    const order = orderFor("wo-human");
+    const spec = specFor(order, { targetBranch: "feat/human" });
+    const specDigest8 = executionSpecDigest(spec).slice(0, 8);
+    // A person, not the worker: pushed straight to origin from the spec's baseCommit.
+    const human = join(f.tempDir, "human-clone");
+    execFileSync("git", ["clone", "-q", `file://${contractBare}`, human], { stdio: "pipe" });
+    git(human, "config", "user.email", "someone@example.com");
+    git(human, "config", "user.name", "Someone Else");
+    git(human, "checkout", "-qb", "feat/human", baseCommit);
+    writeFileSync(join(human, "hand-written.txt"), "not a worker\n");
+    git(human, "add", "hand-written.txt");
+    git(human, "commit", "-qm", "hand-written change");
+    git(human, "push", "-q", "origin", "feat/human");
+    const humanTip = git(human, "rev-parse", "HEAD");
+    assert.notEqual(humanTip, baseCommit, "precondition: origin/feat/human has moved past base_commit");
+    assert.equal(git(contractBare, "rev-parse", "refs/heads/feat/human"), humanTip, "precondition: the human commit is on origin");
+
+    f.busMessages.push(handoff("m-human", register(order, spec)));
+    const r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.getVinciCalls().length, vinciRuns, "a moved targetBranch must never spawn, whoever moved it");
+    assert.equal(pushes().length, 0, `and must never push: ${JSON.stringify(pushes())}`);
+    assert.equal(taskState("m-human").state, "BLOCKED");
+    const posted = postsFor("m-human");
+    // The observation, and both readings of it — never one of them as a fact.
+    assert.match(posted, new RegExp(`target_branch_ahead_of_base: origin/feat/human has advanced past base_commit ${baseCommit.slice(0, 8)}, which spec ${specDigest8} pins; if that is this spec's own output the run is already published, otherwise the branch is in use — either way a re-run needs a new spec or a new targetBranch`));
+    assert.doesNotMatch(posted, /already carries the output of/, "the worker did not write this branch and must not say it did");
+    assert.doesNotMatch(posted, /already_published/, "no authorship claim: the retired reason must not come back");
+    assert.doesNotMatch(posted, /branch_diverged/);
+    // The human's commit is untouched: refusing costs the branch nothing.
+    assert.equal(git(contractBare, "rev-parse", "refs/heads/feat/human"), humanTip, "the human's branch is left exactly where it was");
   }
 
   // --- WARN-1 / NOTE-1: how a registry fetch that never answers is reported ---

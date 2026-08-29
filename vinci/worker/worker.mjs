@@ -474,7 +474,10 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     let reason;
     try {
       triple = parseHandoffTriple(message.body);
-      const registry = await fetchWorkOrderRegistry(bus.serverUrl, process.env.VINCI_BUS_TOKEN, triple.work_order_id);
+      // NOTE-3: ONE source for the bus credential. The token is read from the environment once
+      // (parseArgs) and carried on the bus; re-reading process.env here was a second source for
+      // one secret — equal today, and silently divergent the moment anything rotates it in-process.
+      const registry = await fetchWorkOrderRegistry(bus.serverUrl, bus.token, triple.work_order_id);
       const materialized = materializeEnvelope(triple, registry, {
         modelClasses: modelConfig.table,
         modelClassesConfigured: modelConfig.configured,
