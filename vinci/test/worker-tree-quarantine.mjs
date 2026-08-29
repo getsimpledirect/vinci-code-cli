@@ -483,5 +483,31 @@ rmSync(debrisRoot, { recursive: true });
 renameSync(savedDebrisRoot, debrisRoot);
 writeFileSync(externalAnchor, anchorBytes, { mode: 0o400 });
 await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 30);
+
+// The channel deadline is real even when the supervisor accidentally supplies a blocking-capable
+// socket. A delayed, silent, or partial service invalidates that channel within one bounded
+// end-to-end interval. Only a fresh supervisor channel can reconcile and resume; stale bytes from
+// the timed-out stream can never satisfy a later request.
+const boundedChannelFailure = async (markerPath, markerValue, attempt, label) => {
+  const survivor = join(replay.repoDir, `${label}.txt`);
+  writeFileSync(survivor, `${label} must survive an authority timeout\n`);
+  writeFileSync(markerPath, markerValue);
+  const started = Date.now();
+  await assert.rejects(
+    () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, attempt),
+    /end-to-end deadline exceeded|ambiguous head commit requires reconciliation/,
+  );
+  const elapsed = Date.now() - started;
+  // prepareRepository performs bounded local identity/ledger validation before the channel request,
+  // so its wall-clock duration may exceed the channel's exact 10 s timer under suite load. Keep a
+  // finite outer ceiling without pretending that scheduler delay is part of the transport deadline.
+  assert.ok(elapsed >= 9_000 && elapsed < 15_000, `${label}: bounded refusal elapsed ${elapsed}ms`);
+  assert.equal(readFileSync(survivor, "utf8"), `${label} must survive an authority timeout\n`);
+  debrisAuthority.reopenCapability();
+  await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, attempt);
+};
+await boundedChannelFailure(debrisAuthority.delayResponsePath, "11500\n", 31, "delayed-response");
+await boundedChannelFailure(debrisAuthority.partialResponsePath, "partial\n", 32, "partial-response");
+await boundedChannelFailure(debrisAuthority.neverResponsePath, "never\n", 33, "never-response");
 debrisAuthority.cleanup();
 console.log("PASS worker-tree-quarantine");

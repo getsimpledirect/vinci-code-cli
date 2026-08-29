@@ -15,6 +15,9 @@ export function provisionWorkerDebrisAuthority(stateDir, lineageId) {
   const statePath = `${stateDir}-deployment-debris-authority-state.json`;
   const responseLossPath = `${statePath}.lose-response`;
   const failGetPath = `${statePath}.fail-get`;
+  const delayResponsePath = `${statePath}.delay-response`;
+  const neverResponsePath = `${statePath}.never-response`;
+  const partialResponsePath = `${statePath}.partial-response`;
   const adapterPath = `${stateDir}-deployment-debris-authority-adapter.mjs`;
   const servicePath = `${stateDir}-deployment-debris-authority-service.mjs`;
   const readyPath = `${stateDir}-deployment-debris-authority-service.ready`;
@@ -62,6 +65,9 @@ import { Socket } from "node:net";
 const statePath = ${JSON.stringify(statePath)};
 const responseLossPath = ${JSON.stringify(responseLossPath)};
 const failGetPath = ${JSON.stringify(failGetPath)};
+const delayResponsePath = ${JSON.stringify(delayResponsePath)};
+const neverResponsePath = ${JSON.stringify(neverResponsePath)};
+const partialResponsePath = ${JSON.stringify(partialResponsePath)};
 const readyPath = ${JSON.stringify(readyPath)};
 const adapterSha256 = ${JSON.stringify(adapterSha256)};
 const rootAnchorSha256 = ${JSON.stringify(sha256(readFileSync(anchorPath)))};
@@ -160,7 +166,19 @@ socket.on("data", (chunk) => {
       payload,
       signature: sign(null, bytes(payload), privateKey).toString("base64url"),
     };
-    socket.write(bytes(envelope));
+    const responseBytes = bytes(envelope);
+    if (existsSync(neverResponsePath)) {
+      unlinkSync(neverResponsePath);
+    } else if (existsSync(partialResponsePath)) {
+      unlinkSync(partialResponsePath);
+      socket.write(responseBytes.subarray(0, Math.max(1, Math.floor(responseBytes.length / 2))));
+    } else if (existsSync(delayResponsePath)) {
+      const delayMs = Number(readFileSync(delayResponsePath, "utf8"));
+      unlinkSync(delayResponsePath);
+      setTimeout(() => socket.write(responseBytes), delayMs);
+    } else {
+      socket.write(responseBytes);
+    }
   }
 });
 writeFileSync(readyPath, bytes({ schema: "vinci.test-debris-authority-ready/1", pid: process.pid }), { mode: 0o400 });
@@ -244,6 +262,9 @@ writeFileSync(readyPath, bytes({ schema: "vinci.test-debris-authority-ready/1", 
     statePath,
     responseLossPath,
     failGetPath,
+    delayResponsePath,
+    neverResponsePath,
+    partialResponsePath,
     get capabilityFd() { return capabilityFd; },
     publicKeySpki,
     serviceSha256,
@@ -253,13 +274,14 @@ writeFileSync(readyPath, bytes({ schema: "vinci.test-debris-authority-ready/1", 
       capabilityFd = null;
     },
     reopenCapability() {
+      service.stdio[3]?.destroy();
       if (service.exitCode === null && service.signalCode === null) service.kill();
       startService();
     },
     cleanup() {
       service.stdio[3]?.destroy();
       if (service.exitCode === null && service.signalCode === null) service.kill();
-      for (const path of [anchorPath, adapterPath, servicePath, readyPath, statePath, responseLossPath, failGetPath]) if (existsSync(path)) unlinkSync(path);
+      for (const path of [anchorPath, adapterPath, servicePath, readyPath, statePath, responseLossPath, failGetPath, delayResponsePath, neverResponsePath, partialResponsePath]) if (existsSync(path)) unlinkSync(path);
     },
   };
 }

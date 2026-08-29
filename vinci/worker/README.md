@@ -159,8 +159,9 @@ anchor bytes through `VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256`; ordinary capture 
 process-pinned trust root.
 
 Every task lineage and complete generation/attempt/current inventory is also serialized through a
-deployment-owned compare-and-set adapter named by `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER`. The
-worker requires an exact executable digest in `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256` and
+deployment-owned compare-and-set service. `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER` names the
+reviewed bridge artifact whose identity the service admission binds; the worker pins its exact
+bytes with `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256` but does not execute it. Deployment supplies
 an already-open, supervisor-provided unnamed socket descriptor. The worker communicates directly
 over that process-private descriptor; it never opens an authority pathname and never exports the
 descriptor to a repository command or task child. There is no reusable bearer in environment,
@@ -169,7 +170,7 @@ binds a fresh worker nonce, exact request digest, socket identity, adapter and s
 digests, root/lineage, authority epoch, service principal, peer-credential enforcement, isolated
 service storage, non-inheritance by task children, and the deployment's parent-FD-exfiltration
 proof. Missing, linked, non-socket, unsigned, replayed, relabelled, or incompletely admitted channels
-refuse. Adapter responses are bounded canonical bytes, and each head binds the root anchor,
+refuse. Service responses are bounded canonical bytes, and each head binds the root anchor,
 lineage, storage identities, monotonic
 sequence/predecessor, index, generations, attempts, and current receipt. The authority service
 must independently reject inventory shrink, predecessor/sequence forks, root/storage changes,
@@ -179,9 +180,10 @@ before the task may capture debris. Ordinary worker capture never provisions a l
 head refuses before it creates or cleans task state. Missing or rolled-back adapter state for an
 existing task, any local deletion/fork, or a second task-root bootstrap refuses before cleanup. A verified
 unindexed local suffix may advance the external head after a crash; an external head never moves
-backward. Native adapters are executed directly; script adapters are executed only by the exact
-Node runtime already running the worker, never through their shebang or an ambient `PATH`. The
-adapter, socket descriptor metadata, trust key, and all anchor settings are removed from the
+backward. Each request has one cancellable end-to-end deadline. Timeout, partial output, trailing
+bytes, malformed authentication, or unsolicited/stale output permanently invalidates that stream;
+the worker preserves source and requires a fresh supervisor-provided channel before reconciliation.
+The bridge artifact, socket descriptor metadata, trust key, and all anchor settings are removed from the
 repository task's environment; task processes inherit neither the authority socket nor an
 authority endpoint.
 
