@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { canonicalize } from "../worker/contracts/canonical.mjs";
 import { executionSpecDigest, recordDigest, sha256Hex, workOrderDigest } from "../worker/contracts/digest.mjs";
+import { parsePathGrant } from "../worker/contracts/path-grant.mjs";
 
 const VECTORS = join(dirname(fileURLToPath(import.meta.url)), "fixtures/contract-vectors");
 const EXPECTED = [
@@ -61,4 +62,34 @@ assert.throws(() => canonicalize(undefined), /type undefined/, "a bare undefined
 assert.throws(() => canonicalize(() => 1), /type function/, "a function is refused");
 assert.throws(() => canonicalize(10n), /type bigint/, "a bigint is refused");
 
-console.log(`PASS worker-contract-vectors (${directories.length} vectors, ${floats.length} float cases)`);
+// path-grant-cases.json: the SHARED golden cases for the `path:` grant grammar, copied byte for
+// byte from vinci-contracts @ 9e9a105 (packages/work-orders/vectors/path-grant-cases.json), where
+// src/path-grant.test.ts reads the same file. Consuming it here is what stops the vendored port
+// (vinci/worker/contracts/path-grant.mjs) and the TypeScript original from drifting apart: a rule
+// changed on one side and not the other fails on whichever side did not move.
+const pathCases = JSON.parse(readFileSync(join(VECTORS, "path-grant-cases.json"), "utf8"));
+assert.ok(Array.isArray(pathCases.accepted) && pathCases.accepted.length > 0, "path-grant-cases.json carries accepted cases");
+assert.ok(Array.isArray(pathCases.refused) && pathCases.refused.length > 0, "path-grant-cases.json carries refused cases");
+for (const { token, root, kind } of pathCases.accepted) {
+  const parsed = parsePathGrant(token);
+  assert.ok(parsed !== null, `${token}: a path: token must parse as a path grant`);
+  assert.deepEqual(parsed, { ok: true, value: { root, kind } }, `${token}: accepted as ${kind} ${root}`);
+}
+for (const { token, reason } of pathCases.refused) {
+  assert.deepEqual(parsePathGrant(token), { ok: false, reason }, `${token}: refused as ${reason}`);
+}
+// Non-`path:` tokens are NOT this grammar's business: prose and the other prefixes parse as null
+// so validateWorkOrder leaves them exactly as before.
+for (const token of ["edit files under src/api", "tool:bash", "repo:github.com/o/n", "branch:feat/*", "bogus:whatever", "", 7, null]) {
+  assert.equal(parsePathGrant(token), null, `${JSON.stringify(token)} is not a path: grant`);
+}
+// too_long is a boundary the shared file does not spell out (1024 characters of root).
+assert.deepEqual(parsePathGrant(`path:${"a".repeat(1024)}`), { ok: true, value: { root: "a".repeat(1024), kind: "file" } }, "1024 characters is accepted");
+assert.deepEqual(parsePathGrant(`path:${"a".repeat(1025)}`), { ok: false, reason: "too_long" }, "1025 characters is too_long");
+// The `monotonicity` section stays UNCONSUMED on purpose: the worker vendors the path grammar
+// only (so a malformed grant invalidates the order) and does NOT yet vendor path scopes — an
+// execution spec carrying `paths` is refused as unknown_field, so there is no coverage question
+// to answer. Port pathRootCovers and consume this section when the worker learns write scopes.
+assert.ok(Array.isArray(pathCases.monotonicity) && pathCases.monotonicity.length > 0, "the monotonicity section exists (unconsumed: see above)");
+
+console.log(`PASS worker-contract-vectors (${directories.length} vectors, ${floats.length} float cases, ${pathCases.accepted.length + pathCases.refused.length} path-grant cases)`);

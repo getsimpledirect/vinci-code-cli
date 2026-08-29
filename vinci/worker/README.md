@@ -214,8 +214,13 @@ clone and before a vinci spawn, with ZERO git transfer (no fetch/clone/ls-remote
 
 The registry answer is streamed with a hard cap of 256 KiB under ONE deadline
 (`VINCI_WORKER_REGISTRY_TIMEOUT_MS`, default 10000) that covers headers AND body; `Content-Length`
-is never trusted. A stalled/trickling body, an oversized (chunked or not) body, a connection
-error or a timeout are all `registry_unavailable`. `401`/`403` is `registry_forbidden` (the bus
+is never trusted. The registry is a PINNED endpoint on the configured server: the fetch sets
+`redirect: "error"`, so a `3xx` is a refusal and never a hop that would carry the bus token to a
+host nobody named. A stalled/trickling body, an oversized (chunked or not) body, a redirect, a
+connection error or a timeout are all `registry_unavailable`; the reason names what actually
+happened (`timed out after <n> ms` ONLY for the deadline, the connection error's code otherwise
+— see WARN-1 in the W1B review, where operator precedence made every connection failure read as
+a timeout). `401`/`403` is `registry_forbidden` (the bus
 token is not allowed to read contracts — an operator problem, distinct from a missing order),
 `404` is `work_order_not_found`, any other non-2xx is `registry_error`, and a body that is not
 JSON is `registry_malformed`.
@@ -233,6 +238,40 @@ enforced. A served record that reproduces the handed digest byte for byte but fa
 is refused as `invalid_work_order` / `invalid_execution_spec` naming the first `<path> <code>`.
 The golden vectors under `vinci/test/fixtures/contract-vectors/` pin both the canonical bytes
 and the validators.
+
+`grantedAuthority` is not opaque text. The `path:` grant grammar
+(`vinci/worker/contracts/path-grant.mjs`, vendored from vinci-contracts @ 9e9a105) is applied to
+every grant: a `path:` token that is empty, absolute, `.` (root scope), or carries a `.`/`..`/
+empty segment, a backslash, a NUL, or more than 1024 characters makes the ORDER invalid
+(`invalid_work_order`, `/grantedAuthority/<i> path_grant_<reason>`). The grammar never
+normalises. Grants with any other prefix — including prose like `edit files under src/api` — are
+untouched. The shared cases file `path-grant-cases.json` is copied byte for byte from upstream
+and read by `worker-contract-vectors.mjs`, so the two implementations cannot drift.
+
+An execution spec carrying the newer optional `paths` field (a run's enumerated write scope) is
+still refused as `/paths unknown_field`. That is DELIBERATE and fail-closed: the worker has no
+way to confine writes to a scope, and ignoring the field would run with root write scope while
+the contract said otherwise. `worker-within-order.mjs` pins the refusal so it cannot change by
+accident.
+
+### Containment: a spec may ask for no more than its order grants
+
+Binding proves WHICH order a spec was compiled from. That is identity, not containment — a spec
+bound to the right order can still name a repository, a branch, a promotion, a tool or a deadline
+the order never granted. `vinci/worker/contracts/within-order.mjs` vendors the upstream
+comparison (`checkValidatedExecutionSpecWithinOrder`) and runs it immediately after the binding
+check, before ANY materialization, refusing with `execution_exceeds_contract` and naming every
+dimension exceeded. It is PURE: two records in, a verdict out, no I/O.
+
+Positive-list semantics: absence is not permission. Grants are matched by exact token grammar —
+`tool:<name>`, `repo:<host>/<owner>/<name>`, `branch:<name>`, `branch:<prefix>/*` (one trailing
+wildcard, non-empty prefix), `promotion:pull_request`. Everything else is prose for humans and
+covers nothing. `resourceBounds.deadline` may not be later than the order's `expiresAt`. A
+`branch:*` (or `branch:/*`) grant is an ERROR on the order side (`grant_wildcard_unbounded`), not
+a grant that quietly covers everything.
+
+The spec-side `path_not_granted` half of the upstream check is NOT vendored, because the worker
+refuses `paths` outright (above). Port it together with write-scope enforcement.
 
 ### Model classes (runtime config)
 
@@ -281,6 +320,15 @@ operations, fixed:
 4. `git merge-base --is-ancestor <baseCommit> refs/remotes/origin/<baseRef>` must hold, else
    **BLOCKED `base_commit_unreachable`** — there is NO fallback to local objects: a commit the
    cache happens to hold (an earlier local-only commit, say) is not a base origin vouches for;
+4b. **RE-RUN of a published spec.** `git ls-remote origin refs/heads/<targetBranch>`: if origin
+   already has that branch and it DESCENDS from this spec's `baseCommit` (and is not simply
+   sitting at it), the run is **BLOCKED `already_published`** — before the spawn, and on a cold
+   box as well as a warm one. `targetBranch` and `baseCommit` are both fixed by the execution
+   spec, so a branch of that name built on that base is that spec's own output; a re-run needs a
+   new spec or a new `targetBranch`. Previously only a warm box noticed, and called it
+   `branch_diverged` — false, because the commits it refused to reset were this contract's own
+   output; on a cold box nothing refused at all and the model was spawned and paid for before
+   the push failed;
 5. an existing local `targetBranch` goes through the branch-continuation rules above
    (PR #22): an ancestor of `baseCommit` is simply reset; never-pushed residue (no upstream, on
    no origin head) is renamed aside to `stale/<branch>-<stamp>-<hex>` (never deleted) and the
@@ -319,20 +367,22 @@ The digest form BLOCKs with one of these machine-readable `.code`s, in check ord
 | `invalid_execution_spec` | no served spec matched and at least one fails the vendored schema-v1 validator |
 | `execution_spec_digest_mismatch` | no (validated) served spec reproduces `execution_spec_digest` |
 | `binding_mismatch` | the matched spec was compiled from a different work order id/digest |
+| `execution_exceeds_contract` | the bound spec asks for MORE than the order grants: `tool_not_granted`, `repository_not_granted`, `branch_not_granted`, `promotion_not_granted`, `deadline_exceeds_contract`, or `grant_wildcard_unbounded` on the order — every failing dimension is named |
 | `unsupported_repository_host` | spec repository host is not `github.com` |
 | `unknown_model_class` | `modelClass` not in the runtime table, or the table is not configured |
 | `provider_mismatch` | the spec's `provider` pin differs from the configured provider for its class |
 | `invalid_spec_field` / `no_tools` / `capability_unsupported` | a materialized field the worker cannot serve (empty tools; any `requiredCapabilities` — the worker advertises none) |
-| `invalid_bounds` | `budget_usd <= 0`, `max_runtime_s <= 0`, or a deadline already in the past — before ANY git call |
-| `base_ref_unavailable` / `base_commit_unreachable` / `branch_diverged` | the base checkout (see above) |
+| `invalid_bounds` | `budget_usd <= 0`, `max_runtime_s <= 0`, or a deadline already in the past — before ANY git call; the reason NAMES the field that tripped and its value |
+| `base_ref_unavailable` / `base_commit_unreachable` / `already_published` / `branch_diverged` | the base checkout (see above) |
 
 A successful digest handoff stamps the task record with `work_order_id`, `contract_digest`
 (long form), `execution_spec_digest`, `base_commit`, `base_ref`, `promotion`, `output`,
 `model_class`, `tools`, `input_artifacts`, `required_capabilities`. EVERY terminal post of a
 digest-form task — the final state AND every early blocker (refusal, invalid bounds, Governor
 refusal/unavailability, base checkout) — carries `contract=<work_order_id>@<digest8>` as its first
-token (`contract=malformed` when the triple itself could not be parsed); prose-form posts never
-carry the tag.
+token (`contract=malformed` when the triple itself could not be parsed, and also when the
+handoff's `message_id` is not a valid task id, which refuses before the body is read); prose-form
+posts never carry the tag.
 
 ## Lifecycle
 

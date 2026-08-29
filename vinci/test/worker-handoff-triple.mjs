@@ -37,7 +37,9 @@ const gitFails = (cwd, ...args) => {
 };
 // One daemon pass (--once). `args` are appended to the worker command line; `env` overrides the
 // fixture env. git argv recording is reset before every run so each block reads only its own calls.
-const run = ({ args = [], env = {} } = {}) =>
+// `stateDir` defaults to the fixture's; a test that needs a COLD box (no cached clone, no task
+// records, no local branches) passes a fresh one — see the WARN-2 cold case.
+const run = ({ args = [], env = {}, stateDir = f.tempDir } = {}) =>
   new Promise((resolve) => {
     f.resetGitCalls();
     const capabilityFd = debrisAuthority.capabilityFd;
@@ -45,7 +47,7 @@ const run = ({ args = [], env = {} } = {}) =>
     const forbiddenCapabilityIdentity = `${capabilityStat.dev}:${capabilityStat.ino}`;
     const child = spawn(
       "bash",
-      [LAUNCHER, "worker", "start", "--id", "w1", "--server", f.busUrl(), "--once", "--state-dir", f.tempDir, ...args],
+      [LAUNCHER, "worker", "start", "--id", "w1", "--server", f.busUrl(), "--once", "--state-dir", stateDir, ...args],
       {
         env: f.getEnv({
           ...env,
@@ -124,6 +126,12 @@ try {
   // A valid spec for the happy path: deep copy of the vector, capabilities cleared (the worker
   // advertises none), a future deadline, the real non-tip baseCommit, baseRef=release.
   const futureDeadline = new Date(Date.now() + 3600 * 1000).toISOString();
+  // CONTAINMENT (step 3.5): `resourceBounds.deadline` may not be later than the order's
+  // `expiresAt`. The golden order expires 2026-08-23+1d, so an order whose spec carries a
+  // deadline an hour from now must carry an expiry later still, or every task here would refuse
+  // as execution_exceeds_contract. `expiresAt` is the ONE field orderFor moves off the vector;
+  // deadline_exceeds_contract itself is pinned in worker-within-order.mjs.
+  const futureExpiry = new Date(Date.now() + 7200 * 1000).toISOString();
   // The raw identity of an order the validator refuses (F3 cases) still binds its spec.
   const anyOrderDigest = (order) => {
     try {
@@ -142,7 +150,7 @@ try {
     resourceBounds: { ...baseSpec.resourceBounds, deadline: futureDeadline },
     ...overrides,
   });
-  const orderFor = (id, overrides = {}) => ({ ...workOrder, id, ...overrides });
+  const orderFor = (id, overrides = {}) => ({ ...workOrder, id, expiresAt: futureExpiry, ...overrides });
   // Register a (order, spec) pair under the order's id; returns the triple body. `specDigest`
   // lets a test name a spec the validator refuses (recordDigest: the raw identity).
   const register = (order, spec, { orderDigest = workOrderDigest(order), specDigest = executionSpecDigest(spec) } = {}) => {
@@ -150,12 +158,15 @@ try {
     return triple(order.id, orderDigest, specDigest);
   };
 
-  const happySpec = specFor(workOrder);
+  // The happy-path order is the golden vector with a live expiry (see futureExpiry); its id and
+  // every other field are the vector's. The pristine record's digest stays pinned above.
+  const happyOrder = orderFor("wo-vec-1");
+  const happySpec = specFor(happyOrder);
   const happySpecDigest = executionSpecDigest(happySpec);
-  const contractDigest = workOrderDigest(workOrder);
+  const contractDigest = workOrderDigest(happyOrder);
 
   await f.startBus([], {});
-  const happyTriple = register(workOrder, happySpec);
+  const happyTriple = register(happyOrder, happySpec);
 
   // --- malformed: extra key --- (no registry interaction; refused before fetch)
   {
@@ -196,7 +207,7 @@ try {
   // --- binding_mismatch --- (the spec was compiled from a different work order)
   {
     const foreignSpec = { ...happySpec, workOrderId: "wo-other", workOrderDigest: ZERO64 };
-    f.contractRegistry["wo-vec-1-foreign"] = { work_order: workOrder, execution_spec: foreignSpec };
+    f.contractRegistry["wo-vec-1-foreign"] = { work_order: happyOrder, execution_spec: foreignSpec };
     f.busMessages.push(handoff("m-binding", triple("wo-vec-1-foreign", contractDigest, executionSpecDigest(foreignSpec))));
     const r = await run();
     assert.equal(r.status, 0, r.stderr);
@@ -223,7 +234,9 @@ try {
 
   // --- unsupported_repository_host / no_tools --- (valid records the worker cannot serve)
   {
-    const host = orderFor("wo-host");
+    // The order GRANTS the gitlab repository, so containment (step 3.5) is satisfied and the
+    // refusal under test is the worker's own materialization limit — not repository_not_granted.
+    const host = orderFor("wo-host", { grantedAuthority: [...workOrder.grantedAuthority, "repo:gitlab.com/o/r"] });
     f.busMessages.push(handoff("m-host", register(host, specFor(host, { repository: { host: "gitlab.com", owner: "o", name: "r" } }))));
     let r = await run();
     assert.equal(r.status, 0, r.stderr);
@@ -371,8 +384,15 @@ try {
     vinciRuns += 1;
     assert.equal(f.getVinciCalls().length, vinciRuns, "@file table: the digest handoff runs");
     assert.match(postsFor("m-classes-file"), /state=COMPLETED/, "@file table: the class resolves and the task completes");
-    assert.match(postsFor("m-classes"), /state=BLOCKED/, "the m-classes handoff that the three refused daemons never touched is processed by this pass; it is BLOCKED as branch_diverged (its targetBranch now tracks origin)");
-    assert.match(postsFor("m-classes"), /branch_diverged/);
+    // WARN-2: m-classes carries the HAPPY PATH's triple — the same execution spec, already run
+    // and already pushed. That is a re-run of a published spec, and it must say so: not
+    // `branch_diverged` (the commits it refuses to touch are this contract's own output), and
+    // named against the spec digest so the operator knows a new spec or a new targetBranch is
+    // what is needed.
+    assert.match(postsFor("m-classes"), /state=BLOCKED/, "the m-classes handoff that the three refused daemons never touched is processed by this pass");
+    assert.match(postsFor("m-classes"), new RegExp(`already_published: origin/feat/vector-1 already carries the output of execution_spec ${happySpecDigest.slice(0, 8)}; a re-run needs a new spec or a new targetBranch`));
+    assert.doesNotMatch(postsFor("m-classes"), /branch_diverged/, "a re-run of a published spec is NOT a divergence");
+    assert.equal(f.getVinciCalls().length, vinciRuns, "already_published must never spawn");
     // Unset ⇒ prose-only: start, but BLOCK every digest handoff before any transfer.
     f.busMessages.push(handoff("m-noclasses", happyTriple));
     r = await run({ env: { VINCI_WORKER_MODEL_CLASSES: "" } });
@@ -571,11 +591,15 @@ try {
 
     // (c) a local <targetBranch> that TRACKS origin/<targetBranch> and is ahead of base_commit
     //     is refused (branch_diverged) and left exactly where it is; no checkout -B ran.
+    //     origin/feat/tracked is pushed AT base_commit and left there, so this stays a pure
+    //     local-divergence case: WARN-2's already_published probe (which fires only when the
+    //     ORIGIN branch has moved past base_commit) must not be what refuses it.
     git(repoDir, "checkout", "-qb", "feat/tracked", baseCommit);
+    git(repoDir, "push", "-q", "-u", "origin", "feat/tracked");
+    assert.equal(git(contractBare, "rev-parse", "refs/heads/feat/tracked"), baseCommit, "precondition: origin/feat/tracked sits AT base_commit");
     writeFileSync(join(repoDir, "tracked.txt"), "pushed\n");
     git(repoDir, "add", "tracked.txt");
     git(repoDir, "commit", "-qm", "tracked");
-    git(repoDir, "push", "-q", "-u", "origin", "feat/tracked");
     writeFileSync(join(repoDir, "tracked2.txt"), "ahead\n");
     git(repoDir, "add", "tracked2.txt");
     git(repoDir, "commit", "-qm", "ahead");
@@ -587,6 +611,7 @@ try {
     assert.equal(r.status, 0, r.stderr);
     assert.equal(f.getVinciCalls().length, vinciRuns, "a diverged tracked branch must never spawn");
     assert.match(postsFor("m-tracked"), /branch_diverged: local branch feat\/tracked at .* has commits not on base_commit .*; refusing to reset \(divergence\)/);
+    assert.doesNotMatch(postsFor("m-tracked"), /already_published/, "origin has not moved past base_commit: this is a local divergence, not a published re-run");
     assert.equal(taskState("m-tracked").state, "BLOCKED");
     assert.equal(git(repoDir, "rev-parse", "feat/tracked"), trackedTip, "the tracked branch is left in place");
     assert.doesNotMatch(staleRefs(), /feat\/tracked/, "a tracked branch is never renamed aside");
@@ -683,6 +708,151 @@ try {
     // The happy path earlier also promoted by pull_request: its PR base was the pinned baseRef.
     const happyCreate = ghCalls().find((a) => a[0] === "pr" && a[1] === "create" && a.includes("feat/vector-1"));
     assert.equal(happyCreate[happyCreate.indexOf("--base") + 1], "release");
+  }
+
+  // --- BLOCK-1: CONTAINMENT — a correctly-bound spec that asks for MORE than the order grants ---
+  // Binding proves which order the spec was compiled from; it says nothing about what the spec
+  // then asks for. This is the exact record the W1B review demonstrated running to COMPLETED and
+  // PUSHING: an order granting only prose, and a spec naming a different repository, `main`, a
+  // pull request, three ungranted tools and a 500 USD budget. It must refuse before any transfer
+  // and before any spawn, and the reason must name every dimension it exceeded.
+  {
+    const order = orderFor("wo-exceeds", { grantedAuthority: ["edit files under src/api"] });
+    const spec = specFor(order, {
+      repository: { host: "github.com", owner: "someone-else", name: "production" },
+      targetBranch: "main",
+      promotion: "pull_request",
+      tools: ["bash", "write", "edit"],
+      resourceBounds: { ...happySpec.resourceBounds, budgetMicrousd: 500000000 },
+    });
+    f.busMessages.push(handoff("m-exceeds", register(order, spec)));
+    const r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    assertRefusedBeforeTransfer("m-exceeds", "execution_exceeds_contract");
+    const posted = postsFor("m-exceeds");
+    for (const code of ["tool_not_granted", "repository_not_granted", "branch_not_granted", "promotion_not_granted"]) {
+      assert.match(posted, new RegExp(code), `the reason names ${code}: ${posted}`);
+    }
+    assert.match(posted, new RegExp(`contract=wo-exceeds@${workOrderDigest(order).slice(0, 8)}`), "the refusal carries the contract tag");
+    assert.equal(existsSync(join(f.tempDir, "repos", "production")), false, "the repository the order never granted was never cloned");
+
+    // One dimension is enough on its own: the same order, a spec that differs ONLY in landing on
+    // main. Everything else about it is granted, so branch_not_granted is what refuses it.
+    const okOrder = orderFor("wo-mainonly");
+    f.busMessages.push(handoff("m-mainonly", register(okOrder, specFor(okOrder, { targetBranch: "main" }))));
+    const r2 = await run();
+    assert.equal(r2.status, 0, r2.stderr);
+    assertRefusedBeforeTransfer("m-mainonly", "execution_exceeds_contract");
+    assert.match(postsFor("m-mainonly"), /\/targetBranch branch_not_granted/);
+    assert.equal(git(contractBare, "rev-parse", "refs/heads/main"), tipCommit, "the branch the order never granted was never written to");
+  }
+
+  // --- WARN-2 (cold box): a re-run of a published spec on a machine with NO local state ---
+  // The warm case is m-classes above. Here the worker has never seen this repository: no cached
+  // clone, no local branch, no task record — the state the review said nothing refused, so the
+  // model was spawned and paid for and only the push failed. origin/<targetBranch> is the only
+  // authority that can answer, and it is asked BEFORE the spawn.
+  {
+    const coldState = join(f.tempDir, "cold-state");
+    mkdirSync(coldState, { recursive: true });
+    // The daemon's first run starts its cursor at NOW; the fixture seeds an ancient one per
+    // state dir (see WorkerTestFixture), so a fresh state dir needs the same seed or the
+    // historical handoff is skipped as history rather than processed.
+    writeFileSync(join(coldState, "cursor.json"), JSON.stringify({ w1: { ts: "2000-01-01T00:00:00.000Z", message_ids: [] } }));
+    assert.equal(existsSync(join(coldState, "repos")), false, "precondition: the cold box has no clone");
+    assert.equal(git(contractBare, "rev-parse", "refs/heads/feat/vector-1") !== baseCommit, true, "precondition: origin/feat/vector-1 carries the published output");
+
+    // A cold state dir holds no task records, so it would re-process every handoff this suite
+    // has already posted. The bus is narrowed to the cold cases for the duration of the block.
+    const warmMessages = f.busMessages;
+    f.busMessages = [handoff("m-cold", happyTriple)];
+    const r = await run({ stateDir: coldState });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.getVinciCalls().length, vinciRuns, "a cold-box re-run of a published spec must never spawn");
+    assert.equal(pushes().length, 0, `and must never push: ${JSON.stringify(pushes())}`);
+    const coldPosts = postsFor("m-cold");
+    assert.match(coldPosts, new RegExp(`already_published: origin/feat/vector-1 already carries the output of execution_spec ${happySpecDigest.slice(0, 8)}; a re-run needs a new spec or a new targetBranch`));
+    assert.doesNotMatch(coldPosts, /branch_diverged/, "there is no local branch to diverge on a cold box");
+    assert.match(coldPosts, new RegExp(`contract=wo-vec-1@${contractDigest.slice(0, 8)}`), "the refusal carries the contract tag");
+    assert.equal(JSON.parse(readFileSync(join(coldState, "tasks", "m-cold.json"), "utf8")).state, "BLOCKED");
+    // The probe is not a general veto: a FRESH targetBranch on the same cold box still runs.
+    const coldOrder = orderFor("wo-cold-ok");
+    f.busMessages.push(handoff("m-cold-ok", register(coldOrder, specFor(coldOrder, { targetBranch: "feat/cold-ok" }))));
+    const r2 = await run({ stateDir: coldState, env: { FAKE_VINCI_COMMIT_FILE: "cold.txt" } });
+    assert.equal(r2.status, 0, r2.stderr);
+    vinciRuns += 1;
+    assert.equal(f.getVinciCalls().length, vinciRuns, "an unpublished targetBranch still runs");
+    assert.match(postsFor("m-cold-ok"), /state=COMPLETED/);
+    f.busMessages = warmMessages;
+  }
+
+  // --- WARN-1 / NOTE-1: how a registry fetch that never answers is reported ---
+  {
+    // (a) the connection is reset before a single header. `??` binds tighter than `?:`, so the
+    //     old expression reported EVERY connection failure — ECONNREFUSED included — as
+    //     "timed out after N ms". The reason must name what actually happened.
+    f.contractRespond = (id, request) => {
+      if (id !== "wo-reset") return false;
+      request.socket.destroy();
+      return true;
+    };
+    const reset = orderFor("wo-reset");
+    f.busMessages.push(handoff("m-reset", register(reset, specFor(reset, { targetBranch: "feat/reset" }))));
+    let r = await run({ env: { VINCI_WORKER_REGISTRY_TIMEOUT_MS: "30000" } });
+    assert.equal(r.status, 0, r.stderr);
+    assertRefusedBeforeTransfer("m-reset", "registry_unavailable");
+    assert.doesNotMatch(postsFor("m-reset"), /timed out after/, "a connection failure is NOT a timeout and must not say so");
+    assert.match(postsFor("m-reset"), /governor contracts fetch failed: (UND_ERR_SOCKET|ECONNRESET|ECONNREFUSED)/, `the reason names the connection error: ${postsFor("m-reset")}`);
+
+    // (b) NOTE-1: the registry is a PINNED endpoint. A 3xx would move the contract fetch — and
+    //     the bearer token — to a host nobody named, so `redirect: "error"` makes it a refusal.
+    f.contractRespond = (id, request, response) => {
+      if (id !== "wo-redirect") return false;
+      response.writeHead(302, { location: "http://127.0.0.1:1/elsewhere" });
+      response.end();
+      return true;
+    };
+    const redirect = orderFor("wo-redirect");
+    f.busMessages.push(handoff("m-redirect", register(redirect, specFor(redirect, { targetBranch: "feat/redirect" }))));
+    r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    assertRefusedBeforeTransfer("m-redirect", "registry_unavailable");
+    assert.doesNotMatch(postsFor("m-redirect"), /timed out after/);
+    f.contractRespond = null;
+  }
+
+  // --- WARN-3: invalid_bounds names the field that tripped -----------------------------------
+  // budgetMicrousd: 0 is a VALID execution spec upstream (a non-negative integer) and blocks
+  // here. The old reason listed all three bounds and left the operator to guess which to fix.
+  {
+    const order = orderFor("wo-zerobudget");
+    f.busMessages.push(handoff("m-zerobudget", register(order, specFor(order, { targetBranch: "feat/zerobudget", resourceBounds: { ...happySpec.resourceBounds, budgetMicrousd: 0 } }))));
+    const r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.getVinciCalls().length, vinciRuns, "a zero budget never spawns");
+    assert.equal(taskState("m-zerobudget").state, "BLOCKED");
+    assert.equal(taskState("m-zerobudget").limit_tripped, "budget_usd");
+    assert.match(taskState("m-zerobudget").outcome.reason, /^invalid_bounds: budget_usd must be greater than zero, got 0$/, taskState("m-zerobudget").outcome.reason);
+    assert.match(postsFor("m-zerobudget"), /invalid_bounds budget_usd=0/);
+  }
+
+  // --- NOTE-4: a digest handoff whose message_id is not a task id still carries a contract tag --
+  // The refusal fires before the body is read, so there is no triple to name — but a reader
+  // filtering the ledger for `contract=` posts must not silently lose the row. The prose path's
+  // untagged body is unchanged.
+  {
+    f.busMessages.push(handoff("m bad id", happyTriple));
+    f.busMessages.push(handoff("m bad prose", "repo: proseorg/coderepo\nevidence: none\n\nprose task"));
+    const r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    const digestPost = f.getPostedMessages().find((m) => m.in_reply_to === "m bad id");
+    assert.ok(digestPost, "the invalid digest handoff is answered");
+    assert.match(digestPost.body, /^contract=malformed invalid task id: m bad id worker_build=/, digestPost.body);
+    const prosePost = f.getPostedMessages().find((m) => m.in_reply_to === "m bad prose");
+    assert.ok(prosePost, "the invalid prose handoff is answered");
+    assert.match(prosePost.body, /^invalid task id: m bad prose worker_build=/, prosePost.body);
+    assert.doesNotMatch(prosePost.body, /contract=/, "a prose handoff still carries NO contract tag");
+    assert.equal(f.getVinciCalls().length, vinciRuns, "neither invalid handoff spawns");
   }
 
   console.log("PASS worker-handoff-triple");

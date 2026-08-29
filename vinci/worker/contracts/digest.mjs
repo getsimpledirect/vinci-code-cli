@@ -5,6 +5,10 @@
 //            packages/work-orders/src/execution-spec.ts (`validateExecutionSpec`, `executionSpecDigest`)
 //            packages/work-orders/src/attention.ts (`validateAttentionBudget`)
 //            packages/contracts/src/{scalars,actor,risk,actions}.ts (the predicates below)
+//   plus:    the `path:` grant grammar of packages/work-orders/src/path-grant.ts
+//            @ 9e9a105 (branch feat/path-grants), vendored in ./path-grant.mjs and applied to
+//            `grantedAuthority` below, so a malformed write-scope grant makes the ORDER invalid
+//            rather than passing as opaque prose.
 // The identity of a work order or an execution spec: SHA-256, lowercase hex, over the canonical
 // encoding (canonical.mjs) of the record. EVERYTHING the record carries is covered — there is no
 // digest or signature field to exclude — so the digest names the exact contract or the exact run
@@ -19,6 +23,7 @@
 import { createHash } from "node:crypto";
 
 import { canonicalize } from "./canonical.mjs";
+import { describePathRootRefusal, parsePathGrant } from "./path-grant.mjs";
 
 // ---- scalars (packages/contracts/src/scalars.ts) ---------------------------------------------
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -182,6 +187,14 @@ export function validateWorkOrder(input) {
       }
       if (seenGrants.has(grant)) issues.push(issue(`/grantedAuthority/${i}`, "duplicate_grant", "a grant is listed twice"));
       seenGrants.add(grant);
+      // A malformed `path:` grant is not prose that covers nothing; it is a write scope nobody
+      // can read, and the order carrying it is malformed. Without this the worker treated every
+      // grant as an opaque non-blank string, so `path:../../etc/passwd`, `path:/etc/shadow` and
+      // `path:.` all validated here while vinci-contracts refused them.
+      const pathGrant = parsePathGrant(grant);
+      if (pathGrant !== null && !pathGrant.ok) {
+        issues.push(issue(`/grantedAuthority/${i}`, `path_grant_${pathGrant.reason}`, describePathRootRefusal(pathGrant.reason)));
+      }
     });
   }
 
@@ -297,6 +310,14 @@ export function validateWorkOrder(input) {
 export const EXECUTION_SPEC_SCHEMA_VERSION = 1;
 export const EXECUTION_OUTPUTS = Object.freeze(["branch", "patch", "artifact", "none"]);
 export const EXECUTION_PROMOTIONS = Object.freeze(["pull_request", "none"]);
+// DELIBERATELY BEHIND UPSTREAM: vinci-contracts @ feat/path-grants added an optional `paths`
+// field (the run's enumerated write scope). It is NOT listed here, so a spec that carries it is
+// refused as `/paths unknown_field` — fail-closed, because a worker that ignored the field would
+// silently run with root write scope while the contract said otherwise. Adding "paths" here is a
+// DELIBERATE decision that must land together with the spec-side scope check
+// (`path_not_granted` in within-order.ts) and an enforcement path that actually confines writes;
+// vinci/test/worker-within-order.mjs pins the current refusal so the change cannot happen by
+// accident.
 export const SPEC_FIELDS = Object.freeze([
   "schemaVersion", "workOrderId", "workOrderDigest", "repository", "baseRef", "baseCommit",
   "targetBranch", "modelClass", "provider", "resourceBounds", "tools", "inputArtifacts",

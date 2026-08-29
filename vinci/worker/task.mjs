@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { executionSpecDigest, workOrderDigest } from "./contracts/digest.mjs";
+import { checkValidatedExecutionSpecWithinOrder } from "./contracts/within-order.mjs";
 
 const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -251,6 +252,7 @@ function candidateSpecs(registry) {
 //   1. the served work order reproduces contract_digest      (contract_digest_mismatch)
 //   2. one served spec reproduces execution_spec_digest     (execution_spec_digest_mismatch)
 //   3. that spec names this order by id AND digest          (binding_mismatch)
+//   3.5 the spec asks for no MORE than the order grants     (execution_exceeds_contract)
 //   4. materialization: host, model class, branch, bounds   (per-field reasons)
 // A digest is recomputed from the record AS SERVED (canonical bytes of the JSON the registry
 // returned); nothing from the triple is trusted until the record it names reproduces it.
@@ -309,6 +311,15 @@ export function materializeEnvelope(triple, registry, opts = {}) {
   if (spec.workOrderDigest !== triple.contract_digest) {
     refuse("binding_mismatch", "spec was compiled from a different version of this work order (workOrderDigest != contract_digest)");
   }
+
+  // 3.5 CONTAINMENT (BLOCK-1 of the W1B review): step 3 proves WHICH order the spec was compiled
+  // from. That is identity, not containment — a spec bound to the right order can still name a
+  // repository, a branch, a promotion, a tool or a deadline the order never granted, and before
+  // this check such a spec ran to COMPLETED and pushed. Both records are already VALIDATED here
+  // (a record is validated before its digest is computed, steps 1 and 2), which is exactly the
+  // precondition of the vendored upstream comparison, so it is called directly. Pure: no I/O.
+  const within = checkValidatedExecutionSpecWithinOrder(spec, order);
+  if (!within.ok) refuse("execution_exceeds_contract", `execution spec asks for more than the work order grants: ${describeContainment(within.issues)}`);
 
   // 4. materialize
   const repository = spec.repository;
@@ -419,6 +430,14 @@ export function materializeEnvelope(triple, registry, opts = {}) {
       required_capabilities: requiredCapabilities,
     },
   };
+}
+
+// `<path> <code>[; …]` for the containment issues of step 3.5. Every dimension the spec exceeded
+// is named (not just the first): an operator repairing an over-broad spec needs the whole list.
+// Capped so one over-long tools array cannot fill the terminal post.
+function describeContainment(issues) {
+  const named = issues.slice(0, 8).map((i) => `${i.path || "/"} ${i.code}`).join("; ");
+  return issues.length > 8 ? `${named}; +${issues.length - 8} more` : named;
 }
 
 // `<path> <code>[; …]` for a digest validator's `.issues`, or the bare message when it has none.

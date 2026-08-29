@@ -1021,7 +1021,7 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
   }
 }
 
-export async function prepareRepository(stateDir, repo, taskId, branchOverride, baseCommit, baseRef, attempt = 1) {
+export async function prepareRepository(stateDir, repo, taskId, branchOverride, baseCommit, baseRef, attempt = 1, specDigest) {
   if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
   const branch = branchOverride ?? `worker/${taskId}`;
@@ -1038,8 +1038,10 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
   //   MUST succeed (else BLOCKED base_ref_unavailable) → `merge-base --is-ancestor <baseCommit>
   //   refs/remotes/origin/<baseRef>` (else BLOCKED base_commit_unreachable; there is NO fallback
   //   to local objects: a commit this clone happens to hold is not a base origin vouches for) →
-  //   F5: an existing local <targetBranch> goes through PR #22's handling (never-pushed residue
-  //   renamed aside, a tracked/diverged branch refused) → only then `checkout -B`.
+  //   WARN-2: `ls-remote` origin/<targetBranch> and refuse `already_published` when it already
+  //   carries this execution spec's output (BEFORE the spawn, on a cold box as well as a warm
+  //   one) → F5: an existing local <targetBranch> goes through PR #22's handling (never-pushed
+  //   residue renamed aside, a tracked/diverged branch refused) → only then `checkout -B`.
   if (baseCommit) {
     if (typeof baseCommit !== "string" || !/^[0-9a-f]{40}$/.test(baseCommit)) {
       throw new Error("base_commit must be a full 40-character lowercase hex SHA-1");
@@ -1069,6 +1071,39 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
     const isAncestor = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", baseCommit, `refs/remotes/origin/${baseRef}`], { allowFailure: true });
     if (isAncestor.status !== 0) {
       throw blocked("base_commit_unreachable", `base_commit_unreachable: base_commit ${baseCommit.slice(0, 8)} is not an ancestor of origin/${baseRef} (as fetched)`);
+    }
+
+    // WARN-2: a RE-RUN of a spec that has already been published. Ask ORIGIN, before the spawn.
+    //
+    // Two things were wrong before this probe. On a warm box the only thing that noticed was the
+    // local-branch divergence check below, which called it `branch_diverged` — false, because the
+    // commits it refuses to reset away are this contract's OWN output, not somebody else's work.
+    // On a COLD box (fresh state dir, fresh clone) there was no local branch at all, so nothing
+    // refused: the model was spawned and paid for and only the final push failed.
+    //
+    // THE PREDICATE. targetBranch and baseCommit are both fixed by the execution spec, so they
+    // are fixed by its digest. An origin branch of this exact name that DESCENDS from this exact
+    // baseCommit, and is not simply sitting at it, is the output of a run of this spec. Not
+    // "someone else moved the branch": a branch built on a different base is not an ancestor
+    // relationship and is left alone here (the push refuses it later, as before).
+    if (specDigest) {
+      const remoteTip = await command("git", ["-C", repoDir, "ls-remote", "--heads", "origin", `refs/heads/${branch}`], { allowFailure: true });
+      if (remoteTip.status !== 0) throw new Error(`git ls-remote origin failed for ${branch}: ${remoteTip.stderr || remoteTip.status}`);
+      const tip = remoteTip.stdout.split("\n").map((line) => line.split("\t")[0]).find((sha) => /^[0-9a-f]{40}$/.test(sha)) ?? null;
+      if (tip && tip !== baseCommit) {
+        const fetchedTarget = await command("git", ["-C", repoDir, "fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { allowFailure: true });
+        if (fetchedTarget.status !== 0) {
+          throw new Error(`git fetch origin failed for ${branch}: ${fetchedTarget.stderr || fetchedTarget.status}`);
+        }
+        const carries = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", baseCommit, `refs/remotes/origin/${branch}`], { allowFailure: true });
+        if (carries.status === 0) {
+          throw blocked(
+            "already_published",
+            `already_published: origin/${branch} already carries the output of execution_spec ${specDigest.slice(0, 8)}; a re-run needs a new spec or a new targetBranch`,
+          );
+        }
+        if (carries.status !== 1) throw new Error(`ancestry check failed for origin/${branch} (vs base_commit ${baseCommit}): ${carries.stderr || carries.status}`);
+      }
     }
 
     let aside = null;

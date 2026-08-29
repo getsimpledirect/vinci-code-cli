@@ -402,9 +402,19 @@ async function fetchWorkOrderRegistry(serverUrl, token, workOrderId, { timeoutMs
       response = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
         signal: controller.signal,
+        // The registry is a PINNED endpoint on the configured server. A redirect would move the
+        // contract fetch (and the bearer token) to a host nobody named, so a 3xx is an error
+        // here, never something to follow.
+        redirect: "error",
       });
     } catch (error) {
-      throw new Error(`registry_unavailable: governor contracts fetch failed: ${error?.cause?.code ?? error.name === "AbortError" ? `timed out after ${timeoutMs} ms` : error.message}`);
+      // `??` binds TIGHTER than `?:`, so the obvious spelling
+      //   error?.cause?.code ?? error.name === "AbortError" ? A : B
+      // parses as `(error?.cause?.code ?? (error.name === "AbortError")) ? A : B` — any truthy
+      // cause code (ECONNREFUSED, ENOTFOUND, …) then selects A and EVERY connection failure was
+      // reported as "timed out after N ms". The abort test comes first, explicitly parenthesised.
+      const why = error?.name === "AbortError" ? `timed out after ${timeoutMs} ms` : (error?.cause?.code ?? error.message);
+      throw new Error(`registry_unavailable: governor contracts fetch failed: ${why}`);
     }
     if (response.status === 401 || response.status === 403) {
       throw new Error(`registry_forbidden: governor contracts returned ${response.status}`);
@@ -438,7 +448,12 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   try {
     assertTaskId(taskId);
   } catch (error) {
-    await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(null, error.message), { inReplyTo: message.message_id });
+    // NOTE-4: this refusal fires before the body is ever looked at, so no triple has been parsed
+    // — but a DIGEST handoff's terminal post must still carry a contract= tag, or a reader
+    // filtering the ledger for contract posts silently loses it. Same fallback the unparseable
+    // triple uses: `contract=malformed`. A prose handoff keeps its untagged body byte for byte.
+    const fallback = isDigestHandoff(message.body) ? "contract=malformed" : null;
+    await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(null, error.message, fallback), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -514,7 +529,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   if (contractFields && (envelope.budget_usd <= 0 || envelope.max_runtime_s <= 0 || (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()))) {
     // Digest handoff: full bounds validation with structured post body.
     const limit = envelope.budget_usd <= 0 ? "budget_usd" : envelope.max_runtime_s <= 0 ? "max_runtime_s" : "deadline";
-    lifecycle.transition("BLOCKED", { limit_tripped: limit, outcome: { reason: "invalid_bounds: budget_usd, max_runtime_s and deadline must be within permitted bounds" } });
+    // WARN-3: name the field that actually tripped. `budgetMicrousd: 0` is a legal spec upstream
+    // and blocks here; a reason that only listed all three fields left the operator to guess
+    // which one they had to fix.
+    const why = limit === "deadline"
+      ? `deadline ${envelope.deadline} is not in the future`
+      : `${limit} must be greater than zero, got ${limit === "budget_usd" ? envelope.budget_usd : envelope.max_runtime_s}`;
+    lifecycle.transition("BLOCKED", { limit_tripped: limit, outcome: { reason: `invalid_bounds: ${why}` } });
     await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`), { inReplyTo: message.message_id });
     return true;
   }
@@ -571,6 +592,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       });
     }
 
+    // WARN-2: the execution spec digest is passed so the digest path can name the spec whose
+    // output already sits on origin/<targetBranch> (`already_published`). Prose handoffs pass
+    // undefined and the probe does not run: they pin no spec, so there is nothing to re-run.
     const repository = await prepareRepository(
       stateDir,
       envelopeToUse.repo,
@@ -579,6 +603,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       envelopeToUse.base_commit,
       contractFields ? contractFields.base_ref : undefined,
       attempt.attempt,
+      contractFields ? contractFields.execution_spec_digest : undefined,
     );
     if (repository.debrisReceipt) lifecycle.record({ debris_receipt: repository.debrisReceipt });
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
