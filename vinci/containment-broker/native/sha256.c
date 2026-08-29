@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "sha256.h"
 
 #include <errno.h>

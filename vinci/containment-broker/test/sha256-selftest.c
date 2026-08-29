@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "../native/sha256.h"
 
 #include <fcntl.h>

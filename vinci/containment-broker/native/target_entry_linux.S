@@ -33,3 +33,5 @@ _start:
 #else
 #error "unsupported Linux architecture"
 #endif
+
+    .section .note.GNU-stack,"",@progbits

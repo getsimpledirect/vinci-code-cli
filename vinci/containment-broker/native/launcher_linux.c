@@ -65,7 +65,9 @@ static int socketpair_above_fixed(int pair[2]) {
     pair[1] = fcntl(raw[1], F_DUPFD_CLOEXEC, VINCI_BROKER_TARGET_ATTESTATION_CONTEXT_FD + 1);
     int saved = errno; close(raw[0]); close(raw[1]);
     if (pair[0] < 0 || pair[1] < 0) {
-        if (pair[0] >= 0) close(pair[0]); if (pair[1] >= 0) close(pair[1]); return -saved;
+        if (pair[0] >= 0) close(pair[0]);
+        if (pair[1] >= 0) close(pair[1]);
+        return -saved;
     }
     return 0;
 }
@@ -137,8 +139,10 @@ int vinci_clone_into_cgroup(const struct vinci_broker_launch_fds *fds,
     int pair_result = socketpair_above_fixed(control_pair);
     if (pair_result == 0) pair_result = socketpair_above_fixed(attestation_pair);
     if (pair_result != 0) {
-        if (control_pair[0] >= 0) close(control_pair[0]); if (control_pair[1] >= 0) close(control_pair[1]);
-        if (attestation_pair[0] >= 0) close(attestation_pair[0]); if (attestation_pair[1] >= 0) close(attestation_pair[1]);
+        if (control_pair[0] >= 0) close(control_pair[0]);
+        if (control_pair[1] >= 0) close(control_pair[1]);
+        if (attestation_pair[0] >= 0) close(attestation_pair[0]);
+        if (attestation_pair[1] >= 0) close(attestation_pair[1]);
         return pair_result;
     }
     task->cgroup_fd = fcntl(fds->cgroup, F_DUPFD_CLOEXEC, 13);

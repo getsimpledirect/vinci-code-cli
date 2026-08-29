@@ -253,7 +253,9 @@ int vinci_broker_build_target_context(const struct vinci_broker_session_policy *
 
 static int write_all(int fd, const uint8_t *bytes, size_t length) {
     size_t offset = 0; while (offset < length) { ssize_t count = write(fd, bytes + offset, length - offset);
-        if (count <= 0) return count < 0 ? -errno : -EIO; offset += (size_t)count; } return 0;
+        if (count <= 0) return count < 0 ? -errno : -EIO;
+        offset += (size_t)count; }
+    return 0;
 }
 
 static int identical_existing(int directory_fd, const char *name, const uint8_t *bytes, size_t length) {
@@ -655,7 +657,8 @@ int vinci_broker_session_release(struct vinci_broker_session *session, const voi
 static const struct vinci_broker_target_rule *find_rule(const struct vinci_broker_session *session, int syscall_number) {
     size_t lower = 0, upper = session->target_rule_count;
     while (lower < upper) { size_t middle = lower + (upper - lower) / 2u; int value = session->target_rules[middle].syscall_number;
-        if (value == syscall_number) return &session->target_rules[middle]; if (value < syscall_number) lower = middle + 1u; else upper = middle; }
+        if (value == syscall_number) return &session->target_rules[middle];
+        if (value < syscall_number) lower = middle + 1u; else upper = middle; }
     return NULL;
 }
 
@@ -704,7 +707,8 @@ int vinci_broker_session_mediate_once(struct vinci_broker_session *session) {
         }
         if (rule->action == VINCI_TARGET_EMULATE_ERRNO) result = answer_pending(session, 0, -rule->emulated_errno, 0);
         else result = answer_pending(session, SECCOMP_USER_NOTIF_FLAG_CONTINUE, 0, 0);
-        if (result != 0) goto fail; return 0;
+        if (result != 0) goto fail;
+        return 0;
     }
 protocol: result = -EPROTO;
 fail: session->phase = VINCI_SESSION_UNCONTAINED; return result;
@@ -825,7 +829,9 @@ int vinci_broker_session_begin_closing(struct vinci_broker_session *session, int
 static int read_small_file(int directory_fd, const char *name, uint8_t *bytes, size_t capacity, size_t *length) {
     int fd = openat(directory_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC); if (fd < 0) return -errno;
     ssize_t count = pread(fd, bytes, capacity, 0); int result = count >= 0 && (size_t)count < capacity ? 0 : -EOVERFLOW;
-    if (result == 0) *length = (size_t)count; close(fd); return result;
+    if (result == 0) *length = (size_t)count;
+    close(fd);
+    return result;
 }
 
 static int event_value(const uint8_t *bytes, size_t length, const char *name, int expected) {

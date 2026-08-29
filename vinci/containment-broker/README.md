@@ -97,5 +97,11 @@ answer tests and assert that native admission is false. On Linux,
 `test/linux-native-build.sh` strictly compiles and links every current native
 source and the fixed-entry target fixture. That script is a build/KAT gate only;
 it is not a real-host containment test and cannot populate a Linux runtime
-receipt. The end-to-end cgroup/descendant/repopulation/crash/capture gate remains
+receipt. It was executed on x86_64 Linux (gcc 15.3.0) on 2026-08-29 and passed:
+hermetic `-nostdlib` trampoline and target-fixture links, entry-point, absent
+interpreter, absent init/fini array and absent dynamic-section assertions, both
+trampoline mutant refusals, and the protocol and SHA-256 known-answer selftests.
+That run establishes source, build and link identity only. It establishes no
+containment property whatever, and `native-admission.json` is unchanged by it:
+`admitted` is still false and every receipt field is still null. The end-to-end cgroup/descendant/repopulation/crash/capture gate remains
 required and unexecuted until an admitted Linux runner is available.

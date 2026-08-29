@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -148,3 +148,22 @@ test("strict native compilation is mandatory on Linux and explicitly unexecuted 
   assert.match(build.stdout, /session_linux\.o/);
   assert.match(build.stdout, /target_bootstrap_linux\.o/);
 });
+
+test("linux-native-build.sh hermetically links the trampoline with full mutant gates and a transitive source manifest", () => {
+  const build = source("test/linux-native-build.sh");
+  assert.match(build, /-nostdlib/);
+  assert.match(build, /-static/);
+  assert.match(build, /-nostartfiles/);
+  assert.match(build, /-Wl,-e,_start/);
+  assert.match(build, /trampoline-hosted-mutant\.c/);
+  assert.match(build, /trampoline-pre-main-mutant\.c/);
+  assert.match(build, /init_array/);
+  assert.match(build, /preinit_array/);
+  assert.match(build, /fini_array/);
+  assert.match(build, /dynamic/);
+  const natives = readdirSync(new URL("native/", packageRoot)).filter((name) => /\.(c|S)$/.test(name));
+  for (const name of natives) {
+    assert.ok(build.includes(name), `linux-native-build.sh must reference native/${name}`);
+  }
+});
+
