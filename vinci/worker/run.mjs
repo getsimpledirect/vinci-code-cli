@@ -136,6 +136,49 @@ async function classifyDivergedLocal(repoDir, branch, localSha, remoteTip) {
   return { residue: unreachable.stdout === range.stdout };
 }
 
+function blocked(reason, message) {
+  return Object.assign(new Error(message), { blockedReason: reason });
+}
+// Shared-tree quarantine (used by BOTH the prose default/branch paths and the digest path).
+async function quarantineDirtyTree(stateDir, repoDir, taskId) {
+  // Shared-tree quarantine: a prior run that ended without committing (honest BLOCKED/
+  // UNVERIFIED, or a kill) leaves tracked modifications and untracked files that make every
+  // later checkout fail ("would be overwritten"). Preserve, never discard — a failed task's
+  // working tree can be the only copy of its work — then hand this task a clean tree.
+  // -z: NUL-separated, UNQUOTED paths — the plain porcelain form quotes names with
+  // spaces/specials, and a quoted path fails the rename while clean -fd then deletes
+  // the real file: the exact loss this code exists to prevent.
+  const dirty = await command("git", ["-C", repoDir, "status", "--porcelain", "-z"], { allowFailure: true });
+  const entries = (dirty.stdout ?? "").split("\0").filter((l) => l.length > 1);
+  if (entries.length > 0) {
+    if (!/^[A-Za-z0-9._-]+$/.test(taskId)) throw new Error(`unsafe taskId for debris path: ${taskId}`);
+    const debrisDir = join(stateDir, "debris", taskId);
+    mkdirSync(debrisDir, { recursive: true });
+    writeFileSync(join(debrisDir, "status.txt"), entries.join("\n") + "\n");
+    // Archive gates: a failed capture must abort BEFORE reset/clean destroys the source.
+    // git apply also requires a trailing newline the harness's stdout handling can strip.
+    const asPatch = (t) => (t && !t.endsWith("\n") ? t + "\n" : (t ?? ""));
+    const patch = await command("git", ["-C", repoDir, "diff", "HEAD"], { allowFailure: true });
+    if (patch.status !== 0) throw new Error("quarantine: tracked-diff capture failed; refusing to clean");
+    writeFileSync(join(debrisDir, "tracked.patch"), asPatch(patch.stdout));
+    const staged = await command("git", ["-C", repoDir, "diff", "--cached"], { allowFailure: true });
+    if (staged.status !== 0) throw new Error("quarantine: staged-diff capture failed; refusing to clean");
+    writeFileSync(join(debrisDir, "staged.patch"), asPatch(staged.stdout));
+    for (const entry of entries) {
+      if (!entry.startsWith("??")) continue;
+      const rel = entry.slice(3);
+      const from = join(repoDir, rel);
+      const to = join(debrisDir, "untracked", rel);
+      mkdirSync(dirname(to), { recursive: true });
+      try { renameSync(from, to); } catch (e) {
+        if (e?.code !== "ENOENT") throw e; // any other failure must abort BEFORE clean -fd deletes the file
+      }
+    }
+    await command("git", ["-C", repoDir, "reset", "--hard", "HEAD"], { allowFailure: true });
+    await command("git", ["-C", repoDir, "clean", "-fd"], { allowFailure: true });
+  }
+}
+
 export async function prepareRepository(stateDir, repo, taskId, branchOverride, baseCommit, baseRef) {
   if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
@@ -147,12 +190,14 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
   // Wave 1B digest form: the handoff pinned an exact baseCommit that the task branch must be
   // created FROM (base_commit), not a pre-existing branch to continue. The branch name is still
   // held to the plain-branch rule, but it need not yet exist on origin; the checked-out tip is
-  // the baseCommit rather than an origin head.
-  // B4 base-checkout validation: when a baseRef is named it is fetched so its identity is the
-  // LIVE origin head, and the baseCommit must be an ancestor of origin/<baseRef> (else
-  // `base_ref_unavailable` / `base_commit_unreachable`, both BLOCKED). When no baseRef is named
-  // the fetch is skipped; the baseCommit must resolve in local objects and (when a HEAD exists)
-  // be an ancestor of it, so a local-only baseCommit is refused rather than silently used.
+  // the baseCommit rather than an origin head. Order of operations, fixed:
+  //   validate names → clone (uncached) or QUARANTINE the dirty tree (cached; F5, reusing the
+  //   shared-tree quarantine) → F4: `git fetch origin +refs/heads/<baseRef>:refs/remotes/origin/<baseRef>`
+  //   MUST succeed (else BLOCKED base_ref_unavailable) → `merge-base --is-ancestor <baseCommit>
+  //   refs/remotes/origin/<baseRef>` (else BLOCKED base_commit_unreachable; there is NO fallback
+  //   to local objects: a commit this clone happens to hold is not a base origin vouches for) →
+  //   F5: an existing local <targetBranch> goes through PR #22's handling (never-pushed residue
+  //   renamed aside, a tracked/diverged branch refused) → only then `checkout -B`.
   if (baseCommit) {
     if (typeof baseCommit !== "string" || !/^[0-9a-f]{40}$/.test(baseCommit)) {
       throw new Error("base_commit must be a full 40-character lowercase hex SHA-1");
@@ -160,39 +205,49 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
     validateBranchName(branch);
     const legal = await command("git", ["check-ref-format", "--branch", branch], { allowFailure: true });
     if (legal.status !== 0) throw new Error(`envelope branch ${branch} is not a valid git branch name`);
-    const hasBaseRef = typeof baseRef === "string" && baseRef !== "";
-    if (cached && hasBaseRef) {
-      await command("git", ["-C", repoDir, "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"], { allowFailure: true });
-    } else if (!cached) {
+    if (typeof baseRef !== "string" || baseRef === "") {
+      throw blocked("base_ref_unavailable", "base_ref_unavailable: a pinned base_commit requires a base_ref to be fetched from origin");
+    }
+    validateBranchName(baseRef);
+    const legalBase = await command("git", ["check-ref-format", "--branch", baseRef], { allowFailure: true });
+    if (legalBase.status !== 0) throw blocked("base_ref_unavailable", `base_ref_unavailable: base_ref ${baseRef} is not a valid git branch name`);
+
+    if (cached) {
+      await quarantineDirtyTree(stateDir, repoDir, taskId);
+    } else {
       mkdirSync(dirname(repoDir), { recursive: true });
       await command("git", ["clone", cloneUrl, repoDir]);
     }
-    if (hasBaseRef) {
-      const refExists = await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${baseRef}`], { allowFailure: true });
-      if (refExists.status !== 0) {
-        throw Object.assign(new Error(`base_ref_unavailable: origin/${baseRef} is not available on origin`), { blockedReason: "base_ref_unavailable" });
-      }
+
+    const fetched = await command("git", ["-C", repoDir, "fetch", "origin", `+refs/heads/${baseRef}:refs/remotes/origin/${baseRef}`], { allowFailure: true });
+    if (fetched.status !== 0) {
+      throw blocked("base_ref_unavailable", `base_ref_unavailable: origin/${baseRef} could not be fetched from origin: ${fetched.stderr || fetched.status}`);
     }
-    const baseExists = await command("git", ["-C", repoDir, "cat-file", "-e", `${baseCommit}^{commit}`], { allowFailure: true });
-    if (baseExists.status !== 0) {
-      throw Object.assign(new Error(`base_commit_unreachable: base_commit ${baseCommit} is not available`), { blockedReason: "base_commit_unreachable" });
+    const isAncestor = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", baseCommit, `refs/remotes/origin/${baseRef}`], { allowFailure: true });
+    if (isAncestor.status !== 0) {
+      throw blocked("base_commit_unreachable", `base_commit_unreachable: base_commit ${baseCommit.slice(0, 8)} is not an ancestor of origin/${baseRef} (as fetched)`);
     }
-    if (hasBaseRef) {
-      const isAncestor = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", baseCommit, `refs/remotes/origin/${baseRef}`], { allowFailure: true });
-      if (isAncestor.status !== 0) {
-        throw Object.assign(new Error(`base_commit_unreachable: base_commit ${baseCommit.slice(0, 8)} is not an ancestor of origin/${baseRef}`), { blockedReason: "base_commit_unreachable" });
-      }
-    } else {
-      const headExists = await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", "HEAD"], { allowFailure: true });
-      if (headExists.status === 0) {
-        const isAncestor = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", baseCommit, "HEAD"], { allowFailure: true });
-        if (isAncestor.status !== 0) {
-          throw Object.assign(new Error(`base_commit_unreachable: base_commit ${baseCommit.slice(0, 8)} is not an ancestor of HEAD`), { blockedReason: "base_commit_unreachable" });
-        }
+
+    let aside = null;
+    const local = await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { allowFailure: true });
+    if (local.status === 0) {
+      const localSha = local.stdout;
+      // Never reset away local-only commits: -B is destructive. A local branch that is an ancestor
+      // of (or equal to) baseCommit loses nothing; anything else is divergence, classified by PR
+      // #22's never-pushed-residue predicate against baseCommit as the tip it must rejoin.
+      const anc = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", `refs/heads/${branch}`, baseCommit], { allowFailure: true });
+      if (anc.status === 1) {
+        const reason = `local branch ${branch} at ${localSha} has commits not on base_commit ${baseCommit}; refusing to reset (divergence)`;
+        const verdict = await classifyDivergedLocal(repoDir, branch, localSha, baseCommit);
+        if (!verdict.residue) throw blocked("branch_diverged", `branch_diverged: ${reason}${verdict.note ? `; ${verdict.note}` : ""}`);
+        aside = await renameBranchAside(repoDir, branch);
+        process.stderr.write(`vinci worker: never-pushed residue on ${branch} at ${localSha} renamed aside to ${aside}; continuing from base_commit ${baseCommit.slice(0, 8)}\n`);
+      } else if (anc.status !== 0) {
+        throw new Error(`ancestry check failed for ${branch} (${localSha} vs base_commit ${baseCommit}): ${anc.stderr || anc.status}`);
       }
     }
     await command("git", ["-C", repoDir, "checkout", "-B", branch, baseCommit]);
-    return { branch, repoDir };
+    return { branch, repoDir, aside };
   }
 
 
@@ -238,42 +293,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
     // The default path works off origin/main and needs it fresh. The branch path fetches its
     // branch explicitly below (after the not-found gate) and never runs a general fetch first.
     if (!branchOverride) await command("git", ["-C", repoDir, "fetch", "origin"]);
-    // Shared-tree quarantine: a prior run that ended without committing (honest BLOCKED/
-    // UNVERIFIED, or a kill) leaves tracked modifications and untracked files that make every
-    // later checkout fail ("would be overwritten"). Preserve, never discard — a failed task's
-    // working tree can be the only copy of its work — then hand this task a clean tree.
-    // -z: NUL-separated, UNQUOTED paths — the plain porcelain form quotes names with
-    // spaces/specials, and a quoted path fails the rename while clean -fd then deletes
-    // the real file: the exact loss this code exists to prevent.
-    const dirty = await command("git", ["-C", repoDir, "status", "--porcelain", "-z"], { allowFailure: true });
-    const entries = (dirty.stdout ?? "").split("\0").filter((l) => l.length > 1);
-    if (entries.length > 0) {
-      if (!/^[A-Za-z0-9._-]+$/.test(taskId)) throw new Error(`unsafe taskId for debris path: ${taskId}`);
-      const debrisDir = join(stateDir, "debris", taskId);
-      mkdirSync(debrisDir, { recursive: true });
-      writeFileSync(join(debrisDir, "status.txt"), entries.join("\n") + "\n");
-      // Archive gates: a failed capture must abort BEFORE reset/clean destroys the source.
-      // git apply also requires a trailing newline the harness's stdout handling can strip.
-      const asPatch = (t) => (t && !t.endsWith("\n") ? t + "\n" : (t ?? ""));
-      const patch = await command("git", ["-C", repoDir, "diff", "HEAD"], { allowFailure: true });
-      if (patch.status !== 0) throw new Error("quarantine: tracked-diff capture failed; refusing to clean");
-      writeFileSync(join(debrisDir, "tracked.patch"), asPatch(patch.stdout));
-      const staged = await command("git", ["-C", repoDir, "diff", "--cached"], { allowFailure: true });
-      if (staged.status !== 0) throw new Error("quarantine: staged-diff capture failed; refusing to clean");
-      writeFileSync(join(debrisDir, "staged.patch"), asPatch(staged.stdout));
-      for (const entry of entries) {
-        if (!entry.startsWith("??")) continue;
-        const rel = entry.slice(3);
-        const from = join(repoDir, rel);
-        const to = join(debrisDir, "untracked", rel);
-        mkdirSync(dirname(to), { recursive: true });
-        try { renameSync(from, to); } catch (e) {
-          if (e?.code !== "ENOENT") throw e; // any other failure must abort BEFORE clean -fd deletes the file
-        }
-      }
-      await command("git", ["-C", repoDir, "reset", "--hard", "HEAD"], { allowFailure: true });
-      await command("git", ["-C", repoDir, "clean", "-fd"], { allowFailure: true });
-    }
+    await quarantineDirtyTree(stateDir, repoDir, taskId);
   } else {
     mkdirSync(dirname(repoDir), { recursive: true });
     await command("git", ["clone", cloneUrl, repoDir]);

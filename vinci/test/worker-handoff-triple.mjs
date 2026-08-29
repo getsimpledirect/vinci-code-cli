@@ -344,14 +344,19 @@ try {
       assert.equal(existsSync(join(f.tempDir, "daemon.lock")), false, `${label}: must refuse before taking the daemon lock`);
       assert.equal(existsSync(join(f.tempDir, "tasks", "m-classes.json")), false, `${label}: no task may be touched`);
     }
-    // A readable @file works and is equivalent to the inline form.
+    // A readable @file works and is equivalent to the inline form (a fresh targetBranch: the
+    // happy path's branch now tracks origin and would be refused as diverged, see F5).
+    const classesOrder = orderFor("wo-classes");
+    f.busMessages.push(handoff("m-classes-file", register(classesOrder, specFor(classesOrder, { targetBranch: "feat/classes" }))));
     const classesFile = join(f.tempDir, "classes.json");
     writeFileSync(classesFile, JSON.stringify({ forte: { provider: "vinci", model: "forte" } }));
     let r = await run({ env: { VINCI_WORKER_MODEL_CLASSES: `@${classesFile}` } });
     assert.equal(r.status, 0, r.stderr);
     vinciRuns += 1;
     assert.equal(f.getVinciCalls().length, vinciRuns, "@file table: the digest handoff runs");
-    assert.doesNotMatch(postsFor("m-classes"), /state=BLOCKED/, "@file table: the class resolves and the task is not refused");
+    assert.match(postsFor("m-classes-file"), /state=COMPLETED/, "@file table: the class resolves and the task completes");
+    assert.match(postsFor("m-classes"), /state=BLOCKED/, "the m-classes handoff that the three refused daemons never touched is processed by this pass; it is BLOCKED as branch_diverged (its targetBranch now tracks origin)");
+    assert.match(postsFor("m-classes"), /branch_diverged/);
     // Unset ⇒ prose-only: start, but BLOCK every digest handoff before any transfer.
     f.busMessages.push(handoff("m-noclasses", happyTriple));
     r = await run({ env: { VINCI_WORKER_MODEL_CLASSES: "" } });
@@ -454,6 +459,119 @@ try {
     } finally {
       await new Promise((r) => governor.close(r));
     }
+  }
+
+  // --- F4: base checkout — origin is the only authority for base_ref / base_commit ---
+  {
+    const repoDir = join(f.tempDir, "repos", "vinci-contracts");
+    const sub = (a) => (a[0] === "-C" ? a[2] : a[0]);
+    // (a) a base_ref origin does not have ⇒ base_ref_unavailable; the explicit fetch was attempted
+    //     and nothing was checked out.
+    const noRef = orderFor("wo-noref");
+    f.busMessages.push(handoff("m-noref", register(noRef, specFor(noRef, { baseRef: "no-such-branch", targetBranch: "feat/noref" }))));
+    let r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.getVinciCalls().length, vinciRuns, "base_ref_unavailable must never spawn");
+    assert.match(postsFor("m-noref"), /base_ref_unavailable/);
+    assert.equal(taskState("m-noref").state, "BLOCKED");
+    const fetches = f.getGitCalls().filter((a) => sub(a) === "fetch");
+    assert.deepEqual(fetches.map((a) => a.slice(-2)), [["origin", "+refs/heads/no-such-branch:refs/remotes/origin/no-such-branch"]], `exactly one explicit fetch of the base ref: ${JSON.stringify(fetches)}`);
+    assert.equal(f.getGitCalls().filter((a) => sub(a) === "checkout").length, 0, "nothing is checked out on a base refusal");
+    assert.equal(gitFails(repoDir, "rev-parse", "--verify", "--quiet", "refs/heads/feat/noref"), true, "the target branch was never created");
+
+    // (b) a commit that EXISTS LOCALLY (cached clone) but is not on origin/<baseRef> ⇒
+    //     base_commit_unreachable. The local object is real: a checkout from it would succeed,
+    //     so only the ancestry proof against the fetched origin ref stands between this handoff
+    //     and a spawn on a base origin never vouched for.
+    git(repoDir, "checkout", "-q", "--detach", baseCommit);
+    writeFileSync(join(repoDir, "local-only.txt"), "never pushed\n");
+    git(repoDir, "config", "user.email", "t@t");
+    git(repoDir, "config", "user.name", "t");
+    git(repoDir, "add", "local-only.txt");
+    git(repoDir, "commit", "-qm", "local only");
+    const localOnly = git(repoDir, "rev-parse", "HEAD");
+    git(repoDir, "branch", "-q", "keep/local-only", localOnly); // keep the object reachable
+    git(repoDir, "checkout", "-q", "keep/local-only");
+    assert.equal(gitFails(repoDir, "cat-file", "-e", `${localOnly}^{commit}`), false, "precondition: the commit object exists in the cached clone");
+    assert.equal(gitFails(contractBare, "cat-file", "-e", `${localOnly}^{commit}`), true, "precondition: origin has never seen it");
+    const localBase = orderFor("wo-localbase");
+    f.busMessages.push(handoff("m-localbase", register(localBase, specFor(localBase, { baseCommit: localOnly, targetBranch: "feat/localbase" }))));
+    r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.getVinciCalls().length, vinciRuns, "a base_commit origin does not vouch for must never spawn");
+    assert.match(postsFor("m-localbase"), /base_commit_unreachable/);
+    assert.match(postsFor("m-localbase"), new RegExp(`contract=wo-localbase@${workOrderDigest(localBase).slice(0, 8)}`));
+    assert.equal(taskState("m-localbase").state, "BLOCKED");
+    assert.equal(f.getGitCalls().filter((a) => sub(a) === "checkout").length, 0, "nothing is checked out on a base refusal");
+    assert.equal(gitFails(repoDir, "rev-parse", "--verify", "--quiet", "refs/heads/feat/localbase"), true, "the target branch was never created");
+  }
+
+  // --- F5: the digest path quarantines a dirty tree and applies PR #22's branch handling BEFORE checkout -B ---
+  {
+    const repoDir = join(f.tempDir, "repos", "vinci-contracts");
+    const sub = (a) => (a[0] === "-C" ? a[2] : a[0]);
+    const staleRefs = () => git(repoDir, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads/stale/");
+    // (a) dirty tree: a tracked modification + an untracked file left by a prior run are
+    //     preserved under <state>/debris/<task> and the task runs on a clean tree.
+    git(repoDir, "checkout", "-q", "feat/classes");
+    writeFileSync(join(repoDir, "README.md"), "half-finished\n");
+    writeFileSync(join(repoDir, "leftover.txt"), "only copy\n");
+    const dirtyOrder = orderFor("wo-dirty");
+    f.busMessages.push(handoff("m-dirty", register(dirtyOrder, specFor(dirtyOrder, { targetBranch: "feat/dirty" }))));
+    let r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    assert.equal(f.getVinciCalls().length, vinciRuns, "the task runs after quarantine");
+    assert.match(postsFor("m-dirty"), /state=COMPLETED/);
+    const debris = join(f.tempDir, "debris", "m-dirty");
+    assert.ok(existsSync(join(debris, "tracked.patch")), "the dirty tree must be QUARANTINED under <state>/debris/<task> before checkout -B");
+    assert.match(readFileSync(join(debris, "tracked.patch"), "utf8"), /half-finished/, "the tracked modification is preserved as a patch");
+    assert.equal(readFileSync(join(debris, "untracked", "leftover.txt"), "utf8"), "only copy\n", "the untracked file is moved, not deleted");
+    assert.equal(git(repoDir, "status", "--porcelain"), "", "the task received a clean tree");
+    const calls = f.getGitCalls().map(sub);
+    assert.ok(calls.indexOf("reset") < calls.indexOf("checkout"), `quarantine runs before checkout -B: ${calls.join(",")}`);
+
+    // (b) an existing local <targetBranch> with never-pushed commits (no upstream, on no origin
+    //     head) is renamed aside to stale/<branch>-<stamp>-<hex> — never deleted — and the task
+    //     continues from base_commit.
+    git(repoDir, "checkout", "-qb", "feat/residue", baseCommit);
+    writeFileSync(join(repoDir, "residue.txt"), "night-1 work\n");
+    git(repoDir, "add", "residue.txt");
+    git(repoDir, "commit", "-qm", "residue");
+    const residueTip = git(repoDir, "rev-parse", "HEAD");
+    assert.equal(gitFails(repoDir, "config", "--get", "branch.feat/residue.remote"), true, "precondition: no upstream");
+    const residueOrder = orderFor("wo-residue");
+    f.busMessages.push(handoff("m-residue", register(residueOrder, specFor(residueOrder, { targetBranch: "feat/residue" }))));
+    r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    assert.equal(f.getVinciCalls().length, vinciRuns, "the task runs after the residue is set aside");
+    assert.match(staleRefs(), new RegExp(`^stale/feat/residue-\\d{8}T\\d{6}Z-[0-9a-f]{6} ${residueTip}$`, "m"), `residue must survive at its tip under stale/: ${staleRefs()}`);
+    assert.equal(git(repoDir, "rev-parse", "feat/residue"), baseCommit, "the task branch was recreated from base_commit");
+    assert.match(r.stderr, /never-pushed residue on feat\/residue .* renamed aside to stale\/feat\/residue-/);
+
+    // (c) a local <targetBranch> that TRACKS origin/<targetBranch> and is ahead of base_commit
+    //     is refused (branch_diverged) and left exactly where it is; no checkout -B ran.
+    git(repoDir, "checkout", "-qb", "feat/tracked", baseCommit);
+    writeFileSync(join(repoDir, "tracked.txt"), "pushed\n");
+    git(repoDir, "add", "tracked.txt");
+    git(repoDir, "commit", "-qm", "tracked");
+    git(repoDir, "push", "-q", "-u", "origin", "feat/tracked");
+    writeFileSync(join(repoDir, "tracked2.txt"), "ahead\n");
+    git(repoDir, "add", "tracked2.txt");
+    git(repoDir, "commit", "-qm", "ahead");
+    const trackedTip = git(repoDir, "rev-parse", "HEAD");
+    git(repoDir, "checkout", "-q", "--detach", baseCommit);
+    const trackedOrder = orderFor("wo-tracked");
+    f.busMessages.push(handoff("m-tracked", register(trackedOrder, specFor(trackedOrder, { targetBranch: "feat/tracked" }))));
+    r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.getVinciCalls().length, vinciRuns, "a diverged tracked branch must never spawn");
+    assert.match(postsFor("m-tracked"), /branch_diverged: local branch feat\/tracked at .* has commits not on base_commit .*; refusing to reset \(divergence\)/);
+    assert.equal(taskState("m-tracked").state, "BLOCKED");
+    assert.equal(git(repoDir, "rev-parse", "feat/tracked"), trackedTip, "the tracked branch is left in place");
+    assert.doesNotMatch(staleRefs(), /feat\/tracked/, "a tracked branch is never renamed aside");
+    assert.equal(f.getGitCalls().filter((a) => sub(a) === "checkout").length, 0, "no checkout -B on a divergence refusal");
   }
 
   console.log("PASS worker-handoff-triple");
