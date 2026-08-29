@@ -31,8 +31,8 @@ const OUT_OF_CREDIT_BODY = JSON.stringify({
 const with402 = (body) => Object.assign(new Error(body), { status: 402 });
 
 export function assert402Classifications(classify) {
-  assert.equal(classify(with402(IN_FLIGHT_BODY)), "account", "in-flight 402 must not permit escalation fallback");
-  assert.equal(classify(with402(AFFORDABILITY_BODY)), "account", "affordability 402 must not permit escalation fallback");
+  assert.equal(classify(with402(IN_FLIGHT_BODY)), "account", "in-flight 402 must be retryable");
+  assert.equal(classify(with402(AFFORDABILITY_BODY)), "account", "affordability 402 must be retryable");
   assert.equal(classify(with402(OUT_OF_CREDIT_BODY)), "account", "true out-of-credit 402 must stay terminal");
 }
 
@@ -57,7 +57,7 @@ assert.equal(
 assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can only afford 0"), 0);
 assert.equal(parseAffordableTokenCount("You requested up to -10 tokens, but can only afford 5"), undefined);
 assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can only afford -5"), undefined);
-assert.equal(parseAffordableTokenCount("can afford 19 tokens"), undefined);
+assert.equal(parseAffordableTokenCount("can afford 19 tokens"), 19);
 assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can afford 5"), undefined);
 assert.equal(parseAffordableTokenCount("You requested up to 1,00 tokens, but can only afford 5"), undefined);
 assert.equal(

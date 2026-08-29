@@ -35,14 +35,19 @@ function boundedRetryAfterMs(value: string | null | undefined, fallbackSeconds: 
 }
 
 export function vinciAffordableTokenLimit(errorBodyOrMessage: string | undefined): number | undefined {
-  const match = errorBodyOrMessage?.match(
+  const canonicalMatch = errorBodyOrMessage?.match(
     /You requested up to ([0-9][0-9,]*) tokens, but can only afford ([0-9][0-9,]*)(?![0-9,])/i,
   );
-  if (!match) return undefined;
-  const numericTexts = [match[1], match[2]];
+  const abbreviatedMatch = errorBodyOrMessage?.match(/\bcan (?:only )?afford ([0-9][0-9,]*) tokens?\b/i);
+  const numericTexts = canonicalMatch
+    ? [canonicalMatch[1], canonicalMatch[2]]
+    : abbreviatedMatch
+      ? [abbreviatedMatch[1]]
+      : undefined;
+  if (!numericTexts) return undefined;
   if (!numericTexts.every((value) => /^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(value))) return undefined;
-  const [requestedTokens, affordableTokens] = numericTexts.map((value) => Number(value.replaceAll(",", "")));
-  return Number.isSafeInteger(requestedTokens) && Number.isSafeInteger(affordableTokens) ? affordableTokens : undefined;
+  const tokenCounts = numericTexts.map((value) => Number(value.replaceAll(",", "")));
+  return tokenCounts.every(Number.isSafeInteger) ? tokenCounts.at(-1) : undefined;
 }
 
 function parsedErrorBody(errorBodyOrMessage: string): Record<string, unknown> | undefined {
