@@ -599,11 +599,129 @@ export function isSensitiveShellRead(command: string): boolean {
 
 export function isShellNetworkCommand(command: string): boolean {
   const risk = shellRiskText(command);
-  return /\b(?:curl|wget|scp|sftp|ssh|nc|ncat|socat|ftp|npx|bunx)\b|\brsync\b[^\n]*(?:\s|^)[^\s]+:[^\s]+|\bgit\s+(?:clone|fetch|pull|push|ls-remote|submodule\s+update)\b|\bgh\s+\w+|\b(?:aws|gcloud|az)\s+\w+|\b(?:npm|pnpm|yarn|bun)\s+(?:i|ci|install|add|update|publish|create|init|exec|dlx|x)\b|\b(?:pip|pip3|uv|pipx)\s+install\b|\b(?:cargo|gem)\s+install\b|\bgo\s+(?:install|get)\b|\bcomposer\s+(?:install|require)\b|\bbundle\s+install\b|\bdeno\s+(?:install|cache)\b|\b(?:brew|apt|apt-get)\s+(?:install|update)\b|\bdocker\s+(?:pull|push|login)\b|\bpod\s+(?:install|update|repo)\b|\b(?:flutter|dart)\s+(?:pub|packages)\s+\w+|\bflutter\s+(?:build|run|create)\b|\b(?:gradle|gradlew)\b|\b(?:mvn|mvnw)\b|\b(?:expo|eas)\s+\w+|\bdotnet\s+(?:restore|add|build|publish)\b|\bpoetry\s+(?:install|add|update)\b|\brustup\s+\w+/i.test(risk);
+  // Unescape escaped sequences so disguised commands like c\u\r\l are detected as curl
+  const unescapedRisk = unescapeShellToken(risk);
+  return /\b(?:curl|wget|scp|sftp|ssh|nc|ncat|socat|ftp|npx|bunx)\b|\brsync\b[^\n]*(?:\s|^)[^\s]+:[^\s]+|\bgit\s+(?:clone|fetch|pull|push|ls-remote|submodule\s+update)\b|\bgh\s+\w+|\b(?:aws|gcloud|az)\s+\w+|\b(?:npm|pnpm|yarn|bun)\s+(?:i|ci|install|add|update|publish|create|init|exec|dlx|x)\b|\b(?:pip|pip3|uv|pipx)\s+install\b|\b(?:cargo|gem)\s+install\b|\bgo\s+(?:install|get)\b|\bcomposer\s+(?:install|require)\b|\bbundle\s+install\b|\bdeno\s+(?:install|cache)\b|\b(?:brew|apt|apt-get)\s+(?:install|update)\b|\bdocker\s+(?:pull|push|login)\b|\bpod\s+(?:install|update|repo)\b|\b(?:flutter|dart)\s+(?:pub|packages)\s+\w+|\bflutter\s+(?:build|run|create)\b|\b(?:gradle|gradlew)\b|\b(?:mvn|mvnw)\b|\b(?:expo|eas)\s+\w+|\bdotnet\s+(?:restore|add|build|publish)\b|\bpoetry\s+(?:install|add|update)\b|\brustup\s+\w+/i.test(unescapedRisk);
 }
 
 const CLOUD_TOOL =
   /^(?:gcloud|gsutil|bq|aws|az|kubectl|helm|terraform|pulumi|vercel|netlify|firebase|flyctl|fly|railway|serverless|sst|wrangler|supabase|heroku|amplify|eas|doctl)$/i;
+
+/** Unescape ANSI-C $'...' quoting and in-word backslash escapes from a shell token.
+ *  - c$'u'r'l' becomes curl (shell concatenation + ANSI-C unescaping)
+ *  - c\u\r\l becomes curl (in-word backslash escapes)
+ *  - n\x63 becomes nc (hex escape)
+ *  - Handles $'...' blocks: $'c' → c, $'\x63' → c
+ *  Returns the unescaped string, or the original if not a recognized pattern. */
+function unescapeShellToken(token: string): string {
+  let result = token;
+  
+  // 1. Handle $'...' ANSI-C quoting blocks
+  result = result.replace(/\$'([^']*)'/g, (_match, content) => {
+    let unescaped = "";
+    for (let i = 0; i < content.length; i++) {
+      if (content[i] === "\\") {
+        if (i + 1 >= content.length) {
+          unescaped += "\\";
+          break;
+        }
+        const next = content[i + 1];
+        if (next === "n") {
+          unescaped += "\n";
+          i += 1;
+        } else if (next === "r") {
+          unescaped += "\r";
+          i += 1;
+        } else if (next === "t") {
+          unescaped += "\t";
+          i += 1;
+        } else if (next === "\\") {
+          unescaped += "\\";
+          i += 1;
+        } else if (next === "'") {
+          unescaped += "'";
+          i += 1;
+        } else if (next === "x") {
+          // Hex: \xHH
+          if (i + 3 < content.length) {
+            const hex = content.slice(i + 2, i + 4);
+            if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+              unescaped += String.fromCharCode(parseInt(hex, 16));
+              i += 3;
+            } else {
+              unescaped += next;
+              i += 1;
+            }
+          } else {
+            unescaped += next;
+            i += 1;
+          }
+        } else if (next === "u") {
+          // Unicode: \uHHHH (exactly 4 hex digits)
+          if (i + 5 < content.length) {
+            const hex = content.slice(i + 2, i + 6);
+            if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+              unescaped += String.fromCharCode(parseInt(hex, 16));
+              i += 5;
+            } else {
+              unescaped += next;
+              i += 1;
+            }
+          } else {
+            unescaped += next;
+            i += 1;
+          }
+        } else if (next === "U") {
+          // Unicode: \UHHHHHHHH (exactly 8 hex digits)
+          if (i + 9 < content.length) {
+            const hex = content.slice(i + 2, i + 10);
+            if (/^[0-9a-fA-F]{8}$/.test(hex)) {
+              unescaped += String.fromCharCode(parseInt(hex, 16));
+              i += 9;
+            } else {
+              unescaped += next;
+              i += 1;
+            }
+          } else {
+            unescaped += next;
+            i += 1;
+          }
+        } else if (/^[0-7]/.test(next)) {
+          // Octal: \OOO (up to 3 digits)
+          let octal = next;
+          i += 1;
+          if (i + 1 < content.length && /^[0-7]/.test(content[i + 1])) {
+            octal += content[i + 1];
+            i += 1;
+            if (i + 1 < content.length && /^[0-7]/.test(content[i + 1])) {
+              octal += content[i + 1];
+              i += 1;
+            }
+          }
+          unescaped += String.fromCharCode(parseInt(octal, 8));
+        } else {
+          // For unknown escape sequences, just output the character after the backslash
+          unescaped += next;
+          i += 1;
+        }
+      } else {
+        unescaped += content[i];
+      }
+    }
+    return unescaped;
+  });
+  
+  // 2. Remove single-quoted and double-quoted sections (they're just delimiters in this context)
+  // This handles cases like 'l' in c$'u'r'l' → cur'l' becomes curl
+  result = result.replace(/'[^']*'/g, m => m.slice(1, -1));  // Remove the quotes
+  result = result.replace(/"([^"\\]|\\.)*"/g, m => m.slice(1, -1));  // Remove the quotes, handle escapes
+  
+  // 3. Handle in-word backslash escapes (outside of quoting): c\u\r\l → curl
+  result = result.replace(/\\(.)/g, "$1");
+  
+  return result;
+}
+
 
 /** A segment's body with argv[0] unquoted and PATH-STRIPPED, and everything after it untouched:
  *  `./node_modules/.bin/npx wrangler deploy` → `npx wrangler deploy`.
@@ -619,7 +737,8 @@ const CLOUD_TOOL =
 function pathStrippedBody(segment: string): string {
   const body = commandBody(segment);
   const first = /^\S+/.exec(body)?.[0] ?? "";
-  const bare = first.replace(/^['"]|['"]$/g, "").split("/").pop() ?? "";
+  const unescaped = unescapeShellToken(first);
+  const bare = unescaped.replace(/^['"]|['"]$/g, "").split("/").pop() ?? "";
   return bare + body.slice(first.length);
 }
 
@@ -632,7 +751,7 @@ function segmentCommandWord(segment: string): string {
 
 function isCloudDeploySegment(segment: string): boolean {
   const word = segmentCommandWord(segment);
-  const body = commandBody(segment);
+  const body = pathStrippedBody(segment);
   return (
     CLOUD_TOOL.test(word) ||
     (word === "docker" && /^docker\s+(?:push|pull|login|build)\b/i.test(body)) ||
@@ -745,7 +864,7 @@ function runnerTargetSegment(segment: string): string | null {
  *      and handled by segmentCommandWord's path-stripping only to the extent argv[0] is honest.
  *  Callers must treat a `true` as "this looks like ordinary build tooling", not as "this is safe". */
 export function isDevToolchainOnlyNetwork(command: string): boolean {
-  if (/\$\(|`/.test(command)) return false; // substitution could run anything under the grant
+  if (/\$\(|`|\$\'/.test(command)) return false; // substitution could run anything under the grant
   let sawToolchainNetwork = false;
   for (const segment of shellSegments(command)) {
     if (isCloudDeploySegment(segment)) return false; // cloud deploys keep their per-command prompt
