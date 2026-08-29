@@ -24,6 +24,8 @@ vinci worker start --id <worker-id> \
 - `--state-dir`: Persistent state directory (default `.vinci-worker-state`)
 - `--governor`: Governor URL (Stage 2). Once set, every task needs a granted lease — see "Governor Lease (fail-closed)"
 - `--require-governor` (or `VINCI_WORKER_REQUIRE_GOVERNOR=1`): refuse to start (exit 78) unless `--governor` is configured
+- `VINCI_WORKER_MODEL_CLASSES` env: the model-class table for digest-form handoffs (inline JSON or `@<file>`), validated once at startup — invalid ⇒ exit 78; unset ⇒ prose-only. See "Model classes (runtime config)"
+- `VINCI_WORKER_REGISTRY_TIMEOUT_MS` env: one deadline for the registry fetch, headers and body (default 10000)
 
 ## Supervision
 
@@ -115,59 +117,6 @@ its own reason so the ledger and the operator attribution follow it:
 | (b) branch on origin; local branch absent, or an ancestor of the remote tip | checkout at the remote tip (a fast-forward when the local branch existed) | — |
 | (c) branch on origin; local branch has commits not on the remote tip | **refused**, local commits untouched | `local branch <branch> at <localSha> has commits not on origin/<branch> at <remoteTip>; refusing to reset (divergence)` |
 
-## Handoff Forms (Wave 1B)
-
-A handoff body is one of two forms. The daemon detects which by its first non-blank
-character — a leading `{` is a **digest triple**, anything else is **legacy prose**:
-
-- **Prose** (the classic envelope above): starts with a header line such as `repo: org/repo`;
-  no leading `{`. Parsed by `parseEnvelope`. Carries the branch/evidence/limits inline, so it
-  can pin `branch:` but cannot pin an immutable `base_commit`.
-- **Digest triple**: a JSON object whose first non-blank character is `{`, with EXACTLY three
-  keys — `work_order_id`, `contract_digest`, `execution_spec_digest`. Any extra or missing key
-  is a malformed handoff (`malformed_handoff`), not an extension point. It names a pinned
-  work order by digest; every runtime term (repo, model class, branch, `base_commit`, bounds)
-  is then fetched from the Governor's pinned registry
-  (`GET /v1/governor/contracts/{work_order_id}`) and recomputed locally.
-
-The digest form pins an exact immutable `base_commit` that the task branch is created FROM
-(never a branch to continue), and **never spawns a model on any mismatch** — every refusal
-(BLOCKED reason below) happens before a clone and before a vinci spawn.
-
-### Materialize table
-
-The `modelClass` in the materialized spec must name a class in the worker's closed table; an
-unknown class is BLOCKED (`unknown_model_class`) rather than passed through as a model id.
-`auto` is deliberately absent — a contract names a class, not "whatever the account resolves to".
-
-| modelClass | provider | model |
-|------------|----------|-------|
-| `forte` | vinci | `forte` |
-| `fortissimo` | vinci | `fortissimo` |
-
-A spec-level `provider` pin overrides the provider, never the model id.
-
-### Refusal reasons
-
-The digest form BLOCKs with one of these machine-readable `.code`s:
-
-| code | meaning |
-|------|---------|
-| `malformed_handoff` | body starts with `{` but is not a valid 3-key JSON triple (extra/missing key, bad JSON, bad digest/identifier) |
-| `contract_digest_mismatch` | the served work order does not reproduce `contract_digest` |
-| `execution_spec_digest_mismatch` | no served spec reproduces `execution_spec_digest` |
-| `binding_mismatch` | the matched spec was compiled from a different work order id/digest |
-| `unknown_model_class` | `modelClass` not in the materialize table |
-| `unsupported_repository_host` | spec repository host is not `github.com` |
-| `invalid_spec_field` | a materialized field fails a schema rule (branch, base_commit, bounds, output, promotion, evidence, …) |
-| `registry_malformed` | the registry answer is not an object / carries no usable work order or spec |
-
-`fetchWorkOrderRegistry` also turns a non-2xx registry answer into a BLOCK with the reason
-`registry_unavailable` / `registry_unauthorized` / `work_order_not_found` (404) / `registry_error`.
-A successful digest handoff stamps the task record with `work_order_id`, `contract_digest`
-(long form), `execution_spec_digest`, `base_commit` and `promotion`, and the terminal post cites
-`contract=<work_order_id>@<digest8>`.
-
 **Never-pushed residue on path (c).** Soak cohort 2 rows 11/11b (2026-08-28) were a genuine
 divergence: a Night-1 local `worker/<id>` (2 ahead / 82 behind origin's rebuilt PR head) that had
 never been pushed. When ALL of the following hold, the local branch is renamed aside to
@@ -196,6 +145,138 @@ not-found or divergence. A branch that exists on origin but cannot be resolved l
 explicit fetch is `envelope branch <branch> exists on origin but fetch did not materialize
 origin/<branch> locally`. The pre-existing `reset --hard`/`clean -fd` quarantine of the shared
 checkout is unchanged here (Wave 1 clean-room item).
+
+## Handoff Forms (Wave 1B)
+
+A handoff body is one of two forms. The daemon detects which by its first non-blank
+character — a leading `{` is a **digest triple**, anything else is **legacy prose**:
+
+- **Prose** (the classic envelope above): starts with a header line such as `repo: org/repo`;
+  no leading `{`. Parsed by `parseEnvelope`. Carries the branch/evidence/limits inline, so it
+  can pin `branch:` but cannot pin an immutable `base_commit`. Its behaviour, posts and bytes are
+  unchanged by Wave 1B (the existing suite is the oracle).
+- **Digest triple**: a JSON object whose first non-blank character is `{`, with EXACTLY three
+  keys — `work_order_id`, `contract_digest`, `execution_spec_digest`. Any extra or missing key
+  is a malformed handoff (`malformed_handoff`), not an extension point. It names a pinned
+  work order by digest; every runtime term (repo, model class, `baseRef`/`baseCommit`,
+  `targetBranch`, bounds, tools, output, promotion) is fetched from the Governor's pinned
+  registry (`GET <server>/v1/governor/contracts/{work_order_id}`), VALIDATED, and recomputed
+  locally.
+
+The digest form **never spawns a model on any mismatch** — every refusal below happens before a
+clone and before a vinci spawn, with ZERO git transfer (no fetch/clone/ls-remote/push).
+
+### Registry fetch
+
+The registry answer is streamed with a hard cap of 256 KiB under ONE deadline
+(`VINCI_WORKER_REGISTRY_TIMEOUT_MS`, default 10000) that covers headers AND body; `Content-Length`
+is never trusted. A stalled/trickling body, an oversized (chunked or not) body, a connection
+error or a timeout are all `registry_unavailable`. `401`/`403` is `registry_forbidden` (the bus
+token is not allowed to read contracts — an operator problem, distinct from a missing order),
+`404` is `work_order_not_found`, any other non-2xx is `registry_error`, and a body that is not
+JSON is `registry_malformed`.
+
+### Validation before hashing
+
+`vinci/worker/contracts/digest.mjs` vendors the upstream validators (vinci-contracts @ b2e0188b:
+`validateWorkOrder`, schema v3; `validateExecutionSpec`, schema v1) and the digest functions hash
+ONLY a record that passes them — exactly as upstream ("a digest of an invalid record is not
+computed"). Every required top-level key, the nested required keys the worker consumes
+(`repository.{host,owner,name}`, `resourceBounds.{budgetMicrousd,maxRuntimeS,deadline}`,
+`evidence.required`, `acceptanceCriteria[].{id,statement,verifiedBy}`, actors, …), the pinned
+`schemaVersion`/`contractVersion` rules and the unknown-key rule (top level AND nested) are
+enforced. A served record that reproduces the handed digest byte for byte but fails validation
+is refused as `invalid_work_order` / `invalid_execution_spec` naming the first `<path> <code>`.
+The golden vectors under `vinci/test/fixtures/contract-vectors/` pin both the canonical bytes
+and the validators.
+
+### Model classes (runtime config)
+
+The class → (provider, model) table is OPERATOR RUNTIME CONFIG, read from
+`VINCI_WORKER_MODEL_CLASSES` — inline JSON, or `@<path>` naming a JSON file of the same shape:
+
+```
+VINCI_WORKER_MODEL_CLASSES='{"forte":{"provider":"vinci","model":"forte"},"fortissimo":{"provider":"vinci","model":"fortissimo"}}'
+VINCI_WORKER_MODEL_CLASSES=@/etc/vinci-worker/model-classes.json
+```
+
+It is parsed and validated ONCE at daemon startup, before the state dir, the daemon lock, the
+`/v1/version` fetch and the online post. Invalid (bad JSON, unreadable file, a class without
+`{ provider, model }`, an empty object) ⇒ the daemon **refuses to start with exit 78** and the
+reason on stderr; a change needs a restart. **Unset ⇒ the daemon starts prose-only**: every
+digest handoff BLOCKs with `unknown_model_class: MODEL_CLASSES not configured`. The table is
+closed: a `modelClass` it does not name is `unknown_model_class`, never passed through as a model
+id (`auto` is deliberately never a class — a contract names a class, not "whatever the account
+resolves to"). A spec-level `provider` pin must EQUAL the configured provider for the class
+(`provider_mismatch` otherwise); it never overrides it.
+
+### Base checkout (`baseRef` / `baseCommit`)
+
+The task branch (`targetBranch`) is created FROM the pinned `baseCommit`, never continued from
+an origin head. `baseRef` is REQUIRED (plain-branch rule, like `targetBranch`). Order of
+operations, fixed:
+
+1. names validated (`git check-ref-format --branch` for both);
+2. uncached ⇒ `git clone`; cached ⇒ the shared-tree quarantine runs FIRST (tracked/untracked
+   leavings of a prior run preserved under `<state>/debris/<task>/`, exactly as on the prose
+   paths);
+3. `git fetch origin +refs/heads/<baseRef>:refs/remotes/origin/<baseRef>` MUST succeed, else
+   **BLOCKED `base_ref_unavailable`**;
+4. `git merge-base --is-ancestor <baseCommit> refs/remotes/origin/<baseRef>` must hold, else
+   **BLOCKED `base_commit_unreachable`** — there is NO fallback to local objects: a commit the
+   cache happens to hold (an earlier local-only commit, say) is not a base origin vouches for;
+5. an existing local `targetBranch` goes through the branch-continuation rules above
+   (PR #22): an ancestor of `baseCommit` is simply reset; never-pushed residue (no upstream, on
+   no origin head) is renamed aside to `stale/<branch>-<stamp>-<hex>` (never deleted) and the
+   task continues from `baseCommit`; a branch that tracks `origin/<targetBranch>` or whose
+   commits live on another origin head is **BLOCKED `branch_diverged`** and left in place;
+6. only then `git checkout -B <targetBranch> <baseCommit>`.
+
+`baseRef`/`baseCommit` then thread through the whole run: the PR (when opened) is
+`gh pr create --base <baseRef>`, the evidence `git.diff` is `<baseCommit>...HEAD`, the patch
+output is `format-patch <baseCommit>..HEAD`. Nothing on the digest path is hardcoded to `main`.
+
+### Output modes and promotion
+
+`output` (ExecutionSpec) decides what `publish` does; a pull request is PROMOTION, never evidence:
+
+| output | push | evidence bundle carries | PR |
+|---|---|---|---|
+| `none` | never | session, git.diff, result.json, runner.log | never |
+| `patch` | never | + `<attempt>.patch` (`git format-patch --stdout <baseCommit>..HEAD`) | never |
+| `artifact` | never | + `artifacts.json` (`{ base_commit, files }`: tracked changes vs `baseCommit` + untracked files; also `artifacts` on the task record) | never |
+| `branch` | `refs/heads/<targetBranch>` | as `none` | only when `promotion: pull_request` (`--base <baseRef>`) |
+
+The record's `publish` is `none` / `patch` / `artifact` / `pushed` / `push_failed` (or `blocked`
+when a `BLOCKER.md` at HEAD suppressed the PR; the blocker is `blocker_reason` on every mode).
+
+### Refusal reasons
+
+The digest form BLOCKs with one of these machine-readable `.code`s, in check order:
+
+| code | meaning |
+|------|---------|
+| `malformed_handoff` | body starts with `{` but is not a valid 3-key JSON triple (extra/missing key, bad JSON, bad digest/identifier) |
+| `registry_unavailable` / `registry_forbidden` / `work_order_not_found` / `registry_error` / `registry_malformed` | the registry fetch (see above) |
+| `invalid_work_order` | the served work order fails the vendored schema-v3 validator (missing/unknown key, wrong schemaVersion/contractVersion, …); it is never hashed |
+| `contract_digest_mismatch` | the (validated) served work order does not reproduce `contract_digest` |
+| `invalid_execution_spec` | no served spec matched and at least one fails the vendored schema-v1 validator |
+| `execution_spec_digest_mismatch` | no (validated) served spec reproduces `execution_spec_digest` |
+| `binding_mismatch` | the matched spec was compiled from a different work order id/digest |
+| `unsupported_repository_host` | spec repository host is not `github.com` |
+| `unknown_model_class` | `modelClass` not in the runtime table, or the table is not configured |
+| `provider_mismatch` | the spec's `provider` pin differs from the configured provider for its class |
+| `invalid_spec_field` / `no_tools` / `capability_unsupported` | a materialized field the worker cannot serve (empty tools; any `requiredCapabilities` — the worker advertises none) |
+| `invalid_bounds` | `budget_usd <= 0`, `max_runtime_s <= 0`, or a deadline already in the past — before ANY git call |
+| `base_ref_unavailable` / `base_commit_unreachable` / `branch_diverged` | the base checkout (see above) |
+
+A successful digest handoff stamps the task record with `work_order_id`, `contract_digest`
+(long form), `execution_spec_digest`, `base_commit`, `base_ref`, `promotion`, `output`,
+`model_class`, `tools`, `input_artifacts`, `required_capabilities`. EVERY terminal post of a
+digest-form task — the final state AND every early blocker (refusal, invalid bounds, Governor
+refusal/unavailability, base checkout) — carries `contract=<work_order_id>@<digest8>` as its first
+token (`contract=malformed` when the triple itself could not be parsed); prose-form posts never
+carry the tag.
 
 ## Lifecycle
 
