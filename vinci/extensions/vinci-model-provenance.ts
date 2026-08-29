@@ -100,6 +100,7 @@ const VINCI_CLASS_RANK: Readonly<Record<string, number>> = {
 };
 const ACCOUNT_ERROR =
   /\b(?:401|402|403|429)\b|insufficient[_ -]?(?:credits?|funds?|quota)|(?:credit|budget|quota|usage|plan|subscription)[_ -]?(?:exhausted|exceeded|limit|cap|reached)|(?:account )?balance.{0,24}(?:exhausted|insufficient|low|required)|out of (?:credits?|budget)|spend(?:ing)?[_ -]?(?:limit|cap)|billing|payment required|card declined|rate[_ -]?limit|too many requests|unauthori[sz]ed|forbidden|invalid (?:api )?key|expired (?:api )?(?:key|token)|authentication|auth(?:entication)? failed|permission denied|entitlement|not entitled|subscription required|plan limit/i;
+const AFFORDABILITY_ERROR = /\bcan only afford\s+\d+\b/i;
 const UNAVAILABLE_ERROR =
   /\b(?:404|410)\b|model[_ -]?not[_ -]?found|(?:model|class|tier|route).{0,40}(?:not found|unavailable|not available|unsupported|not serving|no (?:available )?(?:endpoint|route))|no (?:available )?(?:provider|route|endpoint).{0,30}(?:model|class|tier)|unsupported (?:model|class|tier)/i;
 const TRANSIENT_ERROR =
@@ -129,6 +130,11 @@ export function classifyVinciModelError(error: unknown): VinciModelFailureKind {
   const status = errorStatus(error);
   const name = error instanceof Error ? error.name : "";
   const text = `${status ?? ""} ${name} ${describeVinciModelError(error)}`;
+  // An affordability refusal is retryable only if the next request clamps max_tokens to the count in
+  // "can only afford N". This classifier cannot do that because it has no request parameters. Making
+  // it retryable requires carrying N from the provider error through classification to the request
+  // layer; until that mechanism exists, fail terminally instead of repeating the same request.
+  if (status === 402 && AFFORDABILITY_ERROR.test(text)) return "account";
   if (status === 401 || status === 402 || status === 403 || status === 429 || ACCOUNT_ERROR.test(text)) return "account";
   if (status === 404 || status === 410 || UNAVAILABLE_ERROR.test(text)) return "unavailable";
   if (

@@ -19,9 +19,14 @@ const loader = createJiti(import.meta.url, { moduleCache: false, tryNative: fals
 const provenance = await loader.import(resolve(here, "../extensions/vinci-model-provenance.ts"), {
   default: false,
 });
+const provider = await loader.import(resolve(here, "../extensions/vinci-provider.ts"), {
+  default: false,
+});
 
 const { classifyVinciModelError, assertSuccessfulVinciCompletion } = provenance;
+const { vinciBudgetBlockedMessage } = provider;
 assert.ok(classifyVinciModelError, "classifyVinciModelError must be exported");
+assert.ok(vinciBudgetBlockedMessage, "vinciBudgetBlockedMessage must be exported");
 
 const withStatus = (status) => Object.assign(new Error(`status ${status}`), { status });
 
@@ -36,6 +41,34 @@ for (const status of [401, 402, 403, 429]) {
     `HTTP ${status} must classify as account, not transient — otherwise a billing failure silently downgrades the model`,
   );
 }
+assert.strictEqual(
+  classifyVinciModelError(
+    Object.assign(new Error('402: {"error":{"metadata":{"reason":"in_flight_budget_exhausted"}}}'), {
+      status: 402,
+    }),
+  ),
+  "account",
+  "in-flight budget exhaustion must remain terminal because retry-after cannot be honored in the retry loop",
+);
+assert.strictEqual(
+  classifyVinciModelError(Object.assign(new Error("402: request can only afford 4096 tokens"), { status: 402 })),
+  "account",
+  "an affordability refusal must remain terminal until retries can clamp max_tokens",
+);
+
+// ---- billing messages must distinguish temporary and request-sized refusals ----------------
+const inFlightMessage = vinciBudgetBlockedMessage("402: in_flight_budget_exhausted", "task_123");
+assert.match(inFlightMessage, /wait 120 seconds/i, "temporary in-flight exhaustion should show the retry delay");
+assert.match(inFlightMessage, /vinci resume task_123/, "temporary in-flight exhaustion should preserve the resume path");
+assert.doesNotMatch(inFlightMessage, /credits|billing/i, "temporary in-flight exhaustion must not ask users to buy credits");
+
+const affordabilityMessage = vinciBudgetBlockedMessage("402: request can only afford 4096 tokens", "task_123");
+assert.match(affordabilityMessage, /4096/, "an affordability refusal should show the affordable token count");
+assert.match(affordabilityMessage, /max_tokens/i, "an affordability refusal should explain how to resize the request");
+assert.doesNotMatch(affordabilityMessage, /credits|billing/i, "an affordability refusal must not default to buying credits");
+
+const outOfCreditMessage = vinciBudgetBlockedMessage("402 Payment Required", "task_123");
+assert.match(outOfCreditMessage, /credits/i, "a plain 402 should retain the true out-of-credit message");
 
 // ---- genuine disruption may be retried, but only within the same class -------------------
 for (const status of [500, 502, 503, 504, 408]) {

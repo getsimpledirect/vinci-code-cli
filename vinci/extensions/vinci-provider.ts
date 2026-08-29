@@ -75,6 +75,25 @@ function vinciClassModel(id: string, name: string) {
 export function vinciBudgetBlockedMessage(errorBodyOrMessage: string | undefined, taskId: string): string | undefined {
   if (!errorBodyOrMessage) return undefined;
 
+  const resume = SAFE_TASK_ID.test(taskId) ? `, then run \`vinci resume ${taskId}\`` : "";
+  if (/\bin_flight_budget_exhausted\b/i.test(errorBodyOrMessage)) {
+    return (
+      "Vinci's in-flight budget is temporarily exhausted. Your checkpoint is saved. " +
+      `Wait 120 seconds${resume || ", then retry"}.`
+    );
+  }
+
+  // Accept grouping separators ("4,096"). A count of 0 is NOT affordable at any size, so it falls
+  // through to the out-of-credit message rather than advising `max_tokens: 0`, which cannot succeed.
+  const affordRaw = errorBodyOrMessage.match(/\bcan only afford\s+([\d,_ ]*\d)\b/i)?.[1];
+  const affordableTokens = affordRaw ? affordRaw.replace(/[,_ ]/g, "") : undefined;
+  if (affordableTokens && Number(affordableTokens) > 0) {
+    return (
+      `This request exceeds Vinci's currently affordable output budget of ${affordableTokens} tokens. ` +
+      `Nothing retries this automatically -- re-run with max_tokens at or below ${affordableTokens}.`
+    );
+  }
+
   // Try to parse as JSON and extract structured code
   let code: string | undefined;
   try {
@@ -86,7 +105,6 @@ export function vinciBudgetBlockedMessage(errorBodyOrMessage: string | undefined
 
   // Route based on structured code if present
   if (code) {
-    const resume = SAFE_TASK_ID.test(taskId) ? `, then run \`vinci resume ${taskId}\`` : "";
     switch (code) {
       case "balance_exhausted":
         return `BLOCKED: budget — Vinci credits are exhausted. Review or restore credits at ${VINCI_BILLING_URL}.`;
@@ -103,7 +121,6 @@ export function vinciBudgetBlockedMessage(errorBodyOrMessage: string | undefined
 
   // Fallback to legacy text-based detection for older gateways / non-structured paths
   if (!VINCI_BUDGET_ERROR.test(errorBodyOrMessage)) return undefined;
-  const resume = SAFE_TASK_ID.test(taskId) ? `, then run \`vinci resume ${taskId}\`` : "";
   return (
     "BLOCKED: budget — Vinci usage credits are unavailable for this request. Your checkpoint is saved. " +
     `Review or restore credits at ${VINCI_BILLING_URL}${resume}.`
