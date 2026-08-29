@@ -1,58 +1,41 @@
 // Idempotent, fenced publisher (Wave 1).
 //
 // Publishing is the one place the worker mutates the outside world (origin + GitHub), so every
-// effect here is keyed and re-runnable:
-//   - idempotency key = (branch, task): one branch never owns two open PRs — an existing open PR
-//     for the branch is ADOPTED (`pr_adopted: true`), never duplicated;
-//   - the exact sha pushed is recorded (`pushed_sha`) together with what the remote held before
-//     the push (`remote_sha_before`), so a crash between the push and the PR record still leaves
-//     a findable trail and a retry adopts instead of re-pushing;
-//   - the push is NEVER forced: if the remote branch moved to a commit that is not an ancestor of
-//     our head, the push is refused (`publish: "remote_moved"`) and nothing is created;
-//   - an optional fence (`{ check }`, supplied by the lease lane) is consulted immediately before
-//     each effect; `valid: false` skips that effect and records `fenced_out: <reason>`.
+// effect here is keyed, conditional, and re-runnable:
+//   - idempotency key = (branch, task): one branch never owns two PRs. An open PR for the branch
+//     is ADOPTED only when it is provably ours — same repository owner (a same-named fork branch
+//     is not ours; `gh pr list --head` matches those too), same base, and either the body footer
+//     names this task or the PR's head is an ancestor-or-equal of our head (a legacy PR without a
+//     footer, or a held PR this task continues). Anything else on the branch ⇒ `pr_conflict`,
+//     nothing pushed, nothing created;
+//   - the push is a conditional update of the CAPTURED sha, never of the mutable branch name:
+//     `git push origin <sha>:refs/heads/<branch> --force-with-lease=refs/heads/<branch>:<T0 sha>`
+//     where T0 is what `ls-remote` sampled first (empty = must not exist). The lease is a
+//     compare-and-swap against the sampled value; there is no plain --force path. After the push
+//     the remote is read back and must equal the pushed sha;
+//   - what is recorded: `pushed_sha`, `remote_sha_before`, `remote_sha_after`, `pr`, `pr_adopted`,
+//     `pr_head`, `fenced_out`, `base_ref` — so a crash between push and PR record leaves a trail
+//     and a retry adopts instead of re-pushing;
+//   - the PR recorded must be AT the pushed sha (`pr_head_mismatch` otherwise, pr stays null);
+//   - an optional fence (`{ generation?, check }`, the lease lane's) is consulted immediately
+//     before each effect; `valid: false` (or a throwing check) skips it, `fenced_out: <reason>`.
 //
-// Interface: publish({ repoDir, branch, taskId, attempt, baseRef, limitTripped, promotion, fence?, exec? })
-//   promotion: "pr" | "none" — "none" pushes the branch but never opens a PR.
-//   baseRef:   PR base; the caller (envelope/handoff) supplies it, "main" only when nothing is passed.
-//   exec:      optional command runner ({status, stdout, stderr}); defaults to a local spawn.
-import { spawn } from "node:child_process";
-
-import { resolveBin } from "./build.mjs";
+// Interface:
+//   publish({ repoDir, branch, taskId, attempt, baseRef, limitTripped, promotion, fence?, repoOwner?, exec? })
+//   promotion: "pr" | "none" — "none" pushes the branch and never touches gh.
+//   baseRef:   the PR base from the caller; "main" only when nothing is passed.
+//   repoOwner: the GitHub owner of origin (the envelope's repo); derived from the origin URL if absent.
+//   exec:      the structured runner (exec.mjs `command` with allowFailure); injectable for tests.
+import { command } from "./exec.mjs";
 
 const PR_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
 const SHA = /^[0-9a-f]{7,64}$/;
+const FOOTER_TASK = /^vinci-worker: task=(\S+)/m;
+const PR_JSON_FIELDS = "number,url,state,headRefOid,headRefName,baseRefName,headRepositoryOwner,body";
 
 export const DEFAULT_BASE_REF = "main";
 
-function defaultExec(commandName, args, options = {}) {
-  return new Promise((resolveCommand) => {
-    let executable;
-    try {
-      executable = resolveBin(commandName);
-    } catch (error) {
-      resolveCommand({ status: null, signal: null, stdout: "", stderr: error.message });
-      return;
-    }
-    const child = spawn(executable, args, { cwd: options.cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    let settled = false;
-    child.once("error", (error) => {
-      settled = true;
-      resolveCommand({ status: null, signal: null, stdout: "", stderr: error.message });
-    });
-    child.once("close", (status, signal) => {
-      if (settled) return;
-      settled = true;
-      resolveCommand({ status, signal, stdout: stdout.trim(), stderr: stderr.trim() });
-    });
-  });
-}
+const defaultExec = (name, args, options = {}) => command(name, args, { ...options, allowFailure: true });
 
 function shaOrNull(value) {
   const candidate = (value ?? "").trim().split(/\s+/)[0] ?? "";
@@ -75,30 +58,88 @@ async function checkFence(fence, stage) {
   }
 }
 
-function parsePrList(stdout) {
+function parsePrs(stdout) {
   try {
     const parsed = JSON.parse(stdout || "[]");
-    if (!Array.isArray(parsed)) return null;
-    const open = parsed.find((entry) => entry && typeof entry.url === "string" && PR_URL.test(entry.url));
-    return open ?? null;
+    return Array.isArray(parsed) ? parsed.filter((entry) => entry && typeof entry.url === "string" && PR_URL.test(entry.url)) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function listPrs({ repoDir, branch, state, exec }) {
+  const listed = await exec("gh", ["pr", "list", "--head", branch, "--state", state, "--json", PR_JSON_FIELDS], { cwd: repoDir });
+  return listed.status === 0 ? parsePrs(listed.stdout) : [];
+}
+
+async function viewPr({ repoDir, url, exec }) {
+  const viewed = await exec("gh", ["pr", "view", url, "--json", PR_JSON_FIELDS], { cwd: repoDir });
+  if (viewed.status !== 0) return null;
+  try {
+    const parsed = JSON.parse(viewed.stdout || "null");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
   } catch {
     return null;
   }
 }
 
-// P1: the open PR for a branch, if any. Non-JSON / failed output reads as "none known" — the
-// create step still runs and its own "already exists" path re-lists (race between list and create).
-export async function findOpenPr({ repoDir, branch, exec }) {
-  const listed = await exec("gh", ["pr", "list", "--head", branch, "--state", "open", "--json", "number,url,headRefOid"], { cwd: repoDir });
-  if (listed.status !== 0) return null;
-  return parsePrList(listed.stdout);
+async function isAncestorOrEqual({ repoDir, ancestor, descendant, exec }) {
+  if (!ancestor || !descendant) return false;
+  if (ancestor === descendant) return true;
+  // An unknown object (a commit never fetched) fails here too — refusing is the safe read.
+  const check = await exec("git", ["-C", repoDir, "merge-base", "--is-ancestor", ancestor, descendant]);
+  return check.status === 0;
 }
 
-// P2: what origin holds for the branch right now; null when the branch is absent or unreadable.
+// origin's GitHub owner, from the envelope when the caller has it, else from the origin URL.
+async function resolveRepoOwner({ repoDir, repoOwner, exec }) {
+  if (typeof repoOwner === "string" && repoOwner.trim()) return repoOwner.trim();
+  const url = await exec("git", ["-C", repoDir, "remote", "get-url", "origin"]);
+  if (url.status !== 0) return null;
+  const match = /github\.com[:/]([^/\s]+)\/[^/\s]+?(?:\.git)?$/.exec(url.stdout.trim());
+  return match ? match[1] : null;
+}
+
+// P1 (hardened): is this open PR ours? Returns { adopt: true, via } or { adopt: false, reason }.
+async function classifyCandidate({ pr, repoDir, branch, base, taskId, head, owner, exec }) {
+  const prOwner = pr.headRepositoryOwner?.login ?? pr.headRepositoryOwner?.name ?? null;
+  if (!owner || !prOwner || prOwner !== owner) return { adopt: false, reason: `PR #${pr.number ?? "?"} head owner ${prOwner ?? "unknown"} is not ${owner ?? "the origin owner"} (fork)` };
+  if (pr.headRefName !== branch) return { adopt: false, reason: `PR #${pr.number ?? "?"} head ref ${pr.headRefName ?? "unknown"} is not ${branch}` };
+  if (pr.baseRefName !== base) return { adopt: false, reason: `PR #${pr.number ?? "?"} base ${pr.baseRefName ?? "unknown"} is not ${base}` };
+  const footerTask = FOOTER_TASK.exec(pr.body ?? "")?.[1] ?? null;
+  if (footerTask === taskId) return { adopt: true, via: "footer" };
+  if (await isAncestorOrEqual({ repoDir, ancestor: pr.headRefOid, descendant: head, exec })) return { adopt: true, via: footerTask ? "continuation" : "ancestry" };
+  return {
+    adopt: false,
+    reason: footerTask
+      ? `PR #${pr.number ?? "?"} belongs to task ${footerTask} and its head ${pr.headRefOid ?? "unknown"} is not an ancestor of ${head ?? "our head"}`
+      : `PR #${pr.number ?? "?"} has no worker footer and its head ${pr.headRefOid ?? "unknown"} is not an ancestor of ${head ?? "our head"}`,
+  };
+}
+
+async function findOurOpenPr(context) {
+  const open = await listPrs({ ...context, state: "open" });
+  const conflicts = [];
+  for (const pr of open) {
+    const verdict = await classifyCandidate({ ...context, pr });
+    if (verdict.adopt) return { pr, via: verdict.via, conflicts };
+    conflicts.push(verdict.reason);
+  }
+  return { pr: null, via: null, conflicts };
+}
+
+// P2: what origin holds for the branch right now; null sha when the branch is absent.
 export async function remoteBranchSha({ repoDir, branch, exec }) {
   const probe = await exec("git", ["-C", repoDir, "ls-remote", "origin", `refs/heads/${branch}`]);
   if (probe.status !== 0) return { sha: null, error: probe.stderr || `ls-remote exited ${probe.status}` };
   return { sha: shaOrNull(probe.stdout), error: null };
+}
+
+// B5: the PR we are about to record must be AT the pushed sha.
+async function verifyPrHead({ repoDir, url, pushedSha, exec }) {
+  const view = await viewPr({ repoDir, url, exec });
+  const prHead = view?.headRefOid ?? null;
+  return { ok: Boolean(prHead) && prHead === pushedSha, prHead, number: view?.number ?? null };
 }
 
 export async function publish({
@@ -110,6 +151,7 @@ export async function publish({
   limitTripped = null,
   promotion = "pr",
   fence = null,
+  repoOwner = null,
   exec = defaultExec,
 }) {
   if (!repoDir || !branch || !taskId) throw new Error("publish requires repoDir, branch and taskId");
@@ -121,75 +163,116 @@ export async function publish({
     pr_adopted: false,
     pushed_sha: null,
     remote_sha_before: null,
+    remote_sha_after: null,
     base_ref: base,
   };
 
+  // The sha we publish is captured ONCE; every later step refers to it, never to the branch name.
   const localHead = await exec("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
   const head = localHead.status === 0 ? shaOrNull(localHead.stdout) : null;
+  if (!head) return { ...record, publish: "push_failed", push_error: `local refs/heads/${branch} does not resolve to a commit` };
 
-  // --- P2: remote SHA discipline -------------------------------------------------------------
+  // --- P2: remote SHA discipline (sample T0) --------------------------------------------------
   const remote = await remoteBranchSha({ repoDir, branch, exec });
+  if (remote.error) return { ...record, publish: "push_failed", push_error: `could not read origin/${branch}: ${remote.error}` };
   record.remote_sha_before = remote.sha;
-  if (remote.error) record.remote_probe_error = remote.error;
-
-  let alreadyOnRemote = false;
-  if (remote.sha) {
-    if (head && remote.sha === head) {
-      alreadyOnRemote = true;
-    } else {
-      // The remote commit must be an ancestor of what we are about to push. An unknown object
-      // (someone pushed a commit we never fetched) fails this check too — refusing is the safe read.
-      const ancestry = await exec("git", ["-C", repoDir, "merge-base", "--is-ancestor", remote.sha, `refs/heads/${branch}`]);
-      if (ancestry.status !== 0) {
-        return { ...record, publish: "remote_moved", refusal_reason: `origin/${branch} is at ${remote.sha}, not an ancestor of local ${head ?? "head"}; never force-pushing` };
-      }
-    }
+  const alreadyOnRemote = remote.sha === head;
+  if (remote.sha && !alreadyOnRemote && !(await isAncestorOrEqual({ repoDir, ancestor: remote.sha, descendant: head, exec }))) {
+    return { ...record, publish: "remote_moved", refusal_reason: `origin/${branch} is at ${remote.sha}, not an ancestor of local ${head}; never force-pushing` };
   }
 
-  // --- push (fenced) ----------------------------------------------------------------------------
+  // --- P1: find our PR BEFORE touching origin (a foreign PR on the branch refuses everything) --
+  const wantPr = promotion === "pr" && !limitTripped;
+  const owner = wantPr ? await resolveRepoOwner({ repoDir, repoOwner, exec }) : null;
+  const prContext = { repoDir, branch, base, taskId, head, owner, exec };
+  let adopted = null;
+  if (wantPr) {
+    const found = await findOurOpenPr(prContext);
+    if (!found.pr && found.conflicts.length > 0) {
+      return { ...record, publish: "pr_conflict", refusal_reason: found.conflicts.join("; "), pr_conflicts: found.conflicts };
+    }
+    adopted = found;
+  }
+
+  // --- push: fenced, conditional on the sampled sha, read back --------------------------------
   if (alreadyOnRemote) {
-    // A retry after a crash between push and PR record: the sha is already there — adopt, don't re-push.
+    // A retry after a crash between push and PR record: origin already holds our sha — no push.
     record.publish = "pushed";
     record.pushed_sha = head;
+    record.remote_sha_after = head;
     record.push_skipped = "remote_at_head";
   } else {
     const gate = await checkFence(fence, "push");
     if (!gate.valid) return { ...record, publish: "fenced_out", fenced_out: gate.reason };
-    const push = await exec("git", ["-C", repoDir, "push", "--set-upstream", "origin", `refs/heads/${branch}:refs/heads/${branch}`]);
-    if (push.status !== 0) return { ...record, publish: "push_failed", push_error: push.stderr || null };
-    record.publish = "pushed";
+    const push = await exec("git", [
+      "-C", repoDir, "push", "origin", `${head}:refs/heads/${branch}`,
+      `--force-with-lease=refs/heads/${branch}:${remote.sha ?? ""}`,
+    ]);
+    if (push.status !== 0) {
+      const text = `${push.stderr ?? ""}\n${push.stdout ?? ""}`;
+      if (/stale info|rejected|fetch first|non-fast-forward/i.test(text)) {
+        const after = await remoteBranchSha({ repoDir, branch, exec });
+        return { ...record, publish: "remote_moved", remote_sha_after: after.sha, refusal_reason: `origin/${branch} moved after it was sampled at ${remote.sha ?? "absent"}; lease rejected the push, nothing forced` };
+      }
+      return { ...record, publish: "push_failed", push_error: push.stderr || `git push exited ${push.status}` };
+    }
     record.pushed_sha = head;
+    // The branch now tracks itself on origin (what `push --set-upstream` used to record; the
+    // never-pushed residue classifier reads exactly these two keys). Best effort, never fatal.
+    await exec("git", ["-C", repoDir, "config", `branch.${branch}.remote`, "origin"]);
+    await exec("git", ["-C", repoDir, "config", `branch.${branch}.merge`, `refs/heads/${branch}`]);
+    const readback = await remoteBranchSha({ repoDir, branch, exec });
+    record.remote_sha_after = readback.sha;
+    if (readback.error || readback.sha !== head) {
+      return { ...record, publish: "remote_readback_mismatch", refusal_reason: `origin/${branch} reads ${readback.sha ?? readback.error ?? "absent"} after pushing ${head}` };
+    }
+    record.publish = "pushed";
   }
 
-  // --- PR (idempotent, fenced) ------------------------------------------------------------------
-  if (limitTripped || promotion !== "pr") return record;
+  if (!wantPr) return record;
 
-  const existing = await findOpenPr({ repoDir, branch, exec });
-  if (existing) {
-    return { ...record, pr: existing.url, pr_adopted: true, pr_head: existing.headRefOid ?? null };
-  }
+  // --- PR: adopt (verified at the pushed sha) or create exactly one -----------------------------
+  const recordPr = async (url, viaAdoption) => {
+    const check = await verifyPrHead({ repoDir, url, pushedSha: record.pushed_sha, exec });
+    if (!check.ok) {
+      return { ...record, pr: null, pr_adopted: false, pr_head: check.prHead, pr_error: `pr_head_mismatch: ${url} is at ${check.prHead ?? "unknown"}, pushed ${record.pushed_sha}` };
+    }
+    return { ...record, pr: url, pr_adopted: Boolean(viaAdoption), pr_head: check.prHead, ...(viaAdoption ? { pr_adopted_via: viaAdoption } : {}) };
+  };
+
+  if (adopted?.pr) return recordPr(adopted.pr.url, adopted.via);
 
   const gate = await checkFence(fence, "pr");
   if (!gate.valid) return { ...record, fenced_out: gate.reason };
 
-  const body = `Unattended Vinci worker result for task ${taskId}.\n\n${prBodyFooter({ taskId, attempt, head: record.pushed_sha ?? head, baseRef: base, fence })}`;
+  const body = `Unattended Vinci worker result for task ${taskId}.\n\n${prBodyFooter({ taskId, attempt, head: record.pushed_sha, baseRef: base, fence })}`;
   const created = await exec(
     "gh",
     ["pr", "create", "--base", base, "--head", branch, "--title", `Worker task ${taskId}`, "--body", body],
     { cwd: repoDir },
   );
-  if (created.status === 0) record.pr = created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null;
+  const createdUrl = created.status === 0 ? created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null : null;
+  if (createdUrl) return recordPr(createdUrl, null);
+
   const createErr = `${created.stderr ?? ""}${created.stdout ?? ""}`;
-  if (record.pr === null && (created.status === 0 || /already exists|already has|pull request for/i.test(createErr))) {
-    // Lost the race between list and create (or gh printed nothing parseable): the existing PR
-    // IS the evidence. Auth/network failures do NOT take this path: they stay visible as pr:null.
-    const raced = await findOpenPr({ repoDir, branch, exec });
-    if (raced) {
-      record.pr = raced.url;
-      record.pr_adopted = true;
-      record.pr_head = raced.headRefOid ?? null;
+  if (created.status === 0 || /already exists|already has|pull request for/i.test(createErr)) {
+    // W1: lost the race between list and create, or gh printed nothing parseable. List EVERY
+    // state: an open PR that is ours is adopted; a closed/merged one on the branch means the
+    // branch's PR history is spent — refuse, never open a second. Auth/network failures do NOT
+    // take this path: they stay visible as pr:null.
+    const all = await listPrs({ repoDir, branch, state: "all", exec });
+    const conflicts = [];
+    for (const pr of all) {
+      const state = String(pr.state ?? "OPEN").toUpperCase();
+      if (state === "OPEN") {
+        const verdict = await classifyCandidate({ ...prContext, pr });
+        if (verdict.adopt) return recordPr(pr.url, verdict.via);
+        conflicts.push(verdict.reason);
+      } else if ((pr.headRepositoryOwner?.login ?? pr.headRepositoryOwner?.name ?? owner) === owner && pr.headRefName === branch) {
+        return { ...record, publish: "pr_closed", pr: null, refusal_reason: `${pr.url} for ${branch} is ${state.toLowerCase()}; never opening a second PR on the branch` };
+      }
     }
+    if (conflicts.length > 0) return { ...record, publish: "pr_conflict", refusal_reason: conflicts.join("; "), pr_conflicts: conflicts };
   }
-  if (record.pr === null && created.status !== 0) record.pr_error = created.stderr || `gh pr create exited ${created.status}`;
-  return record;
+  return { ...record, pr_error: created.stderr || `gh pr create exited ${created.status} without a PR URL` };
 }

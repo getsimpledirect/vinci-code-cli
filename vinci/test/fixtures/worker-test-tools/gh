@@ -1,6 +1,10 @@
 #!/usr/bin/env node
-// Fake gh for worker tests
+// Fake gh for worker tests. Records every invocation; answers `pr list --json` with [] and
+// `pr view --json` with the head sha of the cwd's HEAD (a just-pushed branch), so the publisher's
+// head verification passes by default. FAKE_GH_OUTPUT overrides the `pr create` output only;
+// FAKE_GH_VIEW_HEAD overrides the sha reported by `pr view`.
 import { appendFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 const recordFile = process.env.FAKE_GH_RECORD || '/tmp/fake-gh-invocations.txt';
 const argv = process.argv.slice(2);
@@ -8,21 +12,25 @@ const argv = process.argv.slice(2);
 appendFileSync(recordFile, JSON.stringify({ argv, timestamp: new Date().toISOString() }) + '\n');
 if (process.env.FAKE_GH_EXIT) process.exit(Number(process.env.FAKE_GH_EXIT));
 
+const isPr = argv[0] === 'pr';
+if (isPr && argv[1] === 'list') {
+  console.log('[]');
+  process.exit(0);
+}
+if (isPr && argv[1] === 'view') {
+  let head = process.env.FAKE_GH_VIEW_HEAD;
+  if (!head) {
+    try { head = execFileSync('git', ['rev-parse', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch { head = 'unknown'; }
+  }
+  console.log(JSON.stringify({ number: 0, url: argv[2], state: 'OPEN', headRefOid: head }));
+  process.exit(0);
+}
+if (isPr && argv[1] === 'create') {
+  console.log(process.env.FAKE_GH_OUTPUT !== undefined ? process.env.FAKE_GH_OUTPUT : 'https://github.com/test/repo/pull/123');
+  process.exit(0);
+}
 if (process.env.FAKE_GH_OUTPUT !== undefined) {
   console.log(process.env.FAKE_GH_OUTPUT);
   process.exit(0);
 }
-
-// If this is a pr create command, print a fake URL
-if (argv.includes('create') && argv.includes('pr')) {
-  console.log('https://github.com/test/repo/pull/123');
-  process.exit(0);
-}
-
-// If this is a pr list command, print empty list
-if (argv.includes('list') && argv.includes('--head')) {
-  console.log('');
-  process.exit(0);
-}
-
 process.exit(0);

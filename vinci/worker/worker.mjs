@@ -343,7 +343,9 @@ async function postFinal(bus, message, envelope, state, evidence) {
   }
 }
 
-async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
+// `fence` is the publish-time fence hook point ({ generation?, check: async ({stage}) => {valid, reason} }).
+// Production passes null today; the lease loop (#26) supplies it with one line at the call site.
+async function processHandoff(bus, stateDir, message, governorUrl, workerId, { fence = null } = {}) {
   const taskId = message.message_id;
   try {
     assertTaskId(taskId);
@@ -380,6 +382,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
     await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
+    return true;
+  }
+
+  // B2 (fail closed, before clone): prepareRepository still forks every branch off origin/main, so
+  // a PR whose base is not main would not share its fork point. Until #23 threads base_ref through
+  // prepareRepository, any other base is refused here — the header stays parsed so #23 can thread it.
+  if (envelope.base_ref !== undefined && envelope.base_ref !== "main") {
+    const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; the branch is forked from origin/main and a PR against another base would not share its fork point`;
+    lifecycle.transition("BLOCKED", { outcome: { reason } });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -441,7 +453,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
     const head = await readHead(repository.repoDir);
     lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
-    const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt });
+    const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt, fence });
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const harnessStops = run.harness_stops ?? [];
     const intendedState = finalState({

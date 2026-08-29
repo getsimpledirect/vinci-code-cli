@@ -16,10 +16,26 @@ try {
   mkdirSync(stubDir);
   const callsLog = join(tempDir, "calls.log");
 
+  // The stub models one remote branch: rev-parse answers a fixed sha, push marks it as on origin,
+  // ls-remote reports it only after the push (so the publisher's readback sees what it pushed).
+  const pushedMarker = join(tempDir, "pushed");
   const gitStub = `#!/bin/sh
 echo "git $@" >> ${callsLog}
-case "$2" in
+case "$3" in
   push)
+    : > ${pushedMarker}
+    exit 0
+    ;;
+  rev-parse)
+    echo 0123456789abcdef0123456789abcdef01234567
+    exit 0
+    ;;
+  ls-remote)
+    if [ -f ${pushedMarker} ]; then echo "0123456789abcdef0123456789abcdef01234567	$5"; fi
+    exit 0
+    ;;
+  remote)
+    echo https://github.com/test/repo.git
     exit 0
     ;;
   cat-file)
@@ -39,6 +55,8 @@ if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   echo "trailing"
   exit 0
 fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo "[]"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{"number":999,"url":"https://github.com/test/repo/pull/999","headRefOid":"0123456789abcdef0123456789abcdef01234567"}'; exit 0; fi
 exit 0
 `;
 
@@ -63,6 +81,7 @@ exit 0
   try {
     // TEST CASE (a): limitTripped set → PR NOT created, push called
     writeFileSync(callsLog, "");
+    rmSync(pushedMarker, { force: true });
     const result1 = await publish({
       envelope: { evidence: "pr" },
       repoDir,
@@ -83,6 +102,7 @@ exit 0
 
     // TEST CASE (b): limitTripped null → PR created normally
     writeFileSync(callsLog, "");
+    rmSync(pushedMarker, { force: true });
     const result2 = await publish({
       envelope: { evidence: "pr" },
       repoDir,

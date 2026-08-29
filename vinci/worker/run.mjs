@@ -4,54 +4,11 @@ import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import { resolveBin } from "./build.mjs";
+import { command } from "./exec.mjs";
 import { publish as publishBranch } from "./publisher.mjs";
 import { readSessionState } from "./session-read.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-
-function command(commandName, args, options = {}) {
-  return new Promise((resolveCommand, rejectCommand) => {
-    let executable;
-    try {
-      executable = resolveBin(commandName);
-    } catch (error) {
-      if (options.allowFailure) {
-        resolveCommand({ status: null, signal: null, stdout: "", stderr: error.message });
-      } else {
-        rejectCommand(error);
-      }
-      return;
-    }
-    const child = spawn(executable, args, {
-      cwd: options.cwd,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    let settled = false;
-    child.once("error", (error) => {
-      settled = true;
-      if (options.allowFailure) resolveCommand({ status: null, signal: null, stdout: "", stderr: error.message });
-      else rejectCommand(error);
-    });
-    child.once("close", (status, signal) => {
-      if (settled) return;
-      settled = true;
-      const result = { status, signal, stdout: stdout.trim(), stderr: stderr.trim() };
-      if (status === 0 || options.allowFailure) resolveCommand(result);
-      else rejectCommand(new Error(`${commandName} ${args.join(" ")} failed: ${stderr.trim() || signal || status}`));
-    });
-  });
-}
 
 function signalExitCode(code, signal) {
   if (typeof code === "number") return code;
@@ -395,6 +352,7 @@ export async function publish({ envelope, repoDir, branch, taskId, attempt, limi
     limitTripped,
     promotion,
     fence,
+    repoOwner: typeof envelope.repo === "string" ? envelope.repo.split("/")[0] : null,
   });
   if (blockerReason) {
     return { ...result, publish: result.publish === "pushed" ? "blocked" : result.publish, blocker_reason: blockerReason };

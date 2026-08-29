@@ -40,6 +40,31 @@ const HEADER_KEYS = new Set([
   "base_ref",
 ]);
 
+// The ONE plain-branch-name rule (PR #22 hardening), shared by `branch:` and `base_ref:`: a git
+// ref NAME, never a refspec, an option, or anything git-check-ref-format rejects.
+const PLAIN_REF = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+export function isPlainRefName(value) {
+  return (
+    typeof value === "string" &&
+    PLAIN_REF.test(value) &&
+    !value.includes("..") &&
+    !value.includes("//") &&
+    !value.includes("/.") &&
+    !value.includes("@{") &&
+    !/^refs[\/.]/.test(value) &&
+    !value.includes("refs/") &&
+    !value.endsWith(".lock") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    value !== "HEAD"
+  );
+}
+export function assertPlainRefName(value, name) {
+  if (!isPlainRefName(value)) {
+    throw new Error(`${name} must be a plain git branch name (letters, digits, ._/-; no leading -/+, no .., no //, no /., no @{, no .lock, no refs/ prefix, no refspec syntax)`);
+  }
+}
+
 function positiveNumber(value, name) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) throw new Error(`${name} must be a positive number`);
@@ -83,30 +108,12 @@ export function parseEnvelope(body) {
   const spec = normalized.slice(separator + 2).trim();
   if (!spec) throw new Error("task spec must not be empty");
   const branchValue = values.get("branch");
-  if (branchValue !== undefined) {
-    const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
-    if (
-      !BRANCH.test(branchValue) ||
-      branchValue.includes("..") ||
-      /^refs[\/.]/.test(branchValue) ||
-      branchValue.includes("refs/") ||
-      branchValue.endsWith(".lock") ||
-      branchValue.endsWith("/") ||
-      branchValue === "HEAD"
-    ) {
-      throw new Error("branch must be a plain git branch name (letters, digits, ._/-; no leading -/+, no .., no refs/ prefix, no refspec syntax)");
-    }
-  }
+  if (branchValue !== undefined) assertPlainRefName(branchValue, "branch");
   const claim = values.get("claim") ?? ".";
   const ref = values.get("evidence_ref") ?? values.get("ref");
-  // base_ref: the PR base the publisher targets (default main). Same name rules as `branch`.
+  // base_ref: the PR base the publisher targets (default main); same name rules as `branch`.
   const baseRef = values.get("base_ref");
-  if (baseRef !== undefined) {
-    const REF = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
-    if (!REF.test(baseRef) || baseRef.includes("..") || /^refs[\/.]/.test(baseRef) || baseRef.includes("refs/") || baseRef.endsWith(".lock") || baseRef.endsWith("/") || baseRef === "HEAD") {
-      throw new Error("base_ref must be a plain git branch name");
-    }
-  }
+  if (baseRef !== undefined) assertPlainRefName(baseRef, "base_ref");
 
   return {
     repo,

@@ -15,5 +15,18 @@ const command = argv[0] === '-C' ? argv[2] : argv[0];
 const rest = argv[0] === '-C' ? argv.slice(3) : argv.slice(1);
 if (command === 'show-ref') process.exit(existsSync(join(repo, '.worker-branch')) ? 0 : 1);
 if (command === 'checkout' && rest[0] === '-b') writeFileSync(join(repo, '.worker-branch'), rest[1]);
-if (command === 'rev-parse' && rest[0] === 'HEAD') process.stdout.write('abc123def456\n');
+const SHA = 'abc123def456';
+if (command === 'rev-parse' && rest[0] === 'HEAD') process.stdout.write(SHA + '\n');
+// The publisher's sha discipline, modelled on one branch: the local branch resolves once it was
+// created (checkout -b), origin reports it only after a push, and the push leaves a marker.
+if (command === 'rev-parse' && rest.at(-1)?.startsWith('refs/heads/')) {
+  if (!existsSync(join(repo, '.worker-branch'))) process.exit(1);
+  process.stdout.write(SHA + '\n');
+}
+if (command === 'push') writeFileSync(join(repo, '.worker-pushed'), rest.join(' '));
+if (command === 'ls-remote') {
+  const ref = rest.at(-1);
+  if (ref?.startsWith('refs/heads/') && existsSync(join(repo, '.worker-pushed'))) process.stdout.write(`${SHA}\t${ref}\n`);
+}
+if (command === 'remote' && rest[0] === 'get-url') process.stdout.write('https://github.com/test/repo.git\n');
 process.exit(0);
