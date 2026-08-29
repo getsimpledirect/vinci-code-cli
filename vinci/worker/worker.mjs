@@ -441,7 +441,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
     const head = await readHead(repository.repoDir);
     lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
-    const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId });
+    const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt });
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const harnessStops = run.harness_stops ?? [];
     const intendedState = finalState({

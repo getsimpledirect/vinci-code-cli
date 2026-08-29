@@ -4,10 +4,10 @@ import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import { resolveBin } from "./build.mjs";
+import { publish as publishBranch } from "./publisher.mjs";
 import { readSessionState } from "./session-read.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-const PR_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
 
 function command(commandName, args, options = {}) {
   return new Promise((resolveCommand, rejectCommand) => {
@@ -377,46 +377,27 @@ export async function readHeadBlocker(repoDir) {
   return contents.status === 0 && contents.stdout.trim() ? "BLOCKER.md at HEAD is non-empty" : null;
 }
 
-export async function publish({ envelope, repoDir, branch, taskId, limitTripped }) {
+// Publishing itself lives in publisher.mjs (idempotent PR adoption, remote-sha discipline,
+// never-force, optional fence). This wrapper keeps the envelope-level rules: BLOCKER.md at HEAD
+// and `evidence: none` both map to promotion "none" (push, never a PR).
+export async function publish({ envelope, repoDir, branch, taskId, attempt, limitTripped, fence }) {
   // A BLOCKER.md at HEAD suppresses only the PR. The branch is still pushed so the agent's
   // work and its stated blocker are on the record (measured 2026-08-27: the first bus-dispatched
   // task committed a decision record + a blocker and nothing reached the remote).
   const blockerReason = await readHeadBlocker(repoDir);
-  const push = await command("git", ["-C", repoDir, "push", "--set-upstream", "origin", `refs/heads/${branch}:refs/heads/${branch}`], {
-    allowFailure: true,
+  const promotion = blockerReason || envelope.evidence !== "pr" ? "none" : "pr";
+  const result = await publishBranch({
+    repoDir,
+    branch,
+    taskId,
+    attempt,
+    baseRef: envelope.base_ref,
+    limitTripped,
+    promotion,
+    fence,
   });
-  const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
-  if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
-  if (limitTripped) return result;
-  if (push.status !== 0 || envelope.evidence !== "pr") return result;
-
-  const created = await command(
-    "gh",
-    [
-      "pr",
-      "create",
-      "--base",
-      "main",
-      "--head",
-      branch,
-      "--title",
-      `Worker task ${taskId}`,
-      "--body",
-      `Unattended Vinci worker result for task ${taskId}.`,
-    ],
-    { cwd: repoDir, allowFailure: true },
-  );
-  if (created.status === 0) result.pr = created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null;
-  const createErr = `${created.stderr ?? ""}${created.stdout ?? ""}`;
-  if (result.pr === null && (created.status === 0 || /already exists|already has|pull request for/i.test(createErr))) {
-    // A PR may already exist for this branch (by-reference tasks continue held PRs); an
-    // existing PR IS the evidence — creation failing must not classify the task UNVERIFIED.
-    // Auth/network failures do NOT take this path: they stay visible as pr:null.
-    const listed = await command("gh", ["pr", "list", "--head", branch, "--state", "open", "--json", "url"], { cwd: repoDir, allowFailure: true });
-    try {
-      const parsed = JSON.parse(listed.stdout ?? "[]");
-      if (Array.isArray(parsed) && parsed[0]?.url) result.pr = parsed[0].url;
-    } catch { /* no JSON, no PR */ }
+  if (blockerReason) {
+    return { ...result, publish: result.publish === "pushed" ? "blocked" : result.publish, blocker_reason: blockerReason };
   }
   return result;
 }

@@ -59,7 +59,7 @@ WantedBy=multi-user.target
    - `budget_usd`: Poll session JSONL every 15s; kill if cost exceeds budget
    - `deadline`: Check before start and each poll; kill if past
 7. **Outcome**: Read task-outcome from session JSONL (DONE, DONE-UNVERIFIED, WAITING, BLOCKED) **and** every harness stop — a tool call the harness refused (`vinci-todo` no-progress latch, `vinci-loopbreak` reserved-actions refusal), serialized as an `isError` toolResult whose text is the block reason
-8. **Publish**: Push branch to origin; if evidence==pr and no BLOCKER.md, create a PR
+8. **Publish**: Push branch to origin; if evidence==pr and no BLOCKER.md, adopt the open PR for the branch or create one (see [Publishing](#publishing))
 9. **Report**: Post finding (COMPLETED), blocker (BLOCKED/FAILED), or status (UNVERIFIED)
 
 ### Outcome precedence (machine-observed events outrank the model's narrative)
@@ -91,6 +91,7 @@ max_runtime_s: 14400               (default; 4 hours)
 deadline: 2026-08-26T12:00:00Z    (optional ISO-8601 UTC)
 ref: ledger_id                     (optional; for finding refs)
 branch: worker/msg_abc123          (optional; continue an EXISTING branch on origin — see Branch continuation)
+base_ref: main                     (optional; the PR base the publisher targets — default main; plain branch name, same rules as branch)
 
 <blank line>
 
@@ -144,6 +145,50 @@ explicit fetch is `envelope branch <branch> exists on origin but fetch did not m
 origin/<branch> locally`. The pre-existing `reset --hard`/`clean -fd` quarantine of the shared
 checkout is unchanged here (Wave 1 clean-room item).
 
+## Publishing
+
+Publishing (`vinci/worker/publisher.mjs`, `publish({ repoDir, branch, taskId, attempt, baseRef, limitTripped, promotion, fence? })`)
+is the only step that mutates the outside world, so every effect is keyed and re-runnable.
+`run.mjs`'s `publish()` is a thin wrapper: it maps `BLOCKER.md` at HEAD and `evidence: none` to
+`promotion: "none"` (push, never a PR) and passes the envelope's `base_ref` through.
+
+**Idempotency keys: branch + task.** One branch never owns two open PRs. Before creating, the
+publisher runs `gh pr list --head <branch> --state open --json number,url,headRefOid`; an open PR
+is ADOPTED (`pr_adopted: true`, `pr_head` = its head sha) and no create is issued. When create
+still collides (the race between list and create), the existing PR is re-listed and adopted.
+The PR body ends with a machine-readable footer that ties the PR to the task:
+`vinci-worker: task=<taskId> attempt=<n> head=<sha> base=<baseRef>` (+ `fence=<generation>`
+when a fence was supplied). The PR base is the caller's `baseRef` (`base_ref:` header);
+`main` is used only when nothing was passed.
+
+**What is recorded** (task record / `result.json`):
+
+| field | meaning |
+|---|---|
+| `publish` | `pushed` · `push_failed` · `remote_moved` (refused) · `fenced_out` · `blocked` (pushed, PR suppressed by BLOCKER.md) |
+| `pushed_sha` | the exact local sha that was pushed (null when nothing was pushed) |
+| `remote_sha_before` | what `git ls-remote origin refs/heads/<branch>` held BEFORE the push (null = absent) |
+| `push_skipped` | `remote_at_head` when origin already held our sha (a retry after a crash between push and PR record) |
+| `pr` / `pr_adopted` / `pr_head` | the PR URL; whether it was adopted rather than created; the adopted PR's head |
+| `fenced_out` | the fence's reason when it declined an effect |
+| `base_ref` | the PR base actually used |
+
+**The never-force rule.** If the remote branch exists and its sha is neither absent nor an
+ancestor of our local head, the push is REFUSED (`publish: "remote_moved"`, `refusal_reason`),
+no PR step runs, and origin is left exactly as found. The publisher has no force path; a moved
+remote is an operator decision, never something a retry resolves. An unknown remote object
+(a commit we never fetched) fails the ancestry check and is refused too.
+
+**Crash windows.** The push and the PR record are two effects. `pushed_sha` is recorded as soon
+as the push succeeds, so a failure in `gh pr create` leaves `publish: "pushed", pr: null` with the
+sha on the record; the next attempt finds origin at that sha (no re-push) and adopts the PR that
+was created out-of-band, or creates exactly one.
+
+**Fence.** An optional `fence: { generation?, check: async ({ stage }) => ({ valid, reason }) }`
+is consulted immediately before the push and again immediately before PR creation (the lease
+lane supplies the implementation). `valid: false` skips that effect and records
+`fenced_out: <reason>`; a fence that fails before the push leaves nothing on origin.
+
 ## Lifecycle
 
 State file `<state-dir>/tasks/<id>.json`:
@@ -159,7 +204,11 @@ State file `<state-dir>/tasks/<id>.json`:
   "exit_code": 0,
   "head": "abc1234567890def",
   "pr": "https://github.com/...",
+  "pr_adopted": false,
   "publish": "pushed",
+  "pushed_sha": "abc1234567890def",
+  "remote_sha_before": null,
+  "base_ref": "main",
   "evidence": "pr",
   "limit_tripped": null,
   "harness_stop": null,

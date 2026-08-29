@@ -37,6 +37,7 @@ const HEADER_KEYS = new Set([
   "branch",
   "claim",
   "evidence_ref",
+  "base_ref",
 ]);
 
 function positiveNumber(value, name) {
@@ -98,6 +99,14 @@ export function parseEnvelope(body) {
   }
   const claim = values.get("claim") ?? ".";
   const ref = values.get("evidence_ref") ?? values.get("ref");
+  // base_ref: the PR base the publisher targets (default main). Same name rules as `branch`.
+  const baseRef = values.get("base_ref");
+  if (baseRef !== undefined) {
+    const REF = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+    if (!REF.test(baseRef) || baseRef.includes("..") || /^refs[\/.]/.test(baseRef) || baseRef.includes("refs/") || baseRef.endsWith(".lock") || baseRef.endsWith("/") || baseRef === "HEAD") {
+      throw new Error("base_ref must be a plain git branch name");
+    }
+  }
 
   return {
     repo,
@@ -109,6 +118,7 @@ export function parseEnvelope(body) {
     deadline,
     ref,
     branch: branchValue,
+    base_ref: baseRef,
     claim,
     spec,
   };
