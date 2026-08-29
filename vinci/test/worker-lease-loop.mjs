@@ -964,23 +964,38 @@ await test('WARN-3: the reasons the server ACTUALLY emits are decisions on 403 a
     } });
     return { result: await client.renew(lease), calls: () => calls };
   };
-  // The strings VERIFIED in vinci-gpu-control main. The first pass listed snake_case inventions
-  // (`unknown_lease`, `not_holder`) that the server never emits, which made the whole list inert:
-  // every one of these still came back `reason=unreachable, calls=2`. These five are the test.
+  // D1: EVERY 403 on a lease route is an authority refusal (CONTRACT §29.1) — the status decides,
+  // the reason is payload carried verbatim. These are real observed strings, but they are now
+  // examples rather than the predicate: the list below deliberately includes reasons NOT known to
+  // this client, because a reason nobody has seen yet must classify identically.
   const SERVER_403_REASONS = [
     'work order expired',                             // governor_runtime.py:530, 843
     'session not in a live state',                    // governor_runtime.py:854
     'work order deadline rule: deadline has passed',  // app.py:152 (_DEADLINE_PASSED)
     'unknown lease',                                  // relayed (#201 branch)
     'lease not held by this session',                 // relayed (#201 branch)
+    'session does not hold this work order',          // OBSERVED on the wire by the integration —
+                                                      // the one this client used to file as a
+                                                      // transport fault (D1)
+    'a reason this client has never heard of',        // the whole point: no list is consulted
+    '',                                               // and an empty/absent reason is still a 403
   ];
   for (const reason of SERVER_403_REASONS) {
     const { result, calls } = await renewWith(403, { reason });
-    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason }, `403 ${reason} must be a decision, not "unreachable"`);
-    assert.equal(calls(), 1, `a decision is never retried (403 ${reason})`);
+    assert.equal(result.ok, false, `403 ${reason}`);
+    assert.equal(result.lost, true, `403 ${reason}`);
+    // An empty reason has nothing to carry verbatim and falls back to the generic label.
+    assert.equal(result.reason, reason || 'refused', `403 "${reason}" must be a decision carrying its reason, not "unreachable"`);
+    assert.equal(calls(), 1, `a decision is never retried (403 "${reason}")`);
   }
-  // A deadline rule is one of a "<rule>: <detail>" family — matched by prefix, not by the single
-  // exact string that happens to exist today.
+  // A 403 with NO reason field at all, and one with a non-string reason: still a decision.
+  for (const body of [{}, { reason: null }, { reason: 42 }]) {
+    const { result, calls } = await renewWith(403, body);
+    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason: 'refused' }, `403 ${JSON.stringify(body)}`);
+    assert.equal(calls(), 1);
+  }
+  // A deadline rule is one of a "<rule>: <detail>" family. It needed a prefix rule when reasons
+  // were the predicate; now it is simply another 403.
   const { result: deadline, calls: deadlineCalls } = await renewWith(403, { reason: 'work order deadline rule: something else entirely' });
   assert.equal(deadline.reason, 'work order deadline rule: something else entirely');
   assert.equal(deadlineCalls(), 1);
@@ -993,7 +1008,9 @@ await test('WARN-3: the reasons the server ACTUALLY emits are decisions on 403 a
     }
   }
   // Anything else non-2xx is transport/unknown: retried once, then LOSS OF AUTHORITY (fail closed).
-  for (const [status, body] of [[500, { reason: 'boom' }], [502, {}], [403, { reason: 'something_new' }], [404, { reason: 'stale_generation' }]]) {
+  // Deliberately NOT a blanket 4xx — 408 and 429 are transient and must keep their retry, and a
+  // 404 is not one of the two statuses the contract names, whatever reason it carries.
+  for (const [status, body] of [[500, { reason: 'boom' }], [502, {}], [404, { reason: 'stale_generation' }], [408, {}], [429, { reason: 'slow down' }]]) {
     const { result, calls } = await renewWith(status, body);
     assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason: 'unreachable' }, `status ${status} ${JSON.stringify(body)}`);
     assert.equal(calls(), 2, `an unknown failure is retried exactly once (status ${status})`);
@@ -1026,6 +1043,10 @@ await test('WARN-3 at acquire: lease-state answers are decisions (leased vs refu
   for (const [status, reason] of [
     [409, 'work order expired'], [409, 'session not in a live state'], [409, 'expired'], [409, 'revoked'],
     [403, 'work order expired'], [403, 'work order deadline rule: deadline has passed'], [403, 'unknown lease'],
+    // D1: the reason text is NOT a predicate. A 403 this client has never seen is still a refusal
+    // — this is the case the integration caught being filed as `unavailable`.
+    [403, 'session does not hold this work order'], [403, 'something no list contains'],
+    [409, 'a 409 reason nobody enumerated'],
   ]) {
     const { result, calls } = await acquireWith(status, { reason });
     assert.equal(result.refused, true, `acquire ${status} ${reason} must be a REFUSAL decision`);
@@ -1035,8 +1056,9 @@ await test('WARN-3 at acquire: lease-state answers are decisions (leased vs refu
     assert.equal(result.reason, reason, 'the rule text rides verbatim');
     assert.equal(calls(), 1);
   }
-  // Not a decision: still fails closed as unavailable.
-  for (const [status, body] of [[500, { reason: 'boom' }], [403, { reason: 'something_new' }], [418, {}]]) {
+  // Not a decision: still fails closed as unavailable. Only statuses OUTSIDE the contract's
+  // 403/409 pair land here — a 403 never does, whatever it says.
+  for (const [status, body] of [[500, { reason: 'boom' }], [418, {}], [404, { reason: 'revoked' }], [429, {}]]) {
     const { result } = await acquireWith(status, body);
     assert.equal(result.unavailable, true, `acquire ${status} ${JSON.stringify(body)} is a failure, not a decision`);
     assert.equal(result.refused, undefined);
@@ -1073,28 +1095,36 @@ await test('WARN-3 at acquire, end to end: 409 work order expired => BLOCKED ref
 
 // A fencing_generation the SERVER would reject on the way in must be refused at acquire, before
 // any work — not accepted and then 400'd on the first renew, mid-run, after the child is spawned.
-await test('fencing_generation: a number must be an integer >= 1; a non-empty string is still accepted', async () => {
+await test('D2 fencing_generation: an integer >= 1, and nothing else — strings included', async () => {
   const acquireGeneration = async (fencing_generation) => {
     const client = new LeaseClient({ governorUrl: 'http://governor.invalid', token: 't', fetch: async () => new Response(JSON.stringify({ lease_id: 'l1', fencing_generation, ttl_s: 60 }), { status: 200, headers: { 'content-type': 'application/json' } }) });
     return client.acquire({ workOrderId: 'job_x', attemptId: 'x/1' });
   };
-  // The server validates `type is int and >= 1` on the way in, so these are values it will refuse
-  // on every later call. Refusing them here BLOCKS cleanly; accepting them moves the failure to
-  // the first renew, after the clone and the spawn.
-  for (const bad of [0, -3, 1.5, -0.0001, Number.NaN, Infinity, '', null, undefined, {}, []]) {
+  // `app.py::_generation_from` requires `type is int and >= 1` and 400s otherwise, so anything
+  // else is a value this client could never hand back successfully. Refusing at ACQUIRE blocks
+  // cleanly, before the clone, the spawn and any spend.
+  for (const bad of [0, -3, 1.5, -0.0001, Number.NaN, Infinity, null, undefined, {}, [], true]) {
     const result = await acquireGeneration(bad);
     assert.equal(result.success, false, `fencing_generation ${JSON.stringify(bad)} must not be a lease`);
     assert.equal(result.unavailable, true);
     assert.match(result.reason, /^Governor lease invalid: fencing_generation=/);
   }
-  for (const good of [1, 7, 100, Number.MAX_SAFE_INTEGER]) {
-    assert.equal((await acquireGeneration(good)).success, true, `integer ${good} is a usable generation`);
+  // D2: STRINGS are refused too, and this is the case the integration flagged. The old code
+  // accepted them so the fence "could not become inadmissible" — but the server 400s a string on
+  // every renew, so accepting one did not avoid the failure, it moved it to mid-run: acquire ok,
+  // clone done, child spawned, first renew 400 -> retried -> `unreachable` -> authority lost ->
+  // SIGTERM. The same argument that narrowed the number half narrows this one.
+  for (const token of ['gen-1', '1', '00000000-0000-4000-8000-000000000000', '']) {
+    const result = await acquireGeneration(token);
+    assert.equal(result.success, false, `a string generation ${JSON.stringify(token)} must be refused at acquire, not mid-run`);
+    assert.equal(result.unavailable, true);
+    assert.match(result.reason, /^Governor lease invalid: fencing_generation=/);
+    // The offending value is IN the reason, so an operator sees what the server sent.
+    assert(result.reason.includes(JSON.stringify(token)), result.reason);
   }
-  // The string half of the widening stands: the worker only echoes the fence back, so a token it
-  // cannot interpret still round-trips.
-  for (const good of ['gen-1', '00000000-0000-4000-8000-000000000000']) {
+  for (const good of [1, 7, 100, Number.MAX_SAFE_INTEGER]) {
     const result = await acquireGeneration(good);
-    assert.equal(result.success, true, `string generation ${good} is carried, not interpreted`);
+    assert.equal(result.success, true, `integer ${good} is a usable generation`);
     assert.equal(result.lease.fencing_generation, good);
   }
 });
@@ -1416,6 +1446,57 @@ await test('declaration refresh cadence keeps its headroom inside the Governor s
     `a ${DECLARATION_REFRESH_DEFAULT_S}s interval writes rows far faster than the staleness window requires`,
   );
   assert.equal(DECLARATION_REFRESH_DEFAULT_S, 21600, '6h — four refreshes inside the 24h window');
+});
+
+// ---------------------------------------------------------------------------------------------
+// D1 end to end, on the exact bytes the integration captured:
+// `403 {"reason":"session does not hold this work order"}` at acquire. Before this fix that was
+// recorded as `outcome.governor = "unavailable"` with a blocker reading
+// `lease_unavailable: Governor error: unexpected status 403 …` — a Governor DECISION filed as a
+// Governor FAILURE, which is what the soak ledger reads and what the README promises never
+// happens. 14 of the server's 15 lease-route 403 reasons took that path.
+await test('D1 end to end: a 403 the client has never seen is a REFUSAL, not "unavailable"', async () => {
+  const fixture = new WorkerTestFixture('lease-403-refusal');
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, mode: 'refuse', refusal: { status: 403, reason: 'session does not hold this work order' } });
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('160', 'w5', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    const { code } = await runWorker(fixture, 'w5', ['--governor', governor.url]);
+    assert.equal(code, 0);
+    const snapshot = state(fixture, '160');
+    assert.equal(snapshot.state, 'BLOCKED');
+    // The reason rides VERBATIM — no `lease_unavailable:` prefix, no "unexpected status 403".
+    assert.equal(snapshot.outcome.reason, 'session does not hold this work order');
+    assert.equal(snapshot.outcome.governor, 'refused', 'a 403 on a lease route is a DECISION');
+    assert.equal(/unavailable/.test(JSON.stringify(snapshot.outcome)), false, 'never filed as unavailability');
+    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    assert(blocker.body.includes('Governor refused the lease: session does not hold this work order'), `blocker: ${blocker.body}`);
+    assert.equal(/lease_unavailable/.test(blocker.body), false, 'the blocker must not say unavailable');
+    assert.equal(/unexpected status/.test(blocker.body), false);
+    // Fail closed either way: nothing ran, nothing was claimed.
+    assert.equal(fixture.getVinciCalls().length, 0);
+    assert.equal(governor.claims.length, 0);
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+// The other half of D1: one wasted retry at renew. A 403 is final, so it must cost exactly ONE
+// request — the integration measured the old path spending two.
+await test('D1: a 403 at renew costs exactly one request, never a retry', async () => {
+  for (const reason of ['session does not hold this work order', 'some reason added to the server next week']) {
+    let calls = 0;
+    const client = new LeaseClient({ governorUrl: 'http://governor.invalid', token: 't', log: () => {}, fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ reason }), { status: 403, headers: { 'content-type': 'application/json' } });
+    } });
+    const result = await client.renew({ lease_id: 'l1', fencing_generation: 7, ttl_s: 60 });
+    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason });
+    assert.equal(calls, 1, `403 "${reason}" must not be retried`);
+  }
 });
 
 console.log(`\nWorker lease loop tests: ${passed} passed, ${failed} failed`);
