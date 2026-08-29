@@ -130,7 +130,11 @@ int vinci_trampoline_main(int argc, char **argv) {
     memset(&send_message, 0, sizeof(send_message));
     send_message.msg_iov = &send_vector;
     send_message.msg_iovlen = 1;
-    if (sendmsg(VINCI_SELFTEST_SEND_FD, &send_message, 0) != (ssize_t)sizeof(outgoing)) {
+    /* MSG_DONTWAIT on the SEND too. A mutant that made sendmsg dispatch recvmsg
+       turned this into a blocking receive with nothing queued, and was caught
+       only by the harness's 30s alarm. Non-blocking, it fails here immediately.
+       12 bytes on a fresh SOCK_SEQPACKET pair never legitimately blocks. */
+    if (sendmsg(VINCI_SELFTEST_SEND_FD, &send_message, MSG_DONTWAIT) != (ssize_t)sizeof(outgoing)) {
         report("check 22: sendmsg\n");
         return 22;
     }
