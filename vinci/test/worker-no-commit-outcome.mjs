@@ -63,7 +63,8 @@ test("Variant 1: evidence=pr and exit 0 records no_commit without changing UNVER
   assert.equal(state.publish, "pushed", "publish remains an action result; outcome distinguishes no work");
   assert.equal(state.harness_stop, null);
   assert.equal(state.limit_tripped, null);
-  assert.equal(state.outcome?.reason, expectedReason(baseCommit));
+  assert.equal(state.outcome?.no_commit, true, "outcome should have no_commit boolean");
+  assert.equal(state.outcome?.reason, expectedReason(baseCommit), "reason should contain full explanation");
   assert.match(finalPost.body, /reason=no_commit: HEAD is unchanged from base_commit/);
 });
 
@@ -80,6 +81,7 @@ test("Variant 2: evidence=none and exit 1 creates an outcome when the run outcom
   assert.equal(state.publish, "pushed", "publish remains an action result; outcome distinguishes no work");
   assert.equal(state.harness_stop, null);
   assert.equal(state.limit_tripped, null);
-  assert.equal(state.outcome?.reason, expectedReason(baseCommit));
+  assert.equal(state.outcome?.no_commit, true, "outcome should have no_commit boolean");
+  assert.equal(state.outcome?.reason, expectedReason(baseCommit), "reason should contain full explanation");
   assert.match(finalPost.body, /reason=no_commit: HEAD is unchanged from base_commit/);
 });

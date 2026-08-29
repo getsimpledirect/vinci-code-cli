@@ -355,6 +355,7 @@ export function noCommitOutcome({ head, baseCommit, outcome }) {
   const priorOutcome = outcome && typeof outcome === "object" && !Array.isArray(outcome) ? outcome : {};
   return {
     ...priorOutcome,
+    no_commit: true,
     reason: `no_commit: HEAD is unchanged from base_commit ${baseCommit}; the run produced no commit`,
   };
 }
