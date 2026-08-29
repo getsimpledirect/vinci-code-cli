@@ -4,10 +4,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalize } from "../worker/contracts/canonical.mjs";
+import { createDebrisAuthorityClient } from "../worker/debris-authority.mjs";
 import { provisionWorkerDebrisAuthority } from "./lib/worker-debris-authority-fixture.mjs";
 import { describeDebrisRootAnchor, prepareRepository } from "../worker/run.mjs";
 
@@ -47,7 +48,7 @@ assert.equal(readFileSync(join(first.repoDir, "notes.txt"), "utf8"), "only copy 
 writeFileSync(debrisAuthority.failGetPath, "fail the first authority read\n");
 await assert.rejects(
   () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 1),
-  /debris authority adapter: exited 74/,
+  /debris authority response: unexpected fields/,
 );
 assert.equal(readFileSync(join(first.repoDir, "notes.txt"), "utf8"), "only copy of this work\n");
 const second = await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 1);
@@ -243,9 +244,33 @@ writeFileSync(debrisAuthority.statePath, authorityBeforeLoss, { mode: 0o600 });
 assert.equal(readFileSync(join(replay.repoDir, "adapter-loss.txt"), "utf8"), "must survive missing authority\n");
 await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 103);
 
-// The worker pins the adapter executable itself and the adapter independently refuses callers
-// that lack the deployment channel token. Neither path can alter the authoritative head.
+// The worker pins the adapter executable itself and the service independently refuses callers
+// that lack the supervisor-preopened unnamed socket. Neither path can alter the authoritative
+// head.
 const adapterBytes = readFileSync(debrisAuthority.adapterPath);
+const authorityStateBeforeRewind = readFileSync(debrisAuthority.statePath);
+const authorityForRewind = JSON.parse(authorityStateBeforeRewind).msg_retry;
+const authorityDigest = (head) => createHash("sha256").update(`${canonicalize(head)}\n`).digest("hex");
+const forgedRewind = {
+  ...authorityForRewind,
+  sequence: authorityForRewind.sequence + 1,
+  predecessor_head_sha256: authorityDigest(authorityForRewind),
+  generations: authorityForRewind.generations.slice(0, -1),
+  attempts: authorityForRewind.attempts.slice(0, -1),
+};
+const requestAuthority = createDebrisAuthorityClient(state, {
+  rootAnchorSha256: createHash("sha256").update(readFileSync(debrisAuthority.anchorPath)).digest("hex"),
+  lineageId: "1".repeat(64),
+});
+const rewindResponse = await requestAuthority({
+    schema: "vinci.worker-debris-authority-request/1",
+    operation: "CAS",
+    task_id: "msg_retry",
+    expected_head_sha256: authorityDigest(authorityForRewind),
+    next_head: forgedRewind,
+});
+assert.equal(rewindResponse.status, "REFUSED", "the service independently rejects an authenticated semantic rewind");
+assert.ok(readFileSync(debrisAuthority.statePath).equals(authorityStateBeforeRewind), "a refused semantic rewind cannot alter the external head");
 const inStateAdapter = join(state, "in-state-authority-adapter.mjs");
 writeFileSync(inStateAdapter, adapterBytes, { mode: 0o500 });
 chmodSync(inStateAdapter, 0o500);
@@ -271,12 +296,24 @@ chmodSync(debrisAuthority.adapterPath, 0o700);
 writeFileSync(debrisAuthority.adapterPath, adapterBytes);
 chmodSync(debrisAuthority.adapterPath, 0o500);
 assert.throws(
-  () => execFileSync(debrisAuthority.adapterPath, [], {
-    input: `${canonicalize({ schema: "vinci.worker-debris-authority-request/1", operation: "GET", task_id: "msg_retry", expected_head_sha256: null, next_head: null, channel_token: "0".repeat(64) })}\n`,
+  () => execFileSync(process.execPath, [debrisAuthority.adapterPath], {
+    input: `${canonicalize({ schema: "vinci.worker-debris-authority-request/1", operation: "GET", task_id: "msg_retry", expected_head_sha256: null, next_head: null })}\n`,
     stdio: ["pipe", "pipe", "pipe"],
   }),
   (error) => error.status === 77,
 );
+const fakeCapabilityPath = join(scratch, "attacker-capability.json");
+writeFileSync(fakeCapabilityPath, `${"0".repeat(512)}\n`, { mode: 0o400 });
+const fakeCapabilityFd = openSync(fakeCapabilityPath, "r");
+unlinkSync(fakeCapabilityPath);
+assert.throws(
+  () => execFileSync(process.execPath, [debrisAuthority.adapterPath], {
+    input: `${canonicalize({ schema: "vinci.worker-debris-authority-request/1", operation: "GET", task_id: "msg_retry", expected_head_sha256: null, next_head: null })}\n`,
+    stdio: ["pipe", "pipe", "pipe", fakeCapabilityFd],
+  }),
+  (error) => error.status === 77,
+);
+closeSync(fakeCapabilityFd);
 assert.equal(readFileSync(join(replay.repoDir, "adapter-replacement.txt"), "utf8"), "must survive adapter replacement\n");
 await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 104);
 

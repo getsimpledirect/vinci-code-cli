@@ -43,7 +43,9 @@ function command(commandName, args, options = {}) {
       "VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256",
       "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER",
       "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256",
-      "VINCI_WORKER_DEBRIS_AUTHORITY_CHANNEL_TOKEN",
+      "VINCI_WORKER_DEBRIS_AUTHORITY_CAPABILITY_FD",
+      "VINCI_WORKER_DEBRIS_AUTHORITY_SERVICE_SHA256",
+      "VINCI_WORKER_DEBRIS_AUTHORITY_PUBLIC_KEY_SPKI",
     ]) delete commandEnvironment[name];
     const child = spawn(executable, args, {
       cwd: options.cwd,
@@ -815,12 +817,12 @@ async function compareAndSetAuthorityHead(client, taskId, prior, next) {
   let response;
   try {
     response = await client({ schema: "vinci.worker-debris-authority-request/1", operation: "CAS", task_id: taskId, expected_head_sha256: expected, next_head: next });
+    validateAuthorityResponse(response, taskId, new Set(["COMMITTED", "CONFLICT", "REFUSED"]));
   } catch (error) {
     const observed = await readAuthorityHead(client, taskId).catch(() => null);
     if (observed?.head && canonicalize(observed.head) === canonicalize(next)) return next;
     throw new Error(`debris authority adapter: ambiguous head commit requires reconciliation: ${error.message}`);
   }
-  validateAuthorityResponse(response, taskId, new Set(["COMMITTED", "CONFLICT"]));
   if (response.head && canonicalize(response.head) === canonicalize(next)) {
     const observed = await readAuthorityHead(client, taskId);
     if (observed.head && canonicalize(observed.head) === canonicalize(next)) return next;
@@ -876,7 +878,10 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
   const debrisRoot = join(stateDir, "debris");
   if (!existsSync(debrisRoot)) throw new Error("debris root identity: deployment must provision the debris root and external trust anchor before capture");
   const rootAnchor = loadDebrisRootAnchor(stateDir);
-  const authorityClient = createDebrisAuthorityClient(stateDir);
+  const authorityClient = createDebrisAuthorityClient(stateDir, {
+    rootAnchorSha256: rootAnchor.anchorSha256,
+    lineageId: rootAnchor.value.lineage_id,
+  });
   const lockPath = join(debrisRoot, ".capture.lock");
   const lock = openSync(lockPath, "wx", 0o600);
   let staging = null;
@@ -1205,7 +1210,9 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
     "VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256",
     "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER",
     "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256",
-    "VINCI_WORKER_DEBRIS_AUTHORITY_CHANNEL_TOKEN",
+    "VINCI_WORKER_DEBRIS_AUTHORITY_CAPABILITY_FD",
+    "VINCI_WORKER_DEBRIS_AUTHORITY_SERVICE_SHA256",
+    "VINCI_WORKER_DEBRIS_AUTHORITY_PUBLIC_KEY_SPKI",
   ]) delete taskEnvironment[name];
   mkdirSync(sessionDir, { recursive: true });
 

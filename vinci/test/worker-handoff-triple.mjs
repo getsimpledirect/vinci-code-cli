@@ -8,7 +8,7 @@
 // post must name the refusal reason and the `contract=<id>@<digest8>` tag.
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, fstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -40,11 +40,22 @@ const gitFails = (cwd, ...args) => {
 const run = ({ args = [], env = {} } = {}) =>
   new Promise((resolve) => {
     f.resetGitCalls();
+    const capabilityFd = debrisAuthority.capabilityFd;
+    const capabilityStat = fstatSync(capabilityFd);
+    const forbiddenCapabilityIdentity = `${capabilityStat.dev}:${capabilityStat.ino}`;
     const child = spawn(
       "bash",
       [LAUNCHER, "worker", "start", "--id", "w1", "--server", f.busUrl(), "--once", "--state-dir", f.tempDir, ...args],
-      { env: f.getEnv(env), stdio: ["ignore", "pipe", "pipe"] },
+      {
+        env: f.getEnv({
+          ...env,
+          VINCI_WORKER_DEBRIS_AUTHORITY_CAPABILITY_FD: "3",
+          FAKE_VINCI_FORBIDDEN_CAPABILITY_IDENTITY: forbiddenCapabilityIdentity,
+        }),
+        stdio: ["ignore", "pipe", "pipe", capabilityFd],
+      },
     );
+    debrisAuthority.releaseCapabilityToChild();
     let stderr = "";
     child.stderr.on("data", (d) => {
       stderr += d;
@@ -52,6 +63,7 @@ const run = ({ args = [], env = {} } = {}) =>
     const timer = setTimeout(() => child.kill("SIGKILL"), 60000);
     child.on("exit", (status) => {
       clearTimeout(timer);
+      debrisAuthority.reopenCapability();
       resolve({ status, stderr });
     });
   });

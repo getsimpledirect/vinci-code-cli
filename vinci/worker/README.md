@@ -160,10 +160,20 @@ process-pinned trust root.
 
 Every task lineage and complete generation/attempt/current inventory is also serialized through a
 deployment-owned compare-and-set adapter named by `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER`. The
-worker requires an exact executable digest in `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256` and a
-deployment-issued 32-byte channel token. Adapter responses are bounded canonical bytes, and each
-head binds the root anchor, lineage, storage identities, monotonic sequence/predecessor, index,
-generations, attempts, and current receipt. Deployment must explicitly create the private task
+worker requires an exact executable digest in `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256` and
+an already-open, supervisor-provided unnamed socket descriptor. The worker communicates directly
+over that process-private descriptor; it never opens an authority pathname and never exports the
+descriptor to a repository command or task child. There is no reusable bearer in environment,
+argv, or a reopenable capability file. Every service response is a canonical Ed25519-signed envelope that
+binds a fresh worker nonce, exact request digest, socket identity, adapter and service implementation
+digests, root/lineage, authority epoch, service principal, peer-credential enforcement, isolated
+service storage, non-inheritance by task children, and the deployment's parent-FD-exfiltration
+proof. Missing, linked, non-socket, unsigned, replayed, relabelled, or incompletely admitted channels
+refuse. Adapter responses are bounded canonical bytes, and each head binds the root anchor,
+lineage, storage identities, monotonic
+sequence/predecessor, index, generations, attempts, and current receipt. The authority service
+must independently reject inventory shrink, predecessor/sequence forks, root/storage changes,
+and any CAS not made through the admitted capability. Deployment must explicitly create the private task
 directories and task-identity anchor and reserve their empty sequence-zero head in that adapter
 before the task may capture debris. Ordinary worker capture never provisions a lineage: a missing
 head refuses before it creates or cleans task state. Missing or rolled-back adapter state for an
@@ -171,8 +181,9 @@ existing task, any local deletion/fork, or a second task-root bootstrap refuses 
 unindexed local suffix may advance the external head after a crash; an external head never moves
 backward. Native adapters are executed directly; script adapters are executed only by the exact
 Node runtime already running the worker, never through their shebang or an ambient `PATH`. The
-adapter and all anchor/adapter settings are removed from the repository task's environment before
-execution.
+adapter, socket descriptor metadata, trust key, and all anchor settings are removed from the
+repository task's environment; task processes inherit neither the authority socket nor an
+authority endpoint.
 
 ## Handoff Forms (Wave 1B)
 

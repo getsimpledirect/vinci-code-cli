@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fake vinci for worker tests - records invocation and simulates behavior
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, fstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const recordFile = process.env.FAKE_VINCI_RECORD || '/tmp/fake-vinci-invocations.txt';
@@ -48,6 +48,28 @@ if (process.env.FAKE_VINCI_SELF_UPDATE_TO && process.env.VINCI_UPDATE_DISABLED !
   writeFileSync(installFile, JSON.stringify({ ...install, version: process.env.FAKE_VINCI_SELF_UPDATE_TO, flips: [] }) + '\n');
 }
 const executedVersion = readInstall().version;
+
+if (process.env.FAKE_VINCI_FORBIDDEN_CAPABILITY_IDENTITY) {
+  for (const name of [
+    'VINCI_WORKER_DEBRIS_ROOT_ANCHOR',
+    'VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_CAPABILITY_FD',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_SERVICE_SHA256',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_PUBLIC_KEY_SPKI',
+  ]) {
+    if (Object.hasOwn(process.env, name)) throw new Error(`task inherited debris authority setting: ${name}`);
+  }
+  try {
+    const stat = fstatSync(3);
+    if (`${stat.dev}:${stat.ino}` === process.env.FAKE_VINCI_FORBIDDEN_CAPABILITY_IDENTITY) {
+      throw new Error('task inherited the debris authority capability descriptor');
+    }
+  } catch (error) {
+    if (error?.code !== 'EBADF') throw error;
+  }
+}
 
 const sessionDir = process.argv.indexOf('--session-dir') >= 0 ? process.argv[process.argv.indexOf('--session-dir') + 1] : undefined;
 const sessionId = process.argv.indexOf('--session-id') >= 0 ? process.argv[process.argv.indexOf('--session-id') + 1] : undefined;
