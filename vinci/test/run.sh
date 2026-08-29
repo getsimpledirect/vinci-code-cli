@@ -248,6 +248,21 @@ if [ "${worker_test_count}" -eq 0 ]; then
   echo "run.sh: no worker tests found under vinci/test/worker-*.mjs" >&2
   exit 1
 fi
+# Containment broker: the whole vinci/containment-broker/test suite. These tests, the two trampoline
+# mutant gates and the native Linux build gate existed through a full development cycle without being
+# listed here, and the package is not an npm workspace either — so no CI job could see them and none
+# ever ran. Same inert-guard shape as the BYOK tests above. Discovered by glob so a new test file
+# cannot be silently omitted; zero matches is a failure, not a pass.
+containment_broker_test_count=0
+for containment_broker_test in "${ROOT}"/vinci/containment-broker/test/*.test.mjs; do
+  [ -e "${containment_broker_test}" ] || continue
+  containment_broker_test_count=$((containment_broker_test_count + 1))
+done
+if [ "${containment_broker_test_count}" -eq 0 ]; then
+  echo "run.sh: no containment-broker tests found under vinci/containment-broker/test/*.test.mjs" >&2
+  exit 1
+fi
+run_group containment-broker node --test "${ROOT}"/vinci/containment-broker/test/*.test.mjs
 # Print-mode liveness: every prompt gets a fresh idle watchdog, all session activity resets it,
 # tool execution suspends it, invalid timeout configuration falls back safely, and cleanup cancels it.
 run_group print-mode-liveness node --experimental-strip-types --input-type=module --eval '
