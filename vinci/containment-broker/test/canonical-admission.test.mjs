@@ -61,7 +61,15 @@ test("the local host and missing native receipt categorically refuse launch", ()
   };
   const evaluated = evaluateHostAdmission(probe, policy);
   assert.equal(evaluated.admitted, false);
-  assert.ok(evaluated.reasons.includes("unsupported_non_linux"));
+  // Platform-dependent, and it had never run on Linux until this suite was wired
+  // into CI: `unsupported_non_linux` is correctly ABSENT on a Linux host. The
+  // invariant being tested is that the host refuses either way, which is
+  // asserted above and by the trampoline reason below.
+  if (process.platform !== "linux") {
+    assert.ok(evaluated.reasons.includes("unsupported_non_linux"));
+  } else {
+    assert.ok(!evaluated.reasons.includes("unsupported_non_linux"));
+  }
   assert.ok(evaluated.reasons.includes("trampoline_binary_unadmitted"));
   assert.throws(
     () => requireNativeAdmission({ probe, policy, nativeAdapter: null }),

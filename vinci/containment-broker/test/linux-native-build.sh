@@ -6,7 +6,13 @@ build_root=$(mktemp -d "${TMPDIR:-/tmp}/vinci-native-build.XXXXXX")
 trap 'rm -rf "$build_root"' EXIT HUP INT TERM
 compiler=${CC:-cc}
 common='-std=c17 -Wall -Wextra -Werror -Wpedantic -O2'
-freestanding='-std=c17 -Wall -Wextra -Werror -Wpedantic -O2 -ffreestanding -fno-stack-protector -fno-builtin -ffunction-sections'
+# -U_FORTIFY_SOURCE is load-bearing, not decoration. Ubuntu's GCC enables
+# _FORTIFY_SOURCE by default at -O2 and rewrites memcpy into __memcpy_chk, which
+# a -nostdlib link has no source for; -fno-stack-protector likewise keeps
+# __stack_chk_fail out. A toolchain without those defaults (conda's, for one)
+# links happily, so this failure appears only on a hardened distro compiler.
+# EVERY object that enters a -nostdlib link must use this flag set.
+freestanding='-std=c17 -Wall -Wextra -Werror -Wpedantic -O2 -U_FORTIFY_SOURCE -fno-pie -ffreestanding -fno-stack-protector -fno-builtin -ffunction-sections'
 freestanding_asm='-Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-builtin -ffunction-sections'
 
 # Hosted objects retained for the launcher, session, and selftest links.
@@ -14,9 +20,9 @@ freestanding_asm='-Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno
 "$compiler" $common -c "$package_root/native/sha256.c" -o "$build_root/sha256.o"
 "$compiler" $common -c "$package_root/native/launcher_linux.c" -o "$build_root/launcher_linux.o"
 "$compiler" $common -c "$package_root/native/session_linux.c" -o "$build_root/session_linux.o"
-"$compiler" $common -c "$package_root/native/target_bootstrap_linux.c" -o "$build_root/target_bootstrap_linux.o"
+"$compiler" $freestanding -c "$package_root/native/target_bootstrap_linux.c" -o "$build_root/target_bootstrap_linux.o"
 "$compiler" $freestanding_asm -c "$package_root/native/target_entry_linux.S" -o "$build_root/target_entry_linux.o"
-"$compiler" $common -ffunction-sections -c "$package_root/native/sha256.c" -o "$build_root/sha256_target.o"
+"$compiler" $freestanding -c "$package_root/native/sha256.c" -o "$build_root/sha256_target.o"
 
 # Freestanding trampoline objects compiled separately from the hosted objects.
 "$compiler" $freestanding_asm -c "$package_root/native/trampoline_entry_linux.S" -o "$build_root/trampoline_entry_linux.o"
@@ -28,7 +34,7 @@ freestanding_asm='-Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno
 # Hermetic static trampoline link with no runtime or startup dependencies.
 "$compiler" $common "$build_root/trampoline_entry_linux.o" "$build_root/trampoline_linux.o" \
   "$build_root/trampoline_runtime_linux.o" "$build_root/protocol_freestanding.o" "$build_root/sha256_freestanding.o" \
-  -static -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections -o "$build_root/vinci-trampoline"
+  -static -no-pie -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections -o "$build_root/vinci-trampoline"
 
 # Verify the trampoline really is a hermetic static ELF binary.
 if readelf -l "$build_root/vinci-trampoline" | grep -q INTERP; then
@@ -88,7 +94,7 @@ if ! readelf -SW "$build_root/trampoline-pre-main-mutant.o" | grep -Eq '\.init_a
 fi
 if "$compiler" $common "$build_root/trampoline_entry_linux.o" "$build_root/trampoline_runtime_linux.o" \
     "$build_root/trampoline-hosted-mutant.o" "$build_root/protocol_freestanding.o" "$build_root/sha256_freestanding.o" \
-    -static -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
+    -static -no-pie -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
     -o "$build_root/vinci-trampoline-hosted-mutant" 2>"$log"; then
   echo "MUTANT ERROR: hosted mutant (main instead of vinci_trampoline_main) linked successfully" >&2
   exit 1
@@ -124,7 +130,7 @@ fi
 "$compiler" $common "$build_root/trampoline_entry_linux.o" "$build_root/trampoline_linux.o" \
   "$build_root/trampoline_runtime_linux.o" "$build_root/trampoline-pre-main-mutant.o" \
   "$build_root/protocol_freestanding.o" "$build_root/sha256_freestanding.o" \
-  -static -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
+  -static -no-pie -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
   -o "$build_root/vinci-trampoline-premain-mutant"
 if reject_pre_main_sections "$build_root/vinci-trampoline-premain-mutant"; then
   echo "MUTANT ERROR: pre-main constructor binary escaped the init_array/preinit_array rejection" >&2
@@ -136,9 +142,10 @@ fi
 "$compiler" $common "$package_root/test/protocol-selftest.c" "$build_root/protocol.o" -o "$build_root/protocol-selftest"
 "$compiler" $common "$package_root/test/sha256-selftest.c" "$build_root/sha256.o" -o "$build_root/sha256-selftest"
 "$compiler" $freestanding -c "$package_root/native/target_runtime_linux.c" -o "$build_root/target_runtime_linux.o"
-"$compiler" $common -static -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
+"$compiler" $freestanding -c "$package_root/test/target-fixture-main.c" -o "$build_root/target_fixture_main.o"
+"$compiler" $common -static -no-pie -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
   "$build_root/target_entry_linux.o" "$build_root/target_bootstrap_linux.o" "$build_root/sha256_target.o" \
-  "$build_root/target_runtime_linux.o" "$package_root/test/target-fixture-main.c" \
+  "$build_root/target_runtime_linux.o" "$build_root/target_fixture_main.o" \
   -o "$build_root/vinci-target-fixture"
 # Every refusal below names itself. These were bare `grep -q` lines under
 # `set -eu`, so a failing check aborted the gate with no output at all and the
@@ -180,7 +187,7 @@ fi
 "$compiler" $freestanding -c "$package_root/test/trampoline-runtime-selftest.c" -o "$build_root/trampoline_runtime_selftest.o"
 "$compiler" $common "$build_root/trampoline_entry_linux.o" "$build_root/trampoline_runtime_selftest.o" \
   "$build_root/trampoline_runtime_linux.o" \
-  -static -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
+  -static -no-pie -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
   -o "$build_root/trampoline-runtime-selftest"
 if ! elf_entry_is_symbol "$build_root/trampoline-runtime-selftest" _start; then
   echo "refusing runtime selftest whose ELF entry point does not equal _start" >&2
