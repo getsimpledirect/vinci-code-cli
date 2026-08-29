@@ -240,7 +240,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
   return { branch, repoDir };
 }
 
-export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
+export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env }) {
   const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
@@ -271,7 +271,8 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
       {
         cwd: repoDir,
         detached: true,
-        env: { ...process.env, VINCI_UPDATE_DISABLED: "1" },
+        // `env` (clean-room mode, cleanroom.mjs) is an allowlisted subset; default is the daemon's env.
+        env: { ...(env ?? process.env), VINCI_UPDATE_DISABLED: "1" },
         stdio: ["ignore", "inherit", "inherit"],
       },
     );
