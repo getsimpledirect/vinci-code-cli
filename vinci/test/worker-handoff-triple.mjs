@@ -59,16 +59,24 @@ try {
   // A separate repo for the legacy prose case so it stays independent of the digest checkout.
   f.createRepo("proseorg", "coderepo");
 
-  // Golden-vector contract and spec, reloaded from the fixture directory.
+  // Golden-vector contract and spec, reloaded from the fixture directory (byte-pinned, never edited).
   const workOrder = JSON.parse(readFileSync(join(VECTORS, "work-order-1-minimal", "input.json"), "utf8"));
   const baseSpec = JSON.parse(readFileSync(join(VECTORS, "execution-spec-1-minimal", "input.json"), "utf8"));
   assert.equal(workOrderDigest(workOrder), "8ba697a58de4eae4ae5405c74659424ac878f5107700cbd0b0001638bca379e2");
-  // The happy-path spec pins the real fixture commit as baseCommit so the checkout has somewhere to go,
-  // and moves the deadline into the future (the golden vector's deadline is already past).
+  
+  // Create a clean fixture spec for the happy-path test: deep-copy, clear capabilities,
+  // set future deadlines, use a real non-tip ancestor commit, and recompute both digests.
+  const futureDeadline = new Date(Date.now() + 3600 * 1000).toISOString();
   const happySpec = {
-    ...baseSpec,
+    ...JSON.parse(JSON.stringify(baseSpec)), // deep copy
     baseCommit,
-    resourceBounds: { ...baseSpec.resourceBounds, deadline: "2030-01-01T00:00:00.000Z" },
+    baseRef: "main",
+    requiredCapabilities: [], // strip test-only capabilities
+    resourceBounds: { 
+      budgetMicrousd: baseSpec.resourceBounds.budgetMicrousd,
+      maxRuntimeS: baseSpec.resourceBounds.maxRuntimeS,
+      deadline: futureDeadline, // move deadline 1 hour into the future
+    },
   };
   const happySpecDigest = executionSpecDigest(happySpec);
   const contractDigest = workOrderDigest(workOrder);

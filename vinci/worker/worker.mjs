@@ -463,11 +463,21 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   if (contractFields) lifecycle.record(contractFields);
   // B6: bounds validation BEFORE prepareRepository and before any spawn. budget_usd<=0, a
   // non-positive max_runtime_s, or a deadline already in the past each BLOCK the task.
-  if (envelope.budget_usd <= 0 || envelope.max_runtime_s <= 0 || (envelope.deadline && Date.parse(envelope.deadline) <= Date.now())) {
+  // For prose envelopes: keep the original reason string. For digest: use the structured format.
+  if (contractFields && (envelope.budget_usd <= 0 || envelope.max_runtime_s <= 0 || (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()))) {
+    // Digest handoff: full bounds validation with structured post body.
     const limit = envelope.budget_usd <= 0 ? "budget_usd" : envelope.max_runtime_s <= 0 ? "max_runtime_s" : "deadline";
     lifecycle.transition("BLOCKED", { limit_tripped: limit, outcome: { reason: "invalid_bounds: budget_usd, max_runtime_s and deadline must be within permitted bounds" } });
     const contract = contractTag(lifecycle.snapshot()) ? `${contractTag(lifecycle.snapshot())} ` : "";
     await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`), { inReplyTo: message.message_id });
+    return true;
+  }
+
+  // Prose handoff: only deadline is checked (budget and runtime have safe defaults from parseEnvelope).
+  if (!contractFields && envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
+    lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
+    const contract = contractTag(lifecycle.snapshot()) ? `${contractTag(lifecycle.snapshot())} ` : "";
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}deadline is in the past`), { inReplyTo: message.message_id });
     return true;
   }
 
