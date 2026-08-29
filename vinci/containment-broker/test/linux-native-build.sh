@@ -98,6 +98,29 @@ if ! grep -q 'vinci_trampoline_main' "$log"; then
   cat "$log" >&2
   exit 1
 fi
+# The link check above is NECESSARY BUT NOT SUFFICIENT, and on its own it was
+# vacuous: the hermetic link omits trampoline_linux.o, so _start's reference to
+# vinci_trampoline_main is undefined whatever the mutant contains — an EMPTY
+# translation unit fails identically and matches the same grep. It says nothing
+# about `main`. The discriminating test is the one the gate actually claims: an
+# ORDINARY HOSTED EXECUTABLE must be refused by the ELF gates that guard the real
+# trampoline, exercised here through those very functions.
+"$compiler" $common "$package_root/test/trampoline-hosted-mutant.c" -o "$build_root/vinci-hosted-executable"
+if ! readelf -l "$build_root/vinci-hosted-executable" | grep -q INTERP; then
+  echo "MUTANT ERROR: the hosted executable has no INTERP, so the interpreter gate cannot be shown to reject it" >&2
+  exit 1
+fi
+if reject_pre_main_sections "$build_root/vinci-hosted-executable"; then
+  echo "MUTANT ERROR: an ordinary hosted executable passed the init/fini array gate" >&2
+  exit 1
+fi
+# Deliberately NOT asserted: elf_entry_is_symbol accepts this binary, because
+# glibc supplies its own _start. That is exactly why the interpreter and
+# init/fini gates above exist — the entry-point check alone cannot tell a
+# hermetic trampoline from an ordinary hosted program.
+if ! elf_entry_is_symbol "$build_root/vinci-hosted-executable" _start; then
+  echo "note: hosted executable entry is not _start on this toolchain" >&2
+fi
 "$compiler" $common "$build_root/trampoline_entry_linux.o" "$build_root/trampoline_linux.o" \
   "$build_root/trampoline_runtime_linux.o" "$build_root/trampoline-pre-main-mutant.o" \
   "$build_root/protocol_freestanding.o" "$build_root/sha256_freestanding.o" \

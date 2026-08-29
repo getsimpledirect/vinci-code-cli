@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -57,8 +58,19 @@ int main(int argc, char **argv) {
         _exit(2);
     }
 
+    /* Hard ceiling. This gate runs in CI, so a child that blocks must fail the
+       build rather than wedge it: a broken sendmsg wrapper once left the child
+       waiting on a receive that could never arrive. */
     int status = 0;
-    if (waitpid(child, &status, 0) != child) { perror("waitpid"); return 2; }
+    alarm(30);
+    pid_t waited = waitpid(child, &status, 0);
+    if (waited != child) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        fprintf(stderr, "hermetic selftest did not finish within 30s\n");
+        return 2;
+    }
+    alarm(0);
     if (!WIFEXITED(status)) {
         fprintf(stderr, "hermetic selftest did not exit normally (status %d)\n", status);
         return 2;

@@ -141,11 +141,25 @@ int vinci_trampoline_main(int argc, char **argv) {
     memset(&receive_message, 0, sizeof(receive_message));
     receive_message.msg_iov = &receive_vector;
     receive_message.msg_iovlen = 1;
-    if (recvmsg(VINCI_SELFTEST_RECV_FD, &receive_message, 0) != (ssize_t)sizeof(incoming)) {
+    /* MSG_DONTWAIT, deliberately: the payload is already queued on the pair, so a
+       blocking receive adds nothing but the ability to HANG. A mutant that breaks
+       sendmsg made this block forever rather than fail, which in CI is a wedged
+       build instead of a red test. */
+    if (recvmsg(VINCI_SELFTEST_RECV_FD, &receive_message, MSG_DONTWAIT) != (ssize_t)sizeof(incoming)) {
         report("check 23: recvmsg\n");
         return 23;
     }
     if (memcmp(incoming, outgoing, sizeof(outgoing)) != 0) { report("check 24: payload mismatch\n"); return 24; }
+
+    /* 25/26. The raw-vs-wrapped errno convention, pinned. vinci_raw_syscall6
+       RETURNS the negative errno and must NOT touch errno; only checked() sets
+       it. Code that assumed otherwise made a failed seccomp install return
+       -0 == 0 and read as success. If this convention ever changes, that class
+       of fail-open silently returns. */
+    errno = 24680;
+    long raw = vinci_raw_syscall6(__NR_close, 999, 0, 0, 0, 0, 0);
+    if (raw != -EBADF) { report("check 25: raw syscall does not return -errno\n"); return 25; }
+    if (errno != 24680) { report("check 26: raw syscall wrote errno\n"); return 26; }
 
     report("trampoline runtime selftest: all checks passed\n");
     return 0;

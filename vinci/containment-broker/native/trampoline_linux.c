@@ -67,7 +67,12 @@ static int install_release_mediator(void) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -errno;
     int listener = (int)vinci_raw_syscall6(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
                                            SECCOMP_FILTER_FLAG_NEW_LISTENER, (long)&program, 0, 0, 0);
-    if (listener < 0) return -errno;
+    /* vinci_raw_syscall6 is the bare stub: it RETURNS the negative errno and never
+     * sets the shim's errno storage, which only checked() does. `return -errno`
+     * here therefore returned -0 == 0 on failure, the caller's `< 0` test read
+     * that as success, and the trampoline continued with NO user-notification
+     * filter installed. Fail-open. Return the raw result, which is already -errno. */
+    if (listener < 0) return listener;
     if (listener != VINCI_BROKER_NOTIFICATION_FD) { close(listener); return -EBUSY; }
     return listener;
 }

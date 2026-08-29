@@ -14,12 +14,13 @@ function source(relative) {
 test("portable native SHA-256 implementation passes an independently compiled vector", () => {
   const directory = mkdtempSync(join(tmpdir(), "vinci-native-sha256-"));
   const output = join(directory, "sha256-selftest");
-  const compile = spawnSync("/usr/bin/cc", [
+  const compile = spawnSync(process.env.CC ?? "cc", [
     "-std=c17", "-Wall", "-Wextra", "-Werror",
     new URL("native/sha256.c", packageRoot).pathname,
     new URL("test/sha256-selftest.c", packageRoot).pathname,
     "-o", output,
   ], { encoding: "utf8" });
+  assert.notEqual(compile.status, null, `compiler ${process.env.CC ?? "cc"} not found on PATH: ${compile.error?.message ?? ""}`);
   assert.equal(compile.status, 0, compile.stderr);
   const execute = spawnSync(output, [], { encoding: "utf8" });
   assert.equal(execute.status, 0, execute.stderr);
@@ -28,12 +29,13 @@ test("portable native SHA-256 implementation passes an independently compiled ve
 test("canonical protocol codec is ABI-independent and rejects reserved bytes", () => {
   const directory = mkdtempSync(join(tmpdir(), "vinci-native-protocol-"));
   const output = join(directory, "protocol-selftest");
-  const compile = spawnSync("/usr/bin/cc", [
+  const compile = spawnSync(process.env.CC ?? "cc", [
     "-std=c17", "-Wall", "-Wextra", "-Werror",
     new URL("native/protocol.c", packageRoot).pathname,
     new URL("test/protocol-selftest.c", packageRoot).pathname,
     "-o", output,
   ], { encoding: "utf8" });
+  assert.notEqual(compile.status, null, `compiler ${process.env.CC ?? "cc"} not found on PATH: ${compile.error?.message ?? ""}`);
   assert.equal(compile.status, 0, compile.stderr);
   const execute = spawnSync(output, [], { encoding: "utf8" });
   assert.equal(execute.status, 0, execute.stderr);
