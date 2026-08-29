@@ -81,12 +81,14 @@ export class WorkerTestFixture {
     return { origin, cloneUrl: `file://${origin}` };
   }
 
-  async startBus(handoffs = []) {
+  async startBus(handoffs = [], contractRegistry = {}) {
     this.busMessages = handoffs;
+    this.contractRegistry = contractRegistry;
     this.postedMessages = [];
     this.rejectedPosts = [];
     this.getRequests = [];
     this.evidencePosts = [];
+    this.contractRequests = [];
 
     const server = createServer((request, response) => {
       if (request.method === "GET" && request.url === "/v1/version") {
@@ -146,6 +148,29 @@ export class WorkerTestFixture {
           response.writeHead(200, { "content-type": "application/json" });
           response.end(JSON.stringify({ ok: true }));
         });
+        return;
+      }
+      // Wave 1B: the Governor's pinned-contract registry, served by the same listener so the
+      // daemon's digest-form contract fetch (`GET <server>/v1/governor/contracts/{work_order_id}`)
+      // can be exercised end-to-end without a second server. Keyed by work_order_id; a caller
+      // returning an entry for the id answers 200, anything else 404.
+      const contractsMatch = /^\/v1\/governor\/contracts\/([^/]+)$/.exec(url.pathname);
+      if (request.method === "GET" && contractsMatch) {
+        const workOrderId = decodeURIComponent(contractsMatch[1]);
+        this.contractRequests.push({ workOrderId });
+        const entry = this.contractRegistry?.[workOrderId];
+        if (!entry) {
+          response.writeHead(404, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: `no contract for ${workOrderId}` }));
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          work_order: entry.work_order,
+          execution_specs: entry.execution_specs ?? [entry.execution_spec].filter(Boolean),
+          digests: entry.digests ?? {},
+          handoffs: entry.handoffs ?? [],
+        }));
         return;
       }
       if (request.method === "POST" && url.pathname === "/v1/evidence") {

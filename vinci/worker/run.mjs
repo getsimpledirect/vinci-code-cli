@@ -136,13 +136,41 @@ async function classifyDivergedLocal(repoDir, branch, localSha, remoteTip) {
   return { residue: unreachable.stdout === range.stdout };
 }
 
-export async function prepareRepository(stateDir, repo, taskId, branchOverride) {
+export async function prepareRepository(stateDir, repo, taskId, branchOverride, baseCommit) {
   if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
   const branch = branchOverride ?? `worker/${taskId}`;
   const base = (process.env.VINCI_WORKER_GIT_BASE ?? "https://github.com/").replace(/\/+$/, "");
   const cloneUrl = `${base}/${repo}.git`;
   const cached = existsSync(repoDir);
+
+  // Wave 1B digest form: the handoff pinned an exact baseCommit that the task branch must be
+  // created FROM (base_commit), not a pre-existing branch to continue. The branch name is still
+  // held to the plain-branch rule, but it need not yet exist on origin; the checked-out tip is
+  // the baseCommit rather than an origin head, and the baseCommit must be reachable on origin.
+  if (baseCommit) {
+    if (typeof baseCommit !== "string" || !/^[0-9a-f]{40}$/.test(baseCommit)) {
+      throw new Error("base_commit must be a full 40-character lowercase hex SHA-1");
+    }
+    validateBranchName(branch);
+    const legal = await command("git", ["check-ref-format", "--branch", branch], { allowFailure: true });
+    if (legal.status !== 0) throw new Error(`envelope branch ${branch} is not a valid git branch name`);
+    if (cached) {
+      await command("git", ["-C", repoDir, "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"], { allowFailure: true });
+    } else {
+      mkdirSync(dirname(repoDir), { recursive: true });
+      await command("git", ["clone", cloneUrl, repoDir]);
+    }
+    // Reachability is asked of the clone AFTER the fetch, so origin must actually serve the
+    // commit; a dangling or local-only baseCommit is refused, never silently used.
+    const reachable = await command("git", ["-C", repoDir, "cat-file", "-e", `${baseCommit}^{commit}`], { allowFailure: true });
+    if (reachable.status !== 0) {
+      throw new Error(`base_commit ${baseCommit} not found on origin`);
+    }
+    await command("git", ["-C", repoDir, "checkout", "-B", branch, baseCommit]);
+    return { branch, repoDir };
+  }
+
 
   if (branchOverride) {
     validateBranchName(branch);

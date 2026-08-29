@@ -13,7 +13,7 @@ import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
-import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
+import { assertTaskId, contractTag, isDigestHandoff, materializeEnvelope, parseEnvelope, parseHandoffTriple, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
 import { readSessionState } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
@@ -311,6 +311,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     state.limit_tripped ? `limit=${state.limit_tripped}` : undefined,
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
+    contractTag(state),
     ...evidenceDetails,
   ]
     .filter(Boolean)
@@ -343,6 +344,35 @@ async function postFinal(bus, message, envelope, state, evidence) {
   }
 }
 
+// Wave 1B: fetch the Governor's pinned registry for a work order and classify non-2xx answers
+// so every one of them becomes a BLOCKED refusal before a clone. The digests are recomputed by
+// materializeEnvelope against the served record; nothing here is trusted from the handoff triple.
+async function fetchWorkOrderRegistry(serverUrl, token, workOrderId) {
+  const url = `${serverUrl}/v1/governor/contracts/${encodeURIComponent(workOrderId)}`;
+  let response;
+  try {
+    response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  } catch (error) {
+    throw new Error(`registry_unavailable: governor contracts fetch failed: ${error?.cause?.code ?? error.message}`);
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(`registry_unauthorized: governor contracts returned ${response.status}`);
+  }
+  if (response.status === 404) {
+    throw new Error(`work_order_not_found: no contract for ${workOrderId}`);
+  }
+  if (!response.ok) {
+    throw new Error(`registry_error: governor contracts returned ${response.status}`);
+  }
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw new Error(`registry_malformed: governor contracts returned invalid JSON: ${error.message}`);
+  }
+  return body;
+}
+
 async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   const taskId = message.message_id;
   try {
@@ -357,29 +387,65 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   if (!acquireTaskClaim(stateDir, taskId)) return false;
 
   let envelope;
-  try {
-    envelope = parseEnvelope(message.body);
-  } catch (error) {
-    lifecycle.startAttempt(
-      { id: taskId, envelope: { evidence: null, provider: null, model: null } },
-      version,
-      { workerBuild, serverBuild, vinciBinary },
-    );
-    const state = /^repo must be/.test(error.message) ? "FAILED" : "BLOCKED";
-    lifecycle.transition(state, {
-      limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
-      outcome: { reason: error.message },
-    });
-    await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
-      inReplyTo: message.message_id,
-    });
-    return true;
+  let contractFields = null;
+  if (isDigestHandoff(message.body)) {
+    // Wave 1B digest form: parse the triple, fetch the pinned registry from the server, and
+    // materialize the envelope. Every refusal (malformed triple, 404/unauthorized registry,
+    // digest mismatch, binding mismatch, unknown model class, bad field) BLOCKs here, before a
+    // clone and before a model spawn.
+    let triple;
+    let reason;
+    try {
+      triple = parseHandoffTriple(message.body);
+      const registry = await fetchWorkOrderRegistry(bus.serverUrl, process.env.VINCI_BUS_TOKEN, triple.work_order_id);
+      const materialized = materializeEnvelope(triple, registry);
+      envelope = materialized.envelope;
+      contractFields = materialized.contract;
+    } catch (error) {
+      reason = error.message || "handoff triple refusal";
+    }
+    if (reason) {
+      lifecycle.startAttempt(
+        { id: taskId, envelope: { evidence: null, provider: null, model: null } },
+        version,
+        { workerBuild, serverBuild, vinciBinary },
+      );
+      lifecycle.transition("BLOCKED", { outcome: { reason } });
+      const contract = triple ? `contract=${triple.work_order_id}@${triple.contract_digest.slice(0, 8)} ` : "";
+      await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`state=BLOCKED ${contract}reason=${reason}`), {
+        inReplyTo: message.message_id,
+      });
+      return true;
+    }
+  } else {
+    try {
+      envelope = parseEnvelope(message.body);
+    } catch (error) {
+      lifecycle.startAttempt(
+        { id: taskId, envelope: { evidence: null, provider: null, model: null } },
+        version,
+        { workerBuild, serverBuild, vinciBinary },
+      );
+      const state = /^repo must be/.test(error.message) ? "FAILED" : "BLOCKED";
+      lifecycle.transition(state, {
+        limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
+        outcome: { reason: error.message },
+      });
+      await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
+        inReplyTo: message.message_id,
+      });
+      return true;
+    }
   }
 
   const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild, vinciBinary });
+  // Wave 1B: stamp the record with the materialized contract (work_order_id, both digests,
+  // base_commit, promotion) so the snapshot and every terminal post can cite the handoff.
+  if (contractFields) lifecycle.record(contractFields);
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
+    const contract = contractTag(lifecycle.snapshot()) ? `${contractTag(lifecycle.snapshot())} ` : "";
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}deadline is in the past`), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -427,7 +493,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       });
     }
 
-    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
+    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch, envelopeToUse.base_commit);
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
     // which can take long enough for an operator update to land — and stamp the task with it.
     // runVinci spawns with VINCI_UPDATE_DISABLED=1, so nothing can change between this probe
