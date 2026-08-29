@@ -29,13 +29,28 @@ function validTtl(value) {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
-export async function claimGovernorPaths({ governorUrl, token, paths, taskId, attempt }) {
+// `attemptId` is the SAME string the lease acquire sent as `attempt_id` — the caller computes it
+// once and passes it to both calls; it is never re-derived here.
+//
+// Why the claim must carry it (Wave 1B, #201/#199 review): the Governor's holder gate
+// (governor_runtime.py:335-338) refuses any claim on a work order that currently holds a lease
+// unless the claim's `attempt_id` equals the lease holder's — and an ABSENT attempt_id fails that
+// comparison too. Since W1B acquires the lease BEFORE claiming paths, every governed task's order
+// has a live lease at claim time, so a claim body without `attempt_id` is refused
+// (403 {"reason":"leased_by_other_attempt"}) for EVERY governed task: the worker would block its
+// own work with a lease it is itself holding. The claim is also idempotency-keyed on the same
+// string, so a retried attempt claims the same paths rather than a second set.
+export async function claimGovernorPaths({ governorUrl, token, paths, attemptId }) {
   if (!governorUrl) return null;
   if (!token) return unavailable(GOVERNOR_TOKEN_MISSING);
+  // Fail closed rather than send a body the holder gate is guaranteed to refuse.
+  if (typeof attemptId !== "string" || !attemptId) {
+    return unavailable(`claim attempt_id is missing (attemptId=${JSON.stringify(attemptId)})`);
+  }
 
   const url = `${governorUrl}/v1/governor/claim-paths`;
-  const idempotencyKey = `${taskId}/${attempt}`;
-  const body = { paths };
+  const idempotencyKey = attemptId;
+  const body = { paths, attempt_id: attemptId };
 
   let response;
   try {

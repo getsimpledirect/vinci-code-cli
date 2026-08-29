@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { delimiter, join, resolve } from "node:path";
 
 import { isLedgerRef } from "./bus.mjs";
+import { checkFence } from "./publisher.mjs";
 
 function resolveBin(name) {
   for (const directory of (process.env.PATH ?? "").split(delimiter)) {
@@ -66,6 +67,7 @@ export async function uploadEvidence({
   busUrl,
   busToken,
   ref,
+  fence,
 }) {
   if (!uriPrefix) return null;
 
@@ -106,20 +108,37 @@ export async function uploadEvidence({
     // (job_/exp_/bk_) are attached as refs; any other ref (or none) skips the
     // bus entirely — the server would reject the post with 422.
     if (busUrl && busToken && isLedgerRef(ref)) {
+      // Wave 1B L3: the evidence POST is a consequential side effect — ask the lease fence first.
+      // A stale generation records `fenced_out:<reason>` and never reaches the ledger.
+      if (fence) {
+        const gate = await checkFence(fence, "evidence");
+        if (!gate.valid) {
+          // The BARE reason, exactly as publisher.publish records it: the `fenced_out` FIELD
+          // names the class, so prefixing the value restates it and made two shapes of the same
+          // fact (`revoked` at the push, `fenced_out:revoked` at the evidence POST).
+          const fencedOut = gate.reason ?? "invalid";
+          return { success: false, uploaded: true, uri: s3Uri, sha256, bytes, fenced_out: fencedOut, error: fencedOut };
+        }
+      }
+      const metadata = {
+        job_ref: ref,
+        uri: s3Uri,
+        sha256,
+        kind: "bundle",
+        bytes,
+        produced_at: new Date().toISOString(),
+      };
+      // Read through the fence at POST time (a getter on the live lease), never a value captured
+      // when the fence was built.
+      const generation = fence?.generation ?? null;
+      if (generation !== null) metadata.fencing_generation = generation;
       const postResult = await fetch(`${busUrl}/v1/evidence`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${busToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          job_ref: ref,
-          uri: s3Uri,
-          sha256,
-          kind: "bundle",
-          bytes,
-          produced_at: new Date().toISOString(),
-        }),
+        body: JSON.stringify(metadata),
       });
 
       if (!postResult.ok) {

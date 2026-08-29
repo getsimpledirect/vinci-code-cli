@@ -47,7 +47,10 @@ export function prBodyFooter({ taskId, attempt, head, baseRef, fence }) {
   return `vinci-worker: task=${taskId} attempt=${attempt ?? 1} head=${head ?? "unknown"} base=${baseRef}${generation}`;
 }
 
-async function checkFence(fence, stage) {
+// Exported so every consequential side effect in the worker asks a fence the SAME way — the
+// publisher's push and PR, and the evidence POST (evidence.mjs). One implementation means one
+// answer to "what does a throwing check mean" (fail closed) rather than two that can drift.
+export async function checkFence(fence, stage) {
   if (!fence || typeof fence.check !== "function") return { valid: true };
   try {
     const verdict = await fence.check({ stage });

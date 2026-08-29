@@ -240,10 +240,17 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
   return { branch, repoDir };
 }
 
-export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env }) {
+// `abortSignal` (optional, Wave 1B): an AbortSignal the daemon fires on LOSS OF AUTHORITY (the
+// Governor lease could not be renewed). Aborting SIGTERMs the child's process group, then SIGKILLs
+// after `abortKillGraceMs` (10 s unless VINCI_WORKER_LEASE_KILL_GRACE_MS says otherwise); the
+// result carries `aborted: <signal.reason>` so the daemon can classify the exit as lease loss
+// rather than a tripped limit. Without a signal the function is unchanged.
+// `env` (clean-room mode, #24) is unrelated and orthogonal: both are optional and compose.
+export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, abortSignal }) {
   const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
+  const abortKillGraceMs = Number(process.env.VINCI_WORKER_LEASE_KILL_GRACE_MS) || 10_000;
   mkdirSync(sessionDir, { recursive: true });
 
   return new Promise((resolveRun) => {
@@ -277,6 +284,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env }
       },
     );
     let limitTripped = null;
+    let aborted = null;
     let killTimer;
     let settled = false;
 
@@ -287,6 +295,19 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env }
       killTimer = setTimeout(() => terminateProcessGroup(child, "SIGKILL"), killGraceMs);
       killTimer.unref();
     };
+
+    const onAbort = () => {
+      if (settled || aborted) return;
+      aborted = String(abortSignal?.reason ?? "aborted");
+      terminateProcessGroup(child, "SIGTERM");
+      if (killTimer) clearTimeout(killTimer);
+      killTimer = setTimeout(() => terminateProcessGroup(child, "SIGKILL"), abortKillGraceMs);
+      killTimer.unref();
+    };
+    if (abortSignal) {
+      if (abortSignal.aborted) onAbort();
+      else abortSignal.addEventListener("abort", onAbort, { once: true });
+    }
 
     const runtimeTimer = setTimeout(() => tripLimit("max_runtime_s"), envelope.max_runtime_s * 1000);
     runtimeTimer.unref();
@@ -305,16 +326,19 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env }
       clearTimeout(runtimeTimer);
       clearInterval(pollTimer);
       if (killTimer) clearTimeout(killTimer);
+      if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
       const session = readSessionState(sessionDir, sessionId);
       if (!limitTripped && session.costUsd >= envelope.budget_usd) limitTripped = "budget_usd";
       if (!limitTripped && envelope.deadline && Date.now() >= Date.parse(envelope.deadline)) limitTripped = "deadline";
-      resolveRun({
+      const run = {
         exit_code: signalExitCode(code, signal),
         limit_tripped: limitTripped,
         cost_usd: session.costUsd,
         outcome: session.outcome,
         harness_stops: session.harnessStops,
-      });
+      };
+      if (abortSignal) run.aborted = aborted;
+      resolveRun(run);
     };
     child.once("error", () => finish(1, null));
     child.once("close", finish);
