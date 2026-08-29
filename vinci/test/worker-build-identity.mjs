@@ -7,7 +7,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, re
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
+import { FakeGovernor, WorkerTestFixture } from "./lib/worker-fixture.mjs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { buildIdentity, fetchServerBuild, findGitDir, findGitEntry, formatWorkerBuild, packageRoot, readHeadCommit, resolveGitDirs } from "../worker/build.mjs";
@@ -203,7 +203,14 @@ await test("T6 early terminal blockers (past deadline, governor refusal, envelop
 
   // (b) governor refusal (409).
   const refused = new WorkerTestFixture("build-gov-refused");
-  const governor = createHttpServer((_request, response) => {
+  // Wave 1B: the work-order lease (granted here by the fixture's FakeGovernor) is acquired before
+  // the path claim, which is what this server refuses.
+  const leases = new FakeGovernor();
+  const governor = createHttpServer((request, response) => {
+    if (request.url.startsWith("/v1/governor/leases")) {
+      leases.handle(request, response);
+      return;
+    }
     response.writeHead(409, { "content-type": "application/json" });
     response.end(JSON.stringify({ reason: "path already leased to worker:other" }));
   });
