@@ -353,41 +353,73 @@ async function postFinal(bus, message, envelope, state, evidence) {
 // Wave 1B: fetch the Governor's pinned registry for a work order and classify non-2xx answers
 // so every one of them becomes a BLOCKED refusal before a clone. The digests are recomputed by
 // materializeEnvelope against the served record; nothing here is trusted from the handoff triple.
-async function fetchWorkOrderRegistry(serverUrl, token, workOrderId) {
+//
+// F1: the body is STREAMED under the same AbortController as the connection, with a hard byte
+// cap. Content-Length is never trusted (a chunked answer has none; a lying one is just a header):
+// an oversized body aborts the read at the cap, and a stalled or trickling body is aborted by the
+// single deadline that covers headers AND body. Both are `registry_unavailable`.
+const REGISTRY_MAX_BYTES = 262_144;
+const REGISTRY_TIMEOUT_MS = 10_000;
+
+function registryTimeoutMs(env = process.env) {
+  const configured = Number(env.VINCI_WORKER_REGISTRY_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : REGISTRY_TIMEOUT_MS;
+}
+
+async function readBodyCapped(response, controller, maxBytes) {
+  if (!response.body) return "";
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of response.body) {
+    total += chunk.byteLength;
+    if (total > maxBytes) {
+      controller.abort();
+      throw new Error(`registry_unavailable: governor contracts response exceeds ${maxBytes / 1024} KiB (streamed ${total} bytes)`);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function fetchWorkOrderRegistry(serverUrl, token, workOrderId, { timeoutMs = registryTimeoutMs() } = {}) {
   const url = `${serverUrl}/v1/governor/contracts/${encodeURIComponent(workOrderId)}`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-  let response;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: controller.signal,
-    });
-  } catch (error) {
-    throw new Error(`registry_unavailable: governor contracts fetch failed: ${error?.cause?.code ?? error.message}`);
+    let response;
+    try {
+      response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+    } catch (error) {
+      throw new Error(`registry_unavailable: governor contracts fetch failed: ${error?.cause?.code ?? error.name === "AbortError" ? `timed out after ${timeoutMs} ms` : error.message}`);
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`registry_forbidden: governor contracts returned ${response.status}`);
+    }
+    if (response.status === 404) {
+      throw new Error(`work_order_not_found: no contract for ${workOrderId}`);
+    }
+    if (!response.ok) {
+      throw new Error(`registry_error: governor contracts returned ${response.status}`);
+    }
+    let text;
+    try {
+      text = await readBodyCapped(response, controller, REGISTRY_MAX_BYTES);
+    } catch (error) {
+      if (/^registry_unavailable:/.test(error.message)) throw error;
+      const why = controller.signal.aborted ? `body stalled; timed out after ${timeoutMs} ms` : (error?.cause?.code ?? error.message);
+      throw new Error(`registry_unavailable: governor contracts body read failed: ${why}`);
+    }
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new Error(`registry_malformed: governor contracts returned invalid JSON: ${error.message}`);
+    }
   } finally {
     clearTimeout(timeout);
   }
-  const contentLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(contentLength) && contentLength > 262_144) {
-    throw new Error(`registry_unavailable: governor contracts response exceeds 256 KiB`);
-  }
-  if (response.status === 401 || response.status === 403) {
-    throw new Error(`registry_forbidden: governor contracts returned ${response.status}`);
-  }
-  if (response.status === 404) {
-    throw new Error(`work_order_not_found: no contract for ${workOrderId}`);
-  }
-  if (!response.ok) {
-    throw new Error(`registry_error: governor contracts returned ${response.status}`);
-  }
-  let body;
-  try {
-    body = await response.json();
-  } catch (error) {
-    throw new Error(`registry_malformed: governor contracts returned invalid JSON: ${error.message}`);
-  }
-  return body;
 }
 
 async function processHandoff(bus, stateDir, message, governorUrl, workerId) {

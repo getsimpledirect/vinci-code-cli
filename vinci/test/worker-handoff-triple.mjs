@@ -358,6 +358,57 @@ try {
     assert.match(postsFor("m-noclasses"), /MODEL_CLASSES not configured/);
   }
 
+  // --- F1: the registry body is streamed under one deadline with a byte cap ---
+  // (a) a body that trickles past the timeout ⇒ registry_unavailable (the deadline covers the
+  //     body, not just the headers); (b) an oversized CHUNKED body (no Content-Length) ⇒
+  //     registry_unavailable at the cap. Both answers are otherwise VALID registries for a spec
+  //     the worker would run, so a daemon that waited for / swallowed the body would spawn.
+  {
+    const trickleOrder = orderFor("wo-trickle");
+    const trickleSpec = specFor(trickleOrder);
+    const bigOrder = orderFor("wo-big");
+    const bigSpec = specFor(bigOrder);
+    const pending = [];
+    f.contractRespond = (id, request, response) => {
+      if (id === "wo-trickle") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write('{"work_order":');
+        const timer = setTimeout(() => {
+          try {
+            response.end(`${JSON.stringify(trickleOrder)},"execution_specs":[${JSON.stringify(trickleSpec)}],"digests":{},"handoffs":[]}`);
+          } catch {}
+        }, 2500);
+        pending.push(timer);
+        return true;
+      }
+      if (id === "wo-big") {
+        // Chunked: several writes, never a Content-Length. ~300 KiB of padding in a top-level
+        // key the worker ignores, around a registry answer that is otherwise exactly right.
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write(`{"work_order":${JSON.stringify(bigOrder)},"execution_specs":[${JSON.stringify(bigSpec)}],"digests":{"pad":"`);
+        for (let i = 0; i < 30; i += 1) response.write("x".repeat(10_240));
+        response.end('"},"handoffs":[]}');
+        return true;
+      }
+      return false;
+    };
+    f.busMessages.push(handoff("m-trickle", triple("wo-trickle", workOrderDigest(trickleOrder), executionSpecDigest(trickleSpec))));
+    const started = Date.now();
+    let r = await run({ env: { VINCI_WORKER_REGISTRY_TIMEOUT_MS: "500" } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(Date.now() - started < 2400, "the daemon must give up at its deadline, not wait for the trickle to finish");
+    assertRefusedBeforeTransfer("m-trickle", "registry_unavailable");
+    assert.match(postsFor("m-trickle"), /timed out after 500 ms/, "the reason names the deadline");
+    for (const timer of pending) clearTimeout(timer);
+
+    f.busMessages.push(handoff("m-big", triple("wo-big", workOrderDigest(bigOrder), executionSpecDigest(bigSpec))));
+    r = await run();
+    assert.equal(r.status, 0, r.stderr);
+    assertRefusedBeforeTransfer("m-big", "registry_unavailable");
+    assert.match(postsFor("m-big"), /exceeds 256 KiB/, "the reason names the cap");
+    f.contractRespond = null;
+  }
+
   console.log("PASS worker-handoff-triple");
 } finally {
   await f.cleanup();
