@@ -1134,7 +1134,7 @@ await test('D2 fencing_generation: an integer >= 1, and nothing else — strings
 // (default 86400 s) and then answers admission `eligible: false, reason: stale_declaration`. A
 // declaration posted only at startup therefore makes any daemon alive more than a day silently
 // inadmissible for ALL work, with no warning and no recovery. The declaration is re-posted on an
-// interval (VINCI_DECLARATION_REFRESH_S, default 3600 s) on the SAME code path as the startup post.
+// interval (VINCI_DECLARATION_REFRESH_S, default DECLARATION_REFRESH_DEFAULT_S) on the SAME code path as the startup post.
 // (The guard for "the refresh timer never holds the process open" is the FIRST test in this file.)
 function declarationPosts(fixture, workerId) {
   return fixture.getPostedMessages().filter((post) => post.subject === `worker ${workerId} declaration`);

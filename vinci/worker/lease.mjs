@@ -21,7 +21,7 @@
 //
 // The two repos deploy independently, so this client assumes NEITHER the server's status codes
 // nor its rollout state: any 2xx with a well-formed body is a success, and EVERY 403 or 409 on a
-// lease route is a final decision (CONTRACT §29.1) — carried by the status, never by matching the
+// lease route is a final decision (CONTRACT §29.1, as proposed in #201) — carried by the status, never by matching the
 // reason text, which is payload.
 //
 // Fail-closed throughout: the ONLY result that lets a task proceed is a 2xx lease whose body
@@ -97,12 +97,20 @@ function isSuccess(status) {
   return typeof status === "number" && status >= 200 && status < 300;
 }
 
-// WARN-3 / D1 (#201 integration): what the Governor answers when the caller has LOST, or never
-// had, authority on a lease route. These are DECISIONS — final, never retried.
+// WARN-3 / D1 (#201 integration): what the Governor answers on a lease route when the request will
+// not be reconsidered. These are DECISIONS — final, never retried.
 //
-// CLASSIFY ON THE STATUS, NOT ON A LIST OF REASON STRINGS. CONTRACT §29.1 classes EVERY 403 on
-// the lease routes as an authority refusal, and 409 is reserved for lease state, so the status
-// alone is authoritative and the reason is payload to carry verbatim — never a predicate.
+// CLASSIFY ON THE STATUS, NOT ON A LIST OF REASON STRINGS. Per CONTRACT §29.1 (as proposed in
+// gpu-control #201 — not yet on main) NONE of the 403 reasons is a transport fault: the request
+// arrived, was understood, and was answered. That is what makes the status alone sufficient to
+// decide RETRY, and 409 is reserved for lease state.
+//
+// The status decides RETRY. It does NOT decide FAULT, and this file must not conflate the two:
+// §29.1 attributes only TWO of its enumerated 403 reasons to the caller ("lease not held by this
+// session", "session does not hold this work order") and the rest to SERVER defects — conditions
+// the caller neither caused nor can fix. A review of #201 has since found a further undocumented
+// reason ("token refused"), so the enumeration is not closed either. Carry the reason verbatim and
+// never infer blame — or completeness — from the status.
 //
 // This replaces a hand-maintained list of reason strings, and the list is why it is gone:
 //   - first pass: written in snake_case (`unknown_lease`, `not_holder`) while the server emitted
