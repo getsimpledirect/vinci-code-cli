@@ -308,6 +308,8 @@ try {
     assert.ok(!/contract=/.test(posted), "a prose handoff must not carry a contract= tag");
     const create = ghCalls().filter((a) => a[0] === "pr" && a[1] === "create");
     assert.equal(create.length, 1, "evidence: none opens no PR");
+    // F7: the prose path's evidence diff is unchanged (origin/main...HEAD).
+    assert.ok(f.getGitCalls().some((a) => a[0] === "-C" && a[2] === "diff" && a[3] === "origin/main...HEAD"), `prose evidence diff is origin/main...HEAD: ${JSON.stringify(f.getGitCalls().filter((a) => a[2] === "diff"))}`);
   }
 
   // --- prose past-deadline: the early blocker post has NO contract= tag (byte-identical prose path) ---
@@ -572,6 +574,97 @@ try {
     assert.equal(git(repoDir, "rev-parse", "feat/tracked"), trackedTip, "the tracked branch is left in place");
     assert.doesNotMatch(staleRefs(), /feat\/tracked/, "a tracked branch is never renamed aside");
     assert.equal(f.getGitCalls().filter((a) => sub(a) === "checkout").length, 0, "no checkout -B on a divergence refusal");
+  }
+
+  // --- F6/F7: output modes decide what publish does; the pinned base threads into PR + evidence ---
+  {
+    const repoDir = join(f.tempDir, "repos", "vinci-contracts");
+    const awsRecord = join(f.tempDir, "aws-calls.txt");
+    const evidenceEnv = { VINCI_EVIDENCE_URI_PREFIX: "s3://evidence-bucket/worker/", FAKE_AWS_RECORD: awsRecord };
+    const bundleOf = (taskId) => {
+      const calls = readFileSync(awsRecord, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l).argv);
+      const upload = calls.find((a) => a[0] === "s3" && a[1] === "cp" && a.at(-1).includes(`/${taskId}/`));
+      assert.ok(upload, `an evidence bundle was uploaded for ${taskId}: ${JSON.stringify(calls)}`);
+      const tgz = upload[3];
+      const listing = execFileSync("tar", ["tzf", tgz]).toString().split("\n").map((l) => l.replace(/^\.\//, "")).filter(Boolean);
+      const read = (name) => execFileSync("tar", ["xzOf", tgz, `./${name}`]).toString();
+      return { listing, read };
+    };
+    const modeRun = async (id, output, promotion, env) => {
+      const order = orderFor(`wo-${id}`);
+      f.busMessages.push(handoff(`m-${id}`, register(order, specFor(order, { output, promotion, targetBranch: `feat/${id}` }))));
+      const r = await run({ env: { FAKE_VINCI_COMMIT_FILE: `${id}.txt`, ...evidenceEnv, ...env } });
+      assert.equal(r.status, 0, r.stderr);
+      vinciRuns += 1;
+      assert.equal(f.getVinciCalls().length, vinciRuns, `${id}: the task ran`);
+      return { order, state: taskState(`m-${id}`) };
+    };
+
+    // none: no push at all, no PR, nothing extra in the bundle.
+    {
+      const { state } = await modeRun("none", "none", "none");
+      assert.equal(pushes().length, 0, `output=none must not push: ${JSON.stringify(pushes())}`);
+      assert.equal(state.publish, "none");
+      assert.equal(state.pr, null);
+      assert.equal(ghCalls().filter((a) => a[0] === "pr" && a[1] === "create" && a.includes("feat/none")).length, 0, "output=none opens no PR");
+      assert.equal(gitFails(contractBare, "rev-parse", "--verify", "--quiet", "refs/heads/feat/none"), true, "origin never receives the branch");
+      const { listing } = bundleOf("m-none");
+      assert.ok(!listing.some((n) => /\.patch$|artifacts\.json/.test(n)), `no patch/artifacts in the bundle: ${listing}`);
+    }
+    // patch: <attempt>.patch (format-patch against baseCommit) in the bundle; no push.
+    {
+      const { state } = await modeRun("patch", "patch", "none");
+      assert.equal(pushes().length, 0, `output=patch must not push: ${JSON.stringify(pushes())}`);
+      assert.equal(state.publish, "patch");
+      assert.equal(gitFails(contractBare, "rev-parse", "--verify", "--quiet", "refs/heads/feat/patch"), true, "origin never receives the branch");
+      const { listing, read } = bundleOf("m-patch");
+      assert.ok(listing.includes("1.patch"), `bundle carries <attempt>.patch: ${listing}`);
+      const patch = read("1.patch");
+      assert.match(patch, /^From [0-9a-f]{40} /m, "format-patch output");
+      assert.match(patch, /\+\+\+ b\/patch\.txt/, "the patch carries the produced file");
+      assert.doesNotMatch(patch, /second\.txt|release\.txt/, "the patch is against baseCommit, not against the tip of the base ref");
+      assert.ok(f.getGitCalls().some((a) => a[2] === "format-patch" && a.at(-1) === `${baseCommit}..HEAD`), "format-patch range is <baseCommit>..HEAD");
+    }
+    // artifact: artifacts.json lists the produced files (committed + untracked); no push.
+    {
+      const { state } = await modeRun("artifact", "artifact", "none", { FAKE_VINCI_UNTRACKED_FILE: "report.md" });
+      assert.equal(pushes().length, 0, `output=artifact must not push: ${JSON.stringify(pushes())}`);
+      assert.equal(state.publish, "artifact");
+      assert.deepEqual(state.artifacts, ["artifact.txt", "report.md"], "the record lists the produced files");
+      const { listing, read } = bundleOf("m-artifact");
+      assert.ok(listing.includes("artifacts.json"), `bundle carries artifacts.json: ${listing}`);
+      assert.deepEqual(JSON.parse(read("artifacts.json")), { base_commit: baseCommit, files: ["artifact.txt", "report.md"] });
+      assert.ok(!listing.some((n) => /\.patch$/.test(n)), "no patch in an artifact bundle");
+    }
+    // branch + promotion none: exactly one push, NO PR.
+    {
+      const { state } = await modeRun("branchonly", "branch", "none");
+      assert.equal(pushes().length, 1, `output=branch pushes exactly once: ${JSON.stringify(pushes())}`);
+      assert.equal(state.publish, "pushed");
+      assert.equal(state.pr, null, "promotion=none opens no PR");
+      assert.equal(ghCalls().filter((a) => a[0] === "pr" && a[1] === "create" && a.includes("feat/branchonly")).length, 0);
+      assert.equal(git(contractBare, "rev-parse", "refs/heads/feat/branchonly"), git(repoDir, "rev-parse", "HEAD"), "the branch reached origin");
+    }
+    // branch + pull_request: one push, a PR with --base <baseRef>; the evidence diff is <baseCommit>...HEAD.
+    {
+      const { state } = await modeRun("branchpr", "branch", "pull_request");
+      assert.equal(pushes().length, 1, `output=branch pushes exactly once: ${JSON.stringify(pushes())}`);
+      assert.equal(state.publish, "pushed");
+      assert.match(state.pr ?? "", /^https:\/\/github\.com\//, "promotion=pull_request opens a PR");
+      const create = ghCalls().find((a) => a[0] === "pr" && a[1] === "create" && a.includes("feat/branchpr"));
+      assert.ok(create, "gh pr create ran for feat/branchpr");
+      assert.equal(create[create.indexOf("--base") + 1], "release", `PR base is the pinned baseRef (never main): ${JSON.stringify(create)}`);
+      const diffs = f.getGitCalls().filter((a) => a[0] === "-C" && a[2] === "diff");
+      assert.ok(f.getGitCalls().some((a) => a[0] === "-C" && a[2] === "diff" && a[3] === `${baseCommit}...HEAD`), `evidence diff is <baseCommit>...HEAD: ${JSON.stringify(diffs)}`);
+      assert.ok(!f.getGitCalls().some((a) => a[2] === "diff" && a[3] === "origin/main...HEAD"), "the digest path never diffs against a hardcoded main");
+      const { listing, read } = bundleOf("m-branchpr");
+      assert.ok(listing.includes("git.diff"));
+      assert.match(read("git.diff"), /\+\+\+ b\/branchpr\.txt/, "the evidence diff carries the produced file");
+      assert.doesNotMatch(read("git.diff"), /second\.txt/, "the evidence diff is against baseCommit, not the tip");
+    }
+    // The happy path earlier also promoted by pull_request: its PR base was the pinned baseRef.
+    const happyCreate = ghCalls().find((a) => a[0] === "pr" && a[1] === "create" && a.includes("feat/vector-1"));
+    assert.equal(happyCreate[happyCreate.indexOf("--base") + 1], "release");
   }
 
   console.log("PASS worker-handoff-triple");

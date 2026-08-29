@@ -585,7 +585,21 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
     const head = await readHead(repository.repoDir);
     lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
-    const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId });
+    // F6/F7: the output mode decides what publish does; the pinned baseRef/baseCommit (digest
+    // path only) are the PR base and the patch/artifact base. The patch text / artifact list ride
+    // into the evidence bundle, not into the task record.
+    const { patch, artifacts, ...published } = await publish({
+      envelope: envelopeToUse,
+      limitTripped: run.limit_tripped,
+      ...repository,
+      taskId,
+      baseRef: contractFields?.base_ref ?? undefined,
+      baseCommit: contractFields?.base_commit ?? undefined,
+    });
+    if (Array.isArray(artifacts)) published.artifacts = artifacts;
+    const extraFiles = {};
+    if (typeof patch === "string") extraFiles[`${attempt.attempt}.patch`] = patch;
+    if (Array.isArray(artifacts)) extraFiles["artifacts.json"] = `${JSON.stringify({ base_commit: contractFields?.base_commit ?? null, files: artifacts }, null, 2)}\n`;
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const harnessStops = run.harness_stops ?? [];
     const intendedState = finalState({
@@ -618,11 +632,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     const resultJson = { ...planned, snapshot: "pre-terminal", committed_state: null, terminal: false };
     const session = readSessionState(join(stateDir, "sessions", taskId), attempt.sessionId);
     const sessionJsonl = session.path ? readFileSync(session.path, "utf8") : null;
+    // F7: the evidence diff is against the pinned baseCommit on the digest path (never a
+    // hardcoded main); the prose path keeps origin/main...HEAD.
     const gitDiffResult = await command("git", [
       "-C",
       repository.repoDir,
       "diff",
-      "origin/main...HEAD",
+      contractFields?.base_commit ? `${contractFields.base_commit}...HEAD` : "origin/main...HEAD",
     ], { allowFailure: true });
     const gitDiff = gitDiffResult.status === 0 ? gitDiffResult.stdout : null;
     const logTail = recentLogTail(200);
@@ -636,6 +652,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       busUrl: bus.serverUrl,
       busToken: bus.token,
       ref: envelopeToUse.ref,
+      extraFiles,
     });
 
     // Evidence was attempted and did not fully land (S3 upload or /v1/evidence POST failed):

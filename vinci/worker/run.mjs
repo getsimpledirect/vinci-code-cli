@@ -450,18 +450,52 @@ export async function readHeadBlocker(repoDir) {
   return contents.status === 0 && contents.stdout.trim() ? "BLOCKER.md at HEAD is non-empty" : null;
 }
 
-export async function publish({ envelope, repoDir, branch, taskId, limitTripped }) {
-  // A BLOCKER.md at HEAD suppresses only the PR. The branch is still pushed so the agent's
-  // work and its stated blocker are on the record (measured 2026-08-27: the first bus-dispatched
-  // task committed a decision record + a blocker and nothing reached the remote).
+// F6 output modes (ExecutionSpec `output`; prose envelopes have none and behave as `branch`):
+//   none     — nothing durable: no push, no PR, no patch. `publish: "none"`.
+//   patch    — `git format-patch --stdout <baseCommit>..HEAD`, returned as `patch` for the evidence
+//              bundle (`<attempt>.patch`); NO push. `publish: "patch"`.
+//   artifact — the produced files (tracked changes vs baseCommit + untracked files), returned as
+//              `artifacts` for the evidence bundle (artifacts.json); NO push. `publish: "artifact"`.
+//   branch   — push refs/heads/<branch>; a PR ONLY when the promotion is pull_request (prose:
+//              `evidence: pr`). `publish: "pushed" | "push_failed"`.
+// F7: the PR base and the evidence diff use the pinned baseRef / baseCommit on the digest path;
+// the prose path keeps `main` / `origin/main...HEAD`.
+// A BLOCKER.md at HEAD suppresses only the PR (never the push on the branch mode: the agent's
+// work and its stated blocker must be on the record — measured 2026-08-27) and is reported as
+// blocker_reason on every mode.
+export async function publish({ envelope, repoDir, branch, taskId, limitTripped, baseRef, baseCommit }) {
+  const mode = envelope.output ?? "branch";
   const blockerReason = await readHeadBlocker(repoDir);
+  const withBlocker = (result) => (blockerReason ? { ...result, blocker_reason: blockerReason } : result);
+  if (mode === "none") return withBlocker({ publish: "none", pr: null });
+  if (mode === "patch") {
+    const range = baseCommit ? `${baseCommit}..HEAD` : "origin/main..HEAD";
+    const patch = await command("git", ["-C", repoDir, "format-patch", "--stdout", range], { allowFailure: true });
+    if (patch.status !== 0) return withBlocker({ publish: "patch_failed", pr: null, patch: null, publish_error: patch.stderr || String(patch.status) });
+    return withBlocker({ publish: "patch", pr: null, patch: patch.stdout ? `${patch.stdout}\n` : "" });
+  }
+  if (mode === "artifact") {
+    const base = baseCommit ?? "origin/main";
+    const changed = await command("git", ["-C", repoDir, "diff", "--name-only", base], { allowFailure: true });
+    const untracked = await command("git", ["-C", repoDir, "ls-files", "--others", "--exclude-standard"], { allowFailure: true });
+    if (changed.status !== 0 || untracked.status !== 0) {
+      return withBlocker({ publish: "artifact_failed", pr: null, artifacts: null, publish_error: changed.stderr || untracked.stderr || "file listing failed" });
+    }
+    const files = [...new Set([...changed.stdout.split("\n"), ...untracked.stdout.split("\n")].filter(Boolean))].sort();
+    return withBlocker({ publish: "artifact", pr: null, artifacts: files });
+  }
+  if (mode !== "branch") throw new Error(`unknown output mode ${JSON.stringify(mode)}`);
+
   const push = await command("git", ["-C", repoDir, "push", "--set-upstream", "origin", `refs/heads/${branch}:refs/heads/${branch}`], {
     allowFailure: true,
   });
   const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
   if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
   if (limitTripped) return result;
-  if (push.status !== 0 || envelope.evidence !== "pr") return result;
+  // Digest path: a PR is PROMOTION (promotion: pull_request), never implied by evidence. Prose
+  // path: `evidence: pr` keeps its meaning.
+  const promotesPr = envelope.promotion !== undefined ? envelope.promotion === "pull_request" : envelope.evidence === "pr";
+  if (push.status !== 0 || !promotesPr) return result;
 
   const created = await command(
     "gh",
@@ -469,7 +503,7 @@ export async function publish({ envelope, repoDir, branch, taskId, limitTripped 
       "pr",
       "create",
       "--base",
-      "main",
+      baseRef ?? "main",
       "--head",
       branch,
       "--title",
