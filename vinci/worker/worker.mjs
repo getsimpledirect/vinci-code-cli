@@ -411,6 +411,27 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     return true;
   }
 
+  // #25 x #24. publishFromCache is a fork of the PRE-#25 publisher: besides the
+  // fence it lacks the remote-sha sample + --force-with-lease, the push read-back,
+  // the alreadyOnRemote idempotent retry (which IS #25's crash-window guarantee,
+  // and the clean room is the mode where that window was measured), the foreign-PR
+  // refusal and the PR-head check. So under --clean-room a governed run would
+  // publish through a path with none of the guarantees the Governor is being told
+  // are in force. Refused here, BEFORE the model is spawned, so an unsupported
+  // configuration costs nothing rather than producing a paid commit that can never
+  // be published. The fix is to route the clean room through publisher.publish()
+  // with repoDir = cacheDir (threading the cache's own pushurl/hooks refusal), not
+  // to teach this fork a fence.
+  //
+  // UNEXERCISED: `fence` is null on every path today, so no test can reach this.
+  // Wiring the fence (#26) MUST add the clean-room x fence test in the same change.
+  if (cleanRoom && fence) {
+    const reason = "clean_room_publish_unsupported: --clean-room publishes from the bare cache, which does not honour a Governor fence and lacks the idempotent-retry, lease, read-back, foreign-PR and PR-head guarantees of the standard publisher; refusing before the run rather than publishing under guarantees that are not in force";
+    lifecycle.transition("BLOCKED", { outcome: { reason } });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
+    return true;
+  }
+
   if (attempt.firstAttempt) {
     await bus.post("status", `task ${taskId} claimed`, `claimed ${taskId} attempt ${attempt.attempt}`, {
       inReplyTo: message.message_id,
@@ -489,17 +510,6 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       env: cleanRoom ? cleanRoomEnv({ provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir }) : undefined });
     const head = await readHead(repository.repoDir);
     lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
-    // MERGE RESOLUTION (#25 fence x #24 clean room). publishFromCache does NOT
-    // accept or honour a fence, so handing it one would look fenced and not be --
-    // the guard-that-never-runs shape. Until it is wired (tracked separately),
-    // refuse the combination rather than publish unfenced from the cache. `fence`
-    // is null in production today, so this changes nothing until #26 supplies one.
-    if (cleanRoom && fence) {
-      const reason = "clean_room_publish_unfenced: the clean-room cache publish path does not honour a Governor fence; refusing to publish rather than publish unfenced";
-      lifecycle.transition("BLOCKED", { outcome: { reason } });
-      await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
-      return true;
-    }
     const published = cleanRoom
       ? await publishFromCache({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId })
       : await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt, fence });
