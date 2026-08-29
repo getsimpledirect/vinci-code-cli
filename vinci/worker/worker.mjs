@@ -560,7 +560,10 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     // "it was escalated for Governor authorization" and "it was allowed to skip a confirmation"
     // must never be the same signal. `null` when the profile resolved nothing (the normal case,
     // and the ONLY case when the profile is off) so an ordinary run's post is unchanged.
-    const unattendedPolicySummary = summarizeUnattendedPolicy(run.unattended_policy ?? []);
+    const unattendedPolicySummary = summarizeUnattendedPolicy(
+      run.unattended_policy ?? [],
+      unattendedPolicy.VINCI_UNATTENDED_POLICY === "governed",
+    );
 
     // W0.2 evidence before terminal: the terminal state is written only AFTER the evidence
     // bundle was attempted. `planned` is the exact snapshot that will be committed (state +

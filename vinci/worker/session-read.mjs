@@ -76,8 +76,15 @@ function unattendedPolicyDecision(entry) {
  * "was allowed to skip a confirmation" are three different events and this is the shape that keeps
  * them distinguishable all the way into the bus post.
  */
-export function summarizeUnattendedPolicy(decisions) {
-  if (!Array.isArray(decisions) || decisions.length === 0) return null;
+export function summarizeUnattendedPolicy(decisions, profileActive = false) {
+  const list = Array.isArray(decisions) ? decisions : [];
+  // `profileActive` is what makes "profile off", "profile on and nothing fired", and "profile on and
+  // the records were lost" three DIFFERENT posts. Keying the policy fields on decisions alone made
+  // the first two identical and silently absorbed the third (adversarial review, 2026-08-29): a run
+  // whose appendEntry failed reported no policy line at all. Whenever the profile was active the
+  // post carries the counts, even when all three are zero.
+  if (!profileActive && list.length === 0) return null;
+  decisions = list;
   const summary = { blocked: 0, escalated: 0, proceeded: 0, sites: { blocked: [], escalated: [], proceeded: [] } };
   for (const decision of decisions) {
     // Explicit mapping with no default: an outcome this daemon does not recognise is DROPPED, never
