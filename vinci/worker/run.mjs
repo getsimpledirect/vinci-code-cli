@@ -283,10 +283,16 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
   return { branch, repoDir };
 }
 
-export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
+// `abortSignal` (optional, Wave 1B): an AbortSignal the daemon fires on LOSS OF AUTHORITY (the
+// Governor lease could not be renewed). Aborting SIGTERMs the child's process group, then SIGKILLs
+// after `abortKillGraceMs` (10 s unless VINCI_WORKER_LEASE_KILL_GRACE_MS says otherwise); the
+// result carries `aborted: <signal.reason>` so the daemon can classify the exit as lease loss
+// rather than a tripped limit. Without a signal the function is unchanged.
+export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, abortSignal }) {
   const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
+  const abortKillGraceMs = Number(process.env.VINCI_WORKER_LEASE_KILL_GRACE_MS) || 10_000;
   mkdirSync(sessionDir, { recursive: true });
 
   return new Promise((resolveRun) => {
@@ -319,6 +325,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
       },
     );
     let limitTripped = null;
+    let aborted = null;
     let killTimer;
     let settled = false;
 
@@ -329,6 +336,19 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
       killTimer = setTimeout(() => terminateProcessGroup(child, "SIGKILL"), killGraceMs);
       killTimer.unref();
     };
+
+    const onAbort = () => {
+      if (settled || aborted) return;
+      aborted = String(abortSignal?.reason ?? "aborted");
+      terminateProcessGroup(child, "SIGTERM");
+      if (killTimer) clearTimeout(killTimer);
+      killTimer = setTimeout(() => terminateProcessGroup(child, "SIGKILL"), abortKillGraceMs);
+      killTimer.unref();
+    };
+    if (abortSignal) {
+      if (abortSignal.aborted) onAbort();
+      else abortSignal.addEventListener("abort", onAbort, { once: true });
+    }
 
     const runtimeTimer = setTimeout(() => tripLimit("max_runtime_s"), envelope.max_runtime_s * 1000);
     runtimeTimer.unref();
@@ -347,16 +367,19 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
       clearTimeout(runtimeTimer);
       clearInterval(pollTimer);
       if (killTimer) clearTimeout(killTimer);
+      if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
       const session = readSessionState(sessionDir, sessionId);
       if (!limitTripped && session.costUsd >= envelope.budget_usd) limitTripped = "budget_usd";
       if (!limitTripped && envelope.deadline && Date.now() >= Date.parse(envelope.deadline)) limitTripped = "deadline";
-      resolveRun({
+      const run = {
         exit_code: signalExitCode(code, signal),
         limit_tripped: limitTripped,
         cost_usd: session.costUsd,
         outcome: session.outcome,
         harness_stops: session.harnessStops,
-      });
+      };
+      if (abortSignal) run.aborted = aborted;
+      resolveRun(run);
     };
     child.once("error", () => finish(1, null));
     child.once("close", finish);
@@ -377,11 +400,21 @@ export async function readHeadBlocker(repoDir) {
   return contents.status === 0 && contents.stdout.trim() ? "BLOCKER.md at HEAD is non-empty" : null;
 }
 
-export async function publish({ envelope, repoDir, branch, taskId, limitTripped }) {
+// `fence` (optional, Wave 1B L3): `async () => ({ valid, reason })`, the Governor lease check
+// with the bus token. It is asked IMMEDIATELY before each consequential side effect — the push,
+// then the PR — and `valid: false` skips that side effect and records `fenced_out: <reason>`; a
+// stale generation never pushes or opens a PR. `fencingGeneration` (optional) is printed in the
+// PR body footer so the PR names the lease generation it was opened under. Without either
+// option the function is unchanged.
+export async function publish({ envelope, repoDir, branch, taskId, limitTripped, fence, fencingGeneration }) {
   // A BLOCKER.md at HEAD suppresses only the PR. The branch is still pushed so the agent's
   // work and its stated blocker are on the record (measured 2026-08-27: the first bus-dispatched
   // task committed a decision record + a blocker and nothing reached the remote).
   const blockerReason = await readHeadBlocker(repoDir);
+  if (fence) {
+    const gate = await fence("push");
+    if (!gate?.valid) return { publish: "fenced_out", pr: null, fenced_out: `fenced_out:${gate?.reason ?? "invalid"}` };
+  }
   const push = await command("git", ["-C", repoDir, "push", "--set-upstream", "origin", `refs/heads/${branch}:refs/heads/${branch}`], {
     allowFailure: true,
   });
@@ -389,6 +422,13 @@ export async function publish({ envelope, repoDir, branch, taskId, limitTripped 
   if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
   if (limitTripped) return result;
   if (push.status !== 0 || envelope.evidence !== "pr") return result;
+  if (fence) {
+    const gate = await fence("pr");
+    if (!gate?.valid) return { ...result, fenced_out: `fenced_out:${gate?.reason ?? "invalid"}` };
+  }
+  const body = fencingGeneration === undefined
+    ? `Unattended Vinci worker result for task ${taskId}.`
+    : `Unattended Vinci worker result for task ${taskId}.\n\n---\nfencing_generation: ${fencingGeneration}`;
 
   const created = await command(
     "gh",
@@ -402,7 +442,7 @@ export async function publish({ envelope, repoDir, branch, taskId, limitTripped 
       "--title",
       `Worker task ${taskId}`,
       "--body",
-      `Unattended Vinci worker result for task ${taskId}.`,
+      body,
     ],
     { cwd: repoDir, allowFailure: true },
   );

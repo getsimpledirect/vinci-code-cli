@@ -66,6 +66,8 @@ export async function uploadEvidence({
   busUrl,
   busToken,
   ref,
+  fence,
+  fencingGeneration,
 }) {
   if (!uriPrefix) return null;
 
@@ -106,20 +108,31 @@ export async function uploadEvidence({
     // (job_/exp_/bk_) are attached as refs; any other ref (or none) skips the
     // bus entirely — the server would reject the post with 422.
     if (busUrl && busToken && isLedgerRef(ref)) {
+      // Wave 1B L3: the evidence POST is a consequential side effect — ask the lease fence first.
+      // A stale generation records `fenced_out:<reason>` and never reaches the ledger.
+      if (fence) {
+        const gate = await fence("evidence");
+        if (!gate?.valid) {
+          const fencedOut = `fenced_out:${gate?.reason ?? "invalid"}`;
+          return { success: false, uploaded: true, uri: s3Uri, sha256, bytes, fenced_out: fencedOut, error: fencedOut };
+        }
+      }
+      const metadata = {
+        job_ref: ref,
+        uri: s3Uri,
+        sha256,
+        kind: "bundle",
+        bytes,
+        produced_at: new Date().toISOString(),
+      };
+      if (fencingGeneration !== undefined) metadata.fencing_generation = fencingGeneration;
       const postResult = await fetch(`${busUrl}/v1/evidence`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${busToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          job_ref: ref,
-          uri: s3Uri,
-          sha256,
-          kind: "bundle",
-          bytes,
-          produced_at: new Date().toISOString(),
-        }),
+        body: JSON.stringify(metadata),
       });
 
       if (!postResult.ok) {

@@ -13,6 +13,175 @@ function runGit(args, cwd) {
   return result.stdout.trim();
 }
 
+function readBody(request) {
+  return new Promise((resolveBody) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      try {
+        resolveBody(body ? JSON.parse(body) : null);
+      } catch {
+        resolveBody({ __unparsable: body });
+      }
+    });
+  });
+}
+
+// Wave 1B: a fake Governor with the lease endpoints (acquire / renew / release / check) plus the
+// Stage 2 claim-paths route, with an injectable clock. Everything a test wants to script is a
+// field:
+//   ttlS            ttl_s served on acquire and renew (seconds; small values make renews frequent)
+//   now             clock (ms) used for expires_at — `() => Date.now()` by default
+//   mode            "grant" | "leased" | "error" | "hang"  (acquire behaviour)
+//   holder          { holder_attempt_id, expires_at } served on mode "leased"
+//   renewOkCount    number of renews to grant before renewFailure is served (Infinity = never)
+//   renewFailure    { status: 409, reason: "stale_generation" } | { status: 500 } | "drop" (socket destroyed)
+//   check           true | false | (body, effectIndex) => ({ valid, reason })
+//   releaseStatus   HTTP status for release (200)
+//   claim           body served (200) on /v1/governor/claim-paths, or { status, body }
+//   epoch           value stamped on every response
+// `hits` records every request `{ method, url, auth, body }`; `renews`, `checks`, `releases`
+// and `acquires` are the parsed bodies per route in arrival order.
+export class FakeGovernor {
+  constructor(options = {}) {
+    this.ttlS = options.ttlS ?? 60;
+    this.now = options.now ?? (() => Date.now());
+    this.mode = options.mode ?? "grant";
+    this.holder = options.holder ?? { holder_attempt_id: "other-worker/7", expires_at: "2099-01-01T00:00:00.000Z" };
+    this.renewOkCount = options.renewOkCount ?? Infinity;
+    this.renewFailure = options.renewFailure ?? { status: 409, reason: "stale_generation" };
+    this.check = options.check ?? true;
+    this.releaseStatus = options.releaseStatus ?? 200;
+    this.claim = options.claim ?? { paths: ["."], ttl: 3600 };
+    this.epoch = options.epoch ?? 1;
+    this.leaseToken = options.leaseToken ?? "Session gov-token";
+    this.hits = [];
+    this.acquires = [];
+    this.renews = [];
+    this.checks = [];
+    this.releases = [];
+    this.leases = new Map();
+    this.nextGeneration = 100;
+    this.server = null;
+    this.url = null;
+  }
+
+  expiresAt() {
+    return new Date(this.now() + this.ttlS * 1000).toISOString();
+  }
+
+  json(response, status, body) {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(JSON.stringify({ epoch: this.epoch, ...body }));
+  }
+
+  // Returns true when the request was one of ours (and has been answered).
+  async handle(request, response) {
+    const url = new URL(request.url, "http://governor.invalid");
+    if (!url.pathname.startsWith("/v1/governor/")) return false;
+    const body = await readBody(request);
+    this.hits.push({ method: request.method, url: request.url, auth: request.headers.authorization, body, at: Date.now() });
+    if (url.pathname === "/v1/governor/claim-paths") {
+      if (this.claim.status) this.json(response, this.claim.status, this.claim.body ?? {});
+      else this.json(response, 200, this.claim);
+      return true;
+    }
+    if (url.pathname === "/v1/governor/leases" && request.method === "POST") {
+      this.acquires.push(body);
+      if (this.mode === "hang") return true; // never answers; the caller's socket stays open
+      if (request.headers.authorization !== this.leaseToken) {
+        this.json(response, 401, { reason: "bad session token" });
+        return true;
+      }
+      if (this.mode === "leased") {
+        this.json(response, 409, { reason: "leased", ...this.holder });
+        return true;
+      }
+      if (this.mode === "error") {
+        this.json(response, 500, { reason: "governor exploded" });
+        return true;
+      }
+      const lease = { lease_id: `lease-${this.leases.size + 1}`, fencing_generation: this.nextGeneration++, ttl_s: this.ttlS, expires_at: this.expiresAt(), renews: 0, released: null };
+      this.leases.set(lease.lease_id, lease);
+      this.json(response, 200, { lease_id: lease.lease_id, fencing_generation: lease.fencing_generation, expires_at: lease.expires_at, ttl_s: lease.ttl_s });
+      return true;
+    }
+    const match = /^\/v1\/governor\/leases\/([^/]+)\/(renew|release|check)$/.exec(url.pathname);
+    if (!match || request.method !== "POST") {
+      this.json(response, 404, { reason: "no such route" });
+      return true;
+    }
+    const [, leaseId, action] = match;
+    const lease = this.leases.get(decodeURIComponent(leaseId));
+    if (action === "check") {
+      this.checks.push({ lease_id: leaseId, ...body, auth: request.headers.authorization });
+      if (!request.headers.authorization?.startsWith("Bearer ")) {
+        this.json(response, 401, { reason: "check needs the bus token" });
+        return true;
+      }
+      const verdict = typeof this.check === "function" ? this.check(body, this.checks.length - 1) : { valid: Boolean(this.check), reason: this.check ? "ok" : "revoked" };
+      const stale = !lease || lease.fencing_generation !== body?.fencing_generation;
+      this.json(response, 200, stale ? { valid: false, reason: "stale_generation" } : verdict);
+      return true;
+    }
+    if (request.headers.authorization !== this.leaseToken) {
+      this.json(response, 401, { reason: "bad session token" });
+      return true;
+    }
+    if (action === "renew") {
+      this.renews.push({ lease_id: leaseId, ...body });
+      if (!lease) {
+        this.json(response, 404, { reason: "unknown lease" });
+        return true;
+      }
+      if (lease.fencing_generation !== body?.fencing_generation) {
+        this.json(response, 409, { reason: "stale_generation" });
+        return true;
+      }
+      if (lease.renews >= this.renewOkCount) {
+        if (this.renewFailure === "drop") {
+          request.socket.destroy();
+          return true;
+        }
+        this.json(response, this.renewFailure.status ?? 409, { reason: this.renewFailure.reason ?? "revoked" });
+        return true;
+      }
+      lease.renews += 1;
+      lease.expires_at = this.expiresAt();
+      this.json(response, 200, { expires_at: lease.expires_at, ttl_s: lease.ttl_s });
+      return true;
+    }
+    this.releases.push({ lease_id: leaseId, ...body });
+    if (lease) lease.released = body?.outcome ?? null;
+    this.json(response, this.releaseStatus, {});
+    return true;
+  }
+
+  async start() {
+    this.server = createServer((request, response) => {
+      this.handle(request, response).then((handled) => {
+        if (!handled) {
+          response.writeHead(404);
+          response.end();
+        }
+      });
+    });
+    await new Promise((resolveListen) => this.server.listen(0, "127.0.0.1", resolveListen));
+    this.url = `http://127.0.0.1:${this.server.address().port}`;
+    return this.url;
+  }
+
+  async close() {
+    if (!this.server) return;
+    this.server.closeAllConnections?.();
+    await new Promise((resolveClose) => this.server.close(resolveClose));
+    this.server = null;
+  }
+}
+
 export class WorkerTestFixture {
   constructor(testName) {
     this.testName = testName;

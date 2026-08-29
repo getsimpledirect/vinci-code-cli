@@ -15,6 +15,7 @@ import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
+import { LeaseClient, buildDeclaration, declarationBody, declarationDigest, leaseSubject, releaseOutcome, startHeartbeat } from "./lease.mjs";
 import { readSessionState } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
@@ -43,6 +44,12 @@ let vinciBinary = { error: "not checked" };
 //   - the file is written only AFTER the post succeeded, so a failed post is retried before the
 //     next task (or at the next start) instead of being lost.
 const ANNOUNCED_BINARY_FILE = "vinci-binary.json";
+
+// Wave 1B D1: the capability declaration this daemon posts once at startup (behind `--governor`)
+// and whose digest every governed lease request and task record carries. Computed once; null
+// until `--governor` is configured.
+let capabilityDeclaration = null;
+let capabilityDeclarationDigest = null;
 
 function readAnnouncedBinary(stateDir) {
   try {
@@ -343,7 +350,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
   }
 }
 
-async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
+async function processHandoff(bus, stateDir, message, governorUrl, workerId, subjectOf = leaseSubject) {
   const taskId = message.message_id;
   try {
     assertTaskId(taskId);
@@ -389,6 +396,32 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     });
   }
 
+  // Wave 1B: the lease held for this attempt (null until acquired), its heartbeat, and the
+  // loss-of-authority latch. `release` runs on EVERY terminal path (L4); it never throws.
+  let leaseClient = null;
+  let lease = null;
+  let heartbeat = null;
+  let authorityLost = null;
+  // Set when a fence said `valid: false` (the generation is stale for the Governor even though
+  // the heartbeat had not yet noticed): the release outcome is then `abandoned`, like a loss.
+  let fencedOutReason = null;
+  const abortController = new AbortController();
+  const releaseLease = async (state) => {
+    if (!lease || !leaseClient) return;
+    if (heartbeat) heartbeat.stop();
+    const held = lease;
+    lease = null;
+    await leaseClient.release(held, releaseOutcome(state, { authorityLost: Boolean(authorityLost || fencedOutReason) }));
+  };
+  // L3: the publisher's fence. Authority already lost ⇒ invalid without asking; otherwise the
+  // Governor's `check` with the bus token. Every answer is recorded on the task.
+  const fence = async (effect) => {
+    if (authorityLost) return { valid: false, reason: authorityLost };
+    const verdict = await leaseClient.check(lease);
+    lifecycle.record({ lease: { ...lifecycle.snapshot().lease, checks: [...(lifecycle.snapshot().lease?.checks ?? []), { effect, valid: verdict.valid, reason: verdict.reason ?? null, at: new Date().toISOString() }] } });
+    return verdict;
+  };
+
   try {
     // Stage 2: Governor lease (if configured). FAIL-CLOSED (W0.1): with a Governor URL set,
     // the task proceeds to clone/spawn ONLY on a granted lease. A missing token, an
@@ -424,10 +457,55 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
       lifecycle.record({
         lease: { ...claimResult, effective_max_runtime_s: envelopeToUse.max_runtime_s },
+        capability_declaration_digest: capabilityDeclarationDigest,
+      });
+
+      // Wave 1B L1: the work-order lease, right after the path claim and BEFORE clone. A 409
+      // "leased" is a Governor decision that the task is not ours (BLOCKED, not a failure);
+      // anything else that is not a usable lease is `lease_unavailable` (fail closed).
+      leaseClient = new LeaseClient({ governorUrl, token: governorToken, busToken: bus.token });
+      const acquired = await leaseClient.acquire({
+        workOrderId: subjectOf({ id: taskId, envelope: envelopeToUse }),
+        attemptId: `${taskId}/${attempt.attempt}`,
+        workerBuildDigest: workerBuild.commit ?? formatWorkerBuild(workerBuild),
+        adapterVersion: version,
+        capabilityDeclarationDigest,
+      });
+      if (!acquired.success) {
+        const reason = acquired.leased ? acquired.reason : `lease_unavailable: ${acquired.reason}`;
+        const governor = acquired.leased ? "leased" : "unavailable";
+        const label = acquired.leased ? "Governor lease held elsewhere" : "Governor lease unavailable";
+        lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
+        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+          inReplyTo: message.message_id,
+        });
+        return true;
+      }
+      lease = acquired.lease;
+      lifecycle.record({ lease: { ...lifecycle.snapshot().lease, ...lease } });
+      // L2: heartbeat every ttl_s/3 from now (the clone counts) until release. The first
+      // failed renew is LOSS OF AUTHORITY: latch it, abort the child (SIGTERM, SIGKILL after
+      // the grace), and let the run's normal exit path classify the task as BLOCKED lease_lost.
+      heartbeat = startHeartbeat({
+        client: leaseClient,
+        lease,
+        onLoss: (lossReason, detail) => {
+          authorityLost = `lease_lost:${lossReason}`;
+          process.stderr.write(`vinci worker: task ${taskId} lost its lease (${lossReason}${detail ? `: ${detail}` : ""}); terminating the run\n`);
+          abortController.abort(authorityLost);
+        },
       });
     }
 
     const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
+    if (authorityLost) {
+      // The lease was lost while cloning: nothing is spawned. BLOCKED lease_lost, no publish,
+      // release `abandoned` — a resumed attempt re-acquires.
+      lifecycle.transition("BLOCKED", { outcome: { reason: authorityLost }, publish: "skipped", pr: null, fenced_out: authorityLost, lease: { ...lifecycle.snapshot().lease, ...lease } });
+      await releaseLease("BLOCKED");
+      await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null);
+      return true;
+    }
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
     // which can take long enough for an operator update to land — and stamp the task with it.
     // runVinci spawns with VINCI_UPDATE_DISABLED=1, so nothing can change between this probe
@@ -438,20 +516,28 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     lifecycle.transition("RUNNING");
     const run = await runVinci({ envelope: envelopeToUse,
       stateDir,
-      taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
+      taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId, ...(lease ? { abortSignal: abortController.signal } : {}) });
     const head = await readHead(repository.repoDir);
+    if (lease) lifecycle.record({ lease: { ...lifecycle.snapshot().lease, ...lease } });
     lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
-    const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId });
-    const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
+    // Loss of authority (L2): NO publish at all — not even the branch push. The record says why.
+    const published = authorityLost
+      ? { publish: "skipped", pr: null, fenced_out: authorityLost }
+      : await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, ...(lease ? { fence, fencingGeneration: lease.fencing_generation } : {}) });
+    const fencedOut = authorityLost ?? published.fenced_out ?? null;
+    if (!authorityLost && published.fenced_out) fencedOutReason = published.fenced_out;
+    const outcome = fencedOut ? { reason: fencedOut } : published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const harnessStops = run.harness_stops ?? [];
-    const intendedState = finalState({
-      exitCode: run.exit_code,
-      limitTripped: run.limit_tripped,
-      outcome: run.outcome,
-      blocker: Boolean(published.blocker_reason),
-      pr: published.pr,
-      harnessStops,
-    });
+    const intendedState = fencedOut
+      ? "BLOCKED"
+      : finalState({
+          exitCode: run.exit_code,
+          limitTripped: run.limit_tripped,
+          outcome: run.outcome,
+          blocker: Boolean(published.blocker_reason),
+          pr: published.pr,
+          harnessStops,
+        });
     // Record the instrument stop on the task whenever one occurred — even when exit/limit outranked it
     // — so the snapshot (and the evidence bundle's result.json) carry the machine-observed reason next
     // to the model's narrative and the soak ledger can see that a latch also fired on a FAILED run.
@@ -472,6 +558,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     // the committed state lives only in the task file, which also records
     // `evidence_result_state` so a downgrade after upload is machine-detectable.
     const resultJson = { ...planned, snapshot: "pre-terminal", committed_state: null, terminal: false };
+    if (lease) resultJson.authority = authorityLost ? "lost" : "held";
     const session = readSessionState(join(stateDir, "sessions", taskId), attempt.sessionId);
     const sessionJsonl = session.path ? readFileSync(session.path, "utf8") : null;
     const gitDiffResult = await command("git", [
@@ -492,6 +579,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       busUrl: bus.serverUrl,
       busToken: bus.token,
       ref: envelopeToUse.ref,
+      ...(lease ? { fence, fencingGeneration: lease.fencing_generation } : {}),
     });
 
     // Evidence was attempted and did not fully land (S3 upload or /v1/evidence POST failed):
@@ -501,16 +589,24 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     const state = evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
     lifecycle.transition(state, {
       ...planned,
+      ...(lease ? { lease: { ...lifecycle.snapshot().lease, ...lease } } : {}),
       evidence_error: evidenceError,
       // State the uploaded result.json names as intended; differs from `state` after a downgrade.
       evidence_result_state: evidenceResult ? intendedState : null,
     });
+    // L4: release with the committed state's outcome, BEFORE the final post so the lease is not
+    // held across a bus retry. A release failure is logged; the state above is already final.
+    await releaseLease(state);
     await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult);
   } catch (error) {
     // A terminal state is immutable: if the failure happened after it was committed (e.g. the
     // final bus post), surface the error to the daemon loop instead of rewriting the record.
-    if (lifecycle.isTerminal()) throw error;
+    if (lifecycle.isTerminal()) {
+      await releaseLease(lifecycle.snapshot().state);
+      throw error;
+    }
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
+    await releaseLease("FAILED");
     await postFinal(bus, message, envelope, lifecycle.snapshot(), null);
   }
   return true;
@@ -542,6 +638,18 @@ async function main() {
     // A change since the last announced binary (e.g. an update while the daemon was down, or a
     // change whose post failed before a restart) is announced here, once.
     await announceBinaryChange(bus, options.stateDir, options.id);
+    // Wave 1B D1 (behind --governor): declare what this daemon actually does, once, right after
+    // `online`. The body is the canonical JSON of the WorkerDeclaration; its sha256 is the
+    // capability_declaration_digest every governed lease request and task record carries.
+    if (options.governor) {
+      capabilityDeclaration = buildDeclaration({
+        workerId: options.id,
+        workerVersion: vinciBinary?.version ?? version,
+        adapterVersion: version,
+      });
+      capabilityDeclarationDigest = declarationDigest(capabilityDeclaration);
+      await bus.post("status", `worker ${options.id} declaration`, declarationBody(capabilityDeclaration));
+    }
     do {
       let cursor = loadCursor(options.stateDir, options.id);
       const messages = await bus.poll(options.id, cursor);

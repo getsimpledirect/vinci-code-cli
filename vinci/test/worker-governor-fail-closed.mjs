@@ -7,7 +7,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WorkerTestFixture } from './lib/worker-fixture.mjs';
+import { FakeGovernor, WorkerTestFixture } from './lib/worker-fixture.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const TOOLS = join(ROOT, 'vinci/test/fixtures/worker-test-tools');
@@ -33,10 +33,18 @@ function handoff(id, workerId, body) {
 }
 
 // A fake Governor whose /v1/governor/claim-paths answer is scripted per test. `respond` gets
-// (request, response) and must end the response; every hit is recorded.
+// (request, response) and must end the response; every claim-paths hit is recorded in `hits`.
+// Wave 1B: with `--governor` set the work-order lease is mandatory, so the lease routes
+// (/v1/governor/leases…) are served by the fixture's FakeGovernor (always granting); those hits
+// are NOT counted in `hits` — this file tests the path claim, worker-lease-loop.mjs the lease.
 async function startGovernor(respond) {
   const hits = [];
+  const leases = new FakeGovernor();
   const server = createServer((request, response) => {
+    if (request.url.startsWith('/v1/governor/leases')) {
+      leases.handle(request, response);
+      return;
+    }
     hits.push({ method: request.method, url: request.url, auth: request.headers.authorization });
     respond(request, response);
   });
@@ -44,6 +52,7 @@ async function startGovernor(respond) {
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     hits,
+    leases,
     close: () => new Promise((r) => server.close(r)),
   };
 }
