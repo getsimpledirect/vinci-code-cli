@@ -143,11 +143,53 @@ const WORK_ORDER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 // class name the table does not know is BLOCKED (`unknown_model_class`), never passed through
 // as a model id. The class names are the managed-provider model ids (`vinci` provider: `forte`,
 // `fortissimo`; `auto` is deliberately absent — a contract names a class, not "whatever the
-// account resolves to"). A spec `provider` pin overrides the provider, never the model id.
-export const MODEL_CLASSES = Object.freeze({
+// account resolves to").
+//
+// B2: a spec `provider` pin must equal the configured provider for the class (else
+// `provider_mismatch`); it no longer overrides the class's provider. The table itself is
+// operator runtime config (VINCI_WORKER_MODEL_CLASSES); DEFAULT_MODEL_CLASSES is the fallback
+// used for prose handoffs only. When the operator has NOT configured the table
+// (`loadModelClasses().configured === false`), any digest-form materialization refuses with
+// `unknown_model_class` "MODEL_CLASSES not configured".
+export const DEFAULT_MODEL_CLASSES = Object.freeze({
   forte: Object.freeze({ provider: "vinci", model: "forte" }),
   fortissimo: Object.freeze({ provider: "vinci", model: "fortissimo" }),
 });
+
+export const MODEL_CLASSES = DEFAULT_MODEL_CLASSES;
+
+// B3: the closed set of capabilities this worker advertises. Wave 1B ships with an EMPTY set —
+// a spec may request none, and any requested capability is BLOCKED (`capability_unsupported`)
+// rather than silently unfulfilled. Grow this list only when the worker actually provides one.
+export const SUPPORTED_CAPABILITIES = Object.freeze([]);
+
+// B2: read the operator model-class table from VINCI_WORKER_MODEL_CLASSES. The value is a JSON
+// object `{ <class>: { provider, model } }`, or `@<path>` naming a JSON file (parsed
+// identically; `@/foo.json` reads `/foo.json`). Unset => `{ configured: false, table:
+// DEFAULT_MODEL_CLASSES }` (prose-only: every digest handoff refuses).
+export function loadModelClasses(env = process.env) {
+  const raw = env.VINCI_WORKER_MODEL_CLASSES;
+  if (raw === undefined || raw === "") return { configured: false, table: DEFAULT_MODEL_CLASSES };
+  const source = raw.startsWith("@") ? raw.slice(1) : null;
+  let value;
+  try {
+    const text = source !== null ? readFileSync(source, "utf8") : raw;
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`invalid VINCI_WORKER_MODEL_CLASSES: ${error.message}`);
+  }
+  if (!isRecord(value) || Object.keys(value).length === 0) {
+    throw new Error("invalid VINCI_WORKER_MODEL_CLASSES: expected a non-empty JSON object of <class> -> { provider, model }");
+  }
+  const table = {};
+  for (const [name, entry] of Object.entries(value)) {
+    if (!isRecord(entry) || typeof entry.provider !== "string" || typeof entry.model !== "string") {
+      throw new Error(`invalid VINCI_WORKER_MODEL_CLASSES: class ${name} must be { provider, model }`);
+    }
+    table[name] = Object.freeze({ provider: entry.provider, model: entry.model });
+  }
+  return { configured: true, table: Object.freeze(table) };
+}
 
 export function isDigestHandoff(body) {
   return typeof body === "string" && body.trimStart().startsWith("{");
@@ -212,8 +254,15 @@ function candidateSpecs(registry) {
 //   4. materialization: host, model class, branch, bounds   (per-field reasons)
 // A digest is recomputed from the record AS SERVED (canonical bytes of the JSON the registry
 // returned); nothing from the triple is trusted until the record it names reproduces it.
-export function materializeEnvelope(triple, registry) {
+// B2/B3: `opts` carries the runtime model-class table. `materializeEnvelope` stays PURE — it
+// never reads env — so refusal reasons can be pinned by tests without a bus. processHandoff
+// passes the table loaded from VINCI_WORKER_MODEL_CLASSES (see loadModelClasses):
+//   opts.modelClasses           the class -> { provider, model } table (default DEFAULT_MODEL_CLASSES)
+//   opts.modelClassesConfigured whether the operator configured the table; false => prose-only.
+export function materializeEnvelope(triple, registry, opts = {}) {
   if (!isRecord(registry)) refuse("registry_malformed", "registry answer is not an object");
+  const modelClasses = opts.modelClasses ?? DEFAULT_MODEL_CLASSES;
+  const modelClassesConfigured = opts.modelClassesConfigured ?? true;
   const order = registry.work_order;
   if (!isRecord(order)) refuse("registry_malformed", "registry answer carries no work_order");
 
@@ -252,13 +301,21 @@ export function materializeEnvelope(triple, registry) {
   if (typeof repository.owner !== "string" || typeof repository.name !== "string" || !REPO.test(repo)) {
     refuse("invalid_spec_field", "repository owner/name must form org/name");
   }
-  if (typeof spec.modelClass !== "string" || !Object.hasOwn(MODEL_CLASSES, spec.modelClass)) {
-    refuse("unknown_model_class", `modelClass ${JSON.stringify(spec.modelClass)} is not in the worker's class table (${Object.keys(MODEL_CLASSES).join(", ")})`);
+  // B2: prose-only mode (operator never configured a table) refuses every digest handoff.
+  if (modelClassesConfigured !== true) {
+    refuse("unknown_model_class", "MODEL_CLASSES not configured");
   }
-  const modelClass = MODEL_CLASSES[spec.modelClass];
+  if (typeof spec.modelClass !== "string" || !Object.hasOwn(modelClasses, spec.modelClass)) {
+    refuse("unknown_model_class", `modelClass ${JSON.stringify(spec.modelClass)} is not in the worker's class table (${Object.keys(modelClasses).join(", ")})`);
+  }
+  const modelClass = modelClasses[spec.modelClass];
   let provider = modelClass.provider;
   if (spec.provider !== undefined) {
     if (typeof spec.provider !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(spec.provider)) refuse("invalid_spec_field", "provider is an identifier");
+    // B2: an explicit provider pin must MATCH the configured provider for the class.
+    if (spec.provider !== modelClass.provider) {
+      refuse("provider_mismatch", `spec provider ${JSON.stringify(spec.provider)} does not match configured provider ${JSON.stringify(modelClass.provider)} for modelClass ${JSON.stringify(spec.modelClass)}`);
+    }
     provider = spec.provider;
   }
   try {
@@ -277,6 +334,24 @@ export function materializeEnvelope(triple, registry) {
   if (spec.output !== "branch" && spec.output !== "patch" && spec.output !== "artifact" && spec.output !== "none") refuse("invalid_spec_field", "output is one of branch, patch, artifact, none");
   if (spec.promotion !== "pull_request" && spec.promotion !== "none") refuse("invalid_spec_field", "promotion is one of pull_request, none");
   if (!isRecord(spec.evidence) || typeof spec.evidence.required !== "boolean") refuse("invalid_spec_field", "evidence.required is boolean");
+  // B3: enforce the remaining spec fields before anything is cloned or spawned.
+  // tools (list): non-empty, all tool-name strings; passed to vinci as --tools <csv>.
+  if (!Array.isArray(spec.tools)) refuse("invalid_spec_field", "tools is a list of tool names");
+  if (spec.tools.length === 0) refuse("no_tools", "tools is empty; at least one tool is required");
+  if (!spec.tools.every((t) => typeof t === "string" && t.length > 0)) refuse("invalid_spec_field", "tools entries are non-empty tool names");
+  const tools = [...spec.tools];
+  // inputArtifacts (list): recorded as-is (no fetch in Wave 1B scope).
+  if (spec.inputArtifacts !== undefined && !Array.isArray(spec.inputArtifacts)) refuse("invalid_spec_field", "inputArtifacts is a list");
+  const inputArtifacts = Array.isArray(spec.inputArtifacts) ? spec.inputArtifacts : [];
+  // requiredCapabilities (list): validated against SUPPORTED_CAPABILITIES (an empty set in
+  // Wave 1B) — any capability we do not advertise BLOCKs the task.
+  if (spec.requiredCapabilities !== undefined && !Array.isArray(spec.requiredCapabilities)) refuse("invalid_spec_field", "requiredCapabilities is a list");
+  const requiredCapabilities = Array.isArray(spec.requiredCapabilities) ? spec.requiredCapabilities : [];
+  for (const capability of requiredCapabilities) {
+    if (!SUPPORTED_CAPABILITIES.includes(capability)) {
+      refuse("capability_unsupported", `requiredCapability ${JSON.stringify(capability)} is not supported by this worker (supported: ${SUPPORTED_CAPABILITIES.join(", ") || "none"})`);
+    }
+  }
   // A pull request is promotion, not evidence: the daemon's `evidence: pr` (open a PR, and a PR
   // is what COMPLETED requires) is materialized ONLY for a branch output promoted by pull
   // request. Every other output/promotion pair is `none` and the publisher never opens a PR.
@@ -303,6 +378,7 @@ export function materializeEnvelope(triple, registry) {
       promotion: spec.promotion,
       output: spec.output,
       base_commit: spec.baseCommit,
+      tools,
     },
     contract: {
       work_order_id: triple.work_order_id,
@@ -313,6 +389,9 @@ export function materializeEnvelope(triple, registry) {
       promotion: spec.promotion,
       output: spec.output,
       model_class: spec.modelClass,
+      tools,
+      input_artifacts: inputArtifacts,
+      required_capabilities: requiredCapabilities,
     },
   };
 }

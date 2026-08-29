@@ -136,7 +136,7 @@ async function classifyDivergedLocal(repoDir, branch, localSha, remoteTip) {
   return { residue: unreachable.stdout === range.stdout };
 }
 
-export async function prepareRepository(stateDir, repo, taskId, branchOverride, baseCommit) {
+export async function prepareRepository(stateDir, repo, taskId, branchOverride, baseCommit, baseRef) {
   if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
   const branch = branchOverride ?? `worker/${taskId}`;
@@ -147,7 +147,12 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
   // Wave 1B digest form: the handoff pinned an exact baseCommit that the task branch must be
   // created FROM (base_commit), not a pre-existing branch to continue. The branch name is still
   // held to the plain-branch rule, but it need not yet exist on origin; the checked-out tip is
-  // the baseCommit rather than an origin head, and the baseCommit must be reachable on origin.
+  // the baseCommit rather than an origin head.
+  // B4 base-checkout validation: when a baseRef is named it is fetched so its identity is the
+  // LIVE origin head, and the baseCommit must be an ancestor of origin/<baseRef> (else
+  // `base_ref_unavailable` / `base_commit_unreachable`, both BLOCKED). When no baseRef is named
+  // the fetch is skipped; the baseCommit must resolve in local objects and (when a HEAD exists)
+  // be an ancestor of it, so a local-only baseCommit is refused rather than silently used.
   if (baseCommit) {
     if (typeof baseCommit !== "string" || !/^[0-9a-f]{40}$/.test(baseCommit)) {
       throw new Error("base_commit must be a full 40-character lowercase hex SHA-1");
@@ -155,17 +160,36 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
     validateBranchName(branch);
     const legal = await command("git", ["check-ref-format", "--branch", branch], { allowFailure: true });
     if (legal.status !== 0) throw new Error(`envelope branch ${branch} is not a valid git branch name`);
-    if (cached) {
+    const hasBaseRef = typeof baseRef === "string" && baseRef !== "";
+    if (cached && hasBaseRef) {
       await command("git", ["-C", repoDir, "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"], { allowFailure: true });
-    } else {
+    } else if (!cached) {
       mkdirSync(dirname(repoDir), { recursive: true });
       await command("git", ["clone", cloneUrl, repoDir]);
     }
-    // Reachability is asked of the clone AFTER the fetch, so origin must actually serve the
-    // commit; a dangling or local-only baseCommit is refused, never silently used.
-    const reachable = await command("git", ["-C", repoDir, "cat-file", "-e", `${baseCommit}^{commit}`], { allowFailure: true });
-    if (reachable.status !== 0) {
-      throw new Error(`base_commit ${baseCommit} not found on origin`);
+    if (hasBaseRef) {
+      const refExists = await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${baseRef}`], { allowFailure: true });
+      if (refExists.status !== 0) {
+        throw Object.assign(new Error(`base_ref_unavailable: origin/${baseRef} is not available on origin`), { blockedReason: "base_ref_unavailable" });
+      }
+    }
+    const baseExists = await command("git", ["-C", repoDir, "cat-file", "-e", `${baseCommit}^{commit}`], { allowFailure: true });
+    if (baseExists.status !== 0) {
+      throw Object.assign(new Error(`base_commit_unreachable: base_commit ${baseCommit} is not available`), { blockedReason: "base_commit_unreachable" });
+    }
+    if (hasBaseRef) {
+      const isAncestor = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", baseCommit, `refs/remotes/origin/${baseRef}`], { allowFailure: true });
+      if (isAncestor.status !== 0) {
+        throw Object.assign(new Error(`base_commit_unreachable: base_commit ${baseCommit.slice(0, 8)} is not an ancestor of origin/${baseRef}`), { blockedReason: "base_commit_unreachable" });
+      }
+    } else {
+      const headExists = await command("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", "HEAD"], { allowFailure: true });
+      if (headExists.status === 0) {
+        const isAncestor = await command("git", ["-C", repoDir, "merge-base", "--is-ancestor", baseCommit, "HEAD"], { allowFailure: true });
+        if (isAncestor.status !== 0) {
+          throw Object.assign(new Error(`base_commit_unreachable: base_commit ${baseCommit.slice(0, 8)} is not an ancestor of HEAD`), { blockedReason: "base_commit_unreachable" });
+        }
+      }
     }
     await command("git", ["-C", repoDir, "checkout", "-B", branch, baseCommit]);
     return { branch, repoDir };
@@ -315,6 +339,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
   const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
+  const tools = Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools.join(",") : "read,grep,find,ls,bash,edit,write";
   mkdirSync(sessionDir, { recursive: true });
 
   return new Promise((resolveRun) => {
@@ -331,7 +356,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
         "--model",
         envelope.model,
         "--tools",
-        "read,grep,find,ls,bash,edit,write",
+        tools,
         envelope.spec,
       ],
       // Post-0.0.51 rule (#18): a task NEVER runs under a self-updating launcher. The daemon

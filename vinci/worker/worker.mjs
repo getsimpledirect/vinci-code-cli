@@ -13,7 +13,7 @@ import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
-import { assertTaskId, contractTag, isDigestHandoff, materializeEnvelope, parseEnvelope, parseHandoffTriple, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
+import { assertTaskId, contractTag, isDigestHandoff, loadModelClasses, materializeEnvelope, parseEnvelope, parseHandoffTriple, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
 import { readSessionState } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
@@ -404,12 +404,18 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     // materialize the envelope. Every refusal (malformed triple, 404/unauthorized registry,
     // digest mismatch, binding mismatch, unknown model class, bad field) BLOCKs here, before a
     // clone and before a model spawn.
+    // B2: the operator model-class table is loaded here (per handoff, so a change takes effect
+    // without a restart) and passed into materializeEnvelope, which stays pure.
+    const modelConfig = loadModelClasses();
     let triple;
     let reason;
     try {
       triple = parseHandoffTriple(message.body);
       const registry = await fetchWorkOrderRegistry(bus.serverUrl, process.env.VINCI_BUS_TOKEN, triple.work_order_id);
-      const materialized = materializeEnvelope(triple, registry);
+      const materialized = materializeEnvelope(triple, registry, {
+        modelClasses: modelConfig.table,
+        modelClassesConfigured: modelConfig.configured,
+      });
       envelope = materialized.envelope;
       contractFields = materialized.contract;
     } catch (error) {
@@ -422,7 +428,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
         { workerBuild, serverBuild, vinciBinary },
       );
       lifecycle.transition("BLOCKED", { outcome: { reason } });
-      const contract = triple ? `contract=${triple.work_order_id}@${triple.contract_digest.slice(0, 8)} ` : "";
+      // B7: a malformed post (the triple could not even be parsed) still carries `contract=malformed`;
+      // a parsed triple whose registry answer refused carries the work_order_id@digest8 tag.
+      const contract = triple ? `contract=${triple.work_order_id}@${triple.contract_digest.slice(0, 8)} ` : "contract=malformed ";
       await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`state=BLOCKED ${contract}reason=${reason}`), {
         inReplyTo: message.message_id,
       });
@@ -453,10 +461,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   // Wave 1B: stamp the record with the materialized contract (work_order_id, both digests,
   // base_commit, promotion) so the snapshot and every terminal post can cite the handoff.
   if (contractFields) lifecycle.record(contractFields);
-  if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
-    lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
+  // B6: bounds validation BEFORE prepareRepository and before any spawn. budget_usd<=0, a
+  // non-positive max_runtime_s, or a deadline already in the past each BLOCK the task.
+  if (envelope.budget_usd <= 0 || envelope.max_runtime_s <= 0 || (envelope.deadline && Date.parse(envelope.deadline) <= Date.now())) {
+    const limit = envelope.budget_usd <= 0 ? "budget_usd" : envelope.max_runtime_s <= 0 ? "max_runtime_s" : "deadline";
+    lifecycle.transition("BLOCKED", { limit_tripped: limit, outcome: { reason: "invalid_bounds: budget_usd, max_runtime_s and deadline must be within permitted bounds" } });
     const contract = contractTag(lifecycle.snapshot()) ? `${contractTag(lifecycle.snapshot())} ` : "";
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}deadline is in the past`), { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -504,7 +515,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       });
     }
 
-    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch, envelopeToUse.base_commit);
+    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch, envelopeToUse.base_commit, contractFields ? contractFields.base_ref : undefined);
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
     // which can take long enough for an operator update to land — and stamp the task with it.
     // runVinci spawns with VINCI_UPDATE_DISABLED=1, so nothing can change between this probe
@@ -587,6 +598,14 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     // A terminal state is immutable: if the failure happened after it was committed (e.g. the
     // final bus post), surface the error to the daemon loop instead of rewriting the record.
     if (lifecycle.isTerminal()) throw error;
+    // B4: a base-checkout validation failure (missing origin base ref, or base_commit not
+    // reachable) is a BLOCKED refusal, not a FAILED run: nothing was spawned, nothing produced.
+    if (error?.blockedReason === "base_ref_unavailable" || error?.blockedReason === "base_commit_unreachable") {
+      lifecycle.transition("BLOCKED", { outcome: { reason: error.message } });
+      const contract = contractTag(lifecycle.snapshot()) ? `${contractTag(lifecycle.snapshot())} ` : "";
+      await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}state=BLOCKED reason=${error.message}`), { inReplyTo: message.message_id });
+      return true;
+    }
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
     await postFinal(bus, message, envelope, lifecycle.snapshot(), null);
   }
