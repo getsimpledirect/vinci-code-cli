@@ -605,12 +605,29 @@ export function isShellNetworkCommand(command: string): boolean {
 const CLOUD_TOOL =
   /^(?:gcloud|gsutil|bq|aws|az|kubectl|helm|terraform|pulumi|vercel|netlify|firebase|flyctl|fly|railway|serverless|sst|wrangler|supabase|heroku|amplify|eas|doctl)$/i;
 
+/** A segment's body with argv[0] unquoted and PATH-STRIPPED, and everything after it untouched:
+ *  `./node_modules/.bin/npx wrangler deploy` → `npx wrangler deploy`.
+ *
+ *  This is THE normalization for anything keyed on argv[0], and it is shared on purpose.
+ *  segmentCommandWord() and runnerTargetSegment() used to derive it separately — the first
+ *  path-stripped, the second matched `^` against the raw body — and they disagreed on exactly one
+ *  input: a path-invoked runner. `./node_modules/.bin/npx wrangler deploy` therefore got INTO the
+ *  dev-toolchain allowlist (argv[0] path-stripped to `npx`) while the runner peel did NOT fire
+ *  (no `^npx` in the raw body), so the disagreement turned a rejection into an allow — on the most
+ *  ordinary spelling there is, a repo-local binary. Two halves of one rule must not compute the
+ *  same thing two ways; there is now one function and no second way to be wrong. */
+function pathStrippedBody(segment: string): string {
+  const body = commandBody(segment);
+  const first = /^\S+/.exec(body)?.[0] ?? "";
+  const bare = first.replace(/^['"]|['"]$/g, "").split("/").pop() ?? "";
+  return bare + body.slice(first.length);
+}
+
 /** The executable actually invoked by a shell segment (argv[0]), after env-assignments / sudo, quote-
  *  and path-stripped. Matching the COMMAND WORD — not a token anywhere in the text — is what stops a
  *  `curl … https://evil/gcloud` or a `# gcloud` comment from masquerading as a cloud command. */
 function segmentCommandWord(segment: string): string {
-  const first = commandBody(segment).match(/^(\S+)/)?.[1] ?? "";
-  return (first.replace(/^['"]|['"]$/g, "").split("/").pop() ?? "").toLowerCase();
+  return (/^\S*/.exec(pathStrippedBody(segment))?.[0] ?? "").toLowerCase();
 }
 
 function isCloudDeploySegment(segment: string): boolean {
@@ -694,7 +711,9 @@ const RUNNER_FLAG_WITH_VALUE = /^(?:-p|--package|--node-options|-c|--call|--allo
  *  command "cannot ride in on it"; that claim was false, which for a permission system is the defect
  *  regardless of the exposure. Peeling one layer makes the claim true for these forms. */
 function runnerTargetSegment(segment: string): string | null {
-  const body = commandBody(segment);
+  // PATH-STRIPPED, the same view segmentCommandWord() judges — see pathStrippedBody(). Matching the
+  // raw body here is what let `./node_modules/.bin/npx wrangler deploy` into the allowlist unpeeled.
+  const body = pathStrippedBody(segment);
   const prefix = RUNNER_PREFIX.map((pattern) => pattern.exec(body)).find((match) => match !== null);
   if (!prefix) return null;
   let rest = body.slice(prefix[0].length).trim();

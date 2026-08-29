@@ -652,6 +652,14 @@ The allowlist alone is not sufficient either: it judges argv[0] per segment, so 
 `npm publish`, `bun publish` and `npm install -g typescript`. Those are stopped by the veto — which
 is why adding `bun` to the OUTWARD publish pattern is load-bearing rather than cosmetic.
 
+**argv[0] is path-stripped once, in one place.** `pathStrippedBody()` produces the single normalized
+view (`./node_modules/.bin/npx wrangler deploy` → `npx wrangler deploy`) that both the command-word
+check and the runner peel judge. They used to derive it separately — one path-stripped, one matched
+against the raw body — and disagreed on exactly one input: a path-invoked runner got *into* the
+allowlist while the peel did not fire, turning a rejection into an allow on the most ordinary
+spelling there is, a repo-local binary. Two halves of one rule must not compute the same thing two
+ways.
+
 **Runners are peeled before the allowlist decides.** `npx wrangler deploy` really runs `wrangler`,
 but argv[0] is `npx` — itself a dev-toolchain name — so the cloud-CLI rejection never saw the tool.
 Measured: `npx wrangler deploy`, `pnpm dlx wrangler deploy`, `npx supabase db push`,

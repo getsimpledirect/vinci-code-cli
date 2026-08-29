@@ -278,9 +278,23 @@ try {
     "npx heroku ps:scale web=0 -a prod",
     "npx -y doctl compute droplet delete x",
     "npx --package=@x/y amplify push",
+    // The SEPARATE-WORD value form. `-p some-wrapper` must consume its value, or the peel judges
+    // `some-wrapper` as the tool and lets `wrangler deploy` through. The attached `--package=@x/y`
+    // form above does not exercise that line, so deleting RUNNER_FLAG_WITH_VALUE survived the suite
+    // until this case existed.
+    "npx -p some-wrapper wrangler deploy",
+    "npx --package some-wrapper supabase db push",
     "npx kubectl delete namespace prod",
     "expo publish",
     "deno install --global -A https://x/cli.ts",
+    // PATH-INVOKED runners. `./node_modules/.bin/npx` is ordinary usage, not evasion: argv[0]
+    // path-strips into the dev-toolchain allowlist, so if the peel matches the RAW body instead of
+    // the path-stripped one the two halves disagree and the disagreement is an ALLOW.
+    "/usr/local/bin/npx wrangler deploy",
+    "./node_modules/.bin/npx wrangler deploy",
+    "/usr/local/bin/pnpm dlx wrangler deploy",
+    '"./node_modules/.bin/npx" supabase db push',
+    "./node_modules/.bin/npx -p some-wrapper heroku ps:scale web=0",
   ]) {
     const result = await headlessCall("bash", { command: laundered });
     const proceeded = decisions().some((decision) => decision.outcome === "PROCEEDED");
@@ -293,12 +307,19 @@ try {
   // when a cloud CLI is BUNDLED with genuine toolchain: without it, `npm install && wrangler deploy`
   // is allowlisted whole and takes the network grant. (`gcloud`/`aws`/`az` are caught either way by
   // isShellNetworkCommand; wrangler, terraform and kubectl are in neither list.)
+  //
+  // PRECISION, so a later trim does not remove the wrong rows: only the FIRST and THIRD entries
+  // below actually die on the X2 mutant. `terraform apply`, `helm upgrade` and `pulumi up` are named
+  // by the OUTWARD veto ("deploy or change cloud / infrastructure resources") and block under X2
+  // anyway — they are here as coverage of the bundled SHAPE, not as pins on the cloud rejection.
+  // `wrangler deploy` and `kubectl delete namespace prod` are the two that pin it, because no veto
+  // names them. Do not delete those two on the theory that the loop is uniformly redundant.
   for (const bundled of [
-    "npm install && wrangler deploy",
-    "npm install && terraform apply",
-    "npm ci && kubectl delete namespace prod",
-    "npm install && helm upgrade app ./chart",
-    "npm install && pulumi up",
+    "npm install && wrangler deploy", // pins the X2 rejection — no veto names wrangler
+    "npm install && terraform apply", // shape coverage; OUTWARD also catches this one
+    "npm ci && kubectl delete namespace prod", // pins the X2 rejection — no veto names kubectl
+    "npm install && helm upgrade app ./chart", // shape coverage; OUTWARD also catches this one
+    "npm install && pulumi up", // shape coverage; OUTWARD also catches this one
   ]) {
     const result = await headlessCall("bash", { command: bundled });
     const proceeded = decisions().some((decision) => decision.outcome === "PROCEEDED");
@@ -310,7 +331,12 @@ try {
 
   // The peel ONLY ever adds a rejection: an ordinary `npx` of a non-cloud tool is unchanged, so the
   // interactive once-per-session build grant keeps its current scope.
-  for (const ordinary of ["npx tsx script.ts", "npx create-react-app my-app"]) {
+  for (const ordinary of [
+    "npx tsx script.ts",
+    "npx create-react-app my-app",
+    "./node_modules/.bin/npx tsx script.ts",
+    "/usr/local/bin/npm install",
+  ]) {
     const result = await headlessCall("bash", { command: ordinary });
     check(
       `PROCEED: an ordinary runner invocation is unaffected by the peel — ${ordinary}`,
@@ -428,6 +454,12 @@ try {
   // which put a plain `git commit` back into the text and satisfied the very precondition the check
   // exists to prove is gone — the mutation that restores that precondition SURVIVED as a result.
   // The command under test must not contain the thing it is meant to prove is unnecessary.
+  //
+  // DO NOT DELETE the meta-assertion inside the loop. It is what makes that rule mechanical instead
+  // of a comment: it fails the suite if anyone ever edits a case back into a form that contains a
+  // bare `git add`/`git commit`, which is exactly how this coverage was lost the first time. A
+  // reviewer flagged it as the right shape for "the command under test must not contain the thing it
+  // is meant to prove is gone" — keep it through refactors.
   for (const staging of [
     "git --no-pager add credentials.json",
     "git -C . add credentials.json",
