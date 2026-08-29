@@ -221,10 +221,17 @@ export class WorkerTestFixture {
   }
 
   getEnv(overrides = {}) {
+    // B2: configure MODEL_CLASSES for digest handoff tests (forte and fortissimo are the
+    // standard managed-provider classes; worker tests may extend this for test cases).
+    const defaultModelClasses = JSON.stringify({
+      forte: { provider: "vinci", model: "forte" },
+      fortissimo: { provider: "vinci", model: "fortissimo" },
+    });
     return {
       ...process.env,
       VINCI_BUS_TOKEN: "test-token",
       VINCI_WORKER_GIT_BASE: `file://${this.reposDir}/`,
+      VINCI_WORKER_MODEL_CLASSES: overrides.VINCI_WORKER_MODEL_CLASSES ?? defaultModelClasses,
       PATH: `${this.toolsDir}:${process.env.PATH}`,
       FAKE_VINCI_RECORD: this.recordFile,
       FAKE_VINCI_SESSION_FIXTURE: join(dirname(new URL(import.meta.url).pathname), "../fixtures/worker-session.jsonl"),
