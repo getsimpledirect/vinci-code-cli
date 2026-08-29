@@ -321,6 +321,43 @@ try {
     assert.equal(f.gitTransferCalls().length, 0, "a past deadline performs no transfer");
   }
 
+  // --- F2: VINCI_WORKER_MODEL_CLASSES is validated ONCE at startup ---
+  // invalid inline JSON ⇒ exit 78 with the reason, before the lock / version fetch / online post;
+  // unreadable @file ⇒ exit 78; unset ⇒ the daemon starts, and every digest handoff BLOCKs
+  // `unknown_model_class` per task (never a crash).
+  {
+    const onlineBefore = f.getPostedMessages().filter((p) => / online$/.test(p.subject)).length;
+    const versionBefore = f.versionRequests;
+    f.busMessages.push(handoff("m-classes", happyTriple));
+    for (const [label, value, reason] of [
+      ["invalid inline", "{not json", /invalid VINCI_WORKER_MODEL_CLASSES: .*; refusing to start/],
+      ["wrong shape", JSON.stringify({ forte: { provider: "vinci" } }), /class forte must be \{ provider, model \}; refusing to start/],
+      ["unreadable @file", `@${join(f.tempDir, "no-such-classes.json")}`, /invalid VINCI_WORKER_MODEL_CLASSES: ENOENT.*; refusing to start/],
+    ]) {
+      const r = await run({ env: { VINCI_WORKER_MODEL_CLASSES: value } });
+      assert.equal(r.status, 78, `${label}: daemon must refuse to start with EX_CONFIG (78), got ${r.status}: ${r.stderr}`);
+      assert.match(r.stderr, reason, `${label}: stderr names the reason: ${r.stderr}`);
+      assert.equal(f.getPostedMessages().filter((p) => / online$/.test(p.subject)).length, onlineBefore, `${label}: must not post online`);
+      assert.equal(f.versionRequests, versionBefore, `${label}: must not fetch /v1/version`);
+      assert.equal(existsSync(join(f.tempDir, "daemon.lock")), false, `${label}: must refuse before taking the daemon lock`);
+      assert.equal(existsSync(join(f.tempDir, "tasks", "m-classes.json")), false, `${label}: no task may be touched`);
+    }
+    // A readable @file works and is equivalent to the inline form.
+    const classesFile = join(f.tempDir, "classes.json");
+    writeFileSync(classesFile, JSON.stringify({ forte: { provider: "vinci", model: "forte" } }));
+    let r = await run({ env: { VINCI_WORKER_MODEL_CLASSES: `@${classesFile}` } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    assert.equal(f.getVinciCalls().length, vinciRuns, "@file table: the digest handoff runs");
+    assert.doesNotMatch(postsFor("m-classes"), /state=BLOCKED/, "@file table: the class resolves and the task is not refused");
+    // Unset ⇒ prose-only: start, but BLOCK every digest handoff before any transfer.
+    f.busMessages.push(handoff("m-noclasses", happyTriple));
+    r = await run({ env: { VINCI_WORKER_MODEL_CLASSES: "" } });
+    assert.equal(r.status, 0, `unset table: the daemon must start and finish the pass: ${r.stderr}`);
+    assertRefusedBeforeTransfer("m-noclasses", "unknown_model_class");
+    assert.match(postsFor("m-noclasses"), /MODEL_CLASSES not configured/);
+  }
+
   console.log("PASS worker-handoff-triple");
 } finally {
   await f.cleanup();

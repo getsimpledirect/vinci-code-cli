@@ -32,6 +32,12 @@ let serverBuild = { error: "not fetched" };
 // tasks. `{ version, path }` or `{ error }`. This is the LAST OBSERVED probe: it is what early
 // terminal posts (which never spawn) report, and what terminalPostBody prints.
 let vinciBinary = { error: "not checked" };
+// F2: the operator model-class table (VINCI_WORKER_MODEL_CLASSES, inline JSON or `@<file>`),
+// parsed and validated EXACTLY ONCE at daemon startup (see main): an invalid value refuses to
+// start (exit 78, reason on stderr) and can never surface as a crash in the middle of a task.
+// Unset ⇒ the daemon starts prose-only: `configured: false`, and every digest handoff BLOCKs
+// with `unknown_model_class: MODEL_CLASSES not configured`.
+let modelConfig = { configured: false, table: Object.freeze({}) };
 
 // Drift signal (#18), persisted so it survives restarts: `<state-dir>/vinci-binary.json` holds
 // the last ANNOUNCED `{ version, path }`. Rules:
@@ -404,9 +410,8 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     // materialize the envelope. Every refusal (malformed triple, 404/unauthorized registry,
     // digest mismatch, binding mismatch, unknown model class, bad field) BLOCKs here, before a
     // clone and before a model spawn.
-    // B2: the operator model-class table is loaded here (per handoff, so a change takes effect
-    // without a restart) and passed into materializeEnvelope, which stays pure.
-    const modelConfig = loadModelClasses();
+    // F2: the operator model-class table was validated once at startup (modelConfig); it is
+    // passed into materializeEnvelope, which stays pure. A change needs a daemon restart.
     let triple;
     let reason;
     try {
@@ -622,8 +627,21 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   return true;
 }
 
+// F2: EX_CONFIG on an unusable model-class table, BEFORE the state dir, the daemon lock, the
+// /v1/version fetch and the online post — the same "refuse to start" shape as --require-governor.
+function loadModelClassesOrRefuse(env = process.env) {
+  try {
+    return loadModelClasses(env);
+  } catch (error) {
+    const configError = new Error(`${error.message}; refusing to start`);
+    configError.exitCode = EXIT_CONFIG;
+    throw configError;
+  }
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  modelConfig = loadModelClassesOrRefuse();
   mkdirSync(options.stateDir, { recursive: true });
   const releaseLock = acquireDaemonLock(options.stateDir, options.id);
   const handleSignal = () => {
