@@ -286,6 +286,28 @@ try {
     const proceeded = decisions().some((decision) => decision.outcome === "PROCEEDED");
     check(`never PROCEED under the profile — ${laundered}`, result?.block === true && !proceeded);
   }
+  // The DIRECT cloud rejection (`isCloudDeploySegment(segment)`) is pinned separately, and only
+  // these forms pin it. A bare `wrangler deploy` is excluded for an unrelated reason — it is in
+  // neither DEV_TOOLCHAIN nor isShellNetworkCommand, so it can never set sawToolchainNetwork — which
+  // is why deleting that rejection SURVIVED an earlier version of this suite. It becomes load-bearing
+  // when a cloud CLI is BUNDLED with genuine toolchain: without it, `npm install && wrangler deploy`
+  // is allowlisted whole and takes the network grant. (`gcloud`/`aws`/`az` are caught either way by
+  // isShellNetworkCommand; wrangler, terraform and kubectl are in neither list.)
+  for (const bundled of [
+    "npm install && wrangler deploy",
+    "npm install && terraform apply",
+    "npm ci && kubectl delete namespace prod",
+    "npm install && helm upgrade app ./chart",
+    "npm install && pulumi up",
+  ]) {
+    const result = await headlessCall("bash", { command: bundled });
+    const proceeded = decisions().some((decision) => decision.outcome === "PROCEEDED");
+    check(
+      `a cloud CLI bundled with real toolchain never PROCEEDs — ${bundled}`,
+      result?.block === true && !proceeded,
+    );
+  }
+
   // The peel ONLY ever adds a rejection: an ordinary `npx` of a non-cloud tool is unchanged, so the
   // interactive once-per-session build grant keeps its current scope.
   for (const ordinary of ["npx tsx script.ts", "npx create-react-app my-app"]) {
@@ -402,6 +424,10 @@ try {
   // ── BLOCK-5: a git GLOBAL option must not defeat the operand pass ────────────────────────────
   // The operand pass was parser-based but `&&`-gated behind a text precondition that could not see
   // past a global, so the parser handled these correctly and the precondition discarded the result.
+  // Each command is tested BARE. An earlier version of this loop appended `&& git commit -m work`,
+  // which put a plain `git commit` back into the text and satisfied the very precondition the check
+  // exists to prove is gone — the mutation that restores that precondition SURVIVED as a result.
+  // The command under test must not contain the thing it is meant to prove is unnecessary.
   for (const staging of [
     "git --no-pager add credentials.json",
     "git -C . add credentials.json",
@@ -409,8 +435,13 @@ try {
     "git --no-pager add .env",
     "git -C . add .aws/credentials",
     "git --literal-pathspecs add service-account.json",
+    "git -c user.name=x add .kube/config",
   ]) {
-    const result = await headlessCall("bash", { command: `${staging} && git commit -m work` });
+    check(
+      `the command under test contains no bare "git add/commit" to satisfy the old precondition — ${staging}`,
+      !/\bgit\s+(add|commit)\b/i.test(staging),
+    );
+    const result = await headlessCall("bash", { command: staging });
     check(
       `KEEP-BLOCKING: a git global does not launder a secret past the operand pass — ${staging}`,
       result?.block === true && last().outcome === "BLOCKED" && last().site === "commit-secret-files",
@@ -423,7 +454,7 @@ try {
     "git add --pathspec-from-file list.txt",
     "git --no-pager add --pathspec-from-file=list.txt",
   ]) {
-    const result = await headlessCall("bash", { command: `${laundered} && git commit -m work` });
+    const result = await headlessCall("bash", { command: laundered });
     check(
       `KEEP-BLOCKING: an unscannable pathspec fails closed — ${laundered}`,
       result?.block === true && last().site === "commit-secret-files",
