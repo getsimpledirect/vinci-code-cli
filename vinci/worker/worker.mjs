@@ -349,14 +349,25 @@ async function postFinal(bus, message, envelope, state, evidence) {
 // materializeEnvelope against the served record; nothing here is trusted from the handoff triple.
 async function fetchWorkOrderRegistry(serverUrl, token, workOrderId) {
   const url = `${serverUrl}/v1/governor/contracts/${encodeURIComponent(workOrderId)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
   let response;
   try {
-    response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    });
   } catch (error) {
     throw new Error(`registry_unavailable: governor contracts fetch failed: ${error?.cause?.code ?? error.message}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > 262_144) {
+    throw new Error(`registry_unavailable: governor contracts response exceeds 256 KiB`);
   }
   if (response.status === 401 || response.status === 403) {
-    throw new Error(`registry_unauthorized: governor contracts returned ${response.status}`);
+    throw new Error(`registry_forbidden: governor contracts returned ${response.status}`);
   }
   if (response.status === 404) {
     throw new Error(`work_order_not_found: no contract for ${workOrderId}`);
