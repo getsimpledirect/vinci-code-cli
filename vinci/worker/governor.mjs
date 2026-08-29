@@ -66,9 +66,14 @@ export async function claimGovernorPaths({ governorUrl, token, paths, taskId, at
     if (!validTtl(responseBody.ttl)) {
       return unavailable(`Governor lease invalid: ttl=${JSON.stringify(responseBody.ttl)}`);
     }
+    const claimedAt = new Date().toISOString();
     return {
       success: true,
-      claimed_at: new Date().toISOString(),
+      // A stable identifier for THIS granted lease. It exists so the W2 unattended policy profile
+      // has something to stamp into the child that CANNOT be produced on any path where the lease
+      // was refused, unavailable, or never requested — see unattendedPolicyEnv() below.
+      id: `${idempotencyKey}@${claimedAt}`,
+      claimed_at: claimedAt,
       paths: responseBody.paths || paths,
       ttl: responseBody.ttl,
       budget_usd: responseBody.budget_usd,
@@ -84,6 +89,26 @@ export async function claimGovernorPaths({ governorUrl, token, paths, taskId, at
 
   // Any other status is not a decision; never proceed on it.
   return unavailable(`Governor error: unexpected status ${response.status} ${responseBody.reason || "unknown"}`);
+}
+
+// ── W2: the `governed` unattended policy profile ───────────────────────────────────────────────
+// The child agent's guard relaxes a small, explicitly classified set of CONFIRMATION-shaped gates
+// only when BOTH of these are present in its environment (see vinci/extensions/lib/unattended-policy.ts
+// and vinci/worker/README.md). This is the only producer of either variable in the codebase.
+//
+// The delete-on-no-lease half is the load-bearing half. `undefined` here means "remove this key from
+// the child's environment", which is why the daemon's OWN environment cannot leak the profile into a
+// run the Governor never leased: an operator who exports VINCI_UNATTENDED_POLICY=governed on the box
+// still gets today's conservative gate on every ungoverned task, because this function strips it.
+export const UNATTENDED_POLICY_ENV_KEYS = Object.freeze(["VINCI_UNATTENDED_POLICY", "VINCI_UNATTENDED_LEASE"]);
+
+export function unattendedPolicyEnv(lease) {
+  // A lease is a GRANTED lease and nothing else. `null` (no --governor configured at all), a
+  // refusal, an unavailability, or a malformed object all mean no authority backs this run, and an
+  // unattended run with no authority behind it keeps the conservative gate.
+  const granted = lease && lease.success === true && typeof lease.id === "string" && lease.id.length > 0;
+  if (!granted) return { VINCI_UNATTENDED_POLICY: undefined, VINCI_UNATTENDED_LEASE: undefined };
+  return { VINCI_UNATTENDED_POLICY: "governed", VINCI_UNATTENDED_LEASE: lease.id };
 }
 
 function positiveSeconds(value) {

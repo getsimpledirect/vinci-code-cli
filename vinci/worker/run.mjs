@@ -240,7 +240,19 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
   return { branch, repoDir };
 }
 
-export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env }) {
+// Apply a set of explicit env overrides on top of a base environment. A key whose value is
+// `undefined` is DELETED, not set to the string "undefined" — that is how the unattended policy
+// profile guarantees an ungoverned run cannot inherit the profile from the daemon's own env.
+export function applyEnvDelta(base, delta) {
+  const env = { ...base };
+  for (const [key, value] of Object.entries(delta ?? {})) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  return env;
+}
+
+export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, envDelta }) {
   const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
@@ -272,7 +284,10 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env }
         cwd: repoDir,
         detached: true,
         // `env` (clean-room mode, cleanroom.mjs) is an allowlisted subset; default is the daemon's env.
-        env: { ...(env ?? process.env), VINCI_UPDATE_DISABLED: "1" },
+        // `envDelta` is the per-run policy stamp (W2): set on a granted Governor lease, and an
+        // explicit DELETE of the same keys otherwise — applied to BOTH modes, so neither the clean
+        // room nor the shared checkout can inherit the profile from anywhere but a real lease.
+        env: { ...applyEnvDelta(env ?? process.env, envDelta), VINCI_UPDATE_DISABLED: "1" },
         stdio: ["ignore", "inherit", "inherit"],
       },
     );
@@ -314,6 +329,8 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env }
         cost_usd: session.costUsd,
         outcome: session.outcome,
         harness_stops: session.harnessStops,
+        // W2: what the governed unattended profile actually did this run, one entry per gate.
+        unattended_policy: session.unattendedPolicy ?? [],
       });
     };
     child.once("error", () => finish(1, null));

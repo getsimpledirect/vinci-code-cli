@@ -555,6 +555,132 @@ When `VINCI_EVIDENCE_URI_PREFIX` is set (e.g. `s3://bucket/vinci/evidence/`):
 
 **Deployment prerequisite:** AWS CLI on PATH; S3 bucket role with PutObject-only permissions; no read access to other buckets.
 
+### Unattended policy profile (`VINCI_UNATTENDED_POLICY=governed`, W2)
+
+**This changes nothing unless the env var is set AND a Governor lease backs the run.** With the
+variable unset — which is what every interactive user, every CI job, every script, and every other
+headless caller sees — the guard behaves exactly as it does today. There is no other code path: the
+guard's `headlessGate()` calls the original `blockHeadless()` with the same arguments when the
+profile is off, so "unchanged by default" is structural rather than a promise.
+
+#### What it fixes
+
+Across 430 real unattended worker runs (2026-08-29/30) three tasks died inside `blockHeadless()` in
+`vinci/extensions/vinci-guard.ts`, whose message reads *"Blocked (X) — no UI to confirm this in a
+non-interactive run … tell the user this step is waiting on their go-ahead."* Two were *"run a
+command that needs the internet"*, one was *"read a file that may contain credentials"*. None was a
+safety refusal. Each was an **interaction-model artifact**: the gate exists because the interactive
+UX would ask a human, unattended there is no human, and the run dies with work half-done and a
+handoff addressed to nobody. In a governed fleet the authority question is answered upstream by the
+Governor lease and the work order, so a confirmation dialog is the wrong mechanism.
+
+#### How it turns on
+
+Two independent facts must **both** hold in the agent child's environment:
+
+1. `VINCI_UNATTENDED_POLICY=governed` — the explicit operator opt-in.
+2. `VINCI_UNATTENDED_LEASE=<lease id>` — a Governor lease actually backs this run.
+
+`vinci/worker/governor.mjs` `unattendedPolicyEnv()` is the **only** producer of either variable. It
+sets both only after `claimGovernorPaths()` returned a granted lease, and on every other path
+(`--governor` not configured, refusal, unavailability, malformed lease) it returns an explicit
+**delete** of both keys, which `runVinci` applies to the child env in both clean-room and
+shared-checkout mode. So a daemon that happens to have `VINCI_UNATTENDED_POLICY=governed` exported
+in its own environment still hands an ungoverned task today's conservative gate. An unattended run
+with no authority behind it keeps the conservative gate — that is the point.
+
+#### Which sites moved bucket
+
+`blockHeadless` has **11 call sites**. They are not one class, and each is classified individually
+with the reason written at the call site. Under the profile:
+
+| Site (guard) | Gate | Bucket |
+| --- | --- | --- |
+| `shell-credential-read` | shell read of a credentials file | **ESCALATE** |
+| `network-priority-dangerous` | DANGEROUS list inside the network branch | **KEEP-BLOCKING** |
+| `network-priority-database` | DATABASE list inside the network branch | **KEEP-BLOCKING** |
+| `network-ordinary` | a network command matching neither OUTWARD nor SYSTEM | **PROCEED** |
+| `network-outward` | network command matching OUTWARD (publish, deploy, push, `gh`) | **ESCALATE** |
+| `network-system` | network command matching SYSTEM (global install, `curl \| sh`, `git remote`) | **ESCALATE** |
+| `git-checkpoint` | staging/committing the user did not explicitly ask for | **PROCEED** |
+| `dangerous-command` | DANGEROUS list / non-root `rm -rf` | **KEEP-BLOCKING** |
+| `consequential-database` | DATABASE in the CONSEQUENTIAL loop | **KEEP-BLOCKING** |
+| `consequential-outward` / `consequential-system` | OUTWARD / SYSTEM in the CONSEQUENTIAL loop | **ESCALATE** |
+| `commit-secret-files` | committing `.env` / keys | **KEEP-BLOCKING** |
+| `file-credential-read` | `read` tool on a credentials file | **ESCALATE** |
+| `outside-project-write` | write/edit outside the project folder | **KEEP-BLOCKING** |
+| `sensitive-path-write` | write/edit of `.env`, `.git/`, keys, lockfiles, `node_modules` | **KEEP-BLOCKING** |
+
+Only **two** gates actually change what a run can do: `network-ordinary` and `git-checkpoint`. Every
+other site either still stops the run (ESCALATE) or still refuses it (KEEP-BLOCKING); the profile
+only changes what the record says.
+
+#### What still blocks, and why
+
+- **The shell-based file write is untouched.** It is not a `blockHeadless` site at all — it blocks
+  in interactive runs too, and the profile cannot reach it by construction. This is deliberate: on
+  2026-08-30 a dispatched spec contained the instruction *"create the file with the editor's
+  write/edit tool, never with shell redirection"* verbatim and the model did a shell write anyway.
+  The refusal is the only enforcement; the instruction is a preference.
+- **The CATASTROPHIC list is untouched.** It has no override anywhere and never reaches
+  `blockHeadless`.
+- **Destructive commands** (`reset --hard`, `clean -f`, `rm -rf`, `sudo`, `DROP`/`TRUNCATE`,
+  `DELETE FROM` with no `WHERE`). A lease is authority to do the work order, not authority to
+  destroy the tree the work order lives in.
+- **Database migrations.** They mutate state outside the attempt tree, so no publish-time review
+  catches them and no branch revert undoes them.
+- **Committing secret files.** The worker's own success path makes this worse, not better: the
+  publisher pushes the branch and opens a PR, so a committed key is a published key. This is exactly
+  why `git-checkpoint` can be a PROCEED — the commit is allowed, its contents are still policed.
+- **Writes outside the project folder** and **writes to sensitive paths**. The attempt tree is the
+  only surface the publisher captures, the evidence bundle records, or a reviewer sees.
+- **Publishing, deploying, and changing the shared box** (`npm publish`, `docker push`,
+  `gh release create`, `terraform apply`, `git push`, global installs, `curl … | sh`,
+  `git remote set-url`). These ESCALATE rather than hard-block, because the Governor genuinely could
+  authorize them — but the guard never self-grants them. Note that the network gate's generic
+  wording *"run a command that needs the internet"* hides all of these, which is why the site is
+  split three ways instead of being classified as one thing.
+
+#### The credential-read decision (deviation from the W2 steer)
+
+The W2 brief proposed allowing a credential read when the path is **inside** the work order's
+granted paths. That was **not built**, and both credential-read sites ESCALATE instead. Reasons:
+
+1. The Governor claim is a **concurrency lease over paths**, not a disclosure grant. It exists so
+   two workers do not collide on the same files. Treating it as authorization to place a live secret
+   into the model's context — and from there into the provider request, the session JSONL, and the
+   evidence bundle — silently widens what the claim means.
+2. The claim header **defaults to `.`**. Under the proposed rule the default work order would be a
+   blanket credential grant for the entire repository: a total widening dressed as a narrow one.
+3. It buys almost nothing. The clean room clones fresh from origin, and real credential files are
+   gitignored, so the files this would unlock barely exist at runtime — while the shared-checkout
+   mode where they *can* exist is exactly where the widening would bite.
+
+ESCALATE still fixes the measured failure. The run no longer dead-ends on a dialog addressed to
+nobody; it ends BLOCKED with a machine-readable reason naming the gate and the Governor as the
+grantor, which the fleet can route on.
+
+#### The record
+
+A run stopped by a KEEP-BLOCKING guard, a run that ESCALATED, and a run that PROCEEDED are
+**separately identifiable**, because "it worked" and "it was allowed to skip a check" must not look
+the same downstream.
+
+- Each resolved gate appends a `vinci-unattended-policy` entry to the session transcript
+  (`{outcome, site, gate, lease}`, one of `BLOCKED` / `ESCALATED` / `PROCEEDED`).
+- Every block the profile emits carries a machine-readable trailer:
+  `[vinci-unattended outcome=… site=… gate="…" grantor=governor lease=…]`. An ESCALATE reason names
+  the Governor as the grantor and deliberately drops today's *"waiting on their go-ahead"* prose.
+- The daemon reads the entries back (`summarizeUnattendedPolicy`) and puts the three counts on the
+  task snapshot and in the terminal bus post:
+  `unattended_policy=governed policy_blocked=N policy_escalated=N policy_proceeded=N`, plus
+  `policy_escalated_sites=` / `policy_proceeded_sites=` / `policy_blocked_sites=` naming the sites.
+  A run that met no gate emits none of these fields, so ordinary posts are unchanged.
+- An outcome the daemon does not recognise is **dropped**, never folded into a bucket — a fail-open
+  default there would report an unknown decision as the most permissive one.
+
+Covered by `vinci/test/worker-unattended-policy.mjs`.
+
 ### Envelope Headers (Stage 2)
 
 - `claim:` — Path or glob to claim from Governor (default `.`). Unknown headers still → blocker.
