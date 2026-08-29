@@ -51,6 +51,53 @@ function fileForSession(sessionDir, sessionId) {
   return candidates[0];
 }
 
+// W2 unattended policy profile. The guard appends one `vinci-unattended-policy` entry per gate it
+// resolved under the profile, each carrying exactly one outcome. Read back here so the daemon can
+// put the THREE counts — not one blended "it ran" — into the terminal post.
+export const UNATTENDED_POLICY_ENTRY = "vinci-unattended-policy";
+const UNATTENDED_OUTCOMES = Object.freeze(["BLOCKED", "ESCALATED", "PROCEEDED"]);
+
+function unattendedPolicyDecision(entry) {
+  if (entry?.type !== "custom" || entry.customType !== UNATTENDED_POLICY_ENTRY) return undefined;
+  const data = entry.data;
+  if (!data || typeof data !== "object") return undefined;
+  // An unrecognised outcome is dropped rather than counted as anything: a decision the daemon
+  // cannot classify must never be silently folded into one of the three buckets.
+  if (!UNATTENDED_OUTCOMES.includes(data.outcome)) return undefined;
+  return {
+    outcome: data.outcome,
+    site: typeof data.site === "string" ? data.site : "",
+    gate: typeof data.gate === "string" ? data.gate : "",
+  };
+}
+
+/**
+ * The three counts plus the sites, kept apart. "was blocked", "escalated for authorization" and
+ * "was allowed to skip a confirmation" are three different events and this is the shape that keeps
+ * them distinguishable all the way into the bus post.
+ */
+export function summarizeUnattendedPolicy(decisions) {
+  if (!Array.isArray(decisions) || decisions.length === 0) return null;
+  const summary = { blocked: 0, escalated: 0, proceeded: 0, sites: { blocked: [], escalated: [], proceeded: [] } };
+  for (const decision of decisions) {
+    // Explicit mapping with no default: an outcome this daemon does not recognise is DROPPED, never
+    // folded into a bucket. A fail-open default here would make an unknown decision read as
+    // "PROCEEDED", i.e. the most permissive answer, on the strength of a typo.
+    const bucket =
+      decision.outcome === "BLOCKED"
+        ? "blocked"
+        : decision.outcome === "ESCALATED"
+          ? "escalated"
+          : decision.outcome === "PROCEEDED"
+            ? "proceeded"
+            : null;
+    if (!bucket) continue;
+    summary[bucket] += 1;
+    if (decision.site && !summary.sites[bucket].includes(decision.site)) summary.sites[bucket].push(decision.site);
+  }
+  return summary;
+}
+
 function usageValue(entry) {
   const usage = entry?.data?.usage;
   return typeof usage?.estimatedCostUsd === "number" &&
@@ -111,7 +158,8 @@ function messageCostUsd(entry) {
 
 export function readSessionState(sessionDir, sessionId) {
   const session = fileForSession(sessionDir, sessionId);
-  if (!session) return { costUsd: 0, outcome: undefined, harnessStops: [], path: undefined };
+  if (!session)
+    return { costUsd: 0, outcome: undefined, harnessStops: [], unattendedPolicy: [], path: undefined };
 
   let accumulatedCostUsd = 0;
   let hasUsageEntries = false;
@@ -120,9 +168,12 @@ export function readSessionState(sessionDir, sessionId) {
   let outcomeCostUsd;
   let outcome;
   const harnessStops = [];
+  const unattendedPolicy = [];
   session.entries.forEach((entry, index) => {
     const stop = harnessStopReason(entry);
     if (stop) harnessStops.push({ index, reason: stop });
+    const decision = unattendedPolicyDecision(entry);
+    if (decision) unattendedPolicy.push(decision);
   });
   for (const entry of session.entries) {
     if (entry?.type === "custom" && entry.customType === "vinci-task-usage") {
@@ -146,7 +197,7 @@ export function readSessionState(sessionDir, sessionId) {
   const costUsd =
     outcomeCostUsd ??
     (hasUsageEntries || accumulatedCostUsd > 0 ? accumulatedCostUsd : messageFallbackCostUsd);
-  return { costUsd, outcome, harnessStops, path: session.path };
+  return { costUsd, outcome, harnessStops, unattendedPolicy, path: session.path };
 }
 
 export function readSessionOutcome(sessionDir, sessionId) {

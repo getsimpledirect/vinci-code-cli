@@ -15,9 +15,9 @@ import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
 import { cleanRoomEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
-import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
+import { claimGovernorPaths, tightenEnvelopeLimits, unattendedPolicyEnv } from "./governor.mjs";
 import { DECLARATION_REFRESH_DEFAULT_S, LEASE_TIMEOUT_MS, LeaseClient, buildDeclaration, declarationBody, declarationDigest, leaseSubject, releaseOutcome, startHeartbeat } from "./lease.mjs";
-import { readSessionState } from "./session-read.mjs";
+import { readSessionState, summarizeUnattendedPolicy } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
 
@@ -416,6 +416,22 @@ async function postFinal(bus, message, envelope, state, evidence) {
         evidence.success ? undefined : `evidence_error=${evidence.error}`,
       ]
     : [];
+  // W2: never collapse the three profile outcomes into one field. A run that PROCEEDED past a
+  // confirmation and a run that never met one look identical without this, which is exactly the
+  // downstream ambiguity the profile exists to remove; escalations name their sites so a reader can
+  // see WHAT needed authorizing without opening the bundle.
+  const policy = state.unattended_policy;
+  const policyDetails = policy
+    ? [
+        `unattended_policy=governed`,
+        `policy_blocked=${policy.blocked}`,
+        `policy_escalated=${policy.escalated}`,
+        `policy_proceeded=${policy.proceeded}`,
+        policy.escalated > 0 ? `policy_escalated_sites=${policy.sites.escalated.join(",")}` : undefined,
+        policy.proceeded > 0 ? `policy_proceeded_sites=${policy.sites.proceeded.join(",")}` : undefined,
+        policy.blocked > 0 ? `policy_blocked_sites=${policy.sites.blocked.join(",")}` : undefined,
+      ]
+    : [];
   const details = [
     `state=${state.state}`,
     `exit_code=${state.exit_code}`,
@@ -423,6 +439,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     state.limit_tripped ? `limit=${state.limit_tripped}` : undefined,
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
+    ...policyDetails,
     ...evidenceDetails,
   ]
     .filter(Boolean)
@@ -608,6 +625,11 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     // unreachable Governor, a network error, a non-JSON body, an unexpected status, or a
     // missing decision all BLOCK the task here, before prepareRepository and runVinci.
     let envelopeToUse = envelope;
+    // W2: the governed unattended policy profile. Default is "no profile" — the delta returned for a
+    // falsy lease explicitly DELETES both variables, so the child of an ungoverned run cannot inherit
+    // the profile from the daemon's environment. It is reassigned in exactly one place: after a
+    // GRANTED lease, a few lines below.
+    let unattendedPolicy = unattendedPolicyEnv(null);
     if (governorUrl) {
       const governorToken = process.env.VINCI_GOVERNOR_TOKEN;
       // Wave 1B L1 (F4): the work-order lease FIRST, then the path claim. The Governor has no
@@ -692,8 +714,12 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       // Claim granted: tighten the envelope (budget, max_runtime_s, deadline, and the claim
       // ttl as a runtime cap) and record the claim next to the lease plus the effective runtime limit.
       envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
+      // The ONLY place the profile is turned on. Reaching this line means claimGovernorPaths()
+      // returned success with a valid ttl — i.e. a Governor lease actually backs this run.
+      unattendedPolicy = unattendedPolicyEnv(claimResult);
       lifecycle.record({
         lease: { ...lifecycle.snapshot().lease, ...claimResult, effective_max_runtime_s: envelopeToUse.max_runtime_s },
+        unattended_policy_profile: unattendedPolicy.VINCI_UNATTENDED_POLICY ?? null,
       });
     }
 
@@ -737,6 +763,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       stateDir,
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId,
       env: cleanRoom ? cleanRoomEnv({ provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir }) : undefined,
+      envDelta: unattendedPolicy,
       ...(lease ? { abortSignal: abortController.signal } : {}) });
     const head = await readHead(repository.repoDir);
     if (lease) lifecycle.record({ lease: { ...lifecycle.snapshot().lease, ...lease } });
@@ -769,6 +796,12 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     // to the model's narrative and the soak ledger can see that a latch also fired on a FAILED run.
     const harnessStop =
       harnessStops.length > 0 ? { count: harnessStops.length, reason: harnessStops[0].reason } : null;
+    // W2: the three profile outcomes, counted separately and carried onto the task record and the
+    // terminal post. This is the whole point of the profile: downstream, "the guard refused it",
+    // "it was escalated for Governor authorization" and "it was allowed to skip a confirmation"
+    // must never be the same signal. `null` when the profile resolved nothing (the normal case,
+    // and the ONLY case when the profile is off) so an ordinary run's post is unchanged.
+    const unattendedPolicySummary = summarizeUnattendedPolicy(run.unattended_policy ?? []);
 
     // W0.2 evidence before terminal: the terminal state is written only AFTER the evidence
     // bundle was attempted. `planned` is the exact snapshot that will be committed (state +
@@ -777,7 +810,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     // sessionJsonl: session transcript from <state-dir>/sessions/<task-id>/ (outside the repo).
     // gitDiff is against the task branch base; it may be empty when the run changed nothing.
     // logTail: last 200 lines of the daemon's stderr so the bundle captures how the run ended.
-    const planned = lifecycle.plan(intendedState, { ...published, outcome, evidence_error: null, harness_stop: harnessStop });
+    const planned = lifecycle.plan(intendedState, { ...published, outcome, evidence_error: null, harness_stop: harnessStop, unattended_policy: unattendedPolicySummary });
     // The bundle is built BEFORE anything is committed, so result.json is marked as a
     // pre-terminal snapshot: `state` is the intended state, `committed_state` is null and
     // `terminal` is false. A bundle-alone reader therefore never sees a committed COMPLETED;

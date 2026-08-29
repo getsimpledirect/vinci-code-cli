@@ -19,6 +19,15 @@ import {
 import { recordVinciConfirmationGate, sendVinciControl } from "./lib/control.ts";
 import { recordFinalizationRefusal } from "./lib/hard-stop.ts";
 import { parseLocalGitSegment } from "./lib/unattended.ts";
+import {
+  escalationReason,
+  keepBlockingReason,
+  recordUnattendedDecision,
+  type UnattendedDecision,
+  type UnattendedOutcome,
+  unattendedPolicyProfile,
+  VINCI_UNATTENDED_POLICY_ENTRY,
+} from "./lib/unattended-policy.ts";
 import { attachImagesFromText } from "./lib/images.ts";
 import { redactSecrets, redactSecretsDeep } from "./lib/secrets.ts";
 import { planCommandMutates } from "./vinci-plan.ts";
@@ -289,6 +298,81 @@ function blockHeadless(gateAction: string, extra = ""): { block: true; reason: s
     reason:
       `Blocked (${gateAction}) — no UI to confirm this in a non-interactive run. Don't try to work ` +
       `around it: make the code changes you can, then tell the user this step is waiting on their go-ahead.${extra ? ` ${extra}` : ""}`,
+  };
+}
+
+// ── W2: the `governed` unattended policy profile ───────────────────────────────────────────────
+// See lib/unattended-policy.ts for why this exists. Every headless confirmation-shaped gate below
+// now goes through headlessGate() instead of blockHeadless() directly, carrying the bucket it was
+// classified into and WHY. With the profile off (the default, and what every other headless caller
+// sees) headlessGate() calls blockHeadless() with the same arguments and returns the same object —
+// there is deliberately no other code path, so "unset behaves exactly as today" is structural.
+//
+// The three buckets:
+//   "keep-blocking" — safety, not interaction. A Governor lease is authority over WORK, not a
+//                     licence to destroy data, leak a secret into git, or write outside the tree.
+//                     Still a hard block; the profile only makes the refusal machine-readable.
+//   "escalate"      — consequential, and the Governor could authorize it, but the guard must never
+//                     self-grant it. The run still stops — with a structured reason naming the gate
+//                     and the grantor, so the fleet can widen the work order and re-dispatch.
+//   "proceed"       — a pure interaction artifact: the gate exists only because the interactive UX
+//                     would have asked a human, and the governed lease already answered it.
+type GateBucket = "keep-blocking" | "escalate" | "proceed";
+
+const BUCKET_OUTCOME: Record<GateBucket, UnattendedOutcome> = {
+  "keep-blocking": "BLOCKED",
+  escalate: "ESCALATED",
+  proceed: "PROCEEDED",
+};
+
+type GateResult = { block: true; reason: string } | undefined;
+
+/**
+ * A headless confirmation-shaped gate, classified.
+ *
+ * Returns a block (today's, or the profile's structured one) for "keep-blocking" and "escalate",
+ * and `undefined` for "proceed" — callers MUST treat `undefined` as "carry on as if the user had
+ * approved", which for the network site means also taking the security-scope grant the interactive
+ * approval path takes.
+ *
+ * `pi` is optional so the module stays testable with a minimal host; the session entry is
+ * best-effort and its absence never changes the decision.
+ */
+function headlessGate(
+  pi: ExtensionAPI | undefined,
+  site: string,
+  bucket: GateBucket,
+  gateAction: string,
+  extra = "",
+): GateResult {
+  const profile = unattendedPolicyProfile();
+  // Default (profile unset, or set with no Governor lease behind it): byte-identical to today.
+  if (!profile) return blockHeadless(gateAction, extra);
+
+  const decision: UnattendedDecision = {
+    outcome: BUCKET_OUTCOME[bucket],
+    site,
+    gate: gateAction,
+    lease: profile.lease,
+  };
+  const recorded = recordUnattendedDecision(decision);
+  // Durable copy for the worker daemon: it reads the session JSONL and turns these into the three
+  // separate counts in the terminal post. Best-effort — a host without appendEntry still gets the
+  // in-process record and the tagged reason string.
+  try {
+    pi?.appendEntry?.(VINCI_UNATTENDED_POLICY_ENTRY, recorded);
+  } catch {
+    /* never let bookkeeping change a safety decision */
+  }
+
+  if (bucket === "proceed") return undefined;
+  // Both remaining buckets still record a confirmation gate, so the existing closing-handoff path
+  // (vinci-verification.ts) keeps naming the held step instead of emitting a generic BLOCKED.
+  recordVinciConfirmationGate(gateAction);
+  return {
+    block: true,
+    reason:
+      bucket === "escalate" ? escalationReason(recorded, extra) : keepBlockingReason(recorded, extra),
   };
 }
 
@@ -772,8 +856,21 @@ export default function (pi: ExtensionAPI) {
       const securityScopes: string[] = [];
 
       if (isSensitiveShellRead(cmd)) {
+        // [W2 bucket: ESCALATE] A credential read is not an interaction artifact — it is a
+        // DISCLOSURE, and disclosure is the one thing the lease demonstrably does not cover. The
+        // Governor's lease is a claim over PATHS (worker.mjs claims `envelope.claim`, which defaults
+        // to "."): it exists to stop two workers colliding on the same files, not to authorize
+        // exfiltrating the credentials that happen to live in them. Keying disclosure on it would
+        // make the default claim ("." = the whole repo) a blanket credential grant, which is a total
+        // widening dressed as a narrow one — so this does NOT proceed inside granted paths.
+        // Escalating rather than hard-blocking still fixes the measured failure (1 of the 3 deaths
+        // on 2026-08-29/30 was this gate): the run ends BLOCKED naming the gate and the Governor as
+        // the grantor, instead of a dead end addressed to a human who is not there.
         if (!ctx.hasUI)
-          return blockHeadless(
+          return headlessGate(
+            pi,
+            "shell-credential-read",
+            "escalate",
             "read a file that may contain credentials",
             "If the actual values aren't essential, inspect .env.example, schemas, or code references instead.",
           );
@@ -808,14 +905,23 @@ export default function (pi: ExtensionAPI) {
         // Keep destructive/database intent ahead of the network prompt. If accepted, the command still
         // needs a separate one-command network grant before it can run.
         if (priorityDanger) {
-          if (!ctx.hasUI) return blockHeadless(priorityDanger[1]);
+          // [W2 bucket: KEEP-BLOCKING] The DANGEROUS list is force-push, `reset --hard`, `clean -f`,
+          // `sudo`, DROP/TRUNCATE, `migrate reset`, `DELETE FROM` with no WHERE. Every one destroys
+          // work or data irreversibly. A lease is authority to DO the work order, never authority to
+          // destroy the tree the work order lives in — and none of these is a dialog the interactive
+          // UX would have rubber-stamped.
+          if (!ctx.hasUI) return headlessGate(pi, "network-priority-dangerous", "keep-blocking", priorityDanger[1]);
           if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${priorityDanger[1]}):\n\n  ${cmd}\n\nRun it?`, cmd))) {
             ctx.ui.notify("Command blocked.", "info");
             return { block: true, reason: "Blocked — the user declined the risky command. Do not retry it or achieve the same effect another way; do what they asked differently, or ask them." };
           }
           confirmedClasses.add("dangerous");
         } else if (priorityDatabase) {
-          if (!ctx.hasUI) return blockHeadless(priorityDatabase[1]);
+          // [W2 bucket: KEEP-BLOCKING] A schema migration mutates state that lives OUTSIDE the work
+          // order's blast radius and outside the attempt tree, so no publish-time review can catch
+          // it and no revert of the branch undoes it. Explicitly named as keep-blocking in the W2
+          // spec; stays a hard block under the profile.
+          if (!ctx.hasUI) return headlessGate(pi, "network-priority-database", "keep-blocking", priorityDatabase[1]);
           if (!(await confirmRisky(ctx, "Vinci — confirm a database change", `Vinci wants to ${priorityDatabase[1]}:\n\n  ${cmd}\n\nGo ahead?`, cmd))) {
             ctx.ui.notify("Held off — good call.", "info");
             return { block: true, reason: `Blocked — the user declined to ${priorityDatabase[1]}. Don't run this; do what they asked another way, or ask them.` };
@@ -854,43 +960,74 @@ export default function (pi: ExtensionAPI) {
           // This check runs BEFORE the CONSEQUENTIAL loop, so network-shaped consequential commands
           // (git push, gh, npm publish, deploys via curl) would otherwise block here with no gate and
           // spiral into a generic BLOCKED — reuse the tailored OUTWARD/SYSTEM wording when one matches.
-          const netWhy =
-            OUTWARD.find(([re]) => re.test(netRiskText))?.[1] ??
-            SYSTEM.find(([re]) => re.test(netRiskText))?.[1] ??
-            "run a command that needs the internet";
-          return blockHeadless(netWhy);
-        }
-        const outward = OUTWARD.find(([pattern]) => pattern.test(netRiskText));
-        const effect = outward ? `\n\nEffect: this would ${outward[1]}.` : "";
-        // Ordinary build tooling (npm/pip/pod/gradle…) asks ONCE per session, then normal dev work runs
-        // without a prompt per command — otherwise installing dependencies is unusable. Raw network
-        // tools and cloud CLIs still take the per-command gate below.
-        if (isDevToolchainOnlyNetwork(netText) && !hasMultipleGuardClasses) {
-          if (!buildNetworkApprovedForSession) {
-            const okBuild = await confirmSafely(
-              ctx,
-              "Vinci — let builds reach the internet?",
-              `Installing packages and scaffolding a project needs the internet:\n\n  ${cmd}\n\nAllow build tools (npm, pip, gradle…) to reach the internet for the rest of this session? Anything else that goes online will still ask each time.`,
-            );
-            if (!okBuild)
-              return {
-                block: true,
-                reason:
-                  "Blocked — the user declined internet access for BUILD TOOLS. Don't retry this install or fetch these packages another way. This deny is SCOPED to build-tool downloads only: other network actions the user asks for (e.g. `git push`) are NOT blocked — attempt them normally and each will prompt for its own approval. Work with what's already installed locally, or ask the user.",
-              };
-            buildNetworkApprovedForSession = true;
-          }
-          securityScopes.push("network");
-        } else {
-          const ok = await confirmSafely(
-            ctx,
-            "Vinci — allow this network command once?",
-            `This command can connect to an external service or transfer data:\n\n  ${cmd}${effect}\n\nAllow this exact invocation once?`,
+          const netOutward = OUTWARD.find(([re]) => re.test(netRiskText));
+          const netSystem = netOutward ? undefined : SYSTEM.find(([re]) => re.test(netRiskText));
+          const netWhy = netOutward?.[1] ?? netSystem?.[1] ?? "run a command that needs the internet";
+          // [W2 buckets: PROCEED when it is an ORDINARY network command, ESCALATE otherwise]
+          //
+          // This one site carries three different meanings, and lumping them together is what made it
+          // the biggest killer in the 2026-08-29/30 sample (2 of the 3 deaths, both "run a command
+          // that needs the internet"):
+          //
+          //  • Neither OUTWARD nor SYSTEM matched → an ordinary network command: fetch a dependency,
+          //    call an API, clone something. PROCEED. The worker already reaches the internet on this
+          //    same box to clone the repo, call the model provider, and push the branch — gating an
+          //    ordinary network call on a confirmation nobody can give buys exactly nothing, and the
+          //    per-command grant it is guarding is a UX affordance for a human at a keyboard.
+          //  • OUTWARD matched (npm publish, docker push, gh release create, deploy to prod, git
+          //    push) → ESCALATE, never proceed. These are public and irreversible. The generic
+          //    "needs the internet" wording hides them, so classifying the whole site as PROCEED
+          //    would have quietly handed a governed run the power to publish and deploy.
+          //  • SYSTEM matched (global installs, `curl … | sh`, `git remote set-url`, shell-rc edits)
+          //    → ESCALATE. These change the box the whole fleet shares, and `git remote set-url`
+          //    would redirect where the publisher pushes.
+          const netProceeds = !netOutward && !netSystem;
+          const held = headlessGate(
+            pi,
+            netOutward ? "network-outward" : netSystem ? "network-system" : "network-ordinary",
+            netProceeds ? "proceed" : "escalate",
+            netWhy,
           );
-          if (!ok) return { block: true, reason: "Blocked — the user declined THIS network command. Don't retry it or run an equivalent that goes online. This applies to this one command only — a different network action the user asks for (e.g. `git push`) is NOT blocked; attempt it and it will prompt for approval. Do what they asked locally, or ask them." };
+          if (held) return held;
+          // PROCEEDED. Take the same security-scope grant the interactive approval takes — without it
+          // the sandbox denies the command anyway and the profile would only change a dialog into an
+          // EPERM. Every later guard (broad staging, catastrophic, dangerous, consequential, secret
+          // commit) still runs on this command: this grant is scoped to the network gate alone.
           securityScopes.push("network");
         }
-        if (outward) confirmedClasses.add("outward");
+        if (ctx.hasUI) {
+          const outward = OUTWARD.find(([pattern]) => pattern.test(netRiskText));
+          const effect = outward ? `\n\nEffect: this would ${outward[1]}.` : "";
+          // Ordinary build tooling (npm/pip/pod/gradle…) asks ONCE per session, then normal dev work runs
+          // without a prompt per command — otherwise installing dependencies is unusable. Raw network
+          // tools and cloud CLIs still take the per-command gate below.
+          if (isDevToolchainOnlyNetwork(netText) && !hasMultipleGuardClasses) {
+            if (!buildNetworkApprovedForSession) {
+              const okBuild = await confirmSafely(
+                ctx,
+                "Vinci — let builds reach the internet?",
+                `Installing packages and scaffolding a project needs the internet:\n\n  ${cmd}\n\nAllow build tools (npm, pip, gradle…) to reach the internet for the rest of this session? Anything else that goes online will still ask each time.`,
+              );
+              if (!okBuild)
+                return {
+                  block: true,
+                  reason:
+                    "Blocked — the user declined internet access for BUILD TOOLS. Don't retry this install or fetch these packages another way. This deny is SCOPED to build-tool downloads only: other network actions the user asks for (e.g. `git push`) are NOT blocked — attempt them normally and each will prompt for its own approval. Work with what's already installed locally, or ask the user.",
+                };
+              buildNetworkApprovedForSession = true;
+            }
+            securityScopes.push("network");
+          } else {
+            const ok = await confirmSafely(
+              ctx,
+              "Vinci — allow this network command once?",
+              `This command can connect to an external service or transfer data:\n\n  ${cmd}${effect}\n\nAllow this exact invocation once?`,
+            );
+            if (!ok) return { block: true, reason: "Blocked — the user declined THIS network command. Don't retry it or run an equivalent that goes online. This applies to this one command only — a different network action the user asks for (e.g. `git push`) is NOT blocked; attempt it and it will prompt for approval. Do what they asked locally, or ask them." };
+            securityScopes.push("network");
+          }
+          if (outward) confirmedClasses.add("outward");
+        }
       }
       if (securityScopes.length > 0) {
         (event.input as { command: string }).command = signSecurityCommand(cmd, ctx.cwd, securityScopes);
@@ -913,25 +1050,40 @@ export default function (pi: ExtensionAPI) {
 
       if (isGitStageOrCommit(riskText) && !gitCheckpointApproved) {
         if (!ctx.hasUI) {
-          const held = blockHeadless("save a git checkpoint (stage or commit changes)");
-          recordFinalizationRefusal(ctx, "guard", cmd, held.reason);
-          return held;
-        }
-        const ok = await confirmSafely(
-          ctx,
-          "Vinci — save a git checkpoint?",
-          `You didn't ask Vinci to stage or commit changes in this request:\n\n  ${cmd}\n\nCreate a git checkpoint now?`,
-        );
-        if (!ok) {
-          sendVinciControl(
-            pi,
-            "vinci-unrequested-git-block",
-            "The user did not authorize a git checkpoint. Leave the working tree and index alone, report the changed files, and do not retry git add or git commit.",
+          // [W2 bucket: PROCEED] This gate's own predicate is "the user did not ASK for a checkpoint
+          // in this request" (userAskedForGitCheckpoint). Under a work order the order IS the
+          // request: the daemon publishes the task branch and opens the PR, so the commit is the
+          // deliverable, and a governed run that cannot commit produces literally nothing. Textbook
+          // interaction artifact. What is NOT relaxed by this: broad staging (`git add .` / `-A` /
+          // `commit -a`) is refused a few lines above by a non-headless guard that keeps refusing,
+          // committing secret files stays KEEP-BLOCKING below, and the commit is local — the
+          // publisher still owns the push, with its force-with-lease, read-back and foreign-PR
+          // refusals. The worst case is a reviewable draft PR, not an unreviewable change.
+          const held = headlessGate(pi, "git-checkpoint", "proceed", "save a git checkpoint (stage or commit changes)");
+          if (held) {
+            recordFinalizationRefusal(ctx, "guard", cmd, held.reason);
+            return held;
+          }
+          // PROCEEDED: treat it as approved for the rest of the session exactly as an interactive
+          // "yes" would, and record NO finalization refusal — nothing was refused.
+          gitCheckpointApproved = true;
+        } else {
+          const ok = await confirmSafely(
+            ctx,
+            "Vinci — save a git checkpoint?",
+            `You didn't ask Vinci to stage or commit changes in this request:\n\n  ${cmd}\n\nCreate a git checkpoint now?`,
           );
-          recordFinalizationRefusal(ctx, "guard", cmd, "Blocked — the user did not ask Vinci to stage or commit changes.");
-          return { block: true, reason: "Blocked — the user did not ask Vinci to stage or commit changes." };
+          if (!ok) {
+            sendVinciControl(
+              pi,
+              "vinci-unrequested-git-block",
+              "The user did not authorize a git checkpoint. Leave the working tree and index alone, report the changed files, and do not retry git add or git commit.",
+            );
+            recordFinalizationRefusal(ctx, "guard", cmd, "Blocked — the user did not ask Vinci to stage or commit changes.");
+            return { block: true, reason: "Blocked — the user did not ask Vinci to stage or commit changes." };
+          }
+          gitCheckpointApproved = true;
         }
-        gitCheckpointApproved = true;
       }
 
       // Catastrophic: fixed patterns + a recursive-force rm aimed at / or home. Only inspect rm's
@@ -948,7 +1100,11 @@ export default function (pi: ExtensionAPI) {
       const danger = confirmedClasses.has("dangerous") ? undefined : DANGEROUS.find(([re]) => re.test(riskText));
       const why = danger ? danger[1] : isRecursiveForceRm(riskText) ? "recursive force delete (rm -rf)" : null;
       if (why) {
-        if (!ctx.hasUI) return blockHeadless(why);
+        // [W2 bucket: KEEP-BLOCKING] Same class as the network-branch DANGEROUS check above, plus a
+        // non-root `rm -rf`. Destroys the work in progress. A lease over paths is not authority to
+        // delete them, and there is no version of "the Governor authorized rm -rf" that a run should
+        // infer for itself.
+        if (!ctx.hasUI) return headlessGate(pi, "dangerous-command", "keep-blocking", why);
         if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${why}):\n\n  ${cmd}\n\nRun it?`, cmd))) {
           ctx.ui.notify("Command blocked.", "info");
           return { block: true, reason: "Blocked — the user declined the risky command. Do not retry it or achieve the same effect another way; do what they asked differently, or ask them." };
@@ -964,7 +1120,20 @@ export default function (pi: ExtensionAPI) {
         if (g.list === OUTWARD && securityScopes.includes("network")) continue;
         const hit = g.list.find(([re]) => re.test(riskText));
         if (!hit || g.skip?.(riskText, hit[1])) continue;
-        if (!ctx.hasUI) return blockHeadless(hit[1]);
+        // [W2 buckets: KEEP-BLOCKING for DATABASE, ESCALATE for OUTWARD/SYSTEM] The non-network
+        // arrival at the same three lists the network site above already split, so it splits the
+        // same way and for the same reasons — a database migration is unreviewable and irreversible
+        // outside the tree (hard block), while publishing/deploying/altering the shared box is
+        // something the Governor could in principle authorize but the guard must never self-grant.
+        // Reaching this loop at all means the command was NOT network-shaped, so nothing here was
+        // already granted by the network PROCEED above.
+        if (!ctx.hasUI)
+          return headlessGate(
+            pi,
+            guardClass === "database" ? "consequential-database" : guardClass === "outward" ? "consequential-outward" : "consequential-system",
+            guardClass === "database" ? "keep-blocking" : "escalate",
+            hit[1],
+          );
         if (!(await confirmRisky(ctx, g.title, `Vinci wants to ${hit[1]}:\n\n  ${cmd}\n\nGo ahead?`, cmd))) {
           ctx.ui.notify("Held off — good call.", "info");
           return { block: true, reason: `Blocked — the user declined to ${hit[1]}. Don't run this; do what they asked another way, or ask them.` };
@@ -979,10 +1148,21 @@ export default function (pi: ExtensionAPI) {
       const swept = !named && isBroadGitStage(riskText) ? secretsAboutToBeStaged(ctx.cwd) : [];
       if (named || swept.length) {
         if (!ctx.hasUI) {
-          const held = blockHeadless(
+          // [W2 bucket: KEEP-BLOCKING] Committing a secret is the one action on this list that the
+          // worker's own success path makes WORSE: the publisher pushes the task branch and opens a
+          // PR, so a committed key is a published key, and git history keeps it after the fix. The
+          // git-checkpoint gate above is PROCEED precisely because this one is not — the commit is
+          // allowed, its contents are still policed.
+          const held = headlessGate(
+            pi,
+            "commit-secret-files",
+            "keep-blocking",
             "commit secret files to git",
             `If they shouldn't be in git, add ${swept.length ? swept.join(", ") : "them"} to .gitignore and commit the rest.`,
           );
+          // `keep-blocking` never returns undefined; the guard is here so a future re-bucketing of
+          // this site cannot silently fall through into the interactive branch with no UI.
+          if (!held) return undefined;
           recordFinalizationRefusal(ctx, "guard", cmd, held.reason);
           return held;
         }
@@ -1007,8 +1187,16 @@ export default function (pi: ExtensionAPI) {
       const input = event.input as { path?: unknown; file_path?: unknown; filePath?: unknown };
       const path = String(input.path ?? input.file_path ?? input.filePath ?? "");
       if (!path || !isSensitiveReadPath(path)) return undefined;
+      // [W2 bucket: ESCALATE] The structured-read twin of the shell credential read above; see that
+      // site for the full reasoning. Same verdict for the same reason: disclosure is not covered by
+      // a path claim, and the claim defaults to "." so keying disclosure on it would grant the whole
+      // repo by default. Escalating (not hard-blocking) is what turns the measured dead end into a
+      // BLOCKED the fleet can route on.
       if (!ctx.hasUI)
-        return blockHeadless(
+        return headlessGate(
+          pi,
+          "file-credential-read",
+          "escalate",
           `read ${path}, which may contain credentials`,
           "If the actual values aren't essential, inspect .env.example, schemas, or code references instead.",
         );
@@ -1166,7 +1354,12 @@ export default function (pi: ExtensionAPI) {
             reason: `Blocked — "${abs}" is in Vinci's internal bookkeeping mirror, not the project. Use a project-relative path such as "${rel}".`,
           };
         }
-        if (!ctx.hasUI) return blockHeadless(`change a file outside the project folder (${abs})`);
+        // [W2 bucket: KEEP-BLOCKING] Named as keep-blocking in the W2 spec, and the clean room makes
+        // it sharper: the attempt tree is the only surface the publisher captures, evidence bundles,
+        // or a reviewer sees. A write outside it is invisible to every downstream check and survives
+        // the attempt's teardown — the definition of an unreviewable change on a shared box.
+        if (!ctx.hasUI)
+          return headlessGate(pi, "outside-project-write", "keep-blocking", `change a file outside the project folder (${abs})`);
         // Confirm ONCE per session (not per edit) — a deliberate opt-in to work outside the project,
         // without nagging on every change.
         const ok = await confirmSafely(
@@ -1183,7 +1376,13 @@ export default function (pi: ExtensionAPI) {
 
       const hit = SENSITIVE_PATHS.find(([re]) => re.test(path));
       if (hit) {
-        if (!ctx.hasUI) return blockHeadless(`change ${hit[1]}`);
+        // [W2 bucket: KEEP-BLOCKING] SENSITIVE_PATHS is .env, .git/ internals, private keys and
+        // certificates, SSH keys, node_modules, lockfiles, and credentials dirs. Hand-writing any of
+        // them is not a confirmation a governed lease answers: writing a key or a .git/ internal is
+        // a safety question, and a lockfile is supposed to be produced by the package manager, so a
+        // model hand-editing one is exactly the case this guard exists for. The legitimate route
+        // (run the installer) is a network command, which the profile now lets through.
+        if (!ctx.hasUI) return headlessGate(pi, "sensitive-path-write", "keep-blocking", `change ${hit[1]}`);
         const ok = await confirmSafely(
           ctx,
           "Vinci — confirm a sensitive change",
