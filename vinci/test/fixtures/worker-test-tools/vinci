@@ -99,7 +99,9 @@ if (sessionDir && sessionId) {
     },
   });
 
-  if (outcome) appendFileSync(sessionFile, JSON.stringify(outcomeEntry(0)) + '\n');
+  if (outcome && process.env.FAKE_VINCI_SKIP_OUTCOME !== '1') {
+    appendFileSync(sessionFile, JSON.stringify(outcomeEntry(0)) + '\n');
+  }
 
   // Write usage if requested
   if (writeUsage) {

@@ -12,7 +12,7 @@ import {
 import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
-import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
+import { command, finalState, noCommitOutcome, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
 import { cleanRoomEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
@@ -451,7 +451,10 @@ async function postFinal(bus, message, envelope, state, evidence) {
     const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
     await bus.post("blocker", subject, terminalPostBody(reason), options);
   } else {
-    await bus.post("status", subject, body, options);
+    const statusBody = state.outcome?.reason
+      ? terminalPostBody(`${details} reason=${state.outcome.reason}`)
+      : body;
+    await bus.post("status", subject, statusBody, options);
   }
 }
 
@@ -709,14 +712,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
           diskFloorBytes: cleanRoom.diskFloorMb * 1048576,
         })
       : await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
-    if (cleanRoom) {
-      lifecycle.record({
-        attempt_dir: repository.attemptDir,
-        cache_ref: repository.cacheRef,
-        base_commit: repository.baseCommit,
-        stale_ref: repository.staleRef,
-      });
-    }
+    lifecycle.record({
+      base_commit: repository.baseCommit ?? null,
+      ...(cleanRoom
+        ? {
+            attempt_dir: repository.attemptDir,
+            cache_ref: repository.cacheRef,
+            stale_ref: repository.staleRef,
+          }
+        : {}),
+    });
     if (authorityLost) {
       // The lease was lost while cloning: nothing is spawned. BLOCKED lease_lost, no publish,
       // release `abandoned` — a resumed attempt re-acquires.
@@ -739,8 +744,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       env: cleanRoom ? cleanRoomEnv({ provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir }) : undefined,
       ...(lease ? { abortSignal: abortController.signal } : {}) });
     const head = await readHead(repository.repoDir);
+    const runOutcome = noCommitOutcome({ head, baseCommit: repository.baseCommit, outcome: run.outcome });
     if (lease) lifecycle.record({ lease: { ...lifecycle.snapshot().lease, ...lease } });
-    lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
+    lifecycle.record({ ...run, head, outcome: runOutcome });
     // Loss of authority (L2): NO publish at all — not even the branch push. The record says why.
     // Otherwise main's routing stands. `fence` is this attempt's fence in publisher.mjs's shape;
     // it is null when ungoverned, and the clean-room x fence combination never reaches here (it is
@@ -752,7 +758,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         : await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt, fence: lease ? fence : null });
     const fencedOut = authorityLost ?? published.fenced_out ?? null;
     if (!authorityLost && published.fenced_out) fencedOutReason = published.fenced_out;
-    const outcome = fencedOut ? { reason: fencedOut } : published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
+    const outcome = fencedOut ? { reason: fencedOut } : published.blocker_reason ? { reason: published.blocker_reason } : noCommitOutcome({ head, baseCommit: repository.baseCommit, outcome: runOutcome });
     const harnessStops = run.harness_stops ?? [];
     const intendedState = fencedOut
       ? "BLOCKED"

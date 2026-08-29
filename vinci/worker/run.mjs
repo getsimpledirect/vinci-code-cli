@@ -228,7 +228,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
       // Case (b): local is an ancestor (or equal) ⇒ -B is a fast-forward to the remote tip.
     }
     await command("git", ["-C", repoDir, "checkout", "-B", branch, remoteTip]);
-    return { branch, repoDir };
+    return { branch, repoDir, baseCommit: await readHead(repoDir) };
   }
   const localBranch = await command(
     "git",
@@ -237,7 +237,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
   );
   if (localBranch.status === 0) await command("git", ["-C", repoDir, "checkout", branch]);
   else await command("git", ["-C", repoDir, "checkout", "-b", branch, "origin/main"]);
-  return { branch, repoDir };
+  return { branch, repoDir, baseCommit: await readHead(repoDir) };
 }
 
 // `abortSignal` (optional, Wave 1B): an AbortSignal the daemon fires on LOSS OF AUTHORITY (the
@@ -348,6 +348,15 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
 export async function readHead(repoDir) {
   const result = await command("git", ["-C", repoDir, "rev-parse", "HEAD"], { allowFailure: true });
   return result.status === 0 ? result.stdout : null;
+}
+
+export function noCommitOutcome({ head, baseCommit, outcome }) {
+  if (!head || !baseCommit || head !== baseCommit) return outcome ?? null;
+  const priorOutcome = outcome && typeof outcome === "object" && !Array.isArray(outcome) ? outcome : {};
+  return {
+    ...priorOutcome,
+    reason: `no_commit: HEAD is unchanged from base_commit ${baseCommit}; the run produced no commit`,
+  };
 }
 
 export async function readHeadBlocker(repoDir) {
