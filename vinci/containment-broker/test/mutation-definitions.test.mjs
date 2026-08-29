@@ -21,22 +21,39 @@ test("mutation definitions cover every v3 authority-bearing invariant", () => {
     assert.ok(MUTATION_CASES.some((entry) => entry.join(" ").toLowerCase().includes(required.toLowerCase())), required);
   }
   assert.ok(NATIVE_LINUX_CASES.includes("transient_zero_one_zero_repopulation"));
+  for (const required of [
+    "queued_signal_before_clone_and_trampoline_boundary",
+    "fd_source_alias_and_reserved_destination_permutations",
+    "notification_replay_stale_id_two_writer_and_100000_call_census",
+    "unlinked_late_alternate_target_bootstrap_entry",
+    "wrong_cgroup_fd_retained_external_writer_and_late_repopulation",
+    "prelaunch_divergent_journal_response_loss_and_directory_fsync_failure",
+  ]) assert.ok(NATIVE_LINUX_CASES.includes(required), required);
 });
 
-test("native sources remain explicit unadmitted fail-closed artifacts", () => {
+test("native sources implement the reviewed boundary while admission remains categorically false", () => {
   const trampoline = readFileSync(new URL("../native/trampoline_linux.c", import.meta.url), "utf8");
   const launcher = readFileSync(new URL("../native/launcher_linux.c", import.meta.url), "utf8");
   const admission = JSON.parse(readFileSync(new URL("../native/native-admission.json", import.meta.url), "utf8"));
-  assert.match(trampoline, /unadmitted trampoline build refused/);
-  assert.match(trampoline, /return 126/);
-  assert.match(launcher, /return -ENOTSUP/);
+  assert.match(trampoline, /install_release_mediator/);
+  assert.match(trampoline, /__NR_execveat/);
+  assert.match(launcher, /CLONE_INTO_CGROUP \| CLONE_PIDFD/);
+  assert.match(launcher, /__NR_clone3/);
   assert.equal(admission.admitted, false);
   assert.equal(admission.binary_sha256, null);
+  assert.equal(admission.linux_build_receipt, null);
   assert.equal(admission.linux_test_receipt, null);
-  assert.equal(createHash("sha256").update(trampoline).digest("hex"), admission.trampoline_source_sha256);
-  assert.equal(createHash("sha256").update(launcher).digest("hex"), admission.launcher_source_sha256);
-  const protocol = readFileSync(new URL("../native/protocol.h", import.meta.url), "utf8");
-  assert.equal(createHash("sha256").update(protocol).digest("hex"), admission.protocol_header_sha256);
+  for (const [relative, field] of [
+    ["trampoline_linux.c", "trampoline_source_sha256"],
+    ["launcher_linux.c", "launcher_source_sha256"],
+    ["launcher_linux.h", "launcher_header_sha256"],
+    ["protocol.h", "protocol_header_sha256"],
+    ["sha256.c", "sha256_source_sha256"],
+    ["sha256.h", "sha256_header_sha256"],
+  ]) {
+    const bytes = readFileSync(new URL(`../native/${relative}`, import.meta.url));
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), admission[field]);
+  }
 });
 
 test("local evidence classification explicitly denies Linux containment proof", () => {

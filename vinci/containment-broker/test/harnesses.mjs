@@ -43,6 +43,20 @@ export const NATIVE_LINUX_CASES = Object.freeze([
   "root_forbidden_capabilities_group_and_namespace_drift",
   "unexpected_inherited_fd_and_writable_controller",
   "missing_partial_kill_and_malformed_events",
+  "queued_signal_before_clone_and_trampoline_boundary",
+  "fd_source_alias_and_reserved_destination_permutations",
+  "pidfd_getfd_eperm_yama_enosys_esrch_and_timeout",
+  "notification_replay_stale_id_two_writer_and_100000_call_census",
+  "unlinked_late_alternate_target_bootstrap_entry",
+  "target_wrong_context_key_exfiltration_and_first_syscall_violation",
+  "target_no_secret_at_exec_post_prctl_addfd_exact_fixed_fd_sequence",
+  "target_addfd_inherited_early_wrong_source_wrong_target_existing_duplicate_response_loss_and_stale_id",
+  "task_handle_close_reuse_endpoint_direction_and_clone_session_cgroup_substitution",
+  "wrong_cgroup_fd_retained_external_writer_and_late_repopulation",
+  "prelaunch_divergent_journal_response_loss_and_directory_fsync_failure",
+  "closing_and_terminal_after_link_before_directory_fsync_reconciliation",
+  "reconcile_reserved_bytes_wrong_directory_rollback_and_unknown_reap",
+  "target_policy_process_thread_namespace_network_fd_transfer_refusal",
 ]);
 
 export const EFFECT_CRASH_EDGES = Object.freeze([
