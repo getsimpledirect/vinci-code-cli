@@ -25,6 +25,7 @@ const VINCI_TERMINAL_BUDGET_ERROR =
 const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const MAX_RETRY_AFTER_MS = 300_000;
 const MAX_IN_FLIGHT_RETRIES = 3;
+const MAX_TOTAL_402_RETRIES = 10;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -34,10 +35,14 @@ function boundedRetryAfterMs(value: string | null | undefined, fallbackSeconds: 
 }
 
 export function vinciAffordableTokenLimit(errorBodyOrMessage: string | undefined): number | undefined {
-  const match = errorBodyOrMessage?.match(/\bcan (?:only )?afford\s+(\d+)\b/i);
+  const match = errorBodyOrMessage?.match(
+    /You requested up to ([0-9][0-9,]*) tokens, but can only afford ([0-9][0-9,]*)(?![0-9,])/i,
+  );
   if (!match) return undefined;
-  const tokens = Number(match[1]);
-  return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : undefined;
+  const numericTexts = [match[1], match[2]];
+  if (!numericTexts.every((value) => /^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(value))) return undefined;
+  const [requestedTokens, affordableTokens] = numericTexts.map((value) => Number(value.replaceAll(",", "")));
+  return Number.isSafeInteger(requestedTokens) && Number.isSafeInteger(affordableTokens) ? affordableTokens : undefined;
 }
 
 function parsedErrorBody(errorBodyOrMessage: string): Record<string, unknown> | undefined {
@@ -49,7 +54,7 @@ function parsedErrorBody(errorBodyOrMessage: string): Record<string, unknown> | 
   }
 }
 
-function isInFlightBudgetExhausted(errorBodyOrMessage: string): boolean {
+export function isInFlightBudgetExhausted(errorBodyOrMessage: string): boolean {
   return /in_flight_budget_exhausted/i.test(errorBodyOrMessage);
 }
 
@@ -132,7 +137,10 @@ function vinciClassModel(id: string, name: string) {
 export function vinciBudgetBlockedMessage(errorBodyOrMessage: string | undefined, taskId: string): string | undefined {
   if (!errorBodyOrMessage) return undefined;
 
-  if (isInFlightBudgetExhausted(errorBodyOrMessage) || vinciAffordableTokenLimit(errorBodyOrMessage)) {
+  if (
+    isInFlightBudgetExhausted(errorBodyOrMessage) ||
+    vinciAffordableTokenLimit(errorBodyOrMessage) !== undefined
+  ) {
     return undefined;
   }
 
@@ -243,6 +251,7 @@ export default function (pi: ExtensionAPI) {
   let affordableTokenLimit: number | undefined;
   let affordabilityRetryAttempted = false;
   let inFlightRetryCount = 0;
+  let total402RetryCount = 0;
 
   pi.registerProvider("vinci", {
     name: "Vinci (SimpleDirect)",
@@ -301,7 +310,8 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  pi.on("after_provider_response", (event) => {
+  pi.on("after_provider_response", (event, ctx) => {
+    if (ctx.model?.provider !== "vinci") return;
     if (event.status >= 200 && event.status < 300) {
       pending402RetryAfterMs = undefined;
       retryDelayMs = undefined;
@@ -318,7 +328,8 @@ export default function (pi: ExtensionAPI) {
     pending402RetryAfterMs = vinciRetryAfterMs(undefined, retryAfter);
   });
 
-  pi.on("before_provider_request", async (event) => {
+  pi.on("before_provider_request", async (event, ctx) => {
+    if (ctx.model?.provider !== "vinci") return;
     if (retryDelayMs !== undefined) {
       const delayMs = retryDelayMs;
       retryDelayMs = undefined;
@@ -344,14 +355,15 @@ export default function (pi: ExtensionAPI) {
     if (m.provider !== "vinci" && ctx.model?.provider !== "vinci") return;
     const em = m.errorMessage ?? "";
     if (isInFlightBudgetExhausted(em)) {
-      if (inFlightRetryCount < MAX_IN_FLIGHT_RETRIES) {
+      if (inFlightRetryCount < MAX_IN_FLIGHT_RETRIES && total402RetryCount < MAX_TOTAL_402_RETRIES) {
         inFlightRetryCount++;
+        total402RetryCount++;
         retryDelayMs = pending402RetryAfterMs ?? vinciRetryAfterMs(em);
         pending402RetryAfterMs = undefined;
         return {
           message: {
             ...m,
-            errorMessage: `OpenRouter's in-flight request limit is temporary; please retry this same model (${inFlightRetryCount}/${MAX_IN_FLIGHT_RETRIES}).`,
+            errorMessage: `OpenRouter's in-flight request limit is temporary; please retry your request on this same model (${inFlightRetryCount}/${MAX_IN_FLIGHT_RETRIES}).`,
           },
         };
       }
@@ -359,20 +371,24 @@ export default function (pi: ExtensionAPI) {
       return {
         message: {
           ...m,
-          errorMessage: `BLOCKED: provider — OpenRouter's in-flight request limit did not clear after ${MAX_IN_FLIGHT_RETRIES} retries. Your checkpoint is saved.`,
+          errorMessage:
+            total402RetryCount >= MAX_TOTAL_402_RETRIES
+              ? `BLOCKED: provider — Vinci stopped retrying after ${MAX_TOTAL_402_RETRIES} HTTP 402 retries in this session. Your checkpoint is saved.`
+              : `BLOCKED: provider — OpenRouter's in-flight request limit did not clear after ${MAX_IN_FLIGHT_RETRIES} retries. Your checkpoint is saved.`,
         },
       };
     }
     const affordableTokens = vinciAffordableTokenLimit(em);
     if (affordableTokens !== undefined) {
       pending402RetryAfterMs = undefined;
-      if (!affordabilityRetryAttempted) {
+      if (!affordabilityRetryAttempted && total402RetryCount < MAX_TOTAL_402_RETRIES) {
         affordabilityRetryAttempted = true;
+        total402RetryCount++;
         affordableTokenLimit = affordableTokens;
         return {
           message: {
             ...m,
-            errorMessage: `OpenRouter can serve this request with max_tokens=${affordableTokens}; please retry this same model once with the reduced limit.`,
+            errorMessage: `OpenRouter can serve this request with max_tokens=${affordableTokens}; please retry your request once on this same model with the reduced limit.`,
           },
         };
       }

@@ -7,6 +7,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const loader = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
 const provenance = await loader.import(resolve(here, "../extensions/vinci-model-provenance.ts"), { default: false });
 const provider = await loader.import(resolve(here, "../extensions/vinci-provider.ts"), { default: false });
+const retry = await loader.import(resolve(here, "../../packages/ai/src/utils/retry.ts"), { default: false });
 
 const IN_FLIGHT_BODY = JSON.stringify({
   message:
@@ -30,8 +31,8 @@ const OUT_OF_CREDIT_BODY = JSON.stringify({
 const with402 = (body) => Object.assign(new Error(body), { status: 402 });
 
 export function assert402Classifications(classify) {
-  assert.equal(classify(with402(IN_FLIGHT_BODY)), "transient", "in-flight 402 must be retryable");
-  assert.equal(classify(with402(AFFORDABILITY_BODY)), "transient", "affordability 402 must be retryable");
+  assert.equal(classify(with402(IN_FLIGHT_BODY)), "account", "in-flight 402 must not permit escalation fallback");
+  assert.equal(classify(with402(AFFORDABILITY_BODY)), "account", "affordability 402 must not permit escalation fallback");
   assert.equal(classify(with402(OUT_OF_CREDIT_BODY)), "account", "true out-of-credit 402 must stay terminal");
 }
 
@@ -43,8 +44,28 @@ export const parseAffordableTokenCount = provider.vinciAffordableTokenLimit;
 assert402Classifications(provenance.classifyVinciModelError);
 
 assert.equal(parseAffordableTokenCount(AFFORDABILITY_BODY), 23014);
-assert.equal(parseAffordableTokenCount("can afford 19 tokens"), 19);
+assert.equal(
+  parseAffordableTokenCount("You requested up to 131,072 tokens, but can only afford 23,014"),
+  23014,
+  "thousands separators must be stripped from both numbers",
+);
+assert.equal(
+  parseAffordableTokenCount("402 and 7: You requested up to 131072 tokens, but can only afford 23014; retry in 5"),
+  23014,
+  "unrelated numbers must not affect the canonical match",
+);
+assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can only afford 0"), 0);
+assert.equal(parseAffordableTokenCount("You requested up to -10 tokens, but can only afford 5"), undefined);
+assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can only afford -5"), undefined);
+assert.equal(parseAffordableTokenCount("can afford 19 tokens"), undefined);
+assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can afford 5"), undefined);
+assert.equal(parseAffordableTokenCount("You requested up to 1,00 tokens, but can only afford 5"), undefined);
+assert.equal(
+  parseAffordableTokenCount("You requested up to 9007199254740992 tokens, but can only afford 5"),
+  undefined,
+);
 assert.equal(parseAffordableTokenCount("credits exhausted"), undefined);
+assert.equal(typeof provider.isInFlightBudgetExhausted, "function");
 
 assert.equal(
   provider.vinciBudgetBlockedMessage(IN_FLIGHT_BODY, "retryable-402"),
@@ -100,12 +121,14 @@ assert.equal(provider.vinciRetryAfterMs(IN_FLIGHT_BODY, "120"), 120_000);
 await afterProviderResponse({ status: 402, headers: { "retry-after": "120" } }, context);
 const inFlightRetry = await messageEnd({ message: inFlightError }, context);
 assert.match(inFlightRetry?.message.errorMessage ?? "", /please retry/i, "in-flight 402 must signal a retry");
+assert.equal(retry.isRetryableAssistantError(inFlightRetry.message), true, "the core retry handler must consume it");
 assert.equal(inFlightRetry?.message.model, "fortissimo", "in-flight retry must not downgrade the model");
 await afterProviderResponse({ status: 200, headers: {} }, context);
 
 await afterProviderResponse({ status: 402, headers: {} }, context);
 const retryResult = await messageEnd({ message: affordabilityError }, context);
 assert.match(retryResult?.message.errorMessage ?? "", /please retry/i, "affordability must signal a retry");
+assert.equal(retry.isRetryableAssistantError(retryResult.message), true, "the core retry handler must consume it");
 
 const retriedPayload = await beforeProviderRequest(
   { payload: { model: "fortissimo", max_tokens: 131072, messages: [] } },
@@ -127,4 +150,15 @@ assert.doesNotMatch(
 assert.equal(secondFailure?.message.model, "fortissimo", "terminal handling must not downgrade the model");
 assert.deepEqual(context.model, { provider: "vinci", id: "fortissimo" }, "the active model must remain unchanged");
 
-console.log("402-classification-integration: 20/20 checks passed");
+await afterProviderResponse({ status: 200, headers: {} }, context);
+for (let retryNumber = 3; retryNumber <= 10; retryNumber++) {
+  await afterProviderResponse({ status: 402, headers: {} }, context);
+  const boundedRetry = await messageEnd({ message: affordabilityError }, context);
+  assert.match(boundedRetry?.message.errorMessage ?? "", /please retry/i, `402 retry ${retryNumber} must be allowed`);
+  await afterProviderResponse({ status: 200, headers: {} }, context);
+}
+await afterProviderResponse({ status: 402, headers: {} }, context);
+const retryCapResult = await messageEnd({ message: affordabilityError }, context);
+assert.doesNotMatch(retryCapResult?.message.errorMessage ?? "", /please retry/i, "the 11th 402 retry must be rejected");
+
+console.log("402-classification-integration: all checks passed");
