@@ -10,7 +10,8 @@ The daemon processes one handoff at a time and blocks until that task reaches a 
 vinci worker start --id <worker-id> \
   --server http://bus.example.com:8000 \
   [--once] [--poll-seconds 60] [--state-dir ~/.vinci-worker-state] \
-  [--governor http://governor:8100] [--require-governor]
+  [--governor http://governor:8100] [--require-governor] \
+  [--clean-room] [--disk-floor-mb 2048] [--keep-attempts 3]
 ```
 
 **Required:**
@@ -24,6 +25,8 @@ vinci worker start --id <worker-id> \
 - `--state-dir`: Persistent state directory (default `.vinci-worker-state`)
 - `--governor`: Governor URL (Stage 2). Once set, every task needs a granted lease — see "Governor Lease (fail-closed)"
 - `--require-governor` (or `VINCI_WORKER_REQUIRE_GOVERNOR=1`): refuse to start (exit 78) unless `--governor` is configured
+- `--clean-room` (or `VINCI_WORKER_CLEAN_ROOM=1`): a fresh worktree, an allowlisted environment and no push for every attempt — see "Clean room". **Off by default this wave**; it flips on after the chaos gate
+- `--disk-floor-mb` (or `VINCI_WORKER_DISK_FLOOR_MB`, default 2048), `--keep-attempts` (or `VINCI_WORKER_KEEP_ATTEMPTS`, default 3): clean-room bounds, ignored without `--clean-room`
 
 ## Supervision
 
@@ -206,7 +209,7 @@ the PR that was created out-of-band, or creates exactly one.
 **Fence.** An optional `fence: { generation?, check: async ({ stage }) => ({ valid, reason }) }`
 is consulted immediately before the push and again immediately before PR creation. `valid: false`
 — or a check that throws — skips that effect and records `fenced_out: <reason>`; a fence that
-fails before the push leaves nothing on origin. The hook point is `processHandoff(…, { fence })`
+fails before the push leaves nothing on origin. The hook point is `processHandoff(…, { fence, cleanRoom })`
 in `worker.mjs`; production passes `null` today, so **publishing under `--governor` is fenced
 only once the lease loop (#26) wires its fence there** (one line at the call site).
 
@@ -305,9 +308,13 @@ No new npm dependencies introduced; uses only node:* and global APIs.
   cursor.json                    # High-water mark per worker
   tasks/
     <id>.json                    # Lifecycle record
+  sessions/<id>/                 # vinci JSONL read for outcomes and usage (outside every tree)
+  debris/<id>/                   # shared-checkout mode: quarantined leavings of a prior run
   repos/
-    <name>/                      # Cloned repo
-      sessions/                  # vinci JSONL read for outcomes and usage
+    <name>/                      # shared-checkout mode (default): ONE tree per repo NAME
+  cache/<org>/<repo>.git         # clean-room mode: one bare cache per org/repo
+  attempts/<org>/<repo>/<id>/    # clean-room mode: one worktree per attempt (+ .home/.tmp/.hooks)
+    <attempt>/
 ```
 
 ## Build identity (W0.5)
@@ -401,6 +408,101 @@ The post-fix soak requires ONE exact build set: both worker boxes must show the 
 `online` posts before the cohort counts, and no `vinci binary changed` post may appear while it
 runs. A cohort whose task records carry two different `worker_build` or `vinci_binary` values
 is two cohorts.
+
+## Clean room (`--clean-room`, W1; default OFF this wave)
+
+What the default (shared-checkout) mode does, measured in soak cohort 2: one working tree per
+repo **name** under `<state-dir>/repos/<name>`, reused across attempts, tasks and orgs; stale local
+branches from an earlier attempt blocked a real continuation (rows 11/11b); the quarantine copies a
+prior run's residue aside (`debris/`) but the tree stays shared; and the spawned `vinci -p` inherits
+the daemon's whole environment — bus token, Governor token, `GH_TOKEN`, every provider key, AWS —
+so an agent could push from inside its sandbox. Publishing already happens in the daemon after the
+run (good), but with that same environment.
+
+`--clean-room` (`vinci/worker/cleanroom.mjs`) replaces the shared things with per-attempt ones. It
+flips on by default after the chaos gate; until then it is opt-in and the shared-checkout path is
+byte-for-byte what it was.
+
+| | shared checkout (default) | clean room (`--clean-room`) |
+|---|---|---|
+| Repository cache | none: the tree IS the clone | `<state-dir>/cache/<org>/<repo>.git`, one bare cache per **org/repo**, all heads fetched (pruned) before every attempt; its origin URL is checked on every reuse, so `a/repo` and `b/repo` can never share one |
+| Working tree | `<state-dir>/repos/<name>`, keyed by name only, reused by every attempt, task and org | `<state-dir>/attempts/<org>/<repo>/<task>/<attempt>/`, a fresh `git worktree add --detach <base>` for **every** attempt, never reused (a dir that already exists is an error) |
+| Base of an attempt | whatever the shared tree was left at; a stale local branch is fast-forwarded, refused, or renamed aside | `origin/<branch>` for a `branch:` envelope; otherwise `origin/worker/<task>` **when origin already has it** (attempt N published, then crashed or was resumed) and `origin/main` only when it does not — so attempt N+1's publish is a fast-forward, never a rejected non-fast-forward. Recorded as `base_commit` / `cache_ref` on the task. A previous attempt's local branch is renamed aside under `stale/…` in the cache (`stale_ref`), never deleted; if it holds commits that are NOT on `origin/worker/<task>`, the attempt is refused with shared mode's divergence reason (never-pushed residue is renamed aside first, the retry continues at `origin/worker/<task>`) — nothing is ever forced |
+| A crashed attempt | its residue is quarantined into `debris/` by the NEXT task | its dir is sealed read-only as evidence when the next attempt starts, and never re-entered; the resume of a RUNNING task is attempt N+1 in a new dir |
+| Child environment | the daemon's entire env | an **allowlist** (below): no bus/Governor/GitHub/AWS credentials, only the provider key the envelope names; the daemon's agent slot (`VINCI_CODING_AGENT_DIR` / `PI_CODING_AGENT_DIR`) never passes through |
+| Child HOME / TMPDIR | the daemon's | `<attempt>.home/` and `<attempt>.tmp/` beside the tree (never inside it, so they are neither in `git status` nor in the evidence diff); the child's agent slot is `<attempt>.home/agent`, empty unless `VINCI_WORKER_AUTH_FILE` opts one credential file in (below) |
+| `git push` from inside | works, with the daemon's credentials | the **default publish path is dead**, in the worktree AND in the bare cache (the `git-common-dir` every worktree can name): `remote.origin.pushurl=/dev/null` refuses `git push`, `git push origin`, `git push --no-verify origin` and `git -C <cache> push origin`; a `core.hooksPath` pre-push hook that exits 1 refuses `git push <literal url>`. This removes the **ambient** credentials and the default path; it does **not** stop a same-uid child that supplies its own — `git push --no-verify <literal url>` and `git remote add x <url> && git push --no-verify x` reach origin whenever the transport needs no credential the child lacks. See "What is still NOT isolated" |
+| Publishing | `git push` from the tree, `gh pr create` in the tree | `git push --no-verify <origin url> refs/heads/<branch>` **from the bare cache**, under the daemon's env (the literal URL sidesteps the cache's dead pushurl, `--no-verify` its hook — `-c remote.origin.pushurl=…` would not: pushurl is multi-valued, `-c` appends, and git still tries `/dev/null` first); `gh pr create -R <org>/<repo>` (no tree needed). The branch ref is shared between cache and worktree, so nothing is fetched, copied, unset or re-set anywhere to publish — the child never holds a working push at any point, and the cache's refusal is intact after every publish. **Capability rollback, not a variant:** this path is a fork of the PRE-#25 publisher. None of the standard publisher's guarantees apply here — no Governor fence, no remote-sha sample with `--force-with-lease`, no push read-back, no `alreadyOnRemote` idempotent retry (which is exactly #25's crash-window guarantee, and the crash window was MEASURED in this mode), no foreign-PR refusal, and no PR-head verification. **Today `fence` is null on every path** (nothing constructs one yet), so a `--governor --clean-room` run is NOT refused: it runs and publishes through this fork with none of the guarantees above. Once the lease loop (#26) supplies a fence, that combination is refused before the model is spawned (`clean_room_publish_unsupported`) rather than published under guarantees that are not in force. The fix is to route this mode through `publisher.publish()` with `repoDir = cacheDir`, threading the cache's own pushurl/hooks refusal — not to teach this fork a fence. |
+| Bounds | none | refuse to start an attempt when `<state-dir>` has less than `--disk-floor-mb` free (`0` disables the floor, on the flag and on `VINCI_WORKER_DISK_FLOOR_MB` alike; an unparsable or negative value refuses to start); keep the newest `--keep-attempts` (3) **evidence-uploaded** attempt dirs per task and prune older uploaded ones — never the newest, never the running one, and **never a dir without its `<attempt>.evidence_uploaded` marker** (a crashed or never-uploaded attempt's sealed dir is the only evidence there is, so it is not prunable by count; with no evidence configured nothing is ever pruned) |
+| Task record | as before | plus `attempt_dir`, `cache_ref`, `base_commit`, `stale_ref` |
+| Sessions, debris, evidence bundle | outside the tree | unchanged, outside the tree |
+
+**The child's environment (exact allowlist).** Copied verbatim from the daemon when set:
+`PATH`, `LANG`, `VINCI_ENV`, `VINCI_BASE_URL`, `VINCI_PLATFORM_URL`, `VINCI_NO_BOOTSTRAP_HEAL`,
+`VINCI_TOOL_BOOTSTRAP`, `VINCI_SHOW_OTHER_PROVIDERS`, `VINCI_SOURCE_CLI` — the variables
+`vinci/bin/vinci` and the install shim read to find the backend and the run mode. Plus **only** the
+key the envelope's `provider:` authenticates with: `OPENROUTER_API_KEY` for `openrouter`,
+`VINCI_API_KEY` for `vinci`, `VINCI_INTERNAL_DEEPINFRA_API_KEY` for `deepinfra` (an unknown provider
+gets no key and the launcher refuses it, as today). Set by the daemon, never copied: `HOME` and
+`TMPDIR` (per attempt), `VINCI_CODING_AGENT_DIR` and `PI_CODING_AGENT_DIR` (both spellings, both
+`<attempt>.home/agent` — the daemon's own slot is **not** passed through: it holds `auth.json` for
+every provider, every prior session and `bin/`), `VINCI_HOME` (the launcher's install root — the
+shim derives it from `HOME`, which is now the empty per-attempt one, so it is passed explicitly from
+the daemon's `VINCI_HOME` or `<daemon HOME>/.vinci-code`), `VINCI_UPDATE_DISABLED=1`. **Everything
+else is dropped**, in particular `VINCI_BUS_TOKEN`, `VINCI_GOVERNOR_TOKEN`, `GH_TOKEN`, `AWS_*`,
+`VINCI_EVIDENCE_URI_PREFIX` and every other provider's key.
+
+**Giving the child a login (`VINCI_WORKER_AUTH_FILE`).** A task that authenticates through a
+stored login rather than a provider key needs an `auth.json` in the child's slot, and the slot is
+empty by construction. The narrow opt-in is `VINCI_WORKER_AUTH_FILE=<path>` in the daemon's
+environment: before the spawn the clean room copies **that one file** (mode 0600) to
+`<attempt>.home/agent/auth.json` — nothing else from the daemon's slot, no sessions, no `bin/`. A
+set-but-missing path fails the attempt with `VINCI_WORKER_AUTH_FILE … does not exist` rather than
+running it logged out. Prefer a file that holds only the provider the envelope names. Because the child's `HOME` has no `~/.gitconfig`, the attempt
+worktree carries the daemon's `user.name`/`user.email` (or `vinci-worker <worker@vinci.invalid>`) in
+its worktree config, so the agent's commits work; and `~/.vinci-code.env` is NOT sourced for the
+child (a profile is a place to put secrets) — put what the child needs in the daemon's environment.
+
+**What is still NOT isolated — say it plainly.** The clean room is a guardrail against the
+measured failures (shared trees, stale branches, credential inheritance, pushing from inside), not
+a security boundary:
+
+- **No container, no VM, no user separation.** The child runs as the daemon's uid on the daemon's
+  box. It can read the daemon's files (state dir, sessions, other attempts' trees, the cache), and
+  it can run `git config --unset remote.origin.pushurl` or edit the hooks. The push refusals
+  remove the **default publish path**, nothing more. Verified open from inside an attempt
+  (`vinci/test/worker-clean-room.mjs` asserts each bypass's status, so closing one flips a test
+  deliberately): `git push --no-verify <literal url> HEAD:refs/heads/x` succeeds, and so does
+  `git remote add x <url> && git push --no-verify x` — a URL on the command line has no pushurl
+  and `--no-verify` skips the hook. `git -C "$(git rev-parse --git-common-dir)" push origin` (the
+  cache, i.e. the daemon's own publish path) is refused since the cache carries the same
+  refusals. What decides whether an open bypass lands is the **transport's credential**, and that
+  boundary is **HOME-keyed, not uid-keyed**: the clean room withholds the ambient env credentials
+  and gives the child an empty HOME, but a same-uid child can point `GH_CONFIG_DIR` or
+  `GIT_CONFIG_GLOBAL` at the daemon's HOME and reach the daemon's `gh auth` login or credential
+  helper; an SSH agent socket or an instance profile is reachable regardless of HOME; and on
+  **macOS the boundary is absent** — Apple git's system gitconfig sets
+  `credential.helper=osxkeychain` for every HOME, so any credential in the keychain is the
+  child's. A real boundary is a separate uid or a container; until then treat "push from inside
+  refused" as a guardrail against accidents, not against intent.
+- **`VINCI_HOME` is writable by the child.** The launcher's install root (`versions/`,
+  `updater/`) is passed explicitly and shared with the daemon; a child can modify the binary the
+  NEXT attempt runs under (`VINCI_UPDATE_DISABLED=1` stops the updater, not a write). Mitigation to
+  come: a read-only bind of `VINCI_HOME` or a separate uid; until then the recorded
+  `vinci_binary` version on every task is the tripwire, not a guard.
+- **No network allowlist.** The child can reach anything the box can reach.
+- **No CPU, memory or process limits** beyond the existing runtime/budget/deadline kills.
+- **Disk and retention are bounds, not quotas.** The floor refuses to START an attempt; it does not
+  stop a running one from filling the disk.
+
+Verified by `vinci/test/worker-clean-room.mjs` (real git; two attempts ⇒ two dirs and the first kept
+sealed; two tasks on one repo ⇒ no shared tree; `a/repo` vs `b/repo` ⇒ distinct caches; the
+allowlist with five planted secrets, end to end through the daemon; `git push` from inside refused
+on the default path — worktree and cache — while the daemon's publish still lands the branch and the
+PR, and the two open bypasses asserted open; attempt N+1 continuing at `origin/worker/<task>` after
+attempt N published, and the divergence refusal; the agent-slot cut-off and the one-file auth
+opt-in; marker-gated retention; the disk floor and the `0`/unparsable env values) and by the
+existing worker suite with the flag off.
 
 ## Network Access
 

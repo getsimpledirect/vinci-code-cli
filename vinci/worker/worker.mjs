@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
+import { cleanRoomEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
 import { readSessionState } from "./session-read.mjs";
@@ -83,7 +84,7 @@ async function announceBinaryChange(bus, stateDir, workerId) {
 }
 
 function usage() {
-  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor]";
+  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor] [--clean-room] [--disk-floor-mb 2048] [--keep-attempts 3]";
 }
 
 // EX_CONFIG (sysexits.h): the daemon refused to start because its configuration is incomplete.
@@ -97,18 +98,26 @@ function parseArgs(args, env = process.env) {
     stateDir: resolve(".vinci-worker-state"),
     governor: null,
     requireGovernor: env.VINCI_WORKER_REQUIRE_GOVERNOR === "1",
+    // W1 clean room (cleanroom.mjs). OFF by default this wave; `--clean-room` or
+    // VINCI_WORKER_CLEAN_ROOM=1 turns it on. The disk floor and retention only apply to it.
+    cleanRoom: env.VINCI_WORKER_CLEAN_ROOM === "1",
+    // F8: an env value is parsed exactly like its flag — "0" is an explicit disable of the disk
+    // floor, not "use the default"; an unparsable value is refused, not silently defaulted.
+    diskFloorMb: env.VINCI_WORKER_DISK_FLOOR_MB === undefined || env.VINCI_WORKER_DISK_FLOOR_MB === "" ? DEFAULT_DISK_FLOOR_MB : Number(env.VINCI_WORKER_DISK_FLOOR_MB),
+    keepAttempts: env.VINCI_WORKER_KEEP_ATTEMPTS === undefined || env.VINCI_WORKER_KEEP_ATTEMPTS === "" ? DEFAULT_KEEP_ATTEMPTS : Number(env.VINCI_WORKER_KEEP_ATTEMPTS),
   };
   const seen = new Set();
   while (args.length > 0) {
     const argument = args.shift();
-    if (argument === "--once" || argument === "--require-governor") {
+    if (argument === "--once" || argument === "--require-governor" || argument === "--clean-room") {
       if (seen.has(argument)) throw new Error(`duplicate option: ${argument}`);
       seen.add(argument);
       if (argument === "--once") options.once = true;
+      else if (argument === "--clean-room") options.cleanRoom = true;
       else options.requireGovernor = true;
       continue;
     }
-    if (!["--id", "--server", "--poll-seconds", "--state-dir", "--governor"].includes(argument)) {
+    if (!["--id", "--server", "--poll-seconds", "--state-dir", "--governor", "--disk-floor-mb", "--keep-attempts"].includes(argument)) {
       throw new Error(`unknown option: ${argument}\n${usage()}`);
     }
     if (seen.has(argument)) throw new Error(`duplicate option: ${argument}`);
@@ -119,8 +128,12 @@ function parseArgs(args, env = process.env) {
     else if (argument === "--server") options.server = value;
     else if (argument === "--state-dir") options.stateDir = resolve(value);
     else if (argument === "--governor") options.governor = value;
+    else if (argument === "--disk-floor-mb") options.diskFloorMb = Number(value);
+    else if (argument === "--keep-attempts") options.keepAttempts = Number(value);
     else options.pollSeconds = Number(value);
   }
+  if (!Number.isFinite(options.diskFloorMb) || options.diskFloorMb < 0) throw new Error("--disk-floor-mb / VINCI_WORKER_DISK_FLOOR_MB must be a non-negative number (0 disables the floor)");
+  if (!Number.isInteger(options.keepAttempts) || options.keepAttempts < 1) throw new Error("--keep-attempts / VINCI_WORKER_KEEP_ATTEMPTS must be a positive integer");
   if (options.requireGovernor && !options.governor) {
     // W0.1: a Governor was REQUIRED but none configured. Refuse to start rather than run a
     // single ungoverned poll. This is the FIRST check after option parsing — ahead of the bus
@@ -343,9 +356,12 @@ async function postFinal(bus, message, envelope, state, evidence) {
   }
 }
 
+// One options object rather than a third positional parameter: #25 (fence), #24
+// (cleanRoom) and #26 (lease loop) all extend this signature, and positional adds
+// silently reorder under a rebase.
 // `fence` is the publish-time fence hook point ({ generation?, check: async ({stage}) => {valid, reason} }).
 // Production passes null today; the lease loop (#26) supplies it with one line at the call site.
-async function processHandoff(bus, stateDir, message, governorUrl, workerId, { fence = null } = {}) {
+async function processHandoff(bus, stateDir, message, governorUrl, workerId, { fence = null, cleanRoom = null } = {}) {
   const taskId = message.message_id;
   try {
     assertTaskId(taskId);
@@ -395,6 +411,27 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     return true;
   }
 
+  // #25 x #24. publishFromCache is a fork of the PRE-#25 publisher: besides the
+  // fence it lacks the remote-sha sample + --force-with-lease, the push read-back,
+  // the alreadyOnRemote idempotent retry (which IS #25's crash-window guarantee,
+  // and the clean room is the mode where that window was measured), the foreign-PR
+  // refusal and the PR-head check. So under --clean-room a governed run would
+  // publish through a path with none of the guarantees the Governor is being told
+  // are in force. Refused here, BEFORE the model is spawned, so an unsupported
+  // configuration costs nothing rather than producing a paid commit that can never
+  // be published. The fix is to route the clean room through publisher.publish()
+  // with repoDir = cacheDir (threading the cache's own pushurl/hooks refusal), not
+  // to teach this fork a fence.
+  //
+  // UNEXERCISED: `fence` is null on every path today, so no test can reach this.
+  // Wiring the fence (#26) MUST add the clean-room x fence test in the same change.
+  if (cleanRoom && fence) {
+    const reason = "clean_room_publish_unsupported: --clean-room publishes from the bare cache, which does not honour a Governor fence and lacks the idempotent-retry, lease, read-back, foreign-PR and PR-head guarantees of the standard publisher; refusing before the run rather than publishing under guarantees that are not in force";
+    lifecycle.transition("BLOCKED", { outcome: { reason } });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
+    return true;
+  }
+
   if (attempt.firstAttempt) {
     await bus.post("status", `task ${taskId} claimed`, `claimed ${taskId} attempt ${attempt.attempt}`, {
       inReplyTo: message.message_id,
@@ -439,7 +476,26 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       });
     }
 
-    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
+    // W1 clean room: a fresh worktree per attempt from a per-org/repo bare cache, an allowlisted
+    // child env, and publishing from the cache. Shared-checkout mode is byte-for-byte the old path.
+    const repository = cleanRoom
+      ? await prepareCleanRoom({
+          stateDir,
+          repo: envelopeToUse.repo,
+          taskId,
+          attempt: attempt.attempt,
+          branchOverride: envelopeToUse.branch,
+          diskFloorBytes: cleanRoom.diskFloorMb * 1048576,
+        })
+      : await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
+    if (cleanRoom) {
+      lifecycle.record({
+        attempt_dir: repository.attemptDir,
+        cache_ref: repository.cacheRef,
+        base_commit: repository.baseCommit,
+        stale_ref: repository.staleRef,
+      });
+    }
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
     // which can take long enough for an operator update to land — and stamp the task with it.
     // runVinci spawns with VINCI_UPDATE_DISABLED=1, so nothing can change between this probe
@@ -450,10 +506,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     lifecycle.transition("RUNNING");
     const run = await runVinci({ envelope: envelopeToUse,
       stateDir,
-      taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId });
+      taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId,
+      env: cleanRoom ? cleanRoomEnv({ provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir }) : undefined });
     const head = await readHead(repository.repoDir);
     lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
-    const published = await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt, fence });
+    const published = cleanRoom
+      ? await publishFromCache({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId })
+      : await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt, fence });
     const outcome = published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
     const harnessStops = run.harness_stops ?? [];
     const intendedState = finalState({
@@ -493,6 +552,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       "origin/main...HEAD",
     ], { allowFailure: true });
     const gitDiff = gitDiffResult.status === 0 ? gitDiffResult.stdout : null;
+    // The attempt is over and its diff is captured: seal the tree (evidence, read-only). Retention
+    // runs AFTER the evidence upload below, because only an uploaded attempt is prunable (F6).
+    if (cleanRoom) sealAttemptDir(repository.attemptDir);
     const logTail = recentLogTail(200);
     const evidenceResult = await uploadEvidence({
       sessionJsonl,
@@ -510,6 +572,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     // a COMPLETED claim without evidence is not a completed claim -> UNVERIFIED.
     // BLOCKED/FAILED keep their state but record why evidence is missing.
     const evidenceError = evidenceResult && !evidenceResult.success ? evidenceResult.error : null;
+    if (cleanRoom) {
+      // F6: the marker that makes this attempt's sealed dir prunable is written ONLY after its
+      // bundle landed (uploaded: true, set solely after a successful `aws s3 cp`). No evidence
+      // configured, or a failed upload ⇒ no marker ⇒ the dir is the only evidence and is kept.
+      // Retention then applies to marked dirs: never the newest, never this attempt.
+      if (evidenceResult?.uploaded === true) {
+        markEvidenceUploaded({ stateDir, repo: envelopeToUse.repo, taskId, attempt: attempt.attempt, uri: evidenceResult.uri, sha256: evidenceResult.sha256 });
+      }
+      await pruneAttempts({ stateDir, repo: envelopeToUse.repo, taskId, keep: cleanRoom.keepAttempts, protect: attempt.attempt });
+    }
     const state = evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
     lifecycle.transition(state, {
       ...planned,
@@ -531,6 +603,11 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   mkdirSync(options.stateDir, { recursive: true });
+  if (options.cleanRoom) {
+    // The effective bounds, on stderr once per start, so an operator (and the F8 test) can see
+    // what "0" or an env value resolved to instead of inferring it from a later refusal.
+    process.stderr.write(`vinci worker: clean room on (disk floor ${options.diskFloorMb} MiB${options.diskFloorMb === 0 ? ", disabled" : ""}, keep ${options.keepAttempts} attempts)\n`);
+  }
   const releaseLock = acquireDaemonLock(options.stateDir, options.id);
   const handleSignal = () => {
     releaseLock();
@@ -558,7 +635,8 @@ async function main() {
       let cursor = loadCursor(options.stateDir, options.id);
       const messages = await bus.poll(options.id, cursor);
       for (const message of messages) {
-        if (!(await processHandoff(bus, options.stateDir, message, options.governor, options.id))) continue;
+        const cleanRoom = options.cleanRoom ? { diskFloorMb: options.diskFloorMb, keepAttempts: options.keepAttempts } : null;
+        if (!(await processHandoff(bus, options.stateDir, message, options.governor, options.id, { cleanRoom }))) continue;
         cursor = advanceCursor(cursor, message);
         saveCursor(options.stateDir, options.id, cursor);
       }
