@@ -10,7 +10,8 @@ The daemon processes one handoff at a time and blocks until that task reaches a 
 vinci worker start --id <worker-id> \
   --server http://bus.example.com:8000 \
   [--once] [--poll-seconds 60] [--state-dir ~/.vinci-worker-state] \
-  [--governor http://governor:8100] [--require-governor]
+  [--governor http://governor:8100] [--require-governor] \
+  [--clean-room] [--disk-floor-mb 2048] [--keep-attempts 3]
 ```
 
 **Required:**
@@ -24,6 +25,8 @@ vinci worker start --id <worker-id> \
 - `--state-dir`: Persistent state directory (default `.vinci-worker-state`)
 - `--governor`: Governor URL (Stage 2). Once set, every task needs a granted lease — see "Governor Lease (fail-closed)"
 - `--require-governor` (or `VINCI_WORKER_REQUIRE_GOVERNOR=1`): refuse to start (exit 78) unless `--governor` is configured
+- `--clean-room` (or `VINCI_WORKER_CLEAN_ROOM=1`): a fresh worktree, an allowlisted environment and no push for every attempt — see "Clean room". **Off by default this wave**; it flips on after the chaos gate
+- `--disk-floor-mb` (or `VINCI_WORKER_DISK_FLOOR_MB`, default 2048), `--keep-attempts` (or `VINCI_WORKER_KEEP_ATTEMPTS`, default 3): clean-room bounds, ignored without `--clean-room`
 
 ## Supervision
 
@@ -305,9 +308,13 @@ No new npm dependencies introduced; uses only node:* and global APIs.
   cursor.json                    # High-water mark per worker
   tasks/
     <id>.json                    # Lifecycle record
+  sessions/<id>/                 # vinci JSONL read for outcomes and usage (outside every tree)
+  debris/<id>/                   # shared-checkout mode: quarantined leavings of a prior run
   repos/
-    <name>/                      # Cloned repo
-      sessions/                  # vinci JSONL read for outcomes and usage
+    <name>/                      # shared-checkout mode (default): ONE tree per repo NAME
+  cache/<org>/<repo>.git         # clean-room mode: one bare cache per org/repo
+  attempts/<org>/<repo>/<id>/    # clean-room mode: one worktree per attempt (+ .home/.tmp/.hooks)
+    <attempt>/
 ```
 
 ## Build identity (W0.5)
@@ -401,6 +408,72 @@ The post-fix soak requires ONE exact build set: both worker boxes must show the 
 `online` posts before the cohort counts, and no `vinci binary changed` post may appear while it
 runs. A cohort whose task records carry two different `worker_build` or `vinci_binary` values
 is two cohorts.
+
+## Clean room (`--clean-room`, W1; default OFF this wave)
+
+What the default (shared-checkout) mode does, measured in soak cohort 2: one working tree per
+repo **name** under `<state-dir>/repos/<name>`, reused across attempts, tasks and orgs; stale local
+branches from an earlier attempt blocked a real continuation (rows 11/11b); the quarantine copies a
+prior run's residue aside (`debris/`) but the tree stays shared; and the spawned `vinci -p` inherits
+the daemon's whole environment — bus token, Governor token, `GH_TOKEN`, every provider key, AWS —
+so an agent could push from inside its sandbox. Publishing already happens in the daemon after the
+run (good), but with that same environment.
+
+`--clean-room` (`vinci/worker/cleanroom.mjs`) replaces the shared things with per-attempt ones. It
+flips on by default after the chaos gate; until then it is opt-in and the shared-checkout path is
+byte-for-byte what it was.
+
+| | shared checkout (default) | clean room (`--clean-room`) |
+|---|---|---|
+| Repository cache | none: the tree IS the clone | `<state-dir>/cache/<org>/<repo>.git`, one bare cache per **org/repo**, all heads fetched (pruned) before every attempt; its origin URL is checked on every reuse, so `a/repo` and `b/repo` can never share one |
+| Working tree | `<state-dir>/repos/<name>`, keyed by name only, reused by every attempt, task and org | `<state-dir>/attempts/<org>/<repo>/<task>/<attempt>/`, a fresh `git worktree add --detach <base>` for **every** attempt, never reused (a dir that already exists is an error) |
+| Base of an attempt | whatever the shared tree was left at; a stale local branch is fast-forwarded, refused, or renamed aside | always `origin/main` (or `origin/<branch>` for a `branch:` envelope), recorded as `base_commit` / `cache_ref` on the task; a previous attempt's branch is renamed aside under `stale/…` in the cache (`stale_ref`), never deleted |
+| A crashed attempt | its residue is quarantined into `debris/` by the NEXT task | its dir is sealed read-only as evidence when the next attempt starts, and never re-entered; the resume of a RUNNING task is attempt N+1 in a new dir |
+| Child environment | the daemon's entire env | an **allowlist** (below): no bus/Governor/GitHub/AWS credentials, only the provider key the envelope names |
+| Child HOME / TMPDIR | the daemon's | `<attempt>.home/` and `<attempt>.tmp/` beside the tree (never inside it, so they are neither in `git status` nor in the evidence diff) |
+| `git push` from inside | works, with the daemon's credentials | refused: worktree-scoped `remote.origin.pushurl=/dev/null` (kills `git push`, `git push origin`, and `--no-verify`) plus a `core.hooksPath` pre-push hook that exits 1 (kills `git push <literal url>`) |
+| Publishing | `git push` from the tree, `gh pr create` in the tree | `git push origin refs/heads/<branch>` **from the bare cache**, under the daemon's env; `gh pr create -R <org>/<repo>` (no tree needed). The branch ref is shared between cache and worktree, so nothing is fetched, copied, unset or re-set in the attempt dir to publish — the child never holds a working push at any point |
+| Bounds | none | refuse to start an attempt when `<state-dir>` has less than `--disk-floor-mb` free; keep the newest `--keep-attempts` (3) attempt dirs per task, prune older ones (never the newest, never the running one) |
+| Task record | as before | plus `attempt_dir`, `cache_ref`, `base_commit`, `stale_ref` |
+| Sessions, debris, evidence bundle | outside the tree | unchanged, outside the tree |
+
+**The child's environment (exact allowlist).** Copied verbatim from the daemon when set:
+`PATH`, `LANG`, `VINCI_ENV`, `VINCI_BASE_URL`, `VINCI_PLATFORM_URL`, `VINCI_CODING_AGENT_DIR`,
+`PI_CODING_AGENT_DIR`, `VINCI_NO_BOOTSTRAP_HEAL`, `VINCI_TOOL_BOOTSTRAP`, `VINCI_SHOW_OTHER_PROVIDERS`,
+`VINCI_SOURCE_CLI` — the variables `vinci/bin/vinci` and the install shim read to find the backend,
+the auth slot and the run mode. Plus **only** the key the envelope's `provider:` authenticates with:
+`OPENROUTER_API_KEY` for `openrouter`, `VINCI_API_KEY` for `vinci`,
+`VINCI_INTERNAL_DEEPINFRA_API_KEY` for `deepinfra` (an unknown provider gets no key and the launcher
+refuses it, as today). Set by the daemon, never copied: `HOME` and `TMPDIR` (per attempt),
+`VINCI_HOME` (the launcher's install root — the shim derives it from `HOME`, which is now the empty
+per-attempt one, so it is passed explicitly from the daemon's `VINCI_HOME` or
+`<daemon HOME>/.vinci-code`), `VINCI_UPDATE_DISABLED=1`. **Everything else is dropped**, in
+particular `VINCI_BUS_TOKEN`, `VINCI_GOVERNOR_TOKEN`, `GH_TOKEN`, `AWS_*`, `VINCI_EVIDENCE_URI_PREFIX`
+and every other provider's key. Because the child's `HOME` has no `~/.gitconfig`, the attempt
+worktree carries the daemon's `user.name`/`user.email` (or `vinci-worker <worker@vinci.invalid>`) in
+its worktree config, so the agent's commits work; and `~/.vinci-code.env` is NOT sourced for the
+child (a profile is a place to put secrets) — put what the child needs in the daemon's environment.
+
+**What is still NOT isolated — say it plainly.** The clean room is a guardrail against the
+measured failures (shared trees, stale branches, credential inheritance, pushing from inside), not
+a security boundary:
+
+- **No container, no VM, no user separation.** The child runs as the daemon's uid on the daemon's
+  box. It can read the daemon's files (state dir, sessions, other attempts' trees, the cache), and
+  it can run `git config --worktree --unset remote.origin.pushurl` or edit the hook — what it
+  cannot do afterwards is authenticate to origin, because the credentials are not in its
+  environment. A credential that reaches the box any other way (an ambient `gh auth` login, an
+  SSH agent socket, an instance profile) is reachable from inside.
+- **No network allowlist.** The child can reach anything the box can reach.
+- **No CPU, memory or process limits** beyond the existing runtime/budget/deadline kills.
+- **Disk and retention are bounds, not quotas.** The floor refuses to START an attempt; it does not
+  stop a running one from filling the disk.
+
+Verified by `vinci/test/worker-clean-room.mjs` (real git; two attempts ⇒ two dirs and the first kept
+sealed; two tasks on one repo ⇒ no shared tree; `a/repo` vs `b/repo` ⇒ distinct caches; the
+allowlist with five planted secrets, end to end through the daemon; `git push` from inside refused
+three ways while the daemon's publish still lands the branch and the PR; retention and the disk
+floor) and by the existing worker suite with the flag off.
 
 ## Network Access
 

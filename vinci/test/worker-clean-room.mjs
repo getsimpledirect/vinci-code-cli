@@ -127,7 +127,7 @@ git(t1a2.attemptDir, "commit", "-qm", "attempt 2 result");
 const attempt2Head = git(t1a2.attemptDir, "rev-parse", "HEAD");
 const insidePush = gitTry(t1a2.attemptDir, ["push", "origin", "HEAD"]);
 assert.notEqual(insidePush.status, 0, "git push origin from inside the attempt must fail");
-assert.equal(git(t1a2.attemptDir, "config", "--get", "remote.origin.pushurl"), "/dev/null", "origin's push URL is dead inside the attempt");
+assert.equal(gitTry(t1a2.attemptDir, ["config", "--get", "remote.origin.pushurl"]).stdout.trim(), "/dev/null", "origin's push URL is dead inside the attempt");
 assert.equal(gitTry(t1a1.cacheDir, ["config", "--get", "remote.origin.pushurl"]).status, 1, "…but NOT in the cache (worktree-scoped)");
 const noVerifyPush = gitTry(t1a2.attemptDir, ["push", "--no-verify", "origin", "HEAD"]);
 assert.notEqual(noVerifyPush.status, 0, "git push --no-verify origin (hook bypassed) still fails: the pushurl is what stops it");
