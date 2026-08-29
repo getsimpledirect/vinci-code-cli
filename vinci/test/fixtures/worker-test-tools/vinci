@@ -117,6 +117,19 @@ if (sessionDir && sessionId) {
   }
 
   if (process.env.FAKE_VINCI_WORKTREE_BLOCKER === '1') writeFileSync(resolve('BLOCKER.md'), 'working tree only\n');
+  // Wave 1B output modes: FAKE_VINCI_COMMIT_FILE=<name> makes the fake agent produce real work —
+  // a new file committed in the task checkout (cwd) — so patch/artifact/branch publishing has
+  // something to carry. FAKE_VINCI_UNTRACKED_FILE=<name> leaves an untracked file behind instead.
+  if (process.env.FAKE_VINCI_COMMIT_FILE) {
+    const { execFileSync } = await import('node:child_process');
+    writeFileSync(resolve(process.env.FAKE_VINCI_COMMIT_FILE), `produced by fake vinci ${sessionId}\n`);
+    const git = (...args) => execFileSync('git', args, { stdio: 'pipe' });
+    git('config', 'user.email', 'fake@vinci.test');
+    git('config', 'user.name', 'fake vinci');
+    git('add', '--', process.env.FAKE_VINCI_COMMIT_FILE);
+    git('commit', '-qm', `fake vinci: ${process.env.FAKE_VINCI_COMMIT_FILE}`);
+  }
+  if (process.env.FAKE_VINCI_UNTRACKED_FILE) writeFileSync(resolve(process.env.FAKE_VINCI_UNTRACKED_FILE), 'untracked deliverable\n');
 
   // Sleep if requested
   if (sleepMs > 0) {

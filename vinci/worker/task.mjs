@@ -266,8 +266,16 @@ export function materializeEnvelope(triple, registry, opts = {}) {
   const order = registry.work_order;
   if (!isRecord(order)) refuse("registry_malformed", "registry answer carries no work_order");
 
-  // 1. contract identity
-  const contractDigest = workOrderDigest(order);
+  // 1. contract identity — F3: the digest is computed ONLY over a record the vendored upstream
+  // validator accepts (every required key present, no unknown key, schemaVersion 3). An invalid
+  // served order is refused as `invalid_work_order` before its bytes are ever hashed, so a
+  // record that merely reproduces the handed digest cannot get through on identity alone.
+  let contractDigest;
+  try {
+    contractDigest = workOrderDigest(order);
+  } catch (error) {
+    refuse("invalid_work_order", `served work order fails validation: ${describeIssues(error)}`);
+  }
   if (contractDigest !== triple.contract_digest) {
     refuse("contract_digest_mismatch", `served work order digests to ${contractDigest.slice(0, 8)}, handoff names ${triple.contract_digest.slice(0, 8)}`);
   }
@@ -275,13 +283,22 @@ export function materializeEnvelope(triple, registry, opts = {}) {
   // 2. execution-spec identity: select by recomputed digest, never by position
   const specs = candidateSpecs(registry);
   if (specs.length === 0) refuse("registry_malformed", "registry answer carries no execution spec");
-  const spec = specs.find((candidate) => {
+  // F3: a candidate is hashed only after it validates; an invalid candidate can never be "the
+  // spec" (its digest is not computed), and when no valid candidate matches, an invalid one is
+  // reported as `invalid_execution_spec` rather than hidden behind a digest mismatch.
+  let spec = null;
+  const invalid = [];
+  for (const candidate of specs) {
     try {
-      return executionSpecDigest(candidate) === triple.execution_spec_digest;
-    } catch {
-      return false;
+      if (executionSpecDigest(candidate) === triple.execution_spec_digest) {
+        spec = candidate;
+        break;
+      }
+    } catch (error) {
+      invalid.push(describeIssues(error));
     }
-  });
+  }
+  if (!spec && invalid.length > 0) refuse("invalid_execution_spec", `served execution spec fails validation: ${invalid[0]}`);
   if (!spec) {
     refuse("execution_spec_digest_mismatch", `none of ${specs.length} served spec(s) digests to ${triple.execution_spec_digest.slice(0, 8)}`);
   }
@@ -324,6 +341,13 @@ export function materializeEnvelope(triple, registry, opts = {}) {
     refuse("invalid_spec_field", error.message);
   }
   if (typeof spec.baseCommit !== "string" || !COMMIT.test(spec.baseCommit)) refuse("invalid_spec_field", "baseCommit is a full 40-character lowercase hex SHA-1");
+  // F4: baseRef is REQUIRED (the base checkout fetches origin/<baseRef> and proves baseCommit is
+  // an ancestor of it) and held to the same plain-branch rule as targetBranch.
+  try {
+    assertPlainBranch(spec.baseRef, "baseRef");
+  } catch (error) {
+    refuse("invalid_spec_field", error.message);
+  }
   const bounds = spec.resourceBounds;
   if (!isRecord(bounds)) refuse("invalid_spec_field", "resourceBounds is an object");
   if (!Number.isSafeInteger(bounds.budgetMicrousd) || bounds.budgetMicrousd < 0) refuse("invalid_spec_field", "budgetMicrousd is a non-negative safe integer");
@@ -378,6 +402,7 @@ export function materializeEnvelope(triple, registry, opts = {}) {
       promotion: spec.promotion,
       output: spec.output,
       base_commit: spec.baseCommit,
+      base_ref: spec.baseRef,
       tools,
     },
     contract: {
@@ -385,7 +410,7 @@ export function materializeEnvelope(triple, registry, opts = {}) {
       contract_digest: contractDigest,
       execution_spec_digest: triple.execution_spec_digest,
       base_commit: spec.baseCommit,
-      base_ref: typeof spec.baseRef === "string" ? spec.baseRef : null,
+      base_ref: spec.baseRef,
       promotion: spec.promotion,
       output: spec.output,
       model_class: spec.modelClass,
@@ -394,6 +419,13 @@ export function materializeEnvelope(triple, registry, opts = {}) {
       required_capabilities: requiredCapabilities,
     },
   };
+}
+
+// `<path> <code>[; …]` for a digest validator's `.issues`, or the bare message when it has none.
+function describeIssues(error) {
+  const issues = Array.isArray(error?.issues) ? error.issues : [];
+  if (issues.length === 0) return error?.message ?? "invalid record";
+  return issues.slice(0, 3).map((i) => `${i.path || "/"} ${i.code}`).join("; ") + (issues.length > 3 ? `; +${issues.length - 3} more` : "");
 }
 
 function renderRequest(order) {

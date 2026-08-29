@@ -1,6 +1,6 @@
 // Test fixture for worker integration tests.
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -81,6 +81,69 @@ export class WorkerTestFixture {
     return { origin, cloneUrl: `file://${origin}` };
   }
 
+  // Add one commit to <org>/<name> on `branch` (created from the current tip of `from` when it
+  // does not exist yet) and push it. Returns the new commit sha. Used to build a remote whose
+  // history has more than one commit, so a pinned baseCommit can be a genuine non-tip ancestor.
+  commitToRepo(org, name, files, { branch = "main", from = "main", message = "more" } = {}) {
+    const origin = join(this.reposDir, org, `${name}.git`);
+    const temporary = join(this.tempDir, `git-${org}-${name}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
+    runGit(["clone", "-q", `file://${origin}`, temporary], this.tempDir);
+    runGit(["-C", temporary, "config", "user.email", "test@test.com"], this.tempDir);
+    runGit(["-C", temporary, "config", "user.name", "Test"], this.tempDir);
+    const exists = spawnSync("git", ["-C", temporary, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]).status === 0;
+    if (exists) runGit(["-C", temporary, "checkout", "-q", "-B", branch, `origin/${branch}`], this.tempDir);
+    else runGit(["-C", temporary, "checkout", "-q", "-b", branch, `origin/${from}`], this.tempDir);
+    for (const [path, contents] of Object.entries(files)) {
+      const target = join(temporary, path);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, contents);
+    }
+    runGit(["-C", temporary, "add", "-A"], this.tempDir);
+    runGit(["-C", temporary, "commit", "-qm", message], this.tempDir);
+    runGit(["-C", temporary, "push", "-q", "origin", `${branch}:${branch}`], this.tempDir);
+    const sha = runGit(["-C", temporary, "rev-parse", "HEAD"], this.tempDir);
+    rmSync(temporary, { recursive: true });
+    return sha;
+  }
+
+  // Put a RECORDING git on the daemon's PATH: every git argv the daemon (or anything it spawns)
+  // runs is appended to <tempDir>/git-calls.jsonl before the real git executes it. Lets a test
+  // assert "no transfer happened" (fetch/clone/ls-remote/push) or count pushes per output mode.
+  recordGit() {
+    mkdirSync(this.toolsDir, { recursive: true });
+    const realGit = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+    this.gitRecordFile = join(this.tempDir, "git-calls.jsonl");
+    writeFileSync(this.gitRecordFile, "");
+    writeFileSync(join(this.toolsDir, "package.json"), '{"type":"module"}\n');
+    writeFileSync(
+      join(this.toolsDir, "git"),
+      `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+appendFileSync(${JSON.stringify(this.gitRecordFile)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+const r = spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), { stdio: "inherit" });
+process.exit(r.status ?? 1);
+`,
+    );
+    chmodSync(join(this.toolsDir, "git"), 0o755);
+  }
+
+  getGitCalls() {
+    if (!this.gitRecordFile) return [];
+    return readFileSync(this.gitRecordFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  }
+
+  resetGitCalls() {
+    if (this.gitRecordFile) writeFileSync(this.gitRecordFile, "");
+  }
+
+  // git subcommands that transfer objects or talk to origin.
+  static TRANSFER = new Set(["fetch", "clone", "ls-remote", "push", "pull"]);
+
+  gitTransferCalls() {
+    return this.getGitCalls().filter((argv) => WorkerTestFixture.TRANSFER.has(argv[0] === "-C" ? argv[2] : argv[0]));
+  }
+
   async startBus(handoffs = [], contractRegistry = {}) {
     this.busMessages = handoffs;
     this.contractRegistry = contractRegistry;
@@ -158,6 +221,9 @@ export class WorkerTestFixture {
       if (request.method === "GET" && contractsMatch) {
         const workOrderId = decodeURIComponent(contractsMatch[1]);
         this.contractRequests.push({ workOrderId });
+        // A test may take over the answer entirely (a trickled or oversized body, a 5xx, …):
+        // `contractRespond(workOrderId, request, response)` returns true when it handled it.
+        if (typeof this.contractRespond === "function" && this.contractRespond(workOrderId, request, response) === true) return;
         const entry = this.contractRegistry?.[workOrderId];
         if (!entry) {
           response.writeHead(404, { "content-type": "application/json" });
