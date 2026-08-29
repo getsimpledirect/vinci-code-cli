@@ -1,0 +1,27 @@
+{
+  "schema": "vinci.containment-broker.native-admission/v4",
+  "admitted": false,
+  "platform": "linux",
+  "source_digests": {
+    "launcher_linux.c": "89d8db4b5b5eb0141f33d1dc5fc1a56c8cbe68d6a8e9cbd5bb136daaf39ae842",
+    "launcher_linux.h": "624875a390d256cb84bf1553ed7206d00c82a1ccb72625117d61899e2f487f0e",
+    "protocol.c": "d051c444c709cd60bbb860c5ae52e4300d9dff93927f7856be25c4cffaac2f3a",
+    "protocol.h": "d53b4374f406e11c4373c0058de13f7185d5411af7ebd8d14de357ab8a62f08c",
+    "session_linux.c": "5c101c36d628ffea933cb8a349769af3e8c9b254dbad120448cb7d5e585cfb71",
+    "session_linux.h": "cb8e351a6b75b3d2f8912750148b9df0361e8fdd9abc6b6d47e810fbf2a78c5a",
+    "sha256.c": "00c99fc75e9504509311b8687d0ba128f371985b753c296bf38fdab59b617c6b",
+    "sha256.h": "e863fb886b6e388508ecb422272c19ff1252d19b8b5b5a169a8ba58966dbe60e",
+    "target_bootstrap_linux.c": "fe59b45653be39ebd1afed82542205cc26b2dd2fef68448ab269f4f178669dc2",
+    "target_bootstrap_linux.h": "9c10296c98234f85c78ef0b10d3814ddb901f0902702c5b8eb2aa06b5dcc85f8",
+    "target_entry_linux.S": "4c4f0806e7689a7ea5612bd8d32b48ecdd2981651001aa00727a30a805a66cfb",
+    "target_runtime_linux.c": "67e908d788deb7b0742a7dcf87ab3fa1e1dae496219d1cff872608bfa4536291",
+    "trampoline_entry_linux.S": "ec1c9e15140dc171fd90038162db69d567797586f4a96aff582769c252e5b562",
+    "trampoline_linux.c": "140cc6b0910348be02318953f73cce3b6d305c534c0290fde2f198b746d86df5",
+    "trampoline_runtime_linux.c": "6a42e23303a9be89a5b6c96975444087321087f7eebbe87b4c58f04104e7e6df",
+    "trampoline_runtime_linux.h": "8754a24c1583b9da897f897e5445f89cfb0e1b6b6fc016b14c683d619e6c7840"
+  },
+  "binary_sha256": null,
+  "linux_build_receipt": null,
+  "linux_test_receipt": null,
+  "reason": "No admitted Linux build or real-host containment evidence exists. Runtime launch is refused."
+}

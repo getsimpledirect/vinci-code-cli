@@ -1,0 +1,12 @@
+{
+  "name": "@vinci/containment-broker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:mutations": "node --test test/mutation-definitions.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
