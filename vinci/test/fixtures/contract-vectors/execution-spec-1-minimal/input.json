@@ -27,10 +27,7 @@
       "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   ],
-  "requiredCapabilities": [
-    "structuredEvidence",
-    "safeResume"
-  ],
+  "requiredCapabilities": [],
   "output": "branch",
   "evidence": {
     "required": true
