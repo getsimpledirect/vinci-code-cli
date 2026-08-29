@@ -994,6 +994,28 @@ await test('WARN-3: the reasons the server ACTUALLY emits are decisions on 403 a
     assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason: 'refused' }, `403 ${JSON.stringify(body)}`);
     assert.equal(calls(), 1);
   }
+  // The `|| !body` guard that used to sit in leaseStateDecision is GONE, and that is a deliberate
+  // behaviour change, not an oversight: on main a 403/409 whose body did not PARSE returned null,
+  // fell through to the transport path, and was RETRIED as if the Governor had been unreachable.
+  // It is a decision by STATUS — an unparseable body cannot turn a refusal into a network blip,
+  // and retrying one spends an attempt on an answer that will not change. Nothing else in this
+  // suite exercises the undefined-body path (the cases above all parse), so it is pinned here.
+  const renewRaw = async (status, text) => {
+    let calls = 0;
+    const client = new LeaseClient({ governorUrl: 'http://governor.invalid', token: 't', log: () => {}, fetch: async () => {
+      calls += 1;
+      return new Response(text, { status, headers: { 'content-type': 'application/json' } });
+    } });
+    return { result: await client.renew(lease), calls: () => calls };
+  };
+  for (const status of [403, 409]) {
+    const { result, calls } = await renewRaw(status, '<<not json at all>>');
+    assert.equal(result.ok, false, `${status} with an unparseable body`);
+    assert.equal(result.lost, true, `${status} with an unparseable body must still be a LOSS`);
+    assert.equal(result.reason, 'refused', `${status} with an unparseable body is a decision, not "unreachable"`);
+    assert.equal(calls(), 1, `${status} with an unparseable body must NOT be retried`);
+  }
+
   // A deadline rule is one of a "<rule>: <detail>" family. It needed a prefix rule when reasons
   // were the predicate; now it is simply another 403.
   const { result: deadline, calls: deadlineCalls } = await renewWith(403, { reason: 'work order deadline rule: something else entirely' });
