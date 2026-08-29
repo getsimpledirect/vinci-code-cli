@@ -329,6 +329,23 @@ try {
     );
   }
 
+  // pathStrippedBody() also UNQUOTES argv[0], and that half is load-bearing on its own. A quoted
+  // cloud tool bundled with toolchain is the case that pins it: without the unquote, `"wrangler"`
+  // yields the command word `wrangler"`, which matches neither CLOUD_TOOL (anchored `$`) nor
+  // isShellNetworkCommand, so the segment disqualifies nothing and the whole command is allowlisted.
+  // Note the quoted forms do NOT trip the OUTWARD veto either — `\bterraform\s+apply\b` cannot match
+  // across `" `, so there is no second line of defence here. A quoted PATH-invoked runner
+  // (`"./node_modules/.bin/npx" …`) blocks either way and therefore pins nothing; these do.
+  for (const quoted of [
+    'npm install && "wrangler" deploy',
+    "npm ci && 'kubectl' delete namespace prod",
+    'npm install && "terraform" apply',
+  ]) {
+    const result = await headlessCall("bash", { command: quoted });
+    const proceeded = decisions().some((decision) => decision.outcome === "PROCEEDED");
+    check(`a quoted cloud tool never PROCEEDs — ${quoted}`, result?.block === true && !proceeded);
+  }
+
   // The peel ONLY ever adds a rejection: an ordinary `npx` of a non-cloud tool is unchanged, so the
   // interactive once-per-session build grant keeps its current scope.
   for (const ordinary of [
