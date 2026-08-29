@@ -12,6 +12,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createServer } from "node:http";
+
 import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
 import { executionSpecDigest, recordDigest, workOrderDigest } from "../worker/contracts/digest.mjs";
 
@@ -407,6 +409,51 @@ try {
     assertRefusedBeforeTransfer("m-big", "registry_unavailable");
     assert.match(postsFor("m-big"), /exceeds 256 KiB/, "the reason names the cap");
     f.contractRespond = null;
+  }
+
+  // --- F8: Governor refusal / unavailability on the digest path carry contract=<id>@<digest8> ---
+  // The tag is the FIRST token of the body (one formatter for every early terminal post); the
+  // prose path's Governor posts stay byte-identical (no tag).
+  {
+    const governor = createServer((request, response) => {
+      response.writeHead(403, { "content-type": "application/json" });
+      response.end(JSON.stringify({ reason: "rule: paths under / are frozen tonight" }));
+    });
+    await new Promise((r) => governor.listen(0, "127.0.0.1", r));
+    const governorUrl = `http://127.0.0.1:${governor.address().port}`;
+    // A closed port: the connection is refused ⇒ "Governor unavailable/invalid".
+    const closed = createServer(() => {});
+    await new Promise((r) => closed.listen(0, "127.0.0.1", r));
+    const closedUrl = `http://127.0.0.1:${closed.address().port}`;
+    await new Promise((r) => closed.close(r));
+    try {
+      const tag = `contract=wo-vec-1@${contractDigest.slice(0, 8)}`;
+      f.busMessages.push(handoff("m-gov-refused", happyTriple));
+      let r = await run({ args: ["--governor", governorUrl], env: { VINCI_GOVERNOR_TOKEN: "gov-token" } });
+      assert.equal(r.status, 0, r.stderr);
+      assertRefusedBeforeTransfer("m-gov-refused", "Governor refused the lease");
+      let blocker = f.getPostedMessages().find((m) => m.kind === "blocker" && m.in_reply_to === "m-gov-refused");
+      assert.match(blocker.body, new RegExp(`^${tag} Governor refused the lease: rule: paths under / are frozen tonight worker_build=`), blocker.body);
+      assert.equal(taskState("m-gov-refused").outcome.governor, "refused");
+
+      f.busMessages.push(handoff("m-gov-down", happyTriple));
+      r = await run({ args: ["--governor", closedUrl], env: { VINCI_GOVERNOR_TOKEN: "gov-token" } });
+      assert.equal(r.status, 0, r.stderr);
+      assertRefusedBeforeTransfer("m-gov-down", "Governor unavailable/invalid");
+      blocker = f.getPostedMessages().find((m) => m.kind === "blocker" && m.in_reply_to === "m-gov-down");
+      assert.match(blocker.body, new RegExp(`^${tag} Governor unavailable/invalid: Governor connection failed: `), blocker.body);
+      assert.equal(taskState("m-gov-down").outcome.governor, "unavailable");
+
+      // Prose path: same refusal, NO tag, body unchanged.
+      f.busMessages.push(handoff("m-gov-prose", "repo: proseorg/coderepo\nevidence: none\n\nprose task"));
+      r = await run({ args: ["--governor", governorUrl], env: { VINCI_GOVERNOR_TOKEN: "gov-token" } });
+      assert.equal(r.status, 0, r.stderr);
+      blocker = f.getPostedMessages().find((m) => m.kind === "blocker" && m.in_reply_to === "m-gov-prose");
+      assert.match(blocker.body, /^Governor refused the lease: rule: paths under \/ are frozen tonight worker_build=/, blocker.body);
+      assert.doesNotMatch(blocker.body, /contract=/);
+    } finally {
+      await new Promise((r) => governor.close(r));
+    }
   }
 
   console.log("PASS worker-handoff-triple");

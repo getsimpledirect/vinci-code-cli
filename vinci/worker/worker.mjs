@@ -296,6 +296,17 @@ function terminalPostBody(details) {
   return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
 
+// F8: EVERY early terminal (blocker) post — digest refusal, invalid bounds, past deadline,
+// Governor refusal/unavailability, base-checkout refusal — is formatted HERE and nowhere else.
+// `record` is the task snapshot (or, before a record exists, the parsed triple / null): a
+// digest-form task always yields `contract=<work_order_id>@<digest8>` as the FIRST token; a prose
+// task yields no tag and its body is byte-identical to what it was before Wave 1B. `fallback`
+// is the tag for a digest handoff whose triple could not even be parsed (`contract=malformed`).
+function blockerPostBody(record, details, fallback = null) {
+  const tag = contractTag(record) ?? fallback;
+  return terminalPostBody(tag ? `${tag} ${details}` : details);
+}
+
 async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
@@ -427,7 +438,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
   try {
     assertTaskId(taskId);
   } catch (error) {
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(error.message), { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(null, error.message), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -467,8 +478,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       lifecycle.transition("BLOCKED", { outcome: { reason } });
       // B7: a malformed post (the triple could not even be parsed) still carries `contract=malformed`;
       // a parsed triple whose registry answer refused carries the work_order_id@digest8 tag.
-      const contract = triple ? `contract=${triple.work_order_id}@${triple.contract_digest.slice(0, 8)} ` : "contract=malformed ";
-      await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`state=BLOCKED ${contract}reason=${reason}`), {
+      await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(triple ?? null, `state=BLOCKED reason=${reason}`, "contract=malformed"), {
         inReplyTo: message.message_id,
       });
       return true;
@@ -505,16 +515,14 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     // Digest handoff: full bounds validation with structured post body.
     const limit = envelope.budget_usd <= 0 ? "budget_usd" : envelope.max_runtime_s <= 0 ? "max_runtime_s" : "deadline";
     lifecycle.transition("BLOCKED", { limit_tripped: limit, outcome: { reason: "invalid_bounds: budget_usd, max_runtime_s and deadline must be within permitted bounds" } });
-    const contract = contractTag(lifecycle.snapshot()) ? `${contractTag(lifecycle.snapshot())} ` : "";
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`), { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`), { inReplyTo: message.message_id });
     return true;
   }
 
   // Prose handoff: only deadline is checked (budget and runtime have safe defaults from parseEnvelope).
   if (!contractFields && envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
-    const contract = contractTag(lifecycle.snapshot()) ? `${contractTag(lifecycle.snapshot())} ` : "";
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}deadline is in the past`), { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), "deadline is in the past"), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -548,7 +556,8 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
         const governor = claimResult?.refused === true ? "refused" : "unavailable";
         const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
-        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+        // F8: on the digest path this post carries contract=<id>@<digest8> like every other.
+        await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
           inReplyTo: message.message_id,
         });
         return true;
@@ -647,10 +656,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
     if (lifecycle.isTerminal()) throw error;
     // B4: a base-checkout validation failure (missing origin base ref, or base_commit not
     // reachable) is a BLOCKED refusal, not a FAILED run: nothing was spawned, nothing produced.
-    if (error?.blockedReason === "base_ref_unavailable" || error?.blockedReason === "base_commit_unreachable") {
+    if (typeof error?.blockedReason === "string") {
       lifecycle.transition("BLOCKED", { outcome: { reason: error.message } });
-      const contract = contractTag(lifecycle.snapshot()) ? `${contractTag(lifecycle.snapshot())} ` : "";
-      await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${contract}state=BLOCKED reason=${error.message}`), { inReplyTo: message.message_id });
+      await bus.post("blocker", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `state=BLOCKED reason=${error.message}`), { inReplyTo: message.message_id });
       return true;
     }
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
