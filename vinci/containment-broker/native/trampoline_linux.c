@@ -244,7 +244,7 @@ int vinci_trampoline_main(int argc, char **argv) {
     if (close(notification_listener) != 0 || setgroups(0, NULL) != 0
         || setresgid((gid_t)hello.target_gid, (gid_t)hello.target_gid, (gid_t)hello.target_gid) != 0
         || setresuid((uid_t)hello.target_uid, (uid_t)hello.target_uid, (uid_t)hello.target_uid) != 0
-        || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent
+        || prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0 || getppid() != expected_parent
         || prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0) return 125;
 
     struct vinci_trampoline_report report; memset(&report, 0, sizeof(report)); report.pid = own_pid;

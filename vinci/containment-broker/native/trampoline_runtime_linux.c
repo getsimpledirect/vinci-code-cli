@@ -124,6 +124,12 @@ int setresuid(uid_t real, uid_t effective, uid_t saved) {
     return (int)checked(vinci_raw_syscall6(__NR_setresuid, real, effective, saved, 0, 0, 0));
 }
 
+/* Every caller MUST pass all four option arguments, padding with zeros. This
+ * reads exactly four ints unconditionally, so a call site that passes fewer is
+ * undefined behaviour: it happened to work only because the unread registers
+ * held values the kernel ignores for that option. A per-option arity table
+ * would be the alternative; a fixed arity plus this contract is smaller and has
+ * no table to fall out of date. */
 int prctl(int option, ...) {
     va_list arguments;
     int values[4];

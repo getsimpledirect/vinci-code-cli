@@ -16,8 +16,8 @@
     "target_entry_linux.S": "4c4f0806e7689a7ea5612bd8d32b48ecdd2981651001aa00727a30a805a66cfb",
     "target_runtime_linux.c": "07dce4857ce7b680ea3463aa5820601c20819947595d97a307dfdcece2e9ba3a",
     "trampoline_entry_linux.S": "ec1c9e15140dc171fd90038162db69d567797586f4a96aff582769c252e5b562",
-    "trampoline_linux.c": "d90ce5cee0d1f80d6d8c54a714e9ac65d5531448a747162915dee075d8075141",
-    "trampoline_runtime_linux.c": "468fa3a7c14ded36003ee89858eda7ef75776de406e60aed65f2fc9c05aeea38",
+    "trampoline_linux.c": "f2ebba25628e0e02ba3b9ddc2526761a94a8266d3c023e17d3a35a43ea69eaef",
+    "trampoline_runtime_linux.c": "6a42e23303a9be89a5b6c96975444087321087f7eebbe87b4c58f04104e7e6df",
     "trampoline_runtime_linux.h": "8754a24c1583b9da897f897e5445f89cfb0e1b6b6fc016b14c683d619e6c7840"
   },
   "binary_sha256": null,

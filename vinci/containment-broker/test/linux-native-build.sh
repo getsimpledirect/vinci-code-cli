@@ -149,8 +149,29 @@ if ! "$build_root/sha256-selftest"; then
   exit 1
 fi
 
+# Runtime known-answer test for the freestanding shim: the hermetic half links
+# exactly as the trampoline does, so it exercises the real _start marshalling,
+# the real vinci_raw_syscall6 register order and the real wrappers. A wrong
+# register or __NR_ yields a plausible wrong answer rather than a crash, which
+# is why this cannot be established by reading the source.
+"$compiler" $freestanding -c "$package_root/test/trampoline-runtime-selftest.c" -o "$build_root/trampoline_runtime_selftest.o"
+"$compiler" $common "$build_root/trampoline_entry_linux.o" "$build_root/trampoline_runtime_selftest.o" \
+  "$build_root/trampoline_runtime_linux.o" \
+  -static -nostdlib -nostartfiles -Wl,-e,_start -Wl,--gc-sections \
+  -o "$build_root/trampoline-runtime-selftest"
+if ! elf_entry_is_symbol "$build_root/trampoline-runtime-selftest" _start; then
+  echo "refusing runtime selftest whose ELF entry point does not equal _start" >&2
+  exit 1
+fi
+"$compiler" $common "$package_root/test/trampoline-runtime-harness.c" -o "$build_root/trampoline-runtime-harness"
+if ! "$build_root/trampoline-runtime-harness" "$build_root/trampoline-runtime-selftest"; then
+  echo "freestanding trampoline runtime known-answer test failed" >&2
+  exit 1
+fi
+
 sha256sum "$build_root/vinci-trampoline" "$build_root/vinci-target-fixture" "$build_root/native-link-smoke" \
   "$build_root/launcher_linux.o" "$build_root/session_linux.o" "$build_root/target_bootstrap_linux.o" \
   "$build_root/target_entry_linux.o" "$build_root/target_runtime_linux.o" "$build_root/sha256_target.o" "$build_root/protocol.o" "$build_root/sha256.o" \
   "$build_root/trampoline_entry_linux.o" "$build_root/trampoline_linux.o" "$build_root/trampoline_runtime_linux.o" \
-  "$build_root/protocol_freestanding.o" "$build_root/sha256_freestanding.o"
+  "$build_root/protocol_freestanding.o" "$build_root/sha256_freestanding.o" \
+  "$build_root/trampoline_runtime_selftest.o"
