@@ -14,7 +14,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { resolveBin } from "./build.mjs";
 import { canonicalize } from "./contracts/canonical.mjs";
@@ -273,34 +273,58 @@ function requireExactKeys(value, keys, label) {
   if (canonicalize(actual) !== canonicalize(expected)) throw new Error(`${label}: unexpected fields`);
 }
 
-function establishDebrisRootAnchor(stateDir, debrisRoot) {
+export function describeDebrisRootAnchor(stateDir, lineageId) {
+  if (!/^[0-9a-f]{64}$/.test(lineageId)) throw new Error("debris lineage id must be 64 lowercase hex characters");
+  const debrisRoot = join(stateDir, "debris");
   const identitiesRoot = join(debrisRoot, ".task-identities-v1");
   const debrisIdentity = directoryIdentity(debrisRoot, "debris root");
-  const identitiesIdentity = ensurePrivateDirectory(identitiesRoot, "debris task identities root");
-  const anchorPath = join(stateDir, "debris-root-identity-v1.json");
-  const expected = {
+  const identitiesIdentity = directoryIdentity(identitiesRoot, "debris task identities root");
+  return {
     schema: "vinci.worker-debris-root-identity/1",
+    authority_admitted: true,
+    lineage_id: lineageId,
+    state_dir: resolve(stateDir),
+    debris_root_path: resolve(debrisRoot),
     debris_root: debrisIdentity,
     task_identities_root: identitiesIdentity,
   };
-  let record;
-  if (existsSync(anchorPath)) {
-    record = readCanonicalFile(anchorPath, "debris root identity");
-    requireExactKeys(record.value, ["schema", "debris_root", "task_identities_root"], "debris root identity");
-    if (canonicalize(record.value) !== canonicalize(expected)) throw new Error("debris root identity: path replacement or rollback detected");
-  } else {
-    const persistent = readdirSync(debrisRoot).filter((name) => name !== ".task-identities-v1");
-    if (persistent.length > 0 || readdirSync(identitiesRoot).length > 0) {
-      throw new Error("debris root identity: missing anchor for existing state");
-    }
-    writeExclusiveDurable(anchorPath, canonicalBytes(expected));
-    syncDirectory(stateDir);
-    record = readCanonicalFile(anchorPath, "debris root identity");
-  }
-  return { identitiesRoot, anchorPath, anchorBytes: record.bytes };
 }
 
-function establishTaskStorageAnchor(anchorRoot, taskId, taskOwnerRoot, taskRoot, generationsRoot) {
+function loadDebrisRootAnchor(stateDir) {
+  const configured = process.env.VINCI_WORKER_DEBRIS_ROOT_ANCHOR;
+  const configuredSha256 = process.env.VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256;
+  if (!configured || !isAbsolute(configured)) throw new Error("debris root identity: VINCI_WORKER_DEBRIS_ROOT_ANCHOR must name an absolute externally provisioned file");
+  if (!/^[0-9a-f]{64}$/.test(configuredSha256 ?? "")) throw new Error("debris root identity: VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256 must pin the exact provisioned bytes");
+  const anchorPath = resolve(configured);
+  const statePath = resolve(stateDir);
+  const fromState = relative(statePath, anchorPath);
+  if (fromState === "" || (!fromState.startsWith("..") && !isAbsolute(fromState))) {
+    throw new Error("debris root identity: trust anchor must be outside the replaceable worker state directory");
+  }
+  const anchorStat = lstatSync(anchorPath);
+  if (!anchorStat.isFile() || anchorStat.isSymbolicLink() || anchorStat.nlink !== 1 || (anchorStat.mode & 0o022) !== 0) {
+    throw new Error("debris root identity: unsafe external trust anchor");
+  }
+  const record = readCanonicalFile(anchorPath, "debris root identity");
+  if (sha256(record.bytes) !== configuredSha256) throw new Error("debris root identity: provisioned anchor digest mismatch");
+  requireExactKeys(
+    record.value,
+    ["schema", "authority_admitted", "lineage_id", "state_dir", "debris_root_path", "debris_root", "task_identities_root"],
+    "debris root identity",
+  );
+  if (record.value.schema !== "vinci.worker-debris-root-identity/1" || record.value.authority_admitted !== true) {
+    throw new Error("debris root identity: authority is not admitted");
+  }
+  const expected = describeDebrisRootAnchor(stateDir, record.value.lineage_id);
+  if (canonicalize(record.value) !== canonicalize(expected)) throw new Error("debris root identity: path replacement or rollback detected");
+  return {
+    identitiesRoot: join(stateDir, "debris", ".task-identities-v1"),
+    anchorPath,
+    anchorBytes: record.bytes,
+  };
+}
+
+function establishTaskStorageAnchor(anchorRoot, taskId, taskOwnerRoot, taskRoot, generationsRoot, attemptsRoot) {
   const anchorPath = join(anchorRoot, `${taskId}.json`);
   const pathExisted = existsSync(taskOwnerRoot);
   if (!existsSync(anchorPath) && pathExisted) throw new Error("debris task identity: missing anchor for existing state");
@@ -308,6 +332,7 @@ function establishTaskStorageAnchor(anchorRoot, taskId, taskOwnerRoot, taskRoot,
     task_root: ensurePrivateDirectory(taskOwnerRoot, "debris task root"),
     ledger_root: ensurePrivateDirectory(taskRoot, "debris ledger root"),
     generations_root: ensurePrivateDirectory(generationsRoot, "debris generations root"),
+    attempts_root: ensurePrivateDirectory(attemptsRoot, "debris attempts root"),
   };
   const expected = { schema: "vinci.worker-debris-task-identity/1", task_id: taskId, storage };
   let record;
@@ -349,10 +374,16 @@ function verifyDebrisGeneration(generationDir, expected) {
   requireExactKeys(manifest, ["schema", "generation", "source_fingerprint", "captured_by_attempt", "source", "tracked_patch", "staged_patch", "untracked"], "debris manifest");
   requireExactKeys(receipt, ["schema", "generation", "source_fingerprint", "manifest_sha256", "task_id", "captured_by_attempt", "repo", "branch", "base_commit", "head", "tree", "storage"], "debris receipt");
   if (manifest.schema !== "vinci.worker-debris-generation/1") throw new Error("debris manifest: unsupported schema");
-  if (manifest.generation !== expected.generation || manifest.source_fingerprint !== expected.sourceFingerprint) throw new Error("debris manifest: source identity mismatch");
+  requireExactKeys(manifest.source, ["task_id", "repo", "branch", "base_commit", "head", "tree", "tracked", "staged", "untracked", "tracked_patch_sha256", "staged_patch_sha256"], "debris manifest source");
+  if (!Number.isSafeInteger(manifest.captured_by_attempt) || manifest.captured_by_attempt < 1) throw new Error("debris manifest: invalid capture attempt");
+  const derivedFingerprint = sha256(Buffer.from(`vinci.worker-debris-source/1\0${canonicalize(manifest.source)}`, "utf8"));
+  const derivedGeneration = sha256(Buffer.from(`vinci.worker-debris-generation/2\0${expected.taskId}\0${manifest.captured_by_attempt}\0${derivedFingerprint}`, "utf8"));
+  if (manifest.source_fingerprint !== derivedFingerprint || manifest.generation !== derivedGeneration || basename(generationDir) !== derivedGeneration) {
+    throw new Error("debris manifest: source identity mismatch");
+  }
   if (manifest.source?.task_id !== expected.taskId || manifest.source?.repo !== expected.repo) throw new Error("debris manifest: task identity mismatch");
   if (receipt.schema !== "vinci.worker-debris-receipt/1") throw new Error("debris receipt: unsupported schema");
-  if (receipt.generation !== manifest.generation || receipt.source_fingerprint !== expected.sourceFingerprint) throw new Error("debris receipt: identity mismatch");
+  if (receipt.generation !== manifest.generation || receipt.source_fingerprint !== derivedFingerprint) throw new Error("debris receipt: identity mismatch");
   if (receipt.manifest_sha256 !== sha256(manifestRecord.bytes)) throw new Error("debris receipt: manifest digest mismatch");
   for (const key of ["task_id", "repo", "branch", "base_commit", "head", "tree"]) {
     const sourceKey = key === "task_id" ? "task_id" : key;
@@ -393,11 +424,37 @@ function verifyDebrisGeneration(generationDir, expected) {
   if (expectedStored.size > 0) walk(untrackedRoot);
   if (canonicalize(actualStored.sort()) !== canonicalize([...expectedStored].sort())) throw new Error("debris generation: stored file inventory mismatch");
   const allowedTop = new Set(["COMMITTED", "manifest.json", "receipt.json", "staged.patch", "tracked.patch", ...(expectedStored.size > 0 ? ["untracked"] : [])]);
+  let indexed = false;
+  const indexedPath = join(generationDir, "INDEXED");
+  if (existsSync(indexedPath)) {
+    const indexedRecord = readCanonicalFile(indexedPath, "debris indexed marker");
+    requireExactKeys(indexedRecord.value, ["schema", "generation", "receipt_sha256"], "debris indexed marker");
+    const expectedIndexed = {
+      schema: "vinci.worker-debris-indexed/1",
+      generation: receipt.generation,
+      receipt_sha256: sha256(receiptRecord.bytes),
+    };
+    if (canonicalize(indexedRecord.value) !== canonicalize(expectedIndexed)) throw new Error("debris indexed marker: identity mismatch");
+    allowedTop.add("INDEXED");
+    indexed = true;
+  }
   const topEntries = readdirSync(generationDir).sort();
   if (canonicalize(topEntries) !== canonicalize([...allowedTop].sort())) throw new Error("debris generation: unexpected top-level object");
   const commit = readSafeRegularFile(join(generationDir, "COMMITTED"), "debris commit marker");
   if (!commit.equals(Buffer.from(`${sha256(receiptRecord.bytes)}\n`, "utf8"))) throw new Error("debris generation: commit marker mismatch");
-  return { receipt, receiptBytes: receiptRecord.bytes };
+  return { receipt, receiptBytes: receiptRecord.bytes, sourceFingerprint: derivedFingerprint, generation: derivedGeneration, generationDir, indexed };
+}
+
+function markGenerationIndexed(record) {
+  if (record.indexed) return;
+  const marker = canonicalBytes({
+    schema: "vinci.worker-debris-indexed/1",
+    generation: record.receipt.generation,
+    receipt_sha256: sha256(record.receiptBytes),
+  });
+  writeExclusiveDurable(join(record.generationDir, "INDEXED"), marker);
+  syncDirectory(record.generationDir);
+  record.indexed = true;
 }
 
 async function collectDirtySnapshot(repoDir, repo, taskId, attempt) {
@@ -442,47 +499,193 @@ async function collectDirtySnapshot(repoDir, repo, taskId, attempt) {
     attempt,
     source,
     sourceFingerprint,
-    generation: sha256(Buffer.from(`vinci.worker-debris-generation/1\0${taskId}\0${sourceFingerprint}`, "utf8")),
+    generation: sha256(Buffer.from(`vinci.worker-debris-generation/2\0${taskId}\0${attempt}\0${sourceFingerprint}`, "utf8")),
     trackedPatch: trackedPatch.stdout,
     stagedPatch: stagedPatch.stdout,
     untracked,
   };
 }
 
-function publishDebrisIndex(taskRoot, taskId, receipt, previousIndexBytes) {
+function indexEntry(record) {
+  return {
+    generation: record.receipt.generation,
+    receipt_sha256: sha256(record.receiptBytes),
+    source_fingerprint: record.receipt.source_fingerprint,
+  };
+}
+
+function validateDebrisIndex(value, taskId) {
+  requireExactKeys(value, ["schema", "task_id", "generations"], "debris index");
+  if (value.schema !== "vinci.worker-debris-index/1" || value.task_id !== taskId || !Array.isArray(value.generations)) {
+    throw new Error("debris index: invalid identity");
+  }
+  const seen = new Set();
+  let previous = null;
+  for (const entry of value.generations) {
+    requireExactKeys(entry, ["generation", "receipt_sha256", "source_fingerprint"], "debris index entry");
+    if (![entry.generation, entry.receipt_sha256, entry.source_fingerprint].every((item) => /^[0-9a-f]{64}$/.test(item))) {
+      throw new Error("debris index: invalid digest field");
+    }
+    if (seen.has(entry.generation)) throw new Error("debris index: duplicate generation");
+    if (previous !== null && previous >= entry.generation) throw new Error("debris index: generations are not in canonical order");
+    seen.add(entry.generation);
+    previous = entry.generation;
+  }
+}
+
+function reconcileDebrisIndex(taskRoot, generationsRoot, taskId, repo, storage, storagePaths) {
+  const generationNames = readdirSync(generationsRoot);
+  const partial = generationNames.filter((name) => name.startsWith(".capture-"));
+  if (partial.length > 0) throw new Error("quarantine: partial prior publication requires reconciliation");
+  if (generationNames.some((name) => !/^[0-9a-f]{64}$/.test(name))) throw new Error("debris generations: unexpected object");
+  const records = generationNames
+    .sort()
+    .map((generation) => verifyDebrisGeneration(join(generationsRoot, generation), { taskId, repo, storage, storagePaths }));
+  const expected = { schema: "vinci.worker-debris-index/1", task_id: taskId, generations: records.map(indexEntry) };
   const indexPath = join(taskRoot, "index.json");
-  let index = { schema: "vinci.worker-debris-index/1", task_id: taskId, generations: [] };
-  if (previousIndexBytes) {
+  if (!existsSync(indexPath)) {
+    if (records.some((record) => record.indexed)) throw new Error("debris index: rollback omitted an indexed generation");
+    if (records.length === 0) return { bytes: null, value: expected, records };
+    const temp = join(taskRoot, `.index-recovery-${randomBytes(12).toString("hex")}.tmp`);
+    writeExclusiveDurable(temp, canonicalBytes(expected));
+    if (existsSync(indexPath)) throw new Error("debris index: appeared during recovery");
+    renameSync(temp, indexPath);
+    syncDirectory(taskRoot);
+    for (const record of records) markGenerationIndexed(record);
+    return { ...readCanonicalFile(indexPath, "debris index"), records };
+  }
+  const current = readCanonicalFile(indexPath, "debris index");
+  validateDebrisIndex(current.value, taskId);
+  const currentByGeneration = new Map(current.value.generations.map((entry) => [entry.generation, entry]));
+  const expectedByGeneration = new Map(expected.generations.map((entry) => [entry.generation, entry]));
+  for (const entry of current.value.generations) {
+    const expectedEntry = expectedByGeneration.get(entry.generation);
+    if (!expectedEntry || canonicalize(entry) !== canonicalize(expectedEntry)) throw new Error("debris index: committed-generation bijection mismatch");
+  }
+  for (const record of records) {
+    if (record.indexed && !currentByGeneration.has(record.generation)) throw new Error("debris index: rollback omitted an indexed generation");
+  }
+  if (canonicalize(current.value) !== canonicalize(expected)) {
+    const missing = records.filter((record) => !currentByGeneration.has(record.generation));
+    if (missing.some((record) => record.indexed)) throw new Error("debris index: committed-generation bijection mismatch");
+    const temp = join(taskRoot, `.index-recovery-${randomBytes(12).toString("hex")}.tmp`);
+    writeExclusiveDurable(temp, canonicalBytes(expected));
+    if (!readFileSync(indexPath).equals(current.bytes)) throw new Error("debris index: compare-and-swap conflict during recovery");
+    renameSync(temp, indexPath);
+    syncDirectory(taskRoot);
+  }
+  for (const record of records) markGenerationIndexed(record);
+  return { ...readCanonicalFile(indexPath, "debris index"), records };
+}
+
+function publishDebrisIndex(taskRoot, taskId, receiptRecord, previousIndex) {
+  const indexPath = join(taskRoot, "index.json");
+  let index = structuredClone(previousIndex.value);
+  if (previousIndex.bytes) {
     const current = readCanonicalFile(indexPath, "debris index");
-    if (!current.bytes.equals(previousIndexBytes)) throw new Error("debris index: compare-and-swap conflict");
-    index = current.value;
+    if (!current.bytes.equals(previousIndex.bytes)) throw new Error("debris index: compare-and-swap conflict");
   } else if (existsSync(indexPath)) {
     throw new Error("debris index: appeared during publication");
   }
-  if (index.schema !== "vinci.worker-debris-index/1" || index.task_id !== taskId || !Array.isArray(index.generations)) {
-    throw new Error("debris index: invalid identity");
-  }
-  const existing = index.generations.find((entry) => entry.generation === receipt.generation);
-  const entry = { generation: receipt.generation, receipt_sha256: receipt.receipt_sha256, source_fingerprint: receipt.source_fingerprint };
+  validateDebrisIndex(index, taskId);
+  const entry = indexEntry(receiptRecord);
+  const existing = index.generations.find((candidate) => candidate.generation === entry.generation);
   if (existing && canonicalize(existing) !== canonicalize(entry)) throw new Error("debris index: divergent generation");
   if (!existing) index.generations.push(entry);
   index.generations.sort((a, b) => (a.generation < b.generation ? -1 : a.generation > b.generation ? 1 : 0));
+  validateDebrisIndex(index, taskId);
   const temp = join(taskRoot, `.index-${randomBytes(12).toString("hex")}.tmp`);
   writeExclusiveDurable(temp, canonicalBytes(index));
-  if (previousIndexBytes) {
+  if (previousIndex.bytes) {
     const currentBytes = readFileSync(indexPath);
-    if (!currentBytes.equals(previousIndexBytes)) throw new Error("debris index: compare-and-swap conflict");
+    if (!currentBytes.equals(previousIndex.bytes)) throw new Error("debris index: compare-and-swap conflict");
   } else if (existsSync(indexPath)) {
     throw new Error("debris index: compare-and-swap conflict");
   }
   renameSync(temp, indexPath);
   syncDirectory(taskRoot);
+}
 
+function attemptReceiptValue(taskId, attempt, generationRecord) {
+  return {
+    schema: "vinci.worker-debris-attempt-receipt/1",
+    task_id: taskId,
+    requested_attempt: attempt,
+    disposition: generationRecord.receipt.captured_by_attempt === attempt ? "CAPTURED" : "REPLAYED",
+    generation: generationRecord.receipt.generation,
+    generation_receipt_sha256: sha256(generationRecord.receiptBytes),
+    captured_by_attempt: generationRecord.receipt.captured_by_attempt,
+  };
+}
+
+function validateAttemptReceipt(value, taskId, attempt, generationRecord) {
+  requireExactKeys(
+    value,
+    ["schema", "task_id", "requested_attempt", "disposition", "generation", "generation_receipt_sha256", "captured_by_attempt"],
+    "debris attempt receipt",
+  );
+  const expected = attemptReceiptValue(taskId, attempt, generationRecord);
+  if (canonicalize(value) !== canonicalize(expected)) throw new Error("debris attempt receipt: identity mismatch");
+}
+
+function writeCurrentAttemptReceipt(taskRoot, bytes) {
   const currentPath = join(taskRoot, "current.json");
   const currentTemp = join(taskRoot, `.current-${randomBytes(12).toString("hex")}.tmp`);
-  writeExclusiveDurable(currentTemp, canonicalBytes(receipt));
+  writeExclusiveDurable(currentTemp, bytes);
   renameSync(currentTemp, currentPath);
   syncDirectory(taskRoot);
+}
+
+function reconcileAttemptReceipts(taskRoot, attemptsRoot, taskId, generationRecords) {
+  const byAttempt = new Map();
+  for (const record of generationRecords) {
+    const attempt = record.receipt.captured_by_attempt;
+    if (byAttempt.has(attempt)) throw new Error("debris attempts: one attempt names multiple generations");
+    byAttempt.set(attempt, record);
+  }
+  const entries = readdirSync(attemptsRoot).sort();
+  for (const entry of entries) {
+    if (!/^[1-9][0-9]*\.json$/.test(entry)) throw new Error("debris attempts: unexpected object");
+    const attempt = Number(entry.slice(0, -5));
+    if (!Number.isSafeInteger(attempt)) throw new Error("debris attempts: invalid attempt number");
+    const record = byAttempt.get(attempt);
+    if (!record) throw new Error("debris attempts: orphan receipt");
+    const stored = readCanonicalFile(join(attemptsRoot, entry), "debris attempt receipt");
+    validateAttemptReceipt(stored.value, taskId, attempt, record);
+  }
+  for (const [attempt, record] of byAttempt) {
+    const path = join(attemptsRoot, `${attempt}.json`);
+    if (!existsSync(path)) writeExclusiveDurable(path, canonicalBytes(attemptReceiptValue(taskId, attempt, record)));
+  }
+  syncDirectory(attemptsRoot);
+  if (byAttempt.size === 0) {
+    if (existsSync(join(taskRoot, "current.json"))) throw new Error("debris current receipt: orphan pointer");
+    return;
+  }
+  let latestAttempt = 0;
+  for (const attempt of byAttempt.keys()) latestAttempt = Math.max(latestAttempt, attempt);
+  const latestBytes = readFileSync(join(attemptsRoot, `${latestAttempt}.json`));
+  const currentPath = join(taskRoot, "current.json");
+  if (!existsSync(currentPath) || !readFileSync(currentPath).equals(latestBytes)) writeCurrentAttemptReceipt(taskRoot, latestBytes);
+}
+
+function publishAttemptReceipt(taskRoot, attemptsRoot, taskId, attempt, generationRecord) {
+  const value = attemptReceiptValue(taskId, attempt, generationRecord);
+  const bytes = canonicalBytes(value);
+  const path = join(attemptsRoot, `${attempt}.json`);
+  if (existsSync(path)) {
+    const current = readCanonicalFile(path, "debris attempt receipt");
+    if (!current.bytes.equals(bytes)) throw new Error("debris attempt receipt: attempt already bound to different source");
+  } else {
+    writeExclusiveDurable(path, bytes);
+    syncDirectory(attemptsRoot);
+  }
+  writeCurrentAttemptReceipt(taskRoot, bytes);
+  return {
+    ...value,
+    attempt_receipt_sha256: sha256(bytes),
+    generation_receipt: generationRecord.receipt,
+  };
 }
 
 // Shared-tree quarantine (used by BOTH the prose default/branch paths and the digest path).
@@ -493,9 +696,11 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
   // working tree can be the only copy of its work — then hand this task a clean tree.
   if (!/^[A-Za-z0-9._-]+$/.test(taskId)) throw new Error(`unsafe taskId for debris path: ${taskId}`);
   if (!Number.isSafeInteger(attempt) || attempt < 1) throw new Error(`unsafe attempt for debris receipt: ${attempt}`);
+  const preliminary = await collectDirtySnapshot(repoDir, repo, taskId, attempt);
+  if (!preliminary) return null;
   const debrisRoot = join(stateDir, "debris");
-  mkdirSync(debrisRoot, { recursive: true, mode: 0o700 });
-  const rootAnchor = establishDebrisRootAnchor(stateDir, debrisRoot);
+  if (!existsSync(debrisRoot)) throw new Error("debris root identity: deployment must provision the debris root and external trust anchor before capture");
+  const rootAnchor = loadDebrisRootAnchor(stateDir);
   const lockPath = join(debrisRoot, ".capture.lock");
   const lock = openSync(lockPath, "wx", 0o600);
   let staging = null;
@@ -504,31 +709,38 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
     fsyncSync(lock);
     syncDirectory(debrisRoot);
     const snapshot = await collectDirtySnapshot(repoDir, repo, taskId, attempt);
-    if (!snapshot) return null;
+    if (!snapshot || snapshot.sourceFingerprint !== preliminary.sourceFingerprint) {
+      throw new Error("quarantine: source changed before exclusive capture");
+    }
 
     const taskOwnerRoot = join(debrisRoot, taskId);
     const taskRoot = join(taskOwnerRoot, "ledger-v1");
     const generationsRoot = join(taskRoot, "generations");
-    const taskAnchor = establishTaskStorageAnchor(rootAnchor.identitiesRoot, taskId, taskOwnerRoot, taskRoot, generationsRoot);
+    const attemptsRoot = join(taskRoot, "attempts");
+    const taskAnchor = establishTaskStorageAnchor(rootAnchor.identitiesRoot, taskId, taskOwnerRoot, taskRoot, generationsRoot, attemptsRoot);
     const storage = taskAnchor.storage;
     const storagePaths = {
       task_root: taskOwnerRoot,
       ledger_root: taskRoot,
       generations_root: generationsRoot,
+      attempts_root: attemptsRoot,
     };
     const partialTaskEntries = readdirSync(taskRoot).filter((name) => name.startsWith(".index-") || name.startsWith(".current-"));
-    const partialGenerationEntries = readdirSync(generationsRoot).filter((name) => name.startsWith(".capture-"));
-    if (partialTaskEntries.length > 0 || partialGenerationEntries.length > 0) {
+    if (partialTaskEntries.length > 0) {
       throw new Error("quarantine: partial prior publication requires reconciliation");
     }
-    syncTreeDirectories(debrisRoot, [join(taskId, "ledger-v1", "generations")]);
+    syncTreeDirectories(debrisRoot, [join(taskId, "ledger-v1", "generations"), join(taskId, "ledger-v1", "attempts")]);
     const finalDir = join(generationsRoot, snapshot.generation);
-    const indexPath = join(taskRoot, "index.json");
-    const previousIndexBytes = existsSync(indexPath) ? readFileSync(indexPath) : null;
+    const previousIndex = reconcileDebrisIndex(taskRoot, generationsRoot, taskId, repo, storage, storagePaths);
+    reconcileAttemptReceipts(taskRoot, attemptsRoot, taskId, previousIndex.records);
+    const priorAttempt = previousIndex.records.find((record) => record.receipt.captured_by_attempt === attempt);
+    if (priorAttempt && priorAttempt.generation !== snapshot.generation) {
+      throw new Error("debris attempt receipt: attempt already bound to different source");
+    }
     let verified;
 
     if (existsSync(finalDir)) {
-      verified = verifyDebrisGeneration(finalDir, { ...snapshot, taskId, repo, storage, storagePaths });
+      verified = verifyDebrisGeneration(finalDir, { taskId, repo, storage, storagePaths });
     } else {
       staging = join(generationsRoot, `.capture-${randomBytes(12).toString("hex")}.tmp`);
       mkdirSync(staging, { mode: 0o700 });
@@ -591,11 +803,15 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
       renameSync(staging, finalDir);
       staging = null;
       syncDirectory(generationsRoot);
-      verified = verifyDebrisGeneration(finalDir, { ...snapshot, taskId, repo, storage, storagePaths });
+      verified = verifyDebrisGeneration(finalDir, { taskId, repo, storage, storagePaths });
+    }
+    if (verified.generation !== snapshot.generation || verified.sourceFingerprint !== snapshot.sourceFingerprint) {
+      throw new Error("quarantine: generation does not match the captured source");
     }
 
-    const receipt = { ...verified.receipt, receipt_sha256: sha256(verified.receiptBytes) };
-    publishDebrisIndex(taskRoot, taskId, receipt, previousIndexBytes);
+    publishDebrisIndex(taskRoot, taskId, verified, previousIndex);
+    markGenerationIndexed(verified);
+    const receipt = publishAttemptReceipt(taskRoot, attemptsRoot, taskId, attempt, verified);
     requireUnchangedAnchor(rootAnchor.anchorPath, rootAnchor.anchorBytes, "debris root identity");
     requireUnchangedAnchor(taskAnchor.anchorPath, taskAnchor.anchorBytes, "debris task identity");
     for (const [label, identity] of Object.entries(storage)) requireSameDirectory(storagePaths[label], identity, `debris storage ${label}`);

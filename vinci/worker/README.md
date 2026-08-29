@@ -147,6 +147,17 @@ origin/<branch> locally`. Before any `reset --hard`/`clean -fd`, the shared chec
 publishes a content-addressed immutable generation and a canonical receipt (Wave 1 clean-room
 item). The task record carries that receipt when a capture occurred.
 
+Debris capture has no ordinary self-bootstrap path. Deployment must create the private
+`<state>/debris/` and `<state>/debris/.task-identities-v1/` directories, build the exact closed
+`vinci.worker-debris-root-identity/1` document for those directory identities, and expose that
+read-only document at an absolute path outside the replaceable worker state through
+`VINCI_WORKER_DEBRIS_ROOT_ANCHOR`. The anchor must assert `authority_admitted: true` and bind a
+64-hex deployment lineage id, state/root paths, and both directory identities. A missing,
+writable, in-state, replaced, or rolled-back anchor refuses capture before source cleanup; the
+worker never creates or repairs it. Deployment must also supply the SHA-256 of the exact canonical
+anchor bytes through `VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256`; ordinary capture cannot change that
+process-pinned trust root.
+
 ## Handoff Forms (Wave 1B)
 
 A handoff body is one of two forms. The daemon detects which by its first non-blank
@@ -222,8 +233,17 @@ operations, fixed:
    leavings are copied and revalidated under
    `<state>/debris/<task>/ledger-v1/generations/<content-digest>/`, with canonical
    manifest/receipt/commit-marker bytes, file and directory fsync, and an atomically replaced
-   index/current pointer. Generation publication is exclusive and an exact response-loss replay
-   converges on the same receipt; divergent retries retain distinct immutable generations;
+   index/current pointer. Every committed generation is independently enumerated and must form
+   an exact bijection with the closed, unique, ordered index; an `INDEXED` marker is written only
+   after the index is durable, distinguishing recoverable pre-index crashes from index rollback.
+   Generation identity binds the capture attempt as well as the source bytes: an exact retry of
+   the same unfinished attempt converges on the same generation, while a later independent
+   attempt with byte-identical debris receives a distinct generation. Publication is exclusive.
+   Each request has an immutable attempt receipt under
+   `ledger-v1/attempts/<attempt>.json`, so the requested retry and original capturing attempt are
+   both explicit. The derived `current.json` pointer and missing attempt receipts are rebuilt only
+   from the complete verified generation/index bijection; a single attempt can never bind two
+   source identities. Divergent retries retain distinct immutable generations;
 3. `git fetch origin +refs/heads/<baseRef>:refs/remotes/origin/<baseRef>` MUST succeed, else
    **BLOCKED `base_ref_unavailable`**;
 4. `git merge-base --is-ancestor <baseCommit> refs/remotes/origin/<baseRef>` must hold, else
