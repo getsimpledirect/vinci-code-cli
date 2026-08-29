@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { test } from "node:test";
 
 import { CRASH_EDGES, EFFECT_CRASH_EDGES, LOCAL_EVIDENCE_CLASSIFICATION, MUTATION_CASES, NATIVE_LINUX_CASES } from "./harnesses.mjs";
@@ -43,16 +43,25 @@ test("native sources implement the reviewed boundary while admission remains cat
   assert.equal(admission.binary_sha256, null);
   assert.equal(admission.linux_build_receipt, null);
   assert.equal(admission.linux_test_receipt, null);
-  for (const [relative, field] of [
-    ["trampoline_linux.c", "trampoline_source_sha256"],
-    ["launcher_linux.c", "launcher_source_sha256"],
-    ["launcher_linux.h", "launcher_header_sha256"],
-    ["protocol.h", "protocol_header_sha256"],
-    ["sha256.c", "sha256_source_sha256"],
-    ["sha256.h", "sha256_header_sha256"],
-  ]) {
-    const bytes = readFileSync(new URL(`../native/${relative}`, import.meta.url));
-    assert.equal(createHash("sha256").update(bytes).digest("hex"), admission[field]);
+  // Transitive source manifest, enumerated rather than listed. The previous
+  // hardcoded six named three fields the manifest did not even carry, so those
+  // assertions compared against undefined; and any native source outside the six
+  // could be edited with every test still green. Enumerating the directory means
+  // adding, removing or editing ANY native source fails here until the manifest
+  // is re-derived and the change re-reviewed.
+  const nativeDirectory = new URL("../native/", import.meta.url);
+  const sources = readdirSync(nativeDirectory)
+    .filter((name) => name !== "native-admission.json")
+    .sort();
+  assert.ok(sources.length > 0, "native/ must contain sources");
+  assert.deepEqual(Object.keys(admission.source_digests).sort(), sources);
+  for (const name of sources) {
+    const bytes = readFileSync(new URL(name, nativeDirectory));
+    assert.equal(
+      createHash("sha256").update(bytes).digest("hex"),
+      admission.source_digests[name],
+      `native/${name} does not match its pinned digest`,
+    );
   }
 });
 
