@@ -30,19 +30,44 @@ function readBody(request) {
   });
 }
 
+// The claim-paths 200 body the DEPLOYED server actually returns (vinci-gpu-control
+// `app.py:2888-2893`, verified on main): `{ok, reason, claim_hash, paths}` — and NO `ttl`, even
+// though the handler computes one (`ttl = min(GOVERNOR_CLAIM_TTL_S, remaining_s)`) and passes it
+// into `governor_runtime.claim_paths`; a comment there even says "The client ignores `ttl`". This
+// client does NOT ignore it: `governor.mjs` refuses a 200 whose ttl is not finite-positive, and
+// `tightenEnvelopeLimits` caps the run's `max_runtime_s` on it. So against today's server a
+// governed task blocks at `Governor lease invalid: ttl=undefined`. That disagreement is real and
+// the server fix is dispatched on gpu-control #201; until it lands this is what the wire looks
+// like, and the fixture says so instead of inventing the field.
+export const CLAIM_PATHS_DEPLOYED = Object.freeze({
+  ok: true,
+  reason: null,
+  claim_hash: "c1a1m0000000000000000000000000000000000000000000000000000000beef",
+  paths: ["."],
+});
+
+// The same body once gpu-control #201 adds the `ttl` it already computes. Tests that need a
+// GRANTED claim opt into this explicitly, so every such test names the server version it assumes.
+export const CLAIM_PATHS_WITH_TTL = Object.freeze({ ...CLAIM_PATHS_DEPLOYED, ttl: 3600 });
+
 // Wave 1B: a fake Governor with the lease endpoints (acquire / renew / release / check) plus the
 // Stage 2 claim-paths route, with an injectable clock. Everything a test wants to script is a
 // field:
 //   ttlS            ttl_s served on acquire and renew (seconds; small values make renews frequent)
 //   now             clock (ms) used for expires_at — `() => Date.now()` by default
-//   mode            "grant" | "leased" | "error" | "hang"  (acquire behaviour)
+//   mode            "grant" | "leased" | "refuse" | "error" | "hang"  (acquire behaviour)
+//   refusal         { status, reason } served on mode "refuse" — a lease-state DECISION about the
+//                   order itself (e.g. 409 "work order expired"), as opposed to "leased"
 //   holder          { holder_attempt_id, expires_at } served on mode "leased"
 //   renewOkCount    number of renews to grant before renewFailure is served (Infinity = never)
 //   renewFailure    { status: 409, reason: "stale_generation" } | { status: 500 } | "drop" (socket destroyed)
 //   renewDelayMs    ms a granted renew is held before it is answered (0) — exercises "renew in flight"
 //   check           true | false | (body, effectIndex) => ({ valid, reason })
 //   releaseStatus   HTTP status for release (200)
-//   claim           body served (200) on /v1/governor/claim-paths, or { status, body }
+//   claim           body served (200) on /v1/governor/claim-paths, or { status, body }.
+//                   DEFAULTS TO `CLAIM_PATHS_DEPLOYED` — the shape the deployed server actually
+//                   returns. A test that needs a GRANTED claim must say so with
+//                   `claim: CLAIM_PATHS_WITH_TTL`; the fixture does not invent the field.
 //   claimHolderGate the Governor's holder gate (governor_runtime.py:335-338), ON by default: once
 //                   a lease is live, a claim is refused 403 {reason:"leased_by_other_attempt"}
 //                   unless its `attempt_id` equals the CURRENT holder's — and an absent attempt_id
@@ -61,12 +86,13 @@ export class FakeGovernor {
     this.now = options.now ?? (() => Date.now());
     this.mode = options.mode ?? "grant";
     this.holder = options.holder ?? { holder_attempt_id: "other-worker/7", expires_at: "2099-01-01T00:00:00.000Z" };
+    this.refusal = options.refusal ?? { status: 409, reason: "work order expired" };
     this.renewOkCount = options.renewOkCount ?? Infinity;
     this.renewFailure = options.renewFailure ?? { status: 409, reason: "stale_generation" };
     this.check = options.check ?? true;
     this.releaseStatus = options.releaseStatus ?? 200;
     this.renewDelayMs = options.renewDelayMs ?? 0;
-    this.claim = options.claim ?? { paths: ["."], ttl: 3600 };
+    this.claim = options.claim ?? CLAIM_PATHS_DEPLOYED;
     this.claimHolderGate = options.claimHolderGate ?? true;
     this.acquireStatus = options.acquireStatus ?? 200;
     // The attempt_id of the live lease, i.e. what the holder gate compares a claim against.
@@ -124,6 +150,10 @@ export class FakeGovernor {
       }
       if (this.mode === "leased") {
         this.json(response, 409, { reason: "leased", ...this.holder });
+        return true;
+      }
+      if (this.mode === "refuse") {
+        this.json(response, this.refusal.status ?? 409, { reason: this.refusal.reason ?? "work order expired" });
         return true;
       }
       if (this.mode === "error") {

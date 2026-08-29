@@ -12,6 +12,7 @@
 //     ⇒ 2xx {lease_id, fencing_generation, expires_at, ttl_s}
 //     | 409 {reason:"leased", holder_attempt_id, expires_at}   (older servers: 403
 //       {reason:"leased_by_other_attempt"} — both are read as the same decision)
+//     | 4xx {reason:<lease-state>}  any other lost-authority reason ⇒ a REFUSAL decision
 //   POST /v1/governor/leases/{id}/renew      {fencing_generation}
 //     ⇒ 2xx {expires_at, ttl_s} | 409 {reason: "stale_generation"|"expired"|"revoked"}
 //       (older servers carry those same reasons on a 403)
@@ -53,20 +54,27 @@ function validTtl(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= MIN_TTL_S;
 }
 
-// DELIBERATE WIDENING (#201 review, cross-repo table). The server only ever sends an integer
-// generation today, and this accepts a finite number OR a non-empty string. That is on purpose,
-// and the line is: the client VALIDATES what it interprets and only requires presence of what it
-// merely echoes. `ttl_s` bounds the run and `lease_id` builds a URL, so both are type-checked
-// hard. `fencing_generation` is an OPAQUE fence token — the worker never compares, orders or does
-// arithmetic on it, it only hands the same value back on renew/release/check and lets the
-// Governor judge it. Narrowing it to an integer would buy no safety (a string round-trips through
-// JSON unchanged) and would cost a real failure mode: the two repos deploy independently, so a
-// server that ever widened the token would make this client BLOCK every task at acquire — exactly
-// the silent, total inadmissibility that the declaration-refresh fix above exists to prevent.
-// What IS refused: null/undefined/missing, NaN, ±Infinity, an empty string, an object or array —
-// values that could not survive the round trip or would fence nothing.
+// A PARTIAL widening, and the halves have different reasons (#201 review, second pass).
+//
+// A NUMBER is accepted only when it is an integer >= 1 — the server validates the generation on
+// the way IN (`app.py`, `type is int and >= 1`, else 400), so `0`, `-3` and `1.5` are values it
+// will never accept on a renew, release or check. The first pass here accepted them on the theory
+// that narrowing "risks BLOCKing every task", and that was half wrong: accepting them does not
+// avoid the failure, it MOVES it past the point of no return. Acquire succeeds, the clone runs,
+// the child spawns, and then the first renew 400s, is filed `unreachable`, and the run is
+// SIGTERMed mid-flight. Narrow fails before any work starts; widened fails after. So this refuses
+// at acquire, where the task is BLOCKED cleanly with the offending value in the reason.
+//
+// A non-empty STRING is still accepted, and that half of the widening is deliberate. The worker
+// never compares, orders or computes on the fence — it only echoes the same value back on
+// renew/release/check and lets the Governor judge it — so a string round-trips unchanged, and
+// refusing one would turn a future server-side token change into a total, silent inadmissibility.
+// The line: the client type-checks what it INTERPRETS (`ttl_s` bounds the run, `lease_id` builds a
+// URL, an integer generation is what the server will accept back) and only requires presence of
+// what it merely carries.
 function validGeneration(value) {
-  return (typeof value === "number" && Number.isFinite(value)) || (typeof value === "string" && value.length > 0);
+  if (typeof value === "number") return Number.isInteger(value) && value >= 1;
+  return typeof value === "string" && value.length > 0;
 }
 
 // Any 2xx is a success (#201 review). The Governor's acquire is changing from 201 to 200 and the
@@ -78,21 +86,69 @@ function isSuccess(status) {
   return typeof status === "number" && status >= 200 && status < 300;
 }
 
-// WARN-3 (#201): lease-state reasons the Governor returns when the caller has LOST or never had
-// authority. These are DECISIONS — final, never retried — regardless of the status that carries
-// them. The server is moving them from 403 to 409; this client must be right under BOTH, so it
-// classifies on the reason and accepts either status. Anything else non-2xx is a transport or
-// unknown failure and fails closed on its own path (retry once, then loss of authority).
-const LEASE_STATE_REASONS = Object.freeze(["stale_generation", "expired", "revoked", "released", "leased", "leased_by_other_attempt", "not_holder", "unknown_lease"]);
+// WARN-3 (#201): the reasons the Governor returns when the caller has LOST, or never had,
+// authority. These are DECISIONS — final, never retried — regardless of the status carrying them.
+// The server is moving them from 403 to 409; this client must be right under BOTH, so it
+// classifies on the REASON and accepts either status.
+//
+// These are the strings the server actually emits, not a plausible-looking set. Getting that
+// wrong makes the whole list inert, which is exactly what happened in the first pass here: it was
+// written in snake_case (`unknown_lease`, `not_holder`) while the server emits prose, so every
+// old-server 403 still fell through to `unreachable` and nothing was fixed.
+//
+// VERIFIED against vinci-gpu-control main:
+//   "work order expired"                            governor_runtime.py:530, 843
+//   "session not in a live state"                   governor_runtime.py:854
+//   "work order deadline rule: deadline has passed"  app.py:152 (_DEADLINE_PASSED)
+// RELAYED from the #201 review, NOT verifiable from that snapshot (the lease endpoints and the
+// snake_case wire reasons live only on the #201 branch, which is not merged; `grep` for
+// `governor/leases`, `stale_generation`, `leased_by_other_attempt`, `unknown lease` and
+// `lease not held by this session` finds ZERO hits on main):
+//   "unknown lease", "lease not held by this session",
+//   "stale_generation", "expired", "revoked", "released", "leased", "leased_by_other_attempt"
+// Both spellings are carried on purpose: whichever set the deployed server turns out to emit, the
+// reason is classified as a decision rather than mislabelled a transport failure.
+const LEASE_STATE_REASONS = Object.freeze([
+  // Prose (verified on main, or relayed for the lease endpoints).
+  "work order expired",
+  "session not in a live state",
+  "unknown lease",
+  "lease not held by this session",
+  // Wire reasons specified by the Wave 1B lease contract (relayed; #201 branch only).
+  "stale_generation",
+  "expired",
+  "revoked",
+  "released",
+  "leased",
+  "leased_by_other_attempt",
+]);
+
+// `_DEADLINE_PASSED` is one of a family the server formats as "<rule>: <detail>", so it is matched
+// by prefix rather than by the one exact string that exists today.
+const LEASE_STATE_REASON_PREFIXES = Object.freeze(["work order deadline rule:"]);
+
 const LEASE_DECISION_STATUSES = Object.freeze([403, 409, 422]);
 
+function isLeaseStateReason(reason) {
+  if (typeof reason !== "string" || !reason) return false;
+  return LEASE_STATE_REASONS.includes(reason) || LEASE_STATE_REASON_PREFIXES.some((prefix) => reason.startsWith(prefix));
+}
+
+// Non-2xx ⇒ a decision reason, or null for "not a decision — fail closed on the caller's own path".
+// A 409 is a decision whatever it says (the contract reserves it for lease state); a 403/422 is a
+// decision only when its reason is one the server emits for lost authority, because those statuses
+// also carry ordinary refusals.
 function leaseStateDecision(status, body) {
   if (isSuccess(status) || !body) return null;
   const reason = typeof body.reason === "string" ? body.reason : null;
   if (status === 409) return reason || "refused";
-  if (reason && LEASE_DECISION_STATUSES.includes(status) && LEASE_STATE_REASONS.includes(reason)) return reason;
+  if (LEASE_DECISION_STATUSES.includes(status) && isLeaseStateReason(reason)) return reason;
   return null;
 }
+
+// "Someone else holds this order" — the one decision the daemon reports as `leased` rather than
+// `refused`, because it names a holder and an expiry the operator can act on.
+const LEASE_HELD_REASONS = Object.freeze(["leased", "leased_by_other_attempt", "lease not held by this session"]);
 
 async function readJson(response) {
   let body;
@@ -182,18 +238,28 @@ export class LeaseClient {
         },
       };
     }
-    // A "someone else holds this order" answer is a DECISION, not a failure: the old server sends
-    // it as 403 leased_by_other_attempt, the new one as 409 leased. Both mean the same thing and
-    // both are final here (the daemon BLOCKS the task; it does not retry).
-    if (LEASE_DECISION_STATUSES.includes(status) && (body.reason === "leased" || body.reason === "leased_by_other_attempt")) {
-      return {
-        success: false,
-        blocked: true,
-        leased: true,
-        holder_attempt_id: body.holder_attempt_id ?? null,
-        expires_at: body.expires_at ?? null,
-        reason: `leased_by ${body.holder_attempt_id ?? "unknown"} until ${body.expires_at ?? "unknown"}`,
-      };
+    // Every lease-state answer at acquire is a Governor DECISION, not a failure — on the old 403
+    // or the new 409 — and the daemon must file it as one. Two shapes:
+    //   leased  : someone else holds this order (a holder and an expiry the operator can act on)
+    //   refused : the order itself will not admit this attempt ("work order expired",
+    //             "session not in a live state", "work order deadline rule: ...", revoked, ...).
+    // Before this, everything but a 409 "leased" fell through to `unavailable`, so a Governor that
+    // had DECIDED (409 work order expired) was recorded as a Governor that had FAILED — the exact
+    // conflation the README promises never happens, and the one the path-claim path already
+    // avoids.
+    const decision = leaseStateDecision(status, body);
+    if (decision) {
+      if (LEASE_HELD_REASONS.includes(decision)) {
+        return {
+          success: false,
+          blocked: true,
+          leased: true,
+          holder_attempt_id: body.holder_attempt_id ?? null,
+          expires_at: body.expires_at ?? null,
+          reason: `leased_by ${body.holder_attempt_id ?? "unknown"} until ${body.expires_at ?? "unknown"}`,
+        };
+      }
+      return { success: false, blocked: true, refused: true, reason: decision };
     }
     return unavailable(`Governor error: unexpected status ${status} ${body.reason ?? "unknown"}`);
   }

@@ -9,7 +9,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { FakeGovernor, WorkerTestFixture } from './lib/worker-fixture.mjs';
+import { CLAIM_PATHS_DEPLOYED, CLAIM_PATHS_WITH_TTL, FakeGovernor, WorkerTestFixture } from './lib/worker-fixture.mjs';
 import { CAPABILITY_MATRIX, LEASE_TIMEOUT_MS, LeaseClient, buildDeclaration, declarationDigest, startHeartbeat } from '../worker/lease.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -96,10 +96,59 @@ function sha256(text) {
 const HEX40_OR_VERSION = /^(?:[0-9a-f]{40}(?:-dirty)?|\d+\.\d+\.\d+\S*)$/;
 
 // ---------------------------------------------------------------------------------------------
+// FIRST, deliberately. This is the guard of record for "the declaration refresh timer never holds
+// the process open", and almost every other test in this file waits on an UNBOUNDED `--once` run.
+// Ordered later, a daemon that fails to exit hangs one of those first and this test never asserts
+// — the failure reads as a CI alarm instead of as this property breaking. It is bounded, so the
+// mutant that removes both exit guards fails here, by name, in seconds.
+await test('BLOCK-B: the refresh timer never holds the process open (--once still exits)', async () => {
+  const fixture = new WorkerTestFixture('declaration-refresh-once');
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL });
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('133', 'w3', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    const started = Date.now();
+    // A 0.2 s refresh on a --once run: a timer that holds the event loop open would make this
+    // process never exit. Bounded explicitly, so a timer that DOES hold it open fails this test
+    // instead of hanging the suite.
+    const worker = spawnWorker(fixture, 'w3', ['--governor', governor.url], { VINCI_DECLARATION_REFRESH_S: '0.2' });
+    const timedOut = Symbol('timeout');
+    const bound = new Promise((r) => setTimeout(() => r(timedOut), 30_000).unref?.());
+    const outcome = await Promise.race([worker.closed, bound]);
+    const elapsed = Date.now() - started;
+    if (outcome === timedOut) {
+      worker.proc.kill('SIGKILL');
+      assert.fail(`--once did not exit within ${elapsed}ms: the declaration refresh timer is holding the process open`);
+    }
+    assert.equal(outcome.code, 0, outcome.stderr);
+    assert(elapsed < 30_000, `--once must still exit promptly, took ${elapsed}ms`);
+    assert.equal(state(fixture, '133').state, 'COMPLETED');
+    // The refresh really was live during that run (otherwise this proves nothing about the timer).
+    assert(declarationPosts(fixture, 'w3').length >= 1, 'the declaration was posted, so the interval was armed');
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+
+// ---------------------------------------------------------------------------------------------
 // L1 + L2 + L3 + L4 + D1 happy path: one governed task, evidence: pr.
+// FAIL FAST on the guard of record. Every remaining test in this file waits on an UNBOUNDED
+// `--once` run, so if a daemon cannot exit there is nothing left here that can report anything —
+// the suite would hang for its CI alarm and the real failure above would scroll past. Stopping
+// here is what makes that failure the visible one.
+if (failed > 0) {
+  console.error('\n  ABORTING: `--once` cannot exit, so every remaining test in this file would hang rather than assert.');
+  console.log(`\nWorker lease loop tests: ${passed} passed, ${failed} failed`);
+  process.exit(1);
+}
+
 await test('happy path: acquire before clone, renew at ttl/3, fenced push+PR, release completed', async () => {
   const fixture = new WorkerTestFixture('lease-happy');
-  const governor = new FakeGovernor({ ttlS: 1 });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1 });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -184,7 +233,7 @@ await test('happy path: acquire before clone, renew at ttl/3, fenced push+PR, re
 // ---------------------------------------------------------------------------------------------
 await test('409 leased => BLOCKED before clone: no git, no spawn, no renew, no release', async () => {
   const fixture = new WorkerTestFixture('lease-leased');
-  const governor = new FakeGovernor({ mode: 'leased', holder: { holder_attempt_id: 'other-worker/7', expires_at: '2099-01-01T00:00:00.000Z' } });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, mode: 'leased', holder: { holder_attempt_id: 'other-worker/7', expires_at: '2099-01-01T00:00:00.000Z' } });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -216,7 +265,7 @@ await test('409 leased => BLOCKED before clone: no git, no spawn, no renew, no r
 // ---------------------------------------------------------------------------------------------
 await test('unusable lease answer at acquire (500) => BLOCKED lease_unavailable, fail closed', async () => {
   const fixture = new WorkerTestFixture('lease-500');
-  const governor = new FakeGovernor({ mode: 'error' });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, mode: 'error' });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -239,7 +288,7 @@ await test('unusable lease answer at acquire (500) => BLOCKED lease_unavailable,
 });
 
 await test('unreachable governor at acquire => lease_unavailable (connection failed); a 200 without a lease is not a lease', async () => {
-  const probe = new FakeGovernor();
+  const probe = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL });
   await probe.start();
   const deadUrl = probe.url;
   await probe.close();
@@ -263,7 +312,7 @@ await test('unreachable governor at acquire => lease_unavailable (connection fai
 // ---------------------------------------------------------------------------------------------
 await test('renew 409 stale mid-run => child SIGTERMed, BLOCKED lease_lost, zero push/PR, evidence authority: lost, release abandoned', async () => {
   const fixture = new WorkerTestFixture('lease-lost');
-  const governor = new FakeGovernor({ ttlS: 1, renewOkCount: 3, renewFailure: { status: 409, reason: 'stale_generation' } });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1, renewOkCount: 3, renewFailure: { status: 409, reason: 'stale_generation' } });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -306,7 +355,7 @@ await test('renew 409 stale mid-run => child SIGTERMed, BLOCKED lease_lost, zero
 
 await test('renew unreachable (socket dropped) is retried once, then lease_lost:unreachable', async () => {
   const fixture = new WorkerTestFixture('lease-drop');
-  const governor = new FakeGovernor({ ttlS: 1, renewOkCount: 3, renewFailure: 'drop' });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1, renewOkCount: 3, renewFailure: 'drop' });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -329,7 +378,7 @@ await test('renew unreachable (socket dropped) is retried once, then lease_lost:
 // ---------------------------------------------------------------------------------------------
 await test('check invalid before push => push skipped, fenced_out recorded, BLOCKED, release abandoned', async () => {
   const fixture = new WorkerTestFixture('lease-fenced');
-  const governor = new FakeGovernor({ check: false });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, check: false });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -358,7 +407,7 @@ await test('check invalid before push => push skipped, fenced_out recorded, BLOC
 
 await test('check invalid between push and PR => branch pushed, PR skipped, fenced_out recorded', async () => {
   const fixture = new WorkerTestFixture('lease-fenced-pr');
-  const governor = new FakeGovernor({ check: (_body, index) => (index === 0 ? { valid: true, reason: 'ok' } : { valid: false, reason: 'revoked' }) });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, check: (_body, index) => (index === 0 ? { valid: true, reason: 'ok' } : { valid: false, reason: 'revoked' }) });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -381,7 +430,7 @@ await test('check invalid between push and PR => branch pushed, PR skipped, fenc
 // ---------------------------------------------------------------------------------------------
 await test('release on the catch path: clone failure after acquire => FAILED, release failed', async () => {
   const fixture = new WorkerTestFixture('lease-catch');
-  const governor = new FakeGovernor({ ttlS: 60 });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 60 });
   await governor.start();
   try {
     // No such origin: prepareRepository's clone throws after the lease was acquired.
@@ -403,7 +452,7 @@ await test('release on the catch path: clone failure after acquire => FAILED, re
 
 await test('release outcome follows the state: FAILED run releases failed; UNVERIFIED releases unverified', async () => {
   const fixture = new WorkerTestFixture('lease-outcomes');
-  const governor = new FakeGovernor({ ttlS: 60 });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 60 });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -423,7 +472,7 @@ await test('release outcome follows the state: FAILED run releases failed; UNVER
     await fixture.cleanup();
   }
   const fixture2 = new WorkerTestFixture('lease-unverified');
-  const governor2 = new FakeGovernor({ ttlS: 60 });
+  const governor2 = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 60 });
   await governor2.start();
   try {
     fixture2.createRepo('test', 'repo');
@@ -441,7 +490,7 @@ await test('release outcome follows the state: FAILED run releases failed; UNVER
 // ---------------------------------------------------------------------------------------------
 await test('release failure is logged and never changes the state', async () => {
   const fixture = new WorkerTestFixture('lease-release-fail');
-  const governor = new FakeGovernor({ ttlS: 60, releaseStatus: 500 });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 60, releaseStatus: 500 });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -507,7 +556,7 @@ await test('heartbeat unit: renews at ttl/3, reschedules on the served ttl, stop
 // fenced_out, release abandoned, blocker post — not a quiet UNVERIFIED downgrade.
 await test('check invalid at the evidence fence (third fence) => BLOCKED fenced_out, release abandoned, blocker says so', async () => {
   const fixture = new WorkerTestFixture('lease-fenced-evidence');
-  const governor = new FakeGovernor({ ttlS: 60, check: (_body, index) => (index < 2 ? { valid: true, reason: 'ok' } : { valid: false, reason: 'revoked' }) });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 60, check: (_body, index) => (index < 2 ? { valid: true, reason: 'ok' } : { valid: false, reason: 'revoked' }) });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -614,7 +663,7 @@ await test('path claim refused after the lease was granted => BLOCKED refused, l
 await test('release waits for the renew in flight: renew:end precedes release in the Governor log', async () => {
   const fixture = new WorkerTestFixture('lease-settle');
   // ttl 1 => first renew ~333ms after acquire, held open for 2.5s; the 500ms run ends well inside.
-  const governor = new FakeGovernor({ ttlS: 1, renewDelayMs: 2500 });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1, renewDelayMs: 2500 });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -665,7 +714,7 @@ await test('ttl_s < 1 is refused at acquire; a renew serving ttl_s < 1 keeps the
   assert.equal((await client.renew(lease)).ttl_s, 12, 'a valid renew ttl is adopted');
   // FakeGovernor-served sub-second leases are refused end to end (the fixture used 0.3 s before F6).
   const fixture = new WorkerTestFixture('lease-subsecond');
-  const governor = new FakeGovernor({ ttlS: 0.3 });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 0.3 });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -687,7 +736,7 @@ await test('ttl_s < 1 is refused at acquire; a renew serving ttl_s < 1 keeps the
 // F7: SIGTERM with a lease in flight releases it (abandoned) and SIGTERMs the child before exit.
 await test('SIGTERM mid-run: heartbeat stops, lease released abandoned, child SIGTERMed, daemon exits 0', async () => {
   const fixture = new WorkerTestFixture('lease-sigterm');
-  const governor = new FakeGovernor({ ttlS: 1 });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1 });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -752,7 +801,7 @@ await test('--governor unset => no declaration, no digest, no lease fields, no f
 // enforces the gate the way the server does (claimHolderGate, on by default).
 await test('BLOCK-A: the claim carries the acquire attempt_id, so the holder gate admits it', async () => {
   const fixture = new WorkerTestFixture('lease-holder-gate');
-  const governor = new FakeGovernor();
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -784,7 +833,7 @@ await test('BLOCK-A: the claim carries the acquire attempt_id, so the holder gat
 // state an attempt_id-less claim would land every governed task in.
 await test('BLOCK-A control: a non-holder attempt_id is refused leased_by_other_attempt and blocks', async () => {
   const fixture = new WorkerTestFixture('lease-holder-gate-neg');
-  const governor = new FakeGovernor();
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -868,7 +917,7 @@ await test('acquire accepts any 2xx with a well-formed body; 200 and 201 both gr
 // A granted acquire served as 201 by a pre-fix Governor still runs the whole governed task.
 await test('2xx acceptance end to end: a 201 acquire runs, renews, fences and releases', async () => {
   const fixture = new WorkerTestFixture('lease-201');
-  const governor = new FakeGovernor({ acquireStatus: 201 });
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, acquireStatus: 201 });
   await governor.start();
   try {
     fixture.createRepo('test', 'repo');
@@ -892,7 +941,7 @@ await test('2xx acceptance end to end: a 201 acquire runs, renews, fences and re
 // WARN-3 (#201): lease-state answers are DECISIONS — final loss of authority, never retried —
 // and the server is moving them from 403 to 409. The client must be right under BOTH, and must
 // still fail CLOSED on anything it cannot classify. Nothing here assumes the server change landed.
-await test('WARN-3: a lease-state reason is a final decision on 403 and on 409; anything else fails closed', async () => {
+await test('WARN-3: the reasons the server ACTUALLY emits are decisions on 403 and 409; anything else fails closed', async () => {
   const lease = { lease_id: 'l1', fencing_generation: 7, ttl_s: 60 };
   const renewWith = async (status, body) => {
     let calls = 0;
@@ -902,18 +951,33 @@ await test('WARN-3: a lease-state reason is a final decision on 403 and on 409; 
     } });
     return { result: await client.renew(lease), calls: () => calls };
   };
-  // New server: 409 + lease-state reason.
-  for (const reason of ['stale_generation', 'expired', 'revoked']) {
-    const { result, calls } = await renewWith(409, { reason });
-    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason }, `409 ${reason}`);
-    assert.equal(calls(), 1, `a decision is never retried (409 ${reason})`);
-  }
-  // Old server: the SAME reasons on a 403. Still a decision, still no retry, reason preserved —
-  // never mislabelled "unreachable", which would file a Governor decision as a Governor failure.
-  for (const reason of ['stale_generation', 'expired', 'revoked', 'not_holder', 'leased_by_other_attempt']) {
+  // The strings VERIFIED in vinci-gpu-control main. The first pass listed snake_case inventions
+  // (`unknown_lease`, `not_holder`) that the server never emits, which made the whole list inert:
+  // every one of these still came back `reason=unreachable, calls=2`. These five are the test.
+  const SERVER_403_REASONS = [
+    'work order expired',                             // governor_runtime.py:530, 843
+    'session not in a live state',                    // governor_runtime.py:854
+    'work order deadline rule: deadline has passed',  // app.py:152 (_DEADLINE_PASSED)
+    'unknown lease',                                  // relayed (#201 branch)
+    'lease not held by this session',                 // relayed (#201 branch)
+  ];
+  for (const reason of SERVER_403_REASONS) {
     const { result, calls } = await renewWith(403, { reason });
-    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason }, `403 ${reason}`);
+    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason }, `403 ${reason} must be a decision, not "unreachable"`);
     assert.equal(calls(), 1, `a decision is never retried (403 ${reason})`);
+  }
+  // A deadline rule is one of a "<rule>: <detail>" family — matched by prefix, not by the single
+  // exact string that happens to exist today.
+  const { result: deadline, calls: deadlineCalls } = await renewWith(403, { reason: 'work order deadline rule: something else entirely' });
+  assert.equal(deadline.reason, 'work order deadline rule: something else entirely');
+  assert.equal(deadlineCalls(), 1);
+  // The wire reasons the Wave 1B lease contract specifies, on the new 409 and the old 403.
+  for (const reason of ['stale_generation', 'expired', 'revoked', 'released', 'leased_by_other_attempt']) {
+    for (const status of [409, 403]) {
+      const { result, calls } = await renewWith(status, { reason });
+      assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason }, `${status} ${reason}`);
+      assert.equal(calls(), 1, `a decision is never retried (${status} ${reason})`);
+    }
   }
   // Anything else non-2xx is transport/unknown: retried once, then LOSS OF AUTHORITY (fail closed).
   for (const [status, body] of [[500, { reason: 'boom' }], [502, {}], [403, { reason: 'something_new' }], [404, { reason: 'stale_generation' }]]) {
@@ -921,19 +985,104 @@ await test('WARN-3: a lease-state reason is a final decision on 403 and on 409; 
     assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason: 'unreachable' }, `status ${status} ${JSON.stringify(body)}`);
     assert.equal(calls(), 2, `an unknown failure is retried exactly once (status ${status})`);
   }
-  // Acquire: "held by another attempt" is a decision on either status, and BLOCKS rather than
-  // being retried or mistaken for a transport failure.
-  for (const [status, body] of [[409, { reason: 'leased', holder_attempt_id: 'other/7', expires_at: '2099-01-01T00:00:00Z' }], [403, { reason: 'leased_by_other_attempt', holder_attempt_id: 'other/7', expires_at: '2099-01-01T00:00:00Z' }]]) {
+});
+
+// The same rule at ACQUIRE. A lease-state answer there is a Governor DECISION and must be filed as
+// one: `leased` when it names another holder, `refused` otherwise. Before this, everything but a
+// 409 "leased" came back `lease_unavailable: unexpected status 409` with
+// `outcome.governor = "unavailable"` — a decision recorded as a failure.
+await test('WARN-3 at acquire: lease-state answers are decisions (leased vs refused), never "unavailable"', async () => {
+  const acquireWith = async (status, body) => {
     let calls = 0;
     const client = new LeaseClient({ governorUrl: 'http://governor.invalid', token: 't', fetch: async () => {
       calls += 1;
       return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
     } });
-    const result = await client.acquire({ workOrderId: 'job_x', attemptId: 'x/1' });
-    assert.equal(result.leased, true, `acquire ${status} ${body.reason} is a "not ours" decision`);
+    return { result: await client.acquire({ workOrderId: 'job_x', attemptId: 'x/1' }), calls: () => calls };
+  };
+  // Held by another attempt: `leased`, with the holder and expiry the operator can act on.
+  for (const [status, reason] of [[409, 'leased'], [403, 'leased_by_other_attempt'], [403, 'lease not held by this session']]) {
+    const { result, calls } = await acquireWith(status, { reason, holder_attempt_id: 'other/7', expires_at: '2099-01-01T00:00:00Z' });
+    assert.equal(result.leased, true, `acquire ${status} ${reason} is a "not ours" decision`);
     assert.equal(result.blocked, true);
+    assert.equal(result.unavailable, undefined, 'a decision is never also a failure');
     assert.equal(result.holder_attempt_id, 'other/7');
-    assert.equal(calls, 1, 'an acquire decision is never retried');
+    assert.equal(calls(), 1, 'an acquire decision is never retried');
+  }
+  // The order itself will not admit this attempt: `refused`, reason verbatim.
+  for (const [status, reason] of [
+    [409, 'work order expired'], [409, 'session not in a live state'], [409, 'expired'], [409, 'revoked'],
+    [403, 'work order expired'], [403, 'work order deadline rule: deadline has passed'], [403, 'unknown lease'],
+  ]) {
+    const { result, calls } = await acquireWith(status, { reason });
+    assert.equal(result.refused, true, `acquire ${status} ${reason} must be a REFUSAL decision`);
+    assert.equal(result.blocked, true);
+    assert.equal(result.leased, undefined);
+    assert.equal(result.unavailable, undefined, 'a Governor decision must never be filed as a Governor failure');
+    assert.equal(result.reason, reason, 'the rule text rides verbatim');
+    assert.equal(calls(), 1);
+  }
+  // Not a decision: still fails closed as unavailable.
+  for (const [status, body] of [[500, { reason: 'boom' }], [403, { reason: 'something_new' }], [418, {}]]) {
+    const { result } = await acquireWith(status, body);
+    assert.equal(result.unavailable, true, `acquire ${status} ${JSON.stringify(body)} is a failure, not a decision`);
+    assert.equal(result.refused, undefined);
+    assert.equal(result.blocked, true);
+  }
+});
+
+// A lease-state refusal at acquire reaches the task record and the blocker post as a DECISION.
+await test('WARN-3 at acquire, end to end: 409 work order expired => BLOCKED refused, not unavailable', async () => {
+  const fixture = new WorkerTestFixture('lease-acquire-refused');
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, mode: 'refuse', refusal: { status: 409, reason: 'work order expired' } });
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('142', 'w8', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    const { code } = await runWorker(fixture, 'w8', ['--governor', governor.url]);
+    assert.equal(code, 0);
+    const snapshot = state(fixture, '142');
+    assert.equal(snapshot.state, 'BLOCKED');
+    assert.equal(snapshot.outcome.reason, 'work order expired', 'the rule text verbatim, with no lease_unavailable prefix');
+    assert.equal(snapshot.outcome.governor, 'refused', 'a Governor DECISION, not "unavailable"');
+    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    assert(blocker && blocker.body.includes('Governor refused the lease: work order expired'), `blocker: ${blocker?.body}`);
+    assert.equal(fixture.getVinciCalls().length, 0, 'must not spawn');
+    assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'must not clone');
+    assert.equal(governor.claims.length, 0, 'no claim is taken for a lease that was refused');
+    assert.equal(governor.releases.length, 0, 'nothing to release');
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+// A fencing_generation the SERVER would reject on the way in must be refused at acquire, before
+// any work — not accepted and then 400'd on the first renew, mid-run, after the child is spawned.
+await test('fencing_generation: a number must be an integer >= 1; a non-empty string is still accepted', async () => {
+  const acquireGeneration = async (fencing_generation) => {
+    const client = new LeaseClient({ governorUrl: 'http://governor.invalid', token: 't', fetch: async () => new Response(JSON.stringify({ lease_id: 'l1', fencing_generation, ttl_s: 60 }), { status: 200, headers: { 'content-type': 'application/json' } }) });
+    return client.acquire({ workOrderId: 'job_x', attemptId: 'x/1' });
+  };
+  // The server validates `type is int and >= 1` on the way in, so these are values it will refuse
+  // on every later call. Refusing them here BLOCKS cleanly; accepting them moves the failure to
+  // the first renew, after the clone and the spawn.
+  for (const bad of [0, -3, 1.5, -0.0001, Number.NaN, Infinity, '', null, undefined, {}, []]) {
+    const result = await acquireGeneration(bad);
+    assert.equal(result.success, false, `fencing_generation ${JSON.stringify(bad)} must not be a lease`);
+    assert.equal(result.unavailable, true);
+    assert.match(result.reason, /^Governor lease invalid: fencing_generation=/);
+  }
+  for (const good of [1, 7, 100, Number.MAX_SAFE_INTEGER]) {
+    assert.equal((await acquireGeneration(good)).success, true, `integer ${good} is a usable generation`);
+  }
+  // The string half of the widening stands: the worker only echoes the fence back, so a token it
+  // cannot interpret still round-trips.
+  for (const good of ['gen-1', '00000000-0000-4000-8000-000000000000']) {
+    const result = await acquireGeneration(good);
+    assert.equal(result.success, true, `string generation ${good} is carried, not interpreted`);
+    assert.equal(result.lease.fencing_generation, good);
   }
 });
 
@@ -943,6 +1092,7 @@ await test('WARN-3: a lease-state reason is a final decision on 403 and on 409; 
 // declaration posted only at startup therefore makes any daemon alive more than a day silently
 // inadmissible for ALL work, with no warning and no recovery. The declaration is re-posted on an
 // interval (VINCI_DECLARATION_REFRESH_S, default 3600 s) on the SAME code path as the startup post.
+// (The guard for "the refresh timer never holds the process open" is the FIRST test in this file.)
 function declarationPosts(fixture, workerId) {
   return fixture.getPostedMessages().filter((post) => post.subject === `worker ${workerId} declaration`);
 }
@@ -959,7 +1109,7 @@ function spawnDaemon(fixture, workerId, extraArgs, envOverrides = {}) {
 
 await test('BLOCK-B: the declaration is re-posted on the refresh interval, byte-identical', async () => {
   const fixture = new WorkerTestFixture('declaration-refresh');
-  const governor = new FakeGovernor();
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL });
   await governor.start();
   let worker = null;
   try {
@@ -983,7 +1133,7 @@ await test('BLOCK-B: the declaration is re-posted on the refresh interval, byte-
 
 await test('BLOCK-B: a failed re-post is logged, never fatal, and the poll loop keeps running', async () => {
   const fixture = new WorkerTestFixture('declaration-refresh-fail');
-  const governor = new FakeGovernor();
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL });
   await governor.start();
   let worker = null;
   try {
@@ -1012,42 +1162,10 @@ await test('BLOCK-B: a failed re-post is logged, never fatal, and the poll loop 
   }
 });
 
-await test('BLOCK-B: the refresh timer never holds the process open (--once still exits)', async () => {
-  const fixture = new WorkerTestFixture('declaration-refresh-once');
-  const governor = new FakeGovernor();
-  await governor.start();
-  try {
-    fixture.createRepo('test', 'repo');
-    fixture.linkTools(TOOLS);
-    await fixture.startBus([handoff('133', 'w3', 'repo: test/repo\nevidence: pr\n\nTask')]);
-    const started = Date.now();
-    // A 0.2 s refresh on a --once run: a timer that holds the event loop open would make this
-    // process never exit. Bounded explicitly, so a timer that DOES hold it open fails this test
-    // instead of hanging the suite.
-    const worker = spawnWorker(fixture, 'w3', ['--governor', governor.url], { VINCI_DECLARATION_REFRESH_S: '0.2' });
-    const timedOut = Symbol('timeout');
-    const bound = new Promise((r) => setTimeout(() => r(timedOut), 30_000).unref?.());
-    const outcome = await Promise.race([worker.closed, bound]);
-    const elapsed = Date.now() - started;
-    if (outcome === timedOut) {
-      worker.proc.kill('SIGKILL');
-      assert.fail(`--once did not exit within ${elapsed}ms: the declaration refresh timer is holding the process open`);
-    }
-    assert.equal(outcome.code, 0, outcome.stderr);
-    assert(elapsed < 30_000, `--once must still exit promptly, took ${elapsed}ms`);
-    assert.equal(state(fixture, '133').state, 'COMPLETED');
-    // The refresh really was live during that run (otherwise this proves nothing about the timer).
-    assert(declarationPosts(fixture, 'w3').length >= 1, 'the declaration was posted, so the interval was armed');
-  } finally {
-    await governor.close();
-    await fixture.cleanup();
-  }
-});
-
 await test('BLOCK-B: the refresh interval defaults to 3600 s and ignores an unusable override', async () => {
   for (const env of [{}, { VINCI_DECLARATION_REFRESH_S: 'soon' }, { VINCI_DECLARATION_REFRESH_S: '0' }, { VINCI_DECLARATION_REFRESH_S: '-5' }]) {
     const fixture = new WorkerTestFixture('declaration-refresh-default');
-    const governor = new FakeGovernor();
+    const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL });
     await governor.start();
     let worker = null;
     try {
@@ -1063,6 +1181,72 @@ await test('BLOCK-B: the refresh interval defaults to 3600 s and ignores an unus
       await governor.close();
       await fixture.cleanup();
     }
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// The claim-paths ttl interlock. VERIFIED against vinci-gpu-control main: the 200 body is
+// `{ok, reason, claim_hash, paths}` (app.py:2888-2893) with NO `ttl`, while this client refuses a
+// 200 without a finite positive ttl (governor.mjs) — so with BLOCK-A fixed and the claim finally
+// reaching the gate, today's server blocks every governed task one step later, at
+// `Governor lease invalid: ttl=undefined`. The server fix (returning the ttl it already computes)
+// is dispatched on gpu-control #201.
+//
+// The client's ttl requirement STAYS: `tightenEnvelopeLimits` caps the run's `max_runtime_s` on
+// the claim ttl (worker-governor-fail-closed.mjs T3/T3b/T3c), so accepting a ttl-less claim would
+// silently delete a runtime cap rather than fix anything. This test is the tripwire on that
+// disagreement: it fails if the client stops requiring the ttl, and it fails if the fixture goes
+// back to inventing one.
+await test('claim-paths without ttl (the DEPLOYED server shape) blocks before any work', async () => {
+  const fixture = new WorkerTestFixture('claim-no-ttl');
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_DEPLOYED });
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('140', 'w6', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    const { code } = await runWorker(fixture, 'w6', ['--governor', governor.url]);
+    assert.equal(code, 0);
+    // The fixture is serving the real shape, not an invented one.
+    assert.equal('ttl' in CLAIM_PATHS_DEPLOYED, false, 'the deployed claim response has no ttl');
+    assert.deepEqual(Object.keys(CLAIM_PATHS_DEPLOYED).sort(), ['claim_hash', 'ok', 'paths', 'reason']);
+    const snapshot = state(fixture, '140');
+    assert.equal(snapshot.state, 'BLOCKED', `expected BLOCKED, got ${snapshot.state} (${JSON.stringify(snapshot.outcome)})`);
+    assert.equal(snapshot.outcome.reason, 'Governor lease invalid: ttl=undefined');
+    assert.equal(snapshot.outcome.governor, 'unavailable', 'a body that cannot bound the run is a FAILURE, not a Governor decision');
+    // It got past the holder gate — this is the NEXT blocker, not BLOCK-A coming back.
+    assert.equal(governor.claims.length, 1, 'the claim was made');
+    assert.equal(governor.claims[0].attempt_id, '140/1', 'and carried the holder attempt_id');
+    // Fail closed, and the lease this worker held is given back.
+    assert.equal(fixture.getVinciCalls().length, 0, 'must not spawn');
+    assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'must not clone');
+    assert.deepEqual(governor.releases.map((r) => r.outcome), ['blocked']);
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+// The same body once #201 adds the ttl: the identical task runs to completion, and the claim ttl
+// becomes the run's runtime cap. Together with the test above this pins BOTH sides of the fix.
+await test('claim-paths WITH ttl (the fixed server) runs, and the claim ttl caps the runtime', async () => {
+  const fixture = new WorkerTestFixture('claim-with-ttl');
+  const governor = new FakeGovernor({ claim: { ...CLAIM_PATHS_WITH_TTL, ttl: 77 } });
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('141', 'w7', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    const { code, stderr } = await runWorker(fixture, 'w7', ['--governor', governor.url]);
+    assert.equal(code, 0, stderr);
+    const snapshot = state(fixture, '141');
+    assert.equal(snapshot.state, 'COMPLETED', `expected COMPLETED, got ${snapshot.state} (${JSON.stringify(snapshot.outcome)})`);
+    assert.equal(snapshot.lease.ttl, 77);
+    assert.equal(snapshot.lease.effective_max_runtime_s, 77, 'the claim ttl is a runtime cap — dropping the ttl requirement would delete it');
+    assert.equal(fixture.getVinciCalls().length, 1);
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
   }
 });
 

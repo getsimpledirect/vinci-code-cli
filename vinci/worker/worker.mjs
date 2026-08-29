@@ -534,9 +534,14 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, sub
         capabilityDeclarationDigest,
       });
       if (!acquired.success) {
-        const reason = acquired.leased ? acquired.reason : `lease_unavailable: ${acquired.reason}`;
-        const governor = acquired.leased ? "leased" : "unavailable";
-        const label = acquired.leased ? "Governor lease held elsewhere" : "Governor lease unavailable";
+        // Three classifications, never conflated (the same rule the path claim already follows):
+        //   leased      a Governor DECISION naming another holder
+        //   refused     a Governor DECISION about the order itself (expired, revoked, deadline...)
+        //   unavailable no decision at all — unreachable, malformed, unexpected status
+        const decided = acquired.leased || acquired.refused;
+        const reason = decided ? acquired.reason : `lease_unavailable: ${acquired.reason}`;
+        const governor = acquired.leased ? "leased" : acquired.refused ? "refused" : "unavailable";
+        const label = acquired.leased ? "Governor lease held elsewhere" : acquired.refused ? "Governor refused the lease" : "Governor lease unavailable";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
         await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
           inReplyTo: message.message_id,
