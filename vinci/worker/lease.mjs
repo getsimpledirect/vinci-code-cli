@@ -17,15 +17,22 @@
 //   POST /v1/governor/leases/{id}/check      {fencing_generation}            ⇒ 200 {valid, reason}
 //
 // Fail-closed throughout: the ONLY result that lets a task proceed is a 200 lease whose body
-// can bound the run (a string lease_id, a fencing_generation, a finite positive ttl_s). A renew
-// that is refused, or unreachable after one retry, is LOSS OF AUTHORITY. A check that cannot be
-// answered is `valid: false`. Release failures are logged and never change a task's state.
+// can bound the run (a string lease_id, a fencing_generation, a ttl_s of at least 1 second). A
+// renew that is refused, or unreachable after one retry, is LOSS OF AUTHORITY. A check that
+// cannot be answered is `valid: false`. Release failures are logged and never change a task's
+// state. Every request is bounded by LEASE_TIMEOUT_MS: a Governor that accepts the connection and
+// never answers is `Governor connection failed: timeout after N ms`, the same class as a refused
+// connection (a hang must not hold a heartbeat, a fence or a release open forever).
 import { createHash } from "node:crypto";
 
 import { canonicalize } from "./contracts/canonical.mjs";
 import { recordDigest } from "./contracts/digest.mjs";
 
 export const LEASE_TOKEN_MISSING = "governor token missing (VINCI_GOVERNOR_TOKEN)";
+export const LEASE_TIMEOUT_MS = 10_000;
+// A lease must be able to bound a run: ttl_s below one second (0, 0.3, negative, NaN, a string)
+// is refused at acquire, and a renew that serves such a value keeps the previous ttl.
+export const MIN_TTL_S = 1;
 export const RELEASE_OUTCOMES = Object.freeze(["completed", "failed", "blocked", "unverified", "abandoned"]);
 
 // The lease subject: what the Governor keys the lease on. Today the envelope's `ref` (a ledger
@@ -36,8 +43,8 @@ export function leaseSubject(task) {
   return task?.envelope?.ref ?? task?.id ?? null;
 }
 
-function positiveFinite(value) {
-  return typeof value === "number" && Number.isFinite(value) && value > 0;
+function validTtl(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= MIN_TTL_S;
 }
 
 function validGeneration(value) {
@@ -58,29 +65,43 @@ async function readJson(response) {
 }
 
 export class LeaseClient {
-  constructor({ governorUrl, token, busToken, fetch: fetchImpl = globalThis.fetch, log = (line) => process.stderr.write(`${line}\n`) }) {
+  // `timeoutMs` bounds every request (connect + headers + body); injectable for tests.
+  constructor({ governorUrl, token, busToken, fetch: fetchImpl = globalThis.fetch, log = (line) => process.stderr.write(`${line}\n`), timeoutMs = LEASE_TIMEOUT_MS }) {
     this.governorUrl = governorUrl ? String(governorUrl).replace(/\/+$/, "") : null;
     this.token = token ?? null;
     this.busToken = busToken ?? null;
     this.fetch = fetchImpl;
     this.log = log;
+    this.timeoutMs = timeoutMs;
   }
 
   async post(path, body, { authorization }) {
     const url = `${this.governorUrl}${path}`;
-    let response;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    if (typeof timer?.unref === "function") timer.unref();
     try {
-      response = await this.fetch(url, {
-        method: "POST",
-        headers: { Authorization: authorization, "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    } catch (error) {
-      return { transport: `Governor connection failed: ${error?.cause?.code ?? error.message}` };
+      let response;
+      try {
+        response = await this.fetch(url, {
+          method: "POST",
+          headers: { Authorization: authorization, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (controller.signal.aborted || error?.name === "AbortError") return { transport: `Governor connection failed: timeout after ${this.timeoutMs} ms` };
+        return { transport: `Governor connection failed: ${error?.cause?.code ?? error.message}` };
+      }
+      const parsed = await readJson(response);
+      if (parsed.error) {
+        if (controller.signal.aborted) return { transport: `Governor connection failed: timeout after ${this.timeoutMs} ms` };
+        return { status: response.status, malformed: `Governor returned ${parsed.error}` };
+      }
+      return { status: response.status, body: parsed.body };
+    } finally {
+      clearTimeout(timer);
     }
-    const parsed = await readJson(response);
-    if (parsed.error) return { status: response.status, malformed: `Governor returned ${parsed.error}` };
-    return { status: response.status, body: parsed.body };
   }
 
   // L1. Returns exactly one of:
@@ -105,7 +126,7 @@ export class LeaseClient {
     if (status === 200) {
       if (typeof body.lease_id !== "string" || !body.lease_id) return unavailable(`Governor lease invalid: lease_id=${JSON.stringify(body.lease_id)}`);
       if (!validGeneration(body.fencing_generation)) return unavailable(`Governor lease invalid: fencing_generation=${JSON.stringify(body.fencing_generation)}`);
-      if (!positiveFinite(body.ttl_s)) return unavailable(`Governor lease invalid: ttl_s=${JSON.stringify(body.ttl_s)}`);
+      if (!validTtl(body.ttl_s)) return unavailable(`Governor lease invalid: ttl_s=${JSON.stringify(body.ttl_s)}`);
       return {
         success: true,
         lease: {
@@ -139,7 +160,7 @@ export class LeaseClient {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const result = await this.post(`/v1/governor/leases/${encodeURIComponent(lease.lease_id)}/renew`, { fencing_generation: lease.fencing_generation }, { authorization: `Session ${this.token}` });
       if (result.status === 200 && result.body) {
-        return { ok: true, expires_at: result.body.expires_at ?? lease.expires_at ?? null, ttl_s: positiveFinite(result.body.ttl_s) ? result.body.ttl_s : lease.ttl_s, epoch: result.body.epoch ?? null };
+        return { ok: true, expires_at: result.body.expires_at ?? lease.expires_at ?? null, ttl_s: validTtl(result.body.ttl_s) ? result.body.ttl_s : lease.ttl_s, epoch: result.body.epoch ?? null };
       }
       if (result.status === 409 && result.body) {
         const reason = typeof result.body.reason === "string" && result.body.reason ? result.body.reason : "refused";
@@ -238,12 +259,19 @@ export function startHeartbeat({ client, lease, onLoss, setTimer = setTimeout, c
 //   approvals              "none" nothing in the run waits for a person
 //   pause                  false  the only brake is termination
 //   restrictToReadOnly     false  the tool set is fixed at spawn (read,grep,find,ls,bash,edit,write)
-//   abort                  true   limits, lease loss and SIGTERM end a run (SIGTERM, then SIGKILL)
+//   abort                  false  no bus command aborts a run: the daemon consumes only kind
+//                                 "handoff" and has no abort handler. Limits, lease loss and the
+//                                 daemon's own SIGTERM end a run, but none of those is a caller-
+//                                 issued abort in the matrix's sense
 //   filesystemEnforcement  false  the child runs in the shared checkout; nothing confines it
 //   networkEnforcement     false  no network policy is applied to the child
-//   structuredEvidence     true   the evidence bundle (session.jsonl, git.diff, result.json, runner.log)
+//   structuredEvidence     CONFIG true only when VINCI_EVIDENCE_URI_PREFIX is set at startup: the
+//                                 bundle (session.jsonl, git.diff, result.json, runner.log) is
+//                                 uploaded only then; without it no evidence is produced at all
 //   nativeReceipts         false  no receipt is emitted by the worker itself
-//   safeResume             true   a daemon restart resumes a RUNNING task as attempt N+1
+//   safeResume             false  a daemon restart re-runs a RUNNING task as attempt N+1, but no
+//                                 test proves a kill mid-write (task file, cursor, checkout, push)
+//                                 resumes without loss or duplication; unproven ⇒ not claimed
 //   independentVerification false verification happens inside the same run that did the work
 // controlLevel is the DERIVED rung (activityStream false ⇒ "inventoried"); a higher claim is an
 // overclaim the validator refuses. `buildDigest` is omitted: the matrix demands a SHA-256 and the
@@ -256,22 +284,24 @@ export const CAPABILITY_MATRIX = Object.freeze({
   approvals: "none",
   pause: false,
   restrictToReadOnly: false,
-  abort: true,
+  abort: false,
   filesystemEnforcement: false,
   networkEnforcement: false,
-  structuredEvidence: true,
+  structuredEvidence: false,
   nativeReceipts: false,
-  safeResume: true,
+  safeResume: false,
   independentVerification: false,
 });
 
-export function buildDeclaration({ workerId, workerVersion, adapterVersion }) {
+// `structuredEvidence` is the one config-derived entry: the daemon passes
+// Boolean(VINCI_EVIDENCE_URI_PREFIX) as read at startup. Everything else is the fixed matrix.
+export function buildDeclaration({ workerId, workerVersion, adapterVersion, structuredEvidence = false }) {
   return {
     schemaVersion: 1,
     worker: { id: workerId, name: "Vinci Code worker", version: workerVersion },
     adapter: { id: "vinci-worker-daemon", version: adapterVersion },
     controlLevel: "inventoried",
-    supports: { ...CAPABILITY_MATRIX },
+    supports: { ...CAPABILITY_MATRIX, structuredEvidence: structuredEvidence === true },
   };
 }
 

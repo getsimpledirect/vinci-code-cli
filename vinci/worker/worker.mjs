@@ -15,7 +15,7 @@ import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
-import { LeaseClient, buildDeclaration, declarationBody, declarationDigest, leaseSubject, releaseOutcome, startHeartbeat } from "./lease.mjs";
+import { LEASE_TIMEOUT_MS, LeaseClient, buildDeclaration, declarationBody, declarationDigest, leaseSubject, releaseOutcome, startHeartbeat } from "./lease.mjs";
 import { readSessionState } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
@@ -50,6 +50,36 @@ const ANNOUNCED_BINARY_FILE = "vinci-binary.json";
 // until `--governor` is configured.
 let capabilityDeclaration = null;
 let capabilityDeclarationDigest = null;
+
+// Wave 1B F7: every lease this daemon currently holds, so a SIGTERM/SIGINT can release each one
+// (`abandoned`) before the process exits. Entries are added right after acquire and removed by
+// the task's own release; the set is empty whenever no governed task is in flight.
+const activeLeases = new Set();
+
+// Bounded shutdown of every active lease: stop the heartbeat, wait for a renew in flight, release
+// `abandoned`, then SIGTERM the child so nothing keeps working under a released lease. The whole
+// thing is capped at LEASE_TIMEOUT_MS per lease (the release post itself has the same cap) so a
+// hung Governor cannot keep the daemon alive after a stop request.
+async function releaseActiveLeases(signal) {
+  for (const entry of [...activeLeases]) {
+    activeLeases.delete(entry);
+    entry.heartbeat?.stop();
+    process.stderr.write(`vinci worker: ${signal}: releasing lease ${entry.lease.lease_id} (task ${entry.taskId}) as abandoned\n`);
+    let bound = null;
+    const deadline = new Promise((resolveDeadline) => {
+      bound = setTimeout(() => resolveDeadline({ ok: false, timeout: true }), LEASE_TIMEOUT_MS);
+      if (typeof bound?.unref === "function") bound.unref();
+    });
+    const release = (async () => {
+      if (entry.heartbeat) await entry.heartbeat.settled();
+      return entry.client.release(entry.lease, "abandoned");
+    })();
+    const result = await Promise.race([release, deadline]);
+    clearTimeout(bound);
+    if (result?.timeout) process.stderr.write(`vinci worker: ${signal}: lease ${entry.lease.lease_id} release did not complete within ${LEASE_TIMEOUT_MS} ms\n`);
+    entry.abortController?.abort(`daemon_${signal.toLowerCase()}`);
+  }
+}
 
 function readAnnouncedBinary(stateDir) {
   try {
@@ -406,9 +436,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, sub
   // the heartbeat had not yet noticed): the release outcome is then `abandoned`, like a loss.
   let fencedOutReason = null;
   const abortController = new AbortController();
+  let leaseEntry = null;
   const releaseLease = async (state) => {
     if (!lease || !leaseClient) return;
-    if (heartbeat) heartbeat.stop();
+    if (leaseEntry) activeLeases.delete(leaseEntry);
+    // F5: stop the heartbeat AND wait for a renew already in flight, so the Governor never sees
+    // a renew arrive after the release for the same generation.
+    if (heartbeat) {
+      heartbeat.stop();
+      await heartbeat.settled();
+    }
     const held = lease;
     lease = null;
     await leaseClient.release(held, releaseOutcome(state, { authorityLost: Boolean(authorityLost || fencedOutReason) }));
@@ -430,39 +467,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, sub
     let envelopeToUse = envelope;
     if (governorUrl) {
       const governorToken = process.env.VINCI_GOVERNOR_TOKEN;
-      const claimResult = await claimGovernorPaths({
-        governorUrl,
-        token: governorToken,
-        paths: [envelope.claim],
-        taskId,
-        attempt: attempt.attempt,
-      });
-
-      if (!claimResult?.success) {
-        // Two classifications, never conflated: a REFUSAL is a Governor decision (403/409/422,
-        // rule text verbatim); everything else is the Governor being unavailable or its answer
-        // being unusable. Both BLOCK; the soak ledger attributes them differently.
-        const reason = claimResult?.reason ?? "governor returned no lease decision";
-        const governor = claimResult?.refused === true ? "refused" : "unavailable";
-        const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
-        lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
-        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
-          inReplyTo: message.message_id,
-        });
-        return true;
-      }
-
-      // Lease granted: tighten the envelope (budget, max_runtime_s, deadline, and the lease
-      // ttl as a runtime cap) and record both the lease and the effective runtime limit.
-      envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
-      lifecycle.record({
-        lease: { ...claimResult, effective_max_runtime_s: envelopeToUse.max_runtime_s },
-        capability_declaration_digest: capabilityDeclarationDigest,
-      });
-
-      // Wave 1B L1: the work-order lease, right after the path claim and BEFORE clone. A 409
-      // "leased" is a Governor decision that the task is not ours (BLOCKED, not a failure);
-      // anything else that is not a usable lease is `lease_unavailable` (fail closed).
+      // Wave 1B L1 (F4): the work-order lease FIRST, then the path claim. The Governor has no
+      // endpoint that releases a path claim, so a claim taken before a refused lease would be
+      // held until its ttl for a task this worker never runs; acquiring the lease first means a
+      // refused/unavailable lease leaves nothing claimed. A 409 "leased" is a Governor decision
+      // that the task is not ours (BLOCKED, not a failure); anything else that is not a usable
+      // lease is `lease_unavailable` (fail closed). A refused path claim after a granted lease
+      // releases the lease (`blocked`) before the task is BLOCKED.
       leaseClient = new LeaseClient({ governorUrl, token: governorToken, busToken: bus.token });
       const acquired = await leaseClient.acquire({
         workOrderId: subjectOf({ id: taskId, envelope: envelopeToUse }),
@@ -482,10 +493,10 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, sub
         return true;
       }
       lease = acquired.lease;
-      lifecycle.record({ lease: { ...lifecycle.snapshot().lease, ...lease } });
-      // L2: heartbeat every ttl_s/3 from now (the clone counts) until release. The first
-      // failed renew is LOSS OF AUTHORITY: latch it, abort the child (SIGTERM, SIGKILL after
-      // the grace), and let the run's normal exit path classify the task as BLOCKED lease_lost.
+      lifecycle.record({ lease: { ...lease }, capability_declaration_digest: capabilityDeclarationDigest });
+      // L2: heartbeat every ttl_s/3 from now (the path claim and the clone count) until release.
+      // The first failed renew is LOSS OF AUTHORITY: latch it, abort the child (SIGTERM, SIGKILL
+      // after the grace), and let the run's normal exit path classify the task as BLOCKED lease_lost.
       heartbeat = startHeartbeat({
         client: leaseClient,
         lease,
@@ -494,6 +505,42 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, sub
           process.stderr.write(`vinci worker: task ${taskId} lost its lease (${lossReason}${detail ? `: ${detail}` : ""}); terminating the run\n`);
           abortController.abort(authorityLost);
         },
+      });
+      leaseEntry = { client: leaseClient, lease, heartbeat, abortController, taskId };
+      activeLeases.add(leaseEntry);
+
+      // Stage 2 path claim, under the lease. FAIL-CLOSED (W0.1): the task proceeds to
+      // clone/spawn ONLY on a granted claim. A missing token, an unreachable Governor, a network
+      // error, a non-JSON body, an unexpected status, or a missing decision all BLOCK the task
+      // here, before prepareRepository and runVinci.
+      const claimResult = await claimGovernorPaths({
+        governorUrl,
+        token: governorToken,
+        paths: [envelope.claim],
+        taskId,
+        attempt: attempt.attempt,
+      });
+
+      if (!claimResult?.success) {
+        // Two classifications, never conflated: a REFUSAL is a Governor decision (403/409/422,
+        // rule text verbatim); everything else is the Governor being unavailable or its answer
+        // being unusable. Both BLOCK; the soak ledger attributes them differently.
+        const reason = claimResult?.reason ?? "governor returned no lease decision";
+        const governor = claimResult?.refused === true ? "refused" : "unavailable";
+        const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
+        lifecycle.transition("BLOCKED", { outcome: { reason, governor }, lease: { ...lifecycle.snapshot().lease, ...lease } });
+        await releaseLease("BLOCKED");
+        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+          inReplyTo: message.message_id,
+        });
+        return true;
+      }
+
+      // Claim granted: tighten the envelope (budget, max_runtime_s, deadline, and the claim
+      // ttl as a runtime cap) and record the claim next to the lease plus the effective runtime limit.
+      envelopeToUse = tightenEnvelopeLimits(envelopeToUse, claimResult);
+      lifecycle.record({
+        lease: { ...lifecycle.snapshot().lease, ...claimResult, effective_max_runtime_s: envelopeToUse.max_runtime_s },
       });
     }
 
@@ -582,13 +629,21 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, sub
       ...(lease ? { fence, fencingGeneration: lease.fencing_generation } : {}),
     });
 
+    // Wave 1B L3 (F1): the evidence POST is the third fence. `valid: false` there is the same
+    // loss of authority as at the push or the PR: the task is BLOCKED `fenced_out:<reason>`, the
+    // release outcome is `abandoned`, and the blocker post says so — not a mere UNVERIFIED
+    // downgrade. Folded into fencedOutReason BEFORE the state transition. When authority was
+    // already lost (or an earlier fence fired) the earlier reason stands.
+    const evidenceFencedOut = !fencedOut && evidenceResult?.fenced_out ? evidenceResult.fenced_out : null;
+    if (evidenceFencedOut) fencedOutReason = evidenceFencedOut;
     // Evidence was attempted and did not fully land (S3 upload or /v1/evidence POST failed):
     // a COMPLETED claim without evidence is not a completed claim -> UNVERIFIED.
     // BLOCKED/FAILED keep their state but record why evidence is missing.
     const evidenceError = evidenceResult && !evidenceResult.success ? evidenceResult.error : null;
-    const state = evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
+    const state = evidenceFencedOut ? "BLOCKED" : evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
     lifecycle.transition(state, {
       ...planned,
+      ...(evidenceFencedOut ? { outcome: { reason: evidenceFencedOut }, fenced_out: evidenceFencedOut } : {}),
       ...(lease ? { lease: { ...lifecycle.snapshot().lease, ...lease } } : {}),
       evidence_error: evidenceError,
       // State the uploaded result.json names as intended; differs from `state` after a downgrade.
@@ -616,9 +671,20 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   mkdirSync(options.stateDir, { recursive: true });
   const releaseLock = acquireDaemonLock(options.stateDir, options.id);
-  const handleSignal = () => {
-    releaseLock();
-    process.exit(0);
+  // F7: a stop request with a lease in flight releases it (`abandoned`, bounded by
+  // LEASE_TIMEOUT_MS) and SIGTERMs the child before the daemon exits; the task record stays
+  // RUNNING and is resumed as the next attempt by the next daemon start. Without an active
+  // lease this is the plain exit it always was.
+  let stopping = false;
+  const handleSignal = (signal) => {
+    if (stopping) return;
+    stopping = true;
+    releaseActiveLeases(signal)
+      .catch((error) => process.stderr.write(`vinci worker: ${signal}: lease release failed: ${error.message}\n`))
+      .finally(() => {
+        releaseLock();
+        process.exit(0);
+      });
   };
   process.once("SIGTERM", handleSignal);
   process.once("SIGINT", handleSignal);
@@ -646,6 +712,8 @@ async function main() {
         workerId: options.id,
         workerVersion: vinciBinary?.version ?? version,
         adapterVersion: version,
+        // Config-derived: evidence bundles exist only when an upload prefix is configured.
+        structuredEvidence: Boolean(process.env.VINCI_EVIDENCE_URI_PREFIX),
       });
       capabilityDeclarationDigest = declarationDigest(capabilityDeclaration);
       await bus.post("status", `worker ${options.id} declaration`, declarationBody(capabilityDeclaration));

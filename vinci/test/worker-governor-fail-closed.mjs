@@ -34,9 +34,13 @@ function handoff(id, workerId, body) {
 
 // A fake Governor whose /v1/governor/claim-paths answer is scripted per test. `respond` gets
 // (request, response) and must end the response; every claim-paths hit is recorded in `hits`.
-// Wave 1B: with `--governor` set the work-order lease is mandatory, so the lease routes
-// (/v1/governor/leases…) are served by the fixture's FakeGovernor (always granting); those hits
-// are NOT counted in `hits` — this file tests the path claim, worker-lease-loop.mjs the lease.
+// Wave 1B: with `--governor` set the work-order lease is mandatory and is acquired BEFORE the
+// path claim (F4: the Governor cannot release a path claim, so none is taken for a lease the
+// worker does not get). The lease routes (/v1/governor/leases…) are served by the fixture's
+// FakeGovernor (always granting); those hits are NOT counted in `hits` — this file tests the
+// path claim, worker-lease-loop.mjs the lease. A failure the lease acquire sees first (no token,
+// unreachable listener) is classified `lease_unavailable` below; a path-claim failure after a
+// granted lease releases that lease `blocked`.
 async function startGovernor(respond) {
   const hits = [];
   const leases = new FakeGovernor();
@@ -70,15 +74,27 @@ function runWorker(fixture, workerId, extraArgs, envOverrides, { stripGovernorTo
   return new Promise((r) => proc.on('close', (code) => r({ code, stderr })));
 }
 
-function assertBlockedBeforeWork(fixture, taskId, reasonPattern, classification = 'unavailable') {
+// `classification`: 'unavailable' | 'refused' (path-claim outcomes, the lease was granted first and
+// must have been released `blocked`) | 'lease_unavailable' (the lease acquire itself failed, so no
+// lease and no path claim exist). `governor` (from startGovernor) is required for the first two.
+function assertBlockedBeforeWork(fixture, taskId, reasonPattern, classification = 'unavailable', governor = null) {
   const snapshot = state(fixture, taskId);
   assert.equal(snapshot.state, 'BLOCKED', `expected BLOCKED, got ${snapshot.state} (${JSON.stringify(snapshot.outcome)})`);
   assert.equal(snapshot.terminal, true);
   assert.match(snapshot.outcome?.reason ?? '', reasonPattern);
-  assert.equal(snapshot.lease, null, 'no lease may be recorded on a blocked task');
+  assert.equal(snapshot.lease?.claimed_at ?? null, null, 'no path claim may be recorded on a blocked task');
+  assert.equal(snapshot.lease?.ttl, undefined, 'no path claim may be recorded on a blocked task');
+  if (classification === 'lease_unavailable') {
+    assert.equal(snapshot.lease, null, 'no lease may be recorded when the acquire failed');
+  } else {
+    assert(governor, 'pass the governor so the released lease can be checked');
+    assert.equal(snapshot.lease?.lease_id, 'lease-1', 'the lease held during the refused/failed claim stays on the record');
+    assert.deepEqual(governor.leases.releases.map((r) => r.outcome), ['blocked'], 'the lease must be released blocked, once');
+    assert.equal(governor.leases.hits.filter((h) => h.url === '/v1/governor/claim-paths').length, 0, 'fixture routing');
+  }
   assert.equal(fixture.getVinciCalls().length, 0, 'model must not be spawned');
   assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'repository must not be cloned');
-  assert.equal(snapshot.outcome.governor, classification, 'outcome.governor must classify refusal vs unavailability');
+  assert.equal(snapshot.outcome.governor, classification === 'lease_unavailable' ? 'unavailable' : classification, 'outcome.governor must classify refusal vs unavailability');
   const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
   assert(blocker, 'a blocker must be posted');
   const body = blocker.body ?? JSON.stringify(blocker);
@@ -89,10 +105,12 @@ function assertBlockedBeforeWork(fixture, taskId, reasonPattern, classification 
   const buildTail = / worker_build=\S+ vinci_binary=\S+$/;
   assert.match(body, buildTail, `blocker must end with worker_build= vinci_binary=, got: ${body}`);
   assert.match(body.replace(buildTail, ''), reasonPattern);
-  const expectedLabel = classification === 'refused' ? 'Governor refused the lease' : 'Governor unavailable/invalid';
-  const otherLabel = classification === 'refused' ? 'Governor unavailable/invalid' : 'Governor refused the lease';
+  const labels = { refused: 'Governor refused the lease', unavailable: 'Governor unavailable/invalid', lease_unavailable: 'Governor lease unavailable' };
+  const expectedLabel = labels[classification];
   assert(body.includes(expectedLabel), `blocker must carry "${expectedLabel}", got: ${body}`);
-  assert(!body.includes(otherLabel), `blocker must not carry "${otherLabel}"`);
+  for (const [key, otherLabel] of Object.entries(labels)) {
+    if (key !== classification) assert(!body.includes(otherLabel), `blocker must not carry "${otherLabel}"`);
+  }
   return snapshot;
 }
 
@@ -120,8 +138,9 @@ await test('T1 governor url without token blocks before any work', async () => {
     await fixture.startBus([handoff('11', 'w1', 'repo: test/repo\nevidence: none\n\nTask')]);
     const { code } = await runWorker(fixture, 'w1', ['--governor', governor.url], {}, { stripGovernorToken: true });
     assert.equal(code, 0, 'daemon itself exits cleanly after blocking the task');
-    assertBlockedBeforeWork(fixture, '11', /governor token missing \(VINCI_GOVERNOR_TOKEN\)/);
+    assertBlockedBeforeWork(fixture, '11', /governor token missing \(VINCI_GOVERNOR_TOKEN\)/, 'lease_unavailable');
     assert.equal(governor.hits.length, 0, 'Governor must not be contacted without a token');
+    assert.equal(governor.leases.hits.length, 0, 'not even the lease acquire goes out without a token');
   } finally {
     await governor.close();
     await fixture.cleanup();
@@ -140,7 +159,7 @@ await test('T2a governor 500 blocks', async () => {
     fixture.linkTools(TOOLS);
     await fixture.startBus([handoff('12', 'w2', 'repo: test/repo\nevidence: none\n\nTask')]);
     await runWorker(fixture, 'w2', ['--governor', governor.url], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
-    assertBlockedBeforeWork(fixture, '12', /unexpected status 500/);
+    assertBlockedBeforeWork(fixture, '12', /unexpected status 500/, 'unavailable', governor);
     assert.equal(governor.hits.length, 1);
     assert.equal(governor.hits[0].auth, 'Session gov-token');
   } finally {
@@ -161,7 +180,7 @@ await test('T2b governor connection refused blocks', async () => {
     fixture.linkTools(TOOLS);
     await fixture.startBus([handoff('13', 'w3', 'repo: test/repo\nevidence: none\n\nTask')]);
     await runWorker(fixture, 'w3', ['--governor', deadUrl], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
-    assertBlockedBeforeWork(fixture, '13', /Governor connection failed: (ECONNREFUSED|fetch failed)/);
+    assertBlockedBeforeWork(fixture, '13', /Governor connection failed: (ECONNREFUSED|fetch failed)/, 'lease_unavailable');
   } finally {
     await fixture.cleanup();
   }
@@ -179,7 +198,7 @@ await test('T2c governor non-JSON body blocks', async () => {
     fixture.linkTools(TOOLS);
     await fixture.startBus([handoff('14', 'w4', 'repo: test/repo\nevidence: none\n\nTask')]);
     await runWorker(fixture, 'w4', ['--governor', governor.url], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
-    assertBlockedBeforeWork(fixture, '14', /Governor returned invalid JSON \(status 200\)/);
+    assertBlockedBeforeWork(fixture, '14', /Governor returned invalid JSON \(status 200\)/, 'unavailable', governor);
   } finally {
     await governor.close();
     await fixture.cleanup();
@@ -198,7 +217,7 @@ await test('T2d governor 409 refusal blocks with rule text', async () => {
     fixture.linkTools(TOOLS);
     await fixture.startBus([handoff('15', 'w5', 'repo: test/repo\nevidence: none\n\nTask')]);
     await runWorker(fixture, 'w5', ['--governor', governor.url], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
-    assertBlockedBeforeWork(fixture, '15', /path already leased to worker:other/, 'refused');
+    assertBlockedBeforeWork(fixture, '15', /path already leased to worker:other/, 'refused', governor);
   } finally {
     await governor.close();
     await fixture.cleanup();
@@ -233,7 +252,7 @@ for (const { name, raw, pattern } of INVALID_TTL_CASES) {
       fixture.linkTools(TOOLS);
       await fixture.startBus([handoff(taskId, 'w5', 'repo: test/repo\nevidence: none\n\nTask')]);
       await runWorker(fixture, 'w5', ['--governor', governor.url], { VINCI_GOVERNOR_TOKEN: 'gov-token' });
-      assertBlockedBeforeWork(fixture, taskId, pattern);
+      assertBlockedBeforeWork(fixture, taskId, pattern, 'unavailable', governor);
     } finally {
       await governor.close();
       await fixture.cleanup();

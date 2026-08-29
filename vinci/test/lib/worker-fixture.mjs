@@ -39,12 +39,15 @@ function readBody(request) {
 //   holder          { holder_attempt_id, expires_at } served on mode "leased"
 //   renewOkCount    number of renews to grant before renewFailure is served (Infinity = never)
 //   renewFailure    { status: 409, reason: "stale_generation" } | { status: 500 } | "drop" (socket destroyed)
+//   renewDelayMs    ms a granted renew is held before it is answered (0) — exercises "renew in flight"
 //   check           true | false | (body, effectIndex) => ({ valid, reason })
 //   releaseStatus   HTTP status for release (200)
 //   claim           body served (200) on /v1/governor/claim-paths, or { status, body }
 //   epoch           value stamped on every response
 // `hits` records every request `{ method, url, auth, body }`; `renews`, `checks`, `releases`
-// and `acquires` are the parsed bodies per route in arrival order.
+// and `acquires` are the parsed bodies per route in arrival order. `events` is the COMPLETION
+// order (`acquire`, `claim`, `renew:start`, `renew:end`, `check`, `release`) so a test can tell a
+// release that waited for an in-flight renew from one that raced it.
 export class FakeGovernor {
   constructor(options = {}) {
     this.ttlS = options.ttlS ?? 60;
@@ -55,6 +58,7 @@ export class FakeGovernor {
     this.renewFailure = options.renewFailure ?? { status: 409, reason: "stale_generation" };
     this.check = options.check ?? true;
     this.releaseStatus = options.releaseStatus ?? 200;
+    this.renewDelayMs = options.renewDelayMs ?? 0;
     this.claim = options.claim ?? { paths: ["."], ttl: 3600 };
     this.epoch = options.epoch ?? 1;
     this.leaseToken = options.leaseToken ?? "Session gov-token";
@@ -63,6 +67,7 @@ export class FakeGovernor {
     this.renews = [];
     this.checks = [];
     this.releases = [];
+    this.events = [];
     this.leases = new Map();
     this.nextGeneration = 100;
     this.server = null;
@@ -85,12 +90,14 @@ export class FakeGovernor {
     const body = await readBody(request);
     this.hits.push({ method: request.method, url: request.url, auth: request.headers.authorization, body, at: Date.now() });
     if (url.pathname === "/v1/governor/claim-paths") {
+      this.events.push("claim");
       if (this.claim.status) this.json(response, this.claim.status, this.claim.body ?? {});
       else this.json(response, 200, this.claim);
       return true;
     }
     if (url.pathname === "/v1/governor/leases" && request.method === "POST") {
       this.acquires.push(body);
+      this.events.push("acquire");
       if (this.mode === "hang") return true; // never answers; the caller's socket stays open
       if (request.headers.authorization !== this.leaseToken) {
         this.json(response, 401, { reason: "bad session token" });
@@ -118,6 +125,7 @@ export class FakeGovernor {
     const lease = this.leases.get(decodeURIComponent(leaseId));
     if (action === "check") {
       this.checks.push({ lease_id: leaseId, ...body, auth: request.headers.authorization });
+      this.events.push("check");
       if (!request.headers.authorization?.startsWith("Bearer ")) {
         this.json(response, 401, { reason: "check needs the bus token" });
         return true;
@@ -150,11 +158,15 @@ export class FakeGovernor {
         return true;
       }
       lease.renews += 1;
+      this.events.push("renew:start");
+      if (this.renewDelayMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, this.renewDelayMs));
       lease.expires_at = this.expiresAt();
+      this.events.push("renew:end");
       this.json(response, 200, { expires_at: lease.expires_at, ttl_s: lease.ttl_s });
       return true;
     }
     this.releases.push({ lease_id: leaseId, ...body });
+    this.events.push("release");
     if (lease) lease.released = body?.outcome ?? null;
     this.json(response, this.releaseStatus, {});
     return true;
