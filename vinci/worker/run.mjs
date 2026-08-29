@@ -64,7 +64,7 @@ export async function renameBranchAside(repoDir, branch, { stamp, nonce } = {}) 
 // work pushed there as never-pushed. If the branch has ANY configured upstream whose
 // remote-tracking ref is still unresolvable after that fetch, fail closed: { residue: false,
 // note } naming it. Any check error ⇒ { residue: false } (refuse as before, rename nothing).
-async function classifyDivergedLocal(repoDir, branch, localSha, remoteTip) {
+export async function classifyDivergedLocal(repoDir, branch, localSha, remoteTip) {
   const upstreamRemote = await command("git", ["-C", repoDir, "config", "--get", `branch.${branch}.remote`], { allowFailure: true });
   const upstreamMerge = await command("git", ["-C", repoDir, "config", "--get", `branch.${branch}.merge`], { allowFailure: true });
   for (const probe of [upstreamRemote, upstreamMerge]) if (probe.status !== 0 && probe.status !== 1) return { residue: false };

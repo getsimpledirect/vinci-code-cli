@@ -21,23 +21,35 @@
 // next attempt starts, and the resume of a RUNNING task is attempt N+1 in a new dir. The task
 // branch is created in the attempt worktree; the cache is where the daemon PUBLISHES from.
 //
-// Publish design (C3). The attempt worktree cannot push: its worktree-scoped config sets
-// `remote.origin.pushurl=/dev/null` (so `git push`/`git push origin` fail before any transport) and
-// `core.hooksPath` to a pre-push hook that exits 1 (so `git push <literal url>` fails too). Both are
-// worktree-scoped (`git config --worktree`), so the bare cache — which shares the branch refs with
-// its worktrees — is untouched, and the daemon pushes `refs/heads/<branch>` FROM THE CACHE under
-// its own env after the run. The child never holds a working push at any point; nothing is
-// unset or re-set in the attempt dir to publish. This is a guardrail, not a security boundary:
-// a child with `git config` and the daemon's uid can undo both settings. The credentials it
-// would need to push with are what the env allowlist (C2) keeps out of its reach.
+// Publish design (C3). The DEFAULT publish path is dead from inside the attempt: the cache's own
+// config sets `remote.origin.pushurl=/dev/null` and `core.hooksPath` to a pre-push hook that exits
+// 1, and every attempt worktree carries the same two settings in its worktree-scoped config. So
+// `git push`, `git push origin`, `git push --no-verify origin` and `git -C <cache> push origin`
+// (the cache is the git-common-dir every worktree can name) all fail before any transport, and
+// `git push <literal url>` trips the hook. The daemon publishes `refs/heads/<branch>` FROM THE
+// CACHE under its own env after the run, going around both settings on its own command line (a
+// push to the LITERAL origin URL with `--no-verify`); nothing is unset or re-set anywhere to
+// publish, and the child never holds a working push at any point.
+//
+// This is a guardrail, not a security boundary — say exactly what it stops. It removes the
+// AMBIENT credentials (env allowlist, C2) and the default publish path. It does NOT stop a child
+// that runs as the daemon's uid and supplies its own path: `git push --no-verify <literal url>`
+// and `git remote add x <url> && git push --no-verify x` reach origin whenever the transport needs
+// no credential the child lacks (a local/file origin, an SSH agent socket, an instance profile).
+// The credential boundary is HOME-keyed, not uid-keyed: GH_CONFIG_DIR / GIT_CONFIG_GLOBAL pointed
+// at the daemon's HOME reach the daemon's logins, and on macOS Apple git's SYSTEM gitconfig sets
+// credential.helper=osxkeychain regardless of HOME, so the boundary is absent there.
+// worker-clean-room.mjs asserts each bypass's status (refused/open) so a change flips a test
+// deliberately.
 //
 // What is still NOT isolated (say it plainly): no container or VM, no user separation (child and
 // daemon share a uid and can read each other's files), no network allowlist (the child can reach
-// anything the box can), no CPU/memory limits. See README "Clean room".
-import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statfsSync, writeFileSync } from "node:fs";
+// anything the box can), no CPU/memory limits; VINCI_HOME (the launcher's install root, versions/
+// and updater/) is writable by the child. See README "Clean room".
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statfsSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { command, readHeadBlocker, renameBranchAside } from "./run.mjs";
+import { classifyDivergedLocal, command, readHeadBlocker, renameBranchAside } from "./run.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
@@ -57,8 +69,10 @@ export const DEFAULT_DISK_FLOOR_MB = 2048;
 //   VINCI_ENV                  prod/dev backend switch (vinci/bin/vinci); the dev URLs derive from it
 //   VINCI_BASE_URL             explicit gateway override (dev boxes)
 //   VINCI_PLATFORM_URL         explicit platform override (dev boxes)
-//   VINCI_CODING_AGENT_DIR     the launcher's auth/settings slot; with a fresh HOME the default
-//   PI_CODING_AGENT_DIR        slot is empty, so an explicit one is the only way to reach a login
+//   (NOT VINCI_CODING_AGENT_DIR / PI_CODING_AGENT_DIR: passing the daemon's slot through hands the
+//   child auth.json for EVERY provider, every prior session and bin/. The child's slot is the
+//   fresh HOME's <home>/agent, set below; a single credential file reaches it only through the
+//   narrow opt-in VINCI_WORKER_AUTH_FILE, copied 0600 by prepareCleanRoom.)
 //   VINCI_NO_BOOTSTRAP_HEAL    launcher: skip the bootstrap self-heal (tests set it)
 //   VINCI_TOOL_BOOTSTRAP       launcher: fd/ripgrep first-run fetch on/off
 //   VINCI_SHOW_OTHER_PROVIDERS launcher: BYOK boundary
@@ -67,6 +81,8 @@ export const DEFAULT_DISK_FLOOR_MB = 2048;
 // Set by the daemon, never copied: HOME (per attempt), TMPDIR (per attempt), VINCI_HOME (the
 // launcher's install root — the shim derives it from HOME, which is now the empty per-attempt one,
 // so it is passed explicitly from the daemon's VINCI_HOME or <daemon HOME>/.vinci-code),
+// VINCI_CODING_AGENT_DIR + PI_CODING_AGENT_DIR (= <attempt HOME>/agent, both spellings, so neither
+// the branded build nor the global-pi fallback lane derives a slot from anywhere else),
 // VINCI_UPDATE_DISABLED=1 (#18: a task never runs under a self-updating launcher).
 export const CLEAN_ROOM_ENV_ALLOWLIST = Object.freeze([
   "PATH",
@@ -74,8 +90,6 @@ export const CLEAN_ROOM_ENV_ALLOWLIST = Object.freeze([
   "VINCI_ENV",
   "VINCI_BASE_URL",
   "VINCI_PLATFORM_URL",
-  "VINCI_CODING_AGENT_DIR",
-  "PI_CODING_AGENT_DIR",
   "VINCI_NO_BOOTSTRAP_HEAL",
   "VINCI_TOOL_BOOTSTRAP",
   "VINCI_SHOW_OTHER_PROVIDERS",
@@ -90,6 +104,11 @@ export const PROVIDER_KEY_ENV = Object.freeze({
   deepinfra: ["VINCI_INTERNAL_DEEPINFRA_API_KEY"],
 });
 
+// The child's agent slot (auth.json, sessions, settings): a dir inside the per-attempt HOME.
+export function attemptAgentDir(homeDir) {
+  return join(homeDir, "agent");
+}
+
 export function cleanRoomEnv({ base = process.env, provider, homeDir, tmpDir }) {
   if (!homeDir || !tmpDir) throw new Error("cleanRoomEnv needs a per-attempt homeDir and tmpDir");
   const env = {};
@@ -99,8 +118,25 @@ export function cleanRoomEnv({ base = process.env, provider, homeDir, tmpDir }) 
   if (vinciHome !== undefined) env.VINCI_HOME = vinciHome;
   env.HOME = homeDir;
   env.TMPDIR = tmpDir;
+  env.VINCI_CODING_AGENT_DIR = attemptAgentDir(homeDir);
+  env.PI_CODING_AGENT_DIR = attemptAgentDir(homeDir);
   env.VINCI_UPDATE_DISABLED = "1";
   return env;
+}
+
+// F4 narrow opt-in: VINCI_WORKER_AUTH_FILE=<path> names ONE credential file the daemon wants the
+// child to have. It is copied (0600) to <attempt HOME>/agent/auth.json — one file, no sessions,
+// no bin/, nothing else from the daemon's slot. A set-but-missing path is a misconfiguration and
+// fails the attempt loudly rather than running it logged out.
+export function installAuthFile(homeDir, authFile) {
+  if (!authFile) return null;
+  if (!existsSync(authFile)) throw new Error(`clean room: VINCI_WORKER_AUTH_FILE ${authFile} does not exist`);
+  const agentDir = attemptAgentDir(homeDir);
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  const target = join(agentDir, "auth.json");
+  copyFileSync(authFile, target);
+  chmodSync(target, 0o600);
+  return target;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -123,7 +159,24 @@ function attemptPaths(attemptsRoot, attempt) {
     homeDir: join(attemptsRoot, `${attempt}.home`),
     tmpDir: join(attemptsRoot, `${attempt}.tmp`),
     hooksDir: join(attemptsRoot, `${attempt}.hooks`),
+    evidenceMarker: join(attemptsRoot, `${attempt}.evidence_uploaded`),
   };
+}
+
+// F6: the evidence marker. Written by the daemon ONLY after the attempt's evidence bundle landed
+// (uploadEvidence success). It lives beside the sealed tree (the tree is read-only by then), and
+// it is what makes an attempt dir prunable: a sealed dir without it is the only copy of that
+// attempt's evidence and is never pruned by count.
+export function evidenceMarkerPath({ stateDir, repo, taskId, attempt }) {
+  const { attemptsRoot } = cleanRoomPaths(stateDir, repo, taskId);
+  return attemptPaths(attemptsRoot, attempt).evidenceMarker;
+}
+
+export function markEvidenceUploaded({ stateDir, repo, taskId, attempt, uri = null, sha256 = null }) {
+  const marker = evidenceMarkerPath({ stateDir, repo, taskId, attempt });
+  mkdirSync(dirname(marker), { recursive: true });
+  writeFileSync(marker, `${JSON.stringify({ attempt, uri, sha256, uploaded_at: new Date().toISOString() })}\n`);
+  return marker;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -176,22 +229,27 @@ function listAttempts(attemptsRoot) {
 }
 
 // C4: retention. Keep the newest `keep` attempt dirs per task; prune older ones — never the newest,
-// never `protect` (the RUNNING attempt). Sealed dirs are unsealed first (rm needs write on the
-// parent). The cache's worktree registration is pruned afterwards so the next `worktree add`
-// does not trip over a registered-but-missing tree.
+// never `protect` (the RUNNING attempt), and NEVER a dir without its evidence marker (F6: a
+// crashed attempt's sealed dir was never uploaded, so it is the only evidence there is; a
+// count-based rule would have dropped it at N+keep). The count applies to MARKED dirs only.
+// Sealed dirs are unsealed first (rm needs write on the parent). The cache's worktree
+// registration is pruned afterwards so the next `worktree add` does not trip over a
+// registered-but-missing tree.
 export async function pruneAttempts({ stateDir, repo, taskId, keep = DEFAULT_KEEP_ATTEMPTS, protect = null }) {
   const { cacheDir, attemptsRoot } = cleanRoomPaths(stateDir, repo, taskId);
   const attempts = listAttempts(attemptsRoot);
   if (attempts.length === 0) return [];
   const newest = attempts[attempts.length - 1];
   const keepCount = Math.max(1, Number.isInteger(keep) ? keep : DEFAULT_KEEP_ATTEMPTS);
-  const victims = attempts.slice(0, Math.max(0, attempts.length - keepCount)).filter((n) => n !== newest && n !== protect);
+  const marked = attempts.filter((n) => existsSync(attemptPaths(attemptsRoot, n).evidenceMarker));
+  const victims = marked.slice(0, Math.max(0, marked.length - keepCount)).filter((n) => n !== newest && n !== protect);
   for (const n of victims) {
     const paths = attemptPaths(attemptsRoot, n);
     for (const dir of [paths.attemptDir, paths.homeDir, paths.tmpDir, paths.hooksDir]) {
       unseal(dir);
       rmSync(dir, { recursive: true, force: true });
     }
+    rmSync(paths.evidenceMarker, { force: true });
   }
   if (victims.length > 0 && existsSync(cacheDir)) await command("git", ["-C", cacheDir, "worktree", "prune"], { allowFailure: true });
   return victims;
@@ -202,12 +260,29 @@ export async function pruneAttempts({ stateDir, repo, taskId, keep = DEFAULT_KEE
 // heads refspec (NOT `clone --mirror`: a mirror's push refspec is `+refs/*:refs/*`, which would
 // push every attempt's branch on the first publish). Its origin URL is checked on every reuse so
 // `a/repo` and `b/repo` can never share a cache by accident.
+//
+// The cache is also the git-common-dir every attempt worktree can name (`git rev-parse
+// --git-common-dir`), i.e. the daemon's own publish path. So the same two refusals the worktrees
+// carry are set at CACHE level too, on every reuse (a cache created before this rule gets them):
+// `remote.origin.pushurl=/dev/null` and `core.hooksPath=<cache>/hooks` (the refusing pre-push
+// hook). The daemon's publishFromCache goes around both on its command line (literal URL, --no-verify).
+export function cacheHooksDir(cacheDir) {
+  return join(cacheDir, "hooks");
+}
+
+async function refuseCachePush(cacheDir) {
+  const hooksDir = writePrePushHook(cacheHooksDir(cacheDir));
+  await command("git", ["-C", cacheDir, "config", "remote.origin.pushurl", "/dev/null"]);
+  await command("git", ["-C", cacheDir, "config", "core.hooksPath", hooksDir]);
+}
+
 async function ensureCache(cacheDir, cloneUrl) {
   if (existsSync(cacheDir)) {
     const url = await command("git", ["-C", cacheDir, "config", "--get", "remote.origin.url"], { allowFailure: true });
     if (url.status !== 0 || url.stdout !== cloneUrl) {
       throw new Error(`clean room: cache ${cacheDir} has origin ${url.stdout || "(none)"}, expected ${cloneUrl}; refusing to reuse it`);
     }
+    await refuseCachePush(cacheDir);
     return;
   }
   mkdirSync(dirname(cacheDir), { recursive: true });
@@ -222,6 +297,7 @@ async function ensureCache(cacheDir, cloneUrl) {
   await command("git", ["-C", cacheDir, "config", "extensions.worktreeConfig", "true"]);
   await command("git", ["-C", cacheDir, "config", "--unset", "core.bare"]);
   await command("git", ["config", "--file", join(cacheDir, "config.worktree"), "core.bare", "true"]);
+  await refuseCachePush(cacheDir);
 }
 
 const PRE_PUSH_HOOK = `#!/bin/sh
@@ -235,7 +311,7 @@ function writePrePushHook(hooksDir) {
   const hook = join(hooksDir, "pre-push");
   writeFileSync(hook, PRE_PUSH_HOOK, { mode: 0o755 });
   chmodSync(hook, 0o755);
-  return hook;
+  return hooksDir;
 }
 
 // The commit identity the child commits under. The child's HOME is empty (no ~/.gitconfig), so
@@ -252,7 +328,7 @@ async function commitIdentity() {
 
 // C1: a fresh attempt worktree. Returns the same `{ branch, repoDir }` shape prepareRepository
 // does (repoDir IS the attempt dir) plus the clean-room facts the task record carries.
-export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branchOverride, diskFloorBytes = DEFAULT_DISK_FLOOR_MB * 1048576 }) {
+export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branchOverride, diskFloorBytes = DEFAULT_DISK_FLOOR_MB * 1048576, authFile = process.env.VINCI_WORKER_AUTH_FILE }) {
   const { cacheDir, attemptsRoot } = cleanRoomPaths(stateDir, repo, taskId);
   const paths = attemptPaths(attemptsRoot, attempt);
   const branch = branchOverride ?? `worker/${taskId}`;
@@ -282,7 +358,15 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
   }
   // Fetched per attempt, all heads, pruned: the cache is a mirror of origin's heads, nothing else.
   await command("git", ["-C", cacheDir, "fetch", "--prune", "--quiet", "origin", "+refs/heads/*:refs/remotes/origin/*"]);
-  const cacheRef = `refs/remotes/origin/${branchOverride ?? "main"}`;
+  // F3: the base. A `branch:` envelope bases at origin/<branch> (its existence was asked of origin
+  // above). Otherwise, when origin ALREADY HAS the task branch — attempt N published and then
+  // crashed, or a resume on a new box — attempt N+1 continues at origin/worker/<task> with
+  // fast-forward semantics (the same rule as shared mode, prepareRepository), so its publish is a
+  // fast-forward rather than a rejected non-fast-forward. Only a task branch absent on origin
+  // starts at origin/main.
+  const taskBranchRef = `refs/remotes/origin/${branch}`;
+  const onOrigin = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", taskBranchRef], { allowFailure: true });
+  const cacheRef = branchOverride || onOrigin.status === 0 ? taskBranchRef : "refs/remotes/origin/main";
   const resolved = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", cacheRef], { allowFailure: true });
   if (resolved.status !== 0 || !SHA.test(resolved.stdout)) throw new Error(`clean room: ${cacheRef} did not materialize in ${cacheDir} after fetch`);
   const baseCommit = resolved.stdout;
@@ -294,8 +378,28 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
   // The branch lives in the cache's shared refs. A previous attempt's copy (its worktree still
   // holds it checked out, and it may carry never-pushed commits) is renamed aside under stale/…,
   // never deleted, so this attempt starts at the base commit with a fresh branch of the right name.
+  //
+  // F3, divergence: when origin has the task branch AND the previous attempt's local copy holds
+  // commits that are not on it, this is exactly shared mode's divergence case and gets PR #22's
+  // rules, not a force: never-pushed residue is renamed aside and THIS attempt is refused with
+  // the reason on record (the retry continues at origin/<branch>); anything else is refused with
+  // the divergence reason and nothing renamed.
   let staleRef = null;
   const existing = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { allowFailure: true });
+  if (existing.status === 0 && cacheRef === taskBranchRef) {
+    const localSha = existing.stdout;
+    const anc = await command("git", ["-C", cacheDir, "merge-base", "--is-ancestor", `refs/heads/${branch}`, baseCommit], { allowFailure: true });
+    if (anc.status === 1) {
+      const reason = `local branch ${branch} at ${localSha} has commits not on origin/${branch} at ${baseCommit}; refusing to reset (divergence)`;
+      const verdict = await classifyDivergedLocal(cacheDir, branch, localSha, baseCommit);
+      if (verdict.residue) {
+        const asideName = await renameBranchAside(cacheDir, branch);
+        throw new Error(`${reason}; never-pushed residue renamed aside to ${asideName} — retry continues at origin/${branch}`);
+      }
+      throw new Error(verdict.note ? `${reason}; ${verdict.note}` : reason);
+    }
+    if (anc.status !== 0) throw new Error(`ancestry check failed for ${branch} (${localSha} vs origin/${branch} ${baseCommit}): ${anc.stderr || anc.status}`);
+  }
   if (existing.status === 0) staleRef = await renameBranchAside(cacheDir, branch);
 
   mkdirSync(attemptsRoot, { recursive: true });
@@ -303,7 +407,8 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
   await command("git", ["-C", paths.attemptDir, "checkout", "--quiet", "-b", branch]);
 
   // C3 (worktree-scoped: the cache keeps a working push; see ensureCache for the extension).
-  const hook = writePrePushHook(paths.hooksDir);
+  writePrePushHook(paths.hooksDir);
+  const hook = join(paths.hooksDir, "pre-push");
   await command("git", ["-C", paths.attemptDir, "config", "--worktree", "remote.origin.pushurl", "/dev/null"]);
   await command("git", ["-C", paths.attemptDir, "config", "--worktree", "core.hooksPath", paths.hooksDir]);
   const identity = await commitIdentity();
@@ -312,6 +417,7 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
 
   mkdirSync(paths.homeDir, { recursive: true });
   mkdirSync(paths.tmpDir, { recursive: true });
+  const authJson = installAuthFile(paths.homeDir, authFile);
 
   return {
     branch,
@@ -325,16 +431,24 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
     cacheRef,
     baseCommit,
     staleRef,
+    authJson,
   };
 }
 
 // C3: the daemon's publisher. Pushes refs/heads/<branch> FROM THE BARE CACHE (the ref is shared
 // with the attempt worktree, so nothing is fetched or copied) under the daemon's own env. The
-// attempt dir is only READ (HEAD:BLOCKER.md). `gh` is pointed at the repo with -R, so it never
-// needs a working tree either.
+// cache's own config refuses pushes (pushurl=/dev/null + the pre-push hook, see ensureCache), so
+// the daemon goes around both for this one command: it pushes to the LITERAL remote.origin.url
+// (a URL on the command line is not a remote, so no pushurl applies — `-c remote.origin.pushurl`
+// would not do: pushurl is multi-valued, -c appends, and git still tries /dev/null first) with
+// `--no-verify` to skip the hook. Nothing in the cache is rewritten. The attempt dir is only READ
+// (HEAD:BLOCKER.md). `gh` is pointed at the repo with -R, so it never needs a working tree either.
 export async function publishFromCache({ envelope, cacheDir, attemptDir, branch, taskId, limitTripped }) {
   const blockerReason = await readHeadBlocker(attemptDir);
-  const push = await command("git", ["-C", cacheDir, "push", "origin", `refs/heads/${branch}:refs/heads/${branch}`], { allowFailure: true });
+  const originUrl = await command("git", ["-C", cacheDir, "config", "--get", "remote.origin.url"], { allowFailure: true });
+  const push = originUrl.status === 0 && originUrl.stdout
+    ? await command("git", ["-C", cacheDir, "push", "--no-verify", originUrl.stdout, `refs/heads/${branch}:refs/heads/${branch}`], { allowFailure: true })
+    : { status: 1, stderr: `clean room: cache ${cacheDir} has no remote.origin.url to publish to` };
   const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
   if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
   if (limitTripped) return result;

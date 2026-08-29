@@ -13,7 +13,7 @@ import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
-import { cleanRoomEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
+import { cleanRoomEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits } from "./governor.mjs";
 import { readSessionState } from "./session-read.mjs";
@@ -101,8 +101,10 @@ function parseArgs(args, env = process.env) {
     // W1 clean room (cleanroom.mjs). OFF by default this wave; `--clean-room` or
     // VINCI_WORKER_CLEAN_ROOM=1 turns it on. The disk floor and retention only apply to it.
     cleanRoom: env.VINCI_WORKER_CLEAN_ROOM === "1",
-    diskFloorMb: Number(env.VINCI_WORKER_DISK_FLOOR_MB) || DEFAULT_DISK_FLOOR_MB,
-    keepAttempts: Number(env.VINCI_WORKER_KEEP_ATTEMPTS) || DEFAULT_KEEP_ATTEMPTS,
+    // F8: an env value is parsed exactly like its flag — "0" is an explicit disable of the disk
+    // floor, not "use the default"; an unparsable value is refused, not silently defaulted.
+    diskFloorMb: env.VINCI_WORKER_DISK_FLOOR_MB === undefined || env.VINCI_WORKER_DISK_FLOOR_MB === "" ? DEFAULT_DISK_FLOOR_MB : Number(env.VINCI_WORKER_DISK_FLOOR_MB),
+    keepAttempts: env.VINCI_WORKER_KEEP_ATTEMPTS === undefined || env.VINCI_WORKER_KEEP_ATTEMPTS === "" ? DEFAULT_KEEP_ATTEMPTS : Number(env.VINCI_WORKER_KEEP_ATTEMPTS),
   };
   const seen = new Set();
   while (args.length > 0) {
@@ -130,8 +132,8 @@ function parseArgs(args, env = process.env) {
     else if (argument === "--keep-attempts") options.keepAttempts = Number(value);
     else options.pollSeconds = Number(value);
   }
-  if (!Number.isFinite(options.diskFloorMb) || options.diskFloorMb < 0) throw new Error("--disk-floor-mb must be a non-negative number");
-  if (!Number.isInteger(options.keepAttempts) || options.keepAttempts < 1) throw new Error("--keep-attempts must be a positive integer");
+  if (!Number.isFinite(options.diskFloorMb) || options.diskFloorMb < 0) throw new Error("--disk-floor-mb / VINCI_WORKER_DISK_FLOOR_MB must be a non-negative number (0 disables the floor)");
+  if (!Number.isInteger(options.keepAttempts) || options.keepAttempts < 1) throw new Error("--keep-attempts / VINCI_WORKER_KEEP_ATTEMPTS must be a positive integer");
   if (options.requireGovernor && !options.governor) {
     // W0.1: a Governor was REQUIRED but none configured. Refuse to start rather than run a
     // single ungoverned poll. This is the FIRST check after option parsing — ahead of the bus
@@ -540,12 +542,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       "origin/main...HEAD",
     ], { allowFailure: true });
     const gitDiff = gitDiffResult.status === 0 ? gitDiffResult.stdout : null;
-    if (cleanRoom) {
-      // The attempt is over and its diff is captured: seal the tree (evidence, read-only) and
-      // apply retention. Never the newest dir, never this attempt — both by construction here.
-      sealAttemptDir(repository.attemptDir);
-      await pruneAttempts({ stateDir, repo: envelopeToUse.repo, taskId, keep: cleanRoom.keepAttempts, protect: attempt.attempt });
-    }
+    // The attempt is over and its diff is captured: seal the tree (evidence, read-only). Retention
+    // runs AFTER the evidence upload below, because only an uploaded attempt is prunable (F6).
+    if (cleanRoom) sealAttemptDir(repository.attemptDir);
     const logTail = recentLogTail(200);
     const evidenceResult = await uploadEvidence({
       sessionJsonl,
@@ -563,6 +562,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     // a COMPLETED claim without evidence is not a completed claim -> UNVERIFIED.
     // BLOCKED/FAILED keep their state but record why evidence is missing.
     const evidenceError = evidenceResult && !evidenceResult.success ? evidenceResult.error : null;
+    if (cleanRoom) {
+      // F6: the marker that makes this attempt's sealed dir prunable is written ONLY after its
+      // bundle landed (uploaded: true, set solely after a successful `aws s3 cp`). No evidence
+      // configured, or a failed upload ⇒ no marker ⇒ the dir is the only evidence and is kept.
+      // Retention then applies to marked dirs: never the newest, never this attempt.
+      if (evidenceResult?.uploaded === true) {
+        markEvidenceUploaded({ stateDir, repo: envelopeToUse.repo, taskId, attempt: attempt.attempt, uri: evidenceResult.uri, sha256: evidenceResult.sha256 });
+      }
+      await pruneAttempts({ stateDir, repo: envelopeToUse.repo, taskId, keep: cleanRoom.keepAttempts, protect: attempt.attempt });
+    }
     const state = evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
     lifecycle.transition(state, {
       ...planned,
@@ -584,6 +593,11 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   mkdirSync(options.stateDir, { recursive: true });
+  if (options.cleanRoom) {
+    // The effective bounds, on stderr once per start, so an operator (and the F8 test) can see
+    // what "0" or an env value resolved to instead of inferring it from a later refusal.
+    process.stderr.write(`vinci worker: clean room on (disk floor ${options.diskFloorMb} MiB${options.diskFloorMb === 0 ? ", disabled" : ""}, keep ${options.keepAttempts} attempts)\n`);
+  }
   const releaseLock = acquireDaemonLock(options.stateDir, options.id);
   const handleSignal = () => {
     releaseLock();
