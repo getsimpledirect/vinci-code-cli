@@ -128,8 +128,18 @@ export function describeVinciModelError(error: unknown): string {
 export function classifyVinciModelError(error: unknown): VinciModelFailureKind {
   const status = errorStatus(error);
   const name = error instanceof Error ? error.name : "";
-  const text = `${status ?? ""} ${name} ${describeVinciModelError(error)}`;
-  if (status === 401 || status === 402 || status === 403 || status === 429 || ACCOUNT_ERROR.test(text)) return "account";
+  const message = describeVinciModelError(error);
+  const text = `${status ?? ""} ${name} ${message}`;
+  if (status === 402) {
+    if (message.includes("in_flight_budget_exhausted")) return "transient";
+
+    // This preserves a bounded same-class retry for OpenRouter affordability responses. The
+    // classifier cannot alter request options, so the caller cannot yet clamp max_tokens here.
+    const affordableMatch = /\bbut can only afford ([0-9]+)\b/i.exec(message);
+    if (affordableMatch) return "transient";
+    return "account";
+  }
+  if (status === 401 || status === 403 || status === 429 || ACCOUNT_ERROR.test(text)) return "account";
   if (status === 404 || status === 410 || UNAVAILABLE_ERROR.test(text)) return "unavailable";
   if (
     status === 408 ||
