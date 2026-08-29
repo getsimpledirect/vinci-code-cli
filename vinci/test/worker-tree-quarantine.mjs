@@ -8,6 +8,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalize } from "../worker/contracts/canonical.mjs";
+import { provisionWorkerDebrisAuthority } from "./lib/worker-debris-authority-fixture.mjs";
 import { describeDebrisRootAnchor, prepareRepository } from "../worker/run.mjs";
 
 const scratch = mkdtempSync(join(tmpdir(), "worker-quarantine-"));
@@ -22,18 +23,33 @@ process.env.VINCI_WORKER_GIT_BASE = scratch;
 
 const state = join(scratch, "state"); mkdirSync(state);
 const first = await prepareRepository(state, "acme/repo", "msg_first");
+const debrisAuthority = provisionWorkerDebrisAuthority(state, "1".repeat(64));
+debrisAuthority.reserveTask("msg_retry");
 const debrisRoot = join(state, "debris");
-mkdirSync(join(debrisRoot, ".task-identities-v1"), { recursive: true, mode: 0o700 });
-const externalAnchor = join(scratch, "deployment-owned-debris-root.json");
-writeFileSync(externalAnchor, `${canonicalize(describeDebrisRootAnchor(state, "1".repeat(64)))}\n`, { mode: 0o400 });
-process.env.VINCI_WORKER_DEBRIS_ROOT_ANCHOR = externalAnchor;
-process.env.VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256 = createHash("sha256").update(readFileSync(externalAnchor)).digest("hex");
+const externalAnchor = debrisAuthority.anchorPath;
 // Simulate an honest-UNVERIFIED run's leavings: a tracked modification and an untracked file.
 writeFileSync(join(first.repoDir, "doc.md"), "half-finished correction\n");
 writeFileSync(join(first.repoDir, "notes.txt"), "only copy of this work\n");
 writeFileSync(join(first.repoDir, "spaced name.txt"), "special-char survivor\n");
 git(first.repoDir, "add", "doc.md"); // staged-but-uncommitted must also be preserved
 
+// Ordinary capture cannot self-provision a task lineage. A missing deployment reservation
+// refuses before creating task storage or cleaning the only copy of the dirty source.
+await assert.rejects(
+  () => prepareRepository(state, "acme/repo", "msg_unprovisioned", undefined, undefined, undefined, 1),
+  /task lineage is not explicitly provisioned/,
+);
+assert.equal(existsSync(join(state, "debris", "msg_unprovisioned")), false);
+assert.equal(readFileSync(join(first.repoDir, "notes.txt"), "utf8"), "only copy of this work\n");
+
+// A transient read failure after deployment has explicitly reserved the task lineage leaves
+// source bytes untouched. The exact retry consumes the same already-provisioned genesis.
+writeFileSync(debrisAuthority.failGetPath, "fail the first authority read\n");
+await assert.rejects(
+  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 1),
+  /debris authority adapter: exited 74/,
+);
+assert.equal(readFileSync(join(first.repoDir, "notes.txt"), "utf8"), "only copy of this work\n");
 const second = await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 1);
 assert.equal(git(second.repoDir, "status", "--porcelain"), "", "the next task must receive a CLEAN tree");
 const ledger = join(state, "debris", "msg_retry", "ledger-v1");
@@ -55,6 +71,7 @@ const digestTree = (directory) => {
 };
 const firstDigest = digestTree(firstGeneration);
 const indexAfterFirstBytes = readFileSync(join(ledger, "index.json"));
+const authorityAfterFirstBytes = readFileSync(debrisAuthority.statePath);
 
 // The same task id retries with different debris on the same paths. Generation one must remain
 // byte-identical and addressable after generation two commits.
@@ -122,7 +139,7 @@ const indexBeforeResponseLoss = readFileSync(join(ledger, "index.json"));
 const gitIndexLock = join(third.repoDir, ".git", "index.lock");
 writeFileSync(gitIndexLock, "held\n");
 await assert.rejects(
-  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 3),
+  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 22),
   /reset failed after durable capture/,
 );
 const lostResponseReceipt = JSON.parse(readFileSync(join(ledger, "current.json"), "utf8"));
@@ -131,14 +148,14 @@ const responseLossGeneration = join(ledger, "generations", lostResponseReceipt.g
 unlinkSync(join(responseLossGeneration, "INDEXED"));
 writeFileSync(join(ledger, "index.json"), indexBeforeResponseLoss);
 unlinkSync(gitIndexLock);
-const replay = await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 3);
+const replay = await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 22);
 assert.equal(replay.debrisReceipt.generation, lostResponseReceipt.generation, "response-loss replay returns the same generation");
-assert.equal(lostResponseReceipt.requested_attempt, 3, "the first response-loss receipt binds its requested attempt");
-assert.equal(replay.debrisReceipt.requested_attempt, 3, "only the exact unfinished attempt can converge on its prior receipt");
-assert.equal(replay.debrisReceipt.captured_by_attempt, 3, "the replay preserves the original capture identity separately");
+assert.equal(lostResponseReceipt.requested_attempt, 22, "the first response-loss receipt binds its requested attempt");
+assert.equal(replay.debrisReceipt.requested_attempt, 22, "only the exact unfinished attempt can converge on its prior receipt");
+assert.equal(replay.debrisReceipt.captured_by_attempt, 22, "the replay preserves the original capture identity separately");
 assert.equal(replay.debrisReceipt.disposition, "CAPTURED");
 assert.equal(replay.debrisReceipt.generation_receipt_sha256, lostResponseReceipt.generation_receipt_sha256, "response-loss replay converges on the same immutable generation receipt");
-assert.equal(replay.debrisReceipt.attempt_receipt_sha256, createHash("sha256").update(readFileSync(join(ledger, "attempts", "3.json"))).digest("hex"), "the exact retry returns the same immutable attempt receipt");
+assert.equal(replay.debrisReceipt.attempt_receipt_sha256, createHash("sha256").update(readFileSync(join(ledger, "attempts", "22.json"))).digest("hex"), "the exact retry returns the same immutable attempt receipt");
 assert.ok(existsSync(join(responseLossGeneration, "INDEXED")), "crash recovery re-establishes the durable indexed marker after restoring the complete index");
 assert.equal(git(replay.repoDir, "status", "--porcelain"), "", "the convergent replay completes the clean");
 assert.equal(JSON.parse(readFileSync(join(ledger, "index.json"), "utf8")).generations.length, generationCountBeforeResponseLoss + 1, "replay does not append a duplicate index row");
@@ -165,13 +182,112 @@ assert.equal(readFileSync(join(replay.repoDir, "same-attempt-conflict.txt"), "ut
 // verified generation ledger. Deleting the latest attempt and rolling current back cannot make
 // the old pointer authoritative or lose the newer capture.
 unlinkSync(join(ledger, "attempts", "99.json"));
-writeFileSync(join(ledger, "current.json"), readFileSync(join(ledger, "attempts", "3.json")));
+writeFileSync(join(ledger, "current.json"), readFileSync(join(ledger, "attempts", "22.json")));
 writeFileSync(join(replay.repoDir, "current-recovery.txt"), "derive from the complete ledger\n");
 const currentRecovery = await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 100);
 assert.ok(existsSync(join(ledger, "attempts", "99.json")), "the deleted attempt receipt is reconstructed from its indexed generation");
 assert.equal(currentRecovery.debrisReceipt.requested_attempt, 100);
 assert.equal(JSON.parse(readFileSync(join(ledger, "current.json"), "utf8")).requested_attempt, 100, "current advances from verified generation and attempt bytes");
 assert.equal(git(currentRecovery.repoDir, "status", "--porcelain"), "");
+
+// A coordinated local deletion cannot erase a committed event because the deployment adapter
+// retains the exact complete task head. Remove the latest generation, attempt, index row, and
+// current pointer together; the next capture must refuse before cleaning its only source.
+const authorityBeforeDeletion = readFileSync(debrisAuthority.statePath);
+const indexBeforeDeletion = readFileSync(join(ledger, "index.json"));
+const currentBeforeDeletion = readFileSync(join(ledger, "current.json"));
+const deletedGeneration = join(ledger, "generations", currentRecovery.debrisReceipt.generation);
+const savedDeletedGeneration = join(scratch, "coordinated-deleted-generation");
+renameSync(deletedGeneration, savedDeletedGeneration);
+const deletedAttempt = readFileSync(join(ledger, "attempts", "100.json"));
+unlinkSync(join(ledger, "attempts", "100.json"));
+const reducedIndex = JSON.parse(indexBeforeDeletion);
+reducedIndex.generations = reducedIndex.generations.filter((entry) => entry.generation !== currentRecovery.debrisReceipt.generation);
+writeFileSync(join(ledger, "index.json"), `${canonicalize(reducedIndex)}\n`);
+writeFileSync(join(ledger, "current.json"), readFileSync(join(ledger, "attempts", "99.json")));
+writeFileSync(join(replay.repoDir, "coordinated-delete.txt"), "external head must retain this history\n");
+await assert.rejects(
+  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 101),
+  /local rollback, deletion, replacement, or fork detected|rollback omitted an indexed generation/,
+);
+assert.equal(readFileSync(join(replay.repoDir, "coordinated-delete.txt"), "utf8"), "external head must retain this history\n");
+renameSync(savedDeletedGeneration, deletedGeneration);
+writeFileSync(join(ledger, "attempts", "100.json"), deletedAttempt, { mode: 0o600 });
+writeFileSync(join(ledger, "index.json"), indexBeforeDeletion);
+writeFileSync(join(ledger, "current.json"), currentBeforeDeletion);
+assert.ok(readFileSync(debrisAuthority.statePath).equals(authorityBeforeDeletion), "the refused local deletion cannot rewrite deployment authority");
+await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 101);
+
+// A valid earlier adapter database cannot be treated as a fresh authority state. The indexed
+// local suffix proves the deployment head was rolled back; source cleanup remains forbidden.
+const currentAuthorityBytes = readFileSync(debrisAuthority.statePath);
+writeFileSync(debrisAuthority.statePath, authorityAfterFirstBytes);
+writeFileSync(join(replay.repoDir, "adapter-rollback.txt"), "must survive adapter rollback\n");
+await assert.rejects(
+  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 102),
+  /local rollback, deletion, replacement, or fork detected/,
+);
+assert.equal(readFileSync(join(replay.repoDir, "adapter-rollback.txt"), "utf8"), "must survive adapter rollback\n");
+writeFileSync(debrisAuthority.statePath, currentAuthorityBytes);
+await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 102);
+
+// Losing the deployment ledger is not first use when task state exists.
+const authorityBeforeLoss = readFileSync(debrisAuthority.statePath);
+unlinkSync(debrisAuthority.statePath);
+writeFileSync(join(replay.repoDir, "adapter-loss.txt"), "must survive missing authority\n");
+await assert.rejects(
+  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 103),
+  /task lineage is not explicitly provisioned/,
+);
+writeFileSync(debrisAuthority.statePath, authorityBeforeLoss, { mode: 0o600 });
+assert.equal(readFileSync(join(replay.repoDir, "adapter-loss.txt"), "utf8"), "must survive missing authority\n");
+await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 103);
+
+// The worker pins the adapter executable itself and the adapter independently refuses callers
+// that lack the deployment channel token. Neither path can alter the authoritative head.
+const adapterBytes = readFileSync(debrisAuthority.adapterPath);
+const inStateAdapter = join(state, "in-state-authority-adapter.mjs");
+writeFileSync(inStateAdapter, adapterBytes, { mode: 0o500 });
+chmodSync(inStateAdapter, 0o500);
+process.env.VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER = inStateAdapter;
+process.env.VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256 = createHash("sha256").update(adapterBytes).digest("hex");
+writeFileSync(join(replay.repoDir, "in-state-adapter.txt"), "adapter cannot share worker state\n");
+await assert.rejects(
+  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 104),
+  /outside the replaceable worker state directory/,
+);
+unlinkSync(inStateAdapter);
+process.env.VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER = debrisAuthority.adapterPath;
+process.env.VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256 = createHash("sha256").update(adapterBytes).digest("hex");
+chmodSync(debrisAuthority.adapterPath, 0o700);
+writeFileSync(debrisAuthority.adapterPath, Buffer.concat([adapterBytes, Buffer.from("\n")]));
+chmodSync(debrisAuthority.adapterPath, 0o500);
+writeFileSync(join(replay.repoDir, "adapter-replacement.txt"), "must survive adapter replacement\n");
+await assert.rejects(
+  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 104),
+  /executable digest mismatch/,
+);
+chmodSync(debrisAuthority.adapterPath, 0o700);
+writeFileSync(debrisAuthority.adapterPath, adapterBytes);
+chmodSync(debrisAuthority.adapterPath, 0o500);
+assert.throws(
+  () => execFileSync(debrisAuthority.adapterPath, [], {
+    input: `${canonicalize({ schema: "vinci.worker-debris-authority-request/1", operation: "GET", task_id: "msg_retry", expected_head_sha256: null, next_head: null, channel_token: "0".repeat(64) })}\n`,
+    stdio: ["pipe", "pipe", "pipe"],
+  }),
+  (error) => error.status === 77,
+);
+assert.equal(readFileSync(join(replay.repoDir, "adapter-replacement.txt"), "utf8"), "must survive adapter replacement\n");
+await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 104);
+
+// If the external compare-and-set commits but its response is lost, an immediate authoritative
+// readback converges on that exact proposed head and cleanup may proceed once, without a fork.
+writeFileSync(join(replay.repoDir, "adapter-response-loss.txt"), "read back the committed head\n");
+writeFileSync(debrisAuthority.responseLossPath, "lose the next CAS response\n");
+const authorityResponseLoss = await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 105);
+assert.equal(authorityResponseLoss.debrisReceipt.requested_attempt, 105);
+assert.equal(existsSync(debrisAuthority.responseLossPath), false);
+assert.equal(git(authorityResponseLoss.repoDir, "status", "--porcelain"), "");
 
 // A competing/stale capture lock is a categorical refusal. No source byte is cleaned, and once
 // the owner releases the lock the same capture can proceed normally.
@@ -202,6 +318,24 @@ assert.equal(readFileSync(join(replay.repoDir, "replacement.txt"), "utf8"), "mus
 rmSync(taskOwnerRoot, { recursive: true });
 renameSync(savedTaskOwnerRoot, taskOwnerRoot);
 await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 6);
+
+// Deleting both the task subtree and its in-root task anchor still cannot bootstrap a second
+// lineage: the deployment adapter retains the original storage identity and monotonic head.
+writeFileSync(join(replay.repoDir, "dual-task-loss.txt"), "must survive task+anchor loss\n");
+const taskAnchorPath = join(state, "debris", ".task-identities-v1", "msg_retry.json");
+const savedTaskAnchorPath = join(scratch, "saved-msg_retry-task-anchor.json");
+renameSync(taskOwnerRoot, savedTaskOwnerRoot);
+renameSync(taskAnchorPath, savedTaskAnchorPath);
+await assert.rejects(
+  () => prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 61),
+  /local rollback, deletion, replacement, or fork detected/,
+);
+assert.equal(readFileSync(join(replay.repoDir, "dual-task-loss.txt"), "utf8"), "must survive task+anchor loss\n");
+rmSync(taskOwnerRoot, { recursive: true });
+unlinkSync(taskAnchorPath);
+renameSync(savedTaskOwnerRoot, taskOwnerRoot);
+renameSync(savedTaskAnchorPath, taskAnchorPath);
+await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 61);
 
 // A crash-created partial staging directory is never ignored or silently replaced. It requires
 // explicit reconciliation, and the working source remains intact while the ledger is partial.
@@ -312,4 +446,5 @@ rmSync(debrisRoot, { recursive: true });
 renameSync(savedDebrisRoot, debrisRoot);
 writeFileSync(externalAnchor, anchorBytes, { mode: 0o400 });
 await prepareRepository(state, "acme/repo", "msg_retry", undefined, undefined, undefined, 30);
+debrisAuthority.cleanup();
 console.log("PASS worker-tree-quarantine");

@@ -18,6 +18,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 
 import { resolveBin } from "./build.mjs";
 import { canonicalize } from "./contracts/canonical.mjs";
+import { createDebrisAuthorityClient } from "./debris-authority.mjs";
 import { readSessionState } from "./session-read.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -36,9 +37,17 @@ function command(commandName, args, options = {}) {
       }
       return;
     }
+    const commandEnvironment = { ...process.env };
+    for (const name of [
+      "VINCI_WORKER_DEBRIS_ROOT_ANCHOR",
+      "VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256",
+      "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER",
+      "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256",
+      "VINCI_WORKER_DEBRIS_AUTHORITY_CHANNEL_TOKEN",
+    ]) delete commandEnvironment[name];
     const child = spawn(executable, args, {
       cwd: options.cwd,
-      env: process.env,
+      env: commandEnvironment,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = options.rawStdout ? [] : "";
@@ -321,6 +330,8 @@ function loadDebrisRootAnchor(stateDir) {
     identitiesRoot: join(stateDir, "debris", ".task-identities-v1"),
     anchorPath,
     anchorBytes: record.bytes,
+    anchorSha256: configuredSha256,
+    value: record.value,
   };
 }
 
@@ -551,7 +562,6 @@ function reconcileDebrisIndex(taskRoot, generationsRoot, taskId, repo, storage, 
     if (existsSync(indexPath)) throw new Error("debris index: appeared during recovery");
     renameSync(temp, indexPath);
     syncDirectory(taskRoot);
-    for (const record of records) markGenerationIndexed(record);
     return { ...readCanonicalFile(indexPath, "debris index"), records };
   }
   const current = readCanonicalFile(indexPath, "debris index");
@@ -574,7 +584,6 @@ function reconcileDebrisIndex(taskRoot, generationsRoot, taskId, repo, storage, 
     renameSync(temp, indexPath);
     syncDirectory(taskRoot);
   }
-  for (const record of records) markGenerationIndexed(record);
   return { ...readCanonicalFile(indexPath, "debris index"), records };
 }
 
@@ -688,6 +697,172 @@ function publishAttemptReceipt(taskRoot, attemptsRoot, taskId, attempt, generati
   };
 }
 
+function authorityHeadDigest(head) {
+  return sha256(canonicalBytes(head));
+}
+
+function validateAuthorityDirectoryIdentity(value, label) {
+  requireExactKeys(value, ["dev", "ino", "uid", "gid", "mode"], label);
+  if (!/^(0|[1-9][0-9]*)$/.test(value.dev) || !/^(0|[1-9][0-9]*)$/.test(value.ino)) {
+    throw new Error(`${label}: invalid device or inode`);
+  }
+  if (!Number.isSafeInteger(value.uid) || value.uid < 0 || !Number.isSafeInteger(value.gid) || value.gid < 0 || value.mode !== 0o700) {
+    throw new Error(`${label}: invalid owner or mode`);
+  }
+}
+
+function validateAuthorityHead(head, taskId) {
+  requireExactKeys(
+    head,
+    [
+      "schema",
+      "sequence",
+      "predecessor_head_sha256",
+      "root_anchor_sha256",
+      "lineage_id",
+      "task_id",
+      "storage",
+      "index_sha256",
+      "generations",
+      "attempts",
+      "current_sha256",
+    ],
+    "debris authority head",
+  );
+  if (head.schema !== "vinci.worker-debris-authority-head/1" || head.task_id !== taskId) throw new Error("debris authority head: invalid identity");
+  if (!Number.isSafeInteger(head.sequence) || head.sequence < 0) throw new Error("debris authority head: invalid sequence");
+  if (head.predecessor_head_sha256 !== null && !/^[0-9a-f]{64}$/.test(head.predecessor_head_sha256)) throw new Error("debris authority head: invalid predecessor");
+  if ((head.sequence === 0) !== (head.predecessor_head_sha256 === null)) throw new Error("debris authority head: invalid genesis/predecessor relation");
+  if (![head.root_anchor_sha256, head.lineage_id, head.index_sha256].every((value) => /^[0-9a-f]{64}$/.test(value))) {
+    throw new Error("debris authority head: invalid digest identity");
+  }
+  requireExactKeys(head.storage, ["task_root", "ledger_root", "generations_root", "attempts_root"], "debris authority storage");
+  for (const key of ["task_root", "ledger_root", "generations_root", "attempts_root"]) {
+    validateAuthorityDirectoryIdentity(head.storage[key], `debris authority storage ${key}`);
+  }
+  if (!Array.isArray(head.generations) || !Array.isArray(head.attempts)) throw new Error("debris authority head: invalid inventory");
+  validateDebrisIndex({ schema: "vinci.worker-debris-index/1", task_id: taskId, generations: head.generations }, taskId);
+  let priorAttempt = 0;
+  for (const entry of head.attempts) {
+    requireExactKeys(entry, ["attempt", "sha256"], "debris authority attempt");
+    if (!Number.isSafeInteger(entry.attempt) || entry.attempt < 1 || entry.attempt <= priorAttempt || !/^[0-9a-f]{64}$/.test(entry.sha256)) {
+      throw new Error("debris authority head: invalid attempt inventory");
+    }
+    priorAttempt = entry.attempt;
+  }
+  if (head.current_sha256 !== null && !/^[0-9a-f]{64}$/.test(head.current_sha256)) throw new Error("debris authority head: invalid current digest");
+}
+
+function localAuthorityPayload(rootAnchor, taskId, storage, index, taskRoot, attemptsRoot) {
+  const attempts = readdirSync(attemptsRoot)
+    .map((entry) => {
+      if (!/^[1-9][0-9]*\.json$/.test(entry)) throw new Error("debris authority: invalid attempt object");
+      const attempt = Number(entry.slice(0, -5));
+      if (!Number.isSafeInteger(attempt)) throw new Error("debris authority: invalid attempt number");
+      return { attempt, sha256: sha256(readSafeRegularFile(join(attemptsRoot, entry), "debris authority attempt")) };
+    })
+    .sort((a, b) => a.attempt - b.attempt);
+  const currentPath = join(taskRoot, "current.json");
+  return {
+    root_anchor_sha256: rootAnchor.anchorSha256,
+    lineage_id: rootAnchor.value.lineage_id,
+    task_id: taskId,
+    storage,
+    index_sha256: sha256(index.bytes ?? canonicalBytes(index.value)),
+    generations: index.value.generations,
+    attempts,
+    current_sha256: existsSync(currentPath) ? sha256(readSafeRegularFile(currentPath, "debris current receipt")) : null,
+  };
+}
+
+function authorityHeadPayload(head) {
+  const { schema: _schema, sequence: _sequence, predecessor_head_sha256: _predecessor, ...payload } = head;
+  return payload;
+}
+
+function buildAuthorityHead(payload, prior) {
+  return {
+    schema: "vinci.worker-debris-authority-head/1",
+    sequence: prior ? prior.sequence + 1 : 0,
+    predecessor_head_sha256: prior ? authorityHeadDigest(prior) : null,
+    ...payload,
+  };
+}
+
+function validateAuthorityResponse(response, taskId, statuses) {
+  requireExactKeys(response, ["schema", "status", "task_id", "head", "head_sha256"], "debris authority response");
+  if (response.schema !== "vinci.worker-debris-authority-response/1" || response.task_id !== taskId || !statuses.has(response.status)) {
+    throw new Error("debris authority adapter: invalid response identity");
+  }
+  if (response.head === null) {
+    if (response.head_sha256 !== null) throw new Error("debris authority adapter: null head has a digest");
+    return;
+  }
+  validateAuthorityHead(response.head, taskId);
+  if (response.head_sha256 !== authorityHeadDigest(response.head)) throw new Error("debris authority adapter: head digest mismatch");
+}
+
+async function readAuthorityHead(client, taskId) {
+  const response = await client({ schema: "vinci.worker-debris-authority-request/1", operation: "GET", task_id: taskId, expected_head_sha256: null, next_head: null });
+  validateAuthorityResponse(response, taskId, new Set(["FOUND", "NOT_FOUND"]));
+  if (response.status === "NOT_FOUND" && response.head !== null) throw new Error("debris authority adapter: NOT_FOUND returned a head");
+  if (response.status === "FOUND" && response.head === null) throw new Error("debris authority adapter: FOUND omitted its head");
+  return response;
+}
+
+async function compareAndSetAuthorityHead(client, taskId, prior, next) {
+  const expected = prior ? authorityHeadDigest(prior) : null;
+  let response;
+  try {
+    response = await client({ schema: "vinci.worker-debris-authority-request/1", operation: "CAS", task_id: taskId, expected_head_sha256: expected, next_head: next });
+  } catch (error) {
+    const observed = await readAuthorityHead(client, taskId).catch(() => null);
+    if (observed?.head && canonicalize(observed.head) === canonicalize(next)) return next;
+    throw new Error(`debris authority adapter: ambiguous head commit requires reconciliation: ${error.message}`);
+  }
+  validateAuthorityResponse(response, taskId, new Set(["COMMITTED", "CONFLICT"]));
+  if (response.head && canonicalize(response.head) === canonicalize(next)) {
+    const observed = await readAuthorityHead(client, taskId);
+    if (observed.head && canonicalize(observed.head) === canonicalize(next)) return next;
+  }
+  throw new Error(`debris authority adapter: ${response.status.toLowerCase()} on monotonic head commit`);
+}
+
+function isRecoverableAuthorityExtension(prior, payload, records) {
+  const old = authorityHeadPayload(prior);
+  if (canonicalize(old.storage) !== canonicalize(payload.storage)
+      || old.root_anchor_sha256 !== payload.root_anchor_sha256
+      || old.lineage_id !== payload.lineage_id
+      || old.task_id !== payload.task_id
+      || old.generations.length > payload.generations.length
+      || old.attempts.length > payload.attempts.length) return false;
+  const localGenerations = new Map(payload.generations.map((entry) => [entry.generation, entry]));
+  for (const entry of old.generations) {
+    if (!localGenerations.has(entry.generation) || canonicalize(localGenerations.get(entry.generation)) !== canonicalize(entry)) return false;
+  }
+  const localAttempts = new Map(payload.attempts.map((entry) => [entry.attempt, entry]));
+  for (const entry of old.attempts) {
+    if (!localAttempts.has(entry.attempt) || canonicalize(localAttempts.get(entry.attempt)) !== canonicalize(entry)) return false;
+  }
+  const oldGenerations = new Set(old.generations.map((entry) => entry.generation));
+  const added = records.filter((record) => !oldGenerations.has(record.generation));
+  return added.length === payload.generations.length - old.generations.length && added.length > 0 && added.every((record) => !record.indexed);
+}
+
+async function reconcileAuthorityHead(client, rootAnchor, taskId, storage, index, taskRoot, attemptsRoot) {
+  const payload = localAuthorityPayload(rootAnchor, taskId, storage, index, taskRoot, attemptsRoot);
+  const response = await readAuthorityHead(client, taskId);
+  if (response.status === "NOT_FOUND") {
+    throw new Error("debris authority adapter: task lineage is not explicitly provisioned");
+  }
+  const prior = response.head;
+  if (canonicalize(authorityHeadPayload(prior)) === canonicalize(payload)) return prior;
+  if (!isRecoverableAuthorityExtension(prior, payload, index.records)) {
+    throw new Error("debris authority adapter: local rollback, deletion, replacement, or fork detected");
+  }
+  return compareAndSetAuthorityHead(client, taskId, prior, buildAuthorityHead(payload, prior));
+}
+
 // Shared-tree quarantine (used by BOTH the prose default/branch paths and the digest path).
 async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
   // Shared-tree quarantine: a prior run that ended without committing (honest BLOCKED/
@@ -701,6 +876,7 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
   const debrisRoot = join(stateDir, "debris");
   if (!existsSync(debrisRoot)) throw new Error("debris root identity: deployment must provision the debris root and external trust anchor before capture");
   const rootAnchor = loadDebrisRootAnchor(stateDir);
+  const authorityClient = createDebrisAuthorityClient(stateDir);
   const lockPath = join(debrisRoot, ".capture.lock");
   const lock = openSync(lockPath, "wx", 0o600);
   let staging = null;
@@ -717,6 +893,13 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
     const taskRoot = join(taskOwnerRoot, "ledger-v1");
     const generationsRoot = join(taskRoot, "generations");
     const attemptsRoot = join(taskRoot, "attempts");
+    const provisioned = await readAuthorityHead(authorityClient, taskId);
+    if (provisioned.status !== "FOUND") {
+      throw new Error("debris authority adapter: task lineage is not explicitly provisioned");
+    }
+    if (provisioned.head.root_anchor_sha256 !== rootAnchor.anchorSha256 || provisioned.head.lineage_id !== rootAnchor.value.lineage_id) {
+      throw new Error("debris authority adapter: provisioned task lineage does not bind this deployment root");
+    }
     const taskAnchor = establishTaskStorageAnchor(rootAnchor.identitiesRoot, taskId, taskOwnerRoot, taskRoot, generationsRoot, attemptsRoot);
     const storage = taskAnchor.storage;
     const storagePaths = {
@@ -733,6 +916,8 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
     const finalDir = join(generationsRoot, snapshot.generation);
     const previousIndex = reconcileDebrisIndex(taskRoot, generationsRoot, taskId, repo, storage, storagePaths);
     reconcileAttemptReceipts(taskRoot, attemptsRoot, taskId, previousIndex.records);
+    await reconcileAuthorityHead(authorityClient, rootAnchor, taskId, storage, previousIndex, taskRoot, attemptsRoot);
+    for (const record of previousIndex.records) markGenerationIndexed(record);
     const priorAttempt = previousIndex.records.find((record) => record.receipt.captured_by_attempt === attempt);
     if (priorAttempt && priorAttempt.generation !== snapshot.generation) {
       throw new Error("debris attempt receipt: attempt already bound to different source");
@@ -810,8 +995,11 @@ async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
     }
 
     publishDebrisIndex(taskRoot, taskId, verified, previousIndex);
-    markGenerationIndexed(verified);
     const receipt = publishAttemptReceipt(taskRoot, attemptsRoot, taskId, attempt, verified);
+    const committedIndex = reconcileDebrisIndex(taskRoot, generationsRoot, taskId, repo, storage, storagePaths);
+    reconcileAttemptReceipts(taskRoot, attemptsRoot, taskId, committedIndex.records);
+    await reconcileAuthorityHead(authorityClient, rootAnchor, taskId, storage, committedIndex, taskRoot, attemptsRoot);
+    for (const record of committedIndex.records) markGenerationIndexed(record);
     requireUnchangedAnchor(rootAnchor.anchorPath, rootAnchor.anchorBytes, "debris root identity");
     requireUnchangedAnchor(taskAnchor.anchorPath, taskAnchor.anchorBytes, "debris task identity");
     for (const [label, identity] of Object.entries(storage)) requireSameDirectory(storagePaths[label], identity, `debris storage ${label}`);
@@ -1011,6 +1199,14 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
   const tools = Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools.join(",") : "read,grep,find,ls,bash,edit,write";
+  const taskEnvironment = { ...process.env, VINCI_UPDATE_DISABLED: "1" };
+  for (const name of [
+    "VINCI_WORKER_DEBRIS_ROOT_ANCHOR",
+    "VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256",
+    "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER",
+    "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256",
+    "VINCI_WORKER_DEBRIS_AUTHORITY_CHANNEL_TOKEN",
+  ]) delete taskEnvironment[name];
   mkdirSync(sessionDir, { recursive: true });
 
   return new Promise((resolveRun) => {
@@ -1038,7 +1234,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
       {
         cwd: repoDir,
         detached: true,
-        env: { ...process.env, VINCI_UPDATE_DISABLED: "1" },
+        env: taskEnvironment,
         stdio: ["ignore", "inherit", "inherit"],
       },
     );

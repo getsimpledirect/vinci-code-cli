@@ -158,6 +158,22 @@ worker never creates or repairs it. Deployment must also supply the SHA-256 of t
 anchor bytes through `VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256`; ordinary capture cannot change that
 process-pinned trust root.
 
+Every task lineage and complete generation/attempt/current inventory is also serialized through a
+deployment-owned compare-and-set adapter named by `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER`. The
+worker requires an exact executable digest in `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256` and a
+deployment-issued 32-byte channel token. Adapter responses are bounded canonical bytes, and each
+head binds the root anchor, lineage, storage identities, monotonic sequence/predecessor, index,
+generations, attempts, and current receipt. Deployment must explicitly create the private task
+directories and task-identity anchor and reserve their empty sequence-zero head in that adapter
+before the task may capture debris. Ordinary worker capture never provisions a lineage: a missing
+head refuses before it creates or cleans task state. Missing or rolled-back adapter state for an
+existing task, any local deletion/fork, or a second task-root bootstrap refuses before cleanup. A verified
+unindexed local suffix may advance the external head after a crash; an external head never moves
+backward. Native adapters are executed directly; script adapters are executed only by the exact
+Node runtime already running the worker, never through their shebang or an ambient `PATH`. The
+adapter and all anchor/adapter settings are removed from the repository task's environment before
+execution.
+
 ## Handoff Forms (Wave 1B)
 
 A handoff body is one of two forms. The daemon detects which by its first non-blank

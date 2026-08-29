@@ -8,17 +8,15 @@
 // post must name the refusal reason and the `contract=<id>@<digest8>` tag.
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createServer } from "node:http";
 
 import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
-import { canonicalize } from "../worker/contracts/canonical.mjs";
+import { provisionWorkerDebrisAuthority } from "./lib/worker-debris-authority-fixture.mjs";
 import { executionSpecDigest, recordDigest, workOrderDigest } from "../worker/contracts/digest.mjs";
-import { describeDebrisRootAnchor } from "../worker/run.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const LAUNCHER = join(ROOT, "vinci/bin/vinci");
@@ -27,11 +25,7 @@ const VECTORS = join(dirname(fileURLToPath(import.meta.url)), "fixtures/contract
 const ZERO64 = "0".repeat(64);
 
 const f = new WorkerTestFixture("handoff-triple");
-mkdirSync(join(f.tempDir, "debris", ".task-identities-v1"), { recursive: true, mode: 0o700 });
-const debrisAnchor = `${f.tempDir}-deployment-debris-root.json`;
-writeFileSync(debrisAnchor, `${canonicalize(describeDebrisRootAnchor(f.tempDir, "2".repeat(64)))}\n`, { mode: 0o400 });
-process.env.VINCI_WORKER_DEBRIS_ROOT_ANCHOR = debrisAnchor;
-process.env.VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256 = createHash("sha256").update(readFileSync(debrisAnchor)).digest("hex");
+const debrisAuthority = provisionWorkerDebrisAuthority(f.tempDir, "2".repeat(64));
 const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { stdio: "pipe" }).toString().trim();
 const gitFails = (cwd, ...args) => {
   try {
@@ -527,6 +521,7 @@ try {
     writeFileSync(join(repoDir, "README.md"), "half-finished\n");
     writeFileSync(join(repoDir, "leftover.txt"), "only copy\n");
     const dirtyOrder = orderFor("wo-dirty");
+    debrisAuthority.reserveTask("m-dirty");
     f.busMessages.push(handoff("m-dirty", register(dirtyOrder, specFor(dirtyOrder, { targetBranch: "feat/dirty" }))));
     let r = await run();
     assert.equal(r.status, 0, r.stderr);
@@ -602,6 +597,7 @@ try {
     };
     const modeRun = async (id, output, promotion, env) => {
       const order = orderFor(`wo-${id}`);
+      debrisAuthority.reserveTask(`m-${id}`);
       f.busMessages.push(handoff(`m-${id}`, register(order, specFor(order, { output, promotion, targetBranch: `feat/${id}` }))));
       const r = await run({ env: { FAKE_VINCI_COMMIT_FILE: `${id}.txt`, ...evidenceEnv, ...env } });
       assert.equal(r.status, 0, r.stderr);
@@ -680,5 +676,5 @@ try {
   console.log("PASS worker-handoff-triple");
 } finally {
   await f.cleanup();
-  unlinkSync(debrisAnchor);
+  debrisAuthority.cleanup();
 }
