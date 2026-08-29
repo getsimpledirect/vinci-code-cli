@@ -82,12 +82,16 @@ export async function claimGovernorPaths({ governorUrl, token, paths, attemptId 
       return unavailable(`Governor lease invalid: ttl=${JSON.stringify(responseBody.ttl)}`);
     }
     const claimedAt = new Date().toISOString();
+    // The lease token the W2 unattended policy profile stamps into the child. It cannot be produced
+    // on any path where the lease was refused, unavailable, or never requested. The `#expires=`
+    // suffix is REQUIRED by the child-side parser and is pinned to the lease's own ttl, so the
+    // relaxed guard can never outlive the lease that justified it — the runtime timer and the
+    // profile expire together rather than the profile silently lasting for the life of the process.
+    const expiresAt = new Date(Date.parse(claimedAt) + responseBody.ttl * 1000).toISOString();
     return {
       success: true,
-      // A stable identifier for THIS granted lease. It exists so the W2 unattended policy profile
-      // has something to stamp into the child that CANNOT be produced on any path where the lease
-      // was refused, unavailable, or never requested — see unattendedPolicyEnv() below.
-      id: `${idempotencyKey}@${claimedAt}`,
+      id: `${idempotencyKey}@${claimedAt}#expires=${expiresAt}`,
+      expires_at: expiresAt,
       claimed_at: claimedAt,
       paths: responseBody.paths || paths,
       ttl: responseBody.ttl,

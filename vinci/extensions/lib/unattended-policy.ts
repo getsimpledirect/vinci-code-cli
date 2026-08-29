@@ -11,15 +11,34 @@
  * answered upstream by the Governor lease, so a confirmation dialog is the wrong mechanism.
  *
  * ── What this module is NOT ────────────────────────────────────────────────────────────────────
- * It is not a bypass, and it is not reachable by accident. Two independent facts must BOTH hold:
+ * It is not a bypass, and it is not reachable by accident. Three facts must ALL hold:
  *
  *   1. `VINCI_UNATTENDED_POLICY=governed` — an explicit operator opt-in. Unset (the default, and
  *      what every CI job, script and other headless caller sees) means the guard behaves exactly as
  *      it does today, byte for byte.
- *   2. `VINCI_UNATTENDED_LEASE=<non-empty>` — a Governor lease actually backs this run. The worker
- *      daemon sets this ONLY after `claimGovernorPaths()` returned a granted lease, and explicitly
- *      DELETES both variables on every other path, so a daemon whose own environment happens to
- *      carry the profile cannot leak it into an ungoverned child.
+ *   2. `VINCI_UNATTENDED_LEASE=<token>` — the worker daemon sets this ONLY after
+ *      `claimGovernorPaths()` returned a granted lease, and explicitly DELETES both variables on
+ *      every other path, so a daemon whose own environment happens to carry the profile cannot leak
+ *      it into an ungoverned child.
+ *   3. The token carries an `#expires=<ISO-8601>` bound that has not passed. A token without a
+ *      parseable expiry is rejected: an unbounded grant is not a lease.
+ *
+ * ── What is ENFORCED vs what is merely TRUE ────────────────────────────────────────────────────
+ * Be precise about this, because a permission system that overstates itself is worse than one that
+ * does less. What the code ENFORCES is: the opt-in string is present, a lease token is present, and
+ * the token's expiry is in the future. That is a cooperative signal plus a time bound — NOT proof
+ * that a Governor granted anything. The token is not signed and the guard has no key to verify one
+ * against, so ANYTHING that can set this child's environment can set the pair, and a `vinci -p`
+ * launched in CI with both exported would get the relaxed guard.
+ *
+ * What is TRUE but not enforced here: `vinci/worker/governor.mjs::unattendedPolicyEnv()` is the only
+ * producer of either variable in this repository, and it produces them only on a granted lease. That
+ * is a property of this codebase, checkable by grep, not a control this module imposes.
+ *
+ * The controls that actually carry the safety argument are therefore: (a) the relaxed set is TINY
+ * and fail-closed — one allowlisted dev-toolchain network case and the unrequested-checkpoint gate,
+ * with every safety guard untouched; (b) every relaxation is durably recorded or it is not granted;
+ * (c) the expiry bounds the window to the lease TTL. Not the env pair on its own.
  *
  * The env var alone is deliberately not enough. An unattended run with no authority behind it is
  * exactly the run that should keep the conservative gate: there is nothing upstream that answered
@@ -51,8 +70,10 @@ export type UnattendedOutcome = "BLOCKED" | "ESCALATED" | "PROCEEDED";
 export type UnattendedProfile = {
   /** Always "governed" today; a named profile so a future second profile cannot be confused with it. */
   profile: "governed";
-  /** Opaque lease identifier the daemon stamped in. Non-empty by construction. */
+  /** Lease token the daemon stamped in. Non-empty and carrying a future `#expires=` by construction. */
   lease: string;
+  /** The token's expiry, already validated as parseable and in the future. */
+  expiresAt: string;
 };
 
 export type UnattendedDecision = {
@@ -79,7 +100,16 @@ export function unattendedPolicyProfile(env: EnvLike = process.env): UnattendedP
   if (env.VINCI_UNATTENDED_POLICY?.trim() !== "governed") return null;
   const lease = env.VINCI_UNATTENDED_LEASE?.trim();
   if (!lease) return null;
-  return { profile: "governed", lease };
+  // The expiry is REQUIRED and enforced. A lease that cannot say when it stops being a lease is not
+  // a lease, and without this the profile would outlive the Governor lease that justified it for as
+  // long as the process ran. This does not make the token unforgeable — nothing here can — but it
+  // does mean the grant is bounded rather than permanent, which is the difference between a window
+  // and a standing permission.
+  const expires = /#expires=([^#\s]+)$/.exec(lease)?.[1];
+  if (!expires) return null;
+  const expiresAtMs = Date.parse(expires);
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return null;
+  return { profile: "governed", lease, expiresAt: new Date(expiresAtMs).toISOString() };
 }
 
 /** Convenience predicate. Same two conditions; never re-derive them anywhere else. */
@@ -161,6 +191,23 @@ export function escalationReason(decision: UnattendedDecision, extra = ""): stri
     `grant it either. Do NOT work around it and do NOT retry: make the code changes you can, then ` +
     `stop and let this run end BLOCKED naming this step, so the Governor can widen the work order ` +
     `and re-dispatch.${extra ? ` ${extra}` : ""} ${unattendedDecisionTag(decision)}`
+  );
+}
+
+/**
+ * The terminal text for a PROCEED that could not be recorded durably. This is a refusal, and it says
+ * why in a way an operator can act on: the gate itself would have been allowed, so the thing to fix
+ * is the transcript, not the command.
+ */
+export function unrecordableProceedReason(decision: UnattendedDecision, extra = ""): string {
+  return (
+    `Blocked (${decision.gate}) — the governed unattended profile would have allowed this, but it ` +
+    `could not durably record the decision, and an unrecorded relaxation is not granted. This is an ` +
+    `instrument failure, not a policy decision: the session transcript could not be appended to. Do ` +
+    `not retry or work around it; stop and let this run end BLOCKED so the operator can fix the ` +
+    `session store.${extra ? ` ${extra}` : ""} ` +
+    `[vinci-unattended outcome=BLOCKED site=${decision.site} gate="${decision.gate}" ` +
+    `grantor=governor lease=${decision.lease} cause=unrecordable]`
   );
 }
 
