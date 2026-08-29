@@ -143,8 +143,9 @@ and left exactly where it is. Any error in these checks ⇒ no rename, plain ref
 Origin unreachable is reported as `git ls-remote origin failed for <branch>: …`, never as
 not-found or divergence. A branch that exists on origin but cannot be resolved locally after the
 explicit fetch is `envelope branch <branch> exists on origin but fetch did not materialize
-origin/<branch> locally`. The pre-existing `reset --hard`/`clean -fd` quarantine of the shared
-checkout is unchanged here (Wave 1 clean-room item).
+origin/<branch> locally`. Before any `reset --hard`/`clean -fd`, the shared checkout quarantine
+publishes a content-addressed immutable generation and a canonical receipt (Wave 1 clean-room
+item). The task record carries that receipt when a capture occurred.
 
 ## Handoff Forms (Wave 1B)
 
@@ -217,9 +218,12 @@ an origin head. `baseRef` is REQUIRED (plain-branch rule, like `targetBranch`). 
 operations, fixed:
 
 1. names validated (`git check-ref-format --branch` for both);
-2. uncached ⇒ `git clone`; cached ⇒ the shared-tree quarantine runs FIRST (tracked/untracked
-   leavings of a prior run preserved under `<state>/debris/<task>/`, exactly as on the prose
-   paths);
+2. uncached ⇒ `git clone`; cached ⇒ the shared-tree quarantine runs FIRST. Tracked/untracked
+   leavings are copied and revalidated under
+   `<state>/debris/<task>/ledger-v1/generations/<content-digest>/`, with canonical
+   manifest/receipt/commit-marker bytes, file and directory fsync, and an atomically replaced
+   index/current pointer. Generation publication is exclusive and an exact response-loss replay
+   converges on the same receipt; divergent retries retain distinct immutable generations;
 3. `git fetch origin +refs/heads/<baseRef>:refs/remotes/origin/<baseRef>` MUST succeed, else
    **BLOCKED `base_ref_unavailable`**;
 4. `git merge-base --is-ancestor <baseCommit> refs/remotes/origin/<baseRef>` must hold, else
@@ -244,7 +248,7 @@ output is `format-patch <baseCommit>..HEAD`. Nothing on the digest path is hardc
 |---|---|---|---|
 | `none` | never | session, git.diff, result.json, runner.log | never |
 | `patch` | never | + `<attempt>.patch` (`git format-patch --stdout <baseCommit>..HEAD`) | never |
-| `artifact` | never | + `artifacts.json` (`{ base_commit, files }`: tracked changes vs `baseCommit` + untracked files; also `artifacts` on the task record) | never |
+| `artifact` | never | + `artifacts.json` (`{ base_commit, files }`: exact canonical UTF-8 repo-relative identities from raw NUL-delimited Git output; unsupported/duplicate/alias paths refuse; also `artifacts` on the task record) | never |
 | `branch` | `refs/heads/<targetBranch>` | as `none` | only when `promotion: pull_request` (`--base <baseRef>`) |
 
 The record's `publish` is `none` / `patch` / `artifact` / `pushed` / `push_failed` (or `blocked`

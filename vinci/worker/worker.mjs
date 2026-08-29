@@ -571,7 +571,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId) {
       });
     }
 
-    const repository = await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch, envelopeToUse.base_commit, contractFields ? contractFields.base_ref : undefined);
+    const repository = await prepareRepository(
+      stateDir,
+      envelopeToUse.repo,
+      taskId,
+      envelopeToUse.branch,
+      envelopeToUse.base_commit,
+      contractFields ? contractFields.base_ref : undefined,
+      attempt.attempt,
+    );
+    if (repository.debrisReceipt) lifecycle.record({ debris_receipt: repository.debrisReceipt });
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
     // which can take long enough for an operator update to land — and stamp the task with it.
     // runVinci spawns with VINCI_UPDATE_DISABLED=1, so nothing can change between this probe

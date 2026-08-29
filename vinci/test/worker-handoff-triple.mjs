@@ -525,10 +525,12 @@ try {
     vinciRuns += 1;
     assert.equal(f.getVinciCalls().length, vinciRuns, "the task runs after quarantine");
     assert.match(postsFor("m-dirty"), /state=COMPLETED/);
-    const debris = join(f.tempDir, "debris", "m-dirty");
-    assert.ok(existsSync(join(debris, "tracked.patch")), "the dirty tree must be QUARANTINED under <state>/debris/<task> before checkout -B");
+    const ledger = join(f.tempDir, "debris", "m-dirty", "ledger-v1");
+    const debrisReceipt = JSON.parse(readFileSync(join(ledger, "current.json"), "utf8"));
+    const debris = join(ledger, "generations", debrisReceipt.generation);
+    assert.ok(existsSync(join(debris, "COMMITTED")), "the dirty tree must be durably QUARANTINED before checkout -B");
     assert.match(readFileSync(join(debris, "tracked.patch"), "utf8"), /half-finished/, "the tracked modification is preserved as a patch");
-    assert.equal(readFileSync(join(debris, "untracked", "leftover.txt"), "utf8"), "only copy\n", "the untracked file is moved, not deleted");
+    assert.equal(readFileSync(join(debris, "untracked", "leftover.txt"), "utf8"), "only copy\n", "the untracked file is copied before the source is cleaned");
     assert.equal(git(repoDir, "status", "--porcelain"), "", "the task received a clean tree");
     const calls = f.getGitCalls().map(sub);
     assert.ok(calls.indexOf("reset") < calls.indexOf("checkout"), `quarantine runs before checkout -B: ${calls.join(",")}`);

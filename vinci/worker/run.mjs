@@ -1,9 +1,23 @@
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { resolveBin } from "./build.mjs";
+import { canonicalize } from "./contracts/canonical.mjs";
 import { readSessionState } from "./session-read.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -16,7 +30,7 @@ function command(commandName, args, options = {}) {
       executable = resolveBin(commandName);
     } catch (error) {
       if (options.allowFailure) {
-        resolveCommand({ status: null, signal: null, stdout: "", stderr: error.message });
+        resolveCommand({ status: null, signal: null, stdout: options.rawStdout ? Buffer.alloc(0) : "", stderr: error.message });
       } else {
         rejectCommand(error);
       }
@@ -27,12 +41,13 @@ function command(commandName, args, options = {}) {
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
+    let stdout = options.rawStdout ? [] : "";
     let stderr = "";
-    child.stdout.setEncoding("utf8");
+    if (!options.rawStdout) child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      stdout += chunk;
+      if (options.rawStdout) stdout.push(Buffer.from(chunk));
+      else stdout += chunk;
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
@@ -40,17 +55,86 @@ function command(commandName, args, options = {}) {
     let settled = false;
     child.once("error", (error) => {
       settled = true;
-      if (options.allowFailure) resolveCommand({ status: null, signal: null, stdout: "", stderr: error.message });
+      if (options.allowFailure) resolveCommand({ status: null, signal: null, stdout: options.rawStdout ? Buffer.alloc(0) : "", stderr: error.message });
       else rejectCommand(error);
     });
     child.once("close", (status, signal) => {
       if (settled) return;
       settled = true;
-      const result = { status, signal, stdout: stdout.trim(), stderr: stderr.trim() };
+      const result = {
+        status,
+        signal,
+        stdout: options.rawStdout ? Buffer.concat(stdout) : stdout.trim(),
+        stderr: stderr.trim(),
+      };
       if (status === 0 || options.allowFailure) resolveCommand(result);
       else rejectCommand(new Error(`${commandName} ${args.join(" ")} failed: ${stderr.trim() || signal || status}`));
     });
   });
+}
+
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalBytes(value) {
+  return Buffer.from(`${canonicalize(value)}\n`, "utf8");
+}
+
+function syncDirectory(path) {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function writeExclusiveDurable(path, bytes, mode = 0o600) {
+  const descriptor = openSync(path, "wx", mode);
+  try {
+    writeFileSync(descriptor, bytes);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function decodeCanonicalRepoPath(bytes, label) {
+  let path;
+  try {
+    path = utf8Decoder.decode(bytes);
+  } catch {
+    throw new Error(`${label}: path is not canonical UTF-8`);
+  }
+  if (!Buffer.from(path, "utf8").equals(bytes)) throw new Error(`${label}: path UTF-8 does not round-trip`);
+  if (path.normalize("NFC") !== path) throw new Error(`${label}: path is not NFC-normalized`);
+  if (path === "" || isAbsolute(path) || path.includes("\0")) throw new Error(`${label}: path is not repository-relative`);
+  const parts = path.split("/");
+  if (parts.some((part) => part === "" || part === "." || part === "..")) throw new Error(`${label}: path contains an aliasing component`);
+  return path;
+}
+
+export function parseGitNulPaths(raw, label = "git path list") {
+  if (!Buffer.isBuffer(raw)) throw new TypeError(`${label}: expected raw bytes`);
+  if (raw.length === 0) return [];
+  if (raw.at(-1) !== 0) throw new Error(`${label}: missing terminal NUL`);
+  const paths = [];
+  let start = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] !== 0) continue;
+    if (index === start) throw new Error(`${label}: empty path entry`);
+    paths.push(decodeCanonicalRepoPath(raw.subarray(start, index), label));
+    start = index + 1;
+  }
+  const seen = new Set();
+  for (const path of paths) {
+    if (seen.has(path)) throw new Error(`${label}: duplicate path ${JSON.stringify(path)}`);
+    seen.add(path);
+  }
+  return paths;
 }
 
 function signalExitCode(code, signal) {
@@ -139,47 +223,396 @@ async function classifyDivergedLocal(repoDir, branch, localSha, remoteTip) {
 function blocked(reason, message) {
   return Object.assign(new Error(message), { blockedReason: reason });
 }
+
+function readCanonicalFile(path, label) {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error(`${label}: unsafe file identity`);
+  const bytes = readFileSync(path);
+  let value;
+  try {
+    value = JSON.parse(utf8Decoder.decode(bytes));
+  } catch (error) {
+    throw new Error(`${label}: invalid canonical JSON: ${error.message}`);
+  }
+  if (!canonicalBytes(value).equals(bytes)) throw new Error(`${label}: bytes are not canonical JSON`);
+  return { bytes, value };
+}
+
+function readSafeRegularFile(path, label) {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error(`${label}: unsafe file identity`);
+  return readFileSync(path);
+}
+
+function directoryIdentity(path, label) {
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`${label}: unsafe directory identity`);
+  if ((stat.mode & 0o077) !== 0) throw new Error(`${label}: directory is accessible outside its owner`);
+  if (stat.nlink < 2) throw new Error(`${label}: invalid directory link count`);
+  return { dev: String(stat.dev), ino: String(stat.ino), uid: stat.uid, gid: stat.gid, mode: stat.mode & 0o777 };
+}
+
+function ensurePrivateDirectory(path, label) {
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  return directoryIdentity(path, label);
+}
+
+function requireSameDirectory(path, expected, label) {
+  const current = directoryIdentity(path, label);
+  if (canonicalize(current) !== canonicalize(expected)) throw new Error(`${label}: directory identity changed`);
+}
+
+function requireExactKeys(value, keys, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}: expected object`);
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (canonicalize(actual) !== canonicalize(expected)) throw new Error(`${label}: unexpected fields`);
+}
+
+function establishDebrisRootAnchor(stateDir, debrisRoot) {
+  const identitiesRoot = join(debrisRoot, ".task-identities-v1");
+  const debrisIdentity = directoryIdentity(debrisRoot, "debris root");
+  const identitiesIdentity = ensurePrivateDirectory(identitiesRoot, "debris task identities root");
+  const anchorPath = join(stateDir, "debris-root-identity-v1.json");
+  const expected = {
+    schema: "vinci.worker-debris-root-identity/1",
+    debris_root: debrisIdentity,
+    task_identities_root: identitiesIdentity,
+  };
+  let record;
+  if (existsSync(anchorPath)) {
+    record = readCanonicalFile(anchorPath, "debris root identity");
+    requireExactKeys(record.value, ["schema", "debris_root", "task_identities_root"], "debris root identity");
+    if (canonicalize(record.value) !== canonicalize(expected)) throw new Error("debris root identity: path replacement or rollback detected");
+  } else {
+    const persistent = readdirSync(debrisRoot).filter((name) => name !== ".task-identities-v1");
+    if (persistent.length > 0 || readdirSync(identitiesRoot).length > 0) {
+      throw new Error("debris root identity: missing anchor for existing state");
+    }
+    writeExclusiveDurable(anchorPath, canonicalBytes(expected));
+    syncDirectory(stateDir);
+    record = readCanonicalFile(anchorPath, "debris root identity");
+  }
+  return { identitiesRoot, anchorPath, anchorBytes: record.bytes };
+}
+
+function establishTaskStorageAnchor(anchorRoot, taskId, taskOwnerRoot, taskRoot, generationsRoot) {
+  const anchorPath = join(anchorRoot, `${taskId}.json`);
+  const pathExisted = existsSync(taskOwnerRoot);
+  if (!existsSync(anchorPath) && pathExisted) throw new Error("debris task identity: missing anchor for existing state");
+  const storage = {
+    task_root: ensurePrivateDirectory(taskOwnerRoot, "debris task root"),
+    ledger_root: ensurePrivateDirectory(taskRoot, "debris ledger root"),
+    generations_root: ensurePrivateDirectory(generationsRoot, "debris generations root"),
+  };
+  const expected = { schema: "vinci.worker-debris-task-identity/1", task_id: taskId, storage };
+  let record;
+  if (existsSync(anchorPath)) {
+    record = readCanonicalFile(anchorPath, "debris task identity");
+    requireExactKeys(record.value, ["schema", "task_id", "storage"], "debris task identity");
+    if (canonicalize(record.value) !== canonicalize(expected)) throw new Error("debris task identity: path replacement or rollback detected");
+  } else {
+    writeExclusiveDurable(anchorPath, canonicalBytes(expected));
+    syncDirectory(anchorRoot);
+    record = readCanonicalFile(anchorPath, "debris task identity");
+  }
+  return { storage, anchorPath, anchorBytes: record.bytes };
+}
+
+function requireUnchangedAnchor(path, expectedBytes, label) {
+  const current = readCanonicalFile(path, label);
+  if (!current.bytes.equals(expectedBytes)) throw new Error(`${label}: changed during capture`);
+}
+
+function syncTreeDirectories(root, relativePaths) {
+  const directories = new Set([root]);
+  for (const relativePath of relativePaths) {
+    let current = dirname(join(root, relativePath));
+    while (current.startsWith(root) && current !== root) {
+      directories.add(current);
+      current = dirname(current);
+    }
+  }
+  for (const directory of [...directories].sort((a, b) => b.length - a.length)) syncDirectory(directory);
+}
+
+function verifyDebrisGeneration(generationDir, expected) {
+  directoryIdentity(generationDir, "debris generation");
+  const manifestRecord = readCanonicalFile(join(generationDir, "manifest.json"), "debris manifest");
+  const receiptRecord = readCanonicalFile(join(generationDir, "receipt.json"), "debris receipt");
+  const manifest = manifestRecord.value;
+  const receipt = receiptRecord.value;
+  requireExactKeys(manifest, ["schema", "generation", "source_fingerprint", "captured_by_attempt", "source", "tracked_patch", "staged_patch", "untracked"], "debris manifest");
+  requireExactKeys(receipt, ["schema", "generation", "source_fingerprint", "manifest_sha256", "task_id", "captured_by_attempt", "repo", "branch", "base_commit", "head", "tree", "storage"], "debris receipt");
+  if (manifest.schema !== "vinci.worker-debris-generation/1") throw new Error("debris manifest: unsupported schema");
+  if (manifest.generation !== expected.generation || manifest.source_fingerprint !== expected.sourceFingerprint) throw new Error("debris manifest: source identity mismatch");
+  if (manifest.source?.task_id !== expected.taskId || manifest.source?.repo !== expected.repo) throw new Error("debris manifest: task identity mismatch");
+  if (receipt.schema !== "vinci.worker-debris-receipt/1") throw new Error("debris receipt: unsupported schema");
+  if (receipt.generation !== manifest.generation || receipt.source_fingerprint !== expected.sourceFingerprint) throw new Error("debris receipt: identity mismatch");
+  if (receipt.manifest_sha256 !== sha256(manifestRecord.bytes)) throw new Error("debris receipt: manifest digest mismatch");
+  for (const key of ["task_id", "repo", "branch", "base_commit", "head", "tree"]) {
+    const sourceKey = key === "task_id" ? "task_id" : key;
+    if (receipt[key] !== manifest.source[sourceKey]) throw new Error(`debris receipt: ${key} mismatch`);
+  }
+  if (receipt.captured_by_attempt !== manifest.captured_by_attempt) throw new Error("debris receipt: attempt mismatch");
+  for (const [label, identity] of Object.entries(expected.storage)) {
+    requireSameDirectory(expected.storagePaths[label], identity, `debris storage ${label}`);
+  }
+  if (canonicalize(receipt.storage) !== canonicalize(expected.storage)) throw new Error("debris receipt: storage identity mismatch");
+  const trackedBytes = readSafeRegularFile(join(generationDir, "tracked.patch"), "debris tracked patch");
+  const stagedBytes = readSafeRegularFile(join(generationDir, "staged.patch"), "debris staged patch");
+  if (trackedBytes.length !== manifest.tracked_patch.size || sha256(trackedBytes) !== manifest.tracked_patch.sha256) throw new Error("debris generation: tracked patch mismatch");
+  if (stagedBytes.length !== manifest.staged_patch.size || sha256(stagedBytes) !== manifest.staged_patch.sha256) throw new Error("debris generation: staged patch mismatch");
+  const expectedStored = new Set();
+  for (const file of manifest.untracked) {
+    if (expectedStored.has(file.path)) throw new Error(`debris generation: duplicate stored file ${JSON.stringify(file.path)}`);
+    expectedStored.add(file.path);
+    const path = join(generationDir, "untracked", file.path);
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error(`debris generation: unsafe stored file ${JSON.stringify(file.path)}`);
+    if ((stat.mode & 0o777) !== file.mode || stat.size !== file.size || sha256(readFileSync(path)) !== file.sha256) {
+      throw new Error(`debris generation: stored file mismatch ${JSON.stringify(file.path)}`);
+    }
+  }
+  const actualStored = [];
+  const untrackedRoot = join(generationDir, "untracked");
+  const walk = (directory, prefix = "") => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const path = join(directory, entry.name);
+      if (entry.isSymbolicLink()) throw new Error(`debris generation: unsafe stored object ${JSON.stringify(relative)}`);
+      if (entry.isDirectory()) walk(path, relative);
+      else if (entry.isFile()) actualStored.push(relative);
+      else throw new Error(`debris generation: unsupported stored object ${JSON.stringify(relative)}`);
+    }
+  };
+  if (expectedStored.size > 0) walk(untrackedRoot);
+  if (canonicalize(actualStored.sort()) !== canonicalize([...expectedStored].sort())) throw new Error("debris generation: stored file inventory mismatch");
+  const allowedTop = new Set(["COMMITTED", "manifest.json", "receipt.json", "staged.patch", "tracked.patch", ...(expectedStored.size > 0 ? ["untracked"] : [])]);
+  const topEntries = readdirSync(generationDir).sort();
+  if (canonicalize(topEntries) !== canonicalize([...allowedTop].sort())) throw new Error("debris generation: unexpected top-level object");
+  const commit = readSafeRegularFile(join(generationDir, "COMMITTED"), "debris commit marker");
+  if (!commit.equals(Buffer.from(`${sha256(receiptRecord.bytes)}\n`, "utf8"))) throw new Error("debris generation: commit marker mismatch");
+  return { receipt, receiptBytes: receiptRecord.bytes };
+}
+
+async function collectDirtySnapshot(repoDir, repo, taskId, attempt) {
+  const [trackedNames, stagedNames, untrackedNames, trackedPatch, stagedPatch, head, tree, branch] = await Promise.all([
+    command("git", ["-C", repoDir, "diff", "--name-only", "-z", "HEAD"], { allowFailure: true, rawStdout: true }),
+    command("git", ["-C", repoDir, "diff", "--name-only", "-z", "--cached"], { allowFailure: true, rawStdout: true }),
+    command("git", ["-C", repoDir, "ls-files", "--others", "--exclude-standard", "-z"], { allowFailure: true, rawStdout: true }),
+    command("git", ["-C", repoDir, "diff", "--binary", "HEAD"], { allowFailure: true, rawStdout: true }),
+    command("git", ["-C", repoDir, "diff", "--binary", "--cached"], { allowFailure: true, rawStdout: true }),
+    command("git", ["-C", repoDir, "rev-parse", "HEAD"], { allowFailure: true }),
+    command("git", ["-C", repoDir, "rev-parse", "HEAD^{tree}"], { allowFailure: true }),
+    command("git", ["-C", repoDir, "symbolic-ref", "--quiet", "--short", "HEAD"], { allowFailure: true }),
+  ]);
+  const probes = [trackedNames, stagedNames, untrackedNames, trackedPatch, stagedPatch, head, tree];
+  if (probes.some((probe) => probe.status !== 0)) throw new Error("quarantine: source capture failed; refusing to clean");
+  const tracked = parseGitNulPaths(trackedNames.stdout, "quarantine tracked paths");
+  const staged = parseGitNulPaths(stagedNames.stdout, "quarantine staged paths");
+  const untrackedPaths = parseGitNulPaths(untrackedNames.stdout, "quarantine untracked paths");
+  if (tracked.length === 0 && staged.length === 0 && untrackedPaths.length === 0) return null;
+  const untracked = untrackedPaths.map((path) => {
+    const source = join(repoDir, path);
+    const stat = lstatSync(source);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error(`quarantine: unsupported untracked object ${JSON.stringify(path)}`);
+    const bytes = readFileSync(source);
+    return { path, bytes, mode: stat.mode & 0o777, size: stat.size, sha256: sha256(bytes), dev: String(stat.dev), ino: String(stat.ino) };
+  });
+  const source = {
+    task_id: taskId,
+    repo,
+    branch: branch.status === 0 ? branch.stdout : null,
+    base_commit: head.stdout,
+    head: head.stdout,
+    tree: tree.stdout,
+    tracked,
+    staged,
+    untracked: untracked.map(({ path, mode, size, sha256: digest, dev, ino }) => ({ path, mode, size, sha256: digest, dev, ino })),
+    tracked_patch_sha256: sha256(trackedPatch.stdout),
+    staged_patch_sha256: sha256(stagedPatch.stdout),
+  };
+  const sourceFingerprint = sha256(Buffer.from(`vinci.worker-debris-source/1\0${canonicalize(source)}`, "utf8"));
+  return {
+    attempt,
+    source,
+    sourceFingerprint,
+    generation: sha256(Buffer.from(`vinci.worker-debris-generation/1\0${taskId}\0${sourceFingerprint}`, "utf8")),
+    trackedPatch: trackedPatch.stdout,
+    stagedPatch: stagedPatch.stdout,
+    untracked,
+  };
+}
+
+function publishDebrisIndex(taskRoot, taskId, receipt, previousIndexBytes) {
+  const indexPath = join(taskRoot, "index.json");
+  let index = { schema: "vinci.worker-debris-index/1", task_id: taskId, generations: [] };
+  if (previousIndexBytes) {
+    const current = readCanonicalFile(indexPath, "debris index");
+    if (!current.bytes.equals(previousIndexBytes)) throw new Error("debris index: compare-and-swap conflict");
+    index = current.value;
+  } else if (existsSync(indexPath)) {
+    throw new Error("debris index: appeared during publication");
+  }
+  if (index.schema !== "vinci.worker-debris-index/1" || index.task_id !== taskId || !Array.isArray(index.generations)) {
+    throw new Error("debris index: invalid identity");
+  }
+  const existing = index.generations.find((entry) => entry.generation === receipt.generation);
+  const entry = { generation: receipt.generation, receipt_sha256: receipt.receipt_sha256, source_fingerprint: receipt.source_fingerprint };
+  if (existing && canonicalize(existing) !== canonicalize(entry)) throw new Error("debris index: divergent generation");
+  if (!existing) index.generations.push(entry);
+  index.generations.sort((a, b) => (a.generation < b.generation ? -1 : a.generation > b.generation ? 1 : 0));
+  const temp = join(taskRoot, `.index-${randomBytes(12).toString("hex")}.tmp`);
+  writeExclusiveDurable(temp, canonicalBytes(index));
+  if (previousIndexBytes) {
+    const currentBytes = readFileSync(indexPath);
+    if (!currentBytes.equals(previousIndexBytes)) throw new Error("debris index: compare-and-swap conflict");
+  } else if (existsSync(indexPath)) {
+    throw new Error("debris index: compare-and-swap conflict");
+  }
+  renameSync(temp, indexPath);
+  syncDirectory(taskRoot);
+
+  const currentPath = join(taskRoot, "current.json");
+  const currentTemp = join(taskRoot, `.current-${randomBytes(12).toString("hex")}.tmp`);
+  writeExclusiveDurable(currentTemp, canonicalBytes(receipt));
+  renameSync(currentTemp, currentPath);
+  syncDirectory(taskRoot);
+}
+
 // Shared-tree quarantine (used by BOTH the prose default/branch paths and the digest path).
-async function quarantineDirtyTree(stateDir, repoDir, taskId) {
+async function quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt) {
   // Shared-tree quarantine: a prior run that ended without committing (honest BLOCKED/
   // UNVERIFIED, or a kill) leaves tracked modifications and untracked files that make every
   // later checkout fail ("would be overwritten"). Preserve, never discard — a failed task's
   // working tree can be the only copy of its work — then hand this task a clean tree.
-  // -z: NUL-separated, UNQUOTED paths — the plain porcelain form quotes names with
-  // spaces/specials, and a quoted path fails the rename while clean -fd then deletes
-  // the real file: the exact loss this code exists to prevent.
-  const dirty = await command("git", ["-C", repoDir, "status", "--porcelain", "-z"], { allowFailure: true });
-  const entries = (dirty.stdout ?? "").split("\0").filter((l) => l.length > 1);
-  if (entries.length > 0) {
-    if (!/^[A-Za-z0-9._-]+$/.test(taskId)) throw new Error(`unsafe taskId for debris path: ${taskId}`);
-    const debrisDir = join(stateDir, "debris", taskId);
-    mkdirSync(debrisDir, { recursive: true });
-    writeFileSync(join(debrisDir, "status.txt"), entries.join("\n") + "\n");
-    // Archive gates: a failed capture must abort BEFORE reset/clean destroys the source.
-    // git apply also requires a trailing newline the harness's stdout handling can strip.
-    const asPatch = (t) => (t && !t.endsWith("\n") ? t + "\n" : (t ?? ""));
-    const patch = await command("git", ["-C", repoDir, "diff", "HEAD"], { allowFailure: true });
-    if (patch.status !== 0) throw new Error("quarantine: tracked-diff capture failed; refusing to clean");
-    writeFileSync(join(debrisDir, "tracked.patch"), asPatch(patch.stdout));
-    const staged = await command("git", ["-C", repoDir, "diff", "--cached"], { allowFailure: true });
-    if (staged.status !== 0) throw new Error("quarantine: staged-diff capture failed; refusing to clean");
-    writeFileSync(join(debrisDir, "staged.patch"), asPatch(staged.stdout));
-    for (const entry of entries) {
-      if (!entry.startsWith("??")) continue;
-      const rel = entry.slice(3);
-      const from = join(repoDir, rel);
-      const to = join(debrisDir, "untracked", rel);
-      mkdirSync(dirname(to), { recursive: true });
-      try { renameSync(from, to); } catch (e) {
-        if (e?.code !== "ENOENT") throw e; // any other failure must abort BEFORE clean -fd deletes the file
-      }
+  if (!/^[A-Za-z0-9._-]+$/.test(taskId)) throw new Error(`unsafe taskId for debris path: ${taskId}`);
+  if (!Number.isSafeInteger(attempt) || attempt < 1) throw new Error(`unsafe attempt for debris receipt: ${attempt}`);
+  const debrisRoot = join(stateDir, "debris");
+  mkdirSync(debrisRoot, { recursive: true, mode: 0o700 });
+  const rootAnchor = establishDebrisRootAnchor(stateDir, debrisRoot);
+  const lockPath = join(debrisRoot, ".capture.lock");
+  const lock = openSync(lockPath, "wx", 0o600);
+  let staging = null;
+  try {
+    writeFileSync(lock, canonicalBytes({ schema: "vinci.worker-debris-lock/1", pid: process.pid, task_id: taskId }));
+    fsyncSync(lock);
+    syncDirectory(debrisRoot);
+    const snapshot = await collectDirtySnapshot(repoDir, repo, taskId, attempt);
+    if (!snapshot) return null;
+
+    const taskOwnerRoot = join(debrisRoot, taskId);
+    const taskRoot = join(taskOwnerRoot, "ledger-v1");
+    const generationsRoot = join(taskRoot, "generations");
+    const taskAnchor = establishTaskStorageAnchor(rootAnchor.identitiesRoot, taskId, taskOwnerRoot, taskRoot, generationsRoot);
+    const storage = taskAnchor.storage;
+    const storagePaths = {
+      task_root: taskOwnerRoot,
+      ledger_root: taskRoot,
+      generations_root: generationsRoot,
+    };
+    const partialTaskEntries = readdirSync(taskRoot).filter((name) => name.startsWith(".index-") || name.startsWith(".current-"));
+    const partialGenerationEntries = readdirSync(generationsRoot).filter((name) => name.startsWith(".capture-"));
+    if (partialTaskEntries.length > 0 || partialGenerationEntries.length > 0) {
+      throw new Error("quarantine: partial prior publication requires reconciliation");
     }
-    await command("git", ["-C", repoDir, "reset", "--hard", "HEAD"], { allowFailure: true });
-    await command("git", ["-C", repoDir, "clean", "-fd"], { allowFailure: true });
+    syncTreeDirectories(debrisRoot, [join(taskId, "ledger-v1", "generations")]);
+    const finalDir = join(generationsRoot, snapshot.generation);
+    const indexPath = join(taskRoot, "index.json");
+    const previousIndexBytes = existsSync(indexPath) ? readFileSync(indexPath) : null;
+    let verified;
+
+    if (existsSync(finalDir)) {
+      verified = verifyDebrisGeneration(finalDir, { ...snapshot, taskId, repo, storage, storagePaths });
+    } else {
+      staging = join(generationsRoot, `.capture-${randomBytes(12).toString("hex")}.tmp`);
+      mkdirSync(staging, { mode: 0o700 });
+      writeExclusiveDurable(join(staging, "tracked.patch"), snapshot.trackedPatch);
+      writeExclusiveDurable(join(staging, "staged.patch"), snapshot.stagedPatch);
+      const relativeStored = ["tracked.patch", "staged.patch"];
+      for (const file of snapshot.untracked) {
+        const destination = join(staging, "untracked", file.path);
+        mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+        writeExclusiveDurable(destination, file.bytes, file.mode);
+        relativeStored.push(join("untracked", file.path));
+        const source = join(repoDir, file.path);
+        const stat = lstatSync(source);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || String(stat.dev) !== file.dev || String(stat.ino) !== file.ino || stat.size !== file.size || sha256(readFileSync(source)) !== file.sha256) {
+          throw new Error(`quarantine: source changed during capture ${JSON.stringify(file.path)}`);
+        }
+      }
+      const [trackedAgain, stagedAgain, headAgain, treeAgain] = await Promise.all([
+        command("git", ["-C", repoDir, "diff", "--binary", "HEAD"], { allowFailure: true, rawStdout: true }),
+        command("git", ["-C", repoDir, "diff", "--binary", "--cached"], { allowFailure: true, rawStdout: true }),
+        command("git", ["-C", repoDir, "rev-parse", "HEAD"], { allowFailure: true }),
+        command("git", ["-C", repoDir, "rev-parse", "HEAD^{tree}"], { allowFailure: true }),
+      ]);
+      if (trackedAgain.status !== 0 || stagedAgain.status !== 0 || headAgain.status !== 0 || treeAgain.status !== 0
+          || !trackedAgain.stdout.equals(snapshot.trackedPatch) || !stagedAgain.stdout.equals(snapshot.stagedPatch)
+          || headAgain.stdout !== snapshot.source.head || treeAgain.stdout !== snapshot.source.tree) {
+        throw new Error("quarantine: tracked source changed during capture");
+      }
+      const manifest = {
+        schema: "vinci.worker-debris-generation/1",
+        generation: snapshot.generation,
+        source_fingerprint: snapshot.sourceFingerprint,
+        captured_by_attempt: snapshot.attempt,
+        source: snapshot.source,
+        tracked_patch: { path: "tracked.patch", sha256: sha256(snapshot.trackedPatch), size: snapshot.trackedPatch.length },
+        staged_patch: { path: "staged.patch", sha256: sha256(snapshot.stagedPatch), size: snapshot.stagedPatch.length },
+        untracked: snapshot.untracked.map(({ path, mode, size, sha256: digest }) => ({ path, mode, size, sha256: digest })),
+      };
+      const manifestBytes = canonicalBytes(manifest);
+      writeExclusiveDurable(join(staging, "manifest.json"), manifestBytes);
+      const receipt = {
+        schema: "vinci.worker-debris-receipt/1",
+        generation: snapshot.generation,
+        source_fingerprint: snapshot.sourceFingerprint,
+        manifest_sha256: sha256(manifestBytes),
+        task_id: taskId,
+        captured_by_attempt: snapshot.attempt,
+        repo,
+        branch: snapshot.source.branch,
+        base_commit: snapshot.source.base_commit,
+        head: snapshot.source.head,
+        tree: snapshot.source.tree,
+        storage,
+      };
+      const receiptBytes = canonicalBytes(receipt);
+      writeExclusiveDurable(join(staging, "receipt.json"), receiptBytes);
+      writeExclusiveDurable(join(staging, "COMMITTED"), `${sha256(receiptBytes)}\n`);
+      syncTreeDirectories(staging, [...relativeStored, "manifest.json", "receipt.json", "COMMITTED"]);
+      if (existsSync(finalDir)) throw new Error("quarantine: generation appeared during no-replace publication");
+      renameSync(staging, finalDir);
+      staging = null;
+      syncDirectory(generationsRoot);
+      verified = verifyDebrisGeneration(finalDir, { ...snapshot, taskId, repo, storage, storagePaths });
+    }
+
+    const receipt = { ...verified.receipt, receipt_sha256: sha256(verified.receiptBytes) };
+    publishDebrisIndex(taskRoot, taskId, receipt, previousIndexBytes);
+    requireUnchangedAnchor(rootAnchor.anchorPath, rootAnchor.anchorBytes, "debris root identity");
+    requireUnchangedAnchor(taskAnchor.anchorPath, taskAnchor.anchorBytes, "debris task identity");
+    for (const [label, identity] of Object.entries(storage)) requireSameDirectory(storagePaths[label], identity, `debris storage ${label}`);
+    const reset = await command("git", ["-C", repoDir, "reset", "--hard", "HEAD"], { allowFailure: true });
+    if (reset.status !== 0) throw new Error(`quarantine: reset failed after durable capture: ${reset.stderr || reset.status}`);
+    const clean = await command("git", ["-C", repoDir, "clean", "-fd"], { allowFailure: true });
+    if (clean.status !== 0) throw new Error(`quarantine: clean failed after durable capture: ${clean.stderr || clean.status}`);
+    return receipt;
+  } finally {
+    closeSync(lock);
+    if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+    unlinkSync(lockPath);
+    syncDirectory(debrisRoot);
   }
 }
 
-export async function prepareRepository(stateDir, repo, taskId, branchOverride, baseCommit, baseRef) {
+export async function prepareRepository(stateDir, repo, taskId, branchOverride, baseCommit, baseRef, attempt = 1) {
   if (!REPO.test(repo)) throw new Error("repo must be in org/name form");
   const repoDir = join(stateDir, "repos", repo.split("/")[1]);
   const branch = branchOverride ?? `worker/${taskId}`;
@@ -212,8 +645,9 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
     const legalBase = await command("git", ["check-ref-format", "--branch", baseRef], { allowFailure: true });
     if (legalBase.status !== 0) throw blocked("base_ref_unavailable", `base_ref_unavailable: base_ref ${baseRef} is not a valid git branch name`);
 
+    let debrisReceipt = null;
     if (cached) {
-      await quarantineDirtyTree(stateDir, repoDir, taskId);
+      debrisReceipt = await quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt);
     } else {
       mkdirSync(dirname(repoDir), { recursive: true });
       await command("git", ["clone", cloneUrl, repoDir]);
@@ -247,7 +681,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
       }
     }
     await command("git", ["-C", repoDir, "checkout", "-B", branch, baseCommit]);
-    return { branch, repoDir, aside };
+    return { branch, repoDir, aside, debrisReceipt };
   }
 
 
@@ -289,11 +723,12 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
     }
   }
 
+  let debrisReceipt = null;
   if (cached) {
     // The default path works off origin/main and needs it fresh. The branch path fetches its
     // branch explicitly below (after the not-found gate) and never runs a general fetch first.
     if (!branchOverride) await command("git", ["-C", repoDir, "fetch", "origin"]);
-    await quarantineDirtyTree(stateDir, repoDir, taskId);
+    debrisReceipt = await quarantineDirtyTree(stateDir, repoDir, repo, taskId, attempt);
   } else {
     mkdirSync(dirname(repoDir), { recursive: true });
     await command("git", ["clone", cloneUrl, repoDir]);
@@ -343,7 +778,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
       // Case (b): local is an ancestor (or equal) ⇒ -B is a fast-forward to the remote tip.
     }
     await command("git", ["-C", repoDir, "checkout", "-B", branch, remoteTip]);
-    return { branch, repoDir };
+    return { branch, repoDir, debrisReceipt };
   }
   const localBranch = await command(
     "git",
@@ -352,7 +787,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride, 
   );
   if (localBranch.status === 0) await command("git", ["-C", repoDir, "checkout", branch]);
   else await command("git", ["-C", repoDir, "checkout", "-b", branch, "origin/main"]);
-  return { branch, repoDir };
+  return { branch, repoDir, debrisReceipt };
 }
 
 export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId }) {
@@ -476,12 +911,26 @@ export async function publish({ envelope, repoDir, branch, taskId, limitTripped,
   }
   if (mode === "artifact") {
     const base = baseCommit ?? "origin/main";
-    const changed = await command("git", ["-C", repoDir, "diff", "--name-only", base], { allowFailure: true });
-    const untracked = await command("git", ["-C", repoDir, "ls-files", "--others", "--exclude-standard"], { allowFailure: true });
+    const changed = await command("git", ["-C", repoDir, "diff", "--name-only", "-z", base], { allowFailure: true, rawStdout: true });
+    const untracked = await command("git", ["-C", repoDir, "ls-files", "--others", "--exclude-standard", "-z"], { allowFailure: true, rawStdout: true });
     if (changed.status !== 0 || untracked.status !== 0) {
       return withBlocker({ publish: "artifact_failed", pr: null, artifacts: null, publish_error: changed.stderr || untracked.stderr || "file listing failed" });
     }
-    const files = [...new Set([...changed.stdout.split("\n"), ...untracked.stdout.split("\n")].filter(Boolean))].sort();
+    let files;
+    try {
+      const combined = [
+        ...parseGitNulPaths(changed.stdout, "artifact tracked paths"),
+        ...parseGitNulPaths(untracked.stdout, "artifact untracked paths"),
+      ];
+      const unique = new Set();
+      for (const path of combined) {
+        if (unique.has(path)) throw new Error(`duplicate path ${JSON.stringify(path)}`);
+        unique.add(path);
+      }
+      files = [...unique].sort();
+    } catch (error) {
+      return withBlocker({ publish: "artifact_failed", pr: null, artifacts: null, publish_error: error.message });
+    }
     return withBlocker({ publish: "artifact", pr: null, artifacts: files });
   }
   if (mode !== "branch") throw new Error(`unknown output mode ${JSON.stringify(mode)}`);
