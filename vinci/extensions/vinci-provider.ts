@@ -47,7 +47,10 @@ export function vinciAffordableTokenLimit(errorBodyOrMessage: string | undefined
   if (!numericTexts) return undefined;
   if (!numericTexts.every((value) => /^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(value))) return undefined;
   const tokenCounts = numericTexts.map((value) => Number(value.replaceAll(",", "")));
-  return tokenCounts.every(Number.isSafeInteger) ? tokenCounts.at(-1) : undefined;
+  const affordableTokens = tokenCounts.at(-1);
+  return tokenCounts.every(Number.isSafeInteger) && affordableTokens !== undefined && affordableTokens > 0
+    ? affordableTokens
+    : undefined;
 }
 
 function parsedErrorBody(errorBodyOrMessage: string): Record<string, unknown> | undefined {
