@@ -32,6 +32,7 @@ async function runNoCommitScenario({ id, evidence, exitCode, skipOutcome }) {
         env: fixture.getEnv({
           FAKE_GH_OUTPUT: "",
           FAKE_VINCI_EXIT: String(exitCode),
+          FAKE_VINCI_NO_COMMIT: "1",
           ...(skipOutcome ? { FAKE_VINCI_SKIP_OUTCOME: "1" } : {}),
         }),
         stdio: "pipe",
