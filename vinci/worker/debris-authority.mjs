@@ -43,7 +43,11 @@ function decodeBase64Url(value, length, label) {
 
 function socketIdentity(fd) {
   const stat = fstatSync(fd);
-  if (!stat.isSocket() || stat.nlink !== 0) throw new Error("debris authority channel: expected a supervisor-preopened unnamed socket");
+  // Socketpair link counts are kernel-specific (Darwin reports zero while Linux
+  // commonly reports one).  The signed deployment admission proves that this is
+  // the supervisor-preopened, unnamed endpoint; locally we prove and pin only
+  // the descriptor's observable socket identity.
+  if (!stat.isSocket()) throw new Error("debris authority channel: expected a supervisor-preopened socket descriptor");
   return { dev: String(stat.dev), ino: String(stat.ino), uid: stat.uid, gid: stat.gid, mode: stat.mode & 0o777, nlink: stat.nlink };
 }
 

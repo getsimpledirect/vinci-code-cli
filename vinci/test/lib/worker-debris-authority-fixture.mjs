@@ -27,7 +27,7 @@ export function provisionWorkerDebrisAuthority(stateDir, lineageId) {
   const adapterSource = `#!/usr/bin/env node
 import { fstatSync, readFileSync, readSync, writeSync } from "node:fs";
 const stat = fstatSync(3);
-if (!stat.isSocket() || stat.nlink !== 0) process.exit(77);
+if (!stat.isSocket()) process.exit(77);
 const input = readFileSync(0);
 let written = 0;
 while (written < input.length) {

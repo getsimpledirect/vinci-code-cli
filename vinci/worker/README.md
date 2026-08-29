@@ -162,14 +162,17 @@ Every task lineage and complete generation/attempt/current inventory is also ser
 deployment-owned compare-and-set service. `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER` names the
 reviewed bridge artifact whose identity the service admission binds; the worker pins its exact
 bytes with `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256` but does not execute it. Deployment supplies
-an already-open, supervisor-provided unnamed socket descriptor. The worker communicates directly
+an already-open socket descriptor. The worker proves that the descriptor is a socket and pins its
+exact observed metadata, including the platform-specific link count. The signed service admission,
+not a kernel-specific `st_nlink` value, proves that it is the supervisor-preopened unnamed endpoint
+with the required peer, inheritance, and exfiltration controls. The worker communicates directly
 over that process-private descriptor; it never opens an authority pathname and never exports the
 descriptor to a repository command or task child. There is no reusable bearer in environment,
 argv, or a reopenable capability file. Every service response is a canonical Ed25519-signed envelope that
 binds a fresh worker nonce, exact request digest, socket identity, adapter and service implementation
 digests, root/lineage, authority epoch, service principal, peer-credential enforcement, isolated
 service storage, non-inheritance by task children, and the deployment's parent-FD-exfiltration
-proof. Missing, linked, non-socket, unsigned, replayed, relabelled, or incompletely admitted channels
+proof. Missing, non-socket, unsigned, replayed, relabelled, or incompletely admitted channels
 refuse. Service responses are bounded canonical bytes, and each head binds the root anchor,
 lineage, storage identities, monotonic
 sequence/predecessor, index, generations, attempts, and current receipt. The authority service
