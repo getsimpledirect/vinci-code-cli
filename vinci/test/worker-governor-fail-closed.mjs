@@ -284,7 +284,11 @@ await test('T3 lease ttl caps max_runtime_s and is recorded in the snapshot', as
     assert.equal(snapshot.state, 'COMPLETED', `expected COMPLETED, got ${snapshot.state} (${JSON.stringify(snapshot.outcome)})`);
     assert.equal(snapshot.lease.ttl, 60);
     assert.equal(snapshot.lease.effective_max_runtime_s, 60, 'effective limit must be min(14400, ttl 60)');
-    assert.deepEqual(claimBody, { paths: ['.'] });
+    // BLOCK-A: the claim carries the SAME attempt_id the lease acquire sent — the Governor's
+    // holder gate compares the two and refuses a claim (an attempt_id-less one included) that is
+    // not the holder's.
+    assert.deepEqual(claimBody, { paths: ['.'], attempt_id: '16/1' });
+    assert.equal(claimBody.attempt_id, governor.leases.acquires[0].attempt_id, 'claim attempt_id must be byte-identical to the acquire attempt_id');
     assert.equal(fixture.getVinciCalls().length, 1, 'a granted lease runs the task exactly once');
   } finally {
     await governor.close();

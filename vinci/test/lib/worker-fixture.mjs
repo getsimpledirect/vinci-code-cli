@@ -43,6 +43,13 @@ function readBody(request) {
 //   check           true | false | (body, effectIndex) => ({ valid, reason })
 //   releaseStatus   HTTP status for release (200)
 //   claim           body served (200) on /v1/governor/claim-paths, or { status, body }
+//   claimHolderGate the Governor's holder gate (governor_runtime.py:335-338), ON by default: once
+//                   a lease is live, a claim is refused 403 {reason:"leased_by_other_attempt"}
+//                   unless its `attempt_id` equals the CURRENT holder's — and an absent attempt_id
+//                   fails that comparison too, exactly as the server's `!=` does. Set false only
+//                   to model a Governor with no leases in play.
+//   acquireStatus   HTTP status for a GRANTED acquire (200). Set 201 to model the pre-fix server;
+//                   the client must accept either.
 //   epoch           value stamped on every response
 // `hits` records every request `{ method, url, auth, body }`; `renews`, `checks`, `releases`
 // and `acquires` are the parsed bodies per route in arrival order. `events` is the COMPLETION
@@ -60,6 +67,11 @@ export class FakeGovernor {
     this.releaseStatus = options.releaseStatus ?? 200;
     this.renewDelayMs = options.renewDelayMs ?? 0;
     this.claim = options.claim ?? { paths: ["."], ttl: 3600 };
+    this.claimHolderGate = options.claimHolderGate ?? true;
+    this.acquireStatus = options.acquireStatus ?? 200;
+    // The attempt_id of the live lease, i.e. what the holder gate compares a claim against.
+    this.holderAttemptId = null;
+    this.claims = [];
     this.epoch = options.epoch ?? 1;
     this.leaseToken = options.leaseToken ?? "Session gov-token";
     this.hits = [];
@@ -90,7 +102,14 @@ export class FakeGovernor {
     const body = await readBody(request);
     this.hits.push({ method: request.method, url: request.url, auth: request.headers.authorization, body, at: Date.now() });
     if (url.pathname === "/v1/governor/claim-paths") {
+      this.claims.push({ ...body, idempotency_key: request.headers["idempotency-key"] ?? null });
       this.events.push("claim");
+      // The server's holder gate: `if lease and claim.attempt_id != lease.attempt_id: 403`. An
+      // absent attempt_id is NOT special-cased there, so `undefined != "t/1"` refuses too.
+      if (this.claimHolderGate && this.holderAttemptId !== null && body?.attempt_id !== this.holderAttemptId) {
+        this.json(response, 403, { reason: "leased_by_other_attempt", holder_attempt_id: this.holderAttemptId });
+        return true;
+      }
       if (this.claim.status) this.json(response, this.claim.status, this.claim.body ?? {});
       else this.json(response, 200, this.claim);
       return true;
@@ -111,9 +130,10 @@ export class FakeGovernor {
         this.json(response, 500, { reason: "governor exploded" });
         return true;
       }
-      const lease = { lease_id: `lease-${this.leases.size + 1}`, fencing_generation: this.nextGeneration++, ttl_s: this.ttlS, expires_at: this.expiresAt(), renews: 0, released: null };
+      const lease = { lease_id: `lease-${this.leases.size + 1}`, fencing_generation: this.nextGeneration++, ttl_s: this.ttlS, expires_at: this.expiresAt(), renews: 0, released: null, attempt_id: body?.attempt_id ?? null };
       this.leases.set(lease.lease_id, lease);
-      this.json(response, 200, { lease_id: lease.lease_id, fencing_generation: lease.fencing_generation, expires_at: lease.expires_at, ttl_s: lease.ttl_s });
+      this.holderAttemptId = lease.attempt_id;
+      this.json(response, this.acquireStatus, { lease_id: lease.lease_id, fencing_generation: lease.fencing_generation, expires_at: lease.expires_at, ttl_s: lease.ttl_s });
       return true;
     }
     const match = /^\/v1\/governor\/leases\/([^/]+)\/(renew|release|check)$/.exec(url.pathname);
@@ -168,6 +188,8 @@ export class FakeGovernor {
     this.releases.push({ lease_id: leaseId, ...body });
     this.events.push("release");
     if (lease) lease.released = body?.outcome ?? null;
+    // A released lease is no longer the holder: later claims are gated only by a live lease.
+    if (lease && this.holderAttemptId === lease.attempt_id) this.holderAttemptId = null;
     this.json(response, this.releaseStatus, {});
     return true;
   }

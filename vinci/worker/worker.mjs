@@ -45,11 +45,58 @@ let vinciBinary = { error: "not checked" };
 //     next task (or at the next start) instead of being lost.
 const ANNOUNCED_BINARY_FILE = "vinci-binary.json";
 
-// Wave 1B D1: the capability declaration this daemon posts once at startup (behind `--governor`)
-// and whose digest every governed lease request and task record carries. Computed once; null
-// until `--governor` is configured.
+// Wave 1B D1: the capability declaration this daemon posts at startup (behind `--governor`) and
+// whose digest every governed lease request and task record carries. Null until `--governor` is
+// configured.
 let capabilityDeclaration = null;
 let capabilityDeclarationDigest = null;
+
+// D1 (#199 review): the Governor EXPIRES a declaration at VGC_DECLARATION_MAX_AGE_S (default
+// 86400 s) and then answers admission with `eligible: false, reason: stale_declaration`. A daemon
+// that declared only at startup therefore goes silently inadmissible for ALL work after a day
+// alive, with no warning and no recovery short of a restart. So the declaration is re-posted on an
+// interval comfortably below that max age: default 3600 s, overridable with
+// VINCI_DECLARATION_REFRESH_S (a positive number of seconds; anything else falls back to the
+// default). The timer is unref'd, so it never keeps an otherwise-idle process alive — `--once`
+// still exits.
+const DECLARATION_REFRESH_DEFAULT_S = 3600;
+
+// Consecutive failed re-posts, reset by the next success. Surfaced on stderr; a failure never
+// changes the daemon's control flow.
+let declarationPostFailures = 0;
+
+function declarationRefreshSeconds(env = process.env) {
+  const configured = Number(env.VINCI_DECLARATION_REFRESH_S);
+  return Number.isFinite(configured) && configured > 0 ? configured : DECLARATION_REFRESH_DEFAULT_S;
+}
+
+// The ONE code path that builds, digests and posts the declaration — used by the startup post and
+// by every refresh, so an unchanged daemon re-posts a byte-identical body under an identical
+// digest. Returns true on a posted declaration. `throwOnFailure` is set only for the startup post,
+// where a bus that refuses the very first declaration is a start-up failure; a refused REFRESH is
+// logged and swallowed, because losing one re-post must never kill a daemon that is working.
+async function postCapabilityDeclaration(bus, options, { throwOnFailure = false } = {}) {
+  capabilityDeclaration = buildDeclaration({
+    workerId: options.id,
+    workerVersion: vinciBinary?.version ?? version,
+    adapterVersion: version,
+    // Config-derived: evidence bundles exist only when an upload prefix is configured.
+    structuredEvidence: Boolean(process.env.VINCI_EVIDENCE_URI_PREFIX),
+  });
+  capabilityDeclarationDigest = declarationDigest(capabilityDeclaration);
+  try {
+    await bus.post("status", `worker ${options.id} declaration`, declarationBody(capabilityDeclaration));
+    declarationPostFailures = 0;
+    return true;
+  } catch (error) {
+    if (throwOnFailure) throw error;
+    declarationPostFailures += 1;
+    process.stderr.write(
+      `vinci worker: declaration re-post failed (${declarationPostFailures} in a row): ${error.message}; the Governor expires a declaration at VGC_DECLARATION_MAX_AGE_S and will report stale_declaration until one lands\n`,
+    );
+    return false;
+  }
+}
 
 // Wave 1B F7: every lease this daemon currently holds, so a SIGTERM/SIGINT can release each one
 // (`abandoned`) before the process exits. Entries are added right after acquire and removed by
@@ -475,9 +522,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, sub
       // lease is `lease_unavailable` (fail closed). A refused path claim after a granted lease
       // releases the lease (`blocked`) before the task is BLOCKED.
       leaseClient = new LeaseClient({ governorUrl, token: governorToken, busToken: bus.token });
+      // ONE attempt identity for this attempt, computed once and reused by BOTH governed calls.
+      // The Governor's holder gate compares the claim's attempt_id against the lease holder's, so
+      // the two strings must be byte-identical; deriving it twice is how they drift apart.
+      const attemptId = `${taskId}/${attempt.attempt}`;
       const acquired = await leaseClient.acquire({
         workOrderId: subjectOf({ id: taskId, envelope: envelopeToUse }),
-        attemptId: `${taskId}/${attempt.attempt}`,
+        attemptId,
         workerBuildDigest: workerBuild.commit ?? formatWorkerBuild(workerBuild),
         adapterVersion: version,
         capabilityDeclarationDigest,
@@ -513,12 +564,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, sub
       // clone/spawn ONLY on a granted claim. A missing token, an unreachable Governor, a network
       // error, a non-JSON body, an unexpected status, or a missing decision all BLOCK the task
       // here, before prepareRepository and runVinci.
+      // Same `attemptId` string the acquire above sent: this claim is made UNDER that lease, and
+      // the Governor refuses a claim whose attempt_id is not the holder's (an absent one included).
       const claimResult = await claimGovernorPaths({
         governorUrl,
         token: governorToken,
         paths: [envelope.claim],
-        taskId,
-        attempt: attempt.attempt,
+        attemptId,
       });
 
       if (!claimResult?.success) {
@@ -676,6 +728,8 @@ async function main() {
   // RUNNING and is resumed as the next attempt by the next daemon start. Without an active
   // lease this is the plain exit it always was.
   let stopping = false;
+  // D1 refresh timer (governed daemons only); cleared on exit.
+  let declarationTimer = null;
   const handleSignal = (signal) => {
     if (stopping) return;
     stopping = true;
@@ -708,15 +762,14 @@ async function main() {
     // `online`. The body is the canonical JSON of the WorkerDeclaration; its sha256 is the
     // capability_declaration_digest every governed lease request and task record carries.
     if (options.governor) {
-      capabilityDeclaration = buildDeclaration({
-        workerId: options.id,
-        workerVersion: vinciBinary?.version ?? version,
-        adapterVersion: version,
-        // Config-derived: evidence bundles exist only when an upload prefix is configured.
-        structuredEvidence: Boolean(process.env.VINCI_EVIDENCE_URI_PREFIX),
-      });
-      capabilityDeclarationDigest = declarationDigest(capabilityDeclaration);
-      await bus.post("status", `worker ${options.id} declaration`, declarationBody(capabilityDeclaration));
+      await postCapabilityDeclaration(bus, options, { throwOnFailure: true });
+      // …and again every VINCI_DECLARATION_REFRESH_S, on the SAME code path, so the Governor never
+      // ages this daemon out into `stale_declaration`. Unref'd: it cannot keep the process alive
+      // (`--once` still exits) and it is cleared in the finally below.
+      declarationTimer = setInterval(() => {
+        void postCapabilityDeclaration(bus, options);
+      }, declarationRefreshSeconds() * 1000);
+      if (typeof declarationTimer?.unref === "function") declarationTimer.unref();
     }
     do {
       let cursor = loadCursor(options.stateDir, options.id);
@@ -729,6 +782,7 @@ async function main() {
       if (!options.once) await new Promise((resolveWait) => setTimeout(resolveWait, options.pollSeconds * 1000));
     } while (!options.once);
   } finally {
+    if (declarationTimer) clearInterval(declarationTimer);
     process.off("SIGTERM", handleSignal);
     process.off("SIGINT", handleSignal);
     releaseLock();

@@ -743,5 +743,328 @@ await test('--governor unset => no declaration, no digest, no lease fields, no f
   }
 });
 
+// ---------------------------------------------------------------------------------------------
+// BLOCK-A (#201/#199 review): the Governor's holder gate (governor_runtime.py:335-338) refuses a
+// claim on a leased order unless the claim's attempt_id equals the holder's — an ABSENT one
+// included. W1B acquires the lease BEFORE the claim, so every governed order is leased at claim
+// time: without attempt_id on the claim body, EVERY governed task is refused
+// 403 leased_by_other_attempt and blocked by a lease this very worker holds. This FakeGovernor
+// enforces the gate the way the server does (claimHolderGate, on by default).
+await test('BLOCK-A: the claim carries the acquire attempt_id, so the holder gate admits it', async () => {
+  const fixture = new WorkerTestFixture('lease-holder-gate');
+  const governor = new FakeGovernor();
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('130', 'w6', 'repo: test/repo\nevidence: pr\nref: job_gate\n\nTask')]);
+    const { code, stderr } = await runWorker(fixture, 'w6', ['--governor', governor.url]);
+    assert.equal(code, 0, stderr);
+    assert.equal(governor.claimHolderGate, true, 'the fake must enforce the gate, or this proves nothing');
+    const snapshot = state(fixture, '130');
+    assert.equal(snapshot.state, 'COMPLETED', `expected COMPLETED, got ${snapshot.state} (${JSON.stringify(snapshot.outcome)})`);
+    assert.equal(governor.acquires.length, 1);
+    assert.equal(governor.claims.length, 1);
+    // Byte-identical, and identical to the gate's holder: not merely "present" or "similar".
+    assert.equal(governor.acquires[0].attempt_id, '130/1');
+    assert.equal(governor.claims[0].attempt_id, governor.acquires[0].attempt_id, 'the claim attempt_id must be the acquire attempt_id, byte for byte');
+    assert.equal(governor.claims[0].idempotency_key, governor.acquires[0].attempt_id, 'the claim is idempotency-keyed on the same attempt');
+    // And the refusal the missing field would have produced never happened.
+    assert.equal(snapshot.outcome?.governor, undefined);
+    assert.equal(fixture.getPostedMessages().some((p) => p.kind === 'blocker'), false, 'no blocker: the holder gate admitted the claim');
+    assert.equal(fixture.getVinciCalls().length, 1, 'the governed task actually ran');
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+// The gate is real: a claim whose attempt_id is NOT the holder's is refused 403 and the task is
+// BLOCKED with the Governor's reason verbatim, the lease released `blocked`. This is the exact
+// state an attempt_id-less claim would land every governed task in.
+await test('BLOCK-A control: a non-holder attempt_id is refused leased_by_other_attempt and blocks', async () => {
+  const fixture = new WorkerTestFixture('lease-holder-gate-neg');
+  const governor = new FakeGovernor();
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('131', 'w7', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    // Force the gate to disagree with whatever the worker sends, exactly as an absent field does.
+    const originalHandle = governor.handle.bind(governor);
+    governor.handle = async (request, response) => {
+      if (request.url === '/v1/governor/claim-paths') governor.holderAttemptId = 'someone-else/1';
+      return originalHandle(request, response);
+    };
+    const { code } = await runWorker(fixture, 'w7', ['--governor', governor.url]);
+    assert.equal(code, 0);
+    const snapshot = state(fixture, '131');
+    assert.equal(snapshot.state, 'BLOCKED');
+    assert.equal(snapshot.outcome.reason, 'leased_by_other_attempt');
+    assert.equal(snapshot.outcome.governor, 'refused');
+    assert.deepEqual(governor.releases.map((r) => r.outcome), ['blocked'], 'the lease this worker held is released');
+    assert.equal(fixture.getVinciCalls().length, 0, 'a refused claim never spawns');
+    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    assert(blocker && blocker.body.includes('Governor refused the lease: leased_by_other_attempt'), `blocker: ${blocker?.body}`);
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// 2xx acceptance (#201 review): the server's status fix moves a granted acquire from 201 to 200.
+// The two repos deploy independently, so the client must take EITHER (and any other 2xx) as a
+// lease, provided the body is well formed. A client pinned to 200 would refuse a lease it was
+// granted and leave the Governor holding one nobody renews or releases.
+await test('acquire accepts any 2xx with a well-formed body; 200 and 201 both grant', async () => {
+  for (const status of [200, 201, 202]) {
+    const client = new LeaseClient({
+      governorUrl: 'http://governor.invalid',
+      token: 't',
+      fetch: async () => new Response(JSON.stringify({ lease_id: 'l1', fencing_generation: 7, expires_at: '2099-01-01T00:00:00Z', ttl_s: 60 }), { status, headers: { 'content-type': 'application/json' } }),
+    });
+    const result = await client.acquire({ workOrderId: 'job_x', attemptId: 'x/1', workerBuildDigest: 'abc', adapterVersion: '0' });
+    assert.equal(result.success, true, `status ${status} must grant the lease`);
+    assert.equal(result.lease.lease_id, 'l1');
+    assert.equal(result.lease.fencing_generation, 7);
+    assert.equal(result.lease.ttl_s, 60);
+  }
+  // A 2xx is never enough on its own: the body still has to bound the run.
+  for (const status of [200, 201]) {
+    const client = new LeaseClient({
+      governorUrl: 'http://governor.invalid',
+      token: 't',
+      fetch: async () => new Response(JSON.stringify({ lease_id: 'l1', fencing_generation: 7, ttl_s: 0 }), { status, headers: { 'content-type': 'application/json' } }),
+    });
+    const result = await client.acquire({ workOrderId: 'job_x', attemptId: 'x/1' });
+    assert.equal(result.unavailable, true, `status ${status} with an unusable ttl_s is not a lease`);
+    assert.match(result.reason, /^Governor lease invalid: ttl_s=0$/);
+  }
+  // 3xx/4xx/5xx are still not leases.
+  for (const status of [199, 302, 400, 500]) {
+    const client = new LeaseClient({
+      governorUrl: 'http://governor.invalid',
+      token: 't',
+      fetch: async () => new Response(JSON.stringify({ lease_id: 'l1', fencing_generation: 7, ttl_s: 60 }), { status, headers: { 'content-type': 'application/json' } }),
+    });
+    const result = await client.acquire({ workOrderId: 'job_x', attemptId: 'x/1' });
+    assert.equal(result.success, false, `status ${status} must not grant a lease`);
+    assert.equal(result.blocked, true);
+  }
+  // renew, release and check are on the same rollout and take any 2xx too.
+  const lease = { lease_id: 'l1', fencing_generation: 7, ttl_s: 60 };
+  for (const status of [200, 201]) {
+    const client = new LeaseClient({ governorUrl: 'http://governor.invalid', token: 't', busToken: 'b', log: () => {}, fetch: async (url) => {
+      if (/\/check$/.test(url)) return new Response(JSON.stringify({ valid: true }), { status, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ expires_at: '2099-01-01T00:00:00Z', ttl_s: 60 }), { status, headers: { 'content-type': 'application/json' } });
+    } });
+    assert.equal((await client.renew(lease)).ok, true, `renew must accept ${status}`);
+    assert.equal((await client.release(lease, 'completed')).ok, true, `release must accept ${status}`);
+    assert.equal((await client.check(lease)).valid, true, `check must accept ${status}`);
+  }
+});
+
+// A granted acquire served as 201 by a pre-fix Governor still runs the whole governed task.
+await test('2xx acceptance end to end: a 201 acquire runs, renews, fences and releases', async () => {
+  const fixture = new WorkerTestFixture('lease-201');
+  const governor = new FakeGovernor({ acquireStatus: 201 });
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('132', 'w8', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    const { code, stderr } = await runWorker(fixture, 'w8', ['--governor', governor.url]);
+    assert.equal(code, 0, stderr);
+    assert.equal(governor.acquireStatus, 201, 'the fake must serve 201, or this proves nothing');
+    const snapshot = state(fixture, '132');
+    assert.equal(snapshot.state, 'COMPLETED', `expected COMPLETED, got ${snapshot.state} (${JSON.stringify(snapshot.outcome)})`);
+    assert.equal(snapshot.lease.lease_id, 'lease-1');
+    assert.deepEqual(governor.releases.map((r) => r.outcome), ['completed']);
+    assert.equal(fixture.getVinciCalls().length, 1);
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// WARN-3 (#201): lease-state answers are DECISIONS — final loss of authority, never retried —
+// and the server is moving them from 403 to 409. The client must be right under BOTH, and must
+// still fail CLOSED on anything it cannot classify. Nothing here assumes the server change landed.
+await test('WARN-3: a lease-state reason is a final decision on 403 and on 409; anything else fails closed', async () => {
+  const lease = { lease_id: 'l1', fencing_generation: 7, ttl_s: 60 };
+  const renewWith = async (status, body) => {
+    let calls = 0;
+    const client = new LeaseClient({ governorUrl: 'http://governor.invalid', token: 't', log: () => {}, fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+    } });
+    return { result: await client.renew(lease), calls: () => calls };
+  };
+  // New server: 409 + lease-state reason.
+  for (const reason of ['stale_generation', 'expired', 'revoked']) {
+    const { result, calls } = await renewWith(409, { reason });
+    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason }, `409 ${reason}`);
+    assert.equal(calls(), 1, `a decision is never retried (409 ${reason})`);
+  }
+  // Old server: the SAME reasons on a 403. Still a decision, still no retry, reason preserved —
+  // never mislabelled "unreachable", which would file a Governor decision as a Governor failure.
+  for (const reason of ['stale_generation', 'expired', 'revoked', 'not_holder', 'leased_by_other_attempt']) {
+    const { result, calls } = await renewWith(403, { reason });
+    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason }, `403 ${reason}`);
+    assert.equal(calls(), 1, `a decision is never retried (403 ${reason})`);
+  }
+  // Anything else non-2xx is transport/unknown: retried once, then LOSS OF AUTHORITY (fail closed).
+  for (const [status, body] of [[500, { reason: 'boom' }], [502, {}], [403, { reason: 'something_new' }], [404, { reason: 'stale_generation' }]]) {
+    const { result, calls } = await renewWith(status, body);
+    assert.deepEqual({ ok: result.ok, lost: result.lost, reason: result.reason }, { ok: false, lost: true, reason: 'unreachable' }, `status ${status} ${JSON.stringify(body)}`);
+    assert.equal(calls(), 2, `an unknown failure is retried exactly once (status ${status})`);
+  }
+  // Acquire: "held by another attempt" is a decision on either status, and BLOCKS rather than
+  // being retried or mistaken for a transport failure.
+  for (const [status, body] of [[409, { reason: 'leased', holder_attempt_id: 'other/7', expires_at: '2099-01-01T00:00:00Z' }], [403, { reason: 'leased_by_other_attempt', holder_attempt_id: 'other/7', expires_at: '2099-01-01T00:00:00Z' }]]) {
+    let calls = 0;
+    const client = new LeaseClient({ governorUrl: 'http://governor.invalid', token: 't', fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+    } });
+    const result = await client.acquire({ workOrderId: 'job_x', attemptId: 'x/1' });
+    assert.equal(result.leased, true, `acquire ${status} ${body.reason} is a "not ours" decision`);
+    assert.equal(result.blocked, true);
+    assert.equal(result.holder_attempt_id, 'other/7');
+    assert.equal(calls, 1, 'an acquire decision is never retried');
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// BLOCK-B (#199 review): the Governor expires a capability declaration at VGC_DECLARATION_MAX_AGE_S
+// (default 86400 s) and then answers admission `eligible: false, reason: stale_declaration`. A
+// declaration posted only at startup therefore makes any daemon alive more than a day silently
+// inadmissible for ALL work, with no warning and no recovery. The declaration is re-posted on an
+// interval (VINCI_DECLARATION_REFRESH_S, default 3600 s) on the SAME code path as the startup post.
+function declarationPosts(fixture, workerId) {
+  return fixture.getPostedMessages().filter((post) => post.subject === `worker ${workerId} declaration`);
+}
+
+// A daemon (no --once) so the interval can actually fire.
+function spawnDaemon(fixture, workerId, extraArgs, envOverrides = {}) {
+  const env = fixture.getEnv({ VINCI_GOVERNOR_TOKEN: 'gov-token', ...envOverrides });
+  const proc = spawn('node', [WORKER, 'start', '--id', workerId, '--server', fixture.busUrl(), '--state-dir', fixture.tempDir, ...extraArgs], { env, stdio: 'pipe' });
+  let stderr = '';
+  proc.stderr.on('data', (chunk) => { stderr += chunk; });
+  const closed = new Promise((r) => proc.on('close', (code) => r({ code, stderr })));
+  return { proc, closed, stderr: () => stderr };
+}
+
+await test('BLOCK-B: the declaration is re-posted on the refresh interval, byte-identical', async () => {
+  const fixture = new WorkerTestFixture('declaration-refresh');
+  const governor = new FakeGovernor();
+  await governor.start();
+  let worker = null;
+  try {
+    await fixture.startBus([]);
+    worker = spawnDaemon(fixture, 'w1', ['--governor', governor.url, '--poll-seconds', '0.2'], { VINCI_DECLARATION_REFRESH_S: '0.4' });
+    await waitFor(() => declarationPosts(fixture, 'w1').length >= 3, { label: 'three declaration posts (startup + two refreshes)' });
+    const posts = declarationPosts(fixture, 'w1');
+    // Same code path ⇒ identical canonical body ⇒ identical digest, so a re-post refreshes the
+    // Governor's record instead of replacing it with a different declaration.
+    assert.equal(new Set(posts.map((p) => p.body)).size, 1, 'every re-post must be byte-identical to the startup post');
+    assert.equal(new Set(posts.map((p) => sha256(p.body))).size, 1, 'and therefore carry the same digest');
+    assert.equal(posts[0].kind, 'status');
+    assert.equal(JSON.parse(posts[0].body).schemaVersion, 1);
+  } finally {
+    worker?.proc.kill('SIGTERM');
+    await worker?.closed;
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+await test('BLOCK-B: a failed re-post is logged, never fatal, and the poll loop keeps running', async () => {
+  const fixture = new WorkerTestFixture('declaration-refresh-fail');
+  const governor = new FakeGovernor();
+  await governor.start();
+  let worker = null;
+  try {
+    await fixture.startBus([]);
+    worker = spawnDaemon(fixture, 'w2', ['--governor', governor.url, '--poll-seconds', '0.2'], { VINCI_DECLARATION_REFRESH_S: '0.4' });
+    await waitFor(() => declarationPosts(fixture, 'w2').length >= 1, { label: 'the startup declaration' });
+    // Refuse every declaration re-post for a while.
+    fixture.failPostSubjects = / declaration$/;
+    await waitFor(() => fixture.failedPosts.length >= 2, { label: 'two refused re-posts' });
+    const pollsAtFailure = fixture.getRequests.length;
+    // The daemon is still polling: a refused declaration must not stop the loop or kill the process.
+    await waitFor(() => fixture.getRequests.length >= pollsAtFailure + 3, { label: 'polls after the refused re-posts' });
+    assert.equal(worker.proc.exitCode, null, 'a refused re-post must not kill the daemon');
+    // …and it recovers on its own once the bus accepts posts again.
+    const before = declarationPosts(fixture, 'w2').length;
+    fixture.failPostSubjects = null;
+    await waitFor(() => declarationPosts(fixture, 'w2').length > before, { label: 'a recovered re-post' });
+    assert.match(worker.stderr(), /declaration re-post failed \(\d+ in a row\).*stale_declaration/, `stderr must record the failure: ${worker.stderr()}`);
+  } finally {
+    fixture.failPostSubjects = null;
+    worker?.proc.kill('SIGTERM');
+    const { code } = (await worker?.closed) ?? {};
+    assert.equal(code, 0, 'the daemon must still exit cleanly');
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+await test('BLOCK-B: the refresh timer never holds the process open (--once still exits)', async () => {
+  const fixture = new WorkerTestFixture('declaration-refresh-once');
+  const governor = new FakeGovernor();
+  await governor.start();
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([handoff('133', 'w3', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    const started = Date.now();
+    // A 0.2 s refresh on a --once run: a timer that holds the event loop open would make this
+    // process never exit. Bounded explicitly, so a timer that DOES hold it open fails this test
+    // instead of hanging the suite.
+    const worker = spawnWorker(fixture, 'w3', ['--governor', governor.url], { VINCI_DECLARATION_REFRESH_S: '0.2' });
+    const timedOut = Symbol('timeout');
+    const bound = new Promise((r) => setTimeout(() => r(timedOut), 30_000).unref?.());
+    const outcome = await Promise.race([worker.closed, bound]);
+    const elapsed = Date.now() - started;
+    if (outcome === timedOut) {
+      worker.proc.kill('SIGKILL');
+      assert.fail(`--once did not exit within ${elapsed}ms: the declaration refresh timer is holding the process open`);
+    }
+    assert.equal(outcome.code, 0, outcome.stderr);
+    assert(elapsed < 30_000, `--once must still exit promptly, took ${elapsed}ms`);
+    assert.equal(state(fixture, '133').state, 'COMPLETED');
+    // The refresh really was live during that run (otherwise this proves nothing about the timer).
+    assert(declarationPosts(fixture, 'w3').length >= 1, 'the declaration was posted, so the interval was armed');
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
+
+await test('BLOCK-B: the refresh interval defaults to 3600 s and ignores an unusable override', async () => {
+  for (const env of [{}, { VINCI_DECLARATION_REFRESH_S: 'soon' }, { VINCI_DECLARATION_REFRESH_S: '0' }, { VINCI_DECLARATION_REFRESH_S: '-5' }]) {
+    const fixture = new WorkerTestFixture('declaration-refresh-default');
+    const governor = new FakeGovernor();
+    await governor.start();
+    let worker = null;
+    try {
+      await fixture.startBus([]);
+      worker = spawnDaemon(fixture, 'w4', ['--governor', governor.url, '--poll-seconds', '0.2'], env);
+      await waitFor(() => declarationPosts(fixture, 'w4').length >= 1, { label: 'the startup declaration' });
+      const pollsBefore = fixture.getRequests.length;
+      await waitFor(() => fixture.getRequests.length >= pollsBefore + 5, { label: 'several poll cycles' });
+      assert.equal(declarationPosts(fixture, 'w4').length, 1, `${JSON.stringify(env)}: the default hour-scale interval must not fire within a couple of seconds`);
+    } finally {
+      worker?.proc.kill('SIGTERM');
+      await worker?.closed;
+      await governor.close();
+      await fixture.cleanup();
+    }
+  }
+});
+
 console.log(`\nWorker lease loop tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

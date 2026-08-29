@@ -9,14 +9,20 @@
 //
 //   POST /v1/governor/leases                 {work_order_id, attempt_id, worker_build_digest,
 //                                             adapter_version, capability_declaration_digest?}
-//     ⇒ 200 {lease_id, fencing_generation, expires_at, ttl_s}
-//     | 409 {reason:"leased", holder_attempt_id, expires_at}
+//     ⇒ 2xx {lease_id, fencing_generation, expires_at, ttl_s}
+//     | 409 {reason:"leased", holder_attempt_id, expires_at}   (older servers: 403
+//       {reason:"leased_by_other_attempt"} — both are read as the same decision)
 //   POST /v1/governor/leases/{id}/renew      {fencing_generation}
-//     ⇒ 200 {expires_at, ttl_s} | 409 {reason: "stale_generation"|"expired"|"revoked"}
+//     ⇒ 2xx {expires_at, ttl_s} | 409 {reason: "stale_generation"|"expired"|"revoked"}
+//       (older servers carry those same reasons on a 403)
 //   POST /v1/governor/leases/{id}/release    {fencing_generation, outcome}   ⇒ 200
 //   POST /v1/governor/leases/{id}/check      {fencing_generation}            ⇒ 200 {valid, reason}
 //
-// Fail-closed throughout: the ONLY result that lets a task proceed is a 200 lease whose body
+// The two repos deploy independently, so this client assumes NEITHER the server's status codes
+// nor its rollout state: any 2xx with a well-formed body is a success, and a lease-state reason is
+// a final decision whether it arrives on a 403 (old) or a 409 (new).
+//
+// Fail-closed throughout: the ONLY result that lets a task proceed is a 2xx lease whose body
 // can bound the run (a string lease_id, a fencing_generation, a ttl_s of at least 1 second). A
 // renew that is refused, or unreachable after one retry, is LOSS OF AUTHORITY. A check that
 // cannot be answered is `valid: false`. Release failures are logged and never change a task's
@@ -47,8 +53,45 @@ function validTtl(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= MIN_TTL_S;
 }
 
+// DELIBERATE WIDENING (#201 review, cross-repo table). The server only ever sends an integer
+// generation today, and this accepts a finite number OR a non-empty string. That is on purpose,
+// and the line is: the client VALIDATES what it interprets and only requires presence of what it
+// merely echoes. `ttl_s` bounds the run and `lease_id` builds a URL, so both are type-checked
+// hard. `fencing_generation` is an OPAQUE fence token — the worker never compares, orders or does
+// arithmetic on it, it only hands the same value back on renew/release/check and lets the
+// Governor judge it. Narrowing it to an integer would buy no safety (a string round-trips through
+// JSON unchanged) and would cost a real failure mode: the two repos deploy independently, so a
+// server that ever widened the token would make this client BLOCK every task at acquire — exactly
+// the silent, total inadmissibility that the declaration-refresh fix above exists to prevent.
+// What IS refused: null/undefined/missing, NaN, ±Infinity, an empty string, an object or array —
+// values that could not survive the round trip or would fence nothing.
 function validGeneration(value) {
   return (typeof value === "number" && Number.isFinite(value)) || (typeof value === "string" && value.length > 0);
+}
+
+// Any 2xx is a success (#201 review). The Governor's acquire is changing from 201 to 200 and the
+// two repos deploy independently, so neither side may assume the other's version: a client pinned
+// to `status === 200` refuses a lease it was actually granted (and, worse, leaves the Governor
+// holding a lease nobody will renew or release). A status alone is never enough — every caller
+// below still requires a well-formed body before it proceeds.
+function isSuccess(status) {
+  return typeof status === "number" && status >= 200 && status < 300;
+}
+
+// WARN-3 (#201): lease-state reasons the Governor returns when the caller has LOST or never had
+// authority. These are DECISIONS — final, never retried — regardless of the status that carries
+// them. The server is moving them from 403 to 409; this client must be right under BOTH, so it
+// classifies on the reason and accepts either status. Anything else non-2xx is a transport or
+// unknown failure and fails closed on its own path (retry once, then loss of authority).
+const LEASE_STATE_REASONS = Object.freeze(["stale_generation", "expired", "revoked", "released", "leased", "leased_by_other_attempt", "not_holder", "unknown_lease"]);
+const LEASE_DECISION_STATUSES = Object.freeze([403, 409, 422]);
+
+function leaseStateDecision(status, body) {
+  if (isSuccess(status) || !body) return null;
+  const reason = typeof body.reason === "string" ? body.reason : null;
+  if (status === 409) return reason || "refused";
+  if (reason && LEASE_DECISION_STATUSES.includes(status) && LEASE_STATE_REASONS.includes(reason)) return reason;
+  return null;
 }
 
 async function readJson(response) {
@@ -123,7 +166,7 @@ export class LeaseClient {
     if (result.transport) return unavailable(result.transport);
     if (result.malformed) return unavailable(result.malformed);
     const { status, body } = result;
-    if (status === 200) {
+    if (isSuccess(status)) {
       if (typeof body.lease_id !== "string" || !body.lease_id) return unavailable(`Governor lease invalid: lease_id=${JSON.stringify(body.lease_id)}`);
       if (!validGeneration(body.fencing_generation)) return unavailable(`Governor lease invalid: fencing_generation=${JSON.stringify(body.fencing_generation)}`);
       if (!validTtl(body.ttl_s)) return unavailable(`Governor lease invalid: ttl_s=${JSON.stringify(body.ttl_s)}`);
@@ -139,7 +182,10 @@ export class LeaseClient {
         },
       };
     }
-    if (status === 409 && body.reason === "leased") {
+    // A "someone else holds this order" answer is a DECISION, not a failure: the old server sends
+    // it as 403 leased_by_other_attempt, the new one as 409 leased. Both mean the same thing and
+    // both are final here (the daemon BLOCKS the task; it does not retry).
+    if (LEASE_DECISION_STATUSES.includes(status) && (body.reason === "leased" || body.reason === "leased_by_other_attempt")) {
       return {
         success: false,
         blocked: true,
@@ -159,13 +205,13 @@ export class LeaseClient {
     let last = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const result = await this.post(`/v1/governor/leases/${encodeURIComponent(lease.lease_id)}/renew`, { fencing_generation: lease.fencing_generation }, { authorization: `Session ${this.token}` });
-      if (result.status === 200 && result.body) {
+      if (isSuccess(result.status) && result.body) {
         return { ok: true, expires_at: result.body.expires_at ?? lease.expires_at ?? null, ttl_s: validTtl(result.body.ttl_s) ? result.body.ttl_s : lease.ttl_s, epoch: result.body.epoch ?? null };
       }
-      if (result.status === 409 && result.body) {
-        const reason = typeof result.body.reason === "string" && result.body.reason ? result.body.reason : "refused";
-        return { ok: false, lost: true, reason };
-      }
+      // A lease-state answer is FINAL loss of authority — never retried — whether the server sends
+      // it as the old 403 or the new 409.
+      const decision = leaseStateDecision(result.status, result.body);
+      if (decision) return { ok: false, lost: true, reason: decision };
       last = result.transport ?? result.malformed ?? `unexpected status ${result.status}`;
     }
     return { ok: false, lost: true, reason: "unreachable", detail: last };
@@ -176,7 +222,7 @@ export class LeaseClient {
     if (!RELEASE_OUTCOMES.includes(outcome)) throw new Error(`invalid release outcome: ${outcome}`);
     try {
       const result = await this.post(`/v1/governor/leases/${encodeURIComponent(lease.lease_id)}/release`, { fencing_generation: lease.fencing_generation, outcome }, { authorization: `Session ${this.token}` });
-      if (result.status === 200) return { ok: true, epoch: result.body?.epoch ?? null };
+      if (isSuccess(result.status)) return { ok: true, epoch: result.body?.epoch ?? null };
       this.log(`vinci worker: lease ${lease.lease_id} release (${outcome}) failed: ${result.transport ?? result.malformed ?? `status ${result.status} ${result.body?.reason ?? ""}`}`);
       return { ok: false };
     } catch (error) {
@@ -190,7 +236,7 @@ export class LeaseClient {
   async check(lease) {
     if (!this.busToken) return { valid: false, reason: "bus token missing" };
     const result = await this.post(`/v1/governor/leases/${encodeURIComponent(lease.lease_id)}/check`, { fencing_generation: lease.fencing_generation }, { authorization: `Bearer ${this.busToken}` });
-    if (result.status === 200 && result.body) {
+    if (isSuccess(result.status) && result.body) {
       if (result.body.valid === true) return { valid: true, reason: result.body.reason ?? null, epoch: result.body.epoch ?? null };
       return { valid: false, reason: typeof result.body.reason === "string" && result.body.reason ? result.body.reason : "invalid", epoch: result.body.epoch ?? null };
     }
