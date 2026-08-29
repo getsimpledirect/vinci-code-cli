@@ -408,6 +408,8 @@ export function finalState({ exitCode, limitTripped, outcome, blocker, pr, harne
   if (Array.isArray(harnessStops) && harnessStops.length > 0) return "BLOCKED";
   if (outcome?.state === "BLOCKED" || outcome?.state === "WAITING" || blocker) return "BLOCKED";
   if (outcome?.state === "DONE_UNVERIFIED") return "UNVERIFIED";
+  // No commit produced: work did not land. Refuse COMPLETED even if evidence was verified.
+  if (outcome?.no_commit === true) return "UNVERIFIED";
   if (outcome?.state === "DONE" && pr) return "COMPLETED";
   return "UNVERIFIED";
 }

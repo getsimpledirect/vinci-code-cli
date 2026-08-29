@@ -744,9 +744,8 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       env: cleanRoom ? cleanRoomEnv({ provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir }) : undefined,
       ...(lease ? { abortSignal: abortController.signal } : {}) });
     const head = await readHead(repository.repoDir);
-    const runOutcome = noCommitOutcome({ head, baseCommit: repository.baseCommit, outcome: run.outcome });
     if (lease) lifecycle.record({ lease: { ...lifecycle.snapshot().lease, ...lease } });
-    lifecycle.record({ ...run, head, outcome: runOutcome });
+    lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
     // Loss of authority (L2): NO publish at all — not even the branch push. The record says why.
     // Otherwise main's routing stands. `fence` is this attempt's fence in publisher.mjs's shape;
     // it is null when ungoverned, and the clean-room x fence combination never reaches here (it is
@@ -758,14 +757,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         : await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt, fence: lease ? fence : null });
     const fencedOut = authorityLost ?? published.fenced_out ?? null;
     if (!authorityLost && published.fenced_out) fencedOutReason = published.fenced_out;
-    const outcome = fencedOut ? { reason: fencedOut } : published.blocker_reason ? { reason: published.blocker_reason } : noCommitOutcome({ head, baseCommit: repository.baseCommit, outcome: runOutcome });
+    // Build outcome: start with fence/blocker reasons, then augment with no_commit if needed (so both can coexist).
+    let outcome = fencedOut ? { reason: fencedOut } : published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
+    outcome = noCommitOutcome({ head, baseCommit: repository.baseCommit, outcome });
     const harnessStops = run.harness_stops ?? [];
     const intendedState = fencedOut
       ? "BLOCKED"
       : finalState({
           exitCode: run.exit_code,
           limitTripped: run.limit_tripped,
-          outcome: run.outcome,
+          outcome,
           blocker: Boolean(published.blocker_reason),
           pr: published.pr,
           harnessStops,

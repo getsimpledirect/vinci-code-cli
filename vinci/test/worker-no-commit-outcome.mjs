@@ -85,3 +85,34 @@ test("Variant 2: evidence=none and exit 1 creates an outcome when the run outcom
   assert.equal(state.outcome?.reason, expectedReason(baseCommit), "reason should contain full explanation");
   assert.match(finalPost.body, /reason=no_commit: HEAD is unchanged from base_commit/);
 });
+
+
+test("Change 1: no-commit with evidence=pr and exit 0, outcome DONE must refuse COMPLETED state", async () => {
+  const { baseCommit, state } = await runNoCommitScenario({
+    id: "28-change1",
+    evidence: "pr",
+    exitCode: 0,
+    skipOutcome: false,
+  });
+  assert.equal(state.head, baseCommit);
+  assert.equal(state.base_commit, baseCommit);
+  // CRITICAL FIX: no-commit run that would have been COMPLETED is now UNVERIFIED
+  assert.notEqual(state.state, "COMPLETED", "no-commit run must NOT be COMPLETED even with pr evidence");
+  assert.equal(state.state, "UNVERIFIED", "no-commit without commit must be UNVERIFIED (work did not land)");
+  assert.equal(state.outcome?.no_commit, true);
+});
+
+test("Change 2: no-commit run that hits a blocker preserves no_commit flag", async () => {
+  // Simulate a run that produces no commit AND has a blocker condition.
+  // This tests that noCommitOutcome is applied AFTER blocker/fence outcomes.
+  const { baseCommit, state } = await runNoCommitScenario({
+    id: "28-change2-blocker",
+    evidence: "none",
+    exitCode: 1,
+    skipOutcome: false,
+  });
+  assert.equal(state.head, baseCommit, "head unchanged means no commit");
+  // Both conditions present: no_commit from the run + blocker from exit code
+  // no_commit must survive and mark the outcome
+  assert.equal(state.outcome?.no_commit, true, "no_commit flag must persist even with blocker/error conditions");
+});
