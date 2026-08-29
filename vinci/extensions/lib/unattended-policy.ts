@@ -107,6 +107,13 @@ export function unattendedPolicyProfile(env: EnvLike = process.env): UnattendedP
   // and a standing permission.
   const expires = /#expires=([^#\s]+)$/.exec(lease)?.[1];
   if (!expires) return null;
+  // STRICT ISO-8601 UTC, the same shape vinci/worker/task.mjs requires of an envelope `deadline:`.
+  // Bare Date.parse() accepted `#expires=9999` (the year 9999) and `+275760-09-12T00:00:00Z`, which
+  // made the claim "the grant is bounded rather than permanent" true only of daemon-issued tokens
+  // (delta review, 2026-08-29). It grants no new capability — anyone who can set the env pair has
+  // already won — but the sentence has to be true of every token the parser accepts, not just the
+  // well-formed ones. This also rejects the malformed-but-accepted class outright.
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(expires)) return null;
   const expiresAtMs = Date.parse(expires);
   if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return null;
   return { profile: "governed", lease, expiresAt: new Date(expiresAtMs).toISOString() };

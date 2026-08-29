@@ -580,9 +580,11 @@ Three facts must all hold in the agent child's environment:
 
 1. `VINCI_UNATTENDED_POLICY=governed` — the explicit operator opt-in.
 2. `VINCI_UNATTENDED_LEASE=<token>` — stamped by the daemon on a granted lease.
-3. The token carries an `#expires=<ISO-8601>` bound that has not passed. It is pinned to the lease's
-   own ttl, so the relaxed guard cannot outlive the lease that justified it. A token with no
-   parseable expiry is rejected — an unbounded grant is not a lease.
+3. The token carries an `#expires=` bound that has not passed, in **strict ISO-8601 UTC** (the same
+   shape `task.mjs` requires of an envelope `deadline:`). It is pinned to the lease's own ttl, so the
+   relaxed guard cannot outlive the lease that justified it. A token with no expiry, or one bare
+   `Date.parse` would accept but the strict form rejects (`9999`, `+275760-09-12T00:00:00Z`,
+   `2026-08-29`, a non-`Z` offset), is refused — an unbounded grant is not a lease.
 
 `vinci/worker/governor.mjs::unattendedPolicyEnv()` is the **only** producer of either variable. It
 sets them only after `claimGovernorPaths()` returned a granted lease, and on every other path
@@ -650,6 +652,23 @@ The allowlist alone is not sufficient either: it judges argv[0] per segment, so 
 `npm publish`, `bun publish` and `npm install -g typescript`. Those are stopped by the veto — which
 is why adding `bun` to the OUTWARD publish pattern is load-bearing rather than cosmetic.
 
+**Runners are peeled before the allowlist decides.** `npx wrangler deploy` really runs `wrangler`,
+but argv[0] is `npx` — itself a dev-toolchain name — so the cloud-CLI rejection never saw the tool.
+Measured: `npx wrangler deploy`, `pnpm dlx wrangler deploy`, `npx supabase db push`,
+`npx heroku ps:scale` and `npx doctl …` all entered the allowlist, and `npx vercel --prod` blocked
+only because OUTWARD happened to text-match `vercel`. `isDevToolchainOnlyNetwork()` now re-evaluates
+the cloud-CLI check against the first non-flag token after a runner (`npx`, `bunx`, `pnpm|yarn dlx`,
+`npm exec`, `deno run|task`). The peel **only ever adds a rejection** — the toolchain/network
+judgement still runs on the original segment — so `npx tsx script.ts` and `npx create-react-app` are
+unchanged and the interactive once-per-session build grant keeps its current scope. `expo publish`
+was added to OUTWARD and `deno install --global` to SYSTEM, neither of which any veto named.
+
+**What the allowlist does NOT do**, stated because the earlier wording ("a laundered or bundled
+command cannot ride in on it") was measurably false, and in a permission system an untrue claim in
+the record is itself the defect: judging argv[0] is a *name* check, not a capability check. It peels
+exactly **one** runner layer. It cannot see inside what it admits. It is a name allowlist. A `true`
+from it means "this looks like ordinary build tooling", never "this is safe".
+
 **Why this grant is not an ordinary confirm.** `securityScopes.push("network")` signs a one-command
 grant that makes the sandbox drop `(deny network*)` (seatbelt) / `--unshare-net` (bwrap).
 `vinci-sandbox.ts` states the invariant it protects: `.env` and `*.tfvars` are deliberately left
@@ -684,10 +703,20 @@ why the allowlist is not widened further.
   `*.pem/key/p12/pfx` and `id_rsa`-family names, while the same file's `isSensitiveReadPath()`
   recognised far more — so `credentials.json`, `.aws/credentials`, `service-account.json`,
   `.dev.vars`, `terraform.tfvars`, `.kube/config` and `.docker/config.json` were all stageable.
-  `isCommitSecrets` now also tests the command's git path *operands* against `isSensitiveReadPath()`,
-  making that function the single source of truth for "this file holds live credentials" whether it
-  is being read or committed. Commit-message values (`-m`, `-F`, …) are excluded, so
-  `git commit -m "fix credentials.json parsing"` is not mistaken for staging one.
+  `isCommitSecrets` now tests the command's git path *operands* — via the shared
+  `parseLocalGitSegment` parser — against both `isSensitiveReadPath()` and the original
+  `.env`/`*.pem` name regex, making `isSensitiveReadPath` the single source of truth for "this file
+  holds live credentials" whether it is being read or committed. Commit-message values (`-m`, `-F`,
+  …) are excluded, so `git commit -m "fix credentials.json parsing"` is not mistaken for staging one.
+
+  The first version of that fix was still fail-open: it was `&&`-gated behind the text precondition
+  `/\bgit\s+(add|commit)\b/`, which cannot see past a git **global option**, so
+  `git --no-pager add credentials.json` and `git -C . add credentials.json` were passed through — the
+  parser handled them correctly and the precondition then discarded the result. The same precondition
+  blinded the original `.env` regex (`git --no-pager add .env` was uncaught). Both branches now run
+  on the parser's operands, so there is no text precondition left to defeat. `--pathspec-from-file`
+  reads the path list out of a file, where no operand scan can see it, and now emits a poison operand
+  so "unknown" fails closed.
 - **Writes outside the project folder** and **writes to sensitive paths**. The attempt tree is the
   only surface the publisher captures, the evidence bundle records, or a reviewer sees.
 - **Every network command outside the dev-toolchain allowlist.** These ESCALATE rather than
