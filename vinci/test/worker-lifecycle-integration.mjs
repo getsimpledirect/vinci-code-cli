@@ -174,7 +174,7 @@ await scenario(
   },
 );
 
-await scenario("runtime", envelope({ max_runtime_s: "0.05" }), { FAKE_VINCI_SLEEP: "10000" }, ({ state, vinciRecord }) => {
+await scenario("runtime", envelope({ max_runtime_s: "0.05" }), { FAKE_VINCI_SLEEP: "10000", FAKE_VINCI_NO_COMMIT: "1" }, ({ state, vinciRecord }) => {
   assert.equal(state.state, "FAILED");
   assert.equal(state.limit_tripped, "max_runtime_s");
   assert.match(readFileSync(vinciRecord, "utf8"), /SIGTERM/);
