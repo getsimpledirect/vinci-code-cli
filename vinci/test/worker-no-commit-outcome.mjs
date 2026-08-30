@@ -117,3 +117,65 @@ test("Change 2: no-commit run that hits a blocker preserves no_commit flag", asy
   // no_commit must survive and mark the outcome
   assert.equal(state.outcome?.no_commit, true, "no_commit flag must persist even with blocker/error conditions");
 });
+
+
+test("Regression: restart with commits on both attempts must NOT be no_commit", async () => {
+  // This tests the fix for: base_commit being re-captured per-attempt caused false positives on restart.
+  // When attempt 1 commits (normal behavior) and attempt 2 restarts (also making commits),
+  // the no-commit detection would incorrectly fire because it compared against attempt 2's baseCommit
+  // (which was the current HEAD after attempt 1's commit) instead of the original task base.
+  const fixture = new WorkerTestFixture("restart-no-commit");
+  try {
+    const { origin } = fixture.createRepo("test", "repo");
+    const originalBase = execFileSync("git", ["--git-dir", origin, "rev-parse", "main"], { encoding: "utf8" }).trim();
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([{
+      message_id: "restart-nc",
+      to_agent: "worker:w1",
+      kind: "handoff",
+      subject: "restart with commits",
+      body: "repo: test/repo\nevidence: pr\n\nTask that will restart",
+      ts: "2026-08-29T20:00:00Z",
+      posted_by: "scheduler",
+    }]);
+
+    // Attempt 1: start and kill mid-run
+    const child1 = spawn(
+      "node",
+      [join(ROOT, "vinci/worker/worker.mjs"), "start", "--id", "w1", "--server", fixture.busUrl(), "--once", "--state-dir", fixture.tempDir],
+      {
+        env: fixture.getEnv({ FAKE_VINCI_SLEEP: "500" }),
+        stdio: "pipe",
+      },
+    );
+    while (fixture.getVinciCalls().length === 0) await new Promise(r => setTimeout(r, 25));
+    await new Promise(r => setTimeout(r, 100));
+    child1.kill("SIGTERM");
+    await new Promise(r => { child1.once("close", r); });
+
+    // Attempt 2: restart and complete successfully
+    const child2 = spawn(
+      "node",
+      [join(ROOT, "vinci/worker/worker.mjs"), "start", "--id", "w1", "--server", fixture.busUrl(), "--once", "--state-dir", fixture.tempDir],
+      {
+        env: fixture.getEnv(),
+        stdio: "pipe",
+      },
+    );
+    assert.equal(await new Promise(resolveClose => child2.once("close", resolveClose)), 0);
+
+    const state = JSON.parse(readFileSync(join(fixture.tempDir, "tasks", "restart-nc.json"), "utf8"));
+    
+    // Verify both attempts exist
+    assert.equal(state.attempt, 2, "should have executed attempt 2");
+    // Verify head is different from original base (commits were made)
+    assert.notEqual(state.head, originalBase, "commits were made, so HEAD should advance");
+    // Verify NO false positive no_commit flag
+    assert.notEqual(state.outcome?.no_commit, true, "restart with commits must NOT be flagged no_commit");
+    // Verify successful state despite having restarted
+    assert.equal(state.state, "COMPLETED", "restart attempt with commits should complete successfully");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
