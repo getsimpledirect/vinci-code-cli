@@ -218,7 +218,7 @@ export class TaskLifecycle {
       finished_at: null,
       exit_code: null,
       head: null,
-      base_commit: null,
+      base_commit: firstAttempt ? null : this.state.base_commit ?? null,
       base_ref: task.envelope.base_ref ?? "main",
       pr: null,
       publish: null,
