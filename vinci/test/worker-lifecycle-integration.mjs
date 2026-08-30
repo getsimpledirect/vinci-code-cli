@@ -157,7 +157,7 @@ async function scenario(name, body, env, verify, prepare) {
 await scenario(
   "restart",
   envelope({ evidence: "pr" }),
-  {},
+  { FAKE_VINCI_NO_COMMIT: "1" },
   ({ bus, state, vinciRecord }) => {
     assert.equal(state.attempt, 2);
     assert.equal(state.session_id, "kept-session");
