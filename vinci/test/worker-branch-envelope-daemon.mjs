@@ -12,7 +12,7 @@ const LAUNCHER = join(ROOT, "vinci/bin/vinci");
 const TOOLS = join(ROOT, "vinci/test/fixtures/worker-test-tools");
 const f = new WorkerTestFixture("branch-envelope-daemon");
 const run = () => new Promise((resolve) => {
-  const child = spawn("bash", [LAUNCHER, "worker", "start", "--id", "w1", "--server", f.busUrl(), "--once", "--state-dir", f.tempDir], { env: f.getEnv(), stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn("bash", [LAUNCHER, "worker", "start", "--id", "w1", "--server", f.busUrl(), "--once", "--state-dir", f.tempDir], { env: { ...f.getEnv(), FAKE_VINCI_NO_COMMIT: "1" }, stdio: ["ignore", "pipe", "pipe"] });
   let stderr = ""; child.stderr.on("data", (d) => { stderr += d; });
   const timer = setTimeout(() => child.kill("SIGKILL"), 60000);
   child.on("exit", (status) => { clearTimeout(timer); resolve({ status, stderr }); });

@@ -228,7 +228,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
       // Case (b): local is an ancestor (or equal) ⇒ -B is a fast-forward to the remote tip.
     }
     await command("git", ["-C", repoDir, "checkout", "-B", branch, remoteTip]);
-    return { branch, repoDir };
+    return { branch, repoDir, baseCommit: await readHead(repoDir) };
   }
   const localBranch = await command(
     "git",
@@ -237,7 +237,7 @@ export async function prepareRepository(stateDir, repo, taskId, branchOverride) 
   );
   if (localBranch.status === 0) await command("git", ["-C", repoDir, "checkout", branch]);
   else await command("git", ["-C", repoDir, "checkout", "-b", branch, "origin/main"]);
-  return { branch, repoDir };
+  return { branch, repoDir, baseCommit: await readHead(repoDir) };
 }
 
 // `abortSignal` (optional, Wave 1B): an AbortSignal the daemon fires on LOSS OF AUTHORITY (the
@@ -350,6 +350,16 @@ export async function readHead(repoDir) {
   return result.status === 0 ? result.stdout : null;
 }
 
+export function noCommitOutcome({ head, baseCommit, outcome }) {
+  if (!head || !baseCommit || head !== baseCommit) return outcome ?? null;
+  const priorOutcome = outcome && typeof outcome === "object" && !Array.isArray(outcome) ? outcome : {};
+  return {
+    ...priorOutcome,
+    no_commit: true,
+    reason: `no_commit: HEAD is unchanged from base_commit ${baseCommit}; the run produced no commit`,
+  };
+}
+
 export async function readHeadBlocker(repoDir) {
   const exists = await command("git", ["-C", repoDir, "cat-file", "-e", "HEAD:BLOCKER.md"], {
     allowFailure: true,
@@ -398,6 +408,8 @@ export function finalState({ exitCode, limitTripped, outcome, blocker, pr, harne
   if (Array.isArray(harnessStops) && harnessStops.length > 0) return "BLOCKED";
   if (outcome?.state === "BLOCKED" || outcome?.state === "WAITING" || blocker) return "BLOCKED";
   if (outcome?.state === "DONE_UNVERIFIED") return "UNVERIFIED";
+  // No commit produced: work did not land. Refuse COMPLETED even if evidence was verified.
+  if (outcome?.no_commit === true) return "UNVERIFIED";
   if (outcome?.state === "DONE" && pr) return "COMPLETED";
   return "UNVERIFIED";
 }

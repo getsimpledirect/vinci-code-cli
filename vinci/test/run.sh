@@ -136,6 +136,11 @@ run_group() {
     echo "  ✗ ${label}: TIMED OUT after ${elapsed}s (ceiling ${GROUP_TIMEOUT_SECONDS}s) — process group killed"
     fails=$((fails + 1))
   elif [ "${status}" -ne 0 ]; then
+    # Name the group. Without this the harness prints only "N test group(s) failed" at the very
+    # end, with nothing anywhere in the log saying WHICH -- a CI run then reports a failure that
+    # cannot be located from its own output. (Cost several hours of bisecting to find that the
+    # silence was the harness, not the test.)
+    echo "  ✗ ${label}: FAILED (exit ${status}) after ${elapsed}s"
     fails=$((fails + 1))
   fi
   return "${status}"

@@ -2,6 +2,7 @@
 // Fake vinci for worker tests - records invocation and simulates behavior
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { execSync } from 'node:child_process';
 
 const recordFile = process.env.FAKE_VINCI_RECORD || '/tmp/fake-vinci-invocations.txt';
 
@@ -72,7 +73,36 @@ if (sessionDir && sessionId) {
   const failExit = process.env.FAKE_VINCI_EXIT !== undefined ? parseInt(process.env.FAKE_VINCI_EXIT, 10) : 0;
   const writeUsage = process.env.FAKE_VINCI_USAGE === '1';
 
-  appendFileSync(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
+
+  // By default, make a real commit (fixture for a successful run).
+  // Use FAKE_VINCI_NO_COMMIT=1 to simulate a run with no commits (e.g. for #28 tests).
+  const noCommit = process.env.FAKE_VINCI_NO_COMMIT === '1';
+  if (!noCommit) {
+    try {
+      // Check if we're in a git repo
+      try {
+        execSync('git rev-parse --git-dir', { cwd: process.cwd(), stdio: 'ignore' });
+      } catch {
+        throw new Error('not a git repo');
+      }
+      // Configure git if needed
+      try {
+        execSync('git config user.email "test@example.com"', { cwd: process.cwd(), stdio: 'ignore' });
+        execSync('git config user.name "Test User"', { cwd: process.cwd(), stdio: 'ignore' });
+      } catch {
+        // Ignore if already configured
+      }
+      // Create and commit a file
+      const workFile = resolve('VINCI_WORK_DONE');
+      writeFileSync(workFile, 'completed by vinci\n');
+      execSync('git add VINCI_WORK_DONE', { cwd: process.cwd() });
+      execSync('git commit -m "vinci fixture: work completed"', { cwd: process.cwd(), stdio: 'ignore' });
+    } catch (e) {
+      // Silently fail if not a git repo or git not available
+    }
+  }
+
+    appendFileSync(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
   const outcomeEntry = (cost) => ({
     type: 'custom',
     customType: 'vinci-task-outcome',
@@ -99,7 +129,9 @@ if (sessionDir && sessionId) {
     },
   });
 
-  if (outcome) appendFileSync(sessionFile, JSON.stringify(outcomeEntry(0)) + '\n');
+  if (outcome && process.env.FAKE_VINCI_SKIP_OUTCOME !== '1') {
+    appendFileSync(sessionFile, JSON.stringify(outcomeEntry(0)) + '\n');
+  }
 
   // Write usage if requested
   if (writeUsage) {
@@ -120,8 +152,8 @@ if (sessionDir && sessionId) {
 
   // Sleep if requested
   if (sleepMs > 0) {
-    process.on('SIGTERM', () => {
-      appendFileSync(recordFile, 'SIGTERM\n');
+    process.on("SIGTERM", () => {
+      appendFileSync(recordFile, "SIGTERM\n");
       process.exit(143);
     });
     await new Promise((resolveSleep) => setTimeout(resolveSleep, sleepMs));
