@@ -744,17 +744,16 @@ function pathStrippedBody(segment: string): string {
   return bare + body.slice(first.length);
 }
 
-const GRANT_PATH_RUNNERS = new Set(["./gradlew", "./gradlew.bat", "./mvnw", "./mvnw.cmd"]);
 
-/** A positive runner pin for network grants. Bare commands rely on the shell's configured PATH;
- *  path-qualified commands are allowed only when they are repository wrapper literals we name.
- *  Unlike pathStrippedBody(), this check preserves the path because a basename may deny an
- *  exemption but must never grant one. */
+/** A positive runner pin for network grants. Only bare commands (no `/`) are allowed,
+ *  which resolve via the ambient PATH from the process that launched Vinci, not from the 
+ *  cloned repository. Path-qualified runners like `./gradlew` can be symlinks or attacker-
+ *  authored scripts, so they are not granted automatic network access. */
 function isAllowedRunnerForGrant(segment: string): boolean {
   const body = commandBody(segment);
   const first = /^\S+/.exec(body)?.[0] ?? "";
   const commandWord = unescapeShellToken(first).replace(/^['"]|['"]$/g, "");
-  return commandWord.length > 0 && (!commandWord.includes("/") || GRANT_PATH_RUNNERS.has(commandWord));
+  return commandWord.length > 0 && !commandWord.includes("/");
 }
 
 /** The executable actually invoked by a shell segment (argv[0]), after env-assignments / sudo, quote-

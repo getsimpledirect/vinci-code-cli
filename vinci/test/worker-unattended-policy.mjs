@@ -230,14 +230,35 @@ try {
     "npm ci",
     "pip install requests",
     "bun install",
-    "./gradlew build",
-    "./mvnw package",
   ]) {
     const result = await headlessCall("bash", { command: allowed });
     check(
       `PROCEED: dev-toolchain network is allowed under a lease — ${allowed}`,
       result === undefined && only().outcome === "PROCEEDED" && only().site === "network-toolchain",
     );
+  }
+
+  // ── NEW TEST SUITE: path-qualified runners must NOT be granted ──────────────────────────
+  // A grant must pin the runner positively through the ambient PATH, which belongs to the 
+  // process that launched Vinci and NOT to the cloned repo. Path-qualified runners like 
+  // ./gradlew can be symlinks or attacker-authored scripts, so they cannot get automatic 
+  // network grants. Under the unattended profile, these fall back to human confirmation.
+  const pathRunnerFailures = [];
+  for (const pathRunner of ["./gradlew build", "./mvnw package", "./gradlew.bat build"]) {
+    const result = await headlessCall("bash", { command: pathRunner });
+    const proceeded = decisions().some(
+      (decision) => decision.outcome === "PROCEEDED" && decision.site === "network-toolchain",
+    );
+    const name = `path-qualified runner is NOT granted — ${pathRunner}`;
+    try {
+      check(name, result?.block === true && !proceeded);
+    } catch (error) {
+      console.error(`  ✗ ${name}`);
+      pathRunnerFailures.push(error);
+    }
+  }
+  if (pathRunnerFailures.length > 0) {
+    throw new AggregateError(pathRunnerFailures, "path-qualified runner grant restriction failed");
   }
 
   // A grant must pin the runner positively. Basename normalization is still useful for vetoes, but
