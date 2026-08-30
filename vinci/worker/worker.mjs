@@ -713,7 +713,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         })
       : await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
     lifecycle.record({
-      base_commit: repository.baseCommit ?? null,
+      ...(attempt.firstAttempt ? { base_commit: repository.baseCommit ?? null } : {}),
       ...(cleanRoom
         ? {
             attempt_dir: repository.attemptDir,
@@ -759,7 +759,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     if (!authorityLost && published.fenced_out) fencedOutReason = published.fenced_out;
     // Build outcome: start with fence/blocker reasons, then augment with no_commit if needed (so both can coexist).
     let outcome = fencedOut ? { reason: fencedOut } : published.blocker_reason ? { reason: published.blocker_reason } : run.outcome ?? null;
-    outcome = noCommitOutcome({ head, baseCommit: repository.baseCommit, outcome });
+    outcome = noCommitOutcome({ head, baseCommit: lifecycle.snapshot().base_commit, outcome });
     const harnessStops = run.harness_stops ?? [];
     const intendedState = fencedOut
       ? "BLOCKED"
