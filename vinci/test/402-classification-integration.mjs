@@ -31,16 +31,16 @@ const OUT_OF_CREDIT_BODY = JSON.stringify({
 const with402 = (body) => Object.assign(new Error(body), { status: 402 });
 
 export function assert402Classifications(classify) {
-  assert.equal(classify(with402(IN_FLIGHT_BODY)), "account", "in-flight 402 must be retryable");
-  assert.equal(classify(with402(AFFORDABILITY_BODY)), "account", "affordability 402 must be retryable");
+  assert.equal(classify(with402(IN_FLIGHT_BODY)), "account", "in-flight 402 must not permit escalation fallback");
+  assert.equal(classify(with402(AFFORDABILITY_BODY)), "account", "affordability 402 must not permit escalation fallback");
   assert.equal(classify(with402(OUT_OF_CREDIT_BODY)), "account", "true out-of-credit 402 must stay terminal");
 }
 
 export const parseAffordableTokenCount = provider.vinciAffordableTokenLimit;
 
-// Mutation procedure: copy the fixed classifier to the prompt-requested backup path, replace the
-// classifier with the old unconditional status === 402 account branch, run this file and confirm
-// assert402Classifications fails, then restore the fixed file from that external backup and rerun.
+// The requested classifier mutation failed against the initial transient-classifier revision and
+// was restored from the external backup. Review then deliberately made all 402s account-classified
+// to prevent escalation fallback; the provider retry and clamping assertions below now pin recovery.
 assert402Classifications(provenance.classifyVinciModelError);
 
 assert.equal(parseAffordableTokenCount(AFFORDABILITY_BODY), 23014);
@@ -54,7 +54,7 @@ assert.equal(
   23014,
   "unrelated numbers must not affect the canonical match",
 );
-assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can only afford 0"), 0);
+assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can only afford 0"), undefined);
 assert.equal(parseAffordableTokenCount("You requested up to -10 tokens, but can only afford 5"), undefined);
 assert.equal(parseAffordableTokenCount("You requested up to 10 tokens, but can only afford -5"), undefined);
 assert.equal(parseAffordableTokenCount("can afford 19 tokens"), 19);
