@@ -67,6 +67,12 @@ if (sessionDir && sessionId) {
   mkdirSync(sessPath, { recursive: true });
   const sessionFile = resolve(sessPath, 'session.jsonl');
 
+  // Register SIGTERM handler early, before git operations
+  process.on("SIGTERM", () => {
+    appendFileSync(recordFile, "SIGTERM\n");
+    process.exit(143);
+  });
+
   // Check for behavior flags
   const sleepMs = process.env.FAKE_VINCI_SLEEP ? parseInt(process.env.FAKE_VINCI_SLEEP, 10) : 0;
   const outcome = process.env.FAKE_VINCI_OUTCOME || 'DONE';
@@ -152,10 +158,6 @@ if (sessionDir && sessionId) {
 
   // Sleep if requested
   if (sleepMs > 0) {
-    process.on('SIGTERM', () => {
-      appendFileSync(recordFile, 'SIGTERM\n');
-      process.exit(143);
-    });
     await new Promise((resolveSleep) => setTimeout(resolveSleep, sleepMs));
   }
 
