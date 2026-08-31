@@ -13,7 +13,7 @@ import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, noCommitOutcome, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
-import { cleanRoomEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
+import { childEnv, cleanRoomEnv, providerScopedEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
 import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits, unattendedPolicyEnv } from "./governor.mjs";
 import { DECLARATION_REFRESH_DEFAULT_S, LEASE_TIMEOUT_MS, LeaseClient, buildDeclaration, declarationBody, declarationDigest, leaseSubject, releaseOutcome, startHeartbeat } from "./lease.mjs";
@@ -899,7 +899,10 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     const run = await runVinci({ envelope: envelopeToUse,
       stateDir,
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId,
-      env: cleanRoom ? cleanRoomEnv({ provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir }) : undefined,
+      // The provider boundary applies on BOTH paths now. It used to be `: undefined` here --
+      // inherit every provider key the daemon holds -- so the scoping promise was kept only in
+      // clean-room mode, which is itself refused under a Governor.
+      env: childEnv({ cleanRoom, provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir }),
       envDelta: unattendedPolicy,
       ...(lease ? { abortSignal: abortController.signal } : {}) });
     const head = await readHead(repository.repoDir);

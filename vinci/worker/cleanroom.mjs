@@ -104,6 +104,50 @@ export const PROVIDER_KEY_ENV = Object.freeze({
   deepinfra: ["VINCI_INTERNAL_DEEPINFRA_API_KEY"],
 });
 
+// The provider boundary for the NORMAL (non-clean-room) path.
+//
+// PROVIDER_KEY_ENV above promises a child gets ONLY the key its envelope's provider
+// authenticates with. That promise was kept exclusively inside cleanRoomEnv, and the normal path
+// passed `env: undefined` to the child -- meaning INHERIT EVERYTHING, every provider key the
+// daemon holds. Clean-room mode is additionally refused under a Governor, so in the governed
+// configuration the boundary never executed at all: it was a guard that existed, was correct,
+// and sat on a path that does not run where it matters. What actually kept a child off another
+// provider was which keys happened to be ABSENT from the box, which is an accident, not a
+// boundary.
+//
+// This is deliberately SUBTRACTIVE rather than an allowlist rebuild. cleanRoomEnv also rewrites
+// HOME, TMPDIR and the agent slot, which is right for a clean room and would be a far larger
+// behaviour change than this defect warrants on the normal path. So: inherit as before, then
+// remove every provider key that is not this envelope's.
+//
+// Fails closed on an unknown provider: `keep` is empty, so ALL provider keys are stripped and
+// the launcher refuses for want of a credential, exactly as it does today for an unknown
+// provider in a clean room.
+export function providerScopedEnv({ base = process.env, provider }) {
+  // Object.hasOwn, not a bare lookup: PROVIDER_KEY_ENV["__proto__"] resolves through the
+  // prototype chain and returns Object.prototype, so `?? []` never fires and the Set
+  // constructor throws on a non-iterable. Found by the unknown-provider test below.
+  const keep = new Set(Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : []);
+  const env = { ...base };
+  for (const keys of Object.values(PROVIDER_KEY_ENV)) {
+    for (const key of keys) if (!keep.has(key)) delete env[key];
+  }
+  return env;
+}
+
+// The single decision about what environment a child gets, on EITHER path.
+//
+// This exists as a named function rather than a ternary at the call site because the first
+// version of this fix was tested past the seam: the unit tests covered providerScopedEnv and
+// reverting the CALL SITE to `env: undefined` -- the exact original fail-open -- left every one
+// of them green. Testing the helper while leaving the wiring untested means the wiring is the
+// only part that can silently regress, and the wiring is what was broken in the first place.
+export function childEnv({ base = process.env, cleanRoom, provider, homeDir, tmpDir }) {
+  return cleanRoom
+    ? cleanRoomEnv({ base, provider, homeDir, tmpDir })
+    : providerScopedEnv({ base, provider });
+}
+
 // The child's agent slot (auth.json, sessions, settings): a dir inside the per-attempt HOME.
 export function attemptAgentDir(homeDir) {
   return join(homeDir, "agent");
@@ -113,7 +157,9 @@ export function cleanRoomEnv({ base = process.env, provider, homeDir, tmpDir }) 
   if (!homeDir || !tmpDir) throw new Error("cleanRoomEnv needs a per-attempt homeDir and tmpDir");
   const env = {};
   for (const key of CLEAN_ROOM_ENV_ALLOWLIST) if (base[key] !== undefined) env[key] = base[key];
-  for (const key of PROVIDER_KEY_ENV[provider] ?? []) if (base[key] !== undefined) env[key] = base[key];
+  // Same prototype-chain hazard as providerScopedEnv below.
+  const providerKeys = Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : [];
+  for (const key of providerKeys) if (base[key] !== undefined) env[key] = base[key];
   const vinciHome = base.VINCI_HOME ?? (base.HOME ? join(base.HOME, ".vinci-code") : undefined);
   if (vinciHome !== undefined) env.VINCI_HOME = vinciHome;
   env.HOME = homeDir;
