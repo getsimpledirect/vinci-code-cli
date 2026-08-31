@@ -227,11 +227,7 @@ await test("T6 early terminal blockers (past deadline, governor refusal, envelop
     );
     const code = await new Promise((resolveClose) => proc.once("close", resolveClose));
     assert.equal(code, 0);
-    // Locate by what the post IS, not by a kind: terminal records post as
-    // `status` now (CONTRACT 16.2/16.7 -- a finished task can never receive
-    // the ruling that closes an open decision). The assertions below are all
-    // on the body, which is what this test is actually about.
-    const blocker = refused.getPostedMessages().find((post) => /task \S+ (blocked|failed)/.test(post.subject ?? ""));
+    const blocker = refused.getPostedMessages().find((post) => post.kind === "blocker");
     assert.ok(blocker, JSON.stringify(refused.getPostedMessages()));
     assert.match(blocker.body, /Governor refused the lease/);
     assert.match(blocker.body, WORKER_BUILD_TAG, blocker.body);

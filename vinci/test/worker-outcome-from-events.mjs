@@ -129,7 +129,7 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
     assert.deepEqual(t1.state.harness_stop, { count: 1, reason: LATCH_REASON }, "T1: harness_stop recorded on the task");
     assert.equal(t1.state.outcome.state, "DONE", "T1: the narrative stays on the record next to the stop");
     const final = t1.posts.at(-1);
-    assert.equal(final.kind, "status");
+    assert.equal(final.kind, "blocker");
     assert.equal(final.subject, "task t1 blocked");
     assert.match(final.body, /stop=instrument/, "T1: the blocker post must say it was an instrument stop");
     assert.match(final.body, /harness_stops=1/);
@@ -147,7 +147,7 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
   assert.equal(t2.state.pr, null);
   assert.deepEqual(t2.state.harness_stop, { count: 2, reason: RESERVE_REASON });
   const final = t2.posts.at(-1);
-  assert.equal(final.kind, "status");
+  assert.equal(final.kind, "blocker");
   assert.match(final.body, /stop=instrument harness_stops=2 /);
   assert.ok(final.body.includes(`instrument stop: ${RESERVE_REASON}`));
 }
@@ -176,7 +176,7 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
   assert.equal(t5.state.state, "FAILED");
   assert.equal(t5.state.exit_code, 1);
   assert.deepEqual(t5.state.harness_stop, { count: 2, reason: RESERVE_REASON }, "T5: the stop is recorded even though exit code outranked it");
-  assert.equal(t5.posts.at(-1).kind, "status");
+  assert.equal(t5.posts.at(-1).kind, "blocker");
   assert.match(t5.posts.at(-1).body, /state=FAILED .*harness_stops=2/, "T5: FAILED post carries the stop count");
   assert.ok(
     t5.posts.at(-1).body.includes(`harness_stop_reason=${RESERVE_REASON}`),

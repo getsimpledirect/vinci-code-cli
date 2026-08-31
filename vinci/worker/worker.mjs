@@ -428,38 +428,6 @@ function terminalPostBody(details) {
   return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
 
-  // TERMINAL RECORDS POST AS `status`, NOT `blocker`. CONTRACT 16.2 makes
-  // blocker and question the only kinds that become OPEN DECISIONS under
-  // 16.7: they stay open until a ruling appears in the reply chain, they age,
-  // and they escalate. A terminal task record can never receive such a ruling
-  // -- the task is already over -- so every one filed as `blocker` became a
-  // permanent, un-closeable open decision.
-  //
-  // Measured 2026-08-31: of 318 blocker-kind messages on the bus, 168 were
-  // from workers and ALL 168 were terminal records ("task <id> blocked|
-  // failed", 111 + 57) -- 53% of every blocker on the bus, and not one of
-  // them a request for a decision. From the other side, 105 of 139 governor
-  // rulings were G-1 cleaning these up: 76% of that layer's output
-  // compensating for this one producer.
-  //
-  // `status` is what 16.2 defines for exactly this: "work passed on, or a
-  // position change". If a future case genuinely needs a human to decide
-  // something, it must post a blocker DELIBERATELY and must not be terminal
-  // -- a blocker whose task has already ended is unanswerable by construction.
-  // Ruled under G-9.reversible-inside-envelope-proceed (ask msg_ee715f03).
-  //
-  // The Governor lease-refused / lease-unavailable exits below are terminal
-  // too, and they are the sharpest illustration of the harm. On 2026-08-28 two
-  // of them posted "Governor unavailable/invalid: governor token missing" and
-  // "... ECONNREFUSED". Filed as blockers they never closed, so 48 hours later
-  // a peer read them as an ONGOING failure and reported the fleet as broken.
-  // It was an 11-minute incident on a build that no longer runs, and the path
-  // had since been disabled. The un-closeable record manufactured the
-  // misreading -- the defect is not only noise, it is false signal.
-  //
-  // A persistent Governor outage does deserve a human. That belongs to
-  // whatever notices the PATTERN, as one deliberate blocker, not to each
-  // individual task -- which is how 168 of them accumulated.
 async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
@@ -512,7 +480,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     // soak ledger attributes the block to the instrument, not to the model's own narrative.
     const stop = state.harness_stop;
     await bus.post(
-      "status",
+      "blocker",
       subject,
       terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`),
       options,
@@ -524,7 +492,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
       ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
       : details;
     const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
-    await bus.post("status", subject, terminalPostBody(reason), options);
+    await bus.post("blocker", subject, terminalPostBody(reason), options);
   } else {
     const statusBody = state.outcome?.reason
       ? terminalPostBody(`${details} reason=${state.outcome.reason}`)
@@ -554,7 +522,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   try {
     assertTaskId(taskId);
   } catch (error) {
-    await bus.post("status", `task ${taskId} blocked`, terminalPostBody(error.message), { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(error.message), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -576,7 +544,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
       outcome: { reason: error.message },
     });
-    await bus.post("status", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
+    await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
       inReplyTo: message.message_id,
     });
     return true;
@@ -585,7 +553,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild, vinciBinary });
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
-    await bus.post("status", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -595,7 +563,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   if (envelope.base_ref !== undefined && envelope.base_ref !== "main") {
     const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; the branch is forked from origin/main and a PR against another base would not share its fork point`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
-    await bus.post("status", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -628,7 +596,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       : governorUrl ? "a Governor fence" : "a branch lease";
     const reason = "clean_room_publish_unsupported: --clean-room publishes from the bare cache, which does not honour " + which + " and lacks the idempotent-retry, lease, read-back, foreign-PR and PR-head guarantees of the standard publisher; refusing before the run rather than publishing under guarantees that are not in force";
     lifecycle.transition("BLOCKED", { outcome: { reason } });
-    await bus.post("status", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -786,7 +754,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         const governor = acquired.leased ? "leased" : acquired.refused ? "refused" : "unavailable";
         const label = acquired.leased ? "Governor lease held elsewhere" : acquired.refused ? "Governor refused the lease" : "Governor lease unavailable";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
-        await bus.post("status", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
           inReplyTo: message.message_id,
         });
         return true;
@@ -830,7 +798,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor }, lease: { ...lifecycle.snapshot().lease, ...lease } });
         await releaseLease("BLOCKED");
-        await bus.post("status", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
           inReplyTo: message.message_id,
         });
         return true;

@@ -100,7 +100,7 @@ const test = async () => {
     await new Promise(r => { proc.on('close', r); });
 
     const posts = fixture.getPostedMessages();
-    const blockerPost = posts.find(p => /task \S+ (blocked|failed)/.test(p.subject ?? ''));
+    const blockerPost = posts.find(p => p.kind === 'blocker');
     assert(blockerPost, 'should post blocker for past deadline');
     assert.equal(fixture.getVinciCalls().length, 0, 'past deadline must not invoke vinci');
   } finally {

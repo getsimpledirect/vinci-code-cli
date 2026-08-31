@@ -223,7 +223,7 @@ await testRun('BLOCKED keeps its state on evidence failure but records evidence_
     assert.equal(onDisk.state, 'BLOCKED');
     assert.equal(onDisk.evidence_error, 'S3 upload failed');
     const final = fixture.getPostedMessages().at(-1);
-    assert.equal(final.kind, 'status');
+    assert.equal(final.kind, 'blocker');
     assert.match(final.body, / evidence_error=S3 upload failed/);
   } finally {
     await fixture.cleanup();
