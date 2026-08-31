@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { replayPending } from "./outbox.mjs";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, noCommitOutcome, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
@@ -1358,7 +1359,7 @@ async function main() {
   process.once("SIGTERM", handleSignal);
   process.once("SIGINT", handleSignal);
   try {
-    const bus = new BusClient(options.server, options.token);
+    const bus = new BusClient(options.server, options.token, 100, join(options.stateDir, "outbox"));
     // W0.5: record the server's build next to our own and announce both ONCE per daemon start,
     // before the first poll. A failed /v1/version fetch is recorded, never fatal: the bus
     // token check and the first poll already gate startup.
@@ -1384,6 +1385,30 @@ async function main() {
         ? "ENFORCED -- acquire/check/release around every push"
         : "OFF (set VINCI_BRANCH_LEASE=1 to enforce); pushes are not fenced by a branch lease"}\n`,
     );
+    // ANY TERMINAL RECORD THAT NEVER REACHED THE BUS IS SETTLED FIRST, before
+    // this daemon claims new work. The worker transitions a task to a terminal
+    // state and then announces it, and those steps are not atomic: a bus
+    // failure or a crash between them left the task terminal and unannounced,
+    // and the restart skipped it precisely BECAUSE it was already terminal.
+    // Replay runs before the poll loop so a failure that happened while we were
+    // down is visible before anything new can bury it.
+    //
+    // It never throws: a bus that is still unreachable must not stop the worker
+    // from starting, and the records stay on disk for the next attempt.
+    // The SAME directory the bus records into -- read off the bus rather than
+    // rebuilt from options, so the two can never drift apart.
+    const replayed = await replayPending(bus, bus.outboxDir, {
+      warn: (m) => process.stderr.write(`${m}\n`),
+      error: (m) => process.stderr.write(`${m}\n`),
+    });
+    if (replayed.attempted || replayed.corrupt) {
+      process.stderr.write(
+        `vinci worker: terminal outbox -- attempted ${replayed.attempted}, `
+        + `delivered ${replayed.delivered}, failed ${replayed.failed}, `
+        + `unreadable ${replayed.corrupt}\n`,
+      );
+    }
+
     // A change since the last announced binary (e.g. an update while the daemon was down, or a
     // change whose post failed before a restart) is announced here, once.
     await announceBinaryChange(bus, options.stateDir, options.id);

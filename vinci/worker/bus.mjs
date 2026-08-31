@@ -1,3 +1,5 @@
+import { DEFAULT_OUTBOX_DIR, clearPending, recordPending } from "./outbox.mjs";
+
 const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 // A terminal record says the task is OVER. The consumer keys human attention on
@@ -43,7 +45,7 @@ export function normaliseMessage(message) {
 }
 
 export class BusClient {
-  constructor(serverUrl, token, pageSize = 100) {
+  constructor(serverUrl, token, pageSize = 100, outboxDir = null) {
     const url = new URL(serverUrl);
     if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("server must use http or https");
     if (url.username || url.password) throw new Error("server URL must not contain credentials");
@@ -51,6 +53,12 @@ export class BusClient {
     this.serverUrl = url.href.replace(/\/$/, "");
     this.token = token;
     this.pageSize = pageSize;
+    // Where undelivered terminal records are parked. Settable because the
+    // worker keeps its durable state under --state-dir, and a default that
+    // wrote to the process cwd would park records somewhere the replay at
+    // startup does not read -- an outbox written to one place and replayed
+    // from another is an inert fix that looks like a working one.
+    this.outboxDir = outboxDir ?? DEFAULT_OUTBOX_DIR;
   }
 
   async poll(workerId, cursor = null) {
@@ -142,6 +150,16 @@ export class BusClient {
         `a terminal record must carry a typed outcome (${[...TERMINAL_OUTCOMES].join(", ")}); got ${options.outcome}`,
       );
     }
-    return this.post(kind, subject, body, options);
+    // RECORDED BEFORE THE ATTEMPT, cleared only after it succeeds, so anything
+    // left on disk is by definition undelivered. The worker transitions its
+    // lifecycle to terminal and THEN announces it, and those two steps are not
+    // atomic: without this, a transient bus failure left the task terminal and
+    // unannounced, and a restart skipped it precisely because it was already
+    // terminal. A typed terminal outcome exists so a failure is VISIBLE without
+    // being an open decision -- undelivered, it is neither.
+    const pendingId = recordPending({ kind, subject, body, options }, this.outboxDir);
+    const result = await this.post(kind, subject, body, options);
+    clearPending(pendingId, this.outboxDir);
+    return result;
   }
 }
