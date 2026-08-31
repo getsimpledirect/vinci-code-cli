@@ -38,7 +38,10 @@ const FULL = Object.freeze({
   GEMINI_API_KEY: "gemini-secret",
   AWS_ACCESS_KEY_ID: "aws-access-secret",
   AWS_SECRET_ACCESS_KEY: "aws-secret",
+  GCLOUD_PROJECT: "gcloud-project",
   GOOGLE_APPLICATION_CREDENTIALS: "/home/jovyan/google.json",
+  GOOGLE_CLOUD_LOCATION: "us-central1",
+  GOOGLE_CLOUD_PROJECT: "google-cloud-project",
   VINCI_CODING_AGENT_DIR: "/home/jovyan/.vinci/agent",
   PI_CODING_AGENT_DIR: "/home/jovyan/.pi/agent",
 });
@@ -97,15 +100,15 @@ test("every provider in the map is covered by the boundary", () => {
   }
 });
 
-test("the credential-removal inventory covers every bundled provider env key", () => {
+test("the removal inventory covers every bundled provider auth env value", () => {
   const source = readFileSync(join(ROOT, "packages/ai/src/env-api-keys.ts"), "utf8");
   const bundled = new Set(
-    [...source.matchAll(/["']([A-Z][A-Z0-9_]*(?:API_KEY|OAUTH_TOKEN|GITHUB_TOKEN)|HF_TOKEN)["']/g)]
-      .map((match) => match[1]),
+    [...source.matchAll(/["']([A-Z][A-Z0-9_]+)["']/g)].map((match) => match[1]),
   );
+  assert.ok(bundled.size >= 40, "the independent provider-auth inventory parser must not narrow silently");
   const removed = new Set(PROVIDER_CREDENTIAL_ENV);
   for (const credential of bundled) {
-    assert.equal(removed.has(credential), true, `${credential} is a bundled provider credential and must be removed unless explicitly selected`);
+    assert.equal(removed.has(credential), true, `${credential} affects bundled provider authentication and must be removed unless explicitly selected`);
   }
 });
 
@@ -178,7 +181,10 @@ test("daemon blocks a disallowed provider before clone or spawn", async () => {
     assert.match(state.outcome.reason, /^provider_not_allowed:/);
     assert.equal(existsSync(join(fixture.tempDir, "repos")), false, "provider refusal must happen before clone");
     assert.equal(fixture.getVinciCalls().length, 0, "provider refusal must happen before spawn");
-    assert.match(fixture.getPostedMessages().at(-1).body, /VINCI_WORKER_ALLOWED_PROVIDERS=openrouter/);
+    const refusal = fixture.getPostedMessages().at(-1);
+    assert.equal(refusal.kind, "status", "terminal refusal must not create an open blocker decision");
+    assert.equal(refusal.outcome, "BLOCKED");
+    assert.match(refusal.body, /VINCI_WORKER_ALLOWED_PROVIDERS=openrouter/);
     const online = fixture.getPostedMessages().find((message) => message.subject === "worker w1 online");
     assert.match(online.body, /allowed_providers=openrouter/);
   } finally {

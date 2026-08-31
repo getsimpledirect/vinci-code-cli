@@ -1,5 +1,15 @@
 const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
+// A terminal record says the task is OVER. The consumer keys human attention on
+// `outcome !== "COMPLETED"`, so this field is load-bearing: it is what lets a failure be
+// VISIBLE without being an open decision. Posting a terminal record without one is a hard
+// error rather than a default, because an unclassified terminal that posts anyway is the
+// same fail-open the typed outcome exists to remove.
+// UNVERIFIED is finalState's DEFAULT fall-through -- "produced, unassessed" -- not an edge
+// case, so leaving it untyped left the most COMMON non-success terminal with a null outcome
+// and therefore invisible to a consumer that keys attention on `outcome !== "COMPLETED"`.
+const TERMINAL_OUTCOMES = new Set(["COMPLETED", "FAILED", "BLOCKED", "REFUSED", "UNVERIFIED"]);
+
 export function isLedgerRef(value) {
   return typeof value === "string" && LEDGER_REF.test(value);
 }
@@ -100,6 +110,9 @@ export class BusClient {
     if (kind !== "status" && kind !== "finding" && kind !== "blocker") {
       throw new Error(`worker cannot post message kind ${kind}`);
     }
+    if (options.outcome !== undefined && !TERMINAL_OUTCOMES.has(options.outcome)) {
+      throw new Error(`worker outcome must be one of ${[...TERMINAL_OUTCOMES].join(", ")} (got ${options.outcome})`);
+    }
     if (options.refs !== undefined && (!Array.isArray(options.refs) || options.refs.some((ref) => !isLedgerRef(ref)))) {
       throw new Error("worker refs must be job_, exp_, or bk_ ledger refs");
     }
@@ -108,6 +121,7 @@ export class BusClient {
     }
     const url = `${this.serverUrl}/v1/messages`;
     const payload = { kind, subject, body };
+    if (options.outcome !== undefined) payload.outcome = options.outcome;
     if (options.refs !== undefined) payload.refs = options.refs;
     if (options.inReplyTo !== undefined) payload.in_reply_to = options.inReplyTo;
     const response = await fetch(url, {
@@ -118,5 +132,16 @@ export class BusClient {
     if (!response.ok) throw new Error(`bus POST ${url} failed: ${response.status} ${await response.text()}`);
     const text = await response.text();
     return text ? JSON.parse(text) : undefined;
+  }
+
+  // The ONLY sanctioned way to announce that a task has ended. Requires the typed outcome, so a
+  // terminal record cannot be posted without one by construction rather than by convention.
+  async postTerminal(kind, subject, body, options = {}) {
+    if (!TERMINAL_OUTCOMES.has(options.outcome)) {
+      throw new Error(
+        `a terminal record must carry a typed outcome (${[...TERMINAL_OUTCOMES].join(", ")}); got ${options.outcome}`,
+      );
+    }
+    return this.post(kind, subject, body, options);
   }
 }

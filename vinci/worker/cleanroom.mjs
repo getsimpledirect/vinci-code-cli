@@ -50,6 +50,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, st
 import { dirname, join } from "node:path";
 
 import { classifyDivergedLocal, command, readHeadBlocker, renameBranchAside } from "./run.mjs";
+import { prTitle } from "./publisher.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
@@ -104,11 +105,12 @@ export const PROVIDER_KEY_ENV = Object.freeze({
   deepinfra: ["VINCI_INTERNAL_DEEPINFRA_API_KEY"],
 });
 
-// Every provider credential the bundled coding agent knows how to resolve from the environment,
-// plus Vinci's managed/internal keys. This inventory is intentionally broader than
-// PROVIDER_KEY_ENV: the latter names what an envelope may KEEP, while this list names what must be
-// REMOVED. Keeping only the three envelope keys in the removal inventory was fail-open — an
-// OpenRouter child still received Anthropic, OpenAI and public DeepInfra credentials.
+// Every provider credential and authentication-routing value the bundled coding agent knows how
+// to resolve from the environment, plus Vinci's managed/internal keys. This inventory is
+// intentionally broader than PROVIDER_KEY_ENV: the latter names what an envelope may KEEP, while
+// this list names what must be REMOVED. Keeping only the three envelope keys in the removal
+// inventory was fail-open — an OpenRouter child still received Anthropic, OpenAI and public
+// DeepInfra credentials.
 export const PROVIDER_CREDENTIAL_ENV = Object.freeze([
   "AI_GATEWAY_API_KEY",
   "ANTHROPIC_API_KEY",
@@ -129,9 +131,12 @@ export const PROVIDER_CREDENTIAL_ENV = Object.freeze([
   "DEEPINFRA_API_KEY",
   "DEEPSEEK_API_KEY",
   "FIREWORKS_API_KEY",
+  "GCLOUD_PROJECT",
   "GEMINI_API_KEY",
   "GOOGLE_APPLICATION_CREDENTIALS",
   "GOOGLE_CLOUD_API_KEY",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_CLOUD_PROJECT",
   "GROQ_API_KEY",
   "HF_TOKEN",
   "KIMI_API_KEY",
@@ -544,7 +549,7 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
 // would not do: pushurl is multi-valued, -c appends, and git still tries /dev/null first) with
 // `--no-verify` to skip the hook. Nothing in the cache is rewritten. The attempt dir is only READ
 // (HEAD:BLOCKER.md). `gh` is pointed at the repo with -R, so it never needs a working tree either.
-export async function publishFromCache({ envelope, cacheDir, attemptDir, branch, taskId, limitTripped }) {
+export async function publishFromCache({ envelope, cacheDir, attemptDir, branch, taskId, limitTripped, prEligible = true, objective = null }) {
   const blockerReason = await readHeadBlocker(attemptDir);
   const originUrl = await command("git", ["-C", cacheDir, "config", "--get", "remote.origin.url"], { allowFailure: true });
   const push = originUrl.status === 0 && originUrl.stdout
@@ -554,10 +559,26 @@ export async function publishFromCache({ envelope, cacheDir, attemptDir, branch,
   if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
   if (limitTripped) return result;
   if (push.status !== 0 || envelope.evidence !== "pr") return result;
+  // The PR gate, same as the standard publisher. An earlier version of this function relied on
+  // the blocker and limitTripped checks above and a comment calling them "this path's
+  // equivalent of the eligibility gate". They are not equivalent: finalState also refuses
+  // COMPLETED on a harness stop, on outcome.state !== DONE, and on no_commit, none of which
+  // are checked here. So a clean-room run that stopped at the instrument or produced no commit
+  // would have opened a PR titled COMPLETED. The branch is already pushed above, so refusing
+  // here loses no evidence -- it only withholds the review request.
+  if (!prEligible) return result;
 
   const created = await command(
     "gh",
-    ["pr", "create", "-R", envelope.repo, "--base", "main", "--head", branch, "--title", `Worker task ${taskId}`, "--body", `Unattended Vinci worker result for task ${taskId}.`],
+    ["pr", "create", "-R", envelope.repo, "--base", "main", "--head", branch, "--title", prTitle({
+       taskId,
+       objective: objective ?? (typeof envelope.spec === "string" ? envelope.spec : null),
+       // Reached only when prEligible, i.e. finalState would return COMPLETED but for the PR
+       // itself. The gate is above; this is not asserting the outcome, it is reporting it.
+       outcome: "COMPLETED",
+       head: null,
+       ref: envelope.ref ?? null,
+     }), "--body", `Unattended Vinci worker result for task ${taskId}.`],
     { cwd: cacheDir, allowFailure: true },
   );
   if (created.status === 0) result.pr = created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null;
