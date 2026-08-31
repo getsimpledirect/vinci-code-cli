@@ -50,6 +50,36 @@ export function prBodyFooter({ taskId, attempt, head, baseRef, fence }) {
 // Exported so every consequential side effect in the worker asks a fence the SAME way — the
 // publisher's push and PR, and the evidence POST (evidence.mjs). One implementation means one
 // answer to "what does a throwing check mean" (fail closed) rather than two that can drift.
+// Two fences now gate a push and neither implies the other: the §29 work-lease
+// (may this ATTEMPT still work) and the §36 branch lease (may this lane write
+// this BRANCH). Composing them keeps publish()'s single `fence` slot, so the
+// gate contract is unchanged and there is no second code path to keep honest.
+//
+// Order is deliberate: the first invalid verdict wins and short-circuits, so a
+// refusal names the fence that actually refused rather than whichever answered
+// last. Nulls are dropped, and composing NOTHING yields null -- not a fence
+// that says yes. A composer that returned an always-valid fence would convert
+// "no gates configured" into "all gates passed", which is the exact fail-open
+// shape §36 exists to remove.
+export function composeFences(...fences) {
+  const live = fences.filter((f) => f && typeof f.check === "function");
+  if (live.length === 0) return null;
+  if (live.length === 1) return live[0];
+  return {
+    generation: live[0].generation,
+    composed: live.length,
+    check: async ({ stage } = {}) => {
+      for (const fence of live) {
+        const verdict = await fence.check({ stage });
+        if (!verdict || verdict.valid !== true) {
+          return { valid: false, reason: verdict?.reason ?? "fence returned no verdict" };
+        }
+      }
+      return { valid: true };
+    },
+  };
+}
+
 export async function checkFence(fence, stage) {
   if (!fence || typeof fence.check !== "function") return { valid: true };
   try {
@@ -234,7 +264,7 @@ export async function publish({
       const text = `${push.stderr ?? ""}\n${push.stdout ?? ""}`;
       if (/stale info|rejected|fetch first|non-fast-forward/i.test(text)) {
         const after = await remoteBranchSha({ repoDir, branch, exec });
-        return { ...record, publish: "remote_moved", remote_sha_after: after.sha, refusal_reason: `origin/${branch} moved after it was sampled at ${remote.sha ?? "absent"}; lease rejected the push, nothing forced` };
+        return { ...record, publish: "remote_moved", remote_sha_after: after.sha, refusal_reason: `origin/${branch} moved after it was sampled at ${remote.sha ?? "absent"}; git --force-with-lease rejected the push, nothing forced (this is git\u2019s sha comparison, NOT a \u00a736 branch lease)` };
       }
       return { ...record, publish: "push_failed", push_error: push.stderr || `git push exited ${push.status}` };
     }

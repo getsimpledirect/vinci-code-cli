@@ -17,6 +17,8 @@ import { cleanRoomEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenc
 import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits, unattendedPolicyEnv } from "./governor.mjs";
 import { DECLARATION_REFRESH_DEFAULT_S, LEASE_TIMEOUT_MS, LeaseClient, buildDeclaration, declarationBody, declarationDigest, leaseSubject, releaseOutcome, startHeartbeat } from "./lease.mjs";
+import { BranchLeaseClient, branchLeaseFence } from "./branch-lease.mjs";
+import { composeFences } from "./publisher.mjs";
 import { readSessionState, summarizeUnattendedPolicy } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
@@ -118,6 +120,30 @@ async function postCapabilityDeclaration(bus, options, { throwOnFailure = false 
 // (`abandoned`) before the process exits. Entries are added right after acquire and removed by
 // the task's own release; the set is empty whenever no governed task is in flight.
 const activeLeases = new Set();
+
+// The same promise for §36 branch leases, raised in adversarial review of #43:
+// activeLeases holds only Governor work-leases, so a SIGTERM left a branch
+// lease held until its TTL expired (default 3600s) and blocked every other
+// writer on (repo, branch) for an hour after the daemon was already gone. A
+// lease that outlives the process holding it is a stall, not a leak.
+// Entries are {client, lease} added right after acquire and removed by the
+// task's own release.
+const activeBranchLeases = new Set();
+
+async function releaseActiveBranchLeases(signal) {
+  for (const entry of [...activeBranchLeases]) {
+    activeBranchLeases.delete(entry);
+    const l = entry.lease || {};
+    process.stderr.write(`vinci worker: ${signal}: releasing branch lease ${l.repo}#${l.branch} gen ${l.fencing_generation}\n`);
+    try {
+      await entry.client.release({ repo: l.repo, branch: l.branch, fencingGeneration: l.fencing_generation });
+    } catch (error) {
+      // Shutdown must not be blocked by a release that cannot complete; the
+      // TTL is the backstop. Say so rather than exiting silently.
+      process.stderr.write(`vinci worker: ${signal}: branch lease release failed (${error.message}); it will expire at TTL\n`);
+    }
+  }
+}
 
 // Bounded shutdown of every active lease: stop the heartbeat, wait for a renew in flight, release
 // `abandoned`, then SIGTERM the child so nothing keeps working under a released lease. The whole
@@ -505,6 +531,12 @@ async function postFinal(bus, message, envelope, state, evidence) {
 // inside this function, so it is constructed below once a lease is held and handed to publish()
 // in main's shape. The option remains for a caller that wants to inject one (tests do).
 async function processHandoff(bus, stateDir, message, governorUrl, workerId, { fence: injectedFence = null, cleanRoom = null, subjectOf = leaseSubject } = {}) {
+  // Known BEFORE the run, like governorUrl and for the same reason: the
+  // clean-room guard below cannot test the fence object (it closes over a
+  // lease acquired much further down, so `cleanRoom && branchFence` would be
+  // permanently false -- a refusal that reads as enforced and never fires).
+  const branchLeaseEnabled =
+    process.env.VINCI_BRANCH_LEASE === "1" && Boolean(bus?.serverUrl) && Boolean(bus?.token);
   const taskId = message.message_id;
   try {
     assertTaskId(taskId);
@@ -573,8 +605,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   // `cleanRoom && fence` would have stayed permanently false — a refusal that reads as enforced
   // and never fires. A configured Governor is exactly "a fence will be in force", and it is known
   // BEFORE the run, which is what this guard promises.
-  if (cleanRoom && governorUrl) {
-    const reason = "clean_room_publish_unsupported: --clean-room publishes from the bare cache, which does not honour a Governor fence and lacks the idempotent-retry, lease, read-back, foreign-PR and PR-head guarantees of the standard publisher; refusing before the run rather than publishing under guarantees that are not in force";
+  // Branch leases join this guard for the same reason, found in adversarial
+  // review of #43: publishFromCache() takes NO fence parameter and does a raw
+  // `git push --no-verify`. Acquiring a branch lease and then publishing
+  // through that path is worse than not taking one -- it blocks every other
+  // writer on (repo, branch) and does not honour the lease itself. Refuse
+  // before the run rather than hold authority we do not enforce.
+  if (cleanRoom && (governorUrl || branchLeaseEnabled)) {
+    const which = governorUrl && branchLeaseEnabled ? "a Governor fence or a branch lease"
+      : governorUrl ? "a Governor fence" : "a branch lease";
+    const reason = "clean_room_publish_unsupported: --clean-room publishes from the bare cache, which does not honour " + which + " and lacks the idempotent-retry, lease, read-back, foreign-PR and PR-head guarantees of the standard publisher; refusing before the run rather than publishing under guarantees that are not in force";
     lifecycle.transition("BLOCKED", { outcome: { reason } });
     await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
@@ -597,7 +637,35 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   let fencedOutReason = null;
   const abortController = new AbortController();
   let leaseEntry = null;
+  // §36 branch lease. Declared HERE, above releaseLease, because releaseLease
+  // runs on paths that precede acquisition (the clone-time BLOCKED exits) and a
+  // `let` declared later would be in its temporal dead zone -- a ReferenceError
+  // on the failure path only, which is the half nobody exercises by hand.
+  let branchLease = null;
+  let branchFence = null;
+  let branchLeaseEntry = null;
+  // Same server and token as the bus: /v1/branch-leases takes the collector or
+  // admin principal, which is what the bus token already is.
+  //
+  // EXPLICIT OPT-IN (VINCI_BRANCH_LEASE=1), and the reason is measured, not
+  // cautious. An earlier revision of this defaulted ON, reasoning that a gate
+  // which is off by default is the inert guard §36.5 describes. Running the
+  // suite refuted it: all four variants of worker-no-commit-outcome failed and
+  // the process hung, because defaulting ON makes every existing caller perform
+  // a new network call, and a fail-closed acquire against an unreachable server
+  // correctly BLOCKS the attempt. That is the right behaviour and the wrong
+  // default -- on the live push path it would refuse real work whenever the
+  // control server blinked.
+  //
+  // This is NOT left inert: the deploy sets it (deploy/worker-box), and F5's W0
+  // cohort is where it gets switched on and observed. A gate nobody enables is
+  // still the defect; the fix is to enable it deliberately and prove it bit,
+  // not to enable it by surprise under everyone already running.
+  const branchLeases = branchLeaseEnabled ? new BranchLeaseClient(bus.serverUrl, bus.token) : null;
   const releaseLease = async (state) => {
+    // The branch lease is released even when there is no work lease: the two are
+    // independent, and an ungoverned worker still holds a branch.
+    await releaseBranchLease();
     if (!lease || !leaseClient) return;
     if (leaseEntry) activeLeases.delete(leaseEntry);
     // F5: stop the heartbeat AND wait for a renew already in flight, so the Governor never sees
@@ -609,6 +677,28 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     const held = lease;
     lease = null;
     await leaseClient.release(held, releaseOutcome(state, { authorityLost: Boolean(authorityLost || fencedOutReason) }));
+  };
+  // Released on EVERY terminal, by riding the work-lease release, which already
+  // covers the success path (933) and both failure paths (939, 943) as well as
+  // the three early BLOCKED exits. A branch lease that outlives its attempt
+  // blocks the next writer until it expires, so the failure to release is a
+  // stall, not a leak -- and it must never be able to fail the attempt it is
+  // cleaning up after, hence the swallow. It is recorded, not silent.
+  const releaseBranchLease = async () => {
+    if (!branchLeases || !branchLease) return;
+    const held = branchLease;
+    branchLease = null;
+    branchFence = null;
+    if (branchLeaseEntry) { activeBranchLeases.delete(branchLeaseEntry); branchLeaseEntry = null; }
+    try {
+      await branchLeases.release({
+        repo: held.repo,
+        branch: held.branch,
+        fencingGeneration: held.fencing_generation,
+      });
+    } catch (error) {
+      process.stderr.write(`vinci worker: branch lease release failed (${held.repo}#${held.branch} gen ${held.fencing_generation}): ${error.message}\n`);
+    }
   };
   // L3: the publisher's fence, in publisher.mjs's shape — `{ generation, check({stage}) }`.
   //
@@ -770,6 +860,48 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
           }
         : {}),
     });
+    // --- §36 branch lease: claim (repo, branch) for the whole attempt ---------
+    // Acquired HERE, not immediately before the push: the guarantee §36 sells is
+    // one writer per branch, and a lease taken at push time leaves the whole run
+    // unprotected. head_sha is the base commit, which is what makes the detector
+    // work -- a later observation of a different head while this lease is live is
+    // a foreign write, reported without this lane's cooperation.
+    //
+    // Refusal is a REFUSAL, not a warning: if another lane holds the branch this
+    // attempt does not run. That is the entire point, and it is why the failure
+    // path below is a terminal transition rather than a log line.
+    if (branchLeases) {
+      let acquired;
+      try {
+        acquired = await branchLeases.acquire({
+          repo: envelopeToUse.repo,
+          branch: repository.branch,
+          sessionId: attempt.sessionId,
+          attemptId: String(attempt.attempt),
+          headSha: repository.baseCommit ?? "",
+        });
+      } catch (error) {
+        // Unreachable server is not permission to write. Refuse and say so.
+        acquired = { ok: false, reason: `branch lease unavailable: ${error.message}` };
+      }
+      if (!acquired.ok) {
+        const reason = `branch_lease_refused: ${acquired.reason}`;
+        lifecycle.transition("BLOCKED", { outcome: { reason }, publish: "skipped", pr: null, fenced_out: reason });
+        await releaseLease("BLOCKED");
+        await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null);
+        return true;
+      }
+      branchLease = acquired.lease;
+      branchLeaseEntry = { client: branchLeases, lease: acquired.lease };
+      activeBranchLeases.add(branchLeaseEntry);
+      branchFence = branchLeaseFence(branchLeases, {
+        repo: envelopeToUse.repo,
+        branch: repository.branch,
+        fencingGeneration: acquired.lease?.fencing_generation,
+      });
+      lifecycle.record({ branch_lease: { fencing_generation: acquired.lease?.fencing_generation ?? null, reason: acquired.reason } });
+    }
+
     if (authorityLost) {
       // The lease was lost while cloning: nothing is spawned. BLOCKED lease_lost, no publish,
       // release `abandoned` — a resumed attempt re-acquires.
@@ -831,7 +963,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         ? await publishFromCache({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, prEligible, objective })
         : await publish({
             envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId,
-            attempt: attempt.attempt, fence: lease ? fence : null,
+            attempt: attempt.attempt, fence: composeFences(lease ? fence : null, branchFence),
             prEligible,
             objective, outcome: prEligible ? "COMPLETED" : null, ref: envelopeToUse.ref ?? null,
           });
@@ -974,7 +1106,7 @@ async function main() {
   const handleSignal = (signal) => {
     if (stopping) return;
     stopping = true;
-    releaseActiveLeases(signal)
+    Promise.all([releaseActiveLeases(signal), releaseActiveBranchLeases(signal)])
       .catch((error) => process.stderr.write(`vinci worker: ${signal}: lease release failed: ${error.message}\n`))
       .finally(() => {
         releaseLock();
@@ -994,7 +1126,18 @@ async function main() {
     await bus.post(
       "status",
       `worker ${options.id} online`,
-      `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`,
+      `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)} vinci_binary=${formatVinciBinary(vinciBinary)} branch_lease=${process.env.VINCI_BRANCH_LEASE === "1" ? "on" : "off"}`,
+    );
+    // Say out loud whether the §36 fence is in force. Raised in adversarial
+    // review of #43: a guard that is off by default is indistinguishable from
+    // one that is on and working, and "we enabled it in the deploy" is a claim
+    // nobody can check from outside the box. Now the online post carries it,
+    // so `vgc msg` and the chaos gate's own build audit both see it, and a
+    // cohort can be graded on whether the fence was actually up.
+    process.stderr.write(
+      `vinci worker: branch leases (CONTRACT §36) ${process.env.VINCI_BRANCH_LEASE === "1"
+        ? "ENFORCED -- acquire/check/release around every push"
+        : "OFF (set VINCI_BRANCH_LEASE=1 to enforce); pushes are not fenced by a branch lease"}\n`,
     );
     // A change since the last announced binary (e.g. an update while the daemon was down, or a
     // change whose post failed before a restart) is announced here, once.
