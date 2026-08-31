@@ -13,8 +13,8 @@ import { join, resolve } from "node:path";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, noCommitOutcome, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
-import { childEnv, cleanRoomEnv, providerScopedEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
-import { assertTaskId, parseEnvelope, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
+import { childEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
+import { assertTaskId, DEFAULT_ALLOWED_PROVIDERS, parseAllowedProviders, parseEnvelope, providerAllowed, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits, unattendedPolicyEnv } from "./governor.mjs";
 import { DECLARATION_REFRESH_DEFAULT_S, LEASE_TIMEOUT_MS, LeaseClient, buildDeclaration, declarationBody, declarationDigest, leaseSubject, releaseOutcome, startHeartbeat } from "./lease.mjs";
 import { BranchLeaseClient, branchLeaseFence } from "./branch-lease.mjs";
@@ -209,7 +209,7 @@ async function announceBinaryChange(bus, stateDir, workerId) {
 }
 
 function usage() {
-  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor] [--clean-room] [--disk-floor-mb 2048] [--keep-attempts 3]";
+  return "Usage: vinci worker start --id <id> --server <url> [--once] [--poll-seconds 60] [--state-dir <dir>] [--governor <url>] [--require-governor] [--clean-room] [--disk-floor-mb 2048] [--keep-attempts 3] (provider policy: VINCI_WORKER_ALLOWED_PROVIDERS=openrouter,...)";
 }
 
 // EX_CONFIG (sysexits.h): the daemon refused to start because its configuration is incomplete.
@@ -223,6 +223,11 @@ function parseArgs(args, env = process.env) {
     stateDir: resolve(".vinci-worker-state"),
     governor: null,
     requireGovernor: env.VINCI_WORKER_REQUIRE_GOVERNOR === "1",
+    allowedProviders: parseAllowedProviders(
+      env.VINCI_WORKER_ALLOWED_PROVIDERS === undefined
+        ? DEFAULT_ALLOWED_PROVIDERS
+        : env.VINCI_WORKER_ALLOWED_PROVIDERS,
+    ),
     // W1 clean room (cleanroom.mjs). OFF by default this wave; `--clean-room` or
     // VINCI_WORKER_CLEAN_ROOM=1 turns it on. The disk floor and retention only apply to it.
     cleanRoom: env.VINCI_WORKER_CLEAN_ROOM === "1",
@@ -511,7 +516,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
 // It is NOT passed in from main(): the fence closes over THIS attempt's lease, which is acquired
 // inside this function, so it is constructed below once a lease is held and handed to publish()
 // in main's shape. The option remains for a caller that wants to inject one (tests do).
-async function processHandoff(bus, stateDir, message, governorUrl, workerId, { fence: injectedFence = null, cleanRoom = null, subjectOf = leaseSubject } = {}) {
+async function processHandoff(bus, stateDir, message, governorUrl, workerId, { fence: injectedFence = null, cleanRoom = null, allowedProviders = parseAllowedProviders(), subjectOf = leaseSubject } = {}) {
   // Known BEFORE the run, like governorUrl and for the same reason: the
   // clean-room guard below cannot test the fence object (it closes over a
   // lease acquired much further down, so `cleanRoom && branchFence` would be
@@ -554,6 +559,17 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
     await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
+    return true;
+  }
+
+  // F5: refuse before clone, lease acquisition or spawn. Credential presence is not authority to
+  // select a provider, and env pruning alone cannot police stored auth or future credential
+  // sources. The explicit operator allowlist is the provider decision.
+  if (!providerAllowed(envelope.provider, allowedProviders)) {
+    const allowed = [...allowedProviders].sort().join(",");
+    const reason = `provider_not_allowed: provider ${envelope.provider} is outside VINCI_WORKER_ALLOWED_PROVIDERS=${allowed}`;
+    lifecycle.transition("BLOCKED", { outcome: { reason } });
+    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
     return true;
   }
 
@@ -895,6 +911,10 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     vinciBinary = vinciBinaryVersion();
     lifecycle.record({ vinci_binary: vinciBinaryRecord(vinciBinary) });
     await announceBinaryChange(bus, stateDir, workerId);
+    const providerAgentDir = cleanRoom
+      ? undefined
+      : join(stateDir, "provider-slots", taskId, String(attempt.attempt), envelopeToUse.provider);
+    if (providerAgentDir) mkdirSync(providerAgentDir, { recursive: true, mode: 0o700 });
     lifecycle.transition("RUNNING");
     const run = await runVinci({ envelope: envelopeToUse,
       stateDir,
@@ -902,7 +922,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       // The provider boundary applies on BOTH paths now. It used to be `: undefined` here --
       // inherit every provider key the daemon holds -- so the scoping promise was kept only in
       // clean-room mode, which is itself refused under a Governor.
-      env: childEnv({ cleanRoom, provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir }),
+      env: childEnv({ cleanRoom, provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir, agentDir: providerAgentDir }),
       envDelta: unattendedPolicy,
       ...(lease ? { abortSignal: abortController.signal } : {}) });
     const head = await readHead(repository.repoDir);
@@ -1076,7 +1096,10 @@ async function main() {
     await bus.post(
       "status",
       `worker ${options.id} online`,
-      `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)} vinci_binary=${formatVinciBinary(vinciBinary)} branch_lease=${process.env.VINCI_BRANCH_LEASE === "1" ? "on" : "off"}`,
+      `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)} vinci_binary=${formatVinciBinary(vinciBinary)} branch_lease=${process.env.VINCI_BRANCH_LEASE === "1" ? "on" : "off"} allowed_providers=${[...options.allowedProviders].sort().join(",")}`,
+    );
+    process.stderr.write(
+      `vinci worker: provider allowlist ENFORCED (${[...options.allowedProviders].sort().join(",")}); set VINCI_WORKER_ALLOWED_PROVIDERS to change it\n`,
     );
     // Say out loud whether the §36 fence is in force. Raised in adversarial
     // review of #43: a guard that is off by default is indistinguishable from
@@ -1110,7 +1133,7 @@ async function main() {
       const messages = await bus.poll(options.id, cursor);
       for (const message of messages) {
         const cleanRoom = options.cleanRoom ? { diskFloorMb: options.diskFloorMb, keepAttempts: options.keepAttempts } : null;
-        if (!(await processHandoff(bus, options.stateDir, message, options.governor, options.id, { cleanRoom }))) continue;
+        if (!(await processHandoff(bus, options.stateDir, message, options.governor, options.id, { cleanRoom, allowedProviders: options.allowedProviders }))) continue;
         cursor = advanceCursor(cursor, message);
         saveCursor(options.stateDir, options.id, cursor);
       }

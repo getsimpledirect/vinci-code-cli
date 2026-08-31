@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const PROVIDER = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/;
 const TERMINAL_STATES = new Set(["COMPLETED", "UNVERIFIED", "BLOCKED", "FAILED"]);
 // Lifecycle table (W0.3). Every transition() is checked against it; anything not listed throws.
 // PENDING  -> RUNNING immediately before the child is spawned, or straight to BLOCKED/FAILED
@@ -73,6 +74,26 @@ function positiveNumber(value, name) {
 
 export function assertTaskId(taskId) {
   if (!TASK_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
+}
+
+export const DEFAULT_ALLOWED_PROVIDERS = "openrouter";
+
+// F5: the provider decision is an operator policy, not a consequence of which credentials happen
+// to be installed on the box. Missing configuration defaults to the fleet's declared boundary
+// (OpenRouter only); an explicitly malformed value refuses daemon startup rather than widening it.
+export function parseAllowedProviders(value = DEFAULT_ALLOWED_PROVIDERS) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("VINCI_WORKER_ALLOWED_PROVIDERS must be a comma-separated non-empty provider list");
+  }
+  const providers = value.split(",").map((provider) => provider.trim());
+  if (providers.some((provider) => !PROVIDER.test(provider))) {
+    throw new Error("VINCI_WORKER_ALLOWED_PROVIDERS entries must use lowercase letters, digits, ._- and no leading or trailing punctuation");
+  }
+  return new Set(providers);
+}
+
+export function providerAllowed(provider, allowedProviders) {
+  return typeof provider === "string" && allowedProviders instanceof Set && allowedProviders.has(provider);
 }
 
 export function parseEnvelope(body) {

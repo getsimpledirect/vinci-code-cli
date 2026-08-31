@@ -104,6 +104,57 @@ export const PROVIDER_KEY_ENV = Object.freeze({
   deepinfra: ["VINCI_INTERNAL_DEEPINFRA_API_KEY"],
 });
 
+// Every provider credential the bundled coding agent knows how to resolve from the environment,
+// plus Vinci's managed/internal keys. This inventory is intentionally broader than
+// PROVIDER_KEY_ENV: the latter names what an envelope may KEEP, while this list names what must be
+// REMOVED. Keeping only the three envelope keys in the removal inventory was fail-open — an
+// OpenRouter child still received Anthropic, OpenAI and public DeepInfra credentials.
+export const PROVIDER_CREDENTIAL_ENV = Object.freeze([
+  "AI_GATEWAY_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_OAUTH_TOKEN",
+  "ANT_LING_API_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+  "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+  "AWS_PROFILE",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_WEB_IDENTITY_TOKEN_FILE",
+  "AZURE_OPENAI_API_KEY",
+  "CEREBRAS_API_KEY",
+  "CLOUDFLARE_API_KEY",
+  "COPILOT_GITHUB_TOKEN",
+  "DEEPINFRA_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "FIREWORKS_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CLOUD_API_KEY",
+  "GROQ_API_KEY",
+  "HF_TOKEN",
+  "KIMI_API_KEY",
+  "MINIMAX_API_KEY",
+  "MINIMAX_CN_API_KEY",
+  "MISTRAL_API_KEY",
+  "MOONSHOT_API_KEY",
+  "NVIDIA_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENCODE_API_KEY",
+  "OPENROUTER_API_KEY",
+  "TOGETHER_API_KEY",
+  "VINCI_API_KEY",
+  "VINCI_INTERNAL_DEEPINFRA_API_KEY",
+  "XAI_API_KEY",
+  "XIAOMI_API_KEY",
+  "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+  "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+  "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+  "ZAI_API_KEY",
+  "ZAI_CODING_CN_API_KEY",
+]);
+
 // The provider boundary for the NORMAL (non-clean-room) path.
 //
 // PROVIDER_KEY_ENV above promises a child gets ONLY the key its envelope's provider
@@ -123,15 +174,19 @@ export const PROVIDER_KEY_ENV = Object.freeze({
 // Fails closed on an unknown provider: `keep` is empty, so ALL provider keys are stripped and
 // the launcher refuses for want of a credential, exactly as it does today for an unknown
 // provider in a clean room.
-export function providerScopedEnv({ base = process.env, provider }) {
+export function providerScopedEnv({ base = process.env, provider, agentDir }) {
+  if (!agentDir) throw new Error("providerScopedEnv needs an isolated agentDir");
   // Object.hasOwn, not a bare lookup: PROVIDER_KEY_ENV["__proto__"] resolves through the
   // prototype chain and returns Object.prototype, so `?? []` never fires and the Set
   // constructor throws on a non-iterable. Found by the unknown-provider test below.
   const keep = new Set(Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : []);
   const env = { ...base };
-  for (const keys of Object.values(PROVIDER_KEY_ENV)) {
-    for (const key of keys) if (!keep.has(key)) delete env[key];
-  }
+  for (const key of PROVIDER_CREDENTIAL_ENV) if (!keep.has(key)) delete env[key];
+  // Do not let normal mode's provider selection be bypassed by the daemon's shared auth.json.
+  // This is a resolution boundary, not uid isolation: a same-uid child can still deliberately
+  // read the daemon's files. Both launchers resolve stored credentials from this isolated slot.
+  env.VINCI_CODING_AGENT_DIR = agentDir;
+  env.PI_CODING_AGENT_DIR = agentDir;
   return env;
 }
 
@@ -142,10 +197,10 @@ export function providerScopedEnv({ base = process.env, provider }) {
 // reverting the CALL SITE to `env: undefined` -- the exact original fail-open -- left every one
 // of them green. Testing the helper while leaving the wiring untested means the wiring is the
 // only part that can silently regress, and the wiring is what was broken in the first place.
-export function childEnv({ base = process.env, cleanRoom, provider, homeDir, tmpDir }) {
+export function childEnv({ base = process.env, cleanRoom, provider, homeDir, tmpDir, agentDir }) {
   return cleanRoom
     ? cleanRoomEnv({ base, provider, homeDir, tmpDir })
-    : providerScopedEnv({ base, provider });
+    : providerScopedEnv({ base, provider, agentDir });
 }
 
 // The child's agent slot (auth.json, sessions, settings): a dir inside the per-attempt HOME.
