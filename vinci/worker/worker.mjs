@@ -512,7 +512,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     // soak ledger attributes the block to the instrument, not to the model's own narrative.
     const stop = state.harness_stop;
     await bus.post(
-      "blocker",
+      "status",
       subject,
       terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`),
       options,
