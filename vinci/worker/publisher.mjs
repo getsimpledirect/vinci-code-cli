@@ -145,6 +145,22 @@ async function verifyPrHead({ repoDir, url, pushedSha, exec }) {
   return { ok: Boolean(prHead) && prHead === pushedSha, prHead, number: view?.number ?? null };
 }
 
+// A PR title a human can triage without opening it. The task id stays because it is the join key
+// between a PR, its branch (`worker/<id>`) and its bus record -- but it is no longer the WHOLE
+// title, which is what made 235 of 236 worker PRs unreadable and turned one repo into an inbox.
+export function prTitle({ taskId, objective, outcome, head, ref }) {
+  const words = typeof objective === "string" ? objective.replace(/\s+/g, " ").trim() : "";
+  // First sentence or clause, so a multi-paragraph spec does not become a multi-line title.
+  const first = words.split(/(?<=[.!?])\s|\n/)[0] ?? "";
+  const trimmed = first.length > 72 ? `${first.slice(0, 69).trimEnd()}...` : first;
+  const shortHead = typeof head === "string" && head.length >= 7 ? head.slice(0, 7) : null;
+  const tail = [taskId, shortHead ? `@${shortHead}` : null, ref ?? null].filter(Boolean).join(" ");
+  const lead = outcome ? `${outcome}: ` : "";
+  // Never emit a bare `Worker task <id>` again: with no objective the outcome and refs still carry
+  // more than the id alone did.
+  return trimmed ? `${lead}${trimmed} [${tail}]` : `${lead}worker task [${tail}]`;
+}
+
 export async function publish({
   repoDir,
   branch,
@@ -155,6 +171,9 @@ export async function publish({
   promotion = "pr",
   fence = null,
   repoOwner = null,
+  objective = null,
+  outcome = null,
+  ref = null,
   exec = defaultExec,
 }) {
   if (!repoDir || !branch || !taskId) throw new Error("publish requires repoDir, branch and taskId");
@@ -251,7 +270,9 @@ export async function publish({
   const body = `Unattended Vinci worker result for task ${taskId}.\n\n${prBodyFooter({ taskId, attempt, head: record.pushed_sha, baseRef: base, fence })}`;
   const created = await exec(
     "gh",
-    ["pr", "create", "--base", base, "--head", branch, "--title", `Worker task ${taskId}`, "--body", body],
+    ["pr", "create", "--base", base, "--head", branch,
+     "--title", prTitle({ taskId, objective, outcome, head: record.pushed_sha, ref }),
+     "--body", body],
     { cwd: repoDir },
   );
   const createdUrl = created.status === 0 ? created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null : null;

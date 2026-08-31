@@ -125,11 +125,18 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
     writeFileSync(latchFixture, latch);
     const t1 = await runScenario("t1", "w1", { evidence: "pr", sessionFixture: latchFixture });
     assert.equal(t1.state.state, "BLOCKED", "T1: a latch block outranks DONE + PR");
-    assert.equal(t1.state.pr, "https://github.com/test/repo/pull/123", "T1: the PR still exists; it just does not complete the task");
+    // CONTRACT CHANGE (2026-08-31): a run that does not reach COMPLETED opens NO PR, even when it
+    // produced a commit and a DONE narrative. T1 is exactly that case -- a latch block outranks
+    // DONE + PR -- and it is exactly the case that made 192 of 194 worker PRs close unmerged.
+    // The branch is still pushed, so the work is not lost; it simply stops arriving as a review
+    // request. The old assertion here ("the PR still exists") pinned the behaviour being removed.
+    assert.equal(t1.state.pr, null, "T1: a blocked run must not open a PR, even with DONE + a commit");
+    assert.ok(t1.state.head, "T1: the head is still recorded, so the pushed work remains findable");
     assert.deepEqual(t1.state.harness_stop, { count: 1, reason: LATCH_REASON }, "T1: harness_stop recorded on the task");
     assert.equal(t1.state.outcome.state, "DONE", "T1: the narrative stays on the record next to the stop");
     const final = t1.posts.at(-1);
-    assert.equal(final.kind, "blocker");
+    assert.equal(final.kind, "status", "T1: a terminal record is a status, not an un-closeable open decision");
+    assert.equal(final.outcome, "BLOCKED", "T1: the terminal carries its typed outcome");
     assert.equal(final.subject, "task t1 blocked");
     assert.match(final.body, /stop=instrument/, "T1: the blocker post must say it was an instrument stop");
     assert.match(final.body, /harness_stops=1/);
@@ -147,7 +154,8 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
   assert.equal(t2.state.pr, null);
   assert.deepEqual(t2.state.harness_stop, { count: 2, reason: RESERVE_REASON });
   const final = t2.posts.at(-1);
-  assert.equal(final.kind, "blocker");
+  assert.equal(final.kind, "status", "T2: a terminal record is a status, not an open decision");
+  assert.equal(final.outcome, "BLOCKED", "T2: the terminal carries its typed outcome");
   assert.match(final.body, /stop=instrument harness_stops=2 /);
   assert.ok(final.body.includes(`instrument stop: ${RESERVE_REASON}`));
 }
@@ -176,7 +184,8 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
   assert.equal(t5.state.state, "FAILED");
   assert.equal(t5.state.exit_code, 1);
   assert.deepEqual(t5.state.harness_stop, { count: 2, reason: RESERVE_REASON }, "T5: the stop is recorded even though exit code outranked it");
-  assert.equal(t5.posts.at(-1).kind, "blocker");
+  assert.equal(t5.posts.at(-1).kind, "status", "T5: a terminal record is a status, not an open decision");
+  assert.equal(t5.posts.at(-1).outcome, "FAILED", "T5: exit_code 1 makes the typed outcome FAILED, not BLOCKED");
   assert.match(t5.posts.at(-1).body, /state=FAILED .*harness_stops=2/, "T5: FAILED post carries the stop count");
   assert.ok(
     t5.posts.at(-1).body.includes(`harness_stop_reason=${RESERVE_REASON}`),

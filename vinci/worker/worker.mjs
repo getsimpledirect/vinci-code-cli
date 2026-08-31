@@ -398,6 +398,17 @@ function recentLogTail(limit) {
 // W0.5: EVERY terminal post — postFinal and each early terminal blocker (envelope error, past
 // deadline, governor refusal/unavailability, invalid task id) — goes through this one formatter
 // so no terminal record on the bus can omit which build produced it.
+// The typed outcome MIRRORS the lifecycle state rather than inventing a second vocabulary for
+// the same fact: two names for one outcome is how a record and its own body come to disagree.
+// REFUSED is reserved for a rejection that happens BEFORE any lifecycle exists (a task id that
+// will not parse), which is the one case with no lifecycle state to mirror.
+function terminalOutcome(lifecycleState) {
+  if (lifecycleState === "COMPLETED") return "COMPLETED";
+  if (lifecycleState === "FAILED") return "FAILED";
+  if (lifecycleState === "BLOCKED") return "BLOCKED";
+  return null;
+}
+
 function terminalPostBody(details) {
   return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
@@ -446,15 +457,17 @@ async function postFinal(bus, message, envelope, state, evidence) {
     .join(" ");
   const body = terminalPostBody(details);
   const options = { inReplyTo: message.message_id };
+  const outcome = terminalOutcome(state.state);
+  if (outcome !== null) options.outcome = outcome;
   if (state.state === "COMPLETED" && isLedgerRef(envelope.ref)) {
     options.refs = [envelope.ref];
-    await bus.post("finding", subject, body, options);
+    await bus.postTerminal("finding", subject, body, options);
   } else if (state.state === "BLOCKED" && state.harness_stop) {
     // An instrument stop: the harness refused the agent's work mid-run. Say so explicitly so the
     // soak ledger attributes the block to the instrument, not to the model's own narrative.
     const stop = state.harness_stop;
-    await bus.post(
-      "blocker",
+    await bus.postTerminal(
+      "status",
       subject,
       terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`),
       options,
@@ -466,7 +479,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
       ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
       : details;
     const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
-    await bus.post("blocker", subject, terminalPostBody(reason), options);
+    await bus.postTerminal("status", subject, terminalPostBody(reason), options);
   } else {
     const statusBody = state.outcome?.reason
       ? terminalPostBody(`${details} reason=${state.outcome.reason}`)
@@ -490,7 +503,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   try {
     assertTaskId(taskId);
   } catch (error) {
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(error.message), { inReplyTo: message.message_id });
+    await bus.postTerminal("status", `task ${taskId} refused`, terminalPostBody(error.message), { inReplyTo: message.message_id, outcome: "REFUSED" });
     return true;
   }
 
@@ -512,8 +525,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
       outcome: { reason: error.message },
     });
-    await bus.post("blocker", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
+    await bus.postTerminal("status", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
       inReplyTo: message.message_id,
+      outcome: terminalOutcome(state),
     });
     return true;
   }
@@ -521,7 +535,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild, vinciBinary });
   if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id });
+    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
   }
 
@@ -531,7 +545,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   if (envelope.base_ref !== undefined && envelope.base_ref !== "main") {
     const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; the branch is forked from origin/main and a PR against another base would not share its fork point`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
+    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
   }
 
@@ -556,7 +570,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   if (cleanRoom && governorUrl) {
     const reason = "clean_room_publish_unsupported: --clean-room publishes from the bare cache, which does not honour a Governor fence and lacks the idempotent-retry, lease, read-back, foreign-PR and PR-head guarantees of the standard publisher; refusing before the run rather than publishing under guarantees that are not in force";
     lifecycle.transition("BLOCKED", { outcome: { reason } });
-    await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id });
+    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
   }
 
@@ -664,8 +678,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         const governor = acquired.leased ? "leased" : acquired.refused ? "refused" : "unavailable";
         const label = acquired.leased ? "Governor lease held elsewhere" : acquired.refused ? "Governor refused the lease" : "Governor lease unavailable";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
-        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+        await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
           inReplyTo: message.message_id,
+          outcome: "BLOCKED",
         });
         return true;
       }
@@ -708,8 +723,9 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor }, lease: { ...lifecycle.snapshot().lease, ...lease } });
         await releaseLease("BLOCKED");
-        await bus.post("blocker", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+        await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
           inReplyTo: message.message_id,
+          outcome: "BLOCKED",
         });
         return true;
       }
@@ -777,11 +793,42 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     // Otherwise main's routing stands. `fence` is this attempt's fence in publisher.mjs's shape;
     // it is null when ungoverned, and the clean-room x fence combination never reaches here (it is
     // refused before the run).
+    // A PR is opened ONLY for work that succeeded. 192 of 194 closed-without-merge PRs in the
+    // research repo were this worker opening one per attempt regardless of outcome, at a 9% merge
+    // rate against a human's 98%.
+    //
+    // The gate cannot be "outcome === COMPLETED": finalState only returns COMPLETED when a `pr`
+    // already exists, so gating the PR on COMPLETED is circular and would stop every PR forever.
+    // The non-circular question is whether the run WOULD be COMPLETED but for the PR itself, which
+    // is finalState with pr: true. Reusing finalState is deliberate -- a second, parallel notion of
+    // "succeeded" living here would drift from the real one.
+    //
+    // A non-eligible attempt still PUSHES its branch (promotion "none"): losing evidence is a W0
+    // cohort failure condition. The work stays findable; it just stops arriving as a review request.
+    const preOutcome = noCommitOutcome({
+      head,
+      baseCommit: lifecycle.snapshot().base_commit,
+      outcome: authorityLost ? { reason: authorityLost } : run.outcome ?? null,
+    });
+    const prEligible = !authorityLost && finalState({
+      exitCode: run.exit_code,
+      limitTripped: run.limit_tripped,
+      outcome: preOutcome,
+      blocker: null,
+      pr: true,
+      harnessStops: run.harness_stops ?? [],
+    }) === "COMPLETED";
+    const objective = typeof envelopeToUse.spec === "string" ? envelopeToUse.spec : null;
     const published = authorityLost
       ? { publish: "skipped", pr: null, fenced_out: authorityLost }
       : cleanRoom
         ? await publishFromCache({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId })
-        : await publish({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, attempt: attempt.attempt, fence: lease ? fence : null });
+        : await publish({
+            envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId,
+            attempt: attempt.attempt, fence: lease ? fence : null,
+            prEligible,
+            objective, outcome: prEligible ? "COMPLETED" : null, ref: envelopeToUse.ref ?? null,
+          });
     const fencedOut = authorityLost ?? published.fenced_out ?? null;
     if (!authorityLost && published.fenced_out) fencedOutReason = published.fenced_out;
     // Build outcome: start with fence/blocker reasons, then augment with no_commit if needed (so both can coexist).

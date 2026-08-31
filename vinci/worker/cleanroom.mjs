@@ -50,6 +50,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, st
 import { dirname, join } from "node:path";
 
 import { classifyDivergedLocal, command, readHeadBlocker, renameBranchAside } from "./run.mjs";
+import { prTitle } from "./publisher.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
@@ -456,7 +457,15 @@ export async function publishFromCache({ envelope, cacheDir, attemptDir, branch,
 
   const created = await command(
     "gh",
-    ["pr", "create", "-R", envelope.repo, "--base", "main", "--head", branch, "--title", `Worker task ${taskId}`, "--body", `Unattended Vinci worker result for task ${taskId}.`],
+    ["pr", "create", "-R", envelope.repo, "--base", "main", "--head", branch, "--title", prTitle({
+       taskId,
+       objective: typeof envelope.spec === "string" ? envelope.spec : null,
+       // The clean-room path only reaches PR creation after a clean push with no blocker and no
+       // limit tripped, which is this path's equivalent of the eligibility gate in worker.mjs.
+       outcome: "COMPLETED",
+       head: null,
+       ref: envelope.ref ?? null,
+     }), "--body", `Unattended Vinci worker result for task ${taskId}.`],
     { cwd: cacheDir, allowFailure: true },
   );
   if (created.status === 0) result.pr = created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null;

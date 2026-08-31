@@ -390,12 +390,20 @@ export async function readHeadBlocker(repoDir) {
 // Publishing itself lives in publisher.mjs (idempotent PR adoption, remote-sha discipline,
 // never-force, optional fence). This wrapper keeps the envelope-level rules: BLOCKER.md at HEAD
 // and `evidence: none` both map to promotion "none" (push, never a PR).
-export async function publish({ envelope, repoDir, branch, taskId, attempt, limitTripped, fence }) {
+export async function publish({
+  envelope, repoDir, branch, taskId, attempt, limitTripped, fence,
+  prEligible = true, objective = null, outcome = null, ref = null,
+}) {
   // A BLOCKER.md at HEAD suppresses only the PR. The branch is still pushed so the agent's
   // work and its stated blocker are on the record (measured 2026-08-27: the first bus-dispatched
   // task committed a decision record + a blocker and nothing reached the remote).
+  //
+  // `prEligible` is the same shape one level up: a run that did not succeed still pushes its
+  // branch -- losing evidence is a W0 cohort failure condition -- but opens no PR. Measured
+  // 2026-08-31, opening one per attempt regardless of outcome produced 192 of 194
+  // closed-without-merge PRs at a 9% merge rate. Any one of the three suppresses the PR alone.
   const blockerReason = await readHeadBlocker(repoDir);
-  const promotion = blockerReason || envelope.evidence !== "pr" ? "none" : "pr";
+  const promotion = blockerReason || envelope.evidence !== "pr" || !prEligible ? "none" : "pr";
   const result = await publishBranch({
     repoDir,
     branch,
@@ -405,6 +413,9 @@ export async function publish({ envelope, repoDir, branch, taskId, attempt, limi
     limitTripped,
     promotion,
     fence,
+    objective,
+    outcome,
+    ref,
     repoOwner: typeof envelope.repo === "string" ? envelope.repo.split("/")[0] : null,
   });
   if (blockerReason) {
