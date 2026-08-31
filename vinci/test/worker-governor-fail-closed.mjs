@@ -95,8 +95,17 @@ function assertBlockedBeforeWork(fixture, taskId, reasonPattern, classification 
   assert.equal(fixture.getVinciCalls().length, 0, 'model must not be spawned');
   assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'repository must not be cloned');
   assert.equal(snapshot.outcome.governor, classification === 'lease_unavailable' ? 'unavailable' : classification, 'outcome.governor must classify refusal vs unavailability');
-  const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
-  assert(blocker, 'a blocker must be posted');
+  // Locate the terminal post by what it IS, not by its kind. `kind` was only
+  // ever a locator here -- every assertion below is on the body -- and
+  // terminal records now post as `status`, because CONTRACT 16.2/16.7 make
+  // `blocker` an OPEN DECISION that a finished task can never close. Measured
+  // 2026-08-31: 168 of 168 worker blockers on the bus were terminal records.
+  const posts = fixture.getPostedMessages();
+  const blocker = posts.find((p) => /task \S+ (blocked|failed)/.test(p.subject ?? ''));
+  assert(blocker, 'a terminal post must be made for the block');
+  // Pin the fix: a terminal record must NOT open a decision nobody can close.
+  assert.equal(blocker.kind, 'status',
+    `a terminal record must post as status, not ${blocker.kind}: it can never receive the ruling that closes an open decision`);
   const body = blocker.body ?? JSON.stringify(blocker);
   // W0.5 + #18: every terminal post ends with ` worker_build=<commit-or-version>[-dirty]
   // vinci_binary=<version>`; the fixture's probe succeeds here, so the version is one token
