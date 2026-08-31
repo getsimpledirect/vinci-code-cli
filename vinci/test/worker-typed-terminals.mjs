@@ -206,3 +206,23 @@ exit 0
   assert.match(okCalls, /COMPLETED: Wire the lease into the push path/, "title must be readable");
   assert.doesNotMatch(okCalls, /--title Worker task/, "the opaque title must never be emitted");
 });
+
+test("UNVERIFIED is a terminal and carries a type like any other", async () => {
+  // finalState's DEFAULT is UNVERIFIED -- "anything else, incl. evidence: none, exit 0 alone".
+  // So this is the most common non-success terminal, not an edge case. It used to post through
+  // the untyped `bus.post`, which meant the commonest way for a run to end badly produced a
+  // record with a NULL outcome -- invisible to a consumer keying on `outcome !== "COMPLETED"`.
+  //
+  // The bus has no server here, so a VALID outcome gets past validation and then fails on the
+  // network. That difference is the assertion: valid values must fail LATER than invalid ones.
+  await assert.rejects(
+    () => bus().postTerminal("status", "task t", "b", { outcome: "UNVERIFIED" }),
+    (err) => !/terminal record must carry a typed outcome/.test(err.message),
+    "UNVERIFIED must pass validation and fail only at the network",
+  );
+  await assert.rejects(
+    () => bus().postTerminal("status", "task t", "b", { outcome: "PRODUCED" }),
+    /terminal record must carry a typed outcome/,
+    "the enum stays closed: a plausible-sounding value is still refused before any I/O",
+  );
+});

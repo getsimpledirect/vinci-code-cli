@@ -5,7 +5,10 @@ const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 // VISIBLE without being an open decision. Posting a terminal record without one is a hard
 // error rather than a default, because an unclassified terminal that posts anyway is the
 // same fail-open the typed outcome exists to remove.
-const TERMINAL_OUTCOMES = new Set(["COMPLETED", "FAILED", "BLOCKED", "REFUSED"]);
+// UNVERIFIED is finalState's DEFAULT fall-through -- "produced, unassessed" -- not an edge
+// case, so leaving it untyped left the most COMMON non-success terminal with a null outcome
+// and therefore invisible to a consumer that keys attention on `outcome !== "COMPLETED"`.
+const TERMINAL_OUTCOMES = new Set(["COMPLETED", "FAILED", "BLOCKED", "REFUSED", "UNVERIFIED"]);
 
 export function isLedgerRef(value) {
   return typeof value === "string" && LEDGER_REF.test(value);

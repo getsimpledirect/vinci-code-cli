@@ -406,6 +406,9 @@ function terminalOutcome(lifecycleState) {
   if (lifecycleState === "COMPLETED") return "COMPLETED";
   if (lifecycleState === "FAILED") return "FAILED";
   if (lifecycleState === "BLOCKED") return "BLOCKED";
+  // finalState's default: the run produced something and nothing assessed it. Not a success and
+  // not a failure, but emphatically a TERMINAL, so it carries a type like every other one.
+  if (lifecycleState === "UNVERIFIED") return "UNVERIFIED";
   return null;
 }
 
@@ -484,7 +487,10 @@ async function postFinal(bus, message, envelope, state, evidence) {
     const statusBody = state.outcome?.reason
       ? terminalPostBody(`${details} reason=${state.outcome.reason}`)
       : body;
-    await bus.post("status", subject, statusBody, options);
+    // postTerminal, not post: this branch is reached for UNVERIFIED, which is a terminal and
+    // must carry a type. Using the untyped post here was the one path that could still emit a
+    // terminal with a null outcome -- the fail-open this contract exists to remove.
+    await bus.postTerminal("status", subject, statusBody, options);
   }
 }
 
