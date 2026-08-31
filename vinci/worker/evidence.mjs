@@ -68,6 +68,9 @@ export async function uploadEvidence({
   busToken,
   ref,
   fence,
+  // F6: extra bundle members by file name (`<attempt>.patch` for output: patch, artifacts.json
+  // for output: artifact). Names are restricted to a single plain path component.
+  extraFiles = {},
 }) {
   if (!uriPrefix) return null;
 
@@ -82,6 +85,10 @@ export async function uploadEvidence({
     writeFileSync(join(bundleDir, "git.diff"), gitDiff ?? "");
     writeFileSync(join(bundleDir, "result.json"), JSON.stringify(resultJson ?? {}, null, 2));
     writeFileSync(join(bundleDir, "runner.log"), logTail ?? "");
+    for (const [name, contents] of Object.entries(extraFiles)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) throw new Error(`evidence: unsafe bundle member name ${JSON.stringify(name)}`);
+      writeFileSync(join(bundleDir, name), contents ?? "");
+    }
 
     const tarResult = await command("tar", ["czf", tarPath, "-C", bundleDir, "."]);
     if (tarResult.status !== 0) {

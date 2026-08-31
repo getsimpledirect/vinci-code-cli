@@ -1,0 +1,46 @@
+[
+  {
+    "input": 1e+21,
+    "canonical": "1e+21"
+  },
+  {
+    "input": 1e-07,
+    "canonical": "1e-7"
+  },
+  {
+    "input": 0.1,
+    "canonical": "0.1"
+  },
+  {
+    "input": 12.5,
+    "canonical": "12.5"
+  },
+  {
+    "input": 1e+30,
+    "canonical": "1e+30"
+  },
+  {
+    "input": 1e-06,
+    "canonical": "0.000001"
+  },
+  {
+    "input": 333333333.3333333,
+    "canonical": "333333333.3333333"
+  },
+  {
+    "input": 5e-324,
+    "canonical": "5e-324"
+  },
+  {
+    "input": -3.3333333333333333e-06,
+    "canonical": "-0.0000033333333333333333"
+  },
+  {
+    "input": 1e+20,
+    "canonical": "100000000000000000000"
+  },
+  {
+    "input": 123456789.123,
+    "canonical": "123456789.123"
+  }
+]

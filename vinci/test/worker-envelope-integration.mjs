@@ -1,6 +1,7 @@
 // Worker envelope parsing tests
 import assert from 'node:assert/strict';
-import { parseEnvelope } from '../worker/task.mjs';
+import { isPlainBranchName } from '../worker/contracts/digest.mjs';
+import { isPlainRefName, parseEnvelope } from '../worker/task.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -177,6 +178,25 @@ test('parseEnvelope accepts a 40-hex branch name (documented decision)', () => {
   const hex = 'a'.repeat(40);
   assert.equal(parseEnvelope(`repo: t/r\nbranch: ${hex}\n\nSpec`).branch, hex);
 });
+
+test('prose and digest paths share one branch-name predicate', () => {
+  assert.strictEqual(isPlainRefName, isPlainBranchName);
+});
+
+for (const valid of ['feature/nested/topic', 'a'.repeat(255)]) {
+  test(`all branch fields accept ${JSON.stringify(valid.slice(0, 32))}`, () => {
+    assert.equal(isPlainBranchName(valid), true);
+    assert.equal(parseEnvelope(`repo: t/r\nbranch: ${valid}\nbase_ref: ${valid}\n\nSpec`).branch, valid);
+  });
+}
+
+for (const invalid of ['a'.repeat(256), 'foo.lock/bar', 'feature//topic', 'feature/.hidden/topic']) {
+  test(`all branch fields reject ${JSON.stringify(invalid.slice(0, 32))}`, () => {
+    assert.equal(isPlainBranchName(invalid), false);
+    assert.throws(() => parseEnvelope(`repo: t/r\nbranch: ${invalid}\n\nSpec`), /branch/);
+    assert.throws(() => parseEnvelope(`repo: t/r\nbase_ref: ${invalid}\n\nSpec`), /base_ref/);
+  });
+}
 
 console.log(`\nWorker envelope tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

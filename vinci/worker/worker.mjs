@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, noCommitOutcome, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
 import { childEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
-import { assertTaskId, DEFAULT_ALLOWED_PROVIDERS, parseAllowedProviders, parseEnvelope, providerAllowed, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
+import { assertTaskId, contractTag, DEFAULT_ALLOWED_PROVIDERS, isDigestHandoff, loadModelClasses, materializeEnvelope, parseAllowedProviders, parseEnvelope, parseHandoffTriple, providerAllowed, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
 import { claimGovernorPaths, tightenEnvelopeLimits, unattendedPolicyEnv } from "./governor.mjs";
 import { DECLARATION_REFRESH_DEFAULT_S, LEASE_TIMEOUT_MS, LeaseClient, buildDeclaration, declarationBody, declarationDigest, leaseSubject, releaseOutcome, startHeartbeat } from "./lease.mjs";
 import { BranchLeaseClient, branchLeaseFence } from "./branch-lease.mjs";
@@ -36,6 +36,12 @@ let serverBuild = { error: "not fetched" };
 // tasks. `{ version, path }` or `{ error }`. This is the LAST OBSERVED probe: it is what early
 // terminal posts (which never spawn) report, and what terminalPostBody prints.
 let vinciBinary = { error: "not checked" };
+// F2: the operator model-class table (VINCI_WORKER_MODEL_CLASSES, inline JSON or `@<file>`),
+// parsed and validated EXACTLY ONCE at daemon startup (see main): an invalid value refuses to
+// start (exit 78, reason on stderr) and can never surface as a crash in the middle of a task.
+// Unset ⇒ the daemon starts prose-only: `configured: false`, and every digest handoff BLOCKs
+// with `unknown_model_class: MODEL_CLASSES not configured`.
+let modelConfig = { configured: false, table: Object.freeze({}) };
 
 // Drift signal (#18), persisted so it survives restarts: `<state-dir>/vinci-binary.json` holds
 // the last ANNOUNCED `{ version, path }`. Rules:
@@ -447,6 +453,17 @@ function terminalPostBody(details) {
   return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
 
+// F8: EVERY early terminal (blocker) post — digest refusal, invalid bounds, past deadline,
+// Governor refusal/unavailability, base-checkout refusal — is formatted HERE and nowhere else.
+// `record` is the task snapshot (or, before a record exists, the parsed triple / null): a
+// digest-form task always yields `contract=<work_order_id>@<digest8>` as the FIRST token; a prose
+// task yields no tag and its body is byte-identical to what it was before Wave 1B. `fallback`
+// is the tag for a digest handoff whose triple could not even be parsed (`contract=malformed`).
+function blockerPostBody(record, details, fallback = null) {
+  const tag = contractTag(record) ?? fallback;
+  return terminalPostBody(tag ? `${tag} ${details}` : details);
+}
+
 async function postFinal(bus, message, envelope, state, evidence) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
@@ -485,6 +502,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
     ...policyDetails,
+    contractTag(state),
     ...evidenceDetails,
   ]
     .filter(Boolean)
@@ -525,28 +543,113 @@ async function postFinal(bus, message, envelope, state, evidence) {
   }
 }
 
-// One options object rather than a third positional parameter: #25 (fence), #24
-// (cleanRoom) and #26 (lease loop) all extend this signature, and positional adds
-// silently reorder under a rebase. #26 obeys that: `subjectOf` (the lease-subject
-// resolver, injectable for tests) is an OPTION, not a 6th positional parameter — as a
-// positional it would have landed on main's options object and silently read `null`.
+// Wave 1B: fetch the Governor's pinned registry for a work order and classify non-2xx answers
+// so every one of them becomes a BLOCKED refusal before a clone. The digests are recomputed by
+// materializeEnvelope against the served record; nothing here is trusted from the handoff triple.
 //
-// `fence` stays main's hook shape ({ generation?, check: async ({stage}) => {valid, reason} }).
-// It is NOT passed in from main(): the fence closes over THIS attempt's lease, which is acquired
-// inside this function, so it is constructed below once a lease is held and handed to publish()
-// in main's shape. The option remains for a caller that wants to inject one (tests do).
-async function processHandoff(bus, stateDir, message, governorUrl, workerId, { fence: injectedFence = null, cleanRoom = null, allowedProviders = parseAllowedProviders(), subjectOf = leaseSubject } = {}) {
-  // Known BEFORE the run, like governorUrl and for the same reason: the
-  // clean-room guard below cannot test the fence object (it closes over a
-  // lease acquired much further down, so `cleanRoom && branchFence` would be
-  // permanently false -- a refusal that reads as enforced and never fires).
+// F1: the body is STREAMED under the same AbortController as the connection, with a hard byte
+// cap. Content-Length is never trusted (a chunked answer has none; a lying one is just a header):
+// an oversized body aborts the read at the cap, and a stalled or trickling body is aborted by the
+// single deadline that covers headers AND body. Both are `registry_unavailable`.
+const REGISTRY_MAX_BYTES = 262_144;
+const REGISTRY_TIMEOUT_MS = 10_000;
+
+function registryTimeoutMs(env = process.env) {
+  const configured = Number(env.VINCI_WORKER_REGISTRY_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : REGISTRY_TIMEOUT_MS;
+}
+
+async function readBodyCapped(response, controller, maxBytes) {
+  if (!response.body) return "";
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of response.body) {
+    total += chunk.byteLength;
+    if (total > maxBytes) {
+      controller.abort();
+      throw new Error(`registry_unavailable: governor contracts response exceeds ${maxBytes / 1024} KiB (streamed ${total} bytes)`);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function fetchWorkOrderRegistry(serverUrl, token, workOrderId, { timeoutMs = registryTimeoutMs() } = {}) {
+  const url = `${serverUrl}/v1/governor/contracts/${encodeURIComponent(workOrderId)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    let response;
+    try {
+      response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+        // The registry is a PINNED endpoint on the configured server. A redirect would move the
+        // contract fetch (and the bearer token) to a host nobody named, so a 3xx is an error
+        // here, never something to follow.
+        redirect: "error",
+      });
+    } catch (error) {
+      // `??` binds TIGHTER than `?:`, so the obvious spelling
+      //   error?.cause?.code ?? error.name === "AbortError" ? A : B
+      // parses as `(error?.cause?.code ?? (error.name === "AbortError")) ? A : B` — any truthy
+      // cause code (ECONNREFUSED, ENOTFOUND, …) then selects A and EVERY connection failure was
+      // reported as "timed out after N ms". The abort test comes first, explicitly parenthesised.
+      const why = error?.name === "AbortError" ? `timed out after ${timeoutMs} ms` : (error?.cause?.code ?? error.message);
+      throw new Error(`registry_unavailable: governor contracts fetch failed: ${why}`);
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`registry_forbidden: governor contracts returned ${response.status}`);
+    }
+    if (response.status === 404) {
+      throw new Error(`work_order_not_found: no contract for ${workOrderId}`);
+    }
+    if (!response.ok) {
+      throw new Error(`registry_error: governor contracts returned ${response.status}`);
+    }
+    let text;
+    try {
+      text = await readBodyCapped(response, controller, REGISTRY_MAX_BYTES);
+    } catch (error) {
+      if (/^registry_unavailable:/.test(error.message)) throw error;
+      const why = controller.signal.aborted ? `body stalled; timed out after ${timeoutMs} ms` : (error?.cause?.code ?? error.message);
+      throw new Error(`registry_unavailable: governor contracts body read failed: ${why}`);
+    }
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new Error(`registry_malformed: governor contracts returned invalid JSON: ${error.message}`);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function processHandoff(
+  bus,
+  stateDir,
+  message,
+  governorUrl,
+  workerId,
+  { fence: injectedFence = null, cleanRoom = null, allowedProviders = parseAllowedProviders(), subjectOf = leaseSubject } = {},
+) {
+  // Known before the run: clean-room publication cannot safely hold a Governor or branch fence
+  // because its cache publisher does not enforce either fence.
   const branchLeaseEnabled =
     process.env.VINCI_BRANCH_LEASE === "1" && Boolean(bus?.serverUrl) && Boolean(bus?.token);
   const taskId = message.message_id;
   try {
     assertTaskId(taskId);
   } catch (error) {
-    await bus.postTerminal("status", `task ${taskId} refused`, terminalPostBody(error.message), { inReplyTo: message.message_id, outcome: "REFUSED" });
+    // NOTE-4: this refusal fires before the body is ever looked at, so no triple has been parsed
+    // — but a DIGEST handoff's terminal post must still carry a contract= tag, or a reader
+    // filtering the ledger for contract posts silently loses it. Same fallback the unparseable
+    // triple uses: `contract=malformed`. A prose handoff keeps its untagged body byte for byte.
+    const fallback = isDigestHandoff(message.body) ? "contract=malformed" : null;
+    await bus.postTerminal("status", `task ${taskId} refused`, blockerPostBody(null, error.message, fallback), {
+      inReplyTo: message.message_id,
+      outcome: "REFUSED",
+    });
     return true;
   }
 
@@ -555,30 +658,97 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   if (!acquireTaskClaim(stateDir, taskId)) return false;
 
   let envelope;
-  try {
-    envelope = parseEnvelope(message.body);
-  } catch (error) {
-    lifecycle.startAttempt(
-      { id: taskId, envelope: { evidence: null, provider: null, model: null } },
-      version,
-      { workerBuild, serverBuild, vinciBinary },
-    );
-    const state = /^repo must be/.test(error.message) ? "FAILED" : "BLOCKED";
-    lifecycle.transition(state, {
-      limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
-      outcome: { reason: error.message },
-    });
-    await bus.postTerminal("status", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
+  let contractFields = null;
+  if (isDigestHandoff(message.body)) {
+    // Wave 1B digest form: parse the triple, fetch the pinned registry from the server, and
+    // materialize the envelope. Every refusal (malformed triple, 404/unauthorized registry,
+    // digest mismatch, binding mismatch, unknown model class, bad field) BLOCKs here, before a
+    // clone and before a model spawn.
+    // F2: the operator model-class table was validated once at startup (modelConfig); it is
+    // passed into materializeEnvelope, which stays pure. A change needs a daemon restart.
+    let triple;
+    let reason;
+    try {
+      triple = parseHandoffTriple(message.body);
+      // NOTE-3: ONE source for the bus credential. The token is read from the environment once
+      // (parseArgs) and carried on the bus; re-reading process.env here was a second source for
+      // one secret — equal today, and silently divergent the moment anything rotates it in-process.
+      const registry = await fetchWorkOrderRegistry(bus.serverUrl, bus.token, triple.work_order_id);
+      const materialized = materializeEnvelope(triple, registry, {
+        modelClasses: modelConfig.table,
+        modelClassesConfigured: modelConfig.configured,
+      });
+      envelope = materialized.envelope;
+      contractFields = materialized.contract;
+    } catch (error) {
+      reason = error.message || "handoff triple refusal";
+    }
+    if (reason) {
+      lifecycle.startAttempt(
+        { id: taskId, envelope: { evidence: null, provider: null, model: null } },
+        version,
+        { workerBuild, serverBuild, vinciBinary },
+      );
+      lifecycle.transition("BLOCKED", { outcome: { reason } });
+      // B7: a malformed post (the triple could not even be parsed) still carries `contract=malformed`;
+      // a parsed triple whose registry answer refused carries the work_order_id@digest8 tag.
+      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(triple ?? null, `state=BLOCKED reason=${reason}`, "contract=malformed"), {
+        inReplyTo: message.message_id,
+        outcome: "BLOCKED",
+      });
+      return true;
+    }
+  } else {
+    try {
+      envelope = parseEnvelope(message.body);
+    } catch (error) {
+      lifecycle.startAttempt(
+        { id: taskId, envelope: { evidence: null, provider: null, model: null } },
+        version,
+        { workerBuild, serverBuild, vinciBinary },
+      );
+      const state = /^repo must be/.test(error.message) ? "FAILED" : "BLOCKED";
+      lifecycle.transition(state, {
+        limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
+        outcome: { reason: error.message },
+      });
+      await bus.postTerminal("status", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
+        inReplyTo: message.message_id,
+        outcome: terminalOutcome(state),
+      });
+      return true;
+    }
+
+  }
+
+  const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild, vinciBinary });
+  // Wave 1B: stamp the record with the materialized contract (work_order_id, both digests,
+  // base_commit, promotion) so the snapshot and every terminal post can cite the handoff.
+  if (contractFields) lifecycle.record(contractFields);
+  // B6: bounds validation BEFORE prepareRepository and before any spawn. budget_usd<=0, a
+  // non-positive max_runtime_s, or a deadline already in the past each BLOCK the task.
+  // For prose envelopes: keep the original reason string. For digest: use the structured format.
+  if (contractFields && (envelope.budget_usd <= 0 || envelope.max_runtime_s <= 0 || (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()))) {
+    // Digest handoff: full bounds validation with structured post body.
+    const limit = envelope.budget_usd <= 0 ? "budget_usd" : envelope.max_runtime_s <= 0 ? "max_runtime_s" : "deadline";
+    // WARN-3: name the field that actually tripped. `budgetMicrousd: 0` is a legal spec upstream
+    // and blocks here; a reason that only listed all three fields left the operator to guess
+    // which one they had to fix.
+    const why = limit === "deadline"
+      ? `deadline ${envelope.deadline} is not in the future`
+      : `${limit} must be greater than zero, got ${limit === "budget_usd" ? envelope.budget_usd : envelope.max_runtime_s}`;
+    lifecycle.transition("BLOCKED", { limit_tripped: limit, outcome: { reason: `invalid_bounds: ${why}` } });
+    await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`), {
       inReplyTo: message.message_id,
-      outcome: terminalOutcome(state),
+      outcome: "BLOCKED",
     });
     return true;
   }
 
-  const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild, vinciBinary });
-  if (envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
+  // Prose handoff: only deadline is checked (budget and runtime have safe defaults from parseEnvelope).
+  if (!contractFields && envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
-    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody("deadline is in the past"), { inReplyTo: message.message_id, outcome: "BLOCKED" });
+    await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), "deadline is in the past"), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
   }
 
@@ -596,13 +766,16 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     return true;
   }
 
-  // B2 (fail closed, before clone): prepareRepository still forks every branch off origin/main, so
-  // a PR whose base is not main would not share its fork point. Until #23 threads base_ref through
-  // prepareRepository, any other base is refused here — the header stays parsed so #23 can thread it.
-  if (envelope.base_ref !== undefined && envelope.base_ref !== "main") {
-    const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; the branch is forked from origin/main and a PR against another base would not share its fork point`;
+  // A prose envelope does not pin a base commit, so the shared-checkout path still forks from
+  // main. Refuse a non-main prose base rather than open a PR against a fork point it did not use.
+  // Digest handoffs carry both base_ref and base_commit and are handled by prepareRepository.
+  if (!contractFields && envelope.base_ref !== undefined && envelope.base_ref !== "main") {
+    const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; a prose handoff does not pin the commit to fork from`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
-    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id, outcome: "BLOCKED" });
+    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), {
+      inReplyTo: message.message_id,
+      outcome: "BLOCKED",
+    });
     return true;
   }
 
@@ -793,7 +966,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         const governor = acquired.leased ? "leased" : acquired.refused ? "refused" : "unavailable";
         const label = acquired.leased ? "Governor lease held elsewhere" : acquired.refused ? "Governor refused the lease" : "Governor lease unavailable";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
-        await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
           inReplyTo: message.message_id,
           outcome: "BLOCKED",
         });
@@ -838,7 +1011,8 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
         const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor }, lease: { ...lifecycle.snapshot().lease, ...lease } });
         await releaseLease("BLOCKED");
-        await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(`${label}: ${reason}`), {
+        // F8: on the digest path this post carries contract=<id>@<digest8> like every other.
+        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
           inReplyTo: message.message_id,
           outcome: "BLOCKED",
         });
@@ -868,7 +1042,17 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
           branchOverride: envelopeToUse.branch,
           diskFloorBytes: cleanRoom.diskFloorMb * 1048576,
         })
-      : await prepareRepository(stateDir, envelopeToUse.repo, taskId, envelopeToUse.branch);
+      : await prepareRepository(
+          stateDir,
+          envelopeToUse.repo,
+          taskId,
+          envelopeToUse.branch,
+          envelopeToUse.base_commit,
+          contractFields ? contractFields.base_ref : envelopeToUse.base_ref,
+          attempt.attempt,
+          contractFields ? contractFields.execution_spec_digest : undefined,
+        );
+    if (repository.debrisReceipt) lifecycle.record({ debris_receipt: repository.debrisReceipt });
     lifecycle.record({
       ...(attempt.firstAttempt ? { base_commit: repository.baseCommit ?? null } : {}),
       ...(cleanRoom
@@ -953,22 +1137,8 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     const head = await readHead(repository.repoDir);
     if (lease) lifecycle.record({ lease: { ...lifecycle.snapshot().lease, ...lease } });
     lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
-    // Loss of authority (L2): NO publish at all — not even the branch push. The record says why.
-    // Otherwise main's routing stands. `fence` is this attempt's fence in publisher.mjs's shape;
-    // it is null when ungoverned, and the clean-room x fence combination never reaches here (it is
-    // refused before the run).
-    // A PR is opened ONLY for work that succeeded. 192 of 194 closed-without-merge PRs in the
-    // research repo were this worker opening one per attempt regardless of outcome, at a 9% merge
-    // rate against a human's 98%.
-    //
-    // The gate cannot be "outcome === COMPLETED": finalState only returns COMPLETED when a `pr`
-    // already exists, so gating the PR on COMPLETED is circular and would stop every PR forever.
-    // The non-circular question is whether the run WOULD be COMPLETED but for the PR itself, which
-    // is finalState with pr: true. Reusing finalState is deliberate -- a second, parallel notion of
-    // "succeeded" living here would drift from the real one.
-    //
-    // A non-eligible attempt still PUSHES its branch (promotion "none"): losing evidence is a W0
-    // cohort failure condition. The work stays findable; it just stops arriving as a review request.
+    // Loss of authority means no publication. Otherwise compute PR eligibility before opening a
+    // PR, while still allowing non-eligible branch results to be pushed as durable evidence.
     const preOutcome = noCommitOutcome({
       head,
       baseCommit: lifecycle.snapshot().base_commit,
@@ -983,16 +1153,35 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       harnessStops: run.harness_stops ?? [],
     }) === "COMPLETED";
     const objective = typeof envelopeToUse.spec === "string" ? envelopeToUse.spec : null;
-    const published = authorityLost
+    const outputMode = envelopeToUse.output ?? "branch";
+    const publication = authorityLost
       ? { publish: "skipped", pr: null, fenced_out: authorityLost }
-      : cleanRoom
+      : cleanRoom && outputMode === "branch"
         ? await publishFromCache({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, prEligible, objective })
         : await publish({
-            envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId,
-            attempt: attempt.attempt, fence: composeFences(lease ? fence : null, branchFence),
+            envelope: envelopeToUse,
+            limitTripped: run.limit_tripped,
+            ...repository,
+            taskId,
+            attempt: attempt.attempt,
+            fence: composeFences(lease ? fence : null, branchFence),
             prEligible,
-            objective, outcome: prEligible ? "COMPLETED" : null, ref: envelopeToUse.ref ?? null,
+            objective,
+            outcome: prEligible ? "COMPLETED" : null,
+            ref: envelopeToUse.ref ?? null,
+            baseRef: contractFields?.base_ref ?? envelopeToUse.base_ref,
+            baseCommit: contractFields?.base_commit ?? lifecycle.snapshot().base_commit,
           });
+    const { patch, artifacts, ...published } = publication;
+    if (Array.isArray(artifacts)) published.artifacts = artifacts;
+    const extraFiles = {};
+    if (typeof patch === "string") extraFiles[`${attempt.attempt}.patch`] = patch;
+    if (Array.isArray(artifacts)) {
+      extraFiles["artifacts.json"] = `${JSON.stringify({
+        base_commit: contractFields?.base_commit ?? lifecycle.snapshot().base_commit ?? null,
+        files: artifacts,
+      }, null, 2)}\n`;
+    }
     const fencedOut = authorityLost ?? published.fenced_out ?? null;
     if (!authorityLost && published.fenced_out) fencedOutReason = published.fenced_out;
     // Build outcome: start with fence/blocker reasons, then augment with no_commit if needed (so both can coexist).
@@ -1041,11 +1230,13 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     if (lease) resultJson.authority = authorityLost ? "lost" : "held";
     const session = readSessionState(join(stateDir, "sessions", taskId), attempt.sessionId);
     const sessionJsonl = session.path ? readFileSync(session.path, "utf8") : null;
+    // F7: the evidence diff is against the pinned baseCommit on the digest path (never a
+    // hardcoded main); the prose path keeps origin/main...HEAD.
     const gitDiffResult = await command("git", [
       "-C",
       repository.repoDir,
       "diff",
-      "origin/main...HEAD",
+      contractFields?.base_commit ? `${contractFields.base_commit}...HEAD` : "origin/main...HEAD",
     ], { allowFailure: true });
     const gitDiff = gitDiffResult.status === 0 ? gitDiffResult.stdout : null;
     // The attempt is over and its diff is captured: seal the tree (evidence, read-only). Retention
@@ -1063,6 +1254,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       busToken: bus.token,
       ref: envelopeToUse.ref,
       fence: lease ? fence : null,
+      extraFiles,
     });
 
     // Wave 1B L3 (F1): the evidence POST is the third fence. `valid: false` there is the same
@@ -1106,6 +1298,17 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
       await releaseLease(lifecycle.snapshot().state);
       throw error;
     }
+    // B4: a base-checkout validation failure (missing origin base ref, or base_commit not
+    // reachable) is a BLOCKED refusal, not a FAILED run: nothing was spawned, nothing produced.
+    if (typeof error?.blockedReason === "string") {
+      lifecycle.transition("BLOCKED", { outcome: { reason: error.message } });
+      await releaseLease("BLOCKED");
+      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `state=BLOCKED reason=${error.message}`), {
+        inReplyTo: message.message_id,
+        outcome: "BLOCKED",
+      });
+      return true;
+    }
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
     await releaseLease("FAILED");
     await postFinal(bus, message, envelope, lifecycle.snapshot(), null);
@@ -1113,8 +1316,21 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
   return true;
 }
 
+// F2: EX_CONFIG on an unusable model-class table, BEFORE the state dir, the daemon lock, the
+// /v1/version fetch and the online post — the same "refuse to start" shape as --require-governor.
+function loadModelClassesOrRefuse(env = process.env) {
+  try {
+    return loadModelClasses(env);
+  } catch (error) {
+    const configError = new Error(`${error.message}; refusing to start`);
+    configError.exitCode = EXIT_CONFIG;
+    throw configError;
+  }
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  modelConfig = loadModelClassesOrRefuse();
   mkdirSync(options.stateDir, { recursive: true });
   if (options.cleanRoom) {
     // The effective bounds, on stderr once per start, so an operator (and the F8 test) can see

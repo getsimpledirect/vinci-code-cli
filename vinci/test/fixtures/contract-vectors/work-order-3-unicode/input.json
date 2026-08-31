@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 3,
+  "contractVersion": 1,
+  "id": "wo-vec-3",
+  "request": "Translate the onboarding flow: “Welcome” → « Bienvenue », 「ようこそ」, and the 😀 sticker set.\nKeep the tab\tstops and the \\ backslash in the \"quoted\" copy exactly.",
+  "scope": "apps/web/i18n/** only; the / and  and  characters in keys are data, not delimiters. 10 < 2 in key order.\u0001\u001f control bytes are escaped, \f\b short-escaped.",
+  "acceptanceCriteria": [
+    {
+      "id": "c.10",
+      "statement": "Key \"10\" sorts before key \"2\".",
+      "verifiedBy": "Golden vector byte comparison."
+    },
+    {
+      "id": "c.2",
+      "statement": "Every string survives a round trip through the canonical encoding.",
+      "verifiedBy": "Python and Node agree on canonical.txt."
+    }
+  ],
+  "grantedAuthority": [
+    "edit files under apps/web/i18n",
+    "פתח בקשת משיכה",
+    "дּ€דּ",
+    "repo:github.com/getsimpledirect/vinci-contracts",
+    "branch:i18n/*"
+  ],
+  "attentionBudget": {
+    "interruptions": 0,
+    "decisions": 0,
+    "onExhaustion": "block"
+  },
+  "requestedBy": {
+    "kind": "worker",
+    "workerId": "w-uber-1"
+  },
+  "owner": {
+    "kind": "user",
+    "userId": "owner-i18n"
+  },
+  "riskClassification": {
+    "level": "low",
+    "consequentialClasses": [],
+    "rationale": "Copy only; Ünïcödé is data."
+  },
+  "verifier": {
+    "kind": "deterministic",
+    "verifierId": "vector-check",
+    "independence": "same-worker"
+  },
+  "rollbackConditions": [],
+  "escalationRules": [
+    {
+      "when": "policy_undetermined",
+      "to": {
+        "kind": "user",
+        "userId": "owner-i18n"
+      },
+      "within": 1
+    },
+    {
+      "when": "verifier_unavailable",
+      "to": {
+        "kind": "user",
+        "userId": "owner-i18n"
+      },
+      "within": 9007199254740991
+    }
+  ],
+  "issuedAt": "2026-01-01T00:00:00.000Z",
+  "expiresAt": "2026-12-31T23:59:59.999Z"
+}
