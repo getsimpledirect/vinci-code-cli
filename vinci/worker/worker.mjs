@@ -822,7 +822,7 @@ async function processHandoff(bus, stateDir, message, governorUrl, workerId, { f
     const published = authorityLost
       ? { publish: "skipped", pr: null, fenced_out: authorityLost }
       : cleanRoom
-        ? await publishFromCache({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId })
+        ? await publishFromCache({ envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId, prEligible, objective })
         : await publish({
             envelope: envelopeToUse, limitTripped: run.limit_tripped, ...repository, taskId,
             attempt: attempt.attempt, fence: lease ? fence : null,

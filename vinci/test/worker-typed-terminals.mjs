@@ -144,3 +144,65 @@ exit 0
   assert.match(okCalls, /COMPLETED: Wire the branch lease into the push path/, "the PR title must be readable");
   assert.doesNotMatch(okCalls, /--title Worker task/, "the opaque title must never be emitted again");
 });
+
+test("the clean-room path is gated too: an ineligible run pushes and opens no PR", async (t) => {
+  // The standard publisher and the clean-room publisher are SEPARATE code paths to a PR, and
+  // gating only the first leaves the second open. An earlier version of publishFromCache
+  // relied on its blocker and limitTripped checks plus a comment calling them "this path's
+  // equivalent of the eligibility gate" -- they are not: finalState also refuses COMPLETED on
+  // a harness stop, on outcome.state !== DONE, and on no_commit. A clean-room run that
+  // stopped at the instrument would have opened a PR titled COMPLETED.
+  const tempDir = mkdtempSync(join(tmpdir(), "typed-terminals-cr-"));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const stubDir = join(tempDir, "stubs");
+  mkdirSync(stubDir);
+  const callsLog = join(tempDir, "calls.log");
+
+  writeFileSync(join(stubDir, "git"), `#!/bin/sh
+echo "git $@" >> ${callsLog}
+case "$3" in
+  config) echo https://github.com/test/repo.git; exit 0 ;;
+  push) exit 0 ;;
+  *) exit 0 ;;
+esac
+`);
+  writeFileSync(join(stubDir, "gh"), `#!/bin/sh
+echo "gh $@" >> ${callsLog}
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then echo "https://github.com/test/repo/pull/777"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo "[]"; exit 0; fi
+exit 0
+`);
+  execSync(`chmod +x ${join(stubDir, "git")} ${join(stubDir, "gh")}`);
+
+  const cacheDir = join(tempDir, "cache");
+  const attemptDir = join(tempDir, "attempt");
+  mkdirSync(cacheDir); mkdirSync(attemptDir);
+
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${stubDir}:${savedPath}`;
+  t.after(() => { process.env.PATH = savedPath; });
+
+  const { publishFromCache } = await import("../worker/cleanroom.mjs");
+
+  writeFileSync(callsLog, "");
+  const blocked = await publishFromCache({
+    envelope: { evidence: "pr", repo: "test/repo", spec: "do a thing" },
+    cacheDir, attemptDir, branch: "worker/msg_cr", taskId: "msg_cr",
+    limitTripped: null, prEligible: false,
+  });
+  const blockedCalls = readFileSync(callsLog, "utf8");
+  assert.equal(blocked.publish, "pushed", "evidence must not be lost: the branch is still pushed");
+  assert.equal(blocked.pr, null, "an ineligible clean-room run must not open a PR");
+  assert.doesNotMatch(blockedCalls, /gh pr create/, "gh pr create must NOT be reached");
+
+  writeFileSync(callsLog, "");
+  const ok = await publishFromCache({
+    envelope: { evidence: "pr", repo: "test/repo", spec: "Wire the lease into the push path" },
+    cacheDir, attemptDir, branch: "worker/msg_cr2", taskId: "msg_cr2",
+    limitTripped: null, prEligible: true,
+  });
+  const okCalls = readFileSync(callsLog, "utf8");
+  assert.equal(ok.pr, "https://github.com/test/repo/pull/777", "an eligible clean-room run still opens its PR");
+  assert.match(okCalls, /COMPLETED: Wire the lease into the push path/, "title must be readable");
+  assert.doesNotMatch(okCalls, /--title Worker task/, "the opaque title must never be emitted");
+});

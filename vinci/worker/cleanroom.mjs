@@ -444,7 +444,7 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
 // would not do: pushurl is multi-valued, -c appends, and git still tries /dev/null first) with
 // `--no-verify` to skip the hook. Nothing in the cache is rewritten. The attempt dir is only READ
 // (HEAD:BLOCKER.md). `gh` is pointed at the repo with -R, so it never needs a working tree either.
-export async function publishFromCache({ envelope, cacheDir, attemptDir, branch, taskId, limitTripped }) {
+export async function publishFromCache({ envelope, cacheDir, attemptDir, branch, taskId, limitTripped, prEligible = true, objective = null }) {
   const blockerReason = await readHeadBlocker(attemptDir);
   const originUrl = await command("git", ["-C", cacheDir, "config", "--get", "remote.origin.url"], { allowFailure: true });
   const push = originUrl.status === 0 && originUrl.stdout
@@ -454,14 +454,22 @@ export async function publishFromCache({ envelope, cacheDir, attemptDir, branch,
   if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
   if (limitTripped) return result;
   if (push.status !== 0 || envelope.evidence !== "pr") return result;
+  // The PR gate, same as the standard publisher. An earlier version of this function relied on
+  // the blocker and limitTripped checks above and a comment calling them "this path's
+  // equivalent of the eligibility gate". They are not equivalent: finalState also refuses
+  // COMPLETED on a harness stop, on outcome.state !== DONE, and on no_commit, none of which
+  // are checked here. So a clean-room run that stopped at the instrument or produced no commit
+  // would have opened a PR titled COMPLETED. The branch is already pushed above, so refusing
+  // here loses no evidence -- it only withholds the review request.
+  if (!prEligible) return result;
 
   const created = await command(
     "gh",
     ["pr", "create", "-R", envelope.repo, "--base", "main", "--head", branch, "--title", prTitle({
        taskId,
-       objective: typeof envelope.spec === "string" ? envelope.spec : null,
-       // The clean-room path only reaches PR creation after a clean push with no blocker and no
-       // limit tripped, which is this path's equivalent of the eligibility gate in worker.mjs.
+       objective: objective ?? (typeof envelope.spec === "string" ? envelope.spec : null),
+       // Reached only when prEligible, i.e. finalState would return COMPLETED but for the PR
+       // itself. The gate is above; this is not asserting the outcome, it is reporting it.
        outcome: "COMPLETED",
        head: null,
        ref: envelope.ref ?? null,
