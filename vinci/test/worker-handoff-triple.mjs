@@ -385,6 +385,38 @@ try {
     vinciRuns += 1;
     assert.equal(f.getVinciCalls().length, vinciRuns, "@file table: the digest handoff runs");
     assert.match(postsFor("m-classes-file"), /state=COMPLETED/, "@file table: the class resolves and the task completes");
+
+    // F5: a CUSTOM class mapping must actually reach the child. Everything above
+    // proves the REFUSALS -- unknown_model_class when the table is unset,
+    // provider_mismatch when a pin disagrees -- and every other digest test runs
+    // with the fixture default, which maps forte to the MANAGED provider
+    // ({provider:"vinci"}). So nothing here demonstrated the property F5 asks
+    // for: "worker boxes are OpenRouter-only; forte/fortissimo must not hardwire
+    // to the managed provider". A mechanism that is configurable and never shown
+    // to deliver is indistinguishable from one that ignores its config.
+    //
+    // This asserts the ARGV the worker spawned, not the task's state. A task can
+    // reach COMPLETED while the class silently resolved to the default; only the
+    // child's --provider/--model says where the work would really have gone.
+    {
+      const remapped = orderFor("wo-remap");
+      f.busMessages.push(handoff("m-remap", register(remapped, specFor(remapped, { targetBranch: "feat/remap" }))));
+      const before = f.getVinciCalls().length;
+      const rr = await run({ env: { VINCI_WORKER_MODEL_CLASSES: JSON.stringify({
+        forte: { provider: "openrouter", model: "deepseek/deepseek-v4-flash-0731" },
+      }) } });
+      assert.equal(rr.status, 0, rr.stderr);
+      vinciRuns += 1;
+      assert.equal(f.getVinciCalls().length, vinciRuns, "custom class mapping: the digest handoff runs");
+      assert.equal(f.getVinciCalls().length, before + 1, "custom class mapping: exactly one spawn");
+      const argv = f.getVinciCalls().at(-1).argv ?? [];
+      const provider = argv[argv.indexOf("--provider") + 1];
+      const model = argv[argv.indexOf("--model") + 1];
+      assert.equal(provider, "openrouter",
+        `custom class mapping: the child must be spawned with the CONFIGURED provider, got ${provider}`);
+      assert.equal(model, "deepseek/deepseek-v4-flash-0731",
+        `custom class mapping: the child must be spawned with the CONFIGURED model, got ${model}`);
+    }
     // WARN-2: m-classes carries the HAPPY PATH's triple — the same execution spec, already run
     // and already pushed. The refusal must report the OBSERVATION (origin/feat/vector-1 has moved
     // past the base_commit this spec pins) and not `branch_diverged`, whose commits may be this
