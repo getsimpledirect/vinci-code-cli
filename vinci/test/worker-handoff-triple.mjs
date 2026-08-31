@@ -265,6 +265,10 @@ try {
       ["m-sp-schema", orderFor("wo-sp-schema"), { schemaVersion: 2 }, "invalid_execution_spec", /schemaVersion invalid_schema_version/],
       ["m-sp-nobase", orderFor("wo-sp-nobase"), { baseRef: undefined }, "invalid_execution_spec", /baseRef/],
       ["m-sp-badbranch", orderFor("wo-sp-badbranch"), { targetBranch: "+oops" }, "invalid_execution_spec", /targetBranch invalid_ref/],
+      ["m-sp-longbranch", orderFor("wo-sp-longbranch"), { targetBranch: "a".repeat(256) }, "invalid_execution_spec", /targetBranch invalid_ref/],
+      ["m-sp-lockcomponent", orderFor("wo-sp-lockcomponent"), { targetBranch: "foo.lock/bar" }, "invalid_execution_spec", /targetBranch invalid_ref/],
+      ["m-sp-double-separator", orderFor("wo-sp-double-separator"), { targetBranch: "feature//topic" }, "invalid_execution_spec", /targetBranch invalid_ref/],
+      ["m-sp-dotcomponent", orderFor("wo-sp-dotcomponent"), { targetBranch: "feature/.hidden/topic" }, "invalid_execution_spec", /targetBranch invalid_ref/],
       ["m-sp-nobounds", orderFor("wo-sp-nobounds"), { resourceBounds: undefined }, "invalid_execution_spec", /resourceBounds/],
       ["m-sp-boundsextra", orderFor("wo-sp-be"), { resourceBounds: { ...happySpec.resourceBounds, extra: 1 } }, "invalid_execution_spec", /resourceBounds\/extra unknown_field/],
     ];
@@ -277,6 +281,26 @@ try {
       assertRefusedBeforeTransfer(id, code);
       assert.match(postsFor(id), detail, `${id}: the refusal names the failing field`);
     }
+  }
+
+  // The digest path accepts the same nested branch boundary as prose. The invalid matrix above
+  // pins the four symmetric refusals; this handoff proves a valid nested targetBranch survives
+  // validation, reaches checkout/spawn, and is published under that exact name.
+  {
+    const nestedOrder = orderFor("wo-sp-nested", {
+      grantedAuthority: [...workOrder.grantedAuthority, "branch:feature/*"],
+    });
+    f.busMessages.push(handoff(
+      "m-sp-nested",
+      register(nestedOrder, specFor(nestedOrder, { targetBranch: "feature/nested/topic", promotion: "none" })),
+    ));
+    const r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "nested.txt" } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    assert.equal(f.getVinciCalls().length, vinciRuns, "valid nested digest targetBranch reaches the child exactly once");
+    assert.equal(taskState("m-sp-nested").state, "UNVERIFIED");
+    assert.match(postsFor("m-sp-nested"), /state=UNVERIFIED/);
+    assert.match(git(contractBare, "rev-parse", "refs/heads/feature/nested/topic"), /^[0-9a-f]{40}$/);
   }
 
   // --- 404 response --- (registry has no contract for the named work order)
