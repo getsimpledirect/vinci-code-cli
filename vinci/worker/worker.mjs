@@ -778,6 +778,13 @@ async function processHandoff(
   // resolution) blocks two cases the composed tree can genuinely serve, and each branch's test
   // proves it: worker-handoff-triple (digest, shared) and worker-typed-terminals (prose,
   // clean room). Requiring EITHER is the correct composition and is still closed by default.
+  //
+  // 🔴 That claim was FALSE until the clean room actually honoured both halves of the pin.
+  // prepareCleanRoom took base_ref only and resolved origin/<base_ref> to its CURRENT TIP, so
+  // a digest handoff in the clean room forked from whatever the branch pointed to now and the
+  // signed base_commit was never verified. The exemption is earned only because
+  // prepareCleanRoom now validates base_commit is an ancestor of origin/<base_ref> and starts
+  // the attempt AT the signed commit, with the same refusals shared mode uses.
   if (!contractFields && !cleanRoom && envelope.base_ref !== undefined && envelope.base_ref !== "main") {
     const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; a prose handoff does not pin the commit to fork from`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
@@ -1049,7 +1056,13 @@ async function processHandoff(
           taskId,
           attempt: attempt.attempt,
           branchOverride: envelopeToUse.branch,
-          baseRef: envelopeToUse.base_ref,
+          // BOTH halves of the pin, and the SAME expressions shared mode uses below.
+          // Previously this passed only envelopeToUse.base_ref and no commit at all, so the
+          // clean room could resolve a different ref than prepareRepository AND never checked
+          // the signed commit -- the composed guard permits a non-main base when EITHER
+          // mechanism honours the pin, which was only half true.
+          baseRef: contractFields ? contractFields.base_ref : envelopeToUse.base_ref,
+          pinnedBaseCommit: envelopeToUse.base_commit,
           diskFloorBytes: cleanRoom.diskFloorMb * 1048576,
         })
       : await prepareRepository(

@@ -417,3 +417,90 @@ spawnSync("chmod", ["-R", "u+w", scratch]);
 rmSync(scratch, { recursive: true, force: true });
 
 console.log("PASS worker-clean-room");
+
+// --- C-PIN: the SIGNED base_commit half of a digest pin ------------------------------------------
+//
+// 🔴 THE DEFECT THIS COVERS. A digest handoff signs BOTH base_ref and base_commit, and shared
+// mode (prepareRepository) validates both. prepareCleanRoom took only base_ref and resolved
+// origin/<base_ref> to its CURRENT TIP. So if the branch advanced after the contract was issued,
+// the clean room forked from the NEW tip and the signed commit was never checked -- while the
+// composed guard in worker.mjs permits a non-main base on the grounds that EITHER mechanism
+// honours the pin. That was half true.
+//
+// The advancing-branch case is the one that matters and the one no existing test reached: a
+// pin that is still the tip cannot distinguish "honours the commit" from "ignores it".
+{
+  const seed = join(scratch, "seed-pin");
+  mkdirSync(seed, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main", seed]);
+  git(seed, "config", "user.email", "t@t");
+  git(seed, "config", "user.name", "t");
+  writeFileSync(join(seed, "doc.md"), "signed\n");
+  git(seed, "add", ".");
+  git(seed, "commit", "-qm", "signed base");
+  const signedSha = git(seed, "rev-parse", "HEAD");
+  // The branch MOVES after the contract was signed.
+  writeFileSync(join(seed, "doc.md"), "advanced\n");
+  git(seed, "commit", "-qam", "advanced past the signed commit");
+  const advancedSha = git(seed, "rev-parse", "HEAD");
+  assert.notEqual(signedSha, advancedSha, "precondition: the branch must have advanced");
+
+  const originDir = join(scratch, "origins", "pin");
+  mkdirSync(originDir, { recursive: true });
+  execFileSync("git", ["clone", "-q", "--bare", seed, join(originDir, "repo.git")]);
+
+  // Honours the SIGNED commit, not the current tip.
+  const pinned = await prepareCleanRoom({
+    stateDir: state, repo: "pin/repo", taskId: "t-pin", attempt: 1,
+    baseRef: "main", pinnedBaseCommit: signedSha, ...noFloor,
+  });
+  assert.equal(pinned.baseCommit, signedSha,
+    `clean room must start at the SIGNED base_commit ${signedSha.slice(0, 8)}, not the ` +
+    `current tip ${advancedSha.slice(0, 8)}`);
+  assert.equal(git(pinned.attemptDir, "rev-parse", "HEAD"), signedSha,
+    "the attempt worktree itself must be checked out at the signed commit");
+
+  // Without the pin, the old behaviour stands: the tip. This is the anti-vacuity case -- an
+  // implementation that ALWAYS used some fixed commit would pass the assertion above.
+  const unpinned = await prepareCleanRoom({
+    stateDir: state, repo: "pin/repo", taskId: "t-pin-none", attempt: 1,
+    baseRef: "main", ...noFloor,
+  });
+  assert.equal(unpinned.baseCommit, advancedSha,
+    "with no pinned base_commit the clean room still bases at the current tip");
+
+  // An unreachable commit is REFUSED, not silently replaced by the tip. Falling back is the
+  // defect itself: it turns 'the branch moved past what was signed' into a silent success.
+  const unreachable = "0".repeat(40);
+  await assert.rejects(
+    prepareCleanRoom({
+      stateDir: state, repo: "pin/repo", taskId: "t-pin-bad", attempt: 1,
+      baseRef: "main", pinnedBaseCommit: unreachable, ...noFloor,
+    }),
+    /base_commit_unreachable/,
+    "an unreachable signed commit must refuse with base_commit_unreachable, never fall back",
+  );
+
+  // A malformed pin is refused before any git work.
+  await assert.rejects(
+    prepareCleanRoom({
+      stateDir: state, repo: "pin/repo", taskId: "t-pin-malformed", attempt: 1,
+      baseRef: "main", pinnedBaseCommit: "deadbeef", ...noFloor,
+    }),
+    /40-character lowercase hex/,
+    "a short/malformed base_commit must be refused",
+  );
+
+  // A pin with no base_ref cannot be validated against anything, so it is refused rather than
+  // accepted on trust -- the same reason shared mode raises base_ref_unavailable.
+  await assert.rejects(
+    prepareCleanRoom({
+      stateDir: state, repo: "pin/repo", taskId: "t-pin-noref", attempt: 1,
+      pinnedBaseCommit: signedSha, ...noFloor,
+    }),
+    /base_ref_unavailable/,
+    "a pinned base_commit with no base_ref must be refused",
+  );
+
+  console.log("  \u2713 C-PIN: clean room honours the signed base_commit, refuses unreachable/malformed/ref-less pins");
+}

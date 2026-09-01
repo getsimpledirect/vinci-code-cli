@@ -435,9 +435,26 @@ async function commitIdentity() {
 
 // C1: a fresh attempt worktree. Returns the same `{ branch, repoDir }` shape prepareRepository
 // does (repoDir IS the attempt dir) plus the clean-room facts the task record carries.
-export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branchOverride, baseRef, diskFloorBytes = DEFAULT_DISK_FLOOR_MB * 1048576, authFile = process.env.VINCI_WORKER_AUTH_FILE }) {
+export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branchOverride, baseRef, pinnedBaseCommit, diskFloorBytes = DEFAULT_DISK_FLOOR_MB * 1048576, authFile = process.env.VINCI_WORKER_AUTH_FILE }) {
   if (baseRef !== undefined && !isPlainRefName(baseRef)) {
     throw new Error(`base_ref ${baseRef} must be a plain git branch name`);
+  }
+  // A digest handoff signs BOTH halves of the pin: base_ref AND base_commit. Shared mode
+  // (prepareRepository, run.mjs) validates both. This path took only the ref and resolved
+  // origin/<base_ref> to its CURRENT TIP, so if the branch advanced after the contract was
+  // issued the attempt silently forked from the new tip and the signed commit was never
+  // checked. The composed guard in worker.mjs permits a non-main base when EITHER mechanism
+  // can honour it; that is only true if this one honours the commit half too.
+  //
+  // Same validation and the same BLOCKED reasons as shared mode, deliberately: two paths
+  // enforcing one contract must not disagree about what the contract means.
+  if (pinnedBaseCommit !== undefined && pinnedBaseCommit !== null) {
+    if (typeof pinnedBaseCommit !== "string" || !/^[0-9a-f]{40}$/.test(pinnedBaseCommit)) {
+      throw new Error("base_commit must be a full 40-character lowercase hex SHA-1");
+    }
+    if (typeof baseRef !== "string" || baseRef === "") {
+      throw new Error("base_ref_unavailable: a pinned base_commit requires a base_ref to be fetched from origin");
+    }
   }
   const { cacheDir, attemptsRoot } = cleanRoomPaths(stateDir, repo, taskId);
   const paths = attemptPaths(attemptsRoot, attempt);
@@ -491,7 +508,28 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
   const cacheRef = branchOverride || onOrigin.status === 0 ? taskBranchRef : baseBranchRef;
   const resolved = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", cacheRef], { allowFailure: true });
   if (resolved.status !== 0 || !SHA.test(resolved.stdout)) throw new Error(`clean room: ${cacheRef} did not materialize in ${cacheDir} after fetch`);
-  const baseCommit = resolved.stdout;
+  let baseCommit = resolved.stdout;
+
+  // The signed commit half of the pin, checked AFTER the fetch so the cache actually has it.
+  // Two refusals, both matching shared mode's reasons:
+  //   base_ref_unavailable    -- origin/<base_ref> is not present after the fetch
+  //   base_commit_unreachable -- the signed commit is not an ancestor of that ref
+  // There is NO fallback to the tip: falling back is precisely the defect, because it converts
+  // "the branch moved past what was signed" into a silent success.
+  if (pinnedBaseCommit) {
+    const baseResolved = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", baseBranchRef], { allowFailure: true });
+    if (baseResolved.status !== 0 || !SHA.test(baseResolved.stdout)) {
+      throw new Error(`base_ref_unavailable: origin/${checkoutBase} is not present in ${cacheDir} after fetch`);
+    }
+    const isAncestor = await command("git", ["-C", cacheDir, "merge-base", "--is-ancestor", pinnedBaseCommit, baseBranchRef], { allowFailure: true });
+    if (isAncestor.status !== 0) {
+      throw new Error(`base_commit_unreachable: base_commit ${pinnedBaseCommit.slice(0, 8)} is not an ancestor of origin/${checkoutBase} (as fetched)`);
+    }
+    // Start the attempt at the SIGNED commit, not at whatever the branch points to now.
+    // Only when the task branch is not being continued: a resumed attempt continues at
+    // origin/worker/<task> by the same fast-forward rule as shared mode.
+    if (cacheRef === baseBranchRef) baseCommit = pinnedBaseCommit;
+  }
 
   // Earlier attempts of this task: sealed (a crashed attempt never sealed itself), never entered.
   for (const previous of listAttempts(attemptsRoot)) sealAttemptDir(attemptPaths(attemptsRoot, previous).attemptDir);
