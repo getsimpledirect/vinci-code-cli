@@ -753,25 +753,6 @@ async function processHandoff(
     return true;
   }
 
-  // B2 (fail closed, before clone): shared mode's prepareRepository still forks every branch off
-  // origin/main, so a PR whose base is not main would not share its fork point. Clean-room mode
-  // threads the pinned base through its checkout and publisher and may therefore accept it.
-  //
-  // COMPOSITION NOTE: this guard and the `!contractFields` guard below are two INDEPENDENT
-  // exemptions for the same hazard, authored separately (#44 keyed on cleanRoom, #46 keyed on
-  // contractFields). Both are kept, so a non-main base_ref is refused unless BOTH modes can
-  // honour it. Collapsing them into one condition would grant an exemption neither author
-  // granted alone.
-  if (!cleanRoom && envelope.base_ref !== undefined && envelope.base_ref !== "main") {
-    const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; the branch is forked from origin/main and a PR against another base would not share its fork point`;
-    lifecycle.transition("BLOCKED", { outcome: { reason } });
-    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), {
-      inReplyTo: message.message_id,
-      outcome: "BLOCKED",
-    });
-    return true;
-  }
-
   // F5: refuse before clone, lease acquisition or spawn. Credential presence is not authority to
   // select a provider, and env pruning alone cannot police stored auth or future credential
   // sources. The explicit operator allowlist is the provider decision.
@@ -786,10 +767,18 @@ async function processHandoff(
     return true;
   }
 
-  // A prose envelope does not pin a base commit, so the shared-checkout path still forks from
-  // main. Refuse a non-main prose base rather than open a PR against a fork point it did not use.
-  // Digest handoffs carry both base_ref and base_commit and are handled by prepareRepository.
-  if (!contractFields && envelope.base_ref !== undefined && envelope.base_ref !== "main") {
+  // A non-main base_ref is honoured by EITHER of two mechanisms, and refused only when neither
+  // is present. A digest handoff carries base_ref + base_commit and is handled by
+  // prepareRepository (#23/#46); clean-room mode threads the pinned base through its own checkout
+  // and publisher (#44). Shared mode with a prose envelope has neither: prepareRepository forks
+  // every branch off origin/main, so a PR against another base would not share its fork point.
+  //
+  // COMPOSITION NOTE: #46 keyed this guard on `contractFields` and #44 keyed it on `cleanRoom`,
+  // each exempting the mechanism its own branch built. Requiring BOTH (the naive conflict
+  // resolution) blocks two cases the composed tree can genuinely serve, and each branch's test
+  // proves it: worker-handoff-triple (digest, shared) and worker-typed-terminals (prose,
+  // clean room). Requiring EITHER is the correct composition and is still closed by default.
+  if (!contractFields && !cleanRoom && envelope.base_ref !== undefined && envelope.base_ref !== "main") {
     const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; a prose handoff does not pin the commit to fork from`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
     await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), {
