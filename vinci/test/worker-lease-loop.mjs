@@ -13,6 +13,17 @@ import { CLAIM_PATHS_DEPLOYED, CLAIM_PATHS_WITH_TTL, FakeGovernor, WorkerTestFix
 import { CAPABILITY_MATRIX, DECLARATION_REFRESH_DEFAULT_S, GOVERNOR_DECLARATION_MAX_AGE_S, LEASE_TIMEOUT_MS, LeaseClient, REFRESH_HEADROOM_FACTOR, buildDeclaration, declarationDigest, startHeartbeat } from '../worker/lease.mjs';
 import { prBodyFooter, publish } from '../worker/publisher.mjs';
 
+// A terminal record is now a status carrying a typed outcome, not a `blocker`. These helpers
+// locate it by the PROPERTY that matters -- the task ended badly -- rather than by a kind string,
+// so they keep their meaning as the contract evolves and, crucially, so the NEGATIVE assertions
+// below cannot pass merely because nothing emits a given kind any more.
+const FAILING_OUTCOMES = ["FAILED", "BLOCKED", "REFUSED"];
+const findTerminalFailure = (posts) =>
+  posts.find((p) => p.kind === "status" && FAILING_OUTCOMES.includes(p.outcome));
+const hasTerminalFailure = (posts) =>
+  posts.some((p) => FAILING_OUTCOMES.includes(p.outcome) || /^task \S+ (blocked|failed|refused)$/.test(p.subject ?? ""));
+
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const TOOLS = join(ROOT, 'vinci/test/fixtures/worker-test-tools');
 const WORKER = join(ROOT, 'vinci/worker/worker.mjs');
@@ -258,7 +269,7 @@ await test('409 leased => BLOCKED before clone: no git, no spawn, no renew, no r
     assert.equal(governor.renews.length, 0);
     assert.equal(governor.releases.length, 0);
     assert.equal(governor.checks.length, 0);
-    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    const blocker = findTerminalFailure(fixture.getPostedMessages());
     assert.match(blocker.body, /^Governor lease held elsewhere: leased_by other-worker\/7 until 2099-01-01T00:00:00\.000Z worker_build=/);
   } finally {
     await governor.close();
@@ -283,7 +294,7 @@ await test('unusable lease answer at acquire (500) => BLOCKED lease_unavailable,
     assert.equal(governor.hits.filter((h) => h.url === '/v1/governor/claim-paths').length, 0, 'an unavailable lease must leave no path claim held');
     assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'must not clone');
     assert.equal(fixture.getVinciCalls().length, 0);
-    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    const blocker = findTerminalFailure(fixture.getPostedMessages());
     assert.match(blocker.body, /^Governor lease unavailable: lease_unavailable:/);
   } finally {
     await governor.close();
@@ -590,7 +601,7 @@ await test('check invalid at the evidence fence (third fence) => BLOCKED fenced_
     assert(ghCalls(fixture).some((c) => c.argv.includes('create')), 'PR happened under a valid fence');
     assert.equal(fixture.getEvidencePosts().length, 0, 'the fenced evidence POST never reaches the ledger');
     assert.deepEqual(governor.releases, [{ lease_id: 'lease-1', fencing_generation: 100, outcome: 'abandoned' }]);
-    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    const blocker = findTerminalFailure(fixture.getPostedMessages());
     assert(blocker, 'a blocker must be posted');
     assert.equal(blocker.subject, 'task 114 blocked');
     assert.match(blocker.body, /^state=BLOCKED .*evidence_error=revoked .*reason=revoked/, blocker.body);
@@ -659,7 +670,7 @@ await test('path claim refused after the lease was granted => BLOCKED refused, l
     assert.deepEqual(governor.releases, [{ lease_id: 'lease-1', fencing_generation: 100, outcome: 'blocked' }]);
     assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'must not clone');
     assert.equal(fixture.getVinciCalls().length, 0, 'must not spawn');
-    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    const blocker = findTerminalFailure(fixture.getPostedMessages());
     assert.match(blocker.body, /^Governor refused the lease: path already leased to worker:other worker_build=/);
   } finally {
     await governor.close();
@@ -771,7 +782,7 @@ await test('SIGTERM mid-run: heartbeat stops, lease released abandoned, child SI
     const snapshot = state(fixture, '118');
     assert.equal(snapshot.state, 'RUNNING', 'the task record is left for the next daemon start to resume');
     assert.equal(originHasBranch(join(fixture.reposDir, 'test', 'repo.git'), 'worker/118'), false, 'nothing published');
-    assert.equal(fixture.getPostedMessages().some((p) => p.kind === 'blocker'), false);
+    assert.equal(hasTerminalFailure(fixture.getPostedMessages()), false, 'no terminal failure record must be posted');
   } finally {
     await governor.close();
     await fixture.cleanup();
@@ -833,7 +844,7 @@ await test('BLOCK-A: the claim carries the acquire attempt_id, so the holder gat
     assert.equal(governor.claims[0].idempotency_key, governor.acquires[0].attempt_id, 'the claim is idempotency-keyed on the same attempt');
     // And the refusal the missing field would have produced never happened.
     assert.equal(snapshot.outcome?.governor, undefined);
-    assert.equal(fixture.getPostedMessages().some((p) => p.kind === 'blocker'), false, 'no blocker: the holder gate admitted the claim');
+    assert.equal(hasTerminalFailure(fixture.getPostedMessages()), false, 'no terminal failure: the holder gate admitted the claim');
     assert.equal(fixture.getVinciCalls().length, 1, 'the governed task actually ran');
   } finally {
     await governor.close();
@@ -866,7 +877,7 @@ await test('BLOCK-A control: a non-holder attempt_id is refused leased_by_other_
     assert.equal(snapshot.outcome.governor, 'refused');
     assert.deepEqual(governor.releases.map((r) => r.outcome), ['blocked'], 'the lease this worker held is released');
     assert.equal(fixture.getVinciCalls().length, 0, 'a refused claim never spawns');
-    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    const blocker = findTerminalFailure(fixture.getPostedMessages());
     assert(blocker && blocker.body.includes('Governor refused the lease: leased_by_other_attempt'), `blocker: ${blocker?.body}`);
   } finally {
     await governor.close();
@@ -1103,7 +1114,7 @@ await test('WARN-3 at acquire, end to end: 409 work order expired => BLOCKED ref
     assert.equal(snapshot.state, 'BLOCKED');
     assert.equal(snapshot.outcome.reason, 'work order expired', 'the rule text verbatim, with no lease_unavailable prefix');
     assert.equal(snapshot.outcome.governor, 'refused', 'a Governor DECISION, not "unavailable"');
-    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    const blocker = findTerminalFailure(fixture.getPostedMessages());
     assert(blocker && blocker.body.includes('Governor refused the lease: work order expired'), `blocker: ${blocker?.body}`);
     assert.equal(fixture.getVinciCalls().length, 0, 'must not spawn');
     assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'must not clone');
@@ -1345,7 +1356,7 @@ await test('#26 x #24: --clean-room under a Governor is refused BEFORE the run',
     assert.equal(governor.acquires.length, 0, 'no lease is taken for a configuration that cannot publish under it');
     assert.equal(governor.claims.length, 0);
     assert.equal(ghCalls(fixture).length, 0, 'nothing published');
-    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    const blocker = findTerminalFailure(fixture.getPostedMessages());
     assert(blocker && blocker.body.includes('clean_room_publish_unsupported'), `blocker: ${blocker?.body}`);
   } finally {
     // If the guard ever stops firing, the clean room DOES run and seals its attempt dir read-only,
@@ -1493,7 +1504,7 @@ await test('D1 end to end: a 403 the client has never seen is a REFUSAL, not "un
     assert.equal(snapshot.outcome.reason, 'session does not hold this work order');
     assert.equal(snapshot.outcome.governor, 'refused', 'a 403 on a lease route is a DECISION');
     assert.equal(/unavailable/.test(JSON.stringify(snapshot.outcome)), false, 'never filed as unavailability');
-    const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+    const blocker = findTerminalFailure(fixture.getPostedMessages());
     assert(blocker.body.includes('Governor refused the lease: session does not hold this work order'), `blocker: ${blocker.body}`);
     assert.equal(/lease_unavailable/.test(blocker.body), false, 'the blocker must not say unavailable');
     assert.equal(/unexpected status/.test(blocker.body), false);

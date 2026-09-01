@@ -48,6 +48,21 @@ assert.equal(existsSync(join(result.fixture.tempDir, "gh-calls.txt")), false, "n
 assert.match(result.fixture.getPostedMessages().at(-1).body, /base_ref_unsupported/);
 await result.fixture.cleanup();
 
+// MUTATION GUARD: the refusal is an allowlist of exactly ONE value, so a single non-main
+// scenario cannot catch a mutation that grants a SECOND exemption. An adversarial review added
+// `&& envelope.base_ref !== "dev"` to the guard and the whole suite still passed, because the
+// only non-main value under test was `release/2026-08`. Sweep the literals a mutation is most
+// likely to reach for: only `main` may be accepted here. (`HEAD` and other non-branch
+// shapes are refused earlier by the base_ref format validator, with a different reason, so
+// they do not exercise THIS guard and are deliberately not in the sweep.)
+for (const [i, ref] of ["dev", "master", "develop", "trunk", "staging", "release/2027-01"].entries()) {
+  const r = await scenario(`br-sweep-${i}`, `base_ref: ${ref}`);
+  assert.equal(r.state.state, "BLOCKED", `base_ref: ${ref} must be refused — main is the only supported base`);
+  assert.match(r.state.outcome.reason, /^base_ref_unsupported/, `base_ref: ${ref} must refuse with base_ref_unsupported`);
+  assert.equal(r.fixture.getVinciCalls().length, 0, `base_ref: ${ref} must be refused before spawn`);
+  await r.fixture.cleanup();
+}
+
 result = await scenario("br2", "base_ref: main");
 assert.equal(result.state.state, "COMPLETED", "base_ref: main is the supported base");
 assert.equal(result.state.base_ref, "main");

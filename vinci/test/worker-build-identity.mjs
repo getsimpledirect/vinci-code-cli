@@ -227,7 +227,9 @@ await test("T6 early terminal blockers (past deadline, governor refusal, envelop
     );
     const code = await new Promise((resolveClose) => proc.once("close", resolveClose));
     assert.equal(code, 0);
-    const blocker = refused.getPostedMessages().find((post) => post.kind === "blocker");
+    const blocker = refused.getPostedMessages().find(
+      (post) => post.kind === "status" && ["FAILED", "BLOCKED", "REFUSED"].includes(post.outcome),
+    );
     assert.ok(blocker, JSON.stringify(refused.getPostedMessages()));
     assert.match(blocker.body, /Governor refused the lease/);
     assert.match(blocker.body, WORKER_BUILD_TAG, blocker.body);

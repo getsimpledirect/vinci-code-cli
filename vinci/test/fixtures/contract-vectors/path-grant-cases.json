@@ -1,0 +1,42 @@
+{
+  "_": "Shared golden cases for the path: grant grammar. src/path-grant.test.ts reads this file; vinci-gpu-control's vendored Python grammar mirrors these exact rules and must agree case for case. Add cases; never edit or remove one.",
+  "accepted": [
+    { "token": "path:src/", "root": "src/", "kind": "directory" },
+    { "token": "path:src/x.ts", "root": "src/x.ts", "kind": "file" },
+    { "token": "path:docs/README.md", "root": "docs/README.md", "kind": "file" },
+    { "token": "path:a/b/c/", "root": "a/b/c/", "kind": "directory" },
+    { "token": "path:.github/workflows/gate.yml", "root": ".github/workflows/gate.yml", "kind": "file" },
+    { "token": "path:a..b/", "root": "a..b/", "kind": "directory" }
+  ],
+  "refused": [
+    { "token": "path:.", "reason": "root_scope" },
+    { "token": "path:/etc", "reason": "absolute" },
+    { "token": "path:a/../b", "reason": "dotdot_segment" },
+    { "token": "path:a\\b", "reason": "backslash" },
+    { "token": "path:", "reason": "empty" },
+    { "token": "path:/", "reason": "absolute" },
+    { "token": "path:./src/", "reason": "dot_segment" },
+    { "token": "path:src/./x.ts", "reason": "dot_segment" },
+    { "token": "path:..", "reason": "dotdot_segment" },
+    { "token": "path:../src/", "reason": "dotdot_segment" },
+    { "token": "path:src/..", "reason": "dotdot_segment" },
+    { "token": "path:src//x.ts", "reason": "empty_segment" },
+    { "token": "path:src//", "reason": "empty_segment" },
+    { "token": "path:src\\x.ts", "reason": "backslash" },
+    { "token": "path:src/\u0000x", "reason": "nul" },
+    { "token": "path:\u0000", "reason": "nul" }
+  ],
+  "monotonicity": [
+    { "parent": "src/", "child": "src/", "covers": true },
+    { "parent": "src/", "child": "src/x.ts", "covers": true },
+    { "parent": "src/", "child": "src/a/b/", "covers": true },
+    { "parent": "src/x.ts", "child": "src/x.ts", "covers": true },
+    { "parent": "src/x.ts", "child": "src/", "covers": false },
+    { "parent": "src/x.ts", "child": "src/x.ts/", "covers": false },
+    { "parent": "src/x.ts", "child": "src/y.ts", "covers": false },
+    { "parent": "src/", "child": "docs/", "covers": false },
+    { "parent": "src/", "child": "srcx/", "covers": false },
+    { "parent": "src/", "child": "src", "covers": false },
+    { "parent": "src/a/", "child": "src/", "covers": false }
+  ]
+}

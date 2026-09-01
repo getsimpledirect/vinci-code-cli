@@ -50,6 +50,8 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, st
 import { dirname, join } from "node:path";
 
 import { classifyDivergedLocal, command, readHeadBlocker, renameBranchAside } from "./run.mjs";
+import { prTitle } from "./publisher.mjs";
+import { isPlainRefName } from "./task.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
@@ -104,6 +106,109 @@ export const PROVIDER_KEY_ENV = Object.freeze({
   deepinfra: ["VINCI_INTERNAL_DEEPINFRA_API_KEY"],
 });
 
+// Every provider credential and authentication-routing value the bundled coding agent knows how
+// to resolve from the environment, plus Vinci's managed/internal keys. This inventory is
+// intentionally broader than PROVIDER_KEY_ENV: the latter names what an envelope may KEEP, while
+// this list names what must be REMOVED. Keeping only the three envelope keys in the removal
+// inventory was fail-open — an OpenRouter child still received Anthropic, OpenAI and public
+// DeepInfra credentials.
+export const PROVIDER_CREDENTIAL_ENV = Object.freeze([
+  "AI_GATEWAY_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_OAUTH_TOKEN",
+  "ANT_LING_API_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+  "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+  "AWS_PROFILE",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_WEB_IDENTITY_TOKEN_FILE",
+  "AZURE_OPENAI_API_KEY",
+  "CEREBRAS_API_KEY",
+  "CLOUDFLARE_API_KEY",
+  "COPILOT_GITHUB_TOKEN",
+  "DEEPINFRA_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "FIREWORKS_API_KEY",
+  "GCLOUD_PROJECT",
+  "GEMINI_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CLOUD_API_KEY",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_CLOUD_PROJECT",
+  "GROQ_API_KEY",
+  "HF_TOKEN",
+  "KIMI_API_KEY",
+  "MINIMAX_API_KEY",
+  "MINIMAX_CN_API_KEY",
+  "MISTRAL_API_KEY",
+  "MOONSHOT_API_KEY",
+  "NVIDIA_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENCODE_API_KEY",
+  "OPENROUTER_API_KEY",
+  "TOGETHER_API_KEY",
+  "VINCI_API_KEY",
+  "VINCI_INTERNAL_DEEPINFRA_API_KEY",
+  "XAI_API_KEY",
+  "XIAOMI_API_KEY",
+  "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+  "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+  "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+  "ZAI_API_KEY",
+  "ZAI_CODING_CN_API_KEY",
+]);
+
+// The provider boundary for the NORMAL (non-clean-room) path.
+//
+// PROVIDER_KEY_ENV above promises a child gets ONLY the key its envelope's provider
+// authenticates with. That promise was kept exclusively inside cleanRoomEnv, and the normal path
+// passed `env: undefined` to the child -- meaning INHERIT EVERYTHING, every provider key the
+// daemon holds. Clean-room mode is additionally refused under a Governor, so in the governed
+// configuration the boundary never executed at all: it was a guard that existed, was correct,
+// and sat on a path that does not run where it matters. What actually kept a child off another
+// provider was which keys happened to be ABSENT from the box, which is an accident, not a
+// boundary.
+//
+// This is deliberately SUBTRACTIVE rather than an allowlist rebuild. cleanRoomEnv also rewrites
+// HOME, TMPDIR and the agent slot, which is right for a clean room and would be a far larger
+// behaviour change than this defect warrants on the normal path. So: inherit as before, then
+// remove every provider key that is not this envelope's.
+//
+// Fails closed on an unknown provider: `keep` is empty, so ALL provider keys are stripped and
+// the launcher refuses for want of a credential, exactly as it does today for an unknown
+// provider in a clean room.
+export function providerScopedEnv({ base = process.env, provider, agentDir }) {
+  if (!agentDir) throw new Error("providerScopedEnv needs an isolated agentDir");
+  // Object.hasOwn, not a bare lookup: PROVIDER_KEY_ENV["__proto__"] resolves through the
+  // prototype chain and returns Object.prototype, so `?? []` never fires and the Set
+  // constructor throws on a non-iterable. Found by the unknown-provider test below.
+  const keep = new Set(Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : []);
+  const env = { ...base };
+  for (const key of PROVIDER_CREDENTIAL_ENV) if (!keep.has(key)) delete env[key];
+  // Do not let normal mode's provider selection be bypassed by the daemon's shared auth.json.
+  // This is a resolution boundary, not uid isolation: a same-uid child can still deliberately
+  // read the daemon's files. Both launchers resolve stored credentials from this isolated slot.
+  env.VINCI_CODING_AGENT_DIR = agentDir;
+  env.PI_CODING_AGENT_DIR = agentDir;
+  return env;
+}
+
+// The single decision about what environment a child gets, on EITHER path.
+//
+// This exists as a named function rather than a ternary at the call site because the first
+// version of this fix was tested past the seam: the unit tests covered providerScopedEnv and
+// reverting the CALL SITE to `env: undefined` -- the exact original fail-open -- left every one
+// of them green. Testing the helper while leaving the wiring untested means the wiring is the
+// only part that can silently regress, and the wiring is what was broken in the first place.
+export function childEnv({ base = process.env, cleanRoom, provider, homeDir, tmpDir, agentDir }) {
+  return cleanRoom
+    ? cleanRoomEnv({ base, provider, homeDir, tmpDir })
+    : providerScopedEnv({ base, provider, agentDir });
+}
+
 // The child's agent slot (auth.json, sessions, settings): a dir inside the per-attempt HOME.
 export function attemptAgentDir(homeDir) {
   return join(homeDir, "agent");
@@ -113,7 +218,9 @@ export function cleanRoomEnv({ base = process.env, provider, homeDir, tmpDir }) 
   if (!homeDir || !tmpDir) throw new Error("cleanRoomEnv needs a per-attempt homeDir and tmpDir");
   const env = {};
   for (const key of CLEAN_ROOM_ENV_ALLOWLIST) if (base[key] !== undefined) env[key] = base[key];
-  for (const key of PROVIDER_KEY_ENV[provider] ?? []) if (base[key] !== undefined) env[key] = base[key];
+  // Same prototype-chain hazard as providerScopedEnv below.
+  const providerKeys = Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : [];
+  for (const key of providerKeys) if (base[key] !== undefined) env[key] = base[key];
   const vinciHome = base.VINCI_HOME ?? (base.HOME ? join(base.HOME, ".vinci-code") : undefined);
   if (vinciHome !== undefined) env.VINCI_HOME = vinciHome;
   env.HOME = homeDir;
@@ -328,10 +435,31 @@ async function commitIdentity() {
 
 // C1: a fresh attempt worktree. Returns the same `{ branch, repoDir }` shape prepareRepository
 // does (repoDir IS the attempt dir) plus the clean-room facts the task record carries.
-export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branchOverride, diskFloorBytes = DEFAULT_DISK_FLOOR_MB * 1048576, authFile = process.env.VINCI_WORKER_AUTH_FILE }) {
+export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branchOverride, baseRef, pinnedBaseCommit, diskFloorBytes = DEFAULT_DISK_FLOOR_MB * 1048576, authFile = process.env.VINCI_WORKER_AUTH_FILE }) {
+  if (baseRef !== undefined && !isPlainRefName(baseRef)) {
+    throw new Error(`base_ref ${baseRef} must be a plain git branch name`);
+  }
+  // A digest handoff signs BOTH halves of the pin: base_ref AND base_commit. Shared mode
+  // (prepareRepository, run.mjs) validates both. This path took only the ref and resolved
+  // origin/<base_ref> to its CURRENT TIP, so if the branch advanced after the contract was
+  // issued the attempt silently forked from the new tip and the signed commit was never
+  // checked. The composed guard in worker.mjs permits a non-main base when EITHER mechanism
+  // can honour it; that is only true if this one honours the commit half too.
+  //
+  // Same validation and the same BLOCKED reasons as shared mode, deliberately: two paths
+  // enforcing one contract must not disagree about what the contract means.
+  if (pinnedBaseCommit !== undefined && pinnedBaseCommit !== null) {
+    if (typeof pinnedBaseCommit !== "string" || !/^[0-9a-f]{40}$/.test(pinnedBaseCommit)) {
+      throw new Error("base_commit must be a full 40-character lowercase hex SHA-1");
+    }
+    if (typeof baseRef !== "string" || baseRef === "") {
+      throw new Error("base_ref_unavailable: a pinned base_commit requires a base_ref to be fetched from origin");
+    }
+  }
   const { cacheDir, attemptsRoot } = cleanRoomPaths(stateDir, repo, taskId);
   const paths = attemptPaths(attemptsRoot, attempt);
   const branch = branchOverride ?? `worker/${taskId}`;
+  const checkoutBase = baseRef ?? "main";
   const base = (process.env.VINCI_WORKER_GIT_BASE ?? "https://github.com/").replace(/\/+$/, "");
   const cloneUrl = `${base}/${repo}.git`;
 
@@ -347,6 +475,16 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
   }
   await ensureCache(cacheDir, cloneUrl);
 
+  if (baseRef !== undefined) {
+    // A pinned base is an authority boundary: ask origin live before fetching, so a stale cache
+    // cannot make a deleted or misspelled base look valid and no attempt worktree is created from
+    // an unintended fallback.
+    const remoteBase = await command("git", ["-C", cacheDir, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${baseRef}`], { allowFailure: true });
+    if (remoteBase.status !== 0) {
+      if (remoteBase.status !== 2) throw new Error(`git ls-remote origin failed for base_ref ${baseRef}: ${remoteBase.stderr || remoteBase.status}`);
+      throw new Error(`base_ref ${baseRef} not found on origin`);
+    }
+  }
   if (branchOverride) {
     // Same gate as shared mode (#19): existence is asked of origin LIVE, before any fetch, so a
     // branch absent on origin is "not found on origin" at cost 0 and never masked by a fetch error.
@@ -363,13 +501,35 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
   // crashed, or a resume on a new box — attempt N+1 continues at origin/worker/<task> with
   // fast-forward semantics (the same rule as shared mode, prepareRepository), so its publish is a
   // fast-forward rather than a rejected non-fast-forward. Only a task branch absent on origin
-  // starts at origin/main.
+  // starts at the requested origin/<base_ref>, defaulting to origin/main.
   const taskBranchRef = `refs/remotes/origin/${branch}`;
+  const baseBranchRef = `refs/remotes/origin/${checkoutBase}`;
   const onOrigin = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", taskBranchRef], { allowFailure: true });
-  const cacheRef = branchOverride || onOrigin.status === 0 ? taskBranchRef : "refs/remotes/origin/main";
+  const cacheRef = branchOverride || onOrigin.status === 0 ? taskBranchRef : baseBranchRef;
   const resolved = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", cacheRef], { allowFailure: true });
   if (resolved.status !== 0 || !SHA.test(resolved.stdout)) throw new Error(`clean room: ${cacheRef} did not materialize in ${cacheDir} after fetch`);
-  const baseCommit = resolved.stdout;
+  let baseCommit = resolved.stdout;
+
+  // The signed commit half of the pin, checked AFTER the fetch so the cache actually has it.
+  // Two refusals, both matching shared mode's reasons:
+  //   base_ref_unavailable    -- origin/<base_ref> is not present after the fetch
+  //   base_commit_unreachable -- the signed commit is not an ancestor of that ref
+  // There is NO fallback to the tip: falling back is precisely the defect, because it converts
+  // "the branch moved past what was signed" into a silent success.
+  if (pinnedBaseCommit) {
+    const baseResolved = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", baseBranchRef], { allowFailure: true });
+    if (baseResolved.status !== 0 || !SHA.test(baseResolved.stdout)) {
+      throw new Error(`base_ref_unavailable: origin/${checkoutBase} is not present in ${cacheDir} after fetch`);
+    }
+    const isAncestor = await command("git", ["-C", cacheDir, "merge-base", "--is-ancestor", pinnedBaseCommit, baseBranchRef], { allowFailure: true });
+    if (isAncestor.status !== 0) {
+      throw new Error(`base_commit_unreachable: base_commit ${pinnedBaseCommit.slice(0, 8)} is not an ancestor of origin/${checkoutBase} (as fetched)`);
+    }
+    // Start the attempt at the SIGNED commit, not at whatever the branch points to now.
+    // Only when the task branch is not being continued: a resumed attempt continues at
+    // origin/worker/<task> by the same fast-forward rule as shared mode.
+    if (cacheRef === baseBranchRef) baseCommit = pinnedBaseCommit;
+  }
 
   // Earlier attempts of this task: sealed (a crashed attempt never sealed itself), never entered.
   for (const previous of listAttempts(attemptsRoot)) sealAttemptDir(attemptPaths(attemptsRoot, previous).attemptDir);
@@ -443,7 +603,7 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
 // would not do: pushurl is multi-valued, -c appends, and git still tries /dev/null first) with
 // `--no-verify` to skip the hook. Nothing in the cache is rewritten. The attempt dir is only READ
 // (HEAD:BLOCKER.md). `gh` is pointed at the repo with -R, so it never needs a working tree either.
-export async function publishFromCache({ envelope, cacheDir, attemptDir, branch, taskId, limitTripped }) {
+export async function publishFromCache({ envelope, cacheDir, attemptDir, branch, taskId, limitTripped, prEligible = true, objective = null }) {
   const blockerReason = await readHeadBlocker(attemptDir);
   const originUrl = await command("git", ["-C", cacheDir, "config", "--get", "remote.origin.url"], { allowFailure: true });
   const push = originUrl.status === 0 && originUrl.stdout
@@ -453,10 +613,26 @@ export async function publishFromCache({ envelope, cacheDir, attemptDir, branch,
   if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
   if (limitTripped) return result;
   if (push.status !== 0 || envelope.evidence !== "pr") return result;
+  // The PR gate, same as the standard publisher. An earlier version of this function relied on
+  // the blocker and limitTripped checks above and a comment calling them "this path's
+  // equivalent of the eligibility gate". They are not equivalent: finalState also refuses
+  // COMPLETED on a harness stop, on outcome.state !== DONE, and on no_commit, none of which
+  // are checked here. So a clean-room run that stopped at the instrument or produced no commit
+  // would have opened a PR titled COMPLETED. The branch is already pushed above, so refusing
+  // here loses no evidence -- it only withholds the review request.
+  if (!prEligible) return result;
 
   const created = await command(
     "gh",
-    ["pr", "create", "-R", envelope.repo, "--base", "main", "--head", branch, "--title", `Worker task ${taskId}`, "--body", `Unattended Vinci worker result for task ${taskId}.`],
+    ["pr", "create", "-R", envelope.repo, "--base", envelope.base_ref ?? "main", "--head", branch, "--title", prTitle({
+       taskId,
+       objective: objective ?? (typeof envelope.spec === "string" ? envelope.spec : null),
+       // Reached only when prEligible, i.e. finalState would return COMPLETED but for the PR
+       // itself. The gate is above; this is not asserting the outcome, it is reporting it.
+       outcome: "COMPLETED",
+       head: null,
+       ref: envelope.ref ?? null,
+     }), "--body", `Unattended Vinci worker result for task ${taskId}.`],
     { cwd: cacheDir, allowFailure: true },
   );
   if (created.status === 0) result.pr = created.stdout.split("\n").find((line) => PR_URL.test(line)) ?? null;

@@ -196,12 +196,14 @@ await scenario("deadline", envelope({ deadline: "2020-01-01T00:00:00Z" }), {}, (
   assert.equal(state.state, "BLOCKED");
   assert.equal(state.limit_tripped, "deadline");
   assert.equal(readFileSync(vinciRecord, "utf8"), "");
-  assert.deepEqual(bus.posts.map((post) => post.kind), ["blocker"]);
+  assert.deepEqual(bus.posts.map((post) => post.kind), ["status"]);
+  assert.deepEqual(bus.posts.map((post) => post.outcome), ["BLOCKED"]);
 });
 
 await scenario("blocked", envelope(), { FAKE_VINCI_OUTCOME: "BLOCKED" }, ({ bus, state }) => {
   assert.equal(state.state, "BLOCKED");
-  assert.deepEqual(bus.posts.map((post) => post.kind), ["status", "blocker"]);
+  assert.deepEqual(bus.posts.map((post) => post.kind), ["status", "status"]);
+  assert.deepEqual(bus.posts.map((post) => post.outcome), [undefined, "BLOCKED"]);
 });
 
 await scenario("unverified", envelope({ evidence: "pr" }), { FAKE_GH_EXIT: "1" }, ({ bus, state }) => {

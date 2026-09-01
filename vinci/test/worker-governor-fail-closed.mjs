@@ -95,7 +95,9 @@ function assertBlockedBeforeWork(fixture, taskId, reasonPattern, classification 
   assert.equal(fixture.getVinciCalls().length, 0, 'model must not be spawned');
   assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'repository must not be cloned');
   assert.equal(snapshot.outcome.governor, classification === 'lease_unavailable' ? 'unavailable' : classification, 'outcome.governor must classify refusal vs unavailability');
-  const blocker = fixture.getPostedMessages().find((p) => p.kind === 'blocker');
+  const blocker = fixture.getPostedMessages().find(
+    (p) => p.kind === 'status' && ['FAILED', 'BLOCKED', 'REFUSED'].includes(p.outcome),
+  );
   assert(blocker, 'a blocker must be posted');
   const body = blocker.body ?? JSON.stringify(blocker);
   // W0.5 + #18: every terminal post ends with ` worker_build=<commit-or-version>[-dirty]

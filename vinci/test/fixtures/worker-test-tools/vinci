@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fake vinci for worker tests - records invocation and simulates behavior
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, fstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { execSync } from 'node:child_process';
 
@@ -50,6 +50,28 @@ if (process.env.FAKE_VINCI_SELF_UPDATE_TO && process.env.VINCI_UPDATE_DISABLED !
 }
 const executedVersion = readInstall().version;
 
+if (process.env.FAKE_VINCI_FORBIDDEN_CAPABILITY_IDENTITY) {
+  for (const name of [
+    'VINCI_WORKER_DEBRIS_ROOT_ANCHOR',
+    'VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_CAPABILITY_FD',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_SERVICE_SHA256',
+    'VINCI_WORKER_DEBRIS_AUTHORITY_PUBLIC_KEY_SPKI',
+  ]) {
+    if (Object.hasOwn(process.env, name)) throw new Error(`task inherited debris authority setting: ${name}`);
+  }
+  try {
+    const stat = fstatSync(3);
+    if (`${stat.dev}:${stat.ino}` === process.env.FAKE_VINCI_FORBIDDEN_CAPABILITY_IDENTITY) {
+      throw new Error('task inherited the debris authority capability descriptor');
+    }
+  } catch (error) {
+    if (error?.code !== 'EBADF') throw error;
+  }
+}
+
 const sessionDir = process.argv.indexOf('--session-dir') >= 0 ? process.argv[process.argv.indexOf('--session-dir') + 1] : undefined;
 const sessionId = process.argv.indexOf('--session-id') >= 0 ? process.argv[process.argv.indexOf('--session-id') + 1] : undefined;
 
@@ -77,7 +99,7 @@ if (sessionDir && sessionId) {
   // By default, make a real commit (fixture for a successful run).
   // Use FAKE_VINCI_NO_COMMIT=1 to simulate a run with no commits (e.g. for #28 tests).
   const noCommit = process.env.FAKE_VINCI_NO_COMMIT === '1';
-  if (!noCommit) {
+  if (!noCommit && !process.env.FAKE_VINCI_COMMIT_FILE) {
     try {
       // Check if we're in a git repo
       try {
@@ -149,6 +171,19 @@ if (sessionDir && sessionId) {
   }
 
   if (process.env.FAKE_VINCI_WORKTREE_BLOCKER === '1') writeFileSync(resolve('BLOCKER.md'), 'working tree only\n');
+  // Wave 1B output modes: FAKE_VINCI_COMMIT_FILE=<name> makes the fake agent produce real work —
+  // a new file committed in the task checkout (cwd) — so patch/artifact/branch publishing has
+  // something to carry. FAKE_VINCI_UNTRACKED_FILE=<name> leaves an untracked file behind instead.
+  if (process.env.FAKE_VINCI_COMMIT_FILE) {
+    const { execFileSync } = await import('node:child_process');
+    writeFileSync(resolve(process.env.FAKE_VINCI_COMMIT_FILE), `produced by fake vinci ${sessionId}\n`);
+    const git = (...args) => execFileSync('git', args, { stdio: 'pipe' });
+    git('config', 'user.email', 'fake@vinci.test');
+    git('config', 'user.name', 'fake vinci');
+    git('add', '--', process.env.FAKE_VINCI_COMMIT_FILE);
+    git('commit', '-qm', `fake vinci: ${process.env.FAKE_VINCI_COMMIT_FILE}`);
+  }
+  if (process.env.FAKE_VINCI_UNTRACKED_FILE) writeFileSync(resolve(process.env.FAKE_VINCI_UNTRACKED_FILE), 'untracked deliverable\n');
 
   // Sleep if requested
   if (sleepMs > 0) {

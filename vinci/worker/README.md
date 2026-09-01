@@ -25,8 +25,11 @@ vinci worker start --id <worker-id> \
 - `--state-dir`: Persistent state directory (default `.vinci-worker-state`)
 - `--governor`: Governor URL (Stage 2). Once set, every task needs a granted lease — see "Governor Lease (fail-closed)"
 - `--require-governor` (or `VINCI_WORKER_REQUIRE_GOVERNOR=1`): refuse to start (exit 78) unless `--governor` is configured
+- `VINCI_WORKER_ALLOWED_PROVIDERS`: comma-separated provider allowlist enforced before clone or spawn (default `openrouter`). Invalid or empty configuration refuses startup; a disallowed task is `BLOCKED` with `provider_not_allowed`
 - `--clean-room` (or `VINCI_WORKER_CLEAN_ROOM=1`): a fresh worktree, an allowlisted environment and no push for every attempt — see "Clean room". **Off by default this wave**; it flips on after the chaos gate
 - `--disk-floor-mb` (or `VINCI_WORKER_DISK_FLOOR_MB`, default 2048), `--keep-attempts` (or `VINCI_WORKER_KEEP_ATTEMPTS`, default 3): clean-room bounds, ignored without `--clean-room`
+- `VINCI_WORKER_MODEL_CLASSES` env: the model-class table for digest-form handoffs (inline JSON or `@<file>`), validated once at startup — invalid ⇒ exit 78; unset ⇒ prose-only. See "Model classes (runtime config)"
+- `VINCI_WORKER_REGISTRY_TIMEOUT_MS` env: one deadline for the registry fetch, headers and body (default 10000)
 
 ## Supervision
 
@@ -145,8 +148,255 @@ and left exactly where it is. Any error in these checks ⇒ no rename, plain ref
 Origin unreachable is reported as `git ls-remote origin failed for <branch>: …`, never as
 not-found or divergence. A branch that exists on origin but cannot be resolved locally after the
 explicit fetch is `envelope branch <branch> exists on origin but fetch did not materialize
-origin/<branch> locally`. The pre-existing `reset --hard`/`clean -fd` quarantine of the shared
-checkout is unchanged here (Wave 1 clean-room item).
+origin/<branch> locally`. Before any `reset --hard`/`clean -fd`, the shared checkout quarantine
+publishes a content-addressed immutable generation and a canonical receipt (Wave 1 clean-room
+item). The task record carries that receipt when a capture occurred.
+
+Debris capture has no ordinary self-bootstrap path. Deployment must create the private
+`<state>/debris/` and `<state>/debris/.task-identities-v1/` directories, build the exact closed
+`vinci.worker-debris-root-identity/1` document for those directory identities, and expose that
+read-only document at an absolute path outside the replaceable worker state through
+`VINCI_WORKER_DEBRIS_ROOT_ANCHOR`. The anchor must assert `authority_admitted: true` and bind a
+64-hex deployment lineage id, state/root paths, and both directory identities. A missing,
+writable, in-state, replaced, or rolled-back anchor refuses capture before source cleanup; the
+worker never creates or repairs it. Deployment must also supply the SHA-256 of the exact canonical
+anchor bytes through `VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256`; ordinary capture cannot change that
+process-pinned trust root.
+
+Every task lineage and complete generation/attempt/current inventory is also serialized through a
+deployment-owned compare-and-set service. `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER` names the
+reviewed bridge artifact whose identity the service admission binds; the worker pins its exact
+bytes with `VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256` but does not execute it. Deployment supplies
+an already-open socket descriptor. The worker proves that the descriptor is a socket and pins its
+exact observed metadata, including the platform-specific link count. The signed service admission,
+not a kernel-specific `st_nlink` value, proves that it is the supervisor-preopened unnamed endpoint
+with the required peer, inheritance, and exfiltration controls. The worker communicates directly
+over that process-private descriptor; it never opens an authority pathname and never exports the
+descriptor to a repository command or task child. There is no reusable bearer in environment,
+argv, or a reopenable capability file. Every service response is a canonical Ed25519-signed envelope that
+binds a fresh worker nonce, exact request digest, socket identity, adapter and service implementation
+digests, root/lineage, authority epoch, service principal, peer-credential enforcement, isolated
+service storage, non-inheritance by task children, and the deployment's parent-FD-exfiltration
+proof. Missing, non-socket, unsigned, replayed, relabelled, or incompletely admitted channels
+refuse. Service responses are bounded canonical bytes, and each head binds the root anchor,
+lineage, storage identities, monotonic
+sequence/predecessor, index, generations, attempts, and current receipt. The authority service
+must independently reject inventory shrink, predecessor/sequence forks, root/storage changes,
+and any CAS not made through the admitted capability. Deployment must explicitly create the private task
+directories and task-identity anchor and reserve their empty sequence-zero head in that adapter
+before the task may capture debris. Ordinary worker capture never provisions a lineage: a missing
+head refuses before it creates or cleans task state. Missing or rolled-back adapter state for an
+existing task, any local deletion/fork, or a second task-root bootstrap refuses before cleanup. A verified
+unindexed local suffix may advance the external head after a crash; an external head never moves
+backward. Each request has one cancellable end-to-end deadline. Timeout, partial output, trailing
+bytes, malformed authentication, or unsolicited/stale output permanently invalidates that stream;
+the worker preserves source and requires a fresh supervisor-provided channel before reconciliation.
+The bridge artifact, socket descriptor metadata, trust key, and all anchor settings are removed from the
+repository task's environment; task processes inherit neither the authority socket nor an
+authority endpoint.
+
+## Handoff Forms (Wave 1B)
+
+A handoff body is one of two forms. The daemon detects which by its first non-blank
+character — a leading `{` is a **digest triple**, anything else is **legacy prose**:
+
+- **Prose** (the classic envelope above): starts with a header line such as `repo: org/repo`;
+  no leading `{`. Parsed by `parseEnvelope`. Carries the branch/evidence/limits inline, so it
+  can pin `branch:` but cannot pin an immutable `base_commit`. Its behaviour, posts and bytes are
+  unchanged by Wave 1B (the existing suite is the oracle).
+- **Digest triple**: a JSON object whose first non-blank character is `{`, with EXACTLY three
+  keys — `work_order_id`, `contract_digest`, `execution_spec_digest`. Any extra or missing key
+  is a malformed handoff (`malformed_handoff`), not an extension point. It names a pinned
+  work order by digest; every runtime term (repo, model class, `baseRef`/`baseCommit`,
+  `targetBranch`, bounds, tools, output, promotion) is fetched from the Governor's pinned
+  registry (`GET <server>/v1/governor/contracts/{work_order_id}`), VALIDATED, and recomputed
+  locally.
+
+The digest form **never spawns a model on any mismatch** — every refusal below happens before a
+clone and before a vinci spawn, with ZERO git transfer (no fetch/clone/ls-remote/push).
+
+### Registry fetch
+
+The registry answer is streamed with a hard cap of 256 KiB under ONE deadline
+(`VINCI_WORKER_REGISTRY_TIMEOUT_MS`, default 10000) that covers headers AND body; `Content-Length`
+is never trusted. The registry is a PINNED endpoint on the configured server: the fetch sets
+`redirect: "error"`, so a `3xx` is a refusal and never a hop that would carry the bus token to a
+host nobody named. A stalled/trickling body, an oversized (chunked or not) body, a redirect, a
+connection error or a timeout are all `registry_unavailable`; the reason names what actually
+happened (`timed out after <n> ms` ONLY for the deadline, the connection error's code otherwise
+— see WARN-1 in the W1B review, where operator precedence made every connection failure read as
+a timeout). `401`/`403` is `registry_forbidden` (the bus
+token is not allowed to read contracts — an operator problem, distinct from a missing order),
+`404` is `work_order_not_found`, any other non-2xx is `registry_error`, and a body that is not
+JSON is `registry_malformed`.
+
+### Validation before hashing
+
+`vinci/worker/contracts/digest.mjs` vendors the upstream validators (vinci-contracts @ b2e0188b:
+`validateWorkOrder`, schema v3; `validateExecutionSpec`, schema v1) and the digest functions hash
+ONLY a record that passes them — exactly as upstream ("a digest of an invalid record is not
+computed"). Every required top-level key, the nested required keys the worker consumes
+(`repository.{host,owner,name}`, `resourceBounds.{budgetMicrousd,maxRuntimeS,deadline}`,
+`evidence.required`, `acceptanceCriteria[].{id,statement,verifiedBy}`, actors, …), the pinned
+`schemaVersion`/`contractVersion` rules and the unknown-key rule (top level AND nested) are
+enforced. A served record that reproduces the handed digest byte for byte but fails validation
+is refused as `invalid_work_order` / `invalid_execution_spec` naming the first `<path> <code>`.
+The golden vectors under `vinci/test/fixtures/contract-vectors/` pin both the canonical bytes
+and the validators.
+
+`grantedAuthority` is not opaque text. The `path:` grant grammar
+(`vinci/worker/contracts/path-grant.mjs`, vendored from vinci-contracts @ 9e9a105) is applied to
+every grant: a `path:` token that is empty, absolute, `.` (root scope), or carries a `.`/`..`/
+empty segment, a backslash, a NUL, or more than 1024 characters makes the ORDER invalid
+(`invalid_work_order`, `/grantedAuthority/<i> path_grant_<reason>`). The grammar never
+normalises. Grants with any other prefix — including prose like `edit files under src/api` — are
+untouched. The shared cases file `path-grant-cases.json` is copied byte for byte from upstream
+and read by `worker-contract-vectors.mjs`, so the two implementations cannot drift.
+
+An execution spec carrying the newer optional `paths` field (a run's enumerated write scope) is
+still refused as `/paths unknown_field`. That is DELIBERATE and fail-closed: the worker has no
+way to confine writes to a scope, and ignoring the field would run with root write scope while
+the contract said otherwise. `worker-within-order.mjs` pins the refusal so it cannot change by
+accident.
+
+### Containment: a spec may ask for no more than its order grants
+
+Binding proves WHICH order a spec was compiled from. That is identity, not containment — a spec
+bound to the right order can still name a repository, a branch, a promotion, a tool or a deadline
+the order never granted. `vinci/worker/contracts/within-order.mjs` vendors the upstream
+comparison (`checkValidatedExecutionSpecWithinOrder`) and runs it immediately after the binding
+check, before ANY materialization, refusing with `execution_exceeds_contract` and naming every
+dimension exceeded. It is PURE: two records in, a verdict out, no I/O.
+
+Positive-list semantics: absence is not permission. Grants are matched by exact token grammar —
+`tool:<name>`, `repo:<host>/<owner>/<name>`, `branch:<name>`, `branch:<prefix>/*` (one trailing
+wildcard, non-empty prefix), `promotion:pull_request`. Everything else is prose for humans and
+covers nothing. `resourceBounds.deadline` may not be later than the order's `expiresAt`. A
+`branch:*` (or `branch:/*`) grant is an ERROR on the order side (`grant_wildcard_unbounded`), not
+a grant that quietly covers everything.
+
+The spec-side `path_not_granted` half of the upstream check is NOT vendored, because the worker
+refuses `paths` outright (above). Port it together with write-scope enforcement.
+
+### Model classes (runtime config)
+
+The class → (provider, model) table is OPERATOR RUNTIME CONFIG, read from
+`VINCI_WORKER_MODEL_CLASSES` — inline JSON, or `@<path>` naming a JSON file of the same shape:
+
+```
+VINCI_WORKER_MODEL_CLASSES='{"forte":{"provider":"vinci","model":"forte"},"fortissimo":{"provider":"vinci","model":"fortissimo"}}'
+VINCI_WORKER_MODEL_CLASSES=@/etc/vinci-worker/model-classes.json
+```
+
+It is parsed and validated ONCE at daemon startup, before the state dir, the daemon lock, the
+`/v1/version` fetch and the online post. Invalid (bad JSON, unreadable file, a class without
+`{ provider, model }`, an empty object) ⇒ the daemon **refuses to start with exit 78** and the
+reason on stderr; a change needs a restart. **Unset ⇒ the daemon starts prose-only**: every
+digest handoff BLOCKs with `unknown_model_class: MODEL_CLASSES not configured`. The table is
+closed: a `modelClass` it does not name is `unknown_model_class`, never passed through as a model
+id (`auto` is deliberately never a class — a contract names a class, not "whatever the account
+resolves to"). A spec-level `provider` pin must EQUAL the configured provider for the class
+(`provider_mismatch` otherwise); it never overrides it.
+
+### Base checkout (`baseRef` / `baseCommit`)
+
+The task branch (`targetBranch`) is created FROM the pinned `baseCommit`, never continued from
+an origin head. `baseRef` is REQUIRED (plain-branch rule, like `targetBranch`). Order of
+operations, fixed:
+
+1. names validated (`git check-ref-format --branch` for both);
+2. uncached ⇒ `git clone`; cached ⇒ the shared-tree quarantine runs FIRST. Tracked/untracked
+   leavings are copied and revalidated under
+   `<state>/debris/<task>/ledger-v1/generations/<content-digest>/`, with canonical
+   manifest/receipt/commit-marker bytes, file and directory fsync, and an atomically replaced
+   index/current pointer. Every committed generation is independently enumerated and must form
+   an exact bijection with the closed, unique, ordered index; an `INDEXED` marker is written only
+   after the index is durable, distinguishing recoverable pre-index crashes from index rollback.
+   Generation identity binds the capture attempt as well as the source bytes: an exact retry of
+   the same unfinished attempt converges on the same generation, while a later independent
+   attempt with byte-identical debris receives a distinct generation. Publication is exclusive.
+   Each request has an immutable attempt receipt under
+   `ledger-v1/attempts/<attempt>.json`, so the requested retry and original capturing attempt are
+   both explicit. The derived `current.json` pointer and missing attempt receipts are rebuilt only
+   from the complete verified generation/index bijection; a single attempt can never bind two
+   source identities. Divergent retries retain distinct immutable generations;
+3. `git fetch origin +refs/heads/<baseRef>:refs/remotes/origin/<baseRef>` MUST succeed, else
+   **BLOCKED `base_ref_unavailable`**;
+4. `git merge-base --is-ancestor <baseCommit> refs/remotes/origin/<baseRef>` must hold, else
+   **BLOCKED `base_commit_unreachable`** — there is NO fallback to local objects: a commit the
+   cache happens to hold (an earlier local-only commit, say) is not a base origin vouches for;
+4b. **The pinned `targetBranch` has already moved.** `git ls-remote origin
+   refs/heads/<targetBranch>`: if origin has that branch, it is not sitting at `baseCommit`, and
+   it DESCENDS from `baseCommit`, the run is **BLOCKED `target_branch_ahead_of_base`** — before
+   the spawn, and on a cold box as well as a warm one.
+
+   That condition is a fact about refs and the refusal says only that. It is **not** proof of
+   authorship: the commonest cause is this spec's own earlier run, but a human — or a different
+   spec pinning the same base — pushing to that branch name produces the identical ref topology,
+   and the worker cannot tell them apart (it authors no commits itself, so there is no trailer or
+   footer of its own to read back). The reason enumerates both readings rather than asserting
+   one. Either way the repair is the same, and the refusal is right in both: that push would have
+   failed anyway, and refusing here costs no model spend.
+
+   Previously only a warm box noticed at all, and called it `branch_diverged` — false, because
+   the commits it refused to reset may be this contract's own output; on a cold box nothing
+   refused and the model was spawned and paid for before the push failed. The first version of
+   this check then over-corrected and called it `already_published`, which claimed an identity
+   nothing had checked;
+5. an existing local `targetBranch` goes through the branch-continuation rules above
+   (PR #22): an ancestor of `baseCommit` is simply reset; never-pushed residue (no upstream, on
+   no origin head) is renamed aside to `stale/<branch>-<stamp>-<hex>` (never deleted) and the
+   task continues from `baseCommit`; a branch that tracks `origin/<targetBranch>` or whose
+   commits live on another origin head is **BLOCKED `branch_diverged`** and left in place;
+6. only then `git checkout -B <targetBranch> <baseCommit>`.
+
+`baseRef`/`baseCommit` then thread through the whole run: the PR (when opened) is
+`gh pr create --base <baseRef>`, the evidence `git.diff` is `<baseCommit>...HEAD`, the patch
+output is `format-patch <baseCommit>..HEAD`. Nothing on the digest path is hardcoded to `main`.
+
+### Output modes and promotion
+
+`output` (ExecutionSpec) decides what `publish` does; a pull request is PROMOTION, never evidence:
+
+| output | push | evidence bundle carries | PR |
+|---|---|---|---|
+| `none` | never | session, git.diff, result.json, runner.log | never |
+| `patch` | never | + `<attempt>.patch` (`git format-patch --stdout <baseCommit>..HEAD`) | never |
+| `artifact` | never | + `artifacts.json` (`{ base_commit, files }`: exact canonical UTF-8 repo-relative identities from raw NUL-delimited Git output; unsupported/duplicate/alias paths refuse; also `artifacts` on the task record) | never |
+| `branch` | `refs/heads/<targetBranch>` | as `none` | only when `promotion: pull_request` (`--base <baseRef>`) |
+
+The record's `publish` is `none` / `patch` / `artifact` / `pushed` / `push_failed` (or `blocked`
+when a `BLOCKER.md` at HEAD suppressed the PR; the blocker is `blocker_reason` on every mode).
+
+### Refusal reasons
+
+The digest form BLOCKs with one of these machine-readable `.code`s, in check order:
+
+| code | meaning |
+|------|---------|
+| `malformed_handoff` | body starts with `{` but is not a valid 3-key JSON triple (extra/missing key, bad JSON, bad digest/identifier) |
+| `registry_unavailable` / `registry_forbidden` / `work_order_not_found` / `registry_error` / `registry_malformed` | the registry fetch (see above) |
+| `invalid_work_order` | the served work order fails the vendored schema-v3 validator (missing/unknown key, wrong schemaVersion/contractVersion, …); it is never hashed |
+| `contract_digest_mismatch` | the (validated) served work order does not reproduce `contract_digest` |
+| `invalid_execution_spec` | no served spec matched and at least one fails the vendored schema-v1 validator |
+| `execution_spec_digest_mismatch` | no (validated) served spec reproduces `execution_spec_digest` |
+| `binding_mismatch` | the matched spec was compiled from a different work order id/digest |
+| `execution_exceeds_contract` | the bound spec asks for MORE than the order grants: `tool_not_granted`, `repository_not_granted`, `branch_not_granted`, `promotion_not_granted`, `deadline_exceeds_contract`, or `grant_wildcard_unbounded` on the order — every failing dimension is named |
+| `unsupported_repository_host` | spec repository host is not `github.com` |
+| `unknown_model_class` | `modelClass` not in the runtime table, or the table is not configured |
+| `provider_mismatch` | the spec's `provider` pin differs from the configured provider for its class |
+| `invalid_spec_field` / `no_tools` / `capability_unsupported` | a materialized field the worker cannot serve (empty tools; any `requiredCapabilities` — the worker advertises none) |
+| `invalid_bounds` | `budget_usd <= 0`, `max_runtime_s <= 0`, or a deadline already in the past — before ANY git call; the reason NAMES the field that tripped and its value |
+| `base_ref_unavailable` / `base_commit_unreachable` / `target_branch_ahead_of_base` / `branch_diverged` | the base checkout (see above) |
+
+A successful digest handoff stamps the task record with `work_order_id`, `contract_digest`
+(long form), `execution_spec_digest`, `base_commit`, `base_ref`, `promotion`, `output`,
+`model_class`, `tools`, `input_artifacts`, `required_capabilities`. EVERY terminal post of a
+digest-form task — the final state AND every early blocker (refusal, invalid bounds, Governor
+refusal/unavailability, base checkout) — carries `contract=<work_order_id>@<digest8>` as its first
+token (`contract=malformed` when the triple itself could not be parsed, and also when the
+handoff's `message_id` is not a valid task id, which refuses before the body is read); prose-form
+posts never carry the tag.
 
 ## Publishing
 
@@ -416,13 +666,15 @@ is two cohorts.
 
 ## Clean room (`--clean-room`, W1; default OFF this wave)
 
-What the default (shared-checkout) mode does, measured in soak cohort 2: one working tree per
+What the default (shared-checkout) mode did in soak cohort 2: one working tree per
 repo **name** under `<state-dir>/repos/<name>`, reused across attempts, tasks and orgs; stale local
 branches from an earlier attempt blocked a real continuation (rows 11/11b); the quarantine copies a
-prior run's residue aside (`debris/`) but the tree stays shared; and the spawned `vinci -p` inherits
-the daemon's whole environment — bus token, Governor token, `GH_TOKEN`, every provider key, AWS —
-so an agent could push from inside its sandbox. Publishing already happens in the daemon after the
-run (good), but with that same environment.
+prior run's residue aside (`debris/`) but the tree stays shared. Provider hardening now applies on
+this path too: `VINCI_WORKER_ALLOWED_PROVIDERS` is checked before clone, non-selected provider
+credential variables are removed, and the child resolves stored auth from a task-specific empty
+agent slot rather than the daemon's shared `auth.json`. The rest of the daemon environment is still
+inherited, including GitHub, bus, Governor and AWS credentials; publishing happens in the daemon
+after the run, but a same-uid child is not an isolation boundary.
 
 `--clean-room` (`vinci/worker/cleanroom.mjs`) replaces the shared things with per-attempt ones. It
 flips on by default after the chaos gate; until then it is opt-in and the shared-checkout path is
@@ -434,8 +686,8 @@ byte-for-byte what it was.
 | Working tree | `<state-dir>/repos/<name>`, keyed by name only, reused by every attempt, task and org | `<state-dir>/attempts/<org>/<repo>/<task>/<attempt>/`, a fresh `git worktree add --detach <base>` for **every** attempt, never reused (a dir that already exists is an error) |
 | Base of an attempt | whatever the shared tree was left at; a stale local branch is fast-forwarded, refused, or renamed aside | `origin/<branch>` for a `branch:` envelope; otherwise `origin/worker/<task>` **when origin already has it** (attempt N published, then crashed or was resumed) and `origin/main` only when it does not — so attempt N+1's publish is a fast-forward, never a rejected non-fast-forward. Recorded as `base_commit` / `cache_ref` on the task. A previous attempt's local branch is renamed aside under `stale/…` in the cache (`stale_ref`), never deleted; if it holds commits that are NOT on `origin/worker/<task>`, the attempt is refused with shared mode's divergence reason (never-pushed residue is renamed aside first, the retry continues at `origin/worker/<task>`) — nothing is ever forced |
 | A crashed attempt | its residue is quarantined into `debris/` by the NEXT task | its dir is sealed read-only as evidence when the next attempt starts, and never re-entered; the resume of a RUNNING task is attempt N+1 in a new dir |
-| Child environment | the daemon's entire env | an **allowlist** (below): no bus/Governor/GitHub/AWS credentials, only the provider key the envelope names; the daemon's agent slot (`VINCI_CODING_AGENT_DIR` / `PI_CODING_AGENT_DIR`) never passes through |
-| Child HOME / TMPDIR | the daemon's | `<attempt>.home/` and `<attempt>.tmp/` beside the tree (never inside it, so they are neither in `git status` nor in the evidence diff); the child's agent slot is `<attempt>.home/agent`, empty unless `VINCI_WORKER_AUTH_FILE` opts one credential file in (below) |
+| Child environment | daemon env minus every known non-selected provider credential; provider is also gated by `VINCI_WORKER_ALLOWED_PROVIDERS` before clone/spawn. GitHub, bus, Governor and AWS credentials still pass through | an **allowlist** (below): no bus/Governor/GitHub/AWS credentials, only the provider key the envelope names; the daemon's agent slot (`VINCI_CODING_AGENT_DIR` / `PI_CODING_AGENT_DIR`) never passes through |
+| Child HOME / TMPDIR | the daemon's; both agent-dir variables point at `<state-dir>/provider-slots/<task>/<attempt>/<provider>`, so automatic auth resolution cannot use the daemon's shared `auth.json` or a prior attempt's stored login | `<attempt>.home/` and `<attempt>.tmp/` beside the tree (never inside it, so they are neither in `git status` nor in the evidence diff); the child's agent slot is `<attempt>.home/agent`, empty unless `VINCI_WORKER_AUTH_FILE` opts one credential file in (below) |
 | `git push` from inside | works, with the daemon's credentials | the **default publish path is dead**, in the worktree AND in the bare cache (the `git-common-dir` every worktree can name): `remote.origin.pushurl=/dev/null` refuses `git push`, `git push origin`, `git push --no-verify origin` and `git -C <cache> push origin`; a `core.hooksPath` pre-push hook that exits 1 refuses `git push <literal url>`. This removes the **ambient** credentials and the default path; it does **not** stop a same-uid child that supplies its own — `git push --no-verify <literal url>` and `git remote add x <url> && git push --no-verify x` reach origin whenever the transport needs no credential the child lacks. See "What is still NOT isolated" |
 | Publishing | `git push` from the tree, `gh pr create` in the tree | `git push --no-verify <origin url> refs/heads/<branch>` **from the bare cache**, under the daemon's env (the literal URL sidesteps the cache's dead pushurl, `--no-verify` its hook — `-c remote.origin.pushurl=…` would not: pushurl is multi-valued, `-c` appends, and git still tries `/dev/null` first); `gh pr create -R <org>/<repo>` (no tree needed). The branch ref is shared between cache and worktree, so nothing is fetched, copied, unset or re-set anywhere to publish — the child never holds a working push at any point, and the cache's refusal is intact after every publish. **Capability rollback, not a variant:** this path is a fork of the PRE-#25 publisher. None of the standard publisher's guarantees apply here — no Governor fence, no remote-sha sample with `--force-with-lease`, no push read-back, no `alreadyOnRemote` idempotent retry (which is exactly #25's crash-window guarantee, and the crash window was MEASURED in this mode), no foreign-PR refusal, and no PR-head verification. **Today `fence` is null on every path** (nothing constructs one yet), so a `--governor --clean-room` run is NOT refused: it runs and publishes through this fork with none of the guarantees above. Once the lease loop (#26) supplies a fence, that combination is refused before the model is spawned (`clean_room_publish_unsupported`) rather than published under guarantees that are not in force. The fix is to route this mode through `publisher.publish()` with `repoDir = cacheDir`, threading the cache's own pushurl/hooks refusal — not to teach this fork a fence. |
 | Bounds | none | refuse to start an attempt when `<state-dir>` has less than `--disk-floor-mb` free (`0` disables the floor, on the flag and on `VINCI_WORKER_DISK_FLOOR_MB` alike; an unparsable or negative value refuses to start); keep the newest `--keep-attempts` (3) **evidence-uploaded** attempt dirs per task and prune older uploaded ones — never the newest, never the running one, and **never a dir without its `<attempt>.evidence_uploaded` marker** (a crashed or never-uploaded attempt's sealed dir is the only evidence there is, so it is not prunable by count; with no evidence configured nothing is ever pruned) |
