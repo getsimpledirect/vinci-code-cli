@@ -788,16 +788,30 @@ async function processHandoff(
   // resolved origin/<base_ref> to its CURRENT TIP, so a digest handoff forked from whatever
   // the branch pointed to and the signed commit was never verified.
   //
-  // FOR PROSE HANDOFFS IT IS NOT EARNED, AND THIS IS A KNOWN ACCEPTED GAP. A prose envelope
-  // carries NO base_commit, so `if (pinnedBaseCommit)` in prepareCleanRoom is skipped entirely
-  // and the attempt forks from the moving tip of origin/<base_ref>. The guard below exempts
-  // clean-room mode unconditionally, so `prose + clean room + non-main base_ref` still runs
-  // against an unsigned, moving base. Pre-existing behaviour, deliberately NOT changed here;
-  // this patch narrows a comment, it does not broaden or restrict what runs.
+  // FOR PROSE HANDOFFS the pin is ABSENT rather than unverified, and the distinction matters.
+  // A prose envelope carries no base_commit, so `if (pinnedBaseCommit)` in prepareCleanRoom is
+  // skipped and no ancestry check runs -- there is no signed commit to check anything against.
   //
-  // TODO(worker/portfolio-security, owner: worker lane): decide whether prose + clean room +
-  // non-main base_ref should be refused outright, or whether prose handoffs should carry a
-  // pinnable commit. Tracked as the follow-up to review msg_4d0f29f7.
+  // An earlier revision of this comment said the attempt therefore "forks from the moving tip".
+  // That was an OVERCLAIM and it is corrected here. prepareCleanRoom resolves
+  // origin/<base_ref> exactly ONCE (cleanroom.mjs: `resolved` -> `baseCommit`), creates the
+  // worktree at that literal sha, and returns the same value as the reported base_commit. The
+  // ref may move afterwards; the attempt does not. So the base is single-valued and recorded,
+  // not moving.
+  //
+  // The ACTUAL residual is narrower: nobody authorised that specific commit ahead of time.
+  // That is true of `prose + clean room + main` too, which this guard has always allowed, so
+  // it is not a hazard the non-main case introduces -- it is a property of prose handoffs as
+  // such. Refusing non-main here would remove a working, tested capability
+  // (worker-typed-terminals: "clean-room checks out and opens the PR against a non-main
+  // base_ref") without closing anything that stays open on the main path.
+  //
+  // What that test did NOT check until now was the fork point itself: it asserted the
+  // base_commit the worker REPORTS and the --base flag it passes to gh, both of which a
+  // worker that forked from main while reporting release/2026-08 would satisfy. It now also
+  // asserts the attempt worktree contains BASE_MARKER, content unique to the release branch.
+  // Proven discriminating: a mutant that diverts only the checkout and leaves the report
+  // correct passes both original assertions and fails the new one.
   //
   // The previous revision of this comment asserted the exemption without the digest
   // qualifier — true of the path it was written about and false of the other one. That is the

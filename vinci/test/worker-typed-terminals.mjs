@@ -317,6 +317,33 @@ test("clean-room checks out and opens the PR against a non-main base_ref", async
   const state = await runWorker(fixture, "typed-base", ["--clean-room", "--disk-floor-mb", "0"]);
   assert.equal(state.state, "COMPLETED");
   assert.equal(state.base_commit, releaseHead, "the attempt must fork from the pinned base_ref");
+
+  // 🔴 VERIFY THE FORK POINT, NOT THE LABEL FOR IT.
+  //
+  // The assertion above and the `--base` assertion below both check things the worker
+  // REPORTS: the base_commit it wrote into its own state file, and the flag it passed to
+  // gh. A worker that resolved release/2026-08 correctly, reported it faithfully, and then
+  // checked out main would satisfy both of them. BASE_MARKER exists in this fixture for
+  // exactly this discrimination -- it is committed on release/2026-08 and on no other
+  // branch -- and until now nothing in the repo ever read it.
+  //
+  // So: assert against the attempt worktree on disk. This is the object the claim is about.
+  const attemptDir = join(fixture.tempDir, "attempts", "test", "repo", "typed-base", "1");
+  assert.ok(
+    existsSync(join(attemptDir, "BASE_MARKER")),
+    `the attempt worktree must actually contain the release branch's content; ` +
+      `BASE_MARKER is absent from ${attemptDir}, so the checkout forked from somewhere ` +
+      `other than release/2026-08 no matter what base_commit reports`,
+  );
+  // Anti-vacuity: the marker must be capable of being absent. If it were on main too, the
+  // assertion above would pass for a checkout of either branch and prove nothing.
+  const mainTree = execFileSync("git", ["ls-tree", "--name-only", "origin/main"], {
+    cwd: seed, encoding: "utf8",
+  });
+  assert.ok(
+    !mainTree.split("\n").includes("BASE_MARKER"),
+    "BASE_MARKER must be unique to release/2026-08, or the check above cannot fail",
+  );
   const ghCalls = readFileSync(join(fixture.tempDir, "gh-calls.txt"), "utf8")
     .trim()
     .split("\n")
