@@ -38,6 +38,40 @@ if [ -z "${VITEST_CLI}" ]; then
   exit 1
 fi
 
+# HERMETICITY: BUILD the internal workspace packages, never assume a prebuilt artifact.
+#
+# `npm ci --ignore-scripts` links the workspaces but does NOT build them, and every dist/ is
+# gitignored. So a genuinely fresh worktree that follows the declared path -- npm ci, then this
+# script -- had `packages/ai/dist` missing and died mid-suite with
+#   ERR_MODULE_NOT_FOUND: .../node_modules/@earendil-works/pi-ai/dist/compat.js
+# which names a path under node_modules and reads like a broken install rather than a missing
+# build. The suite only ever passed because a warm tree happened to carry artifacts an earlier
+# build left behind: the tests were being run against a prebuilt leftover, not against anything
+# this script guarantees.
+#
+# We build via vinci/build.sh rather than `npm run build`: the package's own build script runs
+# generate-models/generate-image-models, which fetch ~1000 external catalogs over the network.
+# build.sh is tsgo-only and offline, so this preflight cannot make an offline harness depend on
+# the network.
+#
+# Checked against the package's DECLARED entry point (its package.json "main"), not a file
+# chosen because it happened to be the one that broke -- a check pinned to compat.js would pass
+# while a differently-broken build still failed.
+WORKSPACE_MAIN="${ROOT}/packages/ai/dist/index.js"
+if [ ! -f "${WORKSPACE_MAIN}" ]; then
+  echo "• internal workspace packages are not built — building (offline) before tests…" >&2
+  if ! bash "${ROOT}/vinci/build.sh" >&2; then
+    echo "✗ workspace build failed; the suite would otherwise fail as a missing node_modules path" >&2
+    exit 1
+  fi
+fi
+if [ ! -f "${WORKSPACE_MAIN}" ]; then
+  echo "✗ ${WORKSPACE_MAIN} still absent after the build — refusing to run the suite against" >&2
+  echo "  an unbuilt workspace, because the failure surfaces as ERR_MODULE_NOT_FOUND on a" >&2
+  echo "  node_modules path and reads like a broken install." >&2
+  exit 1
+fi
+
 terminate_process_group() {
   local process_group_id="$1"
   kill -TERM -- "-${process_group_id}" 2>/dev/null || true
