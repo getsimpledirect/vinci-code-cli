@@ -51,6 +51,7 @@ import { dirname, join } from "node:path";
 
 import { classifyDivergedLocal, command, readHeadBlocker, renameBranchAside } from "./run.mjs";
 import { prTitle } from "./publisher.mjs";
+import { isPlainRefName } from "./task.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
@@ -434,10 +435,14 @@ async function commitIdentity() {
 
 // C1: a fresh attempt worktree. Returns the same `{ branch, repoDir }` shape prepareRepository
 // does (repoDir IS the attempt dir) plus the clean-room facts the task record carries.
-export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branchOverride, diskFloorBytes = DEFAULT_DISK_FLOOR_MB * 1048576, authFile = process.env.VINCI_WORKER_AUTH_FILE }) {
+export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branchOverride, baseRef, diskFloorBytes = DEFAULT_DISK_FLOOR_MB * 1048576, authFile = process.env.VINCI_WORKER_AUTH_FILE }) {
+  if (baseRef !== undefined && !isPlainRefName(baseRef)) {
+    throw new Error(`base_ref ${baseRef} must be a plain git branch name`);
+  }
   const { cacheDir, attemptsRoot } = cleanRoomPaths(stateDir, repo, taskId);
   const paths = attemptPaths(attemptsRoot, attempt);
   const branch = branchOverride ?? `worker/${taskId}`;
+  const checkoutBase = baseRef ?? "main";
   const base = (process.env.VINCI_WORKER_GIT_BASE ?? "https://github.com/").replace(/\/+$/, "");
   const cloneUrl = `${base}/${repo}.git`;
 
@@ -453,6 +458,16 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
   }
   await ensureCache(cacheDir, cloneUrl);
 
+  if (baseRef !== undefined) {
+    // A pinned base is an authority boundary: ask origin live before fetching, so a stale cache
+    // cannot make a deleted or misspelled base look valid and no attempt worktree is created from
+    // an unintended fallback.
+    const remoteBase = await command("git", ["-C", cacheDir, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${baseRef}`], { allowFailure: true });
+    if (remoteBase.status !== 0) {
+      if (remoteBase.status !== 2) throw new Error(`git ls-remote origin failed for base_ref ${baseRef}: ${remoteBase.stderr || remoteBase.status}`);
+      throw new Error(`base_ref ${baseRef} not found on origin`);
+    }
+  }
   if (branchOverride) {
     // Same gate as shared mode (#19): existence is asked of origin LIVE, before any fetch, so a
     // branch absent on origin is "not found on origin" at cost 0 and never masked by a fetch error.
@@ -469,10 +484,11 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
   // crashed, or a resume on a new box — attempt N+1 continues at origin/worker/<task> with
   // fast-forward semantics (the same rule as shared mode, prepareRepository), so its publish is a
   // fast-forward rather than a rejected non-fast-forward. Only a task branch absent on origin
-  // starts at origin/main.
+  // starts at the requested origin/<base_ref>, defaulting to origin/main.
   const taskBranchRef = `refs/remotes/origin/${branch}`;
+  const baseBranchRef = `refs/remotes/origin/${checkoutBase}`;
   const onOrigin = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", taskBranchRef], { allowFailure: true });
-  const cacheRef = branchOverride || onOrigin.status === 0 ? taskBranchRef : "refs/remotes/origin/main";
+  const cacheRef = branchOverride || onOrigin.status === 0 ? taskBranchRef : baseBranchRef;
   const resolved = await command("git", ["-C", cacheDir, "rev-parse", "--verify", "--quiet", cacheRef], { allowFailure: true });
   if (resolved.status !== 0 || !SHA.test(resolved.stdout)) throw new Error(`clean room: ${cacheRef} did not materialize in ${cacheDir} after fetch`);
   const baseCommit = resolved.stdout;
@@ -570,7 +586,7 @@ export async function publishFromCache({ envelope, cacheDir, attemptDir, branch,
 
   const created = await command(
     "gh",
-    ["pr", "create", "-R", envelope.repo, "--base", "main", "--head", branch, "--title", prTitle({
+    ["pr", "create", "-R", envelope.repo, "--base", envelope.base_ref ?? "main", "--head", branch, "--title", prTitle({
        taskId,
        objective: objective ?? (typeof envelope.spec === "string" ? envelope.spec : null),
        // Reached only when prEligible, i.e. finalState would return COMPLETED but for the PR

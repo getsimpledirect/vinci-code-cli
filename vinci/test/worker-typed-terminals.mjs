@@ -7,18 +7,36 @@
 // pinned by tests that can fail.
 
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, execSync, spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { BusClient } from "../worker/bus.mjs";
+import { prepareCleanRoom } from "../worker/cleanroom.mjs";
 import { prTitle } from "../worker/publisher.mjs";
 import { publish } from "../worker/run.mjs";
+import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
 
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
+const TOOLS = join(ROOT, "vinci/test/fixtures/worker-test-tools");
 const bus = () => new BusClient("https://example.invalid", "t");
+
+async function runWorker(fixture, id, extraArgs = []) {
+  const child = spawn(
+    "node",
+    [join(ROOT, "vinci/worker/worker.mjs"), "start", "--id", "w1", "--server", fixture.busUrl(), "--once", "--state-dir", fixture.tempDir, ...extraArgs],
+    { env: fixture.getEnv(), stdio: "pipe" },
+  );
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolveClose) => child.once("close", resolveClose));
+  assert.equal(code, 0, stderr);
+  return JSON.parse(readFileSync(join(fixture.tempDir, "tasks", `${id}.json`), "utf8"));
+}
 
 test("a terminal record without a typed outcome is a hard error, never a default", async () => {
   // The consumer keys human attention on `outcome !== "COMPLETED"`. A terminal that posts with no
@@ -225,4 +243,107 @@ test("UNVERIFIED is a terminal and carries a type like any other", async () => {
     /terminal record must carry a typed outcome/,
     "the enum stays closed: a plausible-sounding value is still refused before any I/O",
   );
+});
+
+test("clean-room rejects invalid and missing pinned base_ref before creating a worktree", async (t) => {
+  const fixture = new WorkerTestFixture("typed-base-validation");
+  t.after(() => fixture.cleanup());
+  fixture.createRepo("test", "repo");
+  const savedGitBase = process.env.VINCI_WORKER_GIT_BASE;
+  process.env.VINCI_WORKER_GIT_BASE = `file://${fixture.reposDir}/`;
+  t.after(() => {
+    if (savedGitBase === undefined) delete process.env.VINCI_WORKER_GIT_BASE;
+    else process.env.VINCI_WORKER_GIT_BASE = savedGitBase;
+  });
+
+  const invalidState = join(fixture.tempDir, "invalid-state");
+  await assert.rejects(
+    prepareCleanRoom({
+      stateDir: invalidState,
+      repo: "test/repo",
+      taskId: "invalid-base",
+      attempt: 1,
+      baseRef: "-release",
+      diskFloorBytes: 0,
+    }),
+    /base_ref .*plain git branch name/,
+  );
+  assert.equal(existsSync(invalidState), false, "syntax validation must happen before repository state is created");
+
+  const missingState = join(fixture.tempDir, "missing-state");
+  await assert.rejects(
+    prepareCleanRoom({
+      stateDir: missingState,
+      repo: "test/repo",
+      taskId: "missing-base",
+      attempt: 1,
+      baseRef: "release/missing",
+      diskFloorBytes: 0,
+    }),
+    /base_ref release\/missing not found on origin/,
+  );
+  assert.equal(existsSync(join(missingState, "attempts")), false, "a missing pinned base must not create an attempt worktree");
+});
+
+test("clean-room checks out and opens the PR against a non-main base_ref", async (t) => {
+  const fixture = new WorkerTestFixture("typed-base-ref");
+  t.after(async () => {
+    execFileSync("chmod", ["-R", "u+w", fixture.tempDir]);
+    await fixture.cleanup();
+  });
+  const { origin } = fixture.createRepo("test", "repo");
+  const seed = join(fixture.tempDir, "release-seed");
+  execFileSync("git", ["clone", "--quiet", origin, seed]);
+  execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: seed });
+  execFileSync("git", ["config", "user.name", "Test"], { cwd: seed });
+  execFileSync("git", ["checkout", "--quiet", "-b", "release/2026-08"], { cwd: seed });
+  writeFileSync(join(seed, "BASE_MARKER"), "release base\n");
+  execFileSync("git", ["add", "BASE_MARKER"], { cwd: seed });
+  execFileSync("git", ["commit", "--quiet", "-m", "release base"], { cwd: seed });
+  execFileSync("git", ["push", "--quiet", "origin", "release/2026-08"], { cwd: seed });
+  const releaseHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: seed, encoding: "utf8" }).trim();
+
+  fixture.linkTools(TOOLS);
+  await fixture.startBus([{
+    message_id: "typed-base",
+    to_agent: "worker:w1",
+    kind: "handoff",
+    subject: "typed base",
+    body: "repo: test/repo\nevidence: pr\nbase_ref: release/2026-08\n\nImplement from the release branch.",
+    ts: "2026-08-31T12:00:00Z",
+    posted_by: "scheduler",
+  }]);
+
+  const state = await runWorker(fixture, "typed-base", ["--clean-room", "--disk-floor-mb", "0"]);
+  assert.equal(state.state, "COMPLETED");
+  assert.equal(state.base_commit, releaseHead, "the attempt must fork from the pinned base_ref");
+  const ghCalls = readFileSync(join(fixture.tempDir, "gh-calls.txt"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const create = ghCalls.find(({ argv }) => argv[0] === "pr" && argv[1] === "create");
+  assert.ok(create, "the eligible run must create a PR");
+  assert.equal(create.argv[create.argv.indexOf("--base") + 1], "release/2026-08");
+});
+
+test("the real finalState fall-through posts status with outcome UNVERIFIED", async (t) => {
+  const fixture = new WorkerTestFixture("typed-unverified-terminal");
+  t.after(() => fixture.cleanup());
+  fixture.createRepo("test", "repo");
+  fixture.linkTools(TOOLS);
+  await fixture.startBus([{
+    message_id: "typed-unverified",
+    to_agent: "worker:w1",
+    kind: "handoff",
+    subject: "typed unverified",
+    body: "repo: test/repo\nevidence: none\n\nProduce work without a PR assessment.",
+    ts: "2026-08-31T12:00:00Z",
+    posted_by: "scheduler",
+  }]);
+
+  const state = await runWorker(fixture, "typed-unverified");
+  assert.equal(state.state, "UNVERIFIED", "DONE with no PR must take finalState's default fall-through");
+  const posted = fixture.getPostedMessages().at(-1);
+  assert.equal(posted.kind, "status");
+  assert.equal(posted.outcome, "UNVERIFIED");
 });
