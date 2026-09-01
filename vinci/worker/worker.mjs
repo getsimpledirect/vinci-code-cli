@@ -779,12 +779,30 @@ async function processHandoff(
   // proves it: worker-handoff-triple (digest, shared) and worker-typed-terminals (prose,
   // clean room). Requiring EITHER is the correct composition and is still closed by default.
   //
-  // 🔴 That claim was FALSE until the clean room actually honoured both halves of the pin.
-  // prepareCleanRoom took base_ref only and resolved origin/<base_ref> to its CURRENT TIP, so
-  // a digest handoff in the clean room forked from whatever the branch pointed to now and the
-  // signed base_commit was never verified. The exemption is earned only because
-  // prepareCleanRoom now validates base_commit is an ancestor of origin/<base_ref> and starts
-  // the attempt AT the signed commit, with the same refusals shared mode uses.
+  // 🔴 SCOPE OF THE CLEAN-ROOM EXEMPTION — READ THE QUALIFIER, IT IS LOAD-BEARING.
+  //
+  // FOR DIGEST/SIGNED HANDOFFS ONLY, the exemption is earned: prepareCleanRoom now validates
+  // that base_commit is an ancestor of origin/<base_ref> and starts the attempt AT the signed
+  // commit, with the same refusals shared mode uses (base_ref_unavailable,
+  // base_commit_unreachable, no fallback to the tip). Before that it took base_ref only and
+  // resolved origin/<base_ref> to its CURRENT TIP, so a digest handoff forked from whatever
+  // the branch pointed to and the signed commit was never verified.
+  //
+  // FOR PROSE HANDOFFS IT IS NOT EARNED, AND THIS IS A KNOWN ACCEPTED GAP. A prose envelope
+  // carries NO base_commit, so `if (pinnedBaseCommit)` in prepareCleanRoom is skipped entirely
+  // and the attempt forks from the moving tip of origin/<base_ref>. The guard below exempts
+  // clean-room mode unconditionally, so `prose + clean room + non-main base_ref` still runs
+  // against an unsigned, moving base. Pre-existing behaviour, deliberately NOT changed here;
+  // this patch narrows a comment, it does not broaden or restrict what runs.
+  //
+  // TODO(worker/portfolio-security, owner: worker lane): decide whether prose + clean room +
+  // non-main base_ref should be refused outright, or whether prose handoffs should carry a
+  // pinnable commit. Tracked as the follow-up to review msg_4d0f29f7.
+  //
+  // The previous revision of this comment asserted the exemption without the digest
+  // qualifier — true of the path it was written about and false of the other one. That is the
+  // failure mode this comment block exists to document, so: the guarantee above is scoped, and
+  // the scope is the point.
   if (!contractFields && !cleanRoom && envelope.base_ref !== undefined && envelope.base_ref !== "main") {
     const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; a prose handoff does not pin the commit to fork from`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
