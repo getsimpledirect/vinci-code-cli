@@ -12,8 +12,8 @@ OUT="${1:-${ROOT}/release}"
 VERSION="$(node -e 'const i=require(process.argv[1]); if(typeof i.version!=="string") process.exit(1); process.stdout.write(i.version)' "${ROOT}/vinci/identity.json")"
 TGZ="${OUT}/vinci-code-${VERSION}.tgz"
 CURRENT_TGZ="${OUT}/vinci-code.tgz"
-EXCLUDES="$(mktemp "${TMPDIR:-/tmp}/vinci-package-excludes.XXXXXX")"
-trap 'rm -f "${EXCLUDES}"' EXIT
+ENTRIES="$(mktemp "${TMPDIR:-/tmp}/vinci-package-entries.XXXXXX")"
+trap 'rm -f "${ENTRIES}"' EXIT
 mkdir -p "${OUT}"
 
 echo "── Building (network-free) ─────────────────────────"
@@ -24,29 +24,12 @@ echo "── Packaging → ${TGZ} ───────────────�
 # Package only the transitive production dependency closure of the five shipped workspaces. This
 # removes development CLIs and test runners as whole graphs, along with unrelated local packages,
 # so no shipped entry point can depend on one of the explicit development-tool exclusions below.
-node "${ROOT}/vinci/scripts/package-excludes.mjs" "${ROOT}" > "${EXCLUDES}"
+node "${ROOT}/vinci/scripts/package-entries.mjs" "${ROOT}" > "${ENTRIES}"
 
 # Tar straight from the repo root so paths extract as packages/… + vinci/ + node_modules (the launcher
 # resolves ROOT from its own location, so this layout runs as-is). Package only Vinci runtime assets;
 # tests, docs, infrastructure state, and release tooling must never enter the public archive.
-tar -czf "${TGZ}" -C "${ROOT}" \
-  --exclude-from="${EXCLUDES}" \
-  --exclude='node_modules/ssh2/test' \
-  --exclude='node_modules/.cache' \
-  --exclude='node_modules/.vite' \
-  --exclude='node_modules/.bin' \
-  --exclude='*.map' \
-  --exclude='*.ts.map' \
-  --exclude='vinci/worker/README.md' \
-  packages/agent/dist packages/agent/package.json \
-  packages/ai/dist packages/ai/package.json \
-  packages/coding-agent/dist packages/coding-agent/package.json \
-  packages/orchestrator/dist packages/orchestrator/package.json \
-  packages/tui/dist packages/tui/package.json \
-  vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater vinci/worker \
-  vinci/scripts/report-wrong.mjs vinci/scripts/reap-heal-temp.mjs vinci/scripts/resolve-dispatch.mjs \
-  vinci/dispatch-manifest.json vinci/identity.json vinci/NOTICE \
-  package.json node_modules
+tar --no-recursion -czf "${TGZ}" -C "${ROOT}" -T "${ENTRIES}"
 
 cp "${TGZ}" "${CURRENT_TGZ}"
 # Record the checksum against the BASENAME so `shasum -c` works from the release dir on any machine
