@@ -528,8 +528,13 @@ async function emitEconomics({
 }
 
 function terminalPostBody(details, economicsSha = null) {
-  const econ = typeof economicsSha === "string" && economicsSha ? ` economics_sha256=${economicsSha}` : "";
-  return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}${econ}`;
+  // Two rules bind this body and they conflict unless the digest goes FIRST: every terminal
+  // ends with ` worker_build=… vinci_binary=…` (asserted as a tail), and several blocker
+  // reasons are `$`-anchored against the body with that tail stripped. A token appended after
+  // the reason breaks the second; a token after the stamps breaks the first. So: digest, then
+  // reason, then stamps.
+  const econ = typeof economicsSha === "string" && economicsSha ? `economics_sha256=${economicsSha} ` : "";
+  return `${econ}${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
 
 // F8: EVERY early terminal (blocker) post — digest refusal, invalid bounds, past deadline,

@@ -59,6 +59,8 @@ const test = async () => {
 
     const posted = fixture.getPostedMessages();
     const terminal = posted.find((m) => /blocked/.test(m.subject ?? "") && /economics_sha256=/.test(m.body ?? ""));
+    // The digest leads the body; the build stamps must still close it (both rules hold).
+    assert.ok(/ worker_build=\S+ vinci_binary=\S+$/.test(terminal.body), terminal.body);
     assert.ok(terminal, `no terminal post carried economics_sha256=; posts: ${posted.map((m) => m.subject).join(" | ")}`);
     const token = terminal.body.match(/economics_sha256=([0-9a-f]{64})/);
     assert.ok(token, terminal.body);
