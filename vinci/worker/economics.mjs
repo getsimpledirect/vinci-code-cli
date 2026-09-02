@@ -76,7 +76,11 @@ function rollupUsage(entries, flags) {
         output_tokens: 0,
         reasoning_tokens: 0,
         cost_microusd: 0,
-        responseIds: new Set(),
+        // model_calls outside any responseId (no dedup key available) accumulate directly;
+        // responseId-keyed calls are tallied once per unique id so a duplicated response is one
+        // call, not two.
+        direct_model_calls: 0,
+        response_calls: new Map(),
         cost_basis: null,
         cost_confidence: null,
       };
@@ -84,7 +88,12 @@ function rollupUsage(entries, flags) {
     }
 
     if (typeof entry.model_calls === "number" && entry.model_calls > 0) {
-      group.model_calls += entry.model_calls;
+      if (typeof entry.responseId === "string" && entry.responseId) {
+        // First write wins per responseId: a duplicated response contributes its call count once.
+        if (!group.response_calls.has(entry.responseId)) group.response_calls.set(entry.responseId, entry.model_calls);
+      } else {
+        group.direct_model_calls += entry.model_calls;
+      }
     }
     if (typeof entry.input_tokens === "number") group.input_tokens += entry.input_tokens;
     if (typeof entry.cached_read_tokens === "number") group.cached_read_tokens += entry.cached_read_tokens;
@@ -93,20 +102,21 @@ function rollupUsage(entries, flags) {
     if (typeof entry.reasoning_tokens === "number") group.reasoning_tokens += entry.reasoning_tokens;
     if (typeof entry.cost_microusd === "number") group.cost_microusd += Math.round(entry.cost_microusd);
 
-    if (typeof entry.responseId === "string") group.responseIds.add(entry.responseId);
     if (str(entry.cost_basis)) group.cost_basis = entry.cost_basis;
     if (str(entry.cost_confidence)) group.cost_confidence = entry.cost_confidence;
   }
 
   const result = [];
   for (const group of rollup.values()) {
+    let modelCalls = group.direct_model_calls;
+    for (const calls of group.response_calls.values()) modelCalls += calls;
     result.push({
       phase: group.phase,
       cost_category: group.cost_category,
       provider: group.provider,
       model: group.model,
       source: group.source,
-      model_calls: group.model_calls,
+      model_calls: modelCalls,
       input_tokens: group.input_tokens,
       cached_read_tokens: group.cached_read_tokens,
       cache_write_tokens: group.cache_write_tokens,
@@ -172,7 +182,12 @@ export function buildEconomicsSummary(input = {}) {
     const usage = rollupUsage(usageArray, flags);
 
     const taskOutcome = typeof input.taskOutcome === "object" && input.taskOutcome !== null ? input.taskOutcome : null;
-    if (taskOutcome === null && !incomplete.includes("killed_before_outcome")) incomplete.push("killed_before_outcome");
+    // `receipt` is the vinci-task-outcome entry the session wrote at its own terminal. Its absence
+    // (SIGKILL, provider failure before the receipt) is what killed_before_outcome means; the
+    // worker-side run outcome is not a substitute for it.
+    const receipt = typeof input.receipt === "object" && input.receipt !== null ? input.receipt : null;
+    if (receipt === null && !incomplete.includes("killed_before_outcome")) incomplete.push("killed_before_outcome");
+    if (input.crewRan === true && !incomplete.includes("crew_unattributed")) incomplete.push("crew_unattributed");
 
     let headSha = null;
     if (taskOutcome && typeof taskOutcome.head_sha === "string") headSha = taskOutcome.head_sha;
@@ -190,7 +205,7 @@ export function buildEconomicsSummary(input = {}) {
 
     const localResult = {
       task_state: taskState,
-      verification_state: null,
+      verification_state: str(receipt?.verificationStatus) ?? null,
       changed_files: typeof input.changed_files === "number" ? input.changed_files : null,
       head_sha: headSha,
       pr_number: typeof input.pr_number === "number" ? input.pr_number : null,

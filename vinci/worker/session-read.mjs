@@ -114,6 +114,50 @@ function usageValue(entry) {
     : 0;
 }
 
+function numberOrZero(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+// Convert the persisted per-call `vinci-task-usage` entry into the flat per-call shape the
+// economics rollup consumes. The persisted entry carries one call (or an aggregate of calls that
+// all share a single response key) in its `data.usage` block; providers/models are arrays because
+// a single response can span more than one upstream, but the dominant pair drives the rollup key.
+// Cost is emitted as integer micro-USD (never a float) to match server-side storage.
+function usageEntryToRecord(entry) {
+  const usage = entry?.data?.usage;
+  if (!usage || typeof usage !== "object") return null;
+  const modelCalls = numberOrZero(usage.modelCalls);
+  const providers = Array.isArray(usage.providers) ? usage.providers.filter((p) => typeof p === "string" && p) : [];
+  const models = Array.isArray(usage.models) ? usage.models.filter((m) => typeof m === "string" && m) : [];
+  const costUsd = numberOrZero(usage.estimatedCostUsd);
+  const responseId = typeof entry?.data?.responseKey === "string" && entry.data.responseKey ? entry.data.responseKey : null;
+  return {
+    provider: providers[0] ?? null,
+    model: models[0] ?? null,
+    model_calls: modelCalls,
+    input_tokens: numberOrZero(usage.inputTokens),
+    cached_read_tokens: numberOrZero(usage.cachedTokens),
+    cache_write_tokens: numberOrZero(usage.cacheWriteTokens),
+    output_tokens: numberOrZero(usage.outputTokens),
+    reasoning_tokens: numberOrZero(usage.reasoningTokens),
+    cost_microusd: Math.round(costUsd * 1_000_000),
+    responseId,
+  };
+}
+
+// The raw per-call usage records persisted during the session, mapped to the flat shape the
+// economics rollup groups by (provider, model). Returned alongside `source` so the terminal
+// economics summary can roll up real usage instead of an empty array.
+function usageEntries(entries) {
+  const result = [];
+  for (const entry of entries) {
+    if (entry?.type !== "custom" || entry.customType !== "vinci-task-usage") continue;
+    const record = usageEntryToRecord(entry);
+    if (record) result.push(record);
+  }
+  return result;
+}
+
 function taskOutcome(entry) {
   if (entry?.type === "custom" && entry.customType === "vinci-task-outcome" && entry.data) return entry.data;
   return undefined;
@@ -166,7 +210,16 @@ function messageCostUsd(entry) {
 export function readSessionState(sessionDir, sessionId) {
   const session = fileForSession(sessionDir, sessionId);
   if (!session)
-    return { costUsd: 0, outcome: undefined, harnessStops: [], unattendedPolicy: [], path: undefined, source: undefined };
+    return {
+      costUsd: 0,
+      outcome: undefined,
+      harnessStops: [],
+      unattendedPolicy: [],
+      usageEntries: [],
+      crewRan: false,
+      path: undefined,
+      source: undefined,
+    };
 
   let accumulatedCostUsd = 0;
   let hasUsageEntries = false;
@@ -182,6 +235,12 @@ export function readSessionState(sessionDir, sessionId) {
     const decision = unattendedPolicyDecision(entry);
     if (decision) unattendedPolicy.push(decision);
   });
+  const extractedUsageEntries = usageEntries(session.entries);
+  // Crew helpers run in their own RPC sessions; their usage is NOT in this session. Flag it so the
+  // economics summary reports crew_unattributed instead of silently under-counting.
+  const crewRan = session.entries.some(
+    (entry) => entry?.type === "custom" && (entry.customType === "vinci-crew-helper" || entry.customType === "vinci-crew-result"),
+  );
   for (const entry of session.entries) {
     if (entry?.type === "custom" && entry.customType === "vinci-task-usage") {
       hasUsageEntries = true;
@@ -209,7 +268,16 @@ export function readSessionState(sessionDir, sessionId) {
     : hasUsageEntries || accumulatedCostUsd > 0
       ? "usage_entries"
       : "message_fallback";
-  return { costUsd, outcome, harnessStops, unattendedPolicy, path: session.path, source };
+  return {
+    costUsd,
+    outcome,
+    harnessStops,
+    unattendedPolicy,
+    usageEntries: extractedUsageEntries,
+    crewRan,
+    path: session.path,
+    source,
+  };
 }
 
 export function readSessionOutcome(sessionDir, sessionId) {
