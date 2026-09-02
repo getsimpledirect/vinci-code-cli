@@ -139,34 +139,63 @@ if (shellErrors.length > 0) {
 }
 
 function parameterReferences(word) {
-  if (!word?.text) return [];
-  return [...word.text.matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}|([A-Za-z_][A-Za-z0-9_]*))/g)]
-    .map((match) => match[1] ?? match[2]);
+  const references = new Set();
+  const visited = new WeakSet();
+  function visit(value) {
+    if (!value || typeof value !== "object" || visited.has(value)) return;
+    visited.add(value);
+    if (value.type === "ParameterExpansion" && typeof value.parameter === "string") {
+      references.add(value.parameter);
+    } else if (value.type === "SimpleExpansion") {
+      const match = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value.text);
+      if (match) references.add(match[1]);
+    }
+    if ("parts" in value && Array.isArray(value.parts)) {
+      for (const part of value.parts) visit(part);
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (key !== "parts") visit(child);
+    }
+  }
+  visit(word);
+  return [...references];
 }
 
-// Track every variable that can carry a path rooted at VINCI. The pass is deliberately
-// flow-insensitive: if any branch can assign such a path, using that variable as an executable
-// target is unreviewed. This catches indirection regardless of quoting or line layout.
-const vinciPathVariables = new Set(["VINCI"]);
+// Track the complete connected assignment graph around the artifact roots. Both directions matter:
+// the real launcher derives VINCI from ROOT and ROOT from SELF, while later aliases derive from any
+// of those three. Treating the graph flow-insensitively is intentionally conservative: if a branch
+// can make a variable artifact-root-equivalent, it can never become an unreviewed executable target.
+const assignmentLinks = new Map();
+function linkVariables(left, right) {
+  if (!assignmentLinks.has(left)) assignmentLinks.set(left, new Set());
+  if (!assignmentLinks.has(right)) assignmentLinks.set(right, new Set());
+  assignmentLinks.get(left).add(right);
+  assignmentLinks.get(right).add(left);
+}
+for (const assignment of shellAssignments) {
+  if (!assignment.name) continue;
+  const words = [assignment.value, ...(assignment.array ?? [])].filter(Boolean);
+  for (const word of words) {
+    for (const reference of parameterReferences(word)) linkVariables(assignment.name, reference);
+  }
+}
+const vinciPathVariables = new Set(["VINCI", "ROOT", "SELF"]);
 let addedVariable = true;
 while (addedVariable) {
   addedVariable = false;
-  for (const assignment of shellAssignments) {
-    const words = [assignment.value, ...(assignment.array ?? [])].filter(Boolean);
-    if (
-      assignment.name
-      && !vinciPathVariables.has(assignment.name)
-      && words.some((word) => parameterReferences(word).some((name) => vinciPathVariables.has(name)))
-    ) {
-      vinciPathVariables.add(assignment.name);
-      addedVariable = true;
+  for (const variable of [...vinciPathVariables]) {
+    for (const linked of assignmentLinks.get(variable) ?? []) {
+      if (!vinciPathVariables.has(linked)) {
+        vinciPathVariables.add(linked);
+        addedVariable = true;
+      }
     }
   }
 }
 
 const safePathConsumers = new Set([
   "[", "test", "echo", "printf", "sed", "head", "tail", "cat", "cp", "mv", "rm", "chmod",
-  "dirname", "readlink", "basename", "_vinci_updater_version", "_vinci_version_is_newer",
+  "cd", "dirname", "readlink", "basename", "_vinci_updater_version", "_vinci_version_is_newer",
 ]);
 let resolverCalls = 0;
 let manifestExecs = 0;
@@ -322,9 +351,9 @@ function checkGraph(entryFiles, label) {
           } else if (node.arguments[0].text.startsWith(".")) {
             specifiers.push(node.arguments[0].text);
           }
-        } else if (ts.isIdentifier(node.expression) && (node.expression.text === "eval" || node.expression.text === "Function")) {
-          addFailure("uses dynamic/runtime module loading; the static artifact proof refuses it");
         }
+      } else if (ts.isIdentifier(node) && (node.text === "eval" || node.text === "Function")) {
+        addFailure("references a dynamic code loader; the static artifact proof refuses it");
       } else if (
         ts.isIdentifier(node)
         && (node.text === "require" || node.text === "createRequire")
@@ -334,7 +363,7 @@ function checkGraph(entryFiles, label) {
       } else if (ts.isIdentifier(node) && node.text === "module" && !isAllowedCommonJsModuleReference(node)) {
         addFailure("uses module through an unverifiable runtime access");
       } else if (
-        (ts.isPropertyAccessExpression(node) && ["require", "_load", "createRequire"].includes(node.name.text))
+        (ts.isPropertyAccessExpression(node) && ["require", "_load", "createRequire", "eval", "Function"].includes(node.name.text))
         || (
           ts.isElementAccessExpression(node)
           && ["require", "_load", "createRequire", "eval", "Function"].includes(

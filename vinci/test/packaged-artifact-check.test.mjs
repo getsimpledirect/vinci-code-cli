@@ -14,7 +14,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-const checker = fileURLToPath(new URL("./packaged-artifact-check.mjs", import.meta.url));
+const checker = process.env.VINCI_PACKAGED_CHECKER
+	?? fileURLToPath(new URL("./packaged-artifact-check.mjs", import.meta.url));
 const resolverSource = readFileSync(new URL("../scripts/resolve-dispatch.mjs", import.meta.url), "utf8");
 const fixtureRoots = [];
 
@@ -29,7 +30,8 @@ const manifest = {
 const launcher = `#!/usr/bin/env bash
 set -euo pipefail
 SELF="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-VINCI="$(cd "\${SELF}/.." && pwd)"
+ROOT="$(cd "\${SELF}/../.." && pwd)"
+VINCI="\${ROOT}/vinci"
 set +e
 _vinci_dispatch_target="$(
   node "\${VINCI}/scripts/resolve-dispatch.mjs" \\
@@ -201,6 +203,25 @@ test("a variable-indirected Vinci target cannot hide a dispatch", () => {
 	expectFailure(run(root), /unmanifested executable dispatch/);
 });
 
+for (const [label, dispatch] of [
+	["ROOT alias", 'node "${ROOT}/vinci/hidden.mjs" "$@"'],
+	["SELF alias", 'node "${SELF}/../hidden.mjs" "$@"'],
+	["nested default", 'node "${_vinci_absent:-${VINCI}/hidden.mjs}" "$@"'],
+]) {
+	test(`${label} cannot hide an executable artifact path`, () => {
+		const root = fixture();
+		write(join(root, "vinci", "hidden.mjs"), 'console.log(`hidden shell target reached: ${process.argv.slice(2).join(" ")}`);\n');
+		write(
+			join(root, "vinci", "bin", "vinci"),
+			`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  ${dispatch}\nfi\n`,
+		);
+		const reached = runLauncher(root, ["hidden", "delta"]);
+		assert.equal(reached.status, 0, reached.stderr);
+		assert.match(reached.stdout, /hidden shell target reached: hidden delta/);
+		expectFailure(run(root), /unmanifested executable dispatch/);
+	});
+}
+
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
 	const cases = [
 		{ value: null, pattern: /wrong schema or no dispatches/ },
@@ -263,8 +284,42 @@ test("dynamic and aliased runtime loaders are explicitly rejected", () => {
 	]) {
 		const root = fixture();
 		write(join(root, "vinci", "worker", "worker.mjs"), source);
-		expectFailure(run(root), /dynamic\/runtime module loading|runtime module loader|runtime access|CommonJS loader/);
+		expectFailure(run(root), /dynamic\/runtime module loading|dynamic code loader|runtime module loader|runtime access|CommonJS loader/);
 	}
+});
+
+for (const [label, source] of [
+	["aliased eval", 'const load = eval; await load(\'import("./hidden.mjs")\');\n'],
+	["property eval", 'const load = globalThis.eval; await load(\'import("./hidden.mjs")\');\n'],
+	["eval.call", 'await eval.call(undefined, \'import("./hidden.mjs")\');\n'],
+	["Function.call", 'await Function.call(undefined, \'return import("./hidden.mjs")\')();\n'],
+]) {
+	test(`${label} cannot execute a hidden module through a manifest entry`, () => {
+		const root = fixture();
+		write(join(root, "vinci", "worker", "worker.mjs"), source);
+		write(join(root, "vinci", "worker", "hidden.mjs"), 'console.log("hidden module reached");\n');
+		const reached = runLauncher(root, ["worker"]);
+		assert.equal(reached.status, 0, reached.stderr);
+		assert.match(reached.stdout, /hidden module reached/);
+		expectFailure(run(root), /dynamic code loader/);
+	});
+}
+
+test("the dynamic-loader policy also covers extension entry points", () => {
+	const root = fixture();
+	write(join(root, "vinci", "extensions", "entry.ts"), "const load = eval; void load('1');\n");
+	expectFailure(run(root), /shipped extension graph.*unverifiable dependency edge|dynamic code loader/s);
+});
+
+test("restoring a rejected loader mutation restores certifiability", () => {
+	const root = fixture();
+	const workerPath = join(root, "vinci", "worker", "worker.mjs");
+	const original = readFileSync(workerPath, "utf8");
+	write(workerPath, "const load = eval; load('1');\n");
+	expectFailure(run(root), /dynamic code loader/);
+	write(workerPath, original);
+	const restored = run(root);
+	assert.equal(restored.status, 0, restored.stderr);
 });
 
 test("computed CommonJS loader access is rejected", () => {
