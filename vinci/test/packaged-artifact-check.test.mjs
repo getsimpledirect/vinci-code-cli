@@ -1080,6 +1080,19 @@ test("tracked authority changes cannot certify between commits", () => {
 	expectFailure(run(root, tmpdir(), { seal: false }), /authority has tracked modifications/);
 });
 
+test("the authority snapshot must match Git HEAD even when status is transiently clean", () => {
+	const root = fixture();
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	const relativePath = "vinci/worker/worker.mjs";
+	git(authorityRoot, ["update-index", "--assume-unchanged", relativePath]);
+	const replacement = 'import { run } from "./run.mjs";\nconsole.log(`replacement ${run}`);\n';
+	write(join(root, relativePath), replacement);
+	write(join(authorityRoot, relativePath), replacement);
+	assert.equal(git(authorityRoot, ["status", "--porcelain=v1", "--untracked-files=no"]), "");
+	expectFailure(run(root, tmpdir(), { seal: false }), /authority file does not match Git HEAD/);
+});
+
 test("artifact resolution is independent of the caller working directory", () => {
 	const root = fixture();
 	const unrelated = mkdtempSync(join(tmpdir(), "vinci-unrelated-cwd-"));

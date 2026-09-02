@@ -92,6 +92,38 @@ function readAuthorityGitIdentity() {
 
 const initialAuthorityGitIdentity = readAuthorityGitIdentity();
 
+function readTrackedAuthorityEntries() {
+  const result = spawnSync("git", ["-C", authorityRoot, "ls-tree", "-rz", "--full-tree", "HEAD"], {
+    encoding: "buffer",
+    env: { PATH: process.env.PATH ?? "" },
+    timeout: 10_000,
+  });
+  if (result.status !== 0) {
+    refuse("trusted executable authority Git tree cannot be read", [result.stderr.toString("utf8").trim()]);
+  }
+  const entries = new Map();
+  for (const record of result.stdout.toString("utf8").split("\0")) {
+    if (!record) continue;
+    const tab = record.indexOf("\t");
+    const [mode, type, object] = record.slice(0, tab).split(" ");
+    entries.set(record.slice(tab + 1), { mode, type, object });
+  }
+  return entries;
+}
+
+const authorityObjectFormat = gitOutput(["rev-parse", "--show-object-format"]);
+if (authorityObjectFormat !== "sha1" && authorityObjectFormat !== "sha256") {
+  refuse("trusted executable authority uses an unsupported Git object format", [authorityObjectFormat]);
+}
+const trackedAuthorityEntries = readTrackedAuthorityEntries();
+
+function gitBlobObject(contents) {
+  return createHash(authorityObjectFormat)
+    .update(`blob ${contents.length}\0`)
+    .update(contents)
+    .digest("hex");
+}
+
 function relativeToRoot(path) {
   return relative(root, path).split(sep).join("/");
 }
@@ -907,6 +939,12 @@ function isAllowedReleasePath(relativePath) {
 
 const authoritySnapshot = new Map();
 
+function requiresGitHeadBinding(relativePath) {
+  return relativePath === "package.json"
+    || relativePath.startsWith("vinci/")
+    || /^packages\/(?:agent|ai|coding-agent|orchestrator|tui)\/package\.json$/.test(relativePath);
+}
+
 function snapshotAuthorityEntry(relativePath) {
   if (!isAllowedReleasePath(relativePath) || excludedFromReleaseAuthority(relativePath)) return;
   const trustedPath = join(authorityRoot, ...relativePath.split("/"));
@@ -917,13 +955,22 @@ function snapshotAuthorityEntry(relativePath) {
     authoritySnapshot.set(relativePath, { type: "directory", children });
     for (const entry of children) snapshotAuthorityEntry(`${relativePath}/${entry}`);
   } else if (before.isSymbolicLink()) {
+    const link = readlinkSync(trustedPath);
+    const tracked = trackedAuthorityEntries.get(relativePath);
+    if (!tracked && requiresGitHeadBinding(relativePath)) {
+      authorityFailures.push(`${relativePath} authority symlink is not tracked by Git HEAD`);
+    }
+    if (tracked && (tracked.mode !== "120000" || tracked.type !== "blob" || gitBlobObject(Buffer.from(link)) !== tracked.object)) {
+      authorityFailures.push(`${relativePath} authority symlink does not match Git HEAD`);
+    }
     authoritySnapshot.set(relativePath, {
       type: "symlink",
-      link: readlinkSync(trustedPath),
+      link,
       canonical: containedCanonicalRelative(authorityRoot, trustedPath, `${relativePath} authority symlink`),
     });
   } else if (before.isFile()) {
-    const digest = fileDigest(trustedPath);
+    const contents = readFileSync(trustedPath);
+    const digest = createHash("sha256").update(contents).digest("hex");
     const after = lstatSync(trustedPath);
     if (
       before.dev !== after.dev
@@ -933,6 +980,21 @@ function snapshotAuthorityEntry(relativePath) {
       || before.ctimeMs !== after.ctimeMs
     ) {
       authorityFailures.push(`${relativePath} changed while the trusted authority snapshot was captured`);
+    }
+    const tracked = trackedAuthorityEntries.get(relativePath);
+    const expectedGitMode = (before.mode & 0o111) === 0 ? "100644" : "100755";
+    if (!tracked && requiresGitHeadBinding(relativePath)) {
+      authorityFailures.push(`${relativePath} authority file is not tracked by Git HEAD`);
+    }
+    if (
+      tracked
+      && (
+        tracked.mode !== expectedGitMode
+        || tracked.type !== "blob"
+        || gitBlobObject(contents) !== tracked.object
+      )
+    ) {
+      authorityFailures.push(`${relativePath} authority file does not match Git HEAD`);
     }
     authoritySnapshot.set(relativePath, {
       type: "file",
