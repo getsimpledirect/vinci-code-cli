@@ -513,9 +513,7 @@ if (
   ]);
 }
 
-function resolveImport(file, specifier) {
-  const base = resolve(dirname(file), specifier);
-  assertInsideRoot(base, `${relativeToRoot(file)} import ${specifier}`);
+function resolveImportCandidates(base, label) {
   for (const candidate of [
     base,
     `${base}.ts`,
@@ -529,15 +527,117 @@ function resolveImport(file, specifier) {
     join(base, "index.cjs"),
   ]) {
     if (!existsSync(candidate)) continue;
-    assertExactRealPath(candidate, `${relativeToRoot(file)} import ${specifier}`);
+    assertExactRealPath(candidate, label);
     if (!lstatSync(candidate).isFile()) continue;
     return candidate;
   }
   return null;
 }
 
+function resolveImport(file, specifier) {
+  const base = resolve(dirname(file), specifier);
+  const label = `${relativeToRoot(file)} import ${specifier}`;
+  assertInsideRoot(base, label);
+  const direct = resolveImportCandidates(base, label);
+  if (direct !== null) return direct;
+  // A relative directory import (`require("../")`) loads the directory's package.json main.
+  const manifestPath = join(base, "package.json");
+  if (existsSync(manifestPath) && lstatSync(base).isDirectory() && lstatSync(manifestPath).isFile()) {
+    let main;
+    try {
+      main = JSON.parse(readFileSync(manifestPath, "utf8")).main;
+    } catch {
+      return null;
+    }
+    if (typeof main === "string" && main !== "") {
+      const mainBase = resolve(base, main);
+      assertInsideRoot(mainBase, label);
+      return resolveImportCandidates(mainBase, label);
+    }
+  }
+  return null;
+}
+
+// Bare resolution depends only on the importing directory, the specifier, and the loader kind, so
+// one Node resolution per distinct edge is enough, and every edge of one file resolves in a single
+// child process. Binding every shipped package rather than only the five workspaces makes the
+// resolver spawn the dominant cost of this check: per-edge spawning took the fixture suite from
+// 41s to 138s and timed out unrelated tests.
+const bareResolutionCache = new Map();
+
+function bareResolutionCacheKey(file, specifier, isCommonJs) {
+  return `${isCommonJs ? "cjs" : "esm"}\0${dirname(file)}\0${specifier}`;
+}
+
+// Resolve one file's bare specifiers in a single child. Resolution semantics are identical to the
+// per-edge form: the child runs with cwd = the importing file's directory, ESM edges resolve
+// through import.meta.resolve from there and CommonJS edges through createRequire(file).resolve.
+function resolveBareBatch(file, requests) {
+  const expression = "import{createRequire}from'node:module';import{pathToFileURL}from'node:url';"
+    + "import{readFileSync}from'node:fs';"
+    + "const input=JSON.parse(readFileSync(0,'utf8'));"
+    + "const required=createRequire(pathToFileURL(input.file));"
+    + "const out=[];"
+    + "for(const request of input.requests){"
+    + "try{out.push({ok:true,value:request.commonJs?required.resolve(request.specifier)"
+    + ":import.meta.resolve(request.specifier)});}catch{out.push({ok:false});}}"
+    + "process.stdout.write(JSON.stringify(out));";
+  const resolved = spawnSync(process.execPath, ["--input-type=module", "--eval", expression], {
+    cwd: dirname(file),
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "" },
+    input: JSON.stringify({ file, requests }),
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: 60_000,
+  });
+  if (resolved.status !== 0) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(resolved.stdout);
+  } catch {
+    return null;
+  }
+  return Array.isArray(parsed) && parsed.length === requests.length ? parsed : null;
+}
+
+// Populate the cache for every not-yet-resolved edge of one file. A batch that fails for any reason
+// (crash, timeout, unparsable output) caches nothing; each edge then falls back to its own child
+// process, so a batch failure can never turn an unresolvable edge into a pass.
+function primeBareResolutions(file, bareSpecifiers) {
+  const requests = [];
+  const seen = new Set();
+  for (const { specifier, commonJs } of bareSpecifiers) {
+    if (isBuiltin(specifier)) continue;
+    const key = bareResolutionCacheKey(file, specifier, commonJs);
+    if (bareResolutionCache.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    requests.push({ specifier, commonJs, key });
+  }
+  if (requests.length === 0) return;
+  const results = resolveBareBatch(file, requests);
+  if (results === null) return;
+  for (const [index, request] of requests.entries()) {
+    const result = results[index];
+    bareResolutionCache.set(
+      request.key,
+      result?.ok === true
+        ? interpretBareResolution(result.value, request.commonJs)
+        : { error: "does not resolve" },
+    );
+  }
+}
+
 function resolveBareSpecifier(file, specifier, isCommonJs) {
   if (isBuiltin(specifier)) return { builtin: true };
+  const cacheKey = bareResolutionCacheKey(file, specifier, isCommonJs);
+  const cached = bareResolutionCache.get(cacheKey);
+  if (cached) return cached;
+  const resolution = resolveBareSpecifierUncached(file, specifier, isCommonJs);
+  bareResolutionCache.set(cacheKey, resolution);
+  return resolution;
+}
+
+function resolveBareSpecifierUncached(file, specifier, isCommonJs) {
   const expression = isCommonJs
     ? "import{createRequire}from'node:module';import{pathToFileURL}from'node:url';process.stdout.write(createRequire(pathToFileURL(process.argv[1])).resolve(process.argv[2]))"
     : "process.stdout.write(import.meta.resolve(process.argv[1]))";
@@ -551,7 +651,11 @@ function resolveBareSpecifier(file, specifier, isCommonJs) {
     timeout: 5_000,
   });
   if (resolved.status !== 0) return { error: "does not resolve" };
-  let path = resolved.stdout;
+  return interpretBareResolution(resolved.stdout, isCommonJs);
+}
+
+function interpretBareResolution(output, isCommonJs) {
+  let path = output;
   if (!isCommonJs) {
     if (!path.startsWith("file:")) return { error: `resolves to unsupported URL ${path}` };
     try {
@@ -574,11 +678,75 @@ function resolveBareSpecifier(file, specifier, isCommonJs) {
   return { path: canonical };
 }
 
+function bareSpecifierPackageName(specifier) {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+}
+
+const enclosingManifestCache = new Map();
+
+// The package.json that governs a shipped file is the nearest one at or above its directory inside
+// the artifact; null when none is found before the artifact root.
+function enclosingPackageManifest(file) {
+  let directory = dirname(file);
+  const visitedDirectories = [];
+  let found = null;
+  while (directory === root || directory.startsWith(`${root}${sep}`)) {
+    if (enclosingManifestCache.has(directory)) {
+      found = enclosingManifestCache.get(directory);
+      break;
+    }
+    visitedDirectories.push(directory);
+    const candidate = join(directory, "package.json");
+    if (lstatExists(candidate) && lstatSync(candidate).isFile()) {
+      try {
+        found = JSON.parse(readFileSync(candidate, "utf8"));
+      } catch {
+        found = null;
+      }
+      break;
+    }
+    if (directory === root) break;
+    directory = dirname(directory);
+  }
+  for (const visitedDirectory of visitedDirectories) enclosingManifestCache.set(visitedDirectory, found);
+  return found && typeof found === "object" ? found : null;
+}
+
+// Whether the importing package's own manifest declares the bare target optional: listed under
+// optionalDependencies, or a peer dependency marked optional in peerDependenciesMeta.
+function isManifestOptionalEdge(file, specifier) {
+  const manifest = enclosingPackageManifest(file);
+  if (manifest === null) return false;
+  const name = bareSpecifierPackageName(specifier);
+  const optionalDependencies = manifest.optionalDependencies;
+  if (optionalDependencies && typeof optionalDependencies === "object" && name in optionalDependencies) return true;
+  const peerMeta = manifest.peerDependenciesMeta;
+  return Boolean(peerMeta && typeof peerMeta === "object" && peerMeta[name]?.optional === true);
+}
+
+// Whether a load expression sits lexically inside a try block (not its catch or finally clause).
+function isTryGuarded(node) {
+  let cursor = node;
+  while (cursor.parent) {
+    if (ts.isTryStatement(cursor.parent) && cursor.parent.tryBlock === cursor) return true;
+    cursor = cursor.parent;
+  }
+  return false;
+}
+
+// Node's default resolution conditions for a plain `node` process (the launcher passes no
+// --conditions). Targets reachable only under other conditions ("source", "types", "browser",
+// "development", ...) are never loaded by the shipped launcher; they are existence-checked but not
+// traversed as executable entry points.
+const nodeDefaultConditions = new Set(["node", "import", "require", "default", "module-sync", "node-addons"]);
+
 function checkGraph(entryFiles, label, { strict = true, bindBare = false } = {}) {
   const queue = [...entryFiles];
   const visited = new Set();
   const failures = [];
   let imports = 0;
+  let optionalAbsent = 0;
   while (queue.length > 0) {
     const file = queue.shift();
     if (visited.has(file)) continue;
@@ -614,9 +782,9 @@ function checkGraph(entryFiles, label, { strict = true, bindBare = false } = {})
       if (strict && (moduleSpecifier.text === "module" || moduleSpecifier.text === "node:module")) {
         addFailure("imports Node module-loader authority; the static artifact proof refuses it");
       } else if (moduleSpecifier.text.startsWith(".")) {
-        specifiers.push(moduleSpecifier.text);
+        specifiers.push({ specifier: moduleSpecifier.text, guarded: false });
       } else if (bindBare) {
-        bareSpecifiers.push({ specifier: moduleSpecifier.text, commonJs: false });
+        bareSpecifiers.push({ specifier: moduleSpecifier.text, commonJs: false, guarded: false });
       }
     }
     const constantCandidates = new Map();
@@ -700,8 +868,9 @@ function checkGraph(entryFiles, label, { strict = true, bindBare = false } = {})
           if (strict) {
             addFailure("uses dynamic/runtime module loading; the static artifact proof refuses it");
           } else if (node.arguments.length === 1 && ts.isStringLiteralLike(node.arguments[0])) {
-            if (node.arguments[0].text.startsWith(".")) specifiers.push(node.arguments[0].text);
-            else if (bindBare) bareSpecifiers.push({ specifier: node.arguments[0].text, commonJs: false });
+            const guarded = isTryGuarded(node);
+            if (node.arguments[0].text.startsWith(".")) specifiers.push({ specifier: node.arguments[0].text, guarded });
+            else if (bindBare) bareSpecifiers.push({ specifier: node.arguments[0].text, commonJs: false, guarded });
           }
         } else if (ts.isIdentifier(node.expression) && node.expression.text === "require") {
           if (!isCommonJs && strict) {
@@ -711,9 +880,9 @@ function checkGraph(entryFiles, label, { strict = true, bindBare = false } = {})
           } else if (strict && (node.arguments[0].text === "module" || node.arguments[0].text === "node:module")) {
             addFailure("loads Node module-loader authority; the static artifact proof refuses it");
           } else if (node.arguments[0].text.startsWith(".")) {
-            specifiers.push(node.arguments[0].text);
+            specifiers.push({ specifier: node.arguments[0].text, guarded: isTryGuarded(node) });
           } else if (bindBare) {
-            bareSpecifiers.push({ specifier: node.arguments[0].text, commonJs: true });
+            bareSpecifiers.push({ specifier: node.arguments[0].text, commonJs: true, guarded: isTryGuarded(node) });
           }
         }
       } else if (strict && ts.isIdentifier(node) && (node.text === "eval" || node.text === "Function")) {
@@ -767,20 +936,51 @@ function checkGraph(entryFiles, label, { strict = true, bindBare = false } = {})
       ts.forEachChild(node, visit);
     }
     visit(sourceFile);
-    for (const specifier of specifiers) {
+    for (const { specifier, guarded } of specifiers) {
       imports += 1;
       const dependency = resolveImport(file, specifier);
-      if (!dependency) failures.push(`${relativeToRoot(file)} -> ${specifier}`);
-      else if (/\.(?:cjs|js|mjs|ts)$/.test(dependency)) queue.push(dependency);
+      if (dependency) {
+        if (/\.(?:cjs|js|mjs|ts)$/.test(dependency)) queue.push(dependency);
+        continue;
+      }
+      // A relative target cannot leave the artifact (assertInsideRoot refuses escapes), so its
+      // absence is a runtime-integrity signal, not a parent-directory edge. In the non-strict
+      // package entry graph a load the author wrapped in try/catch (platform-specific native
+      // binaries, WASI fallbacks) is a declared optional; everywhere else it is a missing edge.
+      if (!strict && guarded) {
+        optionalAbsent += 1;
+        continue;
+      }
+      failures.push(`${relativeToRoot(file)} -> ${specifier}`);
     }
-    for (const { specifier, commonJs } of bareSpecifiers) {
+    primeBareResolutions(file, bareSpecifiers);
+    for (const { specifier, commonJs, guarded } of bareSpecifiers) {
       imports += 1;
       const resolution = resolveBareSpecifier(file, specifier, commonJs);
-      if (resolution.error) failures.push(`${relativeToRoot(file)} -> ${specifier} ${resolution.error}`);
+      if (!resolution.error) {
+        // Bind AND traverse: a file reached through a bare edge (a deep subpath of a legacy package
+        // without an exports map, for instance) has its own bare imports, and they are only closed
+        // if it is walked like any other reachable module.
+        if (resolution.path && /\.(?:cjs|js|mjs|ts)$/.test(resolution.path)) queue.push(resolution.path);
+        continue;
+      }
+      // An edge that resolves anywhere but inside the artifact is the hostile-parent case and is
+      // refused regardless of how the importing package describes it. An edge that resolves
+      // nowhere is tolerated only when the importing package declares it optional, by manifest
+      // (optionalDependencies, peerDependenciesMeta.optional) or by guarding the load with
+      // try/catch; an undeclared, unguarded, absent dependency is a missing edge.
+      if (
+        resolution.error === "does not resolve"
+        && (guarded || isManifestOptionalEdge(file, specifier))
+      ) {
+        optionalAbsent += 1;
+        continue;
+      }
+      failures.push(`${relativeToRoot(file)} -> ${specifier} ${resolution.error}`);
     }
   }
   if (failures.length > 0) refuse(`${label} has ${failures.length} unverifiable dependency edge(s)`, failures);
-  return { files: visited.size, imports, paths: visited };
+  return { files: visited.size, imports, optionalAbsent, paths: visited };
 }
 
 const extensionsRoot = assertExactRealPath(join(root, "vinci", "extensions"), "vinci/extensions");
@@ -1097,19 +1297,29 @@ function requireAuthorityEntry(relativePath) {
 
 compareAuthorityDirectory(root);
 
-function collectConditionalTargets(value, label, targets) {
+function collectConditionalTargets(value, label, targets, nodeResolvable = true) {
   if (value === null) return;
   if (typeof value === "string") {
-    targets.push({ label, target: value });
+    targets.push({ label, target: value, nodeResolvable });
     return;
   }
   if (Array.isArray(value)) {
-    for (const [index, entry] of value.entries()) collectConditionalTargets(entry, `${label}[${index}]`, targets);
+    for (const [index, entry] of value.entries()) {
+      collectConditionalTargets(entry, `${label}[${index}]`, targets, nodeResolvable);
+    }
     return;
   }
   if (typeof value === "object") {
-    for (const [condition, entry] of Object.entries(value)) {
-      collectConditionalTargets(entry, `${label}.${condition}`, targets);
+    for (const [key, entry] of Object.entries(value)) {
+      // Keys starting with "." (exports subpaths) or "#" (imports specifiers) name entry points;
+      // every other key is a resolution condition that only applies when Node evaluates it.
+      const isCondition = !key.startsWith(".") && !key.startsWith("#");
+      collectConditionalTargets(
+        entry,
+        `${label}.${key}`,
+        targets,
+        nodeResolvable && (!isCondition || nodeDefaultConditions.has(key)),
+      );
     }
     return;
   }
@@ -1158,9 +1368,6 @@ function isExecutablePackageEntry(path) {
 function validatePackageManifest(manifestPath) {
   const relativeManifest = relativeToRoot(manifestPath);
   const packageRoot = dirname(manifestPath);
-  const isRuntimeWorkspace = /^packages\/(?:agent|ai|coding-agent|orchestrator|tui)\/package\.json$/.test(
-    relativeManifest,
-  );
   let manifest;
   try {
     manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -1187,17 +1394,13 @@ function validatePackageManifest(manifestPath) {
   if (manifest.imports !== undefined) collectConditionalTargets(manifest.imports, "imports", targets);
   if (manifest.exports !== undefined) collectConditionalTargets(manifest.exports, "exports", targets);
 
-  for (const { label, target, legacy = false, resolveLegacy = false } of targets) {
+  for (const { label, target, legacy = false, resolveLegacy = false, nodeResolvable = true } of targets) {
     if (!legacy && !target.startsWith("./")) {
       if (label.startsWith("imports")) {
         const resolution = resolveBareSpecifier(manifestPath, target, false);
         if (resolution.error) {
           authorityFailures.push(`${relativeManifest} ${label} external target ${target} ${resolution.error}`);
-        } else if (
-          isRuntimeWorkspace
-          && resolution.path
-          && isExecutablePackageEntry(resolution.path)
-        ) {
+        } else if (nodeResolvable && resolution.path && isExecutablePackageEntry(resolution.path)) {
           packageEntryFiles.add(resolution.path);
         }
         continue;
@@ -1219,11 +1422,7 @@ function validatePackageManifest(manifestPath) {
           targetPath,
           `${relativeManifest} ${label} wildcard target ${target}`,
         );
-        if (
-          isRuntimeWorkspace
-          && canonical !== null
-          && isExecutablePackageEntry(canonical)
-        ) {
+        if (nodeResolvable && canonical !== null && isExecutablePackageEntry(canonical)) {
           packageEntryFiles.add(join(root, ...canonical.split("/")));
         }
       }
@@ -1246,19 +1445,13 @@ function validatePackageManifest(manifestPath) {
       continue;
     }
     const canonical = containedCanonicalRelative(root, targetPath, `${relativeManifest} ${label} target ${target}`);
-    if (
-      isRuntimeWorkspace
-      && canonical !== null
-      && !lstatSync(join(root, ...canonical.split("/"))).isFile()
-    ) {
-      authorityFailures.push(`${relativeManifest} ${label} target ${target} is not a regular file`);
-      continue;
-    }
-    if (
-      isRuntimeWorkspace
-      && canonical !== null
-      && isExecutablePackageEntry(canonical)
-    ) {
+    // A target that exists but is not a regular file (a legacy folder mapping such as "./lib/",
+    // or an empty main) is not something Node's exports/imports resolution can load: folder
+    // mappings were removed in Node 17, and a legacy main directory has already been resolved to
+    // its concrete entry above. Nothing executable hides behind it, so it is neither traversed
+    // nor refused; a target escaping the artifact was refused by containedCanonicalRelative.
+    if (canonical === null || !lstatSync(join(root, ...canonical.split("/"))).isFile()) continue;
+    if (nodeResolvable && isExecutablePackageEntry(canonical)) {
       packageEntryFiles.add(join(root, ...canonical.split("/")));
     }
   }
@@ -1297,7 +1490,8 @@ console.log(
   `  ✓ packaged artifact: ${manifest.dispatches.length} manifest-driven launcher dispatches; `
   + `${dispatchGraph.files} dispatch files/${dispatchGraph.imports} imports and `
   + `${extensionGraph.files} extension files/${extensionGraph.imports} imports resolve inside the tarball; `
-  + `${packageEntryGraph.files} package entry files/${packageEntryGraph.imports} imports bind inside the tarball; `
+  + `${packageEntryGraph.files} package entry files/${packageEntryGraph.imports} imports bind inside the tarball `
+  + `(${packageEntryGraph.optionalAbsent} declared-optional edge(s) absent everywhere); `
   + `${authorityFiles} files/${authorityLinks} links match the closed executable authority; `
   + `${requiredAuthorityEntries} required entries close parent-directory dependency resolution`,
 );

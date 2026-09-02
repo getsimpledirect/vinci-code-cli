@@ -828,29 +828,35 @@ test("external package imports cannot resolve from a malicious parent node_modul
 	assert.match(reached.stdout, /PACKAGED_PACKAGE_EXECUTED/);
 });
 
+// Mutation that makes this test fail again: re-gating every `packageEntryFiles.add` in
+// validatePackageManifest on `const isRuntimeWorkspace = /^packages\/(?:agent|ai|coding-agent|orchestrator|tui)\/package\.json$/.test(relativeManifest)`
+// (commit 71ccb43e), which leaves node_modules/runtime existence-checked but never bare-import-bound.
+// The fixture is deliberately a NON-workspace package: 71ccb43e retargeted it to packages/coding-agent,
+// which kept the test green while every other shipped package went unbound.
 test("every declared package export binds bare imports to the artifact", () => {
 	const { outer, root } = nestedFixture();
 	write(
-		join(root, "packages", "coding-agent", "package.json"),
+		join(root, "node_modules", "runtime", "package.json"),
 		JSON.stringify({
-			name: "@earendil-works/pi-coding-agent",
+			name: "runtime",
 			type: "module",
-			main: "./dist/index.js",
-			exports: { ".": "./dist/index.js", "./rpc-entry": "./dist/rpc-entry.js" },
+			main: "./index.js",
+			exports: { ".": "./index.js", "./rpc-entry": { import: "./rpc-entry.js" } },
 		}),
 	);
-	write(join(root, "packages", "coding-agent", "dist", "index.js"), "export const runtime = true;\n");
+	write(join(root, "node_modules", "runtime", "index.js"), "export const runtime = true;\n");
 	write(
-		join(root, "packages", "coding-agent", "dist", "rpc-entry.js"),
+		join(root, "node_modules", "runtime", "rpc-entry.js"),
 		'import { marker } from "tsx";\nconsole.log(marker);\n',
 	);
-	authorize(root, "packages/coding-agent");
+	authorize(root, "node_modules/runtime");
 	write(
 		join(outer, "node_modules", "tsx", "package.json"),
 		JSON.stringify({ name: "tsx", type: "module", exports: "./index.js" }),
 	);
 	write(join(outer, "node_modules", "tsx", "index.js"), 'export const marker = "PARENT_TSX_EXECUTED";\n');
-	expectFailure(run(root), /coding-agent\/dist\/rpc-entry\.js -> tsx resolves outside the artifact root/);
+	expectFailure(run(root), /package entry graph has 1 unverifiable dependency edge/);
+	expectFailure(run(root), /runtime\/rpc-entry\.js -> tsx resolves outside the artifact root/);
 
 	write(
 		join(root, "node_modules", "tsx", "package.json"),
@@ -860,13 +866,247 @@ test("every declared package export binds bare imports to the artifact", () => {
 	authorize(root, "node_modules/tsx");
 	const restored = run(root);
 	assert.equal(restored.status, 0, restored.stderr);
-	const reached = spawnSync(process.execPath, [join(root, "packages", "coding-agent", "dist", "rpc-entry.js")], {
+	const reached = spawnSync(process.execPath, [join(root, "node_modules", "runtime", "rpc-entry.js")], {
 		cwd: outer,
 		encoding: "utf8",
 		timeout: 10_000,
 	});
 	assert.equal(reached.status, 0, reached.stderr);
 	assert.match(reached.stdout, /PACKAGED_TSX_EXECUTED/);
+});
+
+// The three hostile-parent loads from review msg_6322c5f8, in the shapes the real tarball ships:
+// debug/src/node.js try-requires supports-color (peerDependenciesMeta optional, reached through
+// main), and ws reaches lib/buffer-util.js and lib/validation.js through a conditional export whose
+// try-guarded requires name bufferutil and utf-8-validate. Declared-optional and try-guarded loads
+// are exactly the ones Node keeps searching parent directories for, so the checker must refuse them
+// the moment they resolve above the artifact root, and must keep certifying while they resolve nowhere.
+function addOptionalNativeConsumers(root) {
+	write(
+		join(root, "node_modules", "debug", "package.json"),
+		JSON.stringify({
+			name: "debug",
+			main: "./src/index.js",
+			peerDependenciesMeta: { "supports-color": { optional: true } },
+		}),
+	);
+	write(join(root, "node_modules", "debug", "src", "index.js"), 'module.exports = require("./node.js");\n');
+	write(
+		join(root, "node_modules", "debug", "src", "node.js"),
+		"exports.colors = [];\ntry {\n  const supportsColor = require('supports-color');\n  exports.colors = supportsColor.level;\n} catch (error) {}\n",
+	);
+	write(
+		join(root, "node_modules", "ws", "package.json"),
+		JSON.stringify({
+			name: "ws",
+			main: "index.js",
+			exports: { ".": { import: "./wrapper.mjs", require: "./index.js" }, "./package.json": "./package.json" },
+			peerDependencies: { bufferutil: "^4.0.1", "utf-8-validate": ">=5.0.2" },
+			peerDependenciesMeta: { bufferutil: { optional: true }, "utf-8-validate": { optional: true } },
+		}),
+	);
+	write(join(root, "node_modules", "ws", "wrapper.mjs"), 'import ws from "./index.js";\nexport default ws;\n');
+	write(
+		join(root, "node_modules", "ws", "index.js"),
+		"require('./lib/buffer-util');\nrequire('./lib/validation');\nmodule.exports = {};\n",
+	);
+	write(
+		join(root, "node_modules", "ws", "lib", "buffer-util.js"),
+		"if (!process.env.WS_NO_BUFFER_UTIL) {\n  try {\n    const bufferUtil = require('bufferutil');\n    module.exports.mask = bufferUtil.mask;\n  } catch (e) {}\n}\n",
+	);
+	write(
+		join(root, "node_modules", "ws", "lib", "validation.js"),
+		"try {\n  const isValidUTF8 = require('utf-8-validate');\n  module.exports.isValidUTF8 = isValidUTF8;\n} catch (e) {}\n",
+	);
+	authorize(root, "node_modules/debug");
+	authorize(root, "node_modules/ws");
+}
+
+function plantHostileParentPackages(outer, names, marker) {
+	for (const name of names) {
+		write(join(outer, "node_modules", name, "package.json"), JSON.stringify({ name, main: "index.js" }));
+		write(
+			join(outer, "node_modules", name, "index.js"),
+			`require("node:fs").appendFileSync(${JSON.stringify(marker)}, "HOSTILE_${name}\\n");\nmodule.exports = { level: 3, mask() {} };\n`,
+		);
+	}
+}
+
+test("optional native loads in shipped third-party packages refuse a hostile parent and certify while absent", () => {
+	const { outer, root } = nestedFixture();
+	addOptionalNativeConsumers(root);
+	const absent = run(root);
+	assert.equal(absent.status, 0, absent.stderr);
+	assert.match(absent.stdout, /3 declared-optional edge\(s\) absent everywhere/);
+
+	const marker = join(outer, "hostile-marker.txt");
+	plantHostileParentPackages(outer, ["supports-color", "bufferutil", "utf-8-validate"], marker);
+	const loaded = spawnSync(
+		process.execPath,
+		["-e", "require(process.argv[1]); require(process.argv[2]);", join(root, "node_modules", "debug"), join(root, "node_modules", "ws")],
+		{ cwd: outer, encoding: "utf8", timeout: 10_000 },
+	);
+	assert.equal(loaded.status, 0, loaded.stderr);
+	assert.match(readFileSync(marker, "utf8"), /HOSTILE_supports-color/);
+	assert.match(readFileSync(marker, "utf8"), /HOSTILE_bufferutil/);
+	assert.match(readFileSync(marker, "utf8"), /HOSTILE_utf-8-validate/);
+
+	const hijacked = run(root);
+	expectFailure(hijacked, /package entry graph has 3 unverifiable dependency edge\(s\)/);
+	assert.match(hijacked.stderr, /node_modules\/debug\/src\/node\.js -> supports-color resolves outside the artifact root/);
+	assert.match(hijacked.stderr, /node_modules\/ws\/lib\/buffer-util\.js -> bufferutil resolves outside the artifact root/);
+	assert.match(hijacked.stderr, /node_modules\/ws\/lib\/validation\.js -> utf-8-validate resolves outside the artifact root/);
+	assert.doesNotMatch(hijacked.stderr, /closed executable authority|required by the trusted package layout/);
+});
+
+test("an undeclared, unguarded, absent bare import in a third-party package is a missing edge", () => {
+	const root = fixture();
+	write(
+		join(root, "node_modules", "runtime", "package.json"),
+		JSON.stringify({ name: "runtime", type: "module", exports: "./index.js" }),
+	);
+	write(join(root, "node_modules", "runtime", "index.js"), 'import "review-absent-package";\n');
+	authorize(root, "node_modules/runtime");
+	expectFailure(run(root), /node_modules\/runtime\/index\.js -> review-absent-package does not resolve/);
+
+	// Declared optional by manifest: tolerated while absent everywhere.
+	write(
+		join(root, "node_modules", "runtime", "package.json"),
+		JSON.stringify({
+			name: "runtime",
+			type: "module",
+			exports: "./index.js",
+			peerDependenciesMeta: { "review-absent-package": { optional: true } },
+		}),
+	);
+	authorize(root, "node_modules/runtime/package.json");
+	const declared = run(root);
+	assert.equal(declared.status, 0, declared.stderr);
+	assert.match(declared.stdout, /1 declared-optional edge\(s\) absent everywhere/);
+
+	// Declared optional by code: a try-guarded load is tolerated while absent everywhere.
+	write(
+		join(root, "node_modules", "runtime", "package.json"),
+		JSON.stringify({ name: "runtime", exports: "./index.js" }),
+	);
+	write(
+		join(root, "node_modules", "runtime", "index.js"),
+		'let native = null;\ntry {\n  native = require("review-absent-package");\n} catch (error) {}\nmodule.exports = native;\n',
+	);
+	authorize(root, "node_modules/runtime");
+	const guarded = run(root);
+	assert.equal(guarded.status, 0, guarded.stderr);
+	assert.match(guarded.stdout, /1 declared-optional edge\(s\) absent everywhere/);
+
+	// A load in the catch clause is not guarded by that try.
+	write(
+		join(root, "node_modules", "runtime", "index.js"),
+		'try {\n  throw new Error("x");\n} catch (error) {\n  require("review-absent-package");\n}\n',
+	);
+	authorize(root, "node_modules/runtime/index.js");
+	expectFailure(run(root), /node_modules\/runtime\/index\.js -> review-absent-package does not resolve/);
+});
+
+test("wildcard exports, require, and dynamic import in third-party packages bind to the artifact", () => {
+	const { outer, root } = nestedFixture();
+	write(
+		join(root, "node_modules", "runtime", "package.json"),
+		JSON.stringify({
+			name: "runtime",
+			exports: { ".": "./index.js", "./lib/*": "./lib/*.js", "./esm": "./esm.mjs" },
+		}),
+	);
+	write(join(root, "node_modules", "runtime", "index.js"), "module.exports = {};\n");
+	write(join(root, "node_modules", "runtime", "lib", "evil.js"), 'const tsx = require("tsx");\nmodule.exports = tsx;\n');
+	write(join(root, "node_modules", "runtime", "esm.mjs"), 'export const load = () => import("tsx");\n');
+	authorize(root, "node_modules/runtime");
+	write(join(outer, "node_modules", "tsx", "package.json"), JSON.stringify({ name: "tsx", exports: "./index.js" }));
+	write(join(outer, "node_modules", "tsx", "index.js"), "module.exports = {};\n");
+	const result = run(root);
+	expectFailure(result, /package entry graph has 2 unverifiable dependency edge\(s\)/);
+	assert.match(result.stderr, /node_modules\/runtime\/lib\/evil\.js -> tsx resolves outside the artifact root/);
+	assert.match(result.stderr, /node_modules\/runtime\/esm\.mjs -> tsx resolves outside the artifact root/);
+});
+
+test("files reached through bare edges are traversed, so deep subpaths of legacy packages bind too", () => {
+	const { outer, root } = nestedFixture();
+	write(join(root, "node_modules", "legacy", "package.json"), JSON.stringify({ name: "legacy", main: "index.js" }));
+	write(join(root, "node_modules", "legacy", "index.js"), "module.exports = {};\n");
+	write(join(root, "node_modules", "legacy", "deep.js"), 'module.exports = require("tsx");\n');
+	write(
+		join(root, "node_modules", "consumer", "package.json"),
+		JSON.stringify({ name: "consumer", main: "index.js" }),
+	);
+	write(join(root, "node_modules", "consumer", "index.js"), 'module.exports = require("legacy/deep");\n');
+	authorize(root, "node_modules/legacy");
+	authorize(root, "node_modules/consumer");
+	write(join(outer, "node_modules", "tsx", "package.json"), JSON.stringify({ name: "tsx", exports: "./index.js" }));
+	write(join(outer, "node_modules", "tsx", "index.js"), "module.exports = {};\n");
+	expectFailure(run(root), /node_modules\/legacy\/deep\.js -> tsx resolves outside the artifact root/);
+});
+
+test("targets under conditions a plain node process never evaluates exist but are not traversed", () => {
+	const root = fixture();
+	write(
+		join(root, "node_modules", "runtime", "package.json"),
+		JSON.stringify({
+			name: "runtime",
+			type: "module",
+			exports: {
+				".": { source: "./src/index.ts", types: "./index.d.ts", default: "./index.js" },
+				"./*.js": { source: "./src/*.ts", default: "./esm/*.js" },
+			},
+		}),
+	);
+	write(join(root, "node_modules", "runtime", "index.js"), "export {};\n");
+	write(join(root, "node_modules", "runtime", "index.d.ts"), "export {};\n");
+	write(join(root, "node_modules", "runtime", "esm", "config.js"), "export {};\n");
+	// TypeScript source with an ESM-style ./config.js specifier that only a bundler maps to ./config.ts.
+	write(join(root, "node_modules", "runtime", "src", "index.ts"), 'import "./config.js";\n');
+	write(join(root, "node_modules", "runtime", "src", "config.ts"), "export {};\n");
+	authorize(root, "node_modules/runtime");
+	const result = run(root);
+	assert.equal(result.status, 0, result.stderr);
+
+	// A Node-evaluated condition nested under a custom one is still never reached by plain node.
+	write(
+		join(root, "node_modules", "runtime", "package.json"),
+		JSON.stringify({
+			name: "runtime",
+			type: "module",
+			exports: { ".": { source: { import: "./src/index.ts" }, default: "./index.js" } },
+		}),
+	);
+	authorize(root, "node_modules/runtime/package.json");
+	assert.equal(run(root).status, 0);
+
+	// A Node-evaluated condition path IS traversed.
+	write(
+		join(root, "node_modules", "runtime", "package.json"),
+		JSON.stringify({
+			name: "runtime",
+			type: "module",
+			exports: { ".": { node: { import: "./src/index.ts" }, default: "./index.js" } },
+		}),
+	);
+	authorize(root, "node_modules/runtime/package.json");
+	expectFailure(run(root), /node_modules\/runtime\/src\/index\.ts -> \.\/config\.js/);
+});
+
+test("a relative directory import resolves through the directory's package.json main", () => {
+	const root = fixture();
+	write(
+		join(root, "node_modules", "which", "package.json"),
+		JSON.stringify({ name: "which", main: "which.js", bin: { "node-which": "./bin/node-which" } }),
+	);
+	write(join(root, "node_modules", "which", "which.js"), 'module.exports = require("./lib/helper.js");\n');
+	write(join(root, "node_modules", "which", "bin", "node-which"), '#!/usr/bin/env node\nvar which = require("../");\n');
+	authorize(root, "node_modules/which");
+	expectFailure(run(root), /node_modules\/which\/which\.js -> \.\/lib\/helper\.js/);
+	write(join(root, "node_modules", "which", "lib", "helper.js"), "module.exports = {};\n");
+	authorize(root, "node_modules/which/lib/helper.js");
+	const restored = run(root);
+	assert.equal(restored.status, 0, restored.stderr);
 });
 
 test("wildcard workspace exports bind every concrete executable target", () => {
