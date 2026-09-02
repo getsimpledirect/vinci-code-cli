@@ -524,7 +524,34 @@ async function emitEconomics({
     return { summary, sha256: sha };
   } catch {
     // Never throw; return empty summary
-    return { summary: { schema: "vinci.work-order-economics-summary.v1", incomplete: ["malformed_entries"] }, sha256: "" };
+    // A crashed emitter must still be JOINABLE: without the key the ledger records
+    // boundary:missing_key -> REFUSED against nothing, and the attempt's spend leaves the
+    // denominator entirely (charter §8.1). Carry the identity and say the measurement failed.
+    // (projects-11, bus msg_9438fe86.)
+    const degraded = {
+      schema: "vinci.work-order-economics-summary.v1",
+      work_order_id: contractFields?.work_order_id ?? envelopeToUse?.ref ?? null,
+      attempt_label: `${taskId}/${attempt?.attempt ?? attempt ?? 0}`,
+      route: { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] },
+      assets_consumed: [],
+      compactions: 0,
+      human_interventions: [],
+      local_result: {
+        task_state: null, verification_state: null, changed_files: null,
+        head_sha: null, pr_number: null, limit_tripped: null, harness_stop: null,
+      },
+      lineage: { root_objective_id: null, backlog_row_id: null, parent_work_order_id: null },
+      execution_world_ref: null,
+      capacity_events: null,
+      decision_refs: [],
+      measurement_cost: null,
+      incomplete: ["malformed_entries", "lineage_unbound", "execution_world_missing",
+        "capacity_unobserved", "measurement_cost_unknown"],
+      cost_reconstruction: "none",
+    };
+    if (lease?.lease_id) degraded.lease_id = lease.lease_id;
+    if (typeof lease?.fencing_generation === "number") degraded.fencing_generation = lease.fencing_generation;
+    return { summary: degraded, sha256: economicsSha256(canonicalJson(degraded)) };
   }
 }
 

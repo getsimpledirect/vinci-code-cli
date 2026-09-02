@@ -3,7 +3,7 @@
 // worker-side guesses. Each test pairs a positive with the negative it discriminates.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readSessionState } from "../session-read.mjs";
@@ -128,7 +128,9 @@ test("crew-result entry alone also sets the flag; unrelated custom entries do no
 
 test("governed handoff: work_order_id comes from the contract, not envelope.ref", () => {
   const governed = buildEconomicsSummary({
-    task: { id: "msg_abc", envelope: { ref: undefined }, attempt: 1 },
+    // Deliberately DIFFERENT from any envelope.ref: a fixture where the two sources coincide
+    // cannot tell them apart and reads as coverage without being it (projects-11).
+    task: { id: "msg_abc", envelope: { ref: "bk_NOT_THE_ID" }, attempt: 1 },
     workOrderId: "bk_9f2c1d",
     sessionState: { path: "/s/x.jsonl", source: "outcome" },
     receipt: { verificationStatus: "passed" },
@@ -154,4 +156,14 @@ test("governed handoff: work_order_id comes from the contract, not envelope.ref"
     receipt: {},
   });
   assert.equal(prose.work_order_id, "bk_prose1");
+});
+
+test("degraded emit still carries the join key and a real digest", async () => {
+  // The emit helper's catch must not return an identity-less stub: without work_order_id the
+  // ledger refuses it as boundary:missing_key and the attempt's spend leaves the denominator.
+  const src = readFileSync(new URL("../worker.mjs", import.meta.url), "utf8");
+  const degraded = src.slice(src.indexOf("const degraded = {"), src.indexOf("return { summary: degraded"));
+  assert.match(degraded, /work_order_id: contractFields\?\.work_order_id \?\? envelopeToUse\?\.ref/);
+  assert.match(degraded, /"malformed_entries"/);
+  assert.ok(!/sha256: ""/.test(src.slice(src.indexOf("const degraded = {"))), "digest must be real, not empty");
 });
