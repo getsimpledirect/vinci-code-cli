@@ -472,10 +472,12 @@ async function emitEconomics({
   published,
   lifecycle,
   sessionState = null,
+  sessionId = null,
 }) {
   try {
-    // Build summary from session if available, else minimal
-    const session = sessionState || (stateDir ? readSessionState(join(stateDir, "sessions", taskId), taskId) : null);
+    // Build summary from the session when one exists. The session file is keyed by the attempt's
+    // sessionId (see the main path), never by the task id; without a sessionId there is no session.
+    const session = sessionState || (stateDir && sessionId ? readSessionState(join(stateDir, "sessions", taskId), sessionId) : null);
     const economicsInput = {
       task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt || attempt },
       attemptLabel: `${taskId}/${attempt.attempt || attempt}`,
@@ -1080,7 +1082,8 @@ async function processHandoff(
         const governor = acquired.leased ? "leased" : acquired.refused ? "refused" : "unavailable";
         const label = acquired.leased ? "Governor lease held elsewhere" : acquired.refused ? "Governor refused the lease" : "Governor lease unavailable";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
-        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
+        const econGov = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
+        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`, null, econGov.sha256), {
           inReplyTo: message.message_id,
           outcome: "BLOCKED",
         });
@@ -1125,8 +1128,9 @@ async function processHandoff(
         const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor }, lease: { ...lifecycle.snapshot().lease, ...lease } });
         await releaseLease("BLOCKED");
+        const econClaim = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
         // F8: on the digest path this post carries contract=<id>@<digest8> like every other.
-        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
+        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`, null, econClaim.sha256), {
           inReplyTo: message.message_id,
           outcome: "BLOCKED",
         });
@@ -1212,7 +1216,8 @@ async function processHandoff(
         const reason = `branch_lease_refused: ${acquired.reason}`;
         lifecycle.transition("BLOCKED", { outcome: { reason }, publish: "skipped", pr: null, fenced_out: reason });
         await releaseLease("BLOCKED");
-        await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null);
+        const econBranch = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
+        await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econBranch.sha256);
         return true;
       }
       branchLease = acquired.lease;
@@ -1231,7 +1236,8 @@ async function processHandoff(
       // release `abandoned` — a resumed attempt re-acquires.
       lifecycle.transition("BLOCKED", { outcome: { reason: authorityLost }, publish: "skipped", pr: null, fenced_out: authorityLost, lease: { ...lifecycle.snapshot().lease, ...lease } });
       await releaseLease("BLOCKED");
-      await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null);
+      const econLost = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
+      await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econLost.sha256);
       return true;
     }
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
@@ -1462,7 +1468,8 @@ async function processHandoff(
     if (typeof error?.blockedReason === "string") {
       lifecycle.transition("BLOCKED", { outcome: { reason: error.message } });
       await releaseLease("BLOCKED");
-      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `state=BLOCKED reason=${error.message}`), {
+      const econCheckout = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
+      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `state=BLOCKED reason=${error.message}`, null, econCheckout.sha256), {
         inReplyTo: message.message_id,
         outcome: "BLOCKED",
       });
@@ -1470,7 +1477,9 @@ async function processHandoff(
     }
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
     await releaseLease("FAILED");
-    await postFinal(bus, message, envelope, lifecycle.snapshot(), null);
+    // A session may already have run and spent here (exception after runVinci): read it.
+    const econFailed = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
+    await postFinal(bus, message, envelope, lifecycle.snapshot(), null, econFailed.sha256);
   }
   return true;
 }
