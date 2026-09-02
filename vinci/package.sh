@@ -41,12 +41,13 @@ tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude='node_modules/.bin' \
   --exclude='*.map' \
   --exclude='*.ts.map' \
+  --exclude='vinci/worker/README.md' \
   packages/agent/dist packages/agent/package.json \
   packages/ai/dist packages/ai/package.json \
   packages/coding-agent/dist packages/coding-agent/package.json \
   packages/orchestrator/dist packages/orchestrator/package.json \
   packages/tui/dist packages/tui/package.json \
-  vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater \
+  vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater vinci/worker \
   vinci/scripts/report-wrong.mjs vinci/identity.json vinci/NOTICE \
   package.json node_modules
 
