@@ -13,6 +13,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import ts from "typescript";
 
 function refuse(message, details = []) {
   console.error(`✗ packaged artifact: ${message}`);
@@ -121,8 +122,10 @@ for (const [index, entry] of manifest.dispatches.entries()) {
 
 const launcherPath = assertExactRealPath(join(root, "vinci", "bin", "vinci"), "launcher");
 if (!lstatSync(launcherPath).isFile()) refuse("launcher is not a regular file");
-const launcherLines = readFileSync(launcherPath, "utf8").split("\n");
+const launcherSource = readFileSync(launcherPath, "utf8");
+const launcherLines = launcherSource.split("\n");
 const seenMarkers = new Set();
+const reviewedDispatchLines = new Set();
 let pendingMarker = null;
 
 function expectedExec(entry) {
@@ -149,21 +152,142 @@ for (const [index, raw] of launcherLines.entries()) {
     }
     if (seenMarkers.has(pendingMarker)) refuse(`duplicate launcher dispatch marker ${pendingMarker}`);
     seenMarkers.add(pendingMarker);
+    reviewedDispatchLines.add(index + 1);
     pendingMarker = null;
     continue;
   }
-  // Reject every unmarked exec, regardless of whether it spells Node as `node`, `/usr/bin/node`,
-  // an environment variable, or a split/partial replacement. A new dispatch cannot silently fall
-  // outside discovery: it must be added to the manifest and use the canonical marked form.
-  if (containsExec) refuse("launcher contains an unmanifested exec", [`line ${index + 1}: ${line}`]);
+  // This quick check produces the clearest error for ordinary edits. The structural scan below is
+  // the authority and also catches shell-equivalent spellings such as e""xec.
+  if (containsExec) refuse("launcher contains an unmanifested executable dispatch", [`line ${index + 1}: ${line}`]);
 }
 if (pendingMarker) refuse(`dispatch marker ${pendingMarker} has no exec`);
 const missingMarkers = manifest.dispatches.filter((entry) => !seenMarkers.has(entry.command)).map((entry) => entry.command);
 if (missingMarkers.length > 0) refuse("dispatch manifest entries are not reachable from the launcher", missingMarkers);
 
-const STATIC_FROM = /(?:^|[;\n])\s*(?:import|export)\s+[^;]*?\sfrom\s+["'](\.[^"']+)["']/g;
-const SIDE_EFFECT_IMPORT = /(?:^|[;\n])\s*import\s+["'](\.[^"']+)["']/g;
-const DYNAMIC_LOAD = /\b(?:import|require)\s*\(|\bcreateRequire\b|\bModule\s*\.\s*_load\b/;
+// Tokenize shell words before looking for commands. Matching source text is insufficient here:
+// quotes can be concatenated inside one shell word (`e""xec`) and a dispatch can omit `exec`
+// entirely (`node "$VINCI/missing.mjs"; exit $?`). This intentionally recognizes only the shell
+// structure needed to prove executable dispatches. Unterminated quotes/escapes refuse rather than
+// producing a partial view.
+function scanShellCommands(source) {
+  const tokens = [];
+  let index = 0;
+  let line = 1;
+  let atWordBoundary = true;
+  const operators = [";;&", ";;", ";&", "&&", "||", "|&", "<<", ">>", "<&", ">&", ";", "&", "|", "(", ")", "{", "}", "<", ">"];
+
+  while (index < source.length) {
+    const char = source[index];
+    if (char === "\n") {
+      tokens.push({ type: "separator", value: "\n", line });
+      index += 1;
+      line += 1;
+      atWordBoundary = true;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      index += 1;
+      atWordBoundary = true;
+      continue;
+    }
+    if (char === "#" && atWordBoundary) {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      continue;
+    }
+    const operator = operators.find((candidate) => source.startsWith(candidate, index));
+    if (operator) {
+      tokens.push({ type: /^(?:;;&|;;|;&|&&|\|\||\|&|;|&|\||\(|\)|\{|\})$/.test(operator) ? "separator" : "operator", value: operator, line });
+      index += operator.length;
+      atWordBoundary = true;
+      continue;
+    }
+
+    const startLine = line;
+    let value = "";
+    while (index < source.length) {
+      const current = source[index];
+      if (current === "\n" || /[\t\r ]/.test(current) || operators.some((candidate) => source.startsWith(candidate, index))) break;
+      if (current === "\\") {
+        if (index + 1 >= source.length) refuse("launcher has an unterminated shell escape", [`line ${line}`]);
+        if (source[index + 1] === "\n") {
+          index += 2;
+          line += 1;
+        } else {
+          value += source[index + 1];
+          index += 2;
+        }
+        continue;
+      }
+      if (current === "'" || current === '"') {
+        const quote = current;
+        index += 1;
+        let closed = false;
+        while (index < source.length) {
+          const quoted = source[index];
+          if (quoted === quote) {
+            index += 1;
+            closed = true;
+            break;
+          }
+          if (quoted === "\n") line += 1;
+          if (quote === '"' && quoted === "\\" && index + 1 < source.length) {
+            const escaped = source[index + 1];
+            if ('"\\$`\n'.includes(escaped)) {
+              if (escaped === "\n") line += 1;
+              else value += escaped;
+              index += 2;
+              continue;
+            }
+          }
+          value += quoted;
+          index += 1;
+        }
+        if (!closed) refuse("launcher has an unterminated shell quote", [`line ${startLine}`]);
+        continue;
+      }
+      value += current;
+      index += 1;
+    }
+    tokens.push({ type: "word", value, line: startLine });
+    atWordBoundary = false;
+  }
+
+  const commands = [];
+  let words = [];
+  function finishCommand() {
+    if (words.length === 0) return;
+    const controlWords = new Set(["!", "if", "then", "elif", "else", "while", "until", "do"]);
+    let cursor = 0;
+    while (controlWords.has(words[cursor]?.value)) cursor += 1;
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[cursor]?.value ?? "")) cursor += 1;
+    if (words[cursor]) commands.push({ command: words[cursor].value, words: words.slice(cursor), line: words[cursor].line });
+    words = [];
+  }
+  for (const token of tokens) {
+    if (token.type === "separator") finishCommand();
+    else if (token.type === "word") words.push(token);
+  }
+  finishCommand();
+  return commands;
+}
+
+for (const command of scanShellCommands(launcherSource)) {
+  const hasVinciExecutable = command.words.some(({ value }) => (
+    /^(?:\$VINCI|\$\{VINCI\})\/.+\.(?:cjs|js|mjs|sh|ts)$/.test(value)
+  ));
+  const directlyRunsVinciExecutable = hasVinciExecutable && (
+    /(?:^|\/)node$/.test(command.command)
+    || command.command === "env"
+    || command.command === "command"
+    || (command.command.startsWith("$") && command.command !== "${PI[@]}")
+  );
+  const directlyRunsVac = command.command === "${_vinci_vac_cli}";
+  if ((command.command === "exec" || directlyRunsVinciExecutable || directlyRunsVac) && !reviewedDispatchLines.has(command.line)) {
+    refuse("launcher contains an unmanifested executable dispatch", [
+      `line ${command.line}: ${command.words.map(({ value }) => value).join(" ")}`,
+    ]);
+  }
+}
 
 function resolveImport(file, specifier) {
   const base = resolve(dirname(file), specifier);
@@ -173,10 +297,12 @@ function resolveImport(file, specifier) {
     `${base}.ts`,
     `${base}.js`,
     `${base}.mjs`,
+    `${base}.cjs`,
     `${base}.json`,
     join(base, "index.ts"),
     join(base, "index.js"),
     join(base, "index.mjs"),
+    join(base, "index.cjs"),
   ]) {
     if (!existsSync(candidate)) continue;
     assertExactRealPath(candidate, `${relativeToRoot(file)} import ${specifier}`);
@@ -196,19 +322,71 @@ function checkGraph(entryFiles, label) {
     if (visited.has(file)) continue;
     visited.add(file);
     const source = readFileSync(file, "utf8");
-    const codeWithoutComments = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
-    if (DYNAMIC_LOAD.test(codeWithoutComments)) {
-      failures.push(`${relativeToRoot(file)} uses dynamic/runtime module loading; the static artifact proof refuses it`);
+    if (source.includes("\uFFFD")) {
+      failures.push(`${relativeToRoot(file)} is not valid UTF-8`);
+      continue;
     }
-    const specifiers = [
-      ...codeWithoutComments.matchAll(STATIC_FROM),
-      ...codeWithoutComments.matchAll(SIDE_EFFECT_IMPORT),
-    ].map((match) => match[1]);
+    const extension = file.slice(file.lastIndexOf("."));
+    const sourceFile = ts.createSourceFile(
+      file,
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      extension === ".ts" ? ts.ScriptKind.TS : extension === ".cjs" ? ts.ScriptKind.JS : ts.ScriptKind.JS,
+    );
+    if ((sourceFile.parseDiagnostics ?? []).length > 0) {
+      failures.push(`${relativeToRoot(file)} has malformed executable module syntax`);
+      continue;
+    }
+    const specifiers = [];
+    function addModuleSpecifier(node, moduleSpecifier) {
+      if (!moduleSpecifier || !ts.isStringLiteralLike(moduleSpecifier)) {
+        failures.push(`${relativeToRoot(file)} uses a non-literal module specifier`);
+        return;
+      }
+      if (moduleSpecifier.text.startsWith(".")) specifiers.push(moduleSpecifier.text);
+    }
+    function visit(node) {
+      if (ts.isImportDeclaration(node) || (ts.isExportDeclaration(node) && node.moduleSpecifier)) {
+        addModuleSpecifier(node, node.moduleSpecifier);
+      } else if (ts.isImportEqualsDeclaration(node)) {
+        failures.push(`${relativeToRoot(file)} uses runtime import-equals loading; the static artifact proof refuses it`);
+      } else if (ts.isCallExpression(node)) {
+        if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+          failures.push(`${relativeToRoot(file)} uses dynamic/runtime module loading; the static artifact proof refuses it`);
+        } else if (ts.isIdentifier(node.expression) && node.expression.text === "require") {
+          if (node.arguments.length !== 1 || !ts.isStringLiteralLike(node.arguments[0])) {
+            failures.push(`${relativeToRoot(file)} uses dynamic/runtime module loading; the static artifact proof refuses it`);
+          } else if (node.arguments[0].text.startsWith(".")) {
+            specifiers.push(node.arguments[0].text);
+          }
+        } else if (ts.isIdentifier(node.expression) && (node.expression.text === "eval" || node.expression.text === "Function")) {
+          failures.push(`${relativeToRoot(file)} uses dynamic/runtime module loading; the static artifact proof refuses it`);
+        }
+      } else if (
+        ts.isIdentifier(node)
+        && (node.text === "require" || node.text === "createRequire")
+        && !(ts.isCallExpression(node.parent) && node.parent.expression === node && node.text === "require")
+      ) {
+        failures.push(`${relativeToRoot(file)} aliases a runtime module loader; the static artifact proof refuses it`);
+      } else if (
+        (ts.isPropertyAccessExpression(node) && ["require", "_load", "createRequire"].includes(node.name.text))
+        || (
+          ts.isElementAccessExpression(node)
+          && ts.isStringLiteralLike(node.argumentExpression)
+          && ["require", "_load", "createRequire"].includes(node.argumentExpression.text)
+        )
+      ) {
+        failures.push(`${relativeToRoot(file)} aliases a runtime module loader; the static artifact proof refuses it`);
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(sourceFile);
     for (const specifier of specifiers) {
       imports += 1;
       const dependency = resolveImport(file, specifier);
       if (!dependency) failures.push(`${relativeToRoot(file)} -> ${specifier}`);
-      else if (/\.(?:js|mjs|ts)$/.test(dependency)) queue.push(dependency);
+      else if (/\.(?:cjs|js|mjs|ts)$/.test(dependency)) queue.push(dependency);
     }
   }
   if (failures.length > 0) refuse(`${label} has ${failures.length} unverifiable dependency edge(s)`, failures);
@@ -225,7 +403,7 @@ function collectSources(directory) {
     if (stat.isSymbolicLink()) refuse("extension tree contains a symlink", [relativeToRoot(path)]);
     if (stat.isDirectory()) {
       if (entry !== "node_modules") collectSources(path);
-    } else if (/\.(?:ts|mjs|js)$/.test(entry)) {
+    } else if (/\.(?:ts|cjs|mjs|js)$/.test(entry)) {
       extensionEntries.push(path);
     }
   }

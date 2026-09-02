@@ -55,8 +55,9 @@ function fixture() {
   write(join(root, "vinci", "scripts", "report-wrong.mjs"), 'import "./report-helper.mjs";\n');
   write(join(root, "vinci", "scripts", "report-helper.mjs"), "export const ready = true;\n");
   write(join(root, "vinci", "worker", "worker.mjs"), 'import {\n  run,\n} from "./run.mjs";\nrun;\n');
-  write(join(root, "vinci", "worker", "run.mjs"), 'import "./contracts/digest.mjs";\nexport const run = true;\n');
-  write(join(root, "vinci", "worker", "contracts", "digest.mjs"), "export const digest = true;\n");
+  write(join(root, "vinci", "worker", "run.mjs"), 'import{ready}from"./contracts/load.cjs";\nexport const run = ready;\n');
+  write(join(root, "vinci", "worker", "contracts", "load.cjs"), 'const digest = require("./digest.cjs");\nmodule.exports = { ready: digest.ready };\n');
+  write(join(root, "vinci", "worker", "contracts", "digest.cjs"), "module.exports = { ready: true };\n");
   write(join(root, "vinci", "extensions", "entry.ts"), 'import "./side-effect.js";\n');
   write(join(root, "vinci", "extensions", "side-effect.js"), "export {};\n");
   return root;
@@ -80,7 +81,7 @@ test("positive control validates every manifest dispatch and recursive side-effe
   const result = run(root);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /3 manifest-bound launcher dispatches/);
-  assert.match(result.stdout, /5 dispatch files\/3 imports/);
+  assert.match(result.stdout, /6 dispatch files\/4 imports/);
 });
 
 test("old package behavior fails when the worker target is absent", () => {
@@ -91,8 +92,8 @@ test("old package behavior fails when the worker target is absent", () => {
 
 test("fault restoration fails when a transitive side-effect dependency is absent", () => {
   const root = fixture();
-  rmSync(join(root, "vinci", "worker", "contracts", "digest.mjs"));
-  expectFailure(run(root), /worker\/run\.mjs -> \.\/contracts\/digest\.mjs/);
+  rmSync(join(root, "vinci", "worker", "contracts", "digest.cjs"));
+  expectFailure(run(root), /worker\/contracts\/load\.cjs -> \.\/digest\.cjs/);
 });
 
 test("zero-target discovery is a refusal", () => {
@@ -132,7 +133,19 @@ test("absolute and alternate Node exec forms are rejected", () => {
 test("an unmarked extra exec cannot hide beside valid entries", () => {
   const root = fixture();
   write(join(root, "vinci", "bin", "vinci"), `${launcher}\nexec "$NODE" /tmp/extra.mjs\n`);
-  expectFailure(run(root), /unmanifested exec/);
+  expectFailure(run(root), /unmanifested executable dispatch/);
+});
+
+test("shell-equivalent exec spelling cannot bypass dispatch discovery", () => {
+  const root = fixture();
+  write(join(root, "vinci", "bin", "vinci"), `${launcher}\ne""xec node "\${VINCI}/missing.mjs" "$@"\n`);
+  expectFailure(run(root), /unmanifested executable dispatch/);
+});
+
+test("a non-exec Node dispatch cannot bypass dispatch discovery", () => {
+  const root = fixture();
+  write(join(root, "vinci", "bin", "vinci"), `${launcher}\nnode "\${VINCI}/missing.mjs"; exit $?\n`);
+  expectFailure(run(root), /unmanifested executable dispatch/);
 });
 
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
@@ -183,20 +196,42 @@ test("symlink targets and symlinked dependency edges refuse", () => {
   expectFailure(run(targetRoot), /must not traverse a symlink/);
 
   const dependencyRoot = fixture();
-  rmSync(join(dependencyRoot, "vinci", "worker", "contracts", "digest.mjs"));
+  rmSync(join(dependencyRoot, "vinci", "worker", "contracts", "digest.cjs"));
   symlinkSync(
     join(dependencyRoot, "vinci", "scripts", "report-helper.mjs"),
-    join(dependencyRoot, "vinci", "worker", "contracts", "digest.mjs"),
+    join(dependencyRoot, "vinci", "worker", "contracts", "digest.cjs"),
   );
   expectFailure(run(dependencyRoot), /must not traverse a symlink/);
 });
 
-test("dynamic import and require are explicitly rejected", () => {
-  for (const source of ['await import("./run.mjs");\n', 'require("./run.mjs");\n']) {
+test("dynamic import, computed require, and aliased require are explicitly rejected", () => {
+  for (const source of [
+    'await import("./run.mjs");\n',
+    'require("./" + process.env.MODULE);\n',
+    'const load = require; load("./missing.cjs");\n',
+    'const load = module["require"]; load("./missing.cjs");\n',
+    'eval(\'require("./missing.cjs")\');\n',
+  ]) {
     const root = fixture();
     write(join(root, "vinci", "worker", "worker.mjs"), source);
-    expectFailure(run(root), /uses dynamic\/runtime module loading/);
+    expectFailure(run(root), /dynamic\/runtime module loading|aliases a runtime module loader/);
   }
+});
+
+test("compact static imports and recursively traversed CommonJS imports fail on the missing edge", () => {
+  const esmRoot = fixture();
+  write(join(esmRoot, "vinci", "worker", "worker.mjs"), 'import{missing}from"./absent.mjs";\n');
+  expectFailure(run(esmRoot), /worker\/worker\.mjs -> \.\/absent\.mjs/);
+
+  const cjsRoot = fixture();
+  rmSync(join(cjsRoot, "vinci", "worker", "contracts", "digest.cjs"));
+  expectFailure(run(cjsRoot), /worker\/contracts\/load\.cjs -> \.\/digest\.cjs/);
+});
+
+test("malformed executable module syntax refuses instead of yielding a partial graph", () => {
+  const root = fixture();
+  write(join(root, "vinci", "worker", "worker.mjs"), 'import { from "./missing.mjs";\n');
+  expectFailure(run(root), /malformed executable module syntax/);
 });
 
 test("verification never executes packaged target code", () => {
