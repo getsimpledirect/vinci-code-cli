@@ -229,10 +229,10 @@ test("usage rollup: dedup by responseId", () => {
   };
   const summary = buildEconomicsSummary(input);
   assert.ok(summary.usage && summary.usage.length > 0, "should have usage entry");
-  // Both entries should be rolled up into one group (dedup by provider/model is natural, 
-  // but if same responseId appears twice, model_calls should not double-count)
+  // Both entries roll into one group (dedup by provider/model is natural). The same responseId
+  // appearing twice is one call, so model_calls must not double-count.
   const usage = summary.usage[0];
-  assert.equal(usage.model_calls, 2, "model_calls should sum both entries");
+  assert.equal(usage.model_calls, 1, "duplicate responseId should count once");
 });
 
 test("usage rollup: accumulation of tokens and cost", () => {
@@ -406,4 +406,57 @@ test("dedup mutation control: proof that dedup logic works", () => {
   const summary = buildEconomicsSummary(input);
   const usage = summary.usage[0];
   assert.equal(usage.model_calls, 2, "different responseIds should sum normally");
+});
+
+// ============================================================================
+// 13. DEDUP MUTATION CONTROL TEST (actually executed)
+// ============================================================================
+
+test("dedup by responseId: control test with fixture session entries", () => {
+  // This test verifies that two entries with the same responseId and same (provider, model)
+  // are counted as one call, not two. If this test fails after disabling dedup logic,
+  // it proves the dedup mechanism works.
+  const input = {
+    task: { id: "dedup_test", envelope: { ref: "job_dedup" }, attempt: 1 },
+    usageEntries: [
+      {
+        provider: "anthropic",
+        model: "claude-opus",
+        model_calls: 1,
+        responseId: "resp_same",
+        input_tokens: 1000,
+        output_tokens: 200,
+        cached_read_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+        cost_microusd: 100000,
+      },
+      {
+        provider: "anthropic",
+        model: "claude-opus",
+        model_calls: 1,
+        responseId: "resp_same", // SAME responseId
+        input_tokens: 1000,
+        output_tokens: 200,
+        cached_read_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+        cost_microusd: 100000,
+      },
+    ],
+  };
+  const summary = buildEconomicsSummary(input);
+  const usage = summary.usage[0];
+  
+  // ASSERTION: model_calls should be 2 (one from each entry), NOT 1
+  // If dedup by responseId is working, same responseId should only count once per id.
+  // But in our case, both entries have the same model_calls count (1 each), so they should sum to 2.
+  // The dedup in rollupUsage is "first write wins per responseId", so if we have two entries with
+  // same responseId, we keep the first one's model_calls (1) and ignore the second.
+  // Expected: model_calls === 1 (dedup working) or === 2 (dedup broken)
+  assert.equal(
+    usage.model_calls,
+    1,
+    "Two entries with same responseId should count as 1 call (dedup by responseId). If this assertion fails with value 2, dedup logic is broken."
+  );
 });
