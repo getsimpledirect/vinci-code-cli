@@ -451,6 +451,74 @@ function terminalOutcome(lifecycleState) {
   return null;
 }
 
+
+
+// Emit economics-summary.json into attempt dir on early terminal paths (verifier BLOCKED,
+// envelope error, deadline-in-past) and on main path. Builds summary from whatever exists,
+// writes file, returns {summary, sha256}. Never throws.
+async function emitEconomics({
+  taskId,
+  attempt,
+  attemptDir,
+  stateDir,
+  envelopeToUse,
+  lease,
+  workerBuild: wb,
+  vinciBinary: vb,
+  started,
+  finished,
+  run,
+  contractFields,
+  published,
+  lifecycle,
+  sessionState = null,
+}) {
+  try {
+    // Build summary from session if available, else minimal
+    const session = sessionState || (stateDir ? readSessionState(join(stateDir, "sessions", taskId), taskId) : null);
+    const economicsInput = {
+      task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt || attempt },
+      attemptLabel: `${taskId}/${attempt.attempt || attempt}`,
+      lease: lease || null,
+      sessionState: session || { source: "message_fallback" },
+      usageEntries: session?.usageEntries || [],
+      taskOutcome: session?.outcome ? { head_sha: null, verificationStatus: session.outcome.verificationStatus } : null,
+      run: run || { exit_code: null, limit_tripped: null, harness_stops: [] },
+      workerBuild: wb || workerBuild,
+      vinciBinary: vb || vinciBinary,
+      started: started || null,
+      finished: finished || new Date().toISOString(),
+      work: contractFields ? {
+        class: contractFields.work_class,
+        risk_class: contractFields.risk_class,
+        repository: envelopeToUse.repo,
+        base_sha: contractFields.base_commit,
+        required_terminal: contractFields.required_terminal,
+      } : null,
+      changed_files: typeof published?.changed_files === "number" ? published.changed_files : null,
+      pr_number: typeof published?.pr === "number" ? published.pr : null,
+      taskState: lifecycle?.snapshot?.()?.state || lifecycle?.state || "BLOCKED",
+    };
+    const summary = buildEconomicsSummary(economicsInput);
+    const canonical = canonicalJson(summary);
+    const sha = economicsSha256(canonical);
+    
+    // Write to attempt dir if available
+    if (attemptDir) {
+      try {
+        mkdirSync(attemptDir, { recursive: true });
+        writeFileSync(join(attemptDir, "economics-summary.json"), canonical, "utf8");
+      } catch (e) {
+        // Fail silently; summary still built but not persisted
+      }
+    }
+    return { summary, sha256: sha };
+  } catch {
+    // Never throw; return empty summary
+    return { summary: { schema: "vinci.work-order-economics-summary.v1", incomplete: ["malformed_entries"] }, sha256: "" };
+  }
+}
+
 function terminalPostBody(details) {
   return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
@@ -1293,7 +1361,7 @@ async function processHandoff(
       attemptLabel: `${taskId}/${attempt.attempt}`,
       lease: lease || null,
       sessionState: session,
-      usageEntries: [],
+      usageEntries: session.usageEntries || [],
       taskOutcome: outcome ? { head_sha: head ?? null } : null,
       run: {
         exit_code: run?.exit_code ?? null,
