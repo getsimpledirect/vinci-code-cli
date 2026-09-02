@@ -550,3 +550,27 @@ test("a model name over 512 bytes is malformed, not silently merged", () => {
   });
   assert.ok(summary.incomplete.includes("malformed_entries"));
 });
+
+
+// ============================================================================
+// 10. §8.3 REVISION-1 FIELDS
+// ============================================================================
+
+test("§8.3: nullable fields are present and every null carries its code", () => {
+  const summary = buildEconomicsSummary({
+    task: { id: "bk_row7", envelope: { ref: "bk_row7" }, attempt: 1 },
+    sessionState: { path: "/s/x.jsonl", source: "outcome" },
+    receipt: {},
+  });
+  assert.deepEqual(summary.lineage, { root_objective_id: null, backlog_row_id: "bk_row7", parent_work_order_id: null });
+  assert.equal(summary.execution_world_ref, null);
+  assert.equal(summary.capacity_events, null);
+  assert.deepEqual(summary.decision_refs, []);
+  assert.equal(summary.measurement_cost, null);
+  for (const code of ["lineage_unbound", "execution_world_missing", "capacity_unobserved", "measurement_cost_unknown"]) {
+    assert.ok(summary.incomplete.includes(code), code);
+  }
+  // A job_ ref is not a backlog row.
+  const job = buildEconomicsSummary({ task: { id: "job_1", envelope: { ref: "job_1" }, attempt: 1 }, sessionState: { path: "/s/x.jsonl", source: "outcome" }, receipt: {} });
+  assert.equal(job.lineage.backlog_row_id, null);
+});

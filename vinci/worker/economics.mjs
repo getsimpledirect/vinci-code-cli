@@ -255,6 +255,18 @@ export function buildEconomicsSummary(input = {}) {
     summary.compactions = 0;
     summary.human_interventions = [];
     summary.local_result = localResult;
+    // §8.3 (Revision 1) fields. Nullable; every null carries its closed code so the ledger can
+    // tell "unobserved" from "zero". A bk_ task ref is the backlog row; nothing else is bound yet.
+    const backlogRowId = taskRef && /^bk_[A-Za-z0-9._-]+$/.test(taskRef) ? taskRef : null;
+    summary.lineage = { root_objective_id: null, backlog_row_id: backlogRowId, parent_work_order_id: null };
+    incomplete.push("lineage_unbound");
+    summary.execution_world_ref = null;
+    incomplete.push("execution_world_missing");
+    summary.capacity_events = null;
+    incomplete.push("capacity_unobserved");
+    summary.decision_refs = [];
+    summary.measurement_cost = null;
+    incomplete.push("measurement_cost_unknown");
     if (incomplete.length > 0) summary.incomplete = incomplete;
     summary.cost_reconstruction = costReconstruction;
 

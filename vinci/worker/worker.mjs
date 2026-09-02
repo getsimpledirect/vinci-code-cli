@@ -488,7 +488,8 @@ async function emitEconomics({
       taskOutcome: null,
       receipt: session?.outcome ?? null,
       crewRan: session?.crewRan === true,
-      run: run || { exit_code: null, limit_tripped: null, harness_stops: [] },
+      // Early terminals have no run result; the lifecycle already recorded what tripped.
+      run: run || { exit_code: lifecycle?.snapshot?.()?.exit_code ?? null, limit_tripped: lifecycle?.snapshot?.()?.limit_tripped ?? null, harness_stops: [] },
       workerBuild: wb || workerBuild,
       vinciBinary: vb || vinciBinary,
       started: started || null,
