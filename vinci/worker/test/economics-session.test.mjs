@@ -100,7 +100,7 @@ test("receipt absent (killed session): killed_before_outcome, null verification_
 });
 
 test("receipt is the discriminator, not the worker-side run outcome", () => {
-  const state = { usageEntries: [], outcome: undefined, crewRan: false, source: "message_fallback" };
+  const state = { usageEntries: [], outcome: undefined, crewRan: false, source: "message_fallback", path: "/s/x.jsonl" };
   const withRunOutcome = buildEconomicsSummary(base(state, { taskOutcome: { head_sha: "abc" }, receipt: null }));
   assert.ok(withRunOutcome.incomplete.includes("killed_before_outcome"), "a run outcome without a receipt is still killed_before_outcome");
 });

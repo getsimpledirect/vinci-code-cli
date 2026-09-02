@@ -141,6 +141,9 @@ function usageEntryToRecord(entry) {
     output_tokens: numberOrZero(usage.outputTokens),
     reasoning_tokens: numberOrZero(usage.reasoningTokens),
     cost_microusd: Math.round(costUsd * 1_000_000),
+    // The accumulator persists estimatedCostUsd; nothing in the entry says the provider reported it.
+    cost_basis: "estimated",
+    cost_confidence: "estimated",
     responseId,
   };
 }

@@ -141,19 +141,28 @@ test("terminal state: limit_tripped", () => {
 test("terminal state: harness_stop", () => {
   const input = {
     task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
-    run: { harness_stops: [{ reason: "Vinci reserved the remaining actions" }] },
+    sessionState: { path: "/s/x.jsonl", source: "usage_entries" },
+    run: { harness_stops: [{ reason: "Vinci reserved the remaining actions: <tool output that must never reach the ledger>" }, { reason: "second" }] },
   };
   const summary = buildEconomicsSummary(input);
-  assert.equal(summary.local_result.harness_stop, "Vinci reserved the remaining actions");
+  // R3: the instrument's text is tool output; only a closed token and the count may be recorded.
+  assert.equal(summary.local_result.harness_stop, "instrument_stop:2");
+  assert.ok(!JSON.stringify(summary).includes("tool output"));
 });
 
 test("terminal state: killed_before_outcome", () => {
   const input = {
     task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
-    taskOutcome: null,
+    sessionState: { path: "/s/x.jsonl", source: "usage_entries" },
+    receipt: null,
   };
   const summary = buildEconomicsSummary(input);
   assert.ok(summary.incomplete.includes("killed_before_outcome"));
+  // Negative control: no session at all is no_session, not a kill.
+  const noSession = buildEconomicsSummary({ task: input.task, receipt: null });
+  assert.ok(!noSession.incomplete.includes("killed_before_outcome"));
+  assert.ok(noSession.incomplete.includes("no_session"));
+  assert.equal(noSession.cost_reconstruction, "none");
 });
 
 // ============================================================================
@@ -164,7 +173,7 @@ test("cost reconstruction: outcome fallback", () => {
   const input = {
     task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
     taskOutcome: { head_sha: "abc123" },
-    sessionState: { source: "outcome" },
+    sessionState: { path: "/s/x.jsonl", source: "outcome" },
   };
   const summary = buildEconomicsSummary(input);
   assert.equal(summary.cost_reconstruction, "outcome");
@@ -174,7 +183,7 @@ test("cost reconstruction: usage_entries fallback", () => {
   const input = {
     task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
     usageEntries: [{ provider: "anthropic", model: "claude-3", cost_microusd: 1000 }],
-    sessionState: { source: "usage_entries" },
+    sessionState: { path: "/s/x.jsonl", source: "usage_entries" },
   };
   const summary = buildEconomicsSummary(input);
   assert.equal(summary.cost_reconstruction, "usage_entries");
@@ -183,10 +192,15 @@ test("cost reconstruction: usage_entries fallback", () => {
 test("cost reconstruction: message_fallback", () => {
   const input = {
     task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
-    sessionState: { source: "message_fallback" },
+    sessionState: { path: "/s/x.jsonl", source: "message_fallback", costUsd: 0.25 },
   };
   const summary = buildEconomicsSummary(input);
   assert.equal(summary.cost_reconstruction, "message_fallback");
+  // The fallback figure is carried, not dropped, and its provenance is declared.
+  assert.equal(summary.usage.length, 1);
+  assert.equal(summary.usage[0].cost_microusd, 250000);
+  assert.equal(summary.usage[0].provider, "unknown");
+  assert.ok(summary.incomplete.includes("usage_persistence_failed"));
 });
 
 // ============================================================================
@@ -459,4 +473,80 @@ test("dedup by responseId: control test with fixture session entries", () => {
     1,
     "Two entries with same responseId should count as 1 call (dedup by responseId). If this assertion fails with value 2, dedup logic is broken."
   );
+});
+
+
+// ============================================================================
+// 9. REVIEW-FINDING TESTS (PR #49 review)
+// ============================================================================
+
+test("session_id comes from the caller, never from the session file name", () => {
+  const input = {
+    task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
+    sessionId: "bk_abc-session",
+    sessionState: { path: "/s/2026-09-02T18-00-00-000Z_bk_abc-session.jsonl", source: "outcome" },
+    receipt: { verificationStatus: "passed" },
+  };
+  assert.equal(buildEconomicsSummary(input).session_id, "bk_abc-session");
+  assert.equal(buildEconomicsSummary({ ...input, sessionId: undefined }).session_id, undefined);
+});
+
+test("receipt-only cost (no per-call entries) is carried as one estimated row", () => {
+  const input = {
+    task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
+    sessionState: { path: "/s/x.jsonl", source: "outcome", costUsd: 9.99 },
+    receipt: { verificationStatus: "passed", usage: { modelCalls: 11, inputTokens: 22407, outputTokens: 2081, cachedTokens: 44800, providers: ["vinci"], models: ["redacted/model"] } },
+    usageEntries: [],
+  };
+  const summary = buildEconomicsSummary(input);
+  assert.equal(summary.usage.length, 1);
+  const row = summary.usage[0];
+  assert.equal(row.cost_microusd, 9990000);
+  assert.equal(row.model_calls, 11);
+  assert.equal(row.cached_read_tokens, 44800);
+  assert.equal(row.provider, "vinci");
+  assert.equal(row.cost_confidence, "estimated");
+  assert.ok(summary.incomplete.includes("usage_persistence_failed"));
+  // Negative control: with per-call entries present no synthetic row is added.
+  const withEntries = buildEconomicsSummary({ ...input, usageEntries: [{ provider: "vinci", model: "m", model_calls: 1, cost_microusd: 5 }] });
+  assert.equal(withEntries.usage.length, 1);
+  assert.equal(withEntries.usage[0].cost_microusd, 5);
+  assert.ok(!(withEntries.incomplete ?? []).includes("usage_persistence_failed"));
+});
+
+test("cost_basis and cost_confidence default to estimated, never null", () => {
+  const summary = buildEconomicsSummary({
+    task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
+    sessionState: { path: "/s/x.jsonl", source: "usage_entries" },
+    receipt: {},
+    usageEntries: [{ provider: "a", model: "m", model_calls: 1, cost_microusd: 1 }],
+  });
+  assert.equal(summary.usage[0].cost_basis, "estimated");
+  assert.equal(summary.usage[0].cost_confidence, "estimated");
+});
+
+test("dedup is per response across rows: same responseKey under two models counts once", () => {
+  const summary = buildEconomicsSummary({
+    task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
+    sessionState: { path: "/s/x.jsonl", source: "usage_entries" },
+    receipt: {},
+    usageEntries: [
+      { provider: "a", model: "m1", model_calls: 1, input_tokens: 10, cost_microusd: 100, responseId: "r1" },
+      { provider: "a", model: "m2", model_calls: 1, input_tokens: 10, cost_microusd: 100, responseId: "r1" },
+      { provider: "a", model: "m2", model_calls: 1, input_tokens: 10, cost_microusd: 100 },
+    ],
+  });
+  const total = summary.usage.reduce((n, u) => n + u.model_calls, 0);
+  assert.equal(total, 2);
+  assert.equal(summary.usage.reduce((n, u) => n + u.cost_microusd, 0), 200);
+});
+
+test("a model name over 512 bytes is malformed, not silently merged", () => {
+  const summary = buildEconomicsSummary({
+    task: { id: "t1", envelope: { ref: "job_1" }, attempt: 1 },
+    sessionState: { path: "/s/x.jsonl", source: "usage_entries" },
+    receipt: {},
+    usageEntries: [{ provider: "a", model: "x".repeat(600), model_calls: 1, cost_microusd: 1 }],
+  });
+  assert.ok(summary.incomplete.includes("malformed_entries"));
 });

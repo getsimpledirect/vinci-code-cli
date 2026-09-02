@@ -482,7 +482,8 @@ async function emitEconomics({
       task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt || attempt },
       attemptLabel: `${taskId}/${attempt.attempt || attempt}`,
       lease: lease || null,
-      sessionState: session || { source: "message_fallback" },
+      sessionState: session,
+      sessionId,
       usageEntries: session?.usageEntries || [],
       taskOutcome: null,
       receipt: session?.outcome ?? null,
@@ -598,7 +599,7 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
     await bus.postTerminal(
       "status",
       subject,
-      terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`),
+      terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`, economicsSha),
       options,
     );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
@@ -608,10 +609,10 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
       ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
       : details;
     const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
-    await bus.postTerminal("status", subject, terminalPostBody(reason), options);
+    await bus.postTerminal("status", subject, terminalPostBody(reason, economicsSha), options);
   } else {
     const statusBody = state.outcome?.reason
-      ? terminalPostBody(`${details} reason=${state.outcome.reason}`)
+      ? terminalPostBody(`${details} reason=${state.outcome.reason}`, economicsSha)
       : body;
     // postTerminal, not post: this branch is reached for UNVERIFIED, which is a terminal and
     // must carry a type. Using the untyped post here was the one path that could still emit a
@@ -767,9 +768,10 @@ async function processHandoff(
         { workerBuild, serverBuild, vinciBinary },
       );
       lifecycle.transition("BLOCKED", { outcome: { reason } });
+      const econTriple = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: { ref: undefined }, lease: null, lifecycle, contractFields: null });
       // B7: a malformed post (the triple could not even be parsed) still carries `contract=malformed`;
       // a parsed triple whose registry answer refused carries the work_order_id@digest8 tag.
-      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(triple ?? null, `state=BLOCKED reason=${reason}`, "contract=malformed"), {
+      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(triple ?? null, `state=BLOCKED reason=${reason}`, "contract=malformed", econTriple.sha256), {
         inReplyTo: message.message_id,
         outcome: "BLOCKED",
       });
@@ -1380,6 +1382,7 @@ async function processHandoff(
       sessionState: session,
       usageEntries: session.usageEntries || [],
       taskOutcome: { head_sha: head ?? null },
+      sessionId: attempt.sessionId ?? null,
       receipt: session.outcome ?? null,
       crewRan: session.crewRan === true,
       run: {
@@ -1407,6 +1410,13 @@ async function processHandoff(
     const economicsSha = economicsSha256(economicsCanonical);
     extraFiles["economics-summary.json"] = economicsCanonical;
     resultJson.economics_sha256 = economicsSha;
+    // Local copy beside the attempt: a box without VINCI_EVIDENCE_URI_PREFIX uploads nothing, and
+    // the runs that actually spent must not be the only ones that leave no file behind.
+    try {
+      if (repository?.attemptDir) writeFileSync(join(repository.attemptDir, "economics-summary.json"), economicsCanonical, "utf8");
+    } catch {
+      // the bundle copy is the primary; a failed local write is not a terminal failure
+    }
     const evidenceResult = await uploadEvidence({
       sessionJsonl,
       gitDiff,

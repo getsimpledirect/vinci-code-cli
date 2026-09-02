@@ -52,6 +52,8 @@ function str(value) {
 
 function rollupUsage(entries, flags) {
   const rollup = new Map();
+  // One provider response is one response regardless of which (provider, model) row it lands in.
+  const seenResponseIds = new Set();
 
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") {
@@ -60,6 +62,7 @@ function rollupUsage(entries, flags) {
     }
     const provider = str(entry.provider);
     const model = str(entry.model);
+    if ((entry.provider != null && provider === null) || (entry.model != null && model === null)) flags.malformed = true;
     const key = `${provider}|${model}`;
     let group = rollup.get(key);
     if (!group) {
@@ -79,7 +82,6 @@ function rollupUsage(entries, flags) {
         // A responseId names one provider response. The accumulator persists an entry per call and
         // a killed session can replay the same response into two entries; the WHOLE duplicate is
         // skipped (calls, tokens and cost), otherwise cost double-counts while calls do not.
-        seen_response_ids: new Set(),
         cost_basis: null,
         cost_confidence: null,
       };
@@ -87,8 +89,8 @@ function rollupUsage(entries, flags) {
     }
 
     if (typeof entry.responseId === "string" && entry.responseId) {
-      if (group.seen_response_ids.has(entry.responseId)) continue;
-      group.seen_response_ids.add(entry.responseId);
+      if (seenResponseIds.has(entry.responseId)) continue;
+      seenResponseIds.add(entry.responseId);
     }
     if (typeof entry.model_calls === "number" && entry.model_calls > 0) group.model_calls += entry.model_calls;
     if (typeof entry.input_tokens === "number") group.input_tokens += entry.input_tokens;
@@ -117,8 +119,8 @@ function rollupUsage(entries, flags) {
       output_tokens: group.output_tokens,
       reasoning_tokens: group.reasoning_tokens,
       cost_microusd: group.cost_microusd,
-      cost_basis: group.cost_basis,
-      cost_confidence: group.cost_confidence,
+      cost_basis: group.cost_basis ?? "estimated",
+      cost_confidence: group.cost_confidence ?? "estimated",
     });
   }
   return result;
@@ -140,11 +142,9 @@ export function buildEconomicsSummary(input = {}) {
 
     const attemptLabel = str(input.attemptLabel) || (input?.task?.id && typeof input.task.attempt === "number" ? `${input.task.id}/${input.task.attempt}` : null);
 
-    let sessionId = null;
-    if (str(input?.sessionState?.path)) {
-      const parts = input.sessionState.path.split("/");
-      sessionId = parts[parts.length - 1] || null;
-    }
+    // The worker holds the real session id (attempt.sessionId); the session file name is
+    // `<timestamp>_<id>.jsonl` and is not the id.
+    const sessionId = str(input.sessionId);
 
     const workerBuild = typeof input.workerBuild === "object" && input.workerBuild !== null ? input.workerBuild : null;
     const workerBuildDigestValue = workerBuild ? str(workerBuild.commit) || str(workerBuild.digest) : null;
@@ -152,7 +152,9 @@ export function buildEconomicsSummary(input = {}) {
     const vinciBinary = typeof input.vinciBinary === "object" && input.vinciBinary !== null ? input.vinciBinary : null;
     const vinciVersion = vinciBinary ? str(vinciBinary.version) || str(vinciBinary.error) || "unknown" : "unknown";
 
-    const costReconstruction = str(input?.sessionState?.source) || "usage_entries";
+    const hasSession = Boolean(str(input?.sessionState?.path));
+    const costReconstruction = hasSession ? (str(input?.sessionState?.source) || "none") : "none";
+    if (!hasSession && !incomplete.includes("no_session")) incomplete.push("no_session");
 
     const startedAt = typeof input.started === "string" ? input.started : null;
     const finishedAt = typeof input.finished === "string" ? input.finished : null;
@@ -174,13 +176,39 @@ export function buildEconomicsSummary(input = {}) {
 
     const usageArray = Array.isArray(input.usageEntries) ? input.usageEntries : [];
     const usage = rollupUsage(usageArray, flags);
+    // No per-call entries survived but the session still knows what it spent (receipt total or
+    // assistant-message fallback): carry that figure as one estimated row rather than omitting
+    // usage[] and reading as zero spend. The entries' absence is itself reported.
+    const receiptForUsage = typeof input.receipt === "object" && input.receipt !== null ? input.receipt : null;
+    const sessionCostUsd = typeof input?.sessionState?.costUsd === "number" && Number.isFinite(input.sessionState.costUsd) ? input.sessionState.costUsd : 0;
+    if (usage.length === 0 && (sessionCostUsd > 0 || receiptForUsage?.usage)) {
+      const ru = receiptForUsage?.usage && typeof receiptForUsage.usage === "object" ? receiptForUsage.usage : {};
+      const n = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : 0);
+      usage.push({
+        phase: "UNPHASED",
+        cost_category: "unclassified",
+        provider: str(Array.isArray(ru.providers) ? ru.providers[0] : null) ?? "unknown",
+        model: str(Array.isArray(ru.models) ? ru.models[0] : null) ?? "unknown",
+        source: "api",
+        model_calls: n(ru.modelCalls),
+        input_tokens: n(ru.inputTokens),
+        cached_read_tokens: n(ru.cachedTokens),
+        cache_write_tokens: n(ru.cacheWriteTokens),
+        output_tokens: n(ru.outputTokens),
+        reasoning_tokens: n(ru.reasoningTokens),
+        cost_microusd: Math.round(sessionCostUsd * 1_000_000),
+        cost_basis: "estimated",
+        cost_confidence: "estimated",
+      });
+      if (!incomplete.includes("usage_persistence_failed")) incomplete.push("usage_persistence_failed");
+    }
 
     const taskOutcome = typeof input.taskOutcome === "object" && input.taskOutcome !== null ? input.taskOutcome : null;
     // `receipt` is the vinci-task-outcome entry the session wrote at its own terminal. Its absence
     // (SIGKILL, provider failure before the receipt) is what killed_before_outcome means; the
     // worker-side run outcome is not a substitute for it.
     const receipt = typeof input.receipt === "object" && input.receipt !== null ? input.receipt : null;
-    if (receipt === null && !incomplete.includes("killed_before_outcome")) incomplete.push("killed_before_outcome");
+    if (hasSession && receipt === null && !incomplete.includes("killed_before_outcome")) incomplete.push("killed_before_outcome");
     if (input.crewRan === true && !incomplete.includes("crew_unattributed")) incomplete.push("crew_unattributed");
 
     let headSha = null;
@@ -190,10 +218,9 @@ export function buildEconomicsSummary(input = {}) {
     const exitCode = run && typeof run.exit_code === "number" ? run.exit_code : null;
     const limitTripped = run && typeof run.limit_tripped === "string" ? run.limit_tripped : null;
     const harnessStops = Array.isArray(run?.harness_stops) ? run.harness_stops : [];
-    const harnessStop =
-      harnessStops.length > 0 && typeof harnessStops[0] === "object" && harnessStops[0] !== null && typeof harnessStops[0].reason === "string"
-        ? harnessStops[0].reason
-        : null;
+    // The stop reason is the blocked tool call's own text; R3 forbids tool output in the ledger,
+    // so the summary carries a closed token and the count, never the text.
+    const harnessStop = harnessStops.length > 0 ? `instrument_stop:${harnessStops.length}` : null;
 
     const taskState = str(input.taskState) || (typeof input.terminalState === "string" ? input.terminalState : null);
 
