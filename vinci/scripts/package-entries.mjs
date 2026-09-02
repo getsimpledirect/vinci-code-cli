@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { isFirstPartyTestPath } from "./first-party-test-paths.mjs";
 import { runtimePackageExcludes } from "./runtime-package-closure.mjs";
 
 const rootArgument = process.argv[2];
@@ -46,6 +47,10 @@ function belongsToExcludedPackage(relativePath) {
 }
 
 function excluded(relativePath) {
+	// First-party test paths are excluded as a class, not path by path: the release roots below are
+	// tarred wholesale, so a hardcoded per-directory exclusion would go stale the moment a test
+	// directory is added anywhere else under them. See first-party-test-paths.mjs.
+	if (isFirstPartyTestPath(relativePath)) return true;
 	if (
 		/\.map$/.test(relativePath)
 		|| relativePath === "vinci/worker/README.md"

@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { parse } from "unbash";
+import { isFirstPartyTestPath } from "../scripts/first-party-test-paths.mjs";
 import { runtimePackageExcludes } from "../scripts/runtime-package-closure.mjs";
 
 function refuse(message, details = []) {
@@ -1080,6 +1081,13 @@ function compareAuthorityDirectory(artifactDirectory, relativeDirectory = "") {
       authorityFailures.push(`${relativePath} is outside the calculated production release surface`);
       continue;
     }
+    // Reported in its own words rather than as a generic authority mismatch: a test path that
+    // reached the archive means the packaging rule regressed, which is a different repair from a
+    // byte that does not match the trusted tree.
+    if (isFirstPartyTestPath(relativePath)) {
+      authorityFailures.push(`${relativePath} is a first-party test path and must never enter the release archive`);
+      continue;
+    }
     if (belongsToExcludedPackage(relativePath)) {
       authorityFailures.push(`${relativePath} belongs to a package outside the production runtime closure`);
       continue;
@@ -1185,6 +1193,10 @@ function belongsToExcludedPackage(relativePath) {
 }
 
 function excludedFromReleaseAuthority(relativePath) {
+  // Mirrors package-entries.mjs through the same shared predicate, so the trusted release surface
+  // and the archive agree on what a first-party test path is. If only one side knew the rule, every
+  // artifact would fail as "required by the trusted package layout is missing".
+  if (isFirstPartyTestPath(relativePath)) return true;
   if (
     /\.map$/.test(relativePath)
     || relativePath === "vinci/worker/README.md"

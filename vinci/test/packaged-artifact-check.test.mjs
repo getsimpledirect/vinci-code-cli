@@ -357,6 +357,112 @@ test("authority-identical packages outside the production closure are rejected",
 	assert.equal(restored.status, 0, restored.stderr);
 });
 
+// vinci/package.sh promises "tests, docs, infrastructure state, and release tooling must never
+// enter the public archive", but the archive tars first-party directories wholesale and the only
+// test-shaped exclusion was a hardcoded node_modules/ssh2/test. These two tests pin the class rule
+// on BOTH sides of it: the producer that writes tar's entry list, and the verifier that defines the
+// trusted release surface.
+//
+// Each test is discriminated by its OWN mechanism's line; the two are separate code paths and one
+// mutation does not fail both.
+//   "no first-party test path enters the packaged entry list" — in package-entries.mjs excluded(),
+//   replace `if (isFirstPartyTestPath(relativePath)) return true;` with the per-path enumeration
+//   `if (relativePath === "vinci/worker/test") return true;`.
+//   "a first-party test path that reaches the artifact refuses by name" — in
+//   packaged-artifact-check.mjs compareAuthorityDirectory(), replace
+//   `if (isFirstPartyTestPath(relativePath)) {` with `if (relativePath === "vinci/worker/test") {`.
+// Either way the test paths under every other release root pass again while the exclusion still
+// reads as closed. (Mutating only excludedFromReleaseAuthority does NOT fail the second test: the
+// artifact-direction refusal above is a different guard, which is why both are pinned.)
+function packageEntriesFixture() {
+	const base = mkdtempSync(join(tmpdir(), "vinci-package-entries-"));
+	fixtureRoots.push(base);
+	write(join(base, "package.json"), JSON.stringify({ type: "module" }));
+	write(join(base, "vinci", "identity.json"), JSON.stringify({ productName: "Vinci Code", command: "vinci" }));
+	write(join(base, "vinci", "dispatch-manifest.json"), JSON.stringify(manifest));
+	write(join(base, "vinci", "bin", "vinci"), launcher);
+	write(join(base, "vinci", "scripts", "resolve-dispatch.mjs"), resolverSource);
+	write(join(base, "vinci", "scripts", "report-wrong.mjs"), "export {};\n");
+	write(join(base, "vinci", "worker", "worker.mjs"), "export {};\n");
+	write(join(base, "vinci", "extensions", "entry.ts"), "export {};\n");
+	addClosedRuntimeLayout(base);
+	return base;
+}
+
+function packageEntries(base) {
+	const result = spawnSync(
+		process.execPath,
+		[fileURLToPath(new URL("../scripts/package-entries.mjs", import.meta.url)), base],
+		{ encoding: "utf8", timeout: 30_000 },
+	);
+	assert.equal(result.status, 0, result.stdout + result.stderr);
+	return result.stdout.split("\n").filter((line) => line !== "");
+}
+
+test("no first-party test path enters the packaged entry list, under any release root", () => {
+	const base = packageEntriesFixture();
+	const shipped = [
+		["vinci", "worker", "worker.mjs"],
+		["vinci", "extensions", "entry.ts"],
+		["packages", "ai", "dist", "index.js"],
+	];
+	// One per convention the repository could plausibly use, each under a DIFFERENT release root,
+	// and none of them named in any exclusion list.
+	const testPaths = [
+		["vinci", "worker", "test", "worker.test.mjs"],
+		["vinci", "updater", "__tests__", "update.mjs"],
+		["vinci", "extensions", "tests", "entry.ts"],
+		["vinci", "themes", "spec", "theme.mjs"],
+		["packages", "ai", "dist", "index.test.js"],
+		["packages", "tui", "dist", "__mocks__", "terminal.js"],
+	];
+	for (const segments of testPaths) write(join(base, ...segments), "export {};\n");
+	const entries = packageEntries(base);
+	for (const segments of testPaths) {
+		assert.equal(entries.includes(segments.join("/")), false, `${segments.join("/")} must not be packaged`);
+	}
+	// A dependency's own test directory is NOT first-party: pruning inside node_modules would change
+	// which bytes of a third-party package the artifact carries, and is governed by the runtime
+	// package closure instead.
+	write(join(base, "node_modules", "runtime", "test", "runtime.test.js"), "export {};\n");
+	assert.equal(packageEntries(base).includes("node_modules/runtime/test/runtime.test.js"), true);
+	// Positive control: the runtime files beside those test paths still ship, and names that merely
+	// contain the word are untouched.
+	for (const segments of shipped) assert.equal(entries.includes(segments.join("/")), true, segments.join("/"));
+	write(join(base, "vinci", "worker", "latest.mjs"), "export {};\n");
+	write(join(base, "vinci", "worker", "contest", "run.mjs"), "export {};\n");
+	const withLookalikes = packageEntries(base);
+	assert.equal(withLookalikes.includes("vinci/worker/latest.mjs"), true);
+	assert.equal(withLookalikes.includes("vinci/worker/contest/run.mjs"), true);
+});
+
+test("a first-party test path that reaches the artifact refuses by name", () => {
+	// A test DIRECTORY is refused at the directory itself: the authority walk stops there, so the
+	// files beneath it are never reached and never named.
+	const root = fixture();
+	write(join(root, "vinci", "worker", "test", "worker.test.mjs"), "export {};\n");
+	expectFailure(
+		run(root),
+		/vinci\/worker\/test is a first-party test path and must never enter the release archive/,
+	);
+	// Positive control through the same entry point: without it the artifact certifies, so the
+	// refusal above is this rule and not an unrelated authority mismatch.
+	rmSync(join(root, "vinci", "worker", "test"), { recursive: true });
+	assert.equal(run(root).status, 0);
+
+	// The file-shaped half of the rule: a test file sitting directly in a shipped directory, with no
+	// test directory anywhere above it, is refused by its own name.
+	const fileRoot = fixture();
+	write(join(fileRoot, "vinci", "worker", "worker.test.mjs"), "export {};\n");
+	expectFailure(
+		run(fileRoot),
+		/vinci\/worker\/worker\.test\.mjs is a first-party test path and must never enter the release archive/,
+	);
+	rmSync(join(fileRoot, "vinci", "worker", "worker.test.mjs"));
+	const restored = run(fileRoot);
+	assert.equal(restored.status, 0, restored.stderr);
+});
+
 test("the reviewed maintenance helper is packaged, traversed, and fault-restorable", () => {
 	const root = fixture();
 	const helperPath = join(root, "vinci", "scripts", "reap-heal-temp.mjs");
