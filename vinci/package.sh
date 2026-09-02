@@ -21,8 +21,9 @@ bash "${ROOT}/vinci/build.sh" >/dev/null
 echo "  ✓ built"
 
 echo "── Packaging → ${TGZ} ─────────────────────────────"
-# A shared development checkout can contain unrelated top-level packages left by local experiments.
-# Exclude anything npm identifies as extraneous so the release follows the reviewed dependency graph.
+# Package only the transitive production dependency closure of the five shipped workspaces. This
+# removes development CLIs and test runners as whole graphs, along with unrelated local packages,
+# so no shipped entry point can depend on one of the explicit development-tool exclusions below.
 node "${ROOT}/vinci/scripts/package-excludes.mjs" "${ROOT}" > "${EXCLUDES}"
 
 # Tar straight from the repo root so paths extract as packages/… + vinci/ + node_modules (the launcher

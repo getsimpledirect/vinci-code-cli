@@ -21,7 +21,9 @@ import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti/static";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const root = resolve(here, "../..");
+// Review-only override: run the current behavioral assertions against an exact historical checkout
+// without editing that checkout. Normal harness and CI runs always use this file's own repository.
+const root = process.env.VINCI_TEST_PRODUCT_ROOT ? resolve(process.env.VINCI_TEST_PRODUCT_ROOT) : resolve(here, "../..");
 let pass = 0;
 const ok = (name, cond, detail = "") => {
   assert.ok(cond, `${name}${detail ? ` — ${detail}` : ""}`);
@@ -48,8 +50,8 @@ const stubDir = join(stage, "stub-bin");
 mkdirSync(stubDir);
 writeFileSync(
   join(stubDir, "pi"),
-  '#!/usr/bin/env bash\nprintf "BASE=%s\\nPLATFORM=%s\\nAGENT_DIR=%s\\nPI_AGENT_DIR=%s\\nUPDATE=%s\\nENV=%s\\n" ' +
-    '"${VINCI_BASE_URL:-}" "${VINCI_PLATFORM_URL:-}" "${VINCI_CODING_AGENT_DIR:-}" "${PI_CODING_AGENT_DIR:-}" "${VINCI_UPDATE_DISABLED:-}" "${VINCI_ENV:-}"\n',
+  '#!/usr/bin/env bash\nprintf "BASE=%s\\nPLATFORM=%s\\nAGENT_DIR=%s\\nPI_AGENT_DIR=%s\\nUPDATE=%s\\nENV=%s\\nARGS=%s\\n" ' +
+    '"${VINCI_BASE_URL:-}" "${VINCI_PLATFORM_URL:-}" "${VINCI_CODING_AGENT_DIR:-}" "${PI_CODING_AGENT_DIR:-}" "${VINCI_UPDATE_DISABLED:-}" "${VINCI_ENV:-}" "$*"\n',
   { mode: 0o755 },
 );
 // The report-wrong dispatch execs this script directly — it must ALSO see the resolved
@@ -63,12 +65,17 @@ copyFileSync(
   join(root, "vinci", "scripts", "reap-heal-temp.mjs"),
   join(fakeRoot, "vinci", "scripts", "reap-heal-temp.mjs"),
 );
-copyFileSync(join(root, "vinci", "dispatch-manifest.json"), join(fakeRoot, "vinci", "dispatch-manifest.json"));
+const dispatchManifestPath = join(fakeRoot, "vinci", "dispatch-manifest.json");
+const dispatchManifestSource = readFileSync(join(root, "vinci", "dispatch-manifest.json"), "utf8");
+writeFileSync(dispatchManifestPath, dispatchManifestSource);
+copyFileSync(join(root, "vinci", "identity.json"), join(fakeRoot, "vinci", "identity.json"));
 writeFileSync(
   join(fakeRoot, "vinci", "scripts", "report-wrong.mjs"),
   'console.log(`RW_AGENT_DIR=${process.env.VINCI_CODING_AGENT_DIR ?? ""}`);\n' +
     'console.log(`RW_BASE=${process.env.VINCI_BASE_URL ?? ""}`);\n',
 );
+mkdirSync(join(fakeRoot, "vinci", "worker"), { recursive: true });
+writeFileSync(join(fakeRoot, "vinci", "worker", "worker.mjs"), 'console.log("WORKER_REACHED");\n');
 const scratchHome = join(stage, "home");
 mkdirSync(scratchHome);
 
@@ -166,6 +173,49 @@ ok(
     /Unknown VINCI_ENV: bogus/.test(reportWrongBogus.stderr) &&
     !reportWrongBogus.stdout.includes("RW_AGENT_DIR"),
   `status=${reportWrongBogus.status} ${reportWrongBogus.stderr}`,
+);
+
+// A manifest is mandatory for packaged subcommands, but it is not part of Pi's ordinary invocation
+// contract. This is intentionally exercised through the real launcher: the pre-fix broad dispatch
+// predicate exits 65 on the first prompt-word assertion when this current test is run against it.
+for (const manifestState of ["missing", "malformed"]) {
+  if (manifestState === "missing") rmSync(dispatchManifestPath);
+  else writeFileSync(dispatchManifestPath, "{");
+
+  const prompt = runLauncher({}, ["explain", "this"]);
+  ok(
+    `an ordinary prompt reaches Pi with a ${manifestState} dispatch manifest`,
+    prompt.status === 0 && prompt.report.ARGS?.endsWith("explain this"),
+    `status=${prompt.status} ${prompt.stdout}${prompt.stderr}`,
+  );
+  const bare = runLauncher();
+  ok(
+    `a bare launch reaches Pi with a ${manifestState} dispatch manifest`,
+    bare.status === 0 && typeof bare.report.ARGS === "string",
+    `status=${bare.status} ${bare.stdout}${bare.stderr}`,
+  );
+  const version = runLauncher({}, ["--version"]);
+  ok(
+    `--version remains reachable with a ${manifestState} dispatch manifest`,
+    version.status === 0 && version.stdout.trim() === "0.0.51",
+    `status=${version.status} ${version.stdout}${version.stderr}`,
+  );
+  for (const command of ["report-wrong", "worker"]) {
+    const packaged = runLauncher({}, [command]);
+    ok(
+      `${command} refuses a ${manifestState} dispatch manifest`,
+      packaged.status === 65 && /invalid dispatch manifest/.test(packaged.stderr),
+      `status=${packaged.status} ${packaged.stdout}${packaged.stderr}`,
+    );
+  }
+  writeFileSync(dispatchManifestPath, dispatchManifestSource);
+}
+
+const worker = runLauncher({}, ["worker"]);
+ok(
+  "the recognized worker command still dispatches through the healthy manifest",
+  worker.status === 0 && worker.stdout.includes("WORKER_REACHED"),
+  `status=${worker.status} ${worker.stdout}${worker.stderr}`,
 );
 
 const bogus = runLauncher({ VINCI_ENV: "bogus" });

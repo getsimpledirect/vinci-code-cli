@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { parse } from "unbash";
+import { runtimePackageExcludes } from "../scripts/runtime-package-closure.mjs";
 
 function refuse(message, details = []) {
   console.error(`✗ packaged artifact: ${message}`);
@@ -104,6 +105,7 @@ if (
 
 const commands = new Set();
 const nodeTargets = [];
+const requiredDispatchCommands = ["report-wrong", "worker"];
 for (const [index, entry] of manifest.dispatches.entries()) {
   const label = `dispatches[${index}]`;
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) refuse(`${label} must be an object`);
@@ -124,6 +126,15 @@ for (const [index, entry] of manifest.dispatches.entries()) {
   }
   nodeTargets.push(entry);
 }
+const manifestCommands = [...commands].sort();
+if (
+  manifestCommands.length !== requiredDispatchCommands.length
+  || manifestCommands.some((command, index) => command !== requiredDispatchCommands[index])
+) {
+  refuse("dispatch manifest command set differs from the reviewed launcher gate", [
+    `expected ${requiredDispatchCommands.join(", ")}; found ${manifestCommands.join(", ") || "none"}`,
+  ]);
+}
 
 const launcherPath = assertExactRealPath(join(root, "vinci", "bin", "vinci"), "launcher");
 if (!lstatSync(launcherPath).isFile()) refuse("launcher is not a regular file");
@@ -131,6 +142,7 @@ const launcherSource = readFileSync(launcherPath, "utf8");
 const shell = parse(launcherSource);
 const shellCommands = [];
 const shellAssignments = [];
+const shellCases = [];
 const shellErrors = [];
 const visitedShellNodes = new WeakSet();
 function walkShell(value) {
@@ -139,6 +151,7 @@ function walkShell(value) {
   if (value.type === "Script" && Array.isArray(value.errors)) shellErrors.push(...value.errors);
   if (value.type === "Command") shellCommands.push(value);
   if (value.type === "Assignment") shellAssignments.push(value);
+  if (value.type === "Case") shellCases.push(value);
   if ("parts" in value && Array.isArray(value.parts)) {
     for (const part of value.parts) walkShell(part);
   }
@@ -243,6 +256,30 @@ let profileSources = 0;
 let profileEvals = 0;
 function wordsEqual(words, expected) {
   return words.length === expected.length && words.every((word, index) => word?.value === expected[index]);
+}
+const dispatchGateCases = shellCases.filter((candidate) => {
+  if (candidate.word?.value !== "${1:-}" || candidate.items?.length !== 1) return false;
+  const item = candidate.items[0];
+  const patterns = (item.pattern ?? []).map((pattern) => pattern.value).sort();
+  if (
+    patterns.length !== requiredDispatchCommands.length
+    || patterns.some((pattern, index) => pattern !== requiredDispatchCommands[index])
+  ) return false;
+  return shellCommands.some((command) => (
+    command.pos >= item.body.pos
+    && command.end <= item.body.end
+    && command.name?.value === "node"
+    && wordsEqual(command.suffix, [
+      "${VINCI}/scripts/resolve-dispatch.mjs",
+      "${VINCI}/dispatch-manifest.json",
+      "$1",
+    ])
+  ));
+});
+if (dispatchGateCases.length !== 1) {
+  refuse("launcher must gate manifest resolution on exactly the reviewed packaged commands", [
+    requiredDispatchCommands.join(", "),
+  ]);
 }
 for (const command of shellCommands) {
   const name = command.name?.value;
@@ -606,6 +643,33 @@ const authorityFailures = [];
 let authorityFiles = 0;
 let authorityLinks = 0;
 let requiredAuthorityEntries = 0;
+const artifactPackageManifests = [];
+
+function containedCanonicalRelative(base, path, label) {
+  let canonical;
+  try {
+    canonical = realpathSync(path);
+  } catch (error) {
+    authorityFailures.push(`${label} has no resolvable canonical target: ${error.message}`);
+    return null;
+  }
+  const rel = relative(base, canonical);
+  if (rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))) {
+    return rel.split(sep).join("/");
+  }
+  authorityFailures.push(`${label} resolves outside its root`);
+  return null;
+}
+
+function isPackageRootManifest(relativePath) {
+  if (relativePath === "package.json" || /^packages\/[^/]+\/package\.json$/.test(relativePath)) return true;
+  const parts = relativePath.split("/");
+  const nodeModules = parts.lastIndexOf("node_modules");
+  if (nodeModules === -1 || parts.at(-1) !== "package.json") return false;
+  const packageParts = parts.slice(nodeModules + 1, -1);
+  return packageParts.length === 1 || (packageParts.length === 2 && packageParts[0].startsWith("@"));
+}
+
 function compareAuthorityDirectory(artifactDirectory, relativeDirectory = "") {
   for (const entry of readdirSync(artifactDirectory).sort()) {
     const relativePath = relativeDirectory ? `${relativeDirectory}/${entry}` : entry;
@@ -627,12 +691,23 @@ function compareAuthorityDirectory(artifactDirectory, relativeDirectory = "") {
       authorityLinks += 1;
       if (!trustedStat.isSymbolicLink() || readlinkSync(artifactPath) !== readlinkSync(trustedPath)) {
         authorityFailures.push(`${relativePath} differs from the trusted executable authority`);
+      } else {
+        const artifactTarget = containedCanonicalRelative(root, artifactPath, `${relativePath} artifact symlink`);
+        const trustedTarget = containedCanonicalRelative(authorityRoot, trustedPath, `${relativePath} authority symlink`);
+        if (artifactTarget !== null && trustedTarget !== null && artifactTarget !== trustedTarget) {
+          authorityFailures.push(`${relativePath} symlink resolves to a different trusted path`);
+        }
       }
     } else if (artifactStat.isFile()) {
       authorityFiles += 1;
+      if (isPackageRootManifest(relativePath)) {
+        artifactPackageManifests.push(artifactPath);
+      }
       if (
         !trustedStat.isFile()
         || trustedStat.isSymbolicLink()
+        || artifactStat.nlink !== 1
+        || trustedStat.nlink !== 1
         || (artifactStat.mode & 0o111) !== (trustedStat.mode & 0o111)
         || artifactStat.size !== trustedStat.size
         || fileDigest(artifactPath) !== fileDigest(trustedPath)
@@ -686,27 +761,35 @@ const releaseAuthorityRoots = [
   "vinci/NOTICE",
 ];
 const packageLockPath = join(authorityRoot, "package-lock.json");
-const trustedLockPackages = lstatExists(packageLockPath)
-  ? new Set(Object.keys(JSON.parse(readFileSync(packageLockPath, "utf8")).packages ?? {}))
+const runtimePackageExclusions = lstatExists(packageLockPath)
+  ? new Set(runtimePackageExcludes(authorityRoot))
   : null;
 
-function topLevelNodePackage(relativePath) {
-  const parts = relativePath.split("/");
-  if (parts[0] !== "node_modules" || parts.length < 2 || parts[1].startsWith(".")) return null;
-  if (!parts[1].startsWith("@")) return parts.slice(0, 2).join("/");
-  return parts.length >= 3 ? parts.slice(0, 3).join("/") : null;
+function belongsToExcludedPackage(relativePath) {
+  if (runtimePackageExclusions === null) return false;
+  let cursor = relativePath;
+  while (cursor) {
+    if (runtimePackageExclusions.has(cursor)) return true;
+    const slash = cursor.lastIndexOf("/");
+    if (slash === -1) return false;
+    cursor = cursor.slice(0, slash);
+  }
+  return false;
 }
 
 function excludedFromReleaseAuthority(relativePath) {
-  if (/\.map$/.test(relativePath) || relativePath === "vinci/worker/README.md") return true;
+  if (
+    /\.map$/.test(relativePath)
+    || relativePath === "vinci/worker/README.md"
+    || relativePath === "node_modules/.package-lock.json"
+  ) return true;
   const nestedPath = `/${relativePath}`;
   if (
     /\/node_modules\/(?:typescript|unbash|esbuild|@typescript|@biomejs|@types|@esbuild)(?:\/|$)/.test(nestedPath)
     || /\/node_modules\/(?:\.cache|\.vite|\.bin)(?:\/|$)/.test(nestedPath)
     || /\/node_modules\/ssh2\/test(?:\/|$)/.test(nestedPath)
   ) return true;
-  const packageKey = topLevelNodePackage(relativePath);
-  return packageKey !== null && trustedLockPackages !== null && !trustedLockPackages.has(packageKey);
+  return belongsToExcludedPackage(relativePath);
 }
 
 function requireAuthorityEntry(relativePath) {
@@ -731,7 +814,84 @@ function requireAuthorityEntry(relativePath) {
 }
 
 compareAuthorityDirectory(root);
-if (trustedLockPackages === null) {
+
+function collectConditionalTargets(value, label, targets) {
+  if (value === null) return;
+  if (typeof value === "string") {
+    targets.push({ label, target: value });
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const [index, entry] of value.entries()) collectConditionalTargets(entry, `${label}[${index}]`, targets);
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [condition, entry] of Object.entries(value)) {
+      collectConditionalTargets(entry, `${label}.${condition}`, targets);
+    }
+    return;
+  }
+  authorityFailures.push(`${label} has an invalid package entry target`);
+}
+
+function validatePackageManifest(manifestPath) {
+  const relativeManifest = relativeToRoot(manifestPath);
+  const packageRoot = dirname(manifestPath);
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch (error) {
+    authorityFailures.push(`${relativeManifest} is malformed JSON: ${error.message}`);
+    return;
+  }
+  const targets = [];
+  if (manifest.main !== undefined) {
+    if (typeof manifest.main === "string") targets.push({ label: "main", target: manifest.main, legacy: true });
+    else authorityFailures.push(`${relativeManifest} main has the wrong type`);
+  }
+  if (manifest.bin !== undefined) {
+    if (typeof manifest.bin === "string") targets.push({ label: "bin", target: manifest.bin, legacy: true });
+    else if (manifest.bin && typeof manifest.bin === "object" && !Array.isArray(manifest.bin)) {
+      for (const [name, target] of Object.entries(manifest.bin)) {
+        if (typeof target === "string") targets.push({ label: `bin.${name}`, target, legacy: true });
+        else authorityFailures.push(`${relativeManifest} bin.${name} has the wrong type`);
+      }
+    } else authorityFailures.push(`${relativeManifest} bin has the wrong type`);
+  }
+  if (manifest.imports !== undefined) collectConditionalTargets(manifest.imports, "imports", targets);
+  if (manifest.exports !== undefined) collectConditionalTargets(manifest.exports, "exports", targets);
+
+  for (const { label, target, legacy = false } of targets) {
+    if (!legacy && !target.startsWith("./")) {
+      if (label.startsWith("imports")) continue;
+      authorityFailures.push(`${relativeManifest} ${label} target ${target} is not package-relative`);
+      continue;
+    }
+    const normalized = target.startsWith("./") ? target.slice(2) : target;
+    if (isAbsolute(normalized) || normalized.split("/").some((part) => part === "." || part === "..")) {
+      authorityFailures.push(`${relativeManifest} ${label} target ${target} escapes or is not normalized`);
+      continue;
+    }
+    if (normalized.includes("*")) {
+      // A subpath wildcard describes an open set of caller-supplied substitutions. There is no
+      // finite target to require here; its normalized, package-relative prefix is still checked.
+      continue;
+    }
+    let targetPath = join(packageRoot, ...normalized.split("/"));
+    if (legacy && !lstatExists(targetPath)) {
+      targetPath = [".js", ".json", ".node"].map((extension) => `${targetPath}${extension}`).find(lstatExists)
+        ?? targetPath;
+    }
+    if (!lstatExists(targetPath)) {
+      authorityFailures.push(`${relativeManifest} ${label} target ${target} is missing`);
+      continue;
+    }
+    containedCanonicalRelative(root, targetPath, `${relativeManifest} ${label} target ${target}`);
+  }
+}
+
+for (const manifestPath of artifactPackageManifests) validatePackageManifest(manifestPath);
+if (runtimePackageExclusions === null) {
   for (const entry of readdirSync(authorityRoot).sort()) requireAuthorityEntry(entry);
 } else {
   for (const relativePath of releaseAuthorityRoots) requireAuthorityEntry(relativePath);

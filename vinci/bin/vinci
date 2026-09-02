@@ -294,28 +294,29 @@ if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
   exit 0
 fi
 
-# Internal Node subcommands are data, not duplicated shell branches. The shipped manifest is the
-# executable source of truth: adding an entry makes it reachable here, and changing a target changes
-# what this launcher runs. Exit 3 means the first argument is not a manifest command. Options, resume,
-# and a bare launch cannot be manifest commands, so keep their existing zero-lookup path.
-if [ "$#" -gt 0 ] && [[ "$1" != -* ]] && [ "$1" != "resume" ]; then
-  set +e
-  _vinci_dispatch_target="$(
-    node "${VINCI}/scripts/resolve-dispatch.mjs" \
-      "${VINCI}/dispatch-manifest.json" "$1"
-  )"
-  _vinci_dispatch_status=$?
-  set -e
-  case "${_vinci_dispatch_status}" in
-    0)
-      shift
-      exec node "${VINCI}/${_vinci_dispatch_target}" "$@"
-      ;;
-    3) ;;
-    *) exit "${_vinci_dispatch_status}" ;;
-  esac
-  unset _vinci_dispatch_target _vinci_dispatch_status
-fi
+# The manifest owns targets for the two packaged Node subcommands, but it must never sit on the
+# ordinary Pi path. Positional words are valid prompts (`vinci explain this`), so consulting the
+# manifest for every non-option changed product semantics, added a Node startup to every prompt, and
+# made a missing/damaged manifest break normal sessions. Keep this lexical gate deliberately small;
+# packaged-artifact-check.mjs proves its patterns and the manifest command set remain identical.
+case "${1:-}" in
+  report-wrong | worker)
+    set +e
+    _vinci_dispatch_target="$(
+      node "${VINCI}/scripts/resolve-dispatch.mjs" \
+        "${VINCI}/dispatch-manifest.json" "$1"
+    )"
+    _vinci_dispatch_status=$?
+    set -e
+    case "${_vinci_dispatch_status}" in
+      0)
+        shift
+        exec node "${VINCI}/${_vinci_dispatch_target}" "$@"
+        ;;
+      *) exit "${_vinci_dispatch_status}" ;;
+    esac
+    ;;
+esac
 
 # Internal source qualification must execute the current working tree, never a stale dist build.
 # Normal product runs still prefer a locally built pi (packages/coding-agent/dist/cli.js), then the

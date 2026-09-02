@@ -89,16 +89,8 @@ jobs:
       # must exit 0 AND print exactly the version identity.json declares. Any other output
       # (crash, extension-load error, wrong version) fails the PR — the 0.0.31 lesson is
       # that only driving the artifact itself catches a broken tarball.
-      - name: Probe packaged CLI version
-        run: |
-          set -euo pipefail
-          expected="$(node -p "JSON.parse(require('fs').readFileSync('vinci/identity.json','utf8')).version")"
-          out="$(/tmp/vinci-artifact-check/vinci/bin/vinci --version 2>&1)" || {
-            printf '%s\n' "${out}"; echo "::error::Packaged CLI exited non-zero."; exit 1; }
-          printf '%s\n' "${out}"
-          if [ "${out}" != "${expected}" ]; then
-            echo "::error::Packaged CLI printed '${out}', expected '${expected}'."; exit 1
-          fi
+      - name: Probe packaged runtime surface
+        run: node vinci/test/packaged-runtime-probe.mjs /tmp/vinci-artifact-check
       - name: Lint, typecheck, and verify pinned deps
         run: npm run check
 

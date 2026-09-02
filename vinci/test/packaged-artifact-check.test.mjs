@@ -4,6 +4,7 @@ import {
 	chmodSync,
 	cpSync,
 	existsSync,
+	linkSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -16,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { runtimePackageExcludes } from "../scripts/runtime-package-closure.mjs";
 
 const checker = process.env.VINCI_PACKAGED_CHECKER
 	?? fileURLToPath(new URL("./packaged-artifact-check.mjs", import.meta.url));
@@ -37,6 +39,12 @@ set -euo pipefail
 SELF="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "\${SELF}/../.." && pwd)"
 VINCI="\${ROOT}/vinci"
+if [ "\${1:-}" = "--version" ]; then
+  echo "0.0.51"
+  exit 0
+fi
+case "\${1:-}" in
+  report-wrong | worker)
 set +e
 _vinci_dispatch_target="$(
   node "\${VINCI}/scripts/resolve-dispatch.mjs" \\
@@ -49,14 +57,15 @@ case "\${_vinci_dispatch_status}" in
     shift
     exec node "\${VINCI}/\${_vinci_dispatch_target}" "$@"
     ;;
-  3) ;;
   *) exit "\${_vinci_dispatch_status}" ;;
 esac
-unset _vinci_dispatch_target _vinci_dispatch_status
+    ;;
+esac
 if [ "\${1:-}" = "verify" ]; then
   shift
   exec "\${_vinci_vac_cli}" "$@"
 fi
+printf 'pi reached: <%s>\n' "$*"
 `;
 
 function write(path, content) {
@@ -137,7 +146,7 @@ function expectFailure(result, pattern) {
 	assert.match(result.stderr, pattern);
 }
 
-const shellDispatchFailure = /unmanifested executable dispatch|unreviewed (?:Node|shell|path)|exactly one reviewed/;
+const shellDispatchFailure = /unmanifested executable dispatch|unreviewed (?:Node|shell|path)|exactly one reviewed|gate manifest resolution/;
 
 test.after(() => {
 	for (const root of fixtureRoots) rmSync(root, { recursive: true, force: true });
@@ -159,6 +168,48 @@ test("positive reachability control executes every manifest command through the 
 	const worker = runLauncher(root, ["worker", "beta"]);
 	assert.equal(worker.status, 0, worker.stderr);
 	assert.match(worker.stdout, /worker reached: beta true/);
+});
+
+test("ordinary prompt, bare, and version paths never depend on the dispatch manifest", () => {
+	for (const manifestState of ["missing", "malformed"]) {
+		const root = fixture();
+		const manifestPath = join(root, "vinci", "dispatch-manifest.json");
+		if (manifestState === "missing") rmSync(manifestPath);
+		else write(manifestPath, "{");
+
+		const prompt = runLauncher(root, ["explain", "this"]);
+		assert.equal(prompt.status, 0, prompt.stderr);
+		assert.match(prompt.stdout, /pi reached: <explain this>/);
+
+		const bare = runLauncher(root, []);
+		assert.equal(bare.status, 0, bare.stderr);
+		assert.match(bare.stdout, /pi reached: <>/);
+
+		const version = runLauncher(root, ["--version"]);
+		assert.equal(version.status, 0, version.stderr);
+		assert.equal(version.stdout.trim(), "0.0.51");
+
+		for (const command of ["report-wrong", "worker"]) {
+			const packaged = runLauncher(root, [command]);
+			assert.equal(packaged.status, 65, packaged.stdout + packaged.stderr);
+			assert.match(packaged.stderr, /invalid dispatch manifest/);
+		}
+	}
+});
+
+test("the launcher and manifest expose exactly the same reviewed packaged commands", () => {
+	const broadenedRoot = fixture();
+	write(
+		join(broadenedRoot, "vinci", "bin", "vinci"),
+		launcher.replace("report-wrong | worker)", "report-wrong | worker | hidden)"),
+	);
+	expectFailure(run(broadenedRoot), /gate manifest resolution on exactly the reviewed packaged commands/);
+
+	const manifestRoot = fixture();
+	const broadenedManifest = structuredClone(manifest);
+	broadenedManifest.dispatches.push({ command: "hidden", target: "worker/worker.mjs" });
+	write(join(manifestRoot, "vinci", "dispatch-manifest.json"), JSON.stringify(broadenedManifest));
+	expectFailure(run(manifestRoot), /command set differs from the reviewed launcher gate/);
 });
 
 function addChalkDependency(root) {
@@ -208,6 +259,36 @@ test("dependency closure is package-name agnostic", () => {
 	authorize(root, "node_modules/other-runtime/index.js");
 	rmSync(join(root, "node_modules", "other-runtime"), { recursive: true });
 	expectFailure(run(root), /node_modules\/other-runtime\/index\.js required by the trusted package layout is missing/);
+});
+
+test("package selection keeps the runtime graph and excludes whole development graphs", () => {
+	const root = mkdtempSync(join(tmpdir(), "vinci-runtime-package-closure-"));
+	fixtureRoots.push(root);
+	const workspaces = [
+		["agent", "@earendil-works/pi-agent-core", {}],
+		["ai", "@earendil-works/pi-ai", {}],
+		["coding-agent", "@earendil-works/pi-coding-agent", { runtime: "1.0.0" }],
+		["orchestrator", "@earendil-works/pi-orchestrator", {}],
+		["tui", "@earendil-works/pi-tui", {}],
+	];
+	for (const [directory, name, dependencies] of workspaces) {
+		const workspaceRoot = join(root, "packages", directory);
+		write(join(workspaceRoot, "package.json"), JSON.stringify({ name, dependencies }));
+		const linkedRoot = join(root, "node_modules", ...name.split("/"));
+		mkdirSync(dirname(linkedRoot), { recursive: true });
+		symlinkSync(workspaceRoot, linkedRoot);
+	}
+	write(join(root, "node_modules", "runtime", "package.json"), JSON.stringify({ name: "runtime", dependencies: { transitive: "1.0.0" } }));
+	write(join(root, "node_modules", "transitive", "package.json"), JSON.stringify({ name: "transitive" }));
+	write(join(root, "node_modules", "tsx", "package.json"), JSON.stringify({ name: "tsx", dependencies: { esbuild: "1.0.0" } }));
+	write(join(root, "node_modules", "esbuild", "package.json"), JSON.stringify({ name: "esbuild" }));
+
+	const excluded = new Set(runtimePackageExcludes(root));
+	assert.equal(excluded.has("node_modules/runtime"), false);
+	assert.equal(excluded.has("node_modules/transitive"), false);
+	assert.equal(excluded.has("node_modules/tsx"), true);
+	assert.equal(excluded.has("node_modules/esbuild"), true);
+	for (const [, name] of workspaces) assert.equal(excluded.has(`node_modules/${name}`), false);
 });
 
 test("the reviewed maintenance helper is packaged, traversed, and fault-restorable", () => {
@@ -571,6 +652,69 @@ test("a packaged runtime dependency is byte-bound to the external authority", ()
 	authorize(root, "node_modules/runtime/index.js");
 	write(join(root, "node_modules", "runtime", "index.js"), "export const value = 2;\n");
 	expectFailure(run(root), /node_modules\/runtime\/index\.js differs from the trusted executable authority/);
+});
+
+test("absolute and escaping package symlinks refuse even when authority link text matches", () => {
+	const root = fixture();
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	const external = mkdtempSync(join(tmpdir(), "vinci-external-package-"));
+	fixtureRoots.push(external);
+	write(join(external, "package.json"), JSON.stringify({ name: "external", main: "index.js" }));
+	write(join(external, "index.js"), "export const external = true;\n");
+	mkdirSync(join(root, "node_modules"), { recursive: true });
+	mkdirSync(join(authorityRoot, "node_modules"), { recursive: true });
+	symlinkSync(external, join(root, "node_modules", "linked-runtime"));
+	symlinkSync(external, join(authorityRoot, "node_modules", "linked-runtime"));
+	expectFailure(run(root), /linked-runtime .*symlink resolves outside its root/);
+
+	rmSync(join(root, "node_modules", "linked-runtime"));
+	rmSync(join(authorityRoot, "node_modules", "linked-runtime"));
+	for (const base of [root, authorityRoot]) {
+		write(join(base, "node_modules", "linked-runtime", "package.json"), JSON.stringify({ name: "linked-runtime", main: "index.js" }));
+		write(join(base, "node_modules", "linked-runtime", "index.js"), "export const restored = true;\n");
+	}
+	assert.equal(run(root).status, 0);
+});
+
+test("hardlinked package files refuse and independent restoration certifies", () => {
+	const root = fixture();
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	const external = join(mkdtempSync(join(tmpdir(), "vinci-external-hardlink-")), "index.js");
+	fixtureRoots.push(dirname(external));
+	write(external, "export const linked = true;\n");
+	for (const base of [root, authorityRoot]) {
+		const target = join(base, "node_modules", "runtime", "index.js");
+		mkdirSync(dirname(target), { recursive: true });
+		linkSync(external, target);
+	}
+	expectFailure(run(root), /node_modules\/runtime\/index\.js differs from the trusted executable authority/);
+	for (const base of [root, authorityRoot]) {
+		const target = join(base, "node_modules", "runtime", "index.js");
+		rmSync(target);
+		write(target, "export const linked = true;\n");
+	}
+	assert.equal(run(root).status, 0);
+});
+
+test("all literal package main, bin, imports, and conditional exports targets must exist", () => {
+	const root = fixture();
+	const packageJson = {
+		name: "runtime",
+		main: "index.js",
+		bin: { runtime: "bin.mjs" },
+		imports: { "#internal": { default: "./index.js" } },
+		exports: { ".": { default: "./index.js", "review-condition": "./missing.js" } },
+	};
+	write(join(root, "node_modules", "runtime", "package.json"), JSON.stringify(packageJson));
+	write(join(root, "node_modules", "runtime", "index.js"), "export {};\n");
+	write(join(root, "node_modules", "runtime", "bin.mjs"), "export {};\n");
+	authorize(root, "node_modules/runtime");
+	expectFailure(run(root), /exports.*review-condition target \.\/missing\.js is missing/);
+	write(join(root, "node_modules", "runtime", "missing.js"), "export {};\n");
+	authorize(root, "node_modules/runtime/missing.js");
+	assert.equal(run(root).status, 0);
 });
 
 test("missing, malformed, null, and wrong-type manifests refuse", () => {

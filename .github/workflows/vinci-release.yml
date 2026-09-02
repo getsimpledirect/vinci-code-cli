@@ -95,13 +95,9 @@ jobs:
           mkdir -p /tmp/vinci-artifact-check
           tar -xzf "release/vinci-code-${{ steps.meta.outputs.version }}.tgz" -C /tmp/vinci-artifact-check
           node vinci/test/packaged-artifact-check.mjs /tmp/vinci-artifact-check
-          # Belt and braces: the packaged CLI must answer --version without an extension-load error.
-          out="$(/tmp/vinci-artifact-check/vinci/bin/vinci --version 2>&1)" || true
-          printf '%s\n' "${out}"
-          case "${out}" in
-            *"Failed to load extension"*|*"Cannot find module"*)
-              echo "::error::The packaged CLI cannot load its extensions."; exit 1 ;;
-          esac
+          # Static certification is followed by real packaged version/help/worker execution plus
+          # package-entry, symlink-containment, development-tool, and parent-resolution probes.
+          node vinci/test/packaged-runtime-probe.mjs /tmp/vinci-artifact-check
 
       - name: Carry the TESTED payload to publish (publish signs this, never a rebuild)
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
