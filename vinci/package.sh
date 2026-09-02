@@ -39,6 +39,7 @@ tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude='node_modules/@esbuild' \
   --exclude='node_modules/ssh2/test' \
   --exclude='node_modules/.cache' \
+  --exclude='node_modules/.vite' \
   --exclude='node_modules/.bin' \
   --exclude='*.map' \
   --exclude='*.ts.map' \

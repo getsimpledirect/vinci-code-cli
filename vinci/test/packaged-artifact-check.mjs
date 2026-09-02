@@ -605,6 +605,7 @@ function fileDigest(path) {
 const authorityFailures = [];
 let authorityFiles = 0;
 let authorityLinks = 0;
+let requiredAuthorityEntries = 0;
 function compareAuthorityDirectory(artifactDirectory, relativeDirectory = "") {
   for (const entry of readdirSync(artifactDirectory).sort()) {
     const relativePath = relativeDirectory ? `${relativeDirectory}/${entry}` : entry;
@@ -653,7 +654,88 @@ function lstatExists(path) {
   }
 }
 
+// Completeness is the other half of source authority. Node searches parent directories when a bare
+// dependency is absent, so comparing only files present in the payload lets an omitted dependency
+// resolve to attacker-controlled code above the install root. Derive the required release surface
+// from the trusted package layout and lockfile, then require every selected file and symlink. This is
+// package-wide closure: no dependency name is singled out, and nested runtime packages are covered.
+const releaseAuthorityRoots = [
+  "package.json",
+  "node_modules",
+  "packages/agent/dist",
+  "packages/agent/package.json",
+  "packages/ai/dist",
+  "packages/ai/package.json",
+  "packages/coding-agent/dist",
+  "packages/coding-agent/package.json",
+  "packages/orchestrator/dist",
+  "packages/orchestrator/package.json",
+  "packages/tui/dist",
+  "packages/tui/package.json",
+  "vinci/bin",
+  "vinci/extensions",
+  "vinci/themes",
+  "vinci/assets",
+  "vinci/updater",
+  "vinci/worker",
+  "vinci/scripts/report-wrong.mjs",
+  "vinci/scripts/reap-heal-temp.mjs",
+  "vinci/scripts/resolve-dispatch.mjs",
+  "vinci/dispatch-manifest.json",
+  "vinci/identity.json",
+  "vinci/NOTICE",
+];
+const packageLockPath = join(authorityRoot, "package-lock.json");
+const trustedLockPackages = lstatExists(packageLockPath)
+  ? new Set(Object.keys(JSON.parse(readFileSync(packageLockPath, "utf8")).packages ?? {}))
+  : null;
+
+function topLevelNodePackage(relativePath) {
+  const parts = relativePath.split("/");
+  if (parts[0] !== "node_modules" || parts.length < 2 || parts[1].startsWith(".")) return null;
+  if (!parts[1].startsWith("@")) return parts.slice(0, 2).join("/");
+  return parts.length >= 3 ? parts.slice(0, 3).join("/") : null;
+}
+
+function excludedFromReleaseAuthority(relativePath) {
+  if (/\.map$/.test(relativePath) || relativePath === "vinci/worker/README.md") return true;
+  const nestedPath = `/${relativePath}`;
+  if (
+    /\/node_modules\/(?:typescript|unbash|esbuild|@typescript|@biomejs|@types|@esbuild)(?:\/|$)/.test(nestedPath)
+    || /\/node_modules\/(?:\.cache|\.vite|\.bin)(?:\/|$)/.test(nestedPath)
+    || /\/node_modules\/ssh2\/test(?:\/|$)/.test(nestedPath)
+  ) return true;
+  const packageKey = topLevelNodePackage(relativePath);
+  return packageKey !== null && trustedLockPackages !== null && !trustedLockPackages.has(packageKey);
+}
+
+function requireAuthorityEntry(relativePath) {
+  if (excludedFromReleaseAuthority(relativePath)) return;
+  const trustedPath = join(authorityRoot, ...relativePath.split("/"));
+  if (!lstatExists(trustedPath)) {
+    authorityFailures.push(`${relativePath} is absent from the trusted package layout`);
+    return;
+  }
+  const trustedStat = lstatSync(trustedPath);
+  if (trustedStat.isDirectory() && !trustedStat.isSymbolicLink()) {
+    for (const entry of readdirSync(trustedPath).sort()) {
+      requireAuthorityEntry(`${relativePath}/${entry}`);
+    }
+    return;
+  }
+  requiredAuthorityEntries += 1;
+  const artifactPath = join(root, ...relativePath.split("/"));
+  if (!lstatExists(artifactPath)) {
+    authorityFailures.push(`${relativePath} required by the trusted package layout is missing`);
+  }
+}
+
 compareAuthorityDirectory(root);
+if (trustedLockPackages === null) {
+  for (const entry of readdirSync(authorityRoot).sort()) requireAuthorityEntry(entry);
+} else {
+  for (const relativePath of releaseAuthorityRoots) requireAuthorityEntry(relativePath);
+}
 if (authorityFailures.length > 0) {
   const visible = authorityFailures.slice(0, 32);
   if (authorityFailures.length > visible.length) {
@@ -666,5 +748,6 @@ console.log(
   `  ✓ packaged artifact: ${manifest.dispatches.length} manifest-driven launcher dispatches; `
   + `${dispatchGraph.files} dispatch files/${dispatchGraph.imports} imports and `
   + `${extensionGraph.files} extension files/${extensionGraph.imports} imports resolve inside the tarball; `
-  + `${authorityFiles} files/${authorityLinks} links match the closed executable authority`,
+  + `${authorityFiles} files/${authorityLinks} links match the closed executable authority; `
+  + `${requiredAuthorityEntries} required entries close parent-directory dependency resolution`,
 );

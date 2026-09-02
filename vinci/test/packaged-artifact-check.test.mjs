@@ -7,6 +7,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -95,6 +96,16 @@ function fixture() {
 	return root;
 }
 
+function nestedFixture() {
+	const originalRoot = fixture();
+	const outer = mkdtempSync(join(tmpdir(), "vinci-packaged-parent-"));
+	fixtureRoots.push(outer);
+	const root = join(outer, "payload");
+	cpSync(originalRoot, root, { recursive: true });
+	authorityRoots.set(root, authorityRoots.get(originalRoot));
+	return { outer, root };
+}
+
 function authorize(root, relativePath) {
 	const authorityRoot = authorityRoots.get(root);
 	assert.ok(authorityRoot);
@@ -148,6 +159,55 @@ test("positive reachability control executes every manifest command through the 
 	const worker = runLauncher(root, ["worker", "beta"]);
 	assert.equal(worker.status, 0, worker.stderr);
 	assert.match(worker.stdout, /worker reached: beta true/);
+});
+
+function addChalkDependency(root) {
+	write(
+		join(root, "node_modules", "chalk", "package.json"),
+		JSON.stringify({ name: "chalk", version: "1.0.0", type: "module", exports: "./index.js" }),
+	);
+	write(join(root, "node_modules", "chalk", "index.js"), "export default (value) => value;\n");
+	write(
+		join(root, "vinci", "worker", "worker.mjs"),
+		'import chalk from "chalk";\nconsole.log(chalk(`worker with chalk reached: ${process.argv[2]}`));\n',
+	);
+	authorize(root, "node_modules/chalk/package.json");
+	authorize(root, "node_modules/chalk/index.js");
+	authorize(root, "vinci/worker/worker.mjs");
+}
+
+test("a declared packaged dependency remains certifiable and reachable", () => {
+	const root = fixture();
+	addChalkDependency(root);
+	const checked = run(root);
+	assert.equal(checked.status, 0, checked.stderr);
+	const reached = runLauncher(root, ["worker", "canonical"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /worker with chalk reached: canonical/);
+});
+
+test("a missing dependency cannot resolve from a malicious parent directory", () => {
+	const { outer, root } = nestedFixture();
+	addChalkDependency(root);
+	mkdirSync(join(outer, "node_modules"), { recursive: true });
+	renameSync(join(root, "node_modules", "chalk"), join(outer, "node_modules", "chalk"));
+	write(
+		join(outer, "node_modules", "chalk", "index.js"),
+		'console.log("malicious parent chalk reached");\nexport default (value) => value;\n',
+	);
+	const reached = runLauncher(root, ["worker", "parent"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /malicious parent chalk reached/);
+	assert.match(reached.stdout, /worker with chalk reached: parent/);
+	expectFailure(run(root), /required by the trusted package layout is missing/);
+});
+
+test("dependency closure is package-name agnostic", () => {
+	const root = fixture();
+	write(join(root, "node_modules", "other-runtime", "index.js"), "export const value = true;\n");
+	authorize(root, "node_modules/other-runtime/index.js");
+	rmSync(join(root, "node_modules", "other-runtime"), { recursive: true });
+	expectFailure(run(root), /node_modules\/other-runtime\/index\.js required by the trusted package layout is missing/);
 });
 
 test("the reviewed maintenance helper is packaged, traversed, and fault-restorable", () => {
