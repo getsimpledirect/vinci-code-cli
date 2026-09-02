@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -17,6 +18,7 @@ import test from "node:test";
 const checker = process.env.VINCI_PACKAGED_CHECKER
 	?? fileURLToPath(new URL("./packaged-artifact-check.mjs", import.meta.url));
 const resolverSource = readFileSync(new URL("../scripts/resolve-dispatch.mjs", import.meta.url), "utf8");
+const reaperSource = readFileSync(new URL("../scripts/reap-heal-temp.mjs", import.meta.url), "utf8");
 const fixtureRoots = [];
 
 const manifest = {
@@ -104,6 +106,8 @@ function expectFailure(result, pattern) {
 	assert.match(result.stderr, pattern);
 }
 
+const shellDispatchFailure = /unmanifested executable dispatch|unreviewed (?:Node|shell|path)|exactly one reviewed/;
+
 test.after(() => {
 	for (const root of fixtureRoots) rmSync(root, { recursive: true, force: true });
 });
@@ -124,6 +128,26 @@ test("positive reachability control executes every manifest command through the 
 	const worker = runLauncher(root, ["worker", "beta"]);
 	assert.equal(worker.status, 0, worker.stderr);
 	assert.match(worker.stdout, /worker reached: beta true/);
+});
+
+test("the reviewed maintenance helper is packaged, traversed, and fault-restorable", () => {
+	const root = fixture();
+	const helperPath = join(root, "vinci", "scripts", "reap-heal-temp.mjs");
+	write(helperPath, reaperSource);
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		launcher.replace(
+			"set +e",
+			() => '_vinci_home="${ROOT}"\nnode "${VINCI}/scripts/reap-heal-temp.mjs" "${_vinci_home}/updater" "$$" 2>/dev/null || true\nset +e',
+		),
+	);
+	const checked = run(root);
+	assert.equal(checked.status, 0, checked.stderr);
+	assert.match(checked.stdout, /8 dispatch files\/4 imports/);
+	rmSync(helperPath);
+	expectFailure(run(root), /launcher maintenance helper has wrong case or is missing/);
+	write(helperPath, reaperSource);
+	assert.equal(run(root).status, 0);
 });
 
 test("an extensionless manifest target is verified and reachable", () => {
@@ -165,7 +189,7 @@ test("the manifest resolver and exec are each mandatory and unique", () => {
 	]) {
 		const root = fixture();
 		write(join(root, "vinci", "bin", "vinci"), changedLauncher);
-		expectFailure(run(root), /unmanifested executable dispatch|exactly one reviewed/);
+		expectFailure(run(root), shellDispatchFailure);
 	}
 });
 
@@ -179,7 +203,7 @@ test("quote-split, direct, alternate, and extensionless dispatches are rejected"
 	]) {
 		const root = fixture();
 		write(join(root, "vinci", "bin", "vinci"), `${launcher}\n${addition}\n`);
-		expectFailure(run(root), /unmanifested executable dispatch/);
+		expectFailure(run(root), shellDispatchFailure);
 	}
 });
 
@@ -190,7 +214,7 @@ test("multiline command substitutions and backticks cannot hide a dispatch", () 
 	]) {
 		const root = fixture();
 		write(join(root, "vinci", "bin", "vinci"), `${launcher}\n${addition}\n`);
-		expectFailure(run(root), /unmanifested executable dispatch/);
+		expectFailure(run(root), shellDispatchFailure);
 	}
 });
 
@@ -200,7 +224,7 @@ test("a variable-indirected Vinci target cannot hide a dispatch", () => {
 		join(root, "vinci", "bin", "vinci"),
 		`${launcher}\ntarget="${"${VINCI}"}/missing.mjs"\nnode "$target"\n`,
 	);
-	expectFailure(run(root), /unmanifested executable dispatch/);
+	expectFailure(run(root), shellDispatchFailure);
 });
 
 for (const [label, dispatch] of [
@@ -218,9 +242,63 @@ for (const [label, dispatch] of [
 		const reached = runLauncher(root, ["hidden", "delta"]);
 		assert.equal(reached.status, 0, reached.stderr);
 		assert.match(reached.stdout, /hidden shell target reached: hidden delta/);
-		expectFailure(run(root), /unmanifested executable dispatch/);
+		expectFailure(run(root), shellDispatchFailure);
 	});
 }
+
+test("a relative target after an artifact-root cd cannot bypass the manifest", () => {
+	const root = fixture();
+	write(join(root, "vinci", "hidden.mjs"), 'console.log("relative hidden target reached");\n');
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  cd "\${VINCI}"\n  node "./hidden.mjs" "$@"\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /relative hidden target reached/);
+	expectFailure(run(root), /unreviewed Node execution form/);
+});
+
+test("a direct relative executable after an artifact-root cd cannot bypass the manifest", () => {
+	const root = fixture();
+	const hiddenPath = join(root, "vinci", "hidden.sh");
+	write(hiddenPath, '#!/usr/bin/env bash\necho "direct relative hidden target reached"\n');
+	chmodSync(hiddenPath, 0o755);
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  cd "\${VINCI}"\n  ./hidden.sh "$@"\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /direct relative hidden target reached/);
+	expectFailure(run(root), /unreviewed path executable/);
+});
+
+test("shell eval cannot defer an artifact-root expansion past verification", () => {
+	const root = fixture();
+	write(join(root, "vinci", "hidden.mjs"), 'console.log("eval hidden target reached");\n');
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  payload='node "\${VINCI}/hidden.mjs" "$@"'\n  eval "$payload"\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /eval hidden target reached/);
+	expectFailure(run(root), /unreviewed shell eval form/);
+});
+
+test("the reviewed profile eval variable cannot be repurposed as a dispatch", () => {
+	const root = fixture();
+	write(join(root, "vinci", "hidden.mjs"), 'console.log("profile eval hidden target reached");\n');
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  VINCI_PROFILE_EXPORTS='node "\${VINCI}/hidden.mjs" "$@"'\n  eval "$VINCI_PROFILE_EXPORTS"\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /profile eval hidden target reached/);
+	expectFailure(run(root), /repurposes the reviewed profile eval payload/);
+});
 
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
 	const cases = [
@@ -304,6 +382,35 @@ for (const [label, source] of [
 		expectFailure(run(root), /dynamic code loader/);
 	});
 }
+
+for (const [label, source] of [
+	["Function constructor", 'const load = (() => {}).constructor; await load(\'return import("./hidden.mjs")\')();\n'],
+	["AsyncFunction constructor", 'const load = (async () => {}).constructor; await new load(\'return import("./hidden.mjs")\')();\n'],
+	["computed Function constructor", 'const key = "con" + "structor"; const load = (() => {})[key]; await load(\'return import("./hidden.mjs")\')();\n'],
+]) {
+	test(`${label} derivation cannot execute a hidden module`, () => {
+		const root = fixture();
+		write(join(root, "vinci", "worker", "worker.mjs"), source);
+		write(join(root, "vinci", "worker", "hidden.mjs"), 'console.log("constructor hidden module reached");\n');
+		const reached = runLauncher(root, ["worker"]);
+		assert.equal(reached.status, 0, reached.stderr);
+		assert.match(reached.stdout, /constructor hidden module reached/);
+		expectFailure(run(root), /runtime module loader|dynamic code loader/);
+	});
+}
+
+test("a computed Module._load key cannot execute a hidden module", () => {
+	const root = fixture();
+	write(
+		join(root, "vinci", "worker", "worker.mjs"),
+		'import Module from "node:module";\nconst key = ["_", "load"].join("");\nModule[key](new URL("./hidden.cjs", import.meta.url).pathname);\n',
+	);
+	write(join(root, "vinci", "worker", "hidden.cjs"), 'console.log("Module._load hidden module reached");\n');
+	const reached = runLauncher(root, ["worker"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /Module\._load hidden module reached/);
+	expectFailure(run(root), /module-loader authority|runtime module loader|runtime access/);
+});
 
 test("the dynamic-loader policy also covers extension entry points", () => {
 	const root = fixture();

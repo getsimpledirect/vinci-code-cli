@@ -62,19 +62,7 @@ if [ "${VINCI_NO_BOOTSTRAP_HEAL:-}" != "1" ]; then
                 || _vinci_version_is_newer "${_vinci_embedded_version}" "${_vinci_boot_version}"; }; then
           # A killed heal can leave its atomic-replace temp behind. Reap only regular files older
           # than one hour, using lstat so a malicious or accidental symlink is never followed.
-          node -e '
-            const { lstatSync, readdirSync, unlinkSync } = require("node:fs");
-            const { join } = require("node:path");
-            const [directory, pid] = process.argv.slice(1);
-            for (const name of readdirSync(directory)) {
-              if (!/^update\.mjs\.heal-[0-9]+$/.test(name) || name === `update.mjs.heal-${pid}`) continue;
-              try {
-                const path = join(directory, name);
-                const details = lstatSync(path);
-                if (details.isFile() && Date.now() - details.mtimeMs > 60 * 60 * 1000) unlinkSync(path);
-              } catch {}
-            }
-          ' "${_vinci_home}/updater" "$$" 2>/dev/null || true
+          node "${VINCI}/scripts/reap-heal-temp.mjs" "${_vinci_home}/updater" "$$" 2>/dev/null || true
           _vinci_tmp="${_vinci_boot}.heal-$$"
           if cp "${_vinci_embedded}" "${_vinci_tmp}" 2>/dev/null \
              && chmod 755 "${_vinci_tmp}" 2>/dev/null; then

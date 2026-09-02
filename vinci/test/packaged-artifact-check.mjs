@@ -179,6 +179,30 @@ for (const assignment of shellAssignments) {
     for (const reference of parameterReferences(word)) linkVariables(assignment.name, reference);
   }
 }
+const reviewedProfileExportCapture = `$(
+      set +eu
+      set -a
+      . "$VINCI_PROFILE_SOURCE" >&2
+      set +a
+      export -p
+    )`;
+for (const assignment of shellAssignments) {
+  if (assignment.name === "VINCI_PROFILE") {
+    if (assignment.value?.value !== "${HOME:-}/.vinci-code.env") {
+      refuse("launcher repurposes the reviewed profile path", [assignment.text]);
+    }
+  } else if (assignment.name === "VINCI_PROFILE_SOURCE") {
+    if (assignment.value?.value !== "${VINCI_PROFILE_WRAP:-$VINCI_PROFILE}") {
+      refuse("launcher repurposes the reviewed profile source", [assignment.text]);
+    }
+  } else if (
+    assignment.name === "VINCI_PROFILE_EXPORTS"
+    && assignment.value?.value !== ""
+    && assignment.value?.value !== reviewedProfileExportCapture
+  ) {
+    refuse("launcher repurposes the reviewed profile eval payload", [assignment.text]);
+  }
+}
 const vinciPathVariables = new Set(["VINCI", "ROOT", "SELF"]);
 let addedVariable = true;
 while (addedVariable) {
@@ -198,8 +222,12 @@ const safePathConsumers = new Set([
   "cd", "dirname", "readlink", "basename", "_vinci_updater_version", "_vinci_version_is_newer",
 ]);
 let resolverCalls = 0;
+let maintenanceCalls = 0;
 let manifestExecs = 0;
 let externalExecs = 0;
+let profileSyntaxChecks = 0;
+let profileSources = 0;
+let profileEvals = 0;
 function wordsEqual(words, expected) {
   return words.length === expected.length && words.every((word, index) => word?.value === expected[index]);
 }
@@ -210,6 +238,17 @@ for (const command of shellCommands) {
   if (
     name === "node"
     && wordsEqual(command.suffix, [
+      "${VINCI}/scripts/reap-heal-temp.mjs",
+      "${_vinci_home}/updater",
+      "$$",
+    ])
+  ) {
+    maintenanceCalls += 1;
+    continue;
+  }
+  if (
+    name === "node"
+    && wordsEqual(command.suffix, [
       "${VINCI}/scripts/resolve-dispatch.mjs",
       "${VINCI}/dispatch-manifest.json",
       "$1",
@@ -217,6 +256,34 @@ for (const command of shellCommands) {
   ) {
     resolverCalls += 1;
     continue;
+  }
+  if (name === "node") {
+    refuse("launcher contains an unreviewed Node execution form", [detail]);
+  }
+  if (name === "sh") {
+    if (wordsEqual(command.suffix, ["-n", "$VINCI_PROFILE"])) profileSyntaxChecks += 1;
+    else refuse("launcher contains an unreviewed shell execution form", [detail]);
+    continue;
+  }
+  if (name === "." || name === "source") {
+    if (name === "." && wordsEqual(command.suffix, ["$VINCI_PROFILE_SOURCE"])) profileSources += 1;
+    else refuse("launcher contains an unreviewed shell source form", [detail]);
+    continue;
+  }
+  if (name === "eval") {
+    if (wordsEqual(command.suffix, ["$VINCI_PROFILE_EXPORTS"])) profileEvals += 1;
+    else refuse("launcher contains an unreviewed shell eval form", [detail]);
+    continue;
+  }
+  if (name === "bash" || name === "env") {
+    refuse("launcher contains an unreviewed shell execution form", [detail]);
+  }
+  if (name === "command") {
+    if (command.suffix.length === 2 && command.suffix[0]?.value === "-v") continue;
+    refuse("launcher contains an unreviewed command wrapper", [detail]);
+  }
+  if (name?.includes("/")) {
+    refuse("launcher contains an unreviewed path executable", [detail]);
   }
   if (name === "exec") {
     if (wordsEqual(command.suffix, ["node", "${VINCI}/${_vinci_dispatch_target}", "$@"])) {
@@ -235,9 +302,19 @@ for (const command of shellCommands) {
     refuse("launcher contains an unmanifested executable dispatch", [detail]);
   }
 }
-if (resolverCalls !== 1 || manifestExecs !== 1 || externalExecs !== 1) {
+if (
+  resolverCalls !== 1
+  || maintenanceCalls > 1
+  || manifestExecs !== 1
+  || externalExecs !== 1
+  || profileSyntaxChecks > 1
+  || profileSources > 1
+  || profileEvals > 1
+) {
   refuse("launcher does not contain exactly one reviewed manifest resolver, node exec, and external exec", [
-    `resolver=${resolverCalls}, node-exec=${manifestExecs}, external-exec=${externalExecs}`,
+    `resolver=${resolverCalls}, maintenance=${maintenanceCalls}, node-exec=${manifestExecs}, `
+      + `external-exec=${externalExecs}, profile-syntax=${profileSyntaxChecks}, `
+      + `profile-source=${profileSources}, profile-eval=${profileEvals}`,
   ]);
 }
 
@@ -300,10 +377,40 @@ function checkGraph(entryFiles, label) {
         addFailure("uses a non-literal module specifier");
         return;
       }
-      if (moduleSpecifier.text.startsWith(".")) specifiers.push(moduleSpecifier.text);
+      if (moduleSpecifier.text === "module" || moduleSpecifier.text === "node:module") {
+        addFailure("imports Node module-loader authority; the static artifact proof refuses it");
+      } else if (moduleSpecifier.text.startsWith(".")) {
+        specifiers.push(moduleSpecifier.text);
+      }
     }
+    const constantCandidates = new Map();
+    const reassignedConstants = new Set();
+    function collectConstantCandidates(node) {
+      if (
+        ts.isVariableDeclaration(node)
+        && ts.isIdentifier(node.name)
+        && node.initializer
+        && ts.isVariableDeclarationList(node.parent)
+        && (node.parent.flags & ts.NodeFlags.Const) !== 0
+      ) {
+        if (constantCandidates.has(node.name.text)) reassignedConstants.add(node.name.text);
+        else constantCandidates.set(node.name.text, node.initializer);
+      } else if (
+        ts.isBinaryExpression(node)
+        && ts.isIdentifier(node.left)
+        && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+        && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+      ) {
+        reassignedConstants.add(node.left.text);
+      }
+      ts.forEachChild(node, collectConstantCandidates);
+    }
+    collectConstantCandidates(sourceFile);
+    for (const name of reassignedConstants) constantCandidates.delete(name);
+    const constantStrings = new Map();
     function staticPropertyName(node) {
       if (ts.isStringLiteralLike(node)) return node.text;
+      if (ts.isIdentifier(node)) return constantStrings.get(node.text) ?? null;
       if (ts.isParenthesizedExpression(node)) return staticPropertyName(node.expression);
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
         const left = staticPropertyName(node.left);
@@ -320,6 +427,18 @@ function checkGraph(entryFiles, label) {
         return value;
       }
       return null;
+    }
+    let addedConstant = true;
+    while (addedConstant) {
+      addedConstant = false;
+      for (const [name, initializer] of constantCandidates) {
+        if (constantStrings.has(name)) continue;
+        const value = staticPropertyName(initializer);
+        if (value !== null) {
+          constantStrings.set(name, value);
+          addedConstant = true;
+        }
+      }
     }
     function hasExportModifier(node) {
       return node.modifiers?.some((modifier) => (
@@ -348,6 +467,8 @@ function checkGraph(entryFiles, label) {
             addFailure("uses a CommonJS loader in an ESM module");
           } else if (node.arguments.length !== 1 || !ts.isStringLiteralLike(node.arguments[0])) {
             addFailure("uses dynamic/runtime module loading; the static artifact proof refuses it");
+          } else if (node.arguments[0].text === "module" || node.arguments[0].text === "node:module") {
+            addFailure("loads Node module-loader authority; the static artifact proof refuses it");
           } else if (node.arguments[0].text.startsWith(".")) {
             specifiers.push(node.arguments[0].text);
           }
@@ -363,10 +484,19 @@ function checkGraph(entryFiles, label) {
       } else if (ts.isIdentifier(node) && node.text === "module" && !isAllowedCommonJsModuleReference(node)) {
         addFailure("uses module through an unverifiable runtime access");
       } else if (
-        (ts.isPropertyAccessExpression(node) && ["require", "_load", "createRequire", "eval", "Function"].includes(node.name.text))
+        (
+          ts.isPropertyAccessExpression(node)
+          && [
+            "require", "_load", "createRequire", "eval", "Function", "constructor",
+            "getBuiltinModule", "mainModule",
+          ].includes(node.name.text)
+        )
         || (
           ts.isElementAccessExpression(node)
-          && ["require", "_load", "createRequire", "eval", "Function"].includes(
+          && [
+            "require", "_load", "createRequire", "eval", "Function", "constructor",
+            "getBuiltinModule", "mainModule",
+          ].includes(
             staticPropertyName(node.argumentExpression),
           )
         )
@@ -375,7 +505,7 @@ function checkGraph(entryFiles, label) {
       } else if (
         ts.isElementAccessExpression(node)
         && ts.isIdentifier(node.expression)
-        && ["module", "global", "globalThis"].includes(node.expression.text)
+        && ["Module", "module", "global", "globalThis"].includes(node.expression.text)
       ) {
         addFailure("uses computed runtime access that the static artifact proof cannot verify");
       } else if (
@@ -428,7 +558,16 @@ const resolverPath = assertExactRealPath(
   "launcher manifest resolver",
 );
 if (!lstatSync(resolverPath).isFile()) refuse("launcher manifest resolver is not a regular file");
-const dispatchEntries = [resolverPath, ...nodeTargets.map((entry) => {
+const maintenanceEntries = [];
+if (maintenanceCalls === 1) {
+  const maintenancePath = assertExactRealPath(
+    join(root, "vinci", "scripts", "reap-heal-temp.mjs"),
+    "launcher maintenance helper",
+  );
+  if (!lstatSync(maintenancePath).isFile()) refuse("launcher maintenance helper is not a regular file");
+  maintenanceEntries.push(maintenancePath);
+}
+const dispatchEntries = [resolverPath, ...maintenanceEntries, ...nodeTargets.map((entry) => {
   const path = assertExactRealPath(join(root, "vinci", ...entry.target.split("/")), `dispatch target ${entry.command}`);
   if (!lstatSync(path).isFile()) refuse(`dispatch target ${entry.command} is not a regular file`);
   return path;

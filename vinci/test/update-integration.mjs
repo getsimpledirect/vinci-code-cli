@@ -720,12 +720,17 @@ try {
     const healHome = mkdtempSync(join(tmpdir(), "vinci-update-heal-"));
     const payloadRoot = join(healHome, "versions", "0.0.50");
     mkdirSync(join(payloadRoot, "vinci", "bin"), { recursive: true });
+    mkdirSync(join(payloadRoot, "vinci", "scripts"), { recursive: true });
     mkdirSync(join(payloadRoot, "vinci", "updater"), { recursive: true });
     mkdirSync(join(healHome, "bin"), { recursive: true });
     mkdirSync(join(healHome, "updater"), { recursive: true });
 
     // The real launcher, and the real current updater as the payload's copy.
     copyFileSync(join(root, "vinci", "bin", "vinci"), join(payloadRoot, "vinci", "bin", "vinci"));
+    copyFileSync(
+      join(root, "vinci", "scripts", "reap-heal-temp.mjs"),
+      join(payloadRoot, "vinci", "scripts", "reap-heal-temp.mjs"),
+    );
     chmodSync(join(payloadRoot, "vinci", "bin", "vinci"), 0o755);
     writeFileSync(join(payloadRoot, "vinci", "updater", "update.mjs"), updaterSourceAtVersion("2.0.0"));
     writeFileSync(

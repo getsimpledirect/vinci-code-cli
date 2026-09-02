@@ -49,7 +49,7 @@ tar -czf "${TGZ}" -C "${ROOT}" \
   packages/orchestrator/dist packages/orchestrator/package.json \
   packages/tui/dist packages/tui/package.json \
   vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater vinci/worker \
-  vinci/scripts/report-wrong.mjs vinci/scripts/resolve-dispatch.mjs \
+  vinci/scripts/report-wrong.mjs vinci/scripts/reap-heal-temp.mjs vinci/scripts/resolve-dispatch.mjs \
   vinci/dispatch-manifest.json vinci/identity.json vinci/NOTICE \
   package.json node_modules
 

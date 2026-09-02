@@ -59,6 +59,10 @@ copyFileSync(
   join(root, "vinci", "scripts", "resolve-dispatch.mjs"),
   join(fakeRoot, "vinci", "scripts", "resolve-dispatch.mjs"),
 );
+copyFileSync(
+  join(root, "vinci", "scripts", "reap-heal-temp.mjs"),
+  join(fakeRoot, "vinci", "scripts", "reap-heal-temp.mjs"),
+);
 copyFileSync(join(root, "vinci", "dispatch-manifest.json"), join(fakeRoot, "vinci", "dispatch-manifest.json"));
 writeFileSync(
   join(fakeRoot, "vinci", "scripts", "report-wrong.mjs"),
