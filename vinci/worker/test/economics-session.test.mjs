@@ -117,3 +117,41 @@ test("crew-result entry alone also sets the flag; unrelated custom entries do no
   withSession([{ type: "custom", customType: "vinci-crew-result", data: {} }, receiptEntry], (state) => assert.equal(state.crewRan, true));
   withSession([{ type: "custom", customType: "vinci-something-else", data: {} }, receiptEntry], (state) => assert.equal(state.crewRan, false));
 });
+
+// ---------------------------------------------------------------------------
+// Governed (CONTRACT envelope) path. task.mjs hard-codes `ref: undefined` for a
+// contract envelope and carries the real id in contract.work_order_id, so an
+// emitter that reads only envelope.ref emits work_order_id: null on exactly the
+// field the ledger keys acceptance on — while every prose-envelope test passes.
+// Found by projects-11 (bus msg_9438fe86), reproduced here against this tree.
+// ---------------------------------------------------------------------------
+
+test("governed handoff: work_order_id comes from the contract, not envelope.ref", () => {
+  const governed = buildEconomicsSummary({
+    task: { id: "msg_abc", envelope: { ref: undefined }, attempt: 1 },
+    workOrderId: "bk_9f2c1d",
+    sessionState: { path: "/s/x.jsonl", source: "outcome" },
+    receipt: { verificationStatus: "passed" },
+    taskState: "COMPLETED",
+  });
+  assert.equal(governed.work_order_id, "bk_9f2c1d");
+  assert.equal(governed.lineage.backlog_row_id, "bk_9f2c1d");
+  assert.ok(!governed.incomplete.includes("missing"), JSON.stringify(governed.incomplete));
+
+  // Negative control: neither source present -> still "missing", never a fabricated id.
+  const neither = buildEconomicsSummary({
+    task: { id: "msg_abc", envelope: { ref: undefined }, attempt: 1 },
+    sessionState: { path: "/s/x.jsonl", source: "outcome" },
+    receipt: {},
+  });
+  assert.equal(neither.work_order_id, null);
+  assert.ok(neither.incomplete.includes("missing"));
+
+  // Prose path is unchanged.
+  const prose = buildEconomicsSummary({
+    task: { id: "msg_abc", envelope: { ref: "bk_prose1" }, attempt: 1 },
+    sessionState: { path: "/s/x.jsonl", source: "outcome" },
+    receipt: {},
+  });
+  assert.equal(prose.work_order_id, "bk_prose1");
+});

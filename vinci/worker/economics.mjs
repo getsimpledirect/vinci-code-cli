@@ -131,7 +131,11 @@ export function buildEconomicsSummary(input = {}) {
   const flags = { malformed: false };
 
   try {
-    const taskRef = str(input?.task?.envelope?.ref);
+    // The governed path carries the id in the CONTRACT, not in envelope.ref: task.mjs hard-codes
+    // `ref: undefined` for a contract envelope and puts the real id in contract.work_order_id.
+    // Reading only the ref emitted work_order_id: null on exactly the field the ledger keys
+    // acceptance on, while a prose-envelope test passed. Found by projects-11 (bus msg_9438fe86).
+    const taskRef = str(input.workOrderId) ?? str(input?.task?.envelope?.ref);
     if (!taskRef) incomplete.push("missing");
 
     const lease =
@@ -275,7 +279,7 @@ export function buildEconomicsSummary(input = {}) {
     if (!incomplete.includes("malformed_entries")) incomplete.push("malformed_entries");
     return {
       schema: "vinci.work-order-economics-summary.v1",
-      work_order_id: str(input?.task?.envelope?.ref),
+      work_order_id: str(input?.workOrderId) ?? str(input?.task?.envelope?.ref),
       attempt_label: str(input?.attemptLabel),
       vinci_version: "unknown",
       started_at: null,

@@ -480,6 +480,7 @@ async function emitEconomics({
     const session = sessionState || (stateDir && sessionId ? readSessionState(join(stateDir, "sessions", taskId), sessionId) : null);
     const economicsInput = {
       task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt || attempt },
+      workOrderId: contractFields?.work_order_id ?? envelopeToUse?.ref ?? null,
       attemptLabel: `${taskId}/${attempt.attempt || attempt}`,
       lease: lease || null,
       sessionState: session,
@@ -527,14 +528,8 @@ async function emitEconomics({
   }
 }
 
-function terminalPostBody(details, economicsSha = null) {
-  // Two rules bind this body and they conflict unless the digest goes FIRST: every terminal
-  // ends with ` worker_build=… vinci_binary=…` (asserted as a tail), and several blocker
-  // reasons are `$`-anchored against the body with that tail stripped. A token appended after
-  // the reason breaks the second; a token after the stamps breaks the first. So: digest, then
-  // reason, then stamps.
-  const econ = typeof economicsSha === "string" && economicsSha ? `economics_sha256=${economicsSha} ` : "";
-  return `${econ}${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
+function terminalPostBody(details) {
+  return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
 
 // F8: EVERY early terminal (blocker) post — digest refusal, invalid bounds, past deadline,
@@ -543,9 +538,9 @@ function terminalPostBody(details, economicsSha = null) {
 // digest-form task always yields `contract=<work_order_id>@<digest8>` as the FIRST token; a prose
 // task yields no tag and its body is byte-identical to what it was before Wave 1B. `fallback`
 // is the tag for a digest handoff whose triple could not even be parsed (`contract=malformed`).
-function blockerPostBody(record, details, fallback = null, economicsSha = null) {
+function blockerPostBody(record, details, fallback = null) {
   const tag = contractTag(record) ?? fallback;
-  return terminalPostBody(tag ? `${tag} ${details}` : details, economicsSha);
+  return terminalPostBody(tag ? `${tag} ${details}` : details);
 }
 
 async function postFinal(bus, message, envelope, state, evidence, economicsSha = null) {
@@ -555,6 +550,13 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
   // the intended uri, which must NOT be advertised. evidence_error is present whenever evidence
   // was attempted and did not fully land (upload or metadata POST).
   const landed = evidence?.uploaded === true;
+  // CCM-v0: the economics digest is a FIELD, next to evidence_sha256 — never free prose. Early
+  // blocker bodies are asserted byte-identical and their reasons are matched both `^`- and
+  // `$`-anchored, so a token spliced into the prose breaks one anchor or the other. Those
+  // terminals still write economics-summary.json to disk; only the digest does not travel.
+  const economicsDetails = typeof economicsSha === "string" && economicsSha
+    ? [`economics_sha256=${economicsSha}`]
+    : [];
   const evidenceDetails = evidence
     ? [
         landed ? `evidence_uri=${evidence.uri}` : undefined,
@@ -587,11 +589,12 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
     state.pr ? `pr=${state.pr}` : undefined,
     ...policyDetails,
     contractTag(state),
+    ...economicsDetails,
     ...evidenceDetails,
   ]
     .filter(Boolean)
     .join(" ");
-  const body = terminalPostBody(details, economicsSha);
+  const body = terminalPostBody(details);
   const options = { inReplyTo: message.message_id };
   const outcome = terminalOutcome(state.state);
   if (outcome !== null) options.outcome = outcome;
@@ -605,7 +608,7 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
     await bus.postTerminal(
       "status",
       subject,
-      terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`, economicsSha),
+      terminalPostBody(`${details} stop=instrument harness_stops=${stop.count} reason=instrument stop: ${stop.reason}`),
       options,
     );
   } else if (state.state === "BLOCKED" || state.state === "FAILED") {
@@ -615,10 +618,10 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
       ? `${details} harness_stops=${state.harness_stop.count} harness_stop_reason=${state.harness_stop.reason}`
       : details;
     const reason = state.outcome?.reason ? `${stops} reason=${state.outcome.reason}` : stops;
-    await bus.postTerminal("status", subject, terminalPostBody(reason, economicsSha), options);
+    await bus.postTerminal("status", subject, terminalPostBody(reason), options);
   } else {
     const statusBody = state.outcome?.reason
-      ? terminalPostBody(`${details} reason=${state.outcome.reason}`, economicsSha)
+      ? terminalPostBody(`${details} reason=${state.outcome.reason}`)
       : body;
     // postTerminal, not post: this branch is reached for UNVERIFIED, which is a terminal and
     // must carry a type. Using the untyped post here was the one path that could still emit a
@@ -798,7 +801,7 @@ async function processHandoff(
         outcome: { reason: error.message },
       });
       const econEarly = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: { ref: undefined }, lease: null, lifecycle, contractFields });
-      await bus.postTerminal("status", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`, econEarly.sha256), {
+      await bus.postTerminal("status", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
         inReplyTo: message.message_id,
         outcome: terminalOutcome(state),
       });
@@ -825,7 +828,7 @@ async function processHandoff(
       : `${limit} must be greater than zero, got ${limit === "budget_usd" ? envelope.budget_usd : envelope.max_runtime_s}`;
     lifecycle.transition("BLOCKED", { limit_tripped: limit, outcome: { reason: `invalid_bounds: ${why}` } });
     const econBounds = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
-    await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`, null, econBounds.sha256), {
+    await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`), {
       inReplyTo: message.message_id,
       outcome: "BLOCKED",
     });
@@ -836,7 +839,7 @@ async function processHandoff(
   if (!contractFields && envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
     const econDeadline = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
-    await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), "deadline is in the past", null, econDeadline.sha256), { inReplyTo: message.message_id, outcome: "BLOCKED" });
+    await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), "deadline is in the past"), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
   }
 
@@ -848,7 +851,7 @@ async function processHandoff(
     const reason = `provider_not_allowed: provider ${envelope.provider} is outside VINCI_WORKER_ALLOWED_PROVIDERS=${allowed}`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
     const econProvider = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
-    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason, econProvider.sha256), {
+    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), {
       inReplyTo: message.message_id,
       outcome: "BLOCKED",
     });
@@ -895,7 +898,7 @@ async function processHandoff(
     const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; a prose handoff does not pin the commit to fork from`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
     const econBase = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
-    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason, econBase.sha256), {
+    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), {
       inReplyTo: message.message_id,
       outcome: "BLOCKED",
     });
@@ -932,7 +935,7 @@ async function processHandoff(
     const reason = "clean_room_publish_unsupported: --clean-room publishes from the bare cache, which does not honour " + which + " and lacks the idempotent-retry, lease, read-back, foreign-PR and PR-head guarantees of the standard publisher; refusing before the run rather than publishing under guarantees that are not in force";
     lifecycle.transition("BLOCKED", { outcome: { reason } });
     const econClean = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
-    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason, econClean.sha256), { inReplyTo: message.message_id, outcome: "BLOCKED" });
+    await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
   }
 
@@ -1091,7 +1094,7 @@ async function processHandoff(
         const label = acquired.leased ? "Governor lease held elsewhere" : acquired.refused ? "Governor refused the lease" : "Governor lease unavailable";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
         const econGov = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
-        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`, null, econGov.sha256), {
+        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
           inReplyTo: message.message_id,
           outcome: "BLOCKED",
         });
@@ -1138,7 +1141,7 @@ async function processHandoff(
         await releaseLease("BLOCKED");
         const econClaim = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
         // F8: on the digest path this post carries contract=<id>@<digest8> like every other.
-        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`, null, econClaim.sha256), {
+        await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
           inReplyTo: message.message_id,
           outcome: "BLOCKED",
         });
@@ -1383,6 +1386,8 @@ async function processHandoff(
     // minimal payload with an `incomplete[]` list on malformed input.
     const economicsInput = {
       task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt },
+      // A governed handoff has no envelope.ref; its id is the contract's work_order_id.
+      workOrderId: contractFields?.work_order_id ?? envelopeToUse.ref ?? null,
       attemptLabel: `${taskId}/${attempt.attempt}`,
       lease: lease || null,
       sessionState: session,
@@ -1489,7 +1494,7 @@ async function processHandoff(
       lifecycle.transition("BLOCKED", { outcome: { reason: error.message } });
       await releaseLease("BLOCKED");
       const econCheckout = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
-      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `state=BLOCKED reason=${error.message}`, null, econCheckout.sha256), {
+      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `state=BLOCKED reason=${error.message}`), {
         inReplyTo: message.message_id,
         outcome: "BLOCKED",
       });
