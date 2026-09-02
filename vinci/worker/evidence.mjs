@@ -71,6 +71,9 @@ export async function uploadEvidence({
   // F6: extra bundle members by file name (`<attempt>.patch` for output: patch, artifacts.json
   // for output: artifact). Names are restricted to a single plain path component.
   extraFiles = {},
+  // WStep-3 economics: `{ summary, sha256 }` built by the worker terminal seam. For ledger refs
+  // these ride in the POST metadata so the ledger can reconstruct cost/custody per attempt.
+  economics = null,
 }) {
   if (!uriPrefix) return null;
 
@@ -135,6 +138,12 @@ export async function uploadEvidence({
         bytes,
         produced_at: new Date().toISOString(),
       };
+      // WStep-3: ledger-only economics metadata (ungoverned/unpriced tasks skip this whole branch
+      // and never POST). Both fields are inert when economics was not built (e.g. early blockers).
+      if (economics) {
+        if (economics.summary && typeof economics.summary === "object") metadata.economics_summary = economics.summary;
+        if (typeof economics.sha256 === "string") metadata.economics_sha256 = economics.sha256;
+      }
       // Read through the fence at POST time (a getter on the live lease), never a value captured
       // when the fence was built.
       const generation = fence?.generation ?? null;

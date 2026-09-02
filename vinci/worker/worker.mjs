@@ -22,6 +22,7 @@ import { BranchLeaseClient, branchLeaseFence } from "./branch-lease.mjs";
 import { composeFences } from "./publisher.mjs";
 import { readSessionState, summarizeUnattendedPolicy } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
+import { buildEconomicsSummary, canonicalJson, economicsSha256 } from "./economics.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
 
 // W0.5: the exact build this daemon runs from, computed once at startup. `version` keeps the
@@ -450,6 +451,110 @@ function terminalOutcome(lifecycleState) {
   return null;
 }
 
+
+
+// Emit economics-summary.json into attempt dir on early terminal paths (verifier BLOCKED,
+// envelope error, deadline-in-past) and on main path. Builds summary from whatever exists,
+// writes file, returns {summary, sha256}. Never throws.
+async function emitEconomics({
+  taskId,
+  attempt,
+  attemptDir,
+  stateDir,
+  envelopeToUse,
+  lease,
+  workerBuild: wb,
+  vinciBinary: vb,
+  started,
+  finished,
+  run,
+  contractFields,
+  published,
+  lifecycle,
+  sessionState = null,
+  sessionId = null,
+}) {
+  try {
+    // Build summary from the session when one exists. The session file is keyed by the attempt's
+    // sessionId (see the main path), never by the task id; without a sessionId there is no session.
+    const session = sessionState || (stateDir && sessionId ? readSessionState(join(stateDir, "sessions", taskId), sessionId) : null);
+    const economicsInput = {
+      task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt || attempt },
+      workOrderId: contractFields?.work_order_id ?? envelopeToUse?.ref ?? null,
+      attemptLabel: `${taskId}/${attempt.attempt || attempt}`,
+      lease: lease || null,
+      sessionState: session,
+      sessionId,
+      usageEntries: session?.usageEntries || [],
+      taskOutcome: null,
+      receipt: session?.outcome ?? null,
+      crewRan: session?.crewRan === true,
+      // Early terminals have no run result; the lifecycle already recorded what tripped.
+      run: run || { exit_code: lifecycle?.snapshot?.()?.exit_code ?? null, limit_tripped: lifecycle?.snapshot?.()?.limit_tripped ?? null, harness_stops: [] },
+      workerBuild: wb || workerBuild,
+      vinciBinary: vb || vinciBinary,
+      started: started || lifecycle?.snapshot?.()?.started_at || null,
+      finished: finished || lifecycle?.snapshot?.()?.finished_at || new Date().toISOString(),
+      work: contractFields ? {
+        class: contractFields.work_class,
+        risk_class: contractFields.risk_class,
+        repository: envelopeToUse.repo,
+        base_sha: contractFields.base_commit,
+        required_terminal: contractFields.required_terminal,
+      } : null,
+      changed_files: typeof published?.changed_files === "number" ? published.changed_files : null,
+      pr_number: typeof published?.pr === "number" ? published.pr : null,
+      taskState: lifecycle?.snapshot?.()?.state || lifecycle?.state || "BLOCKED",
+    };
+    const summary = buildEconomicsSummary(economicsInput);
+    const canonical = canonicalJson(summary);
+    const sha = economicsSha256(canonical);
+    
+    // Write to the attempt dir when one exists; early blockers (no clone, no attempt dir) land
+    // under <stateDir>/economics/<taskId>/ so a terminal without a bundle still leaves a summary.
+    const outDir = attemptDir || (stateDir ? join(stateDir, "economics", taskId) : null);
+    if (outDir) {
+      try {
+        mkdirSync(outDir, { recursive: true });
+        writeFileSync(join(outDir, "economics-summary.json"), canonical, "utf8");
+      } catch (e) {
+        // Fail silently; summary still built but not persisted
+      }
+    }
+    return { summary, sha256: sha };
+  } catch {
+    // Never throw; return empty summary
+    // A crashed emitter must still be JOINABLE: without the key the ledger records
+    // boundary:missing_key -> REFUSED against nothing, and the attempt's spend leaves the
+    // denominator entirely (charter §8.1). Carry the identity and say the measurement failed.
+    // (projects-11, bus msg_9438fe86.)
+    const degraded = {
+      schema: "vinci.work-order-economics-summary.v1",
+      work_order_id: contractFields?.work_order_id ?? envelopeToUse?.ref ?? null,
+      attempt_label: `${taskId}/${attempt?.attempt ?? attempt ?? 0}`,
+      route: { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] },
+      assets_consumed: [],
+      compactions: 0,
+      human_interventions: [],
+      local_result: {
+        task_state: null, verification_state: null, changed_files: null,
+        head_sha: null, pr_number: null, limit_tripped: null, harness_stop: null,
+      },
+      lineage: { root_objective_id: null, backlog_row_id: null, parent_work_order_id: null },
+      execution_world_ref: null,
+      capacity_events: null,
+      decision_refs: [],
+      measurement_cost: null,
+      incomplete: ["malformed_entries", "lineage_unbound", "execution_world_missing",
+        "capacity_unobserved", "measurement_cost_unknown"],
+      cost_reconstruction: "none",
+    };
+    if (lease?.lease_id) degraded.lease_id = lease.lease_id;
+    if (typeof lease?.fencing_generation === "number") degraded.fencing_generation = lease.fencing_generation;
+    return { summary: degraded, sha256: economicsSha256(canonicalJson(degraded)) };
+  }
+}
+
 function terminalPostBody(details) {
   return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
@@ -465,13 +570,20 @@ function blockerPostBody(record, details, fallback = null) {
   return terminalPostBody(tag ? `${tag} ${details}` : details);
 }
 
-async function postFinal(bus, message, envelope, state, evidence) {
+async function postFinal(bus, message, envelope, state, evidence, economicsSha = null) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
   // set by uploadEvidence solely after a successful `aws s3 cp`); a failed upload also carries
   // the intended uri, which must NOT be advertised. evidence_error is present whenever evidence
   // was attempted and did not fully land (upload or metadata POST).
   const landed = evidence?.uploaded === true;
+  // CCM-v0: the economics digest is a FIELD, next to evidence_sha256 — never free prose. Early
+  // blocker bodies are asserted byte-identical and their reasons are matched both `^`- and
+  // `$`-anchored, so a token spliced into the prose breaks one anchor or the other. Those
+  // terminals still write economics-summary.json to disk; only the digest does not travel.
+  const economicsDetails = typeof economicsSha === "string" && economicsSha
+    ? [`economics_sha256=${economicsSha}`]
+    : [];
   const evidenceDetails = evidence
     ? [
         landed ? `evidence_uri=${evidence.uri}` : undefined,
@@ -504,6 +616,7 @@ async function postFinal(bus, message, envelope, state, evidence) {
     state.pr ? `pr=${state.pr}` : undefined,
     ...policyDetails,
     contractTag(state),
+    ...economicsDetails,
     ...evidenceDetails,
   ]
     .filter(Boolean)
@@ -691,9 +804,10 @@ async function processHandoff(
         { workerBuild, serverBuild, vinciBinary },
       );
       lifecycle.transition("BLOCKED", { outcome: { reason } });
+      const econTriple = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: { ref: undefined }, lease: null, lifecycle, contractFields: null });
       // B7: a malformed post (the triple could not even be parsed) still carries `contract=malformed`;
       // a parsed triple whose registry answer refused carries the work_order_id@digest8 tag.
-      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(triple ?? null, `state=BLOCKED reason=${reason}`, "contract=malformed"), {
+      await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(triple ?? null, `state=BLOCKED reason=${reason}`, "contract=malformed", econTriple.sha256), {
         inReplyTo: message.message_id,
         outcome: "BLOCKED",
       });
@@ -713,6 +827,7 @@ async function processHandoff(
         limit_tripped: /budget_usd/.test(error.message) ? "budget_usd" : null,
         outcome: { reason: error.message },
       });
+      const econEarly = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: { ref: undefined }, lease: null, lifecycle, contractFields });
       await bus.postTerminal("status", `task ${taskId} ${state.toLowerCase()}`, terminalPostBody(`state=${state} reason=${error.message}`), {
         inReplyTo: message.message_id,
         outcome: terminalOutcome(state),
@@ -739,6 +854,7 @@ async function processHandoff(
       ? `deadline ${envelope.deadline} is not in the future`
       : `${limit} must be greater than zero, got ${limit === "budget_usd" ? envelope.budget_usd : envelope.max_runtime_s}`;
     lifecycle.transition("BLOCKED", { limit_tripped: limit, outcome: { reason: `invalid_bounds: ${why}` } });
+    const econBounds = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
     await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `invalid_bounds budget_usd=${envelope.budget_usd} max_runtime_s=${envelope.max_runtime_s} deadline=${envelope.deadline ?? "none"}`), {
       inReplyTo: message.message_id,
       outcome: "BLOCKED",
@@ -749,6 +865,7 @@ async function processHandoff(
   // Prose handoff: only deadline is checked (budget and runtime have safe defaults from parseEnvelope).
   if (!contractFields && envelope.deadline && Date.parse(envelope.deadline) <= Date.now()) {
     lifecycle.transition("BLOCKED", { limit_tripped: "deadline", outcome: { reason: "deadline is in the past" } });
+    const econDeadline = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
     await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), "deadline is in the past"), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
   }
@@ -760,6 +877,7 @@ async function processHandoff(
     const allowed = [...allowedProviders].sort().join(",");
     const reason = `provider_not_allowed: provider ${envelope.provider} is outside VINCI_WORKER_ALLOWED_PROVIDERS=${allowed}`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
+    const econProvider = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
     await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), {
       inReplyTo: message.message_id,
       outcome: "BLOCKED",
@@ -806,6 +924,7 @@ async function processHandoff(
   if (!contractFields && !cleanRoom && envelope.base_ref !== undefined && envelope.base_ref !== "main") {
     const reason = `base_ref_unsupported: base_ref ${envelope.base_ref} is not main; a prose handoff does not pin the commit to fork from`;
     lifecycle.transition("BLOCKED", { outcome: { reason } });
+    const econBase = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
     await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), {
       inReplyTo: message.message_id,
       outcome: "BLOCKED",
@@ -842,6 +961,7 @@ async function processHandoff(
       : governorUrl ? "a Governor fence" : "a branch lease";
     const reason = "clean_room_publish_unsupported: --clean-room publishes from the bare cache, which does not honour " + which + " and lacks the idempotent-retry, lease, read-back, foreign-PR and PR-head guarantees of the standard publisher; refusing before the run rather than publishing under guarantees that are not in force";
     lifecycle.transition("BLOCKED", { outcome: { reason } });
+    const econClean = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: null, lifecycle, contractFields });
     await bus.postTerminal("status", `task ${taskId} blocked`, terminalPostBody(reason), { inReplyTo: message.message_id, outcome: "BLOCKED" });
     return true;
   }
@@ -1000,6 +1120,7 @@ async function processHandoff(
         const governor = acquired.leased ? "leased" : acquired.refused ? "refused" : "unavailable";
         const label = acquired.leased ? "Governor lease held elsewhere" : acquired.refused ? "Governor refused the lease" : "Governor lease unavailable";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor } });
+        const econGov = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
         await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
           inReplyTo: message.message_id,
           outcome: "BLOCKED",
@@ -1045,6 +1166,7 @@ async function processHandoff(
         const label = governor === "refused" ? "Governor refused the lease" : "Governor unavailable/invalid";
         lifecycle.transition("BLOCKED", { outcome: { reason, governor }, lease: { ...lifecycle.snapshot().lease, ...lease } });
         await releaseLease("BLOCKED");
+        const econClaim = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
         // F8: on the digest path this post carries contract=<id>@<digest8> like every other.
         await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `${label}: ${reason}`), {
           inReplyTo: message.message_id,
@@ -1132,7 +1254,8 @@ async function processHandoff(
         const reason = `branch_lease_refused: ${acquired.reason}`;
         lifecycle.transition("BLOCKED", { outcome: { reason }, publish: "skipped", pr: null, fenced_out: reason });
         await releaseLease("BLOCKED");
-        await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null);
+        const econBranch = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
+        await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econBranch.sha256);
         return true;
       }
       branchLease = acquired.lease;
@@ -1151,7 +1274,8 @@ async function processHandoff(
       // release `abandoned` — a resumed attempt re-acquires.
       lifecycle.transition("BLOCKED", { outcome: { reason: authorityLost }, publish: "skipped", pr: null, fenced_out: authorityLost, lease: { ...lifecycle.snapshot().lease, ...lease } });
       await releaseLease("BLOCKED");
-      await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null);
+      const econLost = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
+      await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econLost.sha256);
       return true;
     }
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
@@ -1284,6 +1408,57 @@ async function processHandoff(
     // runs AFTER the evidence upload below, because only an uploaded attempt is prunable (F6).
     if (cleanRoom) sealAttemptDir(repository.attemptDir);
     const logTail = recentLogTail(200);
+    // WStep-3 economics: build the canonical work-order economics summary BEFORE evidence so the
+    // bundle always carries economics-summary.json. Never throws: buildEconomicsSummary returns a
+    // minimal payload with an `incomplete[]` list on malformed input.
+    const economicsInput = {
+      task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt },
+      // A governed handoff has no envelope.ref; its id is the contract's work_order_id.
+      workOrderId: contractFields?.work_order_id ?? envelopeToUse.ref ?? null,
+      attemptLabel: `${taskId}/${attempt.attempt}`,
+      lease: lease || null,
+      sessionState: session,
+      usageEntries: session.usageEntries || [],
+      taskOutcome: { head_sha: head ?? null },
+      sessionId: attempt.sessionId ?? null,
+      receipt: session.outcome ?? null,
+      crewRan: session.crewRan === true,
+      run: {
+        exit_code: run?.exit_code ?? null,
+        limit_tripped: run?.limit_tripped ?? null,
+        harness_stops: run?.harness_stops ?? [],
+      },
+      workerBuild,
+      vinciBinary,
+      // The lifecycle stamped the attempt start; the terminal is now.
+      started: lifecycle.snapshot().started_at ?? run?.started_at ?? null,
+      finished: lifecycle.snapshot().finished_at ?? new Date().toISOString(),
+      work: contractFields ? {
+        class: contractFields.work_class,
+        risk_class: contractFields.risk_class,
+        repository: envelopeToUse.repo,
+        base_sha: contractFields.base_commit,
+        required_terminal: contractFields.required_terminal,
+      } : null,
+      changed_files: typeof published?.changed_files === "number" ? published.changed_files : null,
+      pr_number: typeof published?.pr === "number" ? published.pr : null,
+      taskState: intendedState,
+    };
+    const economicsSummary = buildEconomicsSummary(economicsInput);
+    const economicsCanonical = canonicalJson(economicsSummary);
+    const economicsSha = economicsSha256(economicsCanonical);
+    extraFiles["economics-summary.json"] = economicsCanonical;
+    resultJson.economics_sha256 = economicsSha;
+    // Local copy beside the attempt: a box without VINCI_EVIDENCE_URI_PREFIX uploads nothing, and
+    // the runs that actually spent must not be the only ones that leave no file behind.
+    try {
+      // Clean-room runs have an attempt dir; standard runs land beside the early-terminal copies.
+      const localDir = repository?.attemptDir ?? join(stateDir, "economics", taskId);
+      mkdirSync(localDir, { recursive: true });
+      writeFileSync(join(localDir, "economics-summary.json"), economicsCanonical, "utf8");
+    } catch {
+      // the bundle copy is the primary; a failed local write is not a terminal failure
+    }
     const evidenceResult = await uploadEvidence({
       sessionJsonl,
       gitDiff,
@@ -1295,6 +1470,7 @@ async function processHandoff(
       busToken: bus.token,
       ref: envelopeToUse.ref,
       fence: lease ? fence : null,
+      economics: { summary: economicsSummary, sha256: economicsSha },
       extraFiles,
     });
 
@@ -1331,7 +1507,7 @@ async function processHandoff(
     // L4: release with the committed state's outcome, BEFORE the final post so the lease is not
     // held across a bus retry. A release failure is logged; the state above is already final.
     await releaseLease(state);
-    await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult);
+    await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult, economicsSha);
   } catch (error) {
     // A terminal state is immutable: if the failure happened after it was committed (e.g. the
     // final bus post), surface the error to the daemon loop instead of rewriting the record.
@@ -1344,6 +1520,7 @@ async function processHandoff(
     if (typeof error?.blockedReason === "string") {
       lifecycle.transition("BLOCKED", { outcome: { reason: error.message } });
       await releaseLease("BLOCKED");
+      const econCheckout = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
       await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `state=BLOCKED reason=${error.message}`), {
         inReplyTo: message.message_id,
         outcome: "BLOCKED",
@@ -1352,7 +1529,9 @@ async function processHandoff(
     }
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
     await releaseLease("FAILED");
-    await postFinal(bus, message, envelope, lifecycle.snapshot(), null);
+    // A session may already have run and spent here (exception after runVinci): read it.
+    const econFailed = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
+    await postFinal(bus, message, envelope, lifecycle.snapshot(), null, econFailed.sha256);
   }
   return true;
 }
