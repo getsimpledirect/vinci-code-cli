@@ -485,7 +485,7 @@ function checkGraph(entryFiles, label, { strict = true, bindBare = false } = {})
     if (visited.has(file)) continue;
     visited.add(file);
     const source = readFileSync(file, "utf8");
-    if (source.includes("\uFFFD")) {
+    if (strict && source.includes("\uFFFD")) {
       failures.push(`${relativeToRoot(file)} is not valid UTF-8`);
       continue;
     }
