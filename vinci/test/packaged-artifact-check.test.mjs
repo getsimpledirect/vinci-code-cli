@@ -831,26 +831,26 @@ test("external package imports cannot resolve from a malicious parent node_modul
 test("every declared package export binds bare imports to the artifact", () => {
 	const { outer, root } = nestedFixture();
 	write(
-		join(root, "node_modules", "runtime", "package.json"),
+		join(root, "packages", "coding-agent", "package.json"),
 		JSON.stringify({
-			name: "runtime",
+			name: "@earendil-works/pi-coding-agent",
 			type: "module",
-			main: "./index.js",
-			exports: { ".": "./index.js", "./rpc-entry": "./rpc-entry.js" },
+			main: "./dist/index.js",
+			exports: { ".": "./dist/index.js", "./rpc-entry": "./dist/rpc-entry.js" },
 		}),
 	);
-	write(join(root, "node_modules", "runtime", "index.js"), "export const runtime = true;\n");
+	write(join(root, "packages", "coding-agent", "dist", "index.js"), "export const runtime = true;\n");
 	write(
-		join(root, "node_modules", "runtime", "rpc-entry.js"),
+		join(root, "packages", "coding-agent", "dist", "rpc-entry.js"),
 		'import { marker } from "tsx";\nconsole.log(marker);\n',
 	);
-	authorize(root, "node_modules/runtime");
+	authorize(root, "packages/coding-agent");
 	write(
 		join(outer, "node_modules", "tsx", "package.json"),
 		JSON.stringify({ name: "tsx", type: "module", exports: "./index.js" }),
 	);
 	write(join(outer, "node_modules", "tsx", "index.js"), 'export const marker = "PARENT_TSX_EXECUTED";\n');
-	expectFailure(run(root), /runtime\/rpc-entry\.js -> tsx resolves outside the artifact root/);
+	expectFailure(run(root), /coding-agent\/dist\/rpc-entry\.js -> tsx resolves outside the artifact root/);
 
 	write(
 		join(root, "node_modules", "tsx", "package.json"),
@@ -860,7 +860,7 @@ test("every declared package export binds bare imports to the artifact", () => {
 	authorize(root, "node_modules/tsx");
 	const restored = run(root);
 	assert.equal(restored.status, 0, restored.stderr);
-	const reached = spawnSync(process.execPath, [join(root, "node_modules", "runtime", "rpc-entry.js")], {
+	const reached = spawnSync(process.execPath, [join(root, "packages", "coding-agent", "dist", "rpc-entry.js")], {
 		cwd: outer,
 		encoding: "utf8",
 		timeout: 10_000,

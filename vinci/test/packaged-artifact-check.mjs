@@ -992,6 +992,9 @@ function collectConditionalTargets(value, label, targets) {
 function validatePackageManifest(manifestPath) {
   const relativeManifest = relativeToRoot(manifestPath);
   const packageRoot = dirname(manifestPath);
+  const isRuntimeWorkspace = /^packages\/(?:agent|ai|coding-agent|orchestrator|tui)\/package\.json$/.test(
+    relativeManifest,
+  );
   let manifest;
   try {
     manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -1022,7 +1025,12 @@ function validatePackageManifest(manifestPath) {
         const resolution = resolveBareSpecifier(manifestPath, target, false);
         if (resolution.error) {
           authorityFailures.push(`${relativeManifest} ${label} external target ${target} ${resolution.error}`);
-        } else if (resolution.path && /\.(?:cjs|js|mjs|ts)$/.test(resolution.path)) {
+        } else if (
+          isRuntimeWorkspace
+          && resolution.path
+          && /\.(?:cjs|js|mjs|ts)$/.test(resolution.path)
+          && !/\.d\.(?:cts|mts|ts)$/.test(resolution.path)
+        ) {
           packageEntryFiles.add(resolution.path);
         }
         continue;
@@ -1050,7 +1058,14 @@ function validatePackageManifest(manifestPath) {
       continue;
     }
     const canonical = containedCanonicalRelative(root, targetPath, `${relativeManifest} ${label} target ${target}`);
-    if (canonical !== null && /\.(?:cjs|js|mjs|ts)$/.test(targetPath)) packageEntryFiles.add(targetPath);
+    if (
+      isRuntimeWorkspace
+      && canonical !== null
+      && /\.(?:cjs|js|mjs|ts)$/.test(targetPath)
+      && !/\.d\.(?:cts|mts|ts)$/.test(targetPath)
+    ) {
+      packageEntryFiles.add(targetPath);
+    }
   }
 }
 
