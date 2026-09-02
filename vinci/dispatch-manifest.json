@@ -1,0 +1,20 @@
+{
+  "schema": "vinci.launcher-dispatches/v1",
+  "dispatches": [
+    {
+      "command": "report-wrong",
+      "kind": "node",
+      "target": "scripts/report-wrong.mjs"
+    },
+    {
+      "command": "verify",
+      "kind": "external",
+      "targetVariable": "_vinci_vac_cli"
+    },
+    {
+      "command": "worker",
+      "kind": "node",
+      "target": "worker/worker.mjs"
+    }
+  ]
+}

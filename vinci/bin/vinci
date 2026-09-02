@@ -286,6 +286,7 @@ esac
 # provider, or authentication setup so reporting never spends credits or makes a network request.
 if [ "${1:-}" = "report-wrong" ]; then
   shift
+  # vinci-dispatch: report-wrong
   exec node "${VINCI}/scripts/report-wrong.mjs" "$@"
 fi
 
@@ -302,6 +303,7 @@ if [ "${1:-}" = "verify" ]; then
     echo "Verification isn't set up yet. Install the Vinci Acceptance CLI, then run vinci verify again." >&2
     exit 127
   fi
+  # vinci-dispatch: verify
   exec "${_vinci_vac_cli}" "$@"
 fi
 
@@ -309,6 +311,7 @@ fi
 # setup so it needs only Node, its bus token, and the credentials used by its child processes.
 if [ "${1:-}" = "worker" ]; then
   shift
+  # vinci-dispatch: worker
   exec node "${VINCI}/worker/worker.mjs" "$@"
 fi
 

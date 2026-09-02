@@ -48,7 +48,7 @@ tar -czf "${TGZ}" -C "${ROOT}" \
   packages/orchestrator/dist packages/orchestrator/package.json \
   packages/tui/dist packages/tui/package.json \
   vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater vinci/worker \
-  vinci/scripts/report-wrong.mjs vinci/identity.json vinci/NOTICE \
+  vinci/scripts/report-wrong.mjs vinci/dispatch-manifest.json vinci/identity.json vinci/NOTICE \
   package.json node_modules
 
 cp "${TGZ}" "${CURRENT_TGZ}"

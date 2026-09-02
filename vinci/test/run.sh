@@ -245,6 +245,7 @@ run_cli_supervised() (
 
 echo "── UNIT ──────────────────────────────────────────────"
 run_group identity-contract node "${ROOT}/vinci/test/identity-contract.mjs"
+run_group packaged-artifact-check node --test "${ROOT}/vinci/test/packaged-artifact-check.test.mjs"
 run_group deepinfra-provider-integration node "${ROOT}/vinci/test/deepinfra-provider-integration.mjs"
 # BYOK: the launcher's provider-flag matrix, and proof that a BYOK session keeps every VINCI_CODE
 # guard. Both existed and passed for a while WITHOUT being listed here, so the aggregate gate was
