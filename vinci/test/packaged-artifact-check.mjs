@@ -271,18 +271,33 @@ function scanShellCommands(source) {
   return commands;
 }
 
+const nonDispatchCommands = new Set([
+  "[", "test", "echo", "printf", "sed", "head", "tail", "cat", "cp", "mv", "rm", "chmod", "dirname", "readlink", "basename",
+]);
+for (const [index, line] of launcherLines.entries()) {
+  if (
+    !reviewedDispatchLines.has(index + 1)
+    && /(?:\$\(|`).*?(?:\$VINCI|\$\{VINCI\})\/[^\r\n]*?\.(?:cjs|js|mjs|sh|ts)(?:["'`)};\s]|$)/.test(line)
+  ) {
+    refuse("launcher contains an unmanifested executable dispatch", [`line ${index + 1}: ${line.trim()}`]);
+  }
+}
 for (const command of scanShellCommands(launcherSource)) {
   const hasVinciExecutable = command.words.some(({ value }) => (
     /^(?:\$VINCI|\$\{VINCI\})\/.+\.(?:cjs|js|mjs|sh|ts)$/.test(value)
   ));
   const directlyRunsVinciExecutable = hasVinciExecutable && (
-    /(?:^|\/)node$/.test(command.command)
-    || command.command === "env"
-    || command.command === "command"
-    || (command.command.startsWith("$") && command.command !== "${PI[@]}")
+    command.command !== "${PI[@]}" && !nonDispatchCommands.has(command.command)
   );
+  const nestedVinciDispatch = command.words.some(({ value }) => (
+    (value.includes("$(") || value.includes("`"))
+    && /(?:\$VINCI|\$\{VINCI\})\//.test(value)
+  ));
   const directlyRunsVac = command.command === "${_vinci_vac_cli}";
-  if ((command.command === "exec" || directlyRunsVinciExecutable || directlyRunsVac) && !reviewedDispatchLines.has(command.line)) {
+  if (
+    (command.command === "exec" || directlyRunsVinciExecutable || nestedVinciDispatch || directlyRunsVac)
+    && !reviewedDispatchLines.has(command.line)
+  ) {
     refuse("launcher contains an unmanifested executable dispatch", [
       `line ${command.line}: ${command.words.map(({ value }) => value).join(" ")}`,
     ]);

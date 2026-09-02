@@ -148,6 +148,18 @@ test("a non-exec Node dispatch cannot bypass dispatch discovery", () => {
   expectFailure(run(root), /unmanifested executable dispatch/);
 });
 
+test("alternate runners and nested command substitutions cannot bypass dispatch discovery", () => {
+  for (const addition of [
+    'bash "${VINCI}/missing.sh"',
+    'result="$(node "${VINCI}/missing.mjs")"',
+    'result="`node "${VINCI}/missing.mjs"`"',
+  ]) {
+    const root = fixture();
+    write(join(root, "vinci", "bin", "vinci"), `${launcher}\n${addition}\n`);
+    expectFailure(run(root), /unmanifested executable dispatch/);
+  }
+});
+
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
   const cases = [
     { value: null, pattern: /wrong schema or no dispatches/ },
