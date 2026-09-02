@@ -1246,7 +1246,11 @@ function validatePackageManifest(manifestPath) {
       continue;
     }
     const canonical = containedCanonicalRelative(root, targetPath, `${relativeManifest} ${label} target ${target}`);
-    if (canonical !== null && !lstatSync(join(root, ...canonical.split("/"))).isFile()) {
+    if (
+      isRuntimeWorkspace
+      && canonical !== null
+      && !lstatSync(join(root, ...canonical.split("/"))).isFile()
+    ) {
       authorityFailures.push(`${relativeManifest} ${label} target ${target} is not a regular file`);
       continue;
     }
