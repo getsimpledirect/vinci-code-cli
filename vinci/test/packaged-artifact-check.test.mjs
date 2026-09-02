@@ -869,6 +869,31 @@ test("every declared package export binds bare imports to the artifact", () => {
 	assert.match(reached.stdout, /PACKAGED_TSX_EXECUTED/);
 });
 
+test("wildcard workspace exports bind every concrete executable target", () => {
+	const { outer, root } = nestedFixture();
+	write(
+		join(root, "packages", "coding-agent", "package.json"),
+		JSON.stringify({
+			name: "@earendil-works/pi-coding-agent",
+			type: "module",
+			main: "./dist/index.js",
+			exports: { ".": "./dist/index.js", "./rpc/*": "./dist/*.js" },
+		}),
+	);
+	write(join(root, "packages", "coding-agent", "dist", "index.js"), "export const runtime = true;\n");
+	write(
+		join(root, "packages", "coding-agent", "dist", "evil.js"),
+		'import { marker } from "tsx";\nconsole.log(marker);\n',
+	);
+	authorize(root, "packages/coding-agent");
+	write(
+		join(outer, "node_modules", "tsx", "package.json"),
+		JSON.stringify({ name: "tsx", type: "module", exports: "./index.js" }),
+	);
+	write(join(outer, "node_modules", "tsx", "index.js"), 'export const marker = "PARENT_TSX_EXECUTED";\n');
+	expectFailure(run(root), /coding-agent\/dist\/evil\.js -> tsx resolves outside the artifact root/);
+});
+
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
 	const cases = [
 		{ value: null, pattern: /wrong schema or no dispatches/ },
@@ -1091,6 +1116,25 @@ test("the authority snapshot must match Git HEAD even when status is transiently
 	write(join(authorityRoot, relativePath), replacement);
 	assert.equal(git(authorityRoot, ["status", "--porcelain=v1", "--untracked-files=no"]), "");
 	expectFailure(run(root, tmpdir(), { seal: false }), /authority file does not match Git HEAD/);
+});
+
+test("ignored executable authority cannot substitute for immutable Git or build inputs", () => {
+	const root = fixture();
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	write(
+		join(root, "packages", "coding-agent", "package.json"),
+		JSON.stringify({
+			name: "@earendil-works/pi-coding-agent",
+			type: "module",
+			main: "./dist/index.js",
+		}),
+	);
+	write(join(root, "packages", "coding-agent", "dist", "index.js"), "export const runtime = true;\n");
+	authorize(root, "packages/coding-agent/package.json");
+	write(join(authorityRoot, ".gitignore"), "packages/*/dist/\n");
+	write(join(authorityRoot, "packages", "coding-agent", "dist", "index.js"), "export const runtime = true;\n");
+	expectFailure(run(root), /packages\/coding-agent\/dist\/index\.js authority file is not tracked by Git HEAD/);
 });
 
 test("artifact resolution is independent of the caller working directory", () => {

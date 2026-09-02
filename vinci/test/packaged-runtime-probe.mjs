@@ -24,9 +24,12 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
 const authorityRoot = process.env.VINCI_PACKAGED_AUTHORITY_ROOT ?? repositoryRoot;
 const checker = process.env.VINCI_PACKAGED_CHECKER
 	?? join(repositoryRoot, "vinci", "test", "packaged-artifact-check.mjs");
+const authorityNpmCache = process.env.npm_config_cache
+	?? (process.env.HOME ? join(process.env.HOME, ".npm") : undefined);
 const cleanEnv = {
 	...process.env,
 	HOME: mkdtempSync(join(tmpdir(), "vinci-packaged-probe-home-")),
+	...(authorityNpmCache ? { npm_config_cache: authorityNpmCache } : {}),
 	VINCI_NO_BOOTSTRAP_HEAL: "1",
 	VINCI_UPDATE_DISABLED: "1",
 };
@@ -45,7 +48,7 @@ try {
 		cwd: tmpdir(),
 		encoding: "utf8",
 		env: { ...cleanEnv, VINCI_PACKAGED_AUTHORITY_ROOT: authorityRoot },
-		timeout: 30_000,
+		timeout: 120_000,
 	});
 	assert.equal(checked.status, 0, output(checked));
 
@@ -96,7 +99,7 @@ try {
 		cwd: tmpdir(),
 		encoding: "utf8",
 		env: { ...cleanEnv, VINCI_PACKAGED_AUTHORITY_ROOT: authorityRoot },
-		timeout: 30_000,
+		timeout: 120_000,
 	});
 	assert.equal(malformed.status, 1, output(malformed));
 	assert.match(

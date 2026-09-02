@@ -8,15 +8,18 @@
 import {
   existsSync,
   lstatSync,
+  mkdtempSync,
   readFileSync,
   readlinkSync,
   readdirSync,
   realpathSync,
+  rmSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { isBuiltin } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { parse } from "unbash";
@@ -46,12 +49,12 @@ if (
 ) {
   refuse("trusted executable authority root must be a real directory");
 }
-const authorityRoot = realpathSync(suppliedAuthorityRoot);
+const authorityGitRoot = realpathSync(suppliedAuthorityRoot);
 
 const expectedAuthorityRepository = "https://github.com/getsimpledirect/vinci-code-cli";
 
 function gitOutput(args) {
-  const result = spawnSync("git", ["-C", authorityRoot, ...args], {
+  const result = spawnSync("git", ["-C", authorityGitRoot, ...args], {
     encoding: "utf8",
     env: { PATH: process.env.PATH ?? "" },
     timeout: 10_000,
@@ -74,7 +77,7 @@ function normalizedRemote(remote) {
 
 function readAuthorityGitIdentity() {
   const topLevel = realpathSync(gitOutput(["rev-parse", "--show-toplevel"]));
-  if (topLevel !== authorityRoot) {
+  if (topLevel !== authorityGitRoot) {
     refuse("trusted executable authority root must be the Git worktree root", [topLevel]);
   }
   const remote = normalizedRemote(gitOutput(["remote", "get-url", "origin"]));
@@ -93,7 +96,7 @@ function readAuthorityGitIdentity() {
 const initialAuthorityGitIdentity = readAuthorityGitIdentity();
 
 function readTrackedAuthorityEntries() {
-  const result = spawnSync("git", ["-C", authorityRoot, "ls-tree", "-rz", "--full-tree", "HEAD"], {
+  const result = spawnSync("git", ["-C", authorityGitRoot, "ls-tree", "-rz", "--full-tree", "HEAD"], {
     encoding: "buffer",
     env: { PATH: process.env.PATH ?? "" },
     timeout: 10_000,
@@ -116,6 +119,70 @@ if (authorityObjectFormat !== "sha1" && authorityObjectFormat !== "sha256") {
   refuse("trusted executable authority uses an unsupported Git object format", [authorityObjectFormat]);
 }
 const trackedAuthorityEntries = readTrackedAuthorityEntries();
+
+// A clean Git status is an authority for tracked source, but not for ignored build output or
+// node_modules. Reconstruct the real release tree from immutable HEAD blobs and lockfile-verified
+// packages so a concurrent replacement of ignored executable content cannot become the reference
+// that an attacker-controlled artifact is compared against. Small synthetic test authorities do
+// not have the production build contract; for those, every shipped byte must be tracked instead.
+const productionAuthorityMarkers = [
+  "package-lock.json",
+  "vinci/build.sh",
+  "vinci/identity.json",
+  "packages/agent/package.json",
+  "packages/ai/package.json",
+  "packages/coding-agent/package.json",
+  "packages/orchestrator/package.json",
+  "packages/tui/package.json",
+];
+const reconstructAuthority = productionAuthorityMarkers.every((path) => trackedAuthorityEntries.has(path));
+let reconstructedAuthorityRoot = null;
+
+function checkedCommand(command, args, options, label) {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    env: { ...process.env, HUSKY: "0" },
+    timeout: 120_000,
+    maxBuffer: 100 * 1024 * 1024,
+    ...options,
+  });
+  if (result.status !== 0) {
+    refuse(`trusted executable authority ${label} failed`, [
+      `${command} ${args.join(" ")}: ${(result.stderr || result.stdout || "failed").trim()}`,
+    ]);
+  }
+  return result;
+}
+
+if (reconstructAuthority) {
+  reconstructedAuthorityRoot = realpathSync(mkdtempSync(join(tmpdir(), "vinci-packaged-authority-head-")));
+  process.on("exit", () => rmSync(reconstructedAuthorityRoot, { recursive: true, force: true }));
+  const archive = checkedCommand(
+    "git",
+    ["-C", authorityGitRoot, "archive", "--format=tar", initialAuthorityGitIdentity.commit],
+    { encoding: "buffer" },
+    "Git archive",
+  );
+  checkedCommand(
+    "tar",
+    ["-xf", "-", "-C", reconstructedAuthorityRoot],
+    { input: archive.stdout },
+    "Git archive extraction",
+  );
+  checkedCommand(
+    "npm",
+    ["ci", "--offline", "--no-audit", "--no-fund"],
+    { cwd: reconstructedAuthorityRoot },
+    "locked dependency reconstruction",
+  );
+  checkedCommand(
+    "bash",
+    [join(reconstructedAuthorityRoot, "vinci", "build.sh")],
+    { cwd: reconstructedAuthorityRoot },
+    "build reconstruction",
+  );
+}
+const authorityRoot = reconstructedAuthorityRoot ?? authorityGitRoot;
 
 function gitBlobObject(contents) {
   return createHash(authorityObjectFormat)
@@ -940,9 +1007,7 @@ function isAllowedReleasePath(relativePath) {
 const authoritySnapshot = new Map();
 
 function requiresGitHeadBinding(relativePath) {
-  return relativePath === "package.json"
-    || relativePath.startsWith("vinci/")
-    || /^packages\/(?:agent|ai|coding-agent|orchestrator|tui)\/package\.json$/.test(relativePath);
+  return !reconstructAuthority;
 }
 
 function snapshotAuthorityEntry(relativePath) {
@@ -1051,6 +1116,38 @@ function collectConditionalTargets(value, label, targets) {
   authorityFailures.push(`${label} has an invalid package entry target`);
 }
 
+function wildcardTargetPattern(target) {
+  let source = "^";
+  let captures = 0;
+  for (const character of target) {
+    if (character === "*") {
+      source += captures === 0 ? "(.+)" : "\\1";
+      captures += 1;
+    } else {
+      source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+    }
+  }
+  return new RegExp(`${source}$`);
+}
+
+function concreteWildcardTargets(packageRoot, normalized) {
+  const pattern = wildcardTargetPattern(normalized);
+  const matches = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory).sort()) {
+      const path = join(directory, entry);
+      const stat = lstatSync(path);
+      if (stat.isDirectory() && !stat.isSymbolicLink()) visit(path);
+      else if (stat.isFile()) {
+        const packageRelative = relative(packageRoot, path).split(sep).join("/");
+        if (pattern.test(packageRelative)) matches.push(path);
+      }
+    }
+  };
+  visit(packageRoot);
+  return matches;
+}
+
 function validatePackageManifest(manifestPath) {
   const relativeManifest = relativeToRoot(manifestPath);
   const packageRoot = dirname(manifestPath);
@@ -1106,8 +1203,23 @@ function validatePackageManifest(manifestPath) {
       continue;
     }
     if (normalized.includes("*")) {
-      // A subpath wildcard describes an open set of caller-supplied substitutions. There is no
-      // finite target to require here; its normalized, package-relative prefix is still checked.
+      // Expand the open caller substitution over the finite shipped package. Every concrete
+      // executable target is an entry point and must have its complete static import graph bound.
+      for (const targetPath of concreteWildcardTargets(packageRoot, normalized)) {
+        const canonical = containedCanonicalRelative(
+          root,
+          targetPath,
+          `${relativeManifest} ${label} wildcard target ${target}`,
+        );
+        if (
+          isRuntimeWorkspace
+          && canonical !== null
+          && /\.(?:cjs|js|mjs|ts)$/.test(targetPath)
+          && !/\.d\.(?:cts|mts|ts)$/.test(targetPath)
+        ) {
+          packageEntryFiles.add(targetPath);
+        }
+      }
       continue;
     }
     let targetPath = join(packageRoot, ...normalized.split("/"));
