@@ -76,25 +76,21 @@ function rollupUsage(entries, flags) {
         output_tokens: 0,
         reasoning_tokens: 0,
         cost_microusd: 0,
-        // model_calls outside any responseId (no dedup key available) accumulate directly;
-        // responseId-keyed calls are tallied once per unique id so a duplicated response is one
-        // call, not two.
-        direct_model_calls: 0,
-        response_calls: new Map(),
+        // A responseId names one provider response. The accumulator persists an entry per call and
+        // a killed session can replay the same response into two entries; the WHOLE duplicate is
+        // skipped (calls, tokens and cost), otherwise cost double-counts while calls do not.
+        seen_response_ids: new Set(),
         cost_basis: null,
         cost_confidence: null,
       };
       rollup.set(key, group);
     }
 
-    if (typeof entry.model_calls === "number" && entry.model_calls > 0) {
-      if (typeof entry.responseId === "string" && entry.responseId) {
-        // First write wins per responseId: a duplicated response contributes its call count once.
-        if (!group.response_calls.has(entry.responseId)) group.response_calls.set(entry.responseId, entry.model_calls);
-      } else {
-        group.direct_model_calls += entry.model_calls;
-      }
+    if (typeof entry.responseId === "string" && entry.responseId) {
+      if (group.seen_response_ids.has(entry.responseId)) continue;
+      group.seen_response_ids.add(entry.responseId);
     }
+    if (typeof entry.model_calls === "number" && entry.model_calls > 0) group.model_calls += entry.model_calls;
     if (typeof entry.input_tokens === "number") group.input_tokens += entry.input_tokens;
     if (typeof entry.cached_read_tokens === "number") group.cached_read_tokens += entry.cached_read_tokens;
     if (typeof entry.cache_write_tokens === "number") group.cache_write_tokens += entry.cache_write_tokens;
@@ -108,15 +104,13 @@ function rollupUsage(entries, flags) {
 
   const result = [];
   for (const group of rollup.values()) {
-    let modelCalls = group.direct_model_calls;
-    for (const calls of group.response_calls.values()) modelCalls += calls;
     result.push({
       phase: group.phase,
       cost_category: group.cost_category,
       provider: group.provider,
       model: group.model,
       source: group.source,
-      model_calls: modelCalls,
+      model_calls: group.model_calls,
       input_tokens: group.input_tokens,
       cached_read_tokens: group.cached_read_tokens,
       cache_write_tokens: group.cache_write_tokens,
