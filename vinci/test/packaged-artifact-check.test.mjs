@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
+	cpSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -20,6 +21,7 @@ const checker = process.env.VINCI_PACKAGED_CHECKER
 const resolverSource = readFileSync(new URL("../scripts/resolve-dispatch.mjs", import.meta.url), "utf8");
 const reaperSource = readFileSync(new URL("../scripts/reap-heal-temp.mjs", import.meta.url), "utf8");
 const fixtureRoots = [];
+const authorityRoots = new Map();
 
 const manifest = {
 	schema: "vinci.node-dispatches/v1",
@@ -86,11 +88,29 @@ function fixture() {
 	write(join(root, "vinci", "worker", "contracts", "digest.cjs"), "module.exports = { ready: true };\n");
 	write(join(root, "vinci", "extensions", "entry.ts"), 'import "./side-effect.js";\n');
 	write(join(root, "vinci", "extensions", "side-effect.js"), "export {};\n");
+	const authorityRoot = mkdtempSync(join(tmpdir(), "vinci-packaged-authority-"));
+	fixtureRoots.push(authorityRoot);
+	cpSync(root, authorityRoot, { recursive: true });
+	authorityRoots.set(root, authorityRoot);
 	return root;
 }
 
+function authorize(root, relativePath) {
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	const source = join(root, relativePath);
+	const target = join(authorityRoot, relativePath);
+	mkdirSync(dirname(target), { recursive: true });
+	cpSync(source, target, { recursive: true });
+}
+
 function run(root, cwd = tmpdir()) {
-	return spawnSync(process.execPath, [checker, root], { cwd, encoding: "utf8", timeout: 10_000 });
+	return spawnSync(process.execPath, [checker, root], {
+		cwd,
+		encoding: "utf8",
+		env: { ...process.env, VINCI_PACKAGED_AUTHORITY_ROOT: authorityRoots.get(root) },
+		timeout: 10_000,
+	});
 }
 
 function runLauncher(root, args) {
@@ -141,6 +161,8 @@ test("the reviewed maintenance helper is packaged, traversed, and fault-restorab
 			() => '_vinci_home="${ROOT}"\nnode "${VINCI}/scripts/reap-heal-temp.mjs" "${_vinci_home}/updater" "$$" 2>/dev/null || true\nset +e',
 		),
 	);
+	authorize(root, "vinci/bin/vinci");
+	authorize(root, "vinci/scripts/reap-heal-temp.mjs");
 	const checked = run(root);
 	assert.equal(checked.status, 0, checked.stderr);
 	assert.match(checked.stdout, /8 dispatch files\/4 imports/);
@@ -156,6 +178,8 @@ test("an extensionless manifest target is verified and reachable", () => {
 	changed.dispatches[1].target = "worker/run-worker";
 	write(join(root, "vinci", "dispatch-manifest.json"), JSON.stringify(changed));
 	write(join(root, "vinci", "worker", "run-worker"), 'console.log(`extensionless reached: ${process.argv[2]}`);\n');
+	authorize(root, "vinci/dispatch-manifest.json");
+	authorize(root, "vinci/worker/run-worker");
 	const checked = run(root);
 	assert.equal(checked.status, 0, checked.stderr);
 	const reached = runLauncher(root, ["worker", "gamma"]);
@@ -298,6 +322,195 @@ test("the reviewed profile eval variable cannot be repurposed as a dispatch", ()
 	assert.equal(reached.status, 0, reached.stderr);
 	assert.match(reached.stdout, /profile eval hidden target reached/);
 	expectFailure(run(root), /repurposes the reviewed profile eval payload/);
+});
+
+test("a variable-indirected Node command cannot execute after entering the artifact root", () => {
+	const root = fixture();
+	write(join(root, "vinci", "hidden.mjs"), 'console.log("variable Node hidden target reached");\n');
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  cd "\${VINCI}"\n  runtime="node"\n  "\${runtime}" ./hidden.mjs\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /variable Node hidden target reached/);
+	expectFailure(run(root), /executable authority|unmanifested executable dispatch/);
+});
+
+test("xargs cannot turn artifact data into a Node execution", () => {
+	const root = fixture();
+	write(join(root, "vinci", "hidden.mjs"), 'console.log("xargs hidden target reached");\n');
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  printf '%s\\n' "\${VINCI}/hidden.mjs" | xargs node\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /xargs hidden target reached/);
+	expectFailure(run(root), /executable authority|unreviewed shell execution form/);
+});
+
+test("an artifact-controlled PATH cannot replace the reviewed Node executable", () => {
+	const root = fixture();
+	const fakeNode = join(root, "vinci", "tool-bin", "node");
+	write(
+		fakeNode,
+		`#!/usr/bin/env bash\necho "PATH hidden executable reached" >&2\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
+	);
+	chmodSync(fakeNode, 0o755);
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		launcher.replace("set +e", 'PATH="${VINCI}/tool-bin:${PATH}"\nexport PATH\nset +e'),
+	);
+	const reached = runLauncher(root, ["worker", "path"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stderr, /PATH hidden executable reached/);
+	assert.match(reached.stdout, /worker reached: path true/);
+	expectFailure(run(root), /executable authority|execution-control variable/);
+});
+
+for (const [label, source, hiddenName, hiddenSource, marker] of [
+	[
+		"Reflect-derived Function",
+		'const make = Reflect.get(globalThis, ["Fun", "ction"].join(""));\nawait make(\'return import("./hidden.mjs")\')();\n',
+		"hidden.mjs",
+		'console.log("Reflect Function hidden target reached");\n',
+		/Reflect Function hidden target reached/,
+	],
+	[
+		"Reflect-derived module loader",
+		'const getBuiltin = Reflect.get(process, ["getBuiltin", "Module"].join(""));\nconst Module = getBuiltin("node:module");\nconst load = Reflect.get(Module, ["_", "load"].join(""));\nload(new URL("./hidden.cjs", import.meta.url).pathname);\n',
+		"hidden.cjs",
+		'console.log("Reflect module hidden target reached");\n',
+		/Reflect module hidden target reached/,
+	],
+	[
+		"node:vm",
+		'import { readFileSync } from "node:fs";\nimport { runInThisContext } from "node:vm";\nrunInThisContext(readFileSync(new URL("./hidden.cjs", import.meta.url), "utf8"));\n',
+		"hidden.cjs",
+		'console.log("vm hidden target reached");\n',
+		/vm hidden target reached/,
+	],
+	[
+		"worker_threads",
+		'import { Worker } from "node:worker_threads";\nconst worker = new Worker(new URL("./hidden.mjs", import.meta.url));\nawait new Promise((resolve, reject) => { worker.once("error", reject); worker.once("exit", resolve); });\n',
+		"hidden.mjs",
+		'console.log("worker thread hidden target reached");\n',
+		/worker thread hidden target reached/,
+	],
+	[
+		"child_process.fork",
+		'import { fork } from "node:child_process";\nconst child = fork(new URL("./hidden.cjs", import.meta.url), { stdio: "inherit" });\nawait new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });\n',
+		"hidden.cjs",
+		'console.log("fork hidden target reached");\n',
+		/fork hidden target reached/,
+	],
+]) {
+	test(`${label} cannot execute an unreviewed module`, () => {
+		const root = fixture();
+		write(join(root, "vinci", "worker", "worker.mjs"), source);
+		write(join(root, "vinci", "worker", hiddenName), hiddenSource);
+		const reached = runLauncher(root, ["worker"]);
+		assert.equal(reached.status, 0, reached.stderr);
+		assert.match(reached.stdout, marker);
+		expectFailure(run(root), /executable authority|unverifiable dependency edge/);
+	});
+}
+
+test("an alternate variable-built command cannot execute a relative artifact target", () => {
+	const root = fixture();
+	write(join(root, "vinci", "hidden.mjs"), 'console.log("built command hidden target reached");\n');
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  cd "\${VINCI}"\n  printf -v runtime '%s' node\n  "\${runtime}" ./hidden.mjs\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /built command hidden target reached/);
+	expectFailure(run(root), /closed executable authority/);
+});
+
+test("an alternate command composer cannot execute an artifact target", () => {
+	const root = fixture();
+	write(join(root, "vinci", "hidden.mjs"), 'console.log("find hidden target reached");\n');
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  cd "\${VINCI}"\n  find . -name hidden.mjs -exec node {} \\;\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /find hidden target reached/);
+	expectFailure(run(root), /closed executable authority/);
+});
+
+test("an alternate PATH shadow cannot replace an allowlisted utility", () => {
+	const root = fixture();
+	const fakeSed = join(root, "vinci", "tool-bin", "sed");
+	write(fakeSed, '#!/usr/bin/env bash\necho "PATH utility hidden executable reached"\n');
+	chmodSync(fakeSed, 0o755);
+	write(
+		join(root, "vinci", "bin", "vinci"),
+		`${launcher}\nif [ "\${1:-}" = "hidden" ]; then\n  PATH="\${VINCI}/tool-bin:\${PATH}"\n  sed ignored\nfi\n`,
+	);
+	const reached = runLauncher(root, ["hidden"]);
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /PATH utility hidden executable reached/);
+	expectFailure(run(root), /closed executable authority/);
+});
+
+for (const [label, source, hiddenName, hiddenSource, marker] of [
+	[
+		"Reflect-derived AsyncFunction",
+		'const make = Reflect.get(Object.getPrototypeOf(async () => {}), ["con", "structor"].join(""));\nawait make(\'return import("./hidden.mjs")\')();\n',
+		"hidden.mjs",
+		'console.log("Reflect AsyncFunction hidden target reached");\n',
+		/Reflect AsyncFunction hidden target reached/,
+	],
+	[
+		"node:vm Script",
+		'import { readFileSync } from "node:fs";\nimport { Script } from "node:vm";\nnew Script(readFileSync(new URL("./hidden.cjs", import.meta.url), "utf8")).runInThisContext();\n',
+		"hidden.cjs",
+		'console.log("vm Script hidden target reached");\n',
+		/vm Script hidden target reached/,
+	],
+	[
+		"worker_threads eval",
+		'import { Worker } from "node:worker_threads";\nconst worker = new Worker(\'console.log("worker code reached")\', { ["e" + "val"]: true });\nawait new Promise((resolve, reject) => { worker.once("error", reject); worker.once("exit", resolve); });\n',
+		"unused.mjs",
+		"export {};\n",
+		/worker code reached/,
+	],
+	[
+		"child_process.spawn",
+		'import { spawn } from "node:child_process";\nconst child = spawn(process.execPath, [new URL("./hidden.cjs", import.meta.url).pathname], { stdio: "inherit" });\nawait new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });\n',
+		"hidden.cjs",
+		'console.log("spawn hidden target reached");\n',
+		/spawn hidden target reached/,
+	],
+]) {
+	test(`${label} alternate is refused by the closed authority`, () => {
+		const root = fixture();
+		write(join(root, "vinci", "worker", "worker.mjs"), source);
+		write(join(root, "vinci", "worker", hiddenName), hiddenSource);
+		const reached = runLauncher(root, ["worker"]);
+		assert.equal(reached.status, 0, reached.stderr);
+		assert.match(reached.stdout, marker);
+		expectFailure(run(root), /closed executable authority/);
+	});
+}
+
+test("an artifact-local file cannot extend the external executable authority", () => {
+	const root = fixture();
+	write(join(root, "vinci", "worker", "unreviewed.mjs"), "export const unreviewed = true;\n");
+	expectFailure(run(root), /not present in the trusted executable authority/);
+});
+
+test("a packaged runtime dependency is byte-bound to the external authority", () => {
+	const root = fixture();
+	write(join(root, "node_modules", "runtime", "index.js"), "export const value = 1;\n");
+	authorize(root, "node_modules/runtime/index.js");
+	write(join(root, "node_modules", "runtime", "index.js"), "export const value = 2;\n");
+	expectFailure(run(root), /node_modules\/runtime\/index\.js differs from the trusted executable authority/);
 });
 
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
@@ -475,6 +688,7 @@ test("verification never executes packaged target code", () => {
 		join(root, "vinci", "worker", "worker.mjs"),
 		`import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "executed");\n`,
 	);
+	authorize(root, "vinci/worker/worker.mjs");
 	const result = run(root);
 	assert.equal(result.status, 0, result.stderr);
 	assert.equal(existsSync(marker), false);

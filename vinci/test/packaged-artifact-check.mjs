@@ -9,10 +9,13 @@ import {
   existsSync,
   lstatSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { parse } from "unbash";
 
@@ -31,6 +34,16 @@ if (lstatSync(suppliedRoot).isSymbolicLink() || !lstatSync(suppliedRoot).isDirec
   refuse("artifact root must be a real directory, not a symlink or file");
 }
 const root = realpathSync(suppliedRoot);
+const suppliedAuthorityRoot = process.env.VINCI_PACKAGED_AUTHORITY_ROOT
+  ?? resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+if (
+  !existsSync(suppliedAuthorityRoot)
+  || lstatSync(suppliedAuthorityRoot).isSymbolicLink()
+  || !lstatSync(suppliedAuthorityRoot).isDirectory()
+) {
+  refuse("trusted executable authority root must be a real directory");
+}
+const authorityRoot = realpathSync(suppliedAuthorityRoot);
 
 function relativeToRoot(path) {
   return relative(root, path).split(sep).join("/");
@@ -574,8 +587,84 @@ const dispatchEntries = [resolverPath, ...maintenanceEntries, ...nodeTargets.map
 })];
 const dispatchGraph = checkGraph(dispatchEntries, "launcher dispatch graph");
 
+// The parser checks above provide useful, local diagnostics for malformed launchers and dependency
+// graphs. They are not the trust boundary: shell and JavaScript both expose many equivalent ways to
+// acquire execution authority (PATH shadowing, command composers, reflection, VM contexts, workers,
+// and child processes). Trying to enumerate every spelling is an open denylist and has repeatedly
+// produced false certifications.
+//
+// Close that class of bug by binding every file and symlink that actually shipped to the trusted
+// build tree that is running this checker. An artifact may contain only byte-identical source/build
+// outputs at the same paths; an extra loader, a changed launcher, a rewritten package.json, or a
+// modified dependency therefore fails independently of which runtime primitive reaches it. Missing
+// required entry points and dependency edges are still diagnosed by the structural checks above.
+function fileDigest(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+const authorityFailures = [];
+let authorityFiles = 0;
+let authorityLinks = 0;
+function compareAuthorityDirectory(artifactDirectory, relativeDirectory = "") {
+  for (const entry of readdirSync(artifactDirectory).sort()) {
+    const relativePath = relativeDirectory ? `${relativeDirectory}/${entry}` : entry;
+    const artifactPath = join(artifactDirectory, entry);
+    const trustedPath = join(authorityRoot, ...relativePath.split("/"));
+    if (!existsSync(trustedPath) && !lstatExists(trustedPath)) {
+      authorityFailures.push(`${relativePath} is not present in the trusted executable authority`);
+      continue;
+    }
+    const artifactStat = lstatSync(artifactPath);
+    const trustedStat = lstatSync(trustedPath);
+    if (artifactStat.isDirectory()) {
+      if (!trustedStat.isDirectory() || trustedStat.isSymbolicLink()) {
+        authorityFailures.push(`${relativePath} differs in type from the trusted executable authority`);
+      } else {
+        compareAuthorityDirectory(artifactPath, relativePath);
+      }
+    } else if (artifactStat.isSymbolicLink()) {
+      authorityLinks += 1;
+      if (!trustedStat.isSymbolicLink() || readlinkSync(artifactPath) !== readlinkSync(trustedPath)) {
+        authorityFailures.push(`${relativePath} differs from the trusted executable authority`);
+      }
+    } else if (artifactStat.isFile()) {
+      authorityFiles += 1;
+      if (
+        !trustedStat.isFile()
+        || trustedStat.isSymbolicLink()
+        || (artifactStat.mode & 0o111) !== (trustedStat.mode & 0o111)
+        || artifactStat.size !== trustedStat.size
+        || fileDigest(artifactPath) !== fileDigest(trustedPath)
+      ) {
+        authorityFailures.push(`${relativePath} differs from the trusted executable authority`);
+      }
+    } else {
+      authorityFailures.push(`${relativePath} has an unsupported artifact file type`);
+    }
+  }
+}
+
+function lstatExists(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+compareAuthorityDirectory(root);
+if (authorityFailures.length > 0) {
+  const visible = authorityFailures.slice(0, 32);
+  if (authorityFailures.length > visible.length) {
+    visible.push(`… ${authorityFailures.length - visible.length} more authority mismatch(es)`);
+  }
+  refuse(`artifact violates the closed executable authority (${authorityFailures.length} mismatch(es))`, visible);
+}
+
 console.log(
   `  ✓ packaged artifact: ${manifest.dispatches.length} manifest-driven launcher dispatches; `
   + `${dispatchGraph.files} dispatch files/${dispatchGraph.imports} imports and `
-  + `${extensionGraph.files} extension files/${extensionGraph.imports} imports resolve inside the tarball`,
+  + `${extensionGraph.files} extension files/${extensionGraph.imports} imports resolve inside the tarball; `
+  + `${authorityFiles} files/${authorityLinks} links match the closed executable authority`,
 );
