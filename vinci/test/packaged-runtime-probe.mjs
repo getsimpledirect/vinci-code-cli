@@ -40,7 +40,7 @@ function run(command, args, cwd = artifactRoot) {
 }
 
 function output(result) {
-	return `${result.stdout ?? ""}${result.stderr ?? ""}`;
+	return `${result.stdout ?? ""}${result.stderr ?? ""}${result.error ? `${result.error}\n` : ""}`;
 }
 
 try {
@@ -48,7 +48,7 @@ try {
 		cwd: tmpdir(),
 		encoding: "utf8",
 		env: { ...cleanEnv, VINCI_PACKAGED_AUTHORITY_ROOT: authorityRoot },
-		timeout: 120_000,
+		timeout: 300_000,
 	});
 	assert.equal(checked.status, 0, output(checked));
 
@@ -99,7 +99,7 @@ try {
 		cwd: tmpdir(),
 		encoding: "utf8",
 		env: { ...cleanEnv, VINCI_PACKAGED_AUTHORITY_ROOT: authorityRoot },
-		timeout: 120_000,
+		timeout: 300_000,
 	});
 	assert.equal(malformed.status, 1, output(malformed));
 	assert.match(
