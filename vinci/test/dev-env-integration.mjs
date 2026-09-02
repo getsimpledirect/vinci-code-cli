@@ -55,6 +55,11 @@ writeFileSync(
 // The report-wrong dispatch execs this script directly — it must ALSO see the resolved
 // environment (it reads/appends the task/session store).
 mkdirSync(join(fakeRoot, "vinci", "scripts"), { recursive: true });
+copyFileSync(
+  join(root, "vinci", "scripts", "resolve-dispatch.mjs"),
+  join(fakeRoot, "vinci", "scripts", "resolve-dispatch.mjs"),
+);
+copyFileSync(join(root, "vinci", "dispatch-manifest.json"), join(fakeRoot, "vinci", "dispatch-manifest.json"));
 writeFileSync(
   join(fakeRoot, "vinci", "scripts", "report-wrong.mjs"),
   'console.log(`RW_AGENT_DIR=${process.env.VINCI_CODING_AGENT_DIR ?? ""}`);\n' +

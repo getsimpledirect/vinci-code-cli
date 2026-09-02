@@ -282,14 +282,6 @@ case "${VINCI_ENV:-prod}" in
     ;;
 esac
 
-# A false-completion report is local task instrumentation, not an agent run. Handle it before Pi,
-# provider, or authentication setup so reporting never spends credits or makes a network request.
-if [ "${1:-}" = "report-wrong" ]; then
-  shift
-  # vinci-dispatch: report-wrong
-  exec node "${VINCI}/scripts/report-wrong.mjs" "$@"
-fi
-
 # Verification is a standalone product command, not an agent run. Resolve it before Pi, provider,
 # or authentication setup and replace this process so VAC owns all three output streams and status.
 if [ "${1:-}" = "verify" ]; then
@@ -303,16 +295,7 @@ if [ "${1:-}" = "verify" ]; then
     echo "Verification isn't set up yet. Install the Vinci Acceptance CLI, then run vinci verify again." >&2
     exit 127
   fi
-  # vinci-dispatch: verify
   exec "${_vinci_vac_cli}" "$@"
-fi
-
-# The worker is a standalone daemon command. Dispatch it before --version and before Pi/provider
-# setup so it needs only Node, its bus token, and the credentials used by its child processes.
-if [ "${1:-}" = "worker" ]; then
-  shift
-  # vinci-dispatch: worker
-  exec node "${VINCI}/worker/worker.mjs" "$@"
 fi
 
 # Vinci owns its version string. A bare Pi `--version` prints Pi's internal build number, not ours, so
@@ -321,6 +304,29 @@ if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
   ver="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${VINCI}/identity.json" 2>/dev/null | head -1)"
   echo "${ver:-unknown}"
   exit 0
+fi
+
+# Internal Node subcommands are data, not duplicated shell branches. The shipped manifest is the
+# executable source of truth: adding an entry makes it reachable here, and changing a target changes
+# what this launcher runs. Exit 3 means the first argument is not a manifest command. Options, resume,
+# and a bare launch cannot be manifest commands, so keep their existing zero-lookup path.
+if [ "$#" -gt 0 ] && [[ "$1" != -* ]] && [ "$1" != "resume" ]; then
+  set +e
+  _vinci_dispatch_target="$(
+    node "${VINCI}/scripts/resolve-dispatch.mjs" \
+      "${VINCI}/dispatch-manifest.json" "$1"
+  )"
+  _vinci_dispatch_status=$?
+  set -e
+  case "${_vinci_dispatch_status}" in
+    0)
+      shift
+      exec node "${VINCI}/${_vinci_dispatch_target}" "$@"
+      ;;
+    3) ;;
+    *) exit "${_vinci_dispatch_status}" ;;
+  esac
+  unset _vinci_dispatch_target _vinci_dispatch_status
 fi
 
 # Internal source qualification must execute the current working tree, never a stale dist build.

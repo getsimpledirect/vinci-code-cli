@@ -152,10 +152,10 @@ function createRelease(version, sequence, minimumVersion = version, updaterVersi
   const launcher = join(payload, "vinci", "bin", "vinci");
   const launcherSource = readFileSync(join(root, "vinci", "bin", "vinci"), "utf8");
   const fixtureLauncher = launcherSource.replace(
-    "# A false-completion report is local task instrumentation",
+    "# Verification is a standalone product command",
     `if [ "\${1:-}" = "--payload-version" ]; then echo "${version}"; exit 0; fi
 
-# A false-completion report is local task instrumentation`,
+# Verification is a standalone product command`,
   );
   assert.notEqual(fixtureLauncher, launcherSource, "fixture payload-version insertion must apply to the real launcher");
   writeFileSync(launcher, fixtureLauncher);

@@ -31,6 +31,7 @@ node "${ROOT}/vinci/scripts/package-excludes.mjs" "${ROOT}" > "${EXCLUDES}"
 tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude-from="${EXCLUDES}" \
   --exclude='node_modules/typescript' \
+  --exclude='node_modules/unbash' \
   --exclude='node_modules/@typescript' \
   --exclude='node_modules/@biomejs' \
   --exclude='node_modules/@types' \
@@ -48,7 +49,8 @@ tar -czf "${TGZ}" -C "${ROOT}" \
   packages/orchestrator/dist packages/orchestrator/package.json \
   packages/tui/dist packages/tui/package.json \
   vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater vinci/worker \
-  vinci/scripts/report-wrong.mjs vinci/dispatch-manifest.json vinci/identity.json vinci/NOTICE \
+  vinci/scripts/report-wrong.mjs vinci/scripts/resolve-dispatch.mjs \
+  vinci/dispatch-manifest.json vinci/identity.json vinci/NOTICE \
   package.json node_modules
 
 cp "${TGZ}" "${CURRENT_TGZ}"
