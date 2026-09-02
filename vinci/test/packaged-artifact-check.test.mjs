@@ -894,6 +894,97 @@ test("wildcard workspace exports bind every concrete executable target", () => {
 	expectFailure(run(root), /coding-agent\/dist\/evil\.js -> tsx resolves outside the artifact root/);
 });
 
+test("wildcard workspace exports traverse contained symlinks at their canonical target", () => {
+	const { outer, root } = nestedFixture();
+	write(
+		join(root, "packages", "coding-agent", "package.json"),
+		JSON.stringify({
+			name: "@earendil-works/pi-coding-agent",
+			type: "module",
+			main: "./dist/index.js",
+			exports: { ".": "./dist/index.js", "./rpc/*": "./dist/*.js" },
+		}),
+	);
+	write(join(root, "packages", "coding-agent", "dist", "index.js"), "export const runtime = true;\n");
+	write(
+		join(root, "packages", "coding-agent", "dist", "hidden", "evil.mjs"),
+		'import { marker } from "tsx";\nconsole.log(marker);\n',
+	);
+	symlinkSync("hidden/evil.mjs", join(root, "packages", "coding-agent", "dist", "evil.js"));
+	authorize(root, "packages/coding-agent");
+	write(
+		join(outer, "node_modules", "tsx", "package.json"),
+		JSON.stringify({ name: "tsx", type: "module", exports: "./index.js" }),
+	);
+	write(join(outer, "node_modules", "tsx", "index.js"), 'export const marker = "PARENT_TSX_EXECUTED";\n');
+	expectFailure(run(root), /coding-agent\/dist\/hidden\/evil\.mjs -> tsx resolves outside the artifact root/);
+});
+
+test("literal workspace entry symlinks resolve imports beside their canonical target", () => {
+	const { outer, root } = nestedFixture();
+	write(
+		join(root, "packages", "coding-agent", "package.json"),
+		JSON.stringify({
+			name: "@earendil-works/pi-coding-agent",
+			type: "module",
+			main: "./dist/entry.js",
+		}),
+	);
+	write(
+		join(root, "packages", "coding-agent", "dist", "hidden", "entry.mjs"),
+		'import "./dep.mjs";\n',
+	);
+	write(
+		join(root, "packages", "coding-agent", "dist", "hidden", "dep.mjs"),
+		'import { marker } from "tsx";\nconsole.log(marker);\n',
+	);
+	write(join(root, "packages", "coding-agent", "dist", "dep.mjs"), "export const safe = true;\n");
+	symlinkSync("hidden/entry.mjs", join(root, "packages", "coding-agent", "dist", "entry.js"));
+	authorize(root, "packages/coding-agent");
+	write(
+		join(outer, "node_modules", "tsx", "package.json"),
+		JSON.stringify({ name: "tsx", type: "module", exports: "./index.js" }),
+	);
+	write(join(outer, "node_modules", "tsx", "index.js"), 'export const marker = "PARENT_TSX_EXECUTED";\n');
+	expectFailure(run(root), /coding-agent\/dist\/hidden\/dep\.mjs -> tsx resolves outside the artifact root/);
+});
+
+test("extensionless workspace bins are executable package-entry graph roots", () => {
+	const { outer, root } = nestedFixture();
+	write(
+		join(root, "packages", "coding-agent", "package.json"),
+		JSON.stringify({
+			name: "@earendil-works/pi-coding-agent",
+			type: "module",
+			main: "./dist/index.js",
+			bin: { pi: "./dist/runner" },
+		}),
+	);
+	write(join(root, "packages", "coding-agent", "dist", "index.js"), "export const runtime = true;\n");
+	write(join(root, "packages", "coding-agent", "dist", "runner"), '#!/usr/bin/env node\nimport "tsx";\n');
+	authorize(root, "packages/coding-agent");
+	write(join(outer, "node_modules", "tsx", "package.json"), JSON.stringify({ name: "tsx", exports: "./index.js" }));
+	write(join(outer, "node_modules", "tsx", "index.js"), "export {};\n");
+	expectFailure(run(root), /coding-agent\/dist\/runner -> tsx resolves outside the artifact root/);
+});
+
+test("legacy workspace main directories resolve to their concrete Node entry", () => {
+	const { outer, root } = nestedFixture();
+	write(
+		join(root, "packages", "coding-agent", "package.json"),
+		JSON.stringify({
+			name: "@earendil-works/pi-coding-agent",
+			type: "module",
+			main: "./dist",
+		}),
+	);
+	write(join(root, "packages", "coding-agent", "dist", "index.js"), 'import "tsx";\n');
+	authorize(root, "packages/coding-agent");
+	write(join(outer, "node_modules", "tsx", "package.json"), JSON.stringify({ name: "tsx", exports: "./index.js" }));
+	write(join(outer, "node_modules", "tsx", "index.js"), "export {};\n");
+	expectFailure(run(root), /coding-agent\/dist\/index\.js -> tsx resolves outside the artifact root/);
+});
+
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
 	const cases = [
 		{ value: null, pattern: /wrong schema or no dispatches/ },

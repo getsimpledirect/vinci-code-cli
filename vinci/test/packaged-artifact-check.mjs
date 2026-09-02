@@ -16,8 +16,8 @@ import {
   rmSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { isBuiltin } from "node:module";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createRequire, isBuiltin } from "node:module";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1138,7 +1138,7 @@ function concreteWildcardTargets(packageRoot, normalized) {
       const path = join(directory, entry);
       const stat = lstatSync(path);
       if (stat.isDirectory() && !stat.isSymbolicLink()) visit(path);
-      else if (stat.isFile()) {
+      else if (stat.isFile() || stat.isSymbolicLink()) {
         const packageRelative = relative(packageRoot, path).split(sep).join("/");
         if (pattern.test(packageRelative)) matches.push(path);
       }
@@ -1146,6 +1146,13 @@ function concreteWildcardTargets(packageRoot, normalized) {
   };
   visit(packageRoot);
   return matches;
+}
+
+function isExecutablePackageEntry(path) {
+  const name = basename(path);
+  if (/\.d\.(?:cts|mts|ts)$/.test(name)) return false;
+  const extension = extname(name);
+  return extension === "" || [".cjs", ".js", ".mjs", ".ts"].includes(extension);
 }
 
 function validatePackageManifest(manifestPath) {
@@ -1163,7 +1170,9 @@ function validatePackageManifest(manifestPath) {
   }
   const targets = [];
   if (manifest.main !== undefined) {
-    if (typeof manifest.main === "string") targets.push({ label: "main", target: manifest.main, legacy: true });
+    if (typeof manifest.main === "string") {
+      targets.push({ label: "main", target: manifest.main, legacy: true, resolveLegacy: true });
+    }
     else authorityFailures.push(`${relativeManifest} main has the wrong type`);
   }
   if (manifest.bin !== undefined) {
@@ -1178,7 +1187,7 @@ function validatePackageManifest(manifestPath) {
   if (manifest.imports !== undefined) collectConditionalTargets(manifest.imports, "imports", targets);
   if (manifest.exports !== undefined) collectConditionalTargets(manifest.exports, "exports", targets);
 
-  for (const { label, target, legacy = false } of targets) {
+  for (const { label, target, legacy = false, resolveLegacy = false } of targets) {
     if (!legacy && !target.startsWith("./")) {
       if (label.startsWith("imports")) {
         const resolution = resolveBareSpecifier(manifestPath, target, false);
@@ -1187,8 +1196,7 @@ function validatePackageManifest(manifestPath) {
         } else if (
           isRuntimeWorkspace
           && resolution.path
-          && /\.(?:cjs|js|mjs|ts)$/.test(resolution.path)
-          && !/\.d\.(?:cts|mts|ts)$/.test(resolution.path)
+          && isExecutablePackageEntry(resolution.path)
         ) {
           packageEntryFiles.add(resolution.path);
         }
@@ -1214,15 +1222,21 @@ function validatePackageManifest(manifestPath) {
         if (
           isRuntimeWorkspace
           && canonical !== null
-          && /\.(?:cjs|js|mjs|ts)$/.test(targetPath)
-          && !/\.d\.(?:cts|mts|ts)$/.test(targetPath)
+          && isExecutablePackageEntry(canonical)
         ) {
-          packageEntryFiles.add(targetPath);
+          packageEntryFiles.add(join(root, ...canonical.split("/")));
         }
       }
       continue;
     }
     let targetPath = join(packageRoot, ...normalized.split("/"));
+    if (resolveLegacy) {
+      try {
+        targetPath = createRequire(manifestPath).resolve(targetPath);
+      } catch {
+        // Preserve the literal path so the ordinary missing/non-file diagnostic below owns refusal.
+      }
+    }
     if (legacy && !lstatExists(targetPath)) {
       targetPath = [".js", ".json", ".node"].map((extension) => `${targetPath}${extension}`).find(lstatExists)
         ?? targetPath;
@@ -1232,13 +1246,16 @@ function validatePackageManifest(manifestPath) {
       continue;
     }
     const canonical = containedCanonicalRelative(root, targetPath, `${relativeManifest} ${label} target ${target}`);
+    if (canonical !== null && !lstatSync(join(root, ...canonical.split("/"))).isFile()) {
+      authorityFailures.push(`${relativeManifest} ${label} target ${target} is not a regular file`);
+      continue;
+    }
     if (
       isRuntimeWorkspace
       && canonical !== null
-      && /\.(?:cjs|js|mjs|ts)$/.test(targetPath)
-      && !/\.d\.(?:cts|mts|ts)$/.test(targetPath)
+      && isExecutablePackageEntry(canonical)
     ) {
-      packageEntryFiles.add(targetPath);
+      packageEntryFiles.add(join(root, ...canonical.split("/")));
     }
   }
 }
