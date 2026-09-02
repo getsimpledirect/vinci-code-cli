@@ -13,6 +13,10 @@
 //   * every payload value is kinded {kind, value} with kind in the six kinds
 //   * every string value is <=128 chars or exactly 64 lowercase hex; none carries the prompt text
 //     or the tool output (content-free by construction)
+//   * run.started payload keys are exactly ["attemptId"] (the registry allowlist refuses more)
+//   * context.loaded.entryCount is the contextManifestEntryCount passed in, not a constant
+//   * idempotencyKey is per-event IDENTITY, not type+payload: two manual interrupts in one run are
+//     two run.paused lines with two keys, while re-appending one of them dedupes to its sequence
 //   * sink idempotency: same key+payload -> same sequence, no new line; same key, different
 //     payload -> throws code "idempotency_conflict"; reopen + replay() -> lastSequence === N
 import assert from "node:assert/strict";
@@ -34,7 +38,10 @@ const EXPECTED_TYPES = [
   "tool.started",
   "tool.completed",
   "agent.turn_finished",
+  "run.paused",
+  "run.paused",
 ];
+const CONTEXT_MANIFEST_ENTRY_COUNT = 3;
 
 // Distinctive markers: the prompt text and the file the `ls` output will name. Neither may appear
 // in any payload string.
@@ -68,6 +75,7 @@ const run = {
   attemptId: "attempt_ir02_0001",
   workspaceId: "ws_ir02_0001",
   contextManifestDigest,
+  contextManifestEntryCount: CONTEXT_MANIFEST_ENTRY_COUNT,
   provider: model.provider,
   model: model.id,
 };
@@ -107,6 +115,10 @@ try {
   });
 
   await handle.prompt(PROMPT);
+  // Two identical logical pauses while idle: defect (a) collapsed these into one line because the
+  // key was derived from type+payload.
+  await handle.interrupt("manual");
+  await handle.interrupt("manual");
   await handle.dispose();
 
   check(faux.getPendingResponseCount() === 0, "scripted model consumed both responses");
@@ -178,9 +190,24 @@ try {
   }
 
   // Per-type payload shape.
-  const [started, loaded, turnStarted, toolStarted, toolCompleted, turnFinished] = events;
+  const [started, loaded, turnStarted, toolStarted, toolCompleted, turnFinished, pausedA, pausedB] = events;
   assert.equal(started.payload.attemptId.value, run.attemptId, "run.started carries attemptId");
   assert.equal(started.payload.attemptId.kind, "id");
+  // Defect (b): run.started carried an extra kinded runId; the registry allowlist is exactly {attemptId}.
+  assert.deepEqual(Object.keys(started.payload), ["attemptId"], "run.started payload keys are exactly [attemptId]");
+  assert.equal(
+    loaded.payload.entryCount.value,
+    CONTEXT_MANIFEST_ENTRY_COUNT,
+    "context.loaded.entryCount reflects the manifest entry count passed in",
+  );
+  // Defect (a): two distinct pauses with identical payloads are two lines under two keys.
+  assert.equal(pausedA.type, "run.paused");
+  assert.equal(pausedB.type, "run.paused");
+  assert.deepEqual(pausedA.payload, { reasonCode: { kind: "enum", value: "manual" } }, "run.paused payload");
+  assert.deepEqual(pausedB.payload, pausedA.payload, "both pauses carry the identical payload");
+  assert.notEqual(pausedA.idempotencyKey, pausedB.idempotencyKey, "two distinct pauses have two idempotencyKeys");
+  assert.equal(pausedB.sequence, pausedA.sequence + 1, "second pause is its own line");
+  passed += 4;
   assert.equal(loaded.payload.contextManifestDigest.value, contextManifestDigest, "context.loaded carries the digest passed");
   assert.equal(loaded.payload.contextManifestDigest.kind, "digest");
   assert.equal(loaded.payload.entryCount.kind, "count");
@@ -219,6 +246,17 @@ try {
   assert.equal(linesBefore, N, "sink holds exactly N lines before controls");
   const last = events[N - 1];
   const { sequence: _ignored, ...lastWithoutSequence } = last;
+
+  // A true re-append of the FIRST pause (same identity key + same payload) dedupes to its own
+  // sequence, so identity keys do not lose the sink's replay guarantee.
+  const { sequence: pausedASequence, ...pausedAWithoutSequence } = pausedA;
+  assert.equal(
+    sink.append({ ...pausedAWithoutSequence, eventId: "replay-pause-a" }),
+    pausedASequence,
+    "re-appending the first run.paused returns its existing sequence",
+  );
+  assert.equal(lineCount(), N, "re-appending the first run.paused writes no new line");
+  passed += 2;
 
   // Re-append the same key + same payload: same sequence, file untouched.
   const again = sink.append({ ...lastWithoutSequence, eventId: "replay-attempt-eventid" });

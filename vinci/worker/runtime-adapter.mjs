@@ -49,8 +49,44 @@ function stableStringify(value) {
   return JSON.stringify(String(value));
 }
 
-function eventKey(type, payload) {
-  return sha256Hex(`${type}\u0000${stableStringify(payload ?? {})}`);
+// idempotencyKey is derived from the EVENT'S IDENTITY, never from its payload: two distinct
+// logical events with identical payloads (e.g. two manual pauses in one run) must be two lines,
+// while a true re-append of the same event (same runId + type + identity) dedupes in the sink.
+// The identity is the native id where the SDK provides one (tool call id), otherwise a per-attach
+// monotonic counter scoped by the attach's traceId so a resumed process can never collide with
+// the counters of the process it replaced.
+function eventKey(runId, type, identity) {
+  return sha256Hex(`${runId}\u0000${type}\u0000${identity}`);
+}
+
+// In-process mirror of run.mjs's envDelta provider isolation: the session's credential store
+// answers ONLY for the Run's own provider and never falls back to ambient environment variables
+// (AuthStorage.hasAuth / getApiKey / getAuthStatus consult process.env by default, which would let
+// an OPENAI_API_KEY in the worker's environment make an "openai" model look configured to the
+// session's ModelRegistry). Stored/runtime credentials for the Run's provider still resolve.
+export function isolateAuthStorage(authStorage, provider) {
+  const baseGetApiKey = authStorage.getApiKey.bind(authStorage);
+  const baseGetAuthStatus = authStorage.getAuthStatus.bind(authStorage);
+  const isolated = {
+    hasAuth(candidate) {
+      if (candidate !== provider) return false;
+      const status = baseGetAuthStatus(candidate);
+      return status.source === "stored" || status.source === "runtime";
+    },
+    getAuthStatus(candidate) {
+      if (candidate !== provider) return { configured: false };
+      const status = baseGetAuthStatus(candidate);
+      return status.source === "stored" || status.source === "runtime" ? status : { configured: false };
+    },
+    async getApiKey(candidate, options = {}) {
+      if (candidate !== provider) return undefined;
+      return baseGetApiKey(candidate, { ...options, includeFallback: false });
+    },
+  };
+  for (const [name, method] of Object.entries(isolated)) {
+    Object.defineProperty(authStorage, name, { value: method, writable: true, configurable: true });
+  }
+  return authStorage;
 }
 
 // A resource loader that returns NOTHING regardless of what exists in cwd or ~/.pi/agent: no
@@ -88,7 +124,7 @@ function lastAssistantUsage(messages) {
 function openSession({ run, grantedTools, customTools, cwd, sessionDir, persistent, authStorage, model }) {
   const manager = persistent ? SessionManager.create(cwd, sessionDir) : SessionManager.inMemory(cwd);
   const modelInstance = model ?? getModel(run.provider, run.model);
-  const auth = authStorage ?? AuthStorage.inMemory();
+  const auth = isolateAuthStorage(authStorage ?? AuthStorage.inMemory(), run.provider);
   const allowlistedCustom = (Array.isArray(customTools) ? customTools : []).filter((tool) =>
     ALLOWLISTED_CUSTOM_TOOLS.includes(tool && tool.name),
   );
@@ -101,21 +137,28 @@ function openSession({ run, grantedTools, customTools, cwd, sessionDir, persiste
     customTools: allowlistedCustom,
     resourceLoader: nullResourceLoader(),
     sessionManager: manager,
-  }).then((result) => result.session);
+  }).then((result) => ({ session: result.session, authStorage: auth }));
 }
 
 // Shared translator: subscribes to the session and returns the adapter handle (prompt/steer/
 // interrupt/dispose/sessionPath/complete). `onStart` is invoked to emit the run.started /
 // run.resumed opening event.
-function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) {
+function attachTranslator({ run, session, authStorage, sink, clock, grantedTools, onStart }) {
   const grantedSet = new Set(grantedTools ?? []);
   const traceId = randomUUID();
+  // Per-attach monotonic counter for events the SDK gives no native id to (turns, pauses,
+  // compaction, retries, completion). Scoped by traceId, see eventKey().
+  let identityCounter = 0;
+  function nextIdentity() {
+    identityCounter += 1;
+    return `${traceId}:${identityCounter}`;
+  }
 
   function now() {
     return clock && typeof clock.now === "function" ? clock.now() : Date.now();
   }
 
-  function emit(type, payload) {
+  function emit(type, payload, identity = nextIdentity()) {
     return sink.append({
       eventId: randomUUID(),
       runId: run.runId,
@@ -124,7 +167,7 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
       type,
       actor: "worker",
       occurredAt: new Date(now()).toISOString(),
-      idempotencyKey: eventKey(type, payload),
+      idempotencyKey: eventKey(run.runId, type, identity),
       traceId,
       payload,
     });
@@ -132,6 +175,9 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
 
   let turnCounter = 0;
   let lastTurnId = "1";
+  let turnIdentity = nextIdentity();
+  // Set by interrupt(): the turn it stops is reported by run.paused, not by agent.turn_finished.
+  let interrupted = false;
   const toolStartedAt = new Map();
   const refusedToolCalls = new Set();
 
@@ -140,10 +186,18 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
       case "agent_start": {
         turnCounter += 1;
         lastTurnId = String(turnCounter);
-        emit("agent.turn_started", { turnId: kinded("id", lastTurnId) });
+        turnIdentity = nextIdentity();
+        interrupted = false;
+        emit("agent.turn_started", { turnId: kinded("id", lastTurnId) }, `turn:${turnIdentity}:started`);
         break;
       }
       case "agent_end": {
+        if (interrupted) {
+          // The turn was stopped by interrupt(): run.paused already closed it; no agent.turn_*
+          // event may follow the pause.
+          interrupted = false;
+          break;
+        }
         const usage = lastAssistantUsage(event.messages) ?? {};
         const payload = {
           turnId: kinded("id", lastTurnId),
@@ -159,23 +213,31 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
         if (usage.cost && typeof usage.cost.total === "number" && usage.cost.total > 0) {
           payload.costMicrousd = kinded("count", Math.round(usage.cost.total * 1000000));
         }
-        emit("agent.turn_finished", payload);
+        emit("agent.turn_finished", payload, `turn:${turnIdentity}:finished`);
         break;
       }
       case "tool_execution_start": {
         if (!grantedSet.has(event.toolName)) {
           refusedToolCalls.add(event.toolCallId);
-          emit("capability.refused", {
-            capabilityId: kinded("id", event.toolName),
-            reason: kinded("enum", "not_attested"),
-          });
+          emit(
+            "capability.refused",
+            {
+              capabilityId: kinded("id", event.toolName),
+              reason: kinded("enum", "not_attested"),
+            },
+            `tool:${event.toolCallId}:refused`,
+          );
           break;
         }
         toolStartedAt.set(event.toolCallId, now());
-        emit("tool.started", {
-          toolCallId: kinded("id", event.toolCallId),
-          toolId: kinded("id", event.toolName),
-        });
+        emit(
+          "tool.started",
+          {
+            toolCallId: kinded("id", event.toolCallId),
+            toolId: kinded("id", event.toolName),
+          },
+          `tool:${event.toolCallId}:started`,
+        );
         break;
       }
       case "tool_execution_end": {
@@ -187,18 +249,26 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
         toolStartedAt.delete(event.toolCallId);
         const durationMs = typeof started === "number" ? Math.max(0, now() - started) : 0;
         if (event.isError) {
-          emit("tool.failed", {
-            toolCallId: kinded("id", event.toolCallId),
-            toolId: kinded("id", event.toolName),
-            reason: kinded("enum", "error"),
-          });
+          emit(
+            "tool.failed",
+            {
+              toolCallId: kinded("id", event.toolCallId),
+              toolId: kinded("id", event.toolName),
+              reason: kinded("enum", "error"),
+            },
+            `tool:${event.toolCallId}:failed`,
+          );
         } else {
-          emit("tool.completed", {
-            toolCallId: kinded("id", event.toolCallId),
-            toolId: kinded("id", event.toolName),
-            durationMs: kinded("count", durationMs),
-            outputDigest: kinded("digest", sha256Hex(stableStringify(event.result))),
-          });
+          emit(
+            "tool.completed",
+            {
+              toolCallId: kinded("id", event.toolCallId),
+              toolId: kinded("id", event.toolName),
+              durationMs: kinded("count", durationMs),
+              outputDigest: kinded("digest", sha256Hex(stableStringify(event.result))),
+            },
+            `tool:${event.toolCallId}:completed`,
+          );
         }
         break;
       }
@@ -238,19 +308,38 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
     await session.prompt(text, options);
   }
 
+  // Records the steer (digest only) and queues it as a user message the model sees before its
+  // next response (AgentSession.steer -> Agent steering queue, drained after the current tool
+  // batch). The event is appended BEFORE the queue so a sink reader never sees an effect without
+  // its cause.
   async function steer(text) {
-    emit("steer.received", {
-      steerId: kinded("id", randomUUID()),
-      instructionDigest: kinded("digest", sha256Hex(String(text))),
-      issuedByPrincipalId: kinded("id", "control"),
-    });
-    await session.steer(text);
+    const steerId = randomUUID();
+    emit(
+      "steer.received",
+      {
+        steerId: kinded("id", steerId),
+        instructionDigest: kinded("digest", sha256Hex(String(text))),
+        issuedByPrincipalId: kinded("id", "control"),
+      },
+      `steer:${steerId}`,
+    );
+    await session.steer(String(text));
   }
 
+  // Appends run.paused and stops the current turn. A reason outside the enum throws BEFORE
+  // anything is appended. The turn's agent_end is swallowed (see agent_end above) so no
+  // agent.turn_* event follows the pause; session.abort() resolves once the agent is idle.
   async function interrupt(reason = "manual") {
-    const reasonCode = VALID_PAUSE_REASONS.includes(reason) ? reason : "manual";
-    emit("run.paused", { reasonCode: kinded("enum", reasonCode) });
-    await session.agent.abort();
+    if (!VALID_PAUSE_REASONS.includes(reason)) {
+      const error = new Error(
+        `invalid pause reason ${JSON.stringify(reason)}; expected one of ${VALID_PAUSE_REASONS.join(", ")}`,
+      );
+      error.code = "invalid_pause_reason";
+      throw error;
+    }
+    emit("run.paused", { reasonCode: kinded("enum", reason) });
+    interrupted = session.isStreaming === true;
+    await session.abort();
   }
 
   function complete({ outcome = "SUCCEEDED", tierReached = "NONE" } = {}) {
@@ -276,6 +365,7 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
     // AgentSession exposes the persisted file as a getter (delegating to sessionManager.getSessionFile()).
     sessionPath: session.sessionFile,
     session,
+    authStorage,
     _emit: emit,
   };
 }
@@ -285,7 +375,7 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
  *
  * @param {object} options
  * @param {object} options.run - {runId, workOrderId, workOrderDigest, attemptId, workspaceId,
- *   contextManifestDigest|null, provider, model}
+ *   contextManifestDigest|null, contextManifestEntryCount?, provider, model}
  * @param {string[]} options.grantedTools - exact tool allowlist passed to the session
  * @param {object[]} [options.customTools=[]] - custom tools, gated by ALLOWLISTED_CUSTOM_TOOLS
  * @param {string} options.cwd - working directory
@@ -293,9 +383,10 @@ function attachTranslator({ run, session, sink, clock, grantedTools, onStart }) 
  * @param {boolean} [options.persistent=true] - persist via SessionManager.create, else inMemory
  * @param {object} options.sink - run-events sink (createJsonlSink)
  * @param {object} [options.clock] - {now(): number} for deterministic timing
- * @param {object} [options.authStorage] - SDK AuthStorage (test seam; default in-memory, isolated)
+ * @param {object} [options.authStorage] - SDK AuthStorage (test seam; default in-memory). It is
+ *   provider-isolated in place (isolateAuthStorage) before the session sees it.
  * @param {object} [options.model] - SDK Model (test seam; default getModel(run.provider, run.model))
- * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session}>}
+ * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session, authStorage}>}
  */
 export async function createRunSession({
   run,
@@ -309,7 +400,7 @@ export async function createRunSession({
   authStorage,
   model,
 }) {
-  const session = await openSession({
+  const opened = await openSession({
     run,
     grantedTools,
     customTools,
@@ -319,25 +410,34 @@ export async function createRunSession({
     authStorage,
     model,
   });
+  const { session } = opened;
   // Record the run identity as a custom entry so resume can verify it.
   session.sessionManager.appendCustomEntry("vinci_run", { runId: run.runId, attemptId: run.attemptId });
+
+  const entryCount = Number.isInteger(run.contextManifestEntryCount) && run.contextManifestEntryCount >= 0
+    ? run.contextManifestEntryCount
+    : 0;
 
   return attachTranslator({
     run,
     session,
+    authStorage: opened.authStorage,
     sink,
     clock,
     grantedTools,
     onStart: (emit) => {
-      emit("run.started", {
-        runId: kinded("id", run.runId),
-        attemptId: kinded("id", run.attemptId),
-      });
+      // Payload is exactly {attemptId}: the runId is the envelope's runId, and the registry's
+      // allowlist for run.started refuses unknown keys.
+      emit("run.started", { attemptId: kinded("id", run.attemptId) }, `run:${run.attemptId}:started`);
       if (run.contextManifestDigest) {
-        emit("context.loaded", {
-          contextManifestDigest: kinded("digest", run.contextManifestDigest),
-          entryCount: kinded("count", 0),
-        });
+        emit(
+          "context.loaded",
+          {
+            contextManifestDigest: kinded("digest", run.contextManifestDigest),
+            entryCount: kinded("count", entryCount),
+          },
+          `context:${run.attemptId}:loaded`,
+        );
       }
     },
   });
@@ -349,7 +449,7 @@ export async function createRunSession({
  * identity, emits run.resumed, and returns the same handle shape as createRunSession.
  *
  * @param {object} options - same as createRunSession, plus `sessionPath` (returned for clarity)
- * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session}>}
+ * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session, authStorage}>}
  * @throws {Error} code "run_identity_mismatch" when the persisted runId differs (nothing appended)
  */
 export async function resumeRunSession({
@@ -364,7 +464,7 @@ export async function resumeRunSession({
   authStorage,
   model,
 }) {
-  const session = await openSession({
+  const opened = await openSession({
     run,
     grantedTools,
     customTools,
@@ -374,6 +474,7 @@ export async function resumeRunSession({
     authStorage,
     model,
   });
+  const { session } = opened;
 
   const recordedRunId = sessionRunId(session);
   if (recordedRunId !== run.runId) {
@@ -388,6 +489,7 @@ export async function resumeRunSession({
   return attachTranslator({
     run,
     session,
+    authStorage: opened.authStorage,
     sink,
     clock,
     grantedTools,
