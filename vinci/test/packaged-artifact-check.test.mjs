@@ -807,7 +807,7 @@ test("external package imports cannot resolve from a malicious parent node_modul
 		join(outer, "node_modules", "review-missing-package", "index.js"),
 		'export const marker = "PARENT_PACKAGE_EXECUTED";\n',
 	);
-	expectFailure(run(root), /#review-external resolves outside the artifact root/);
+	expectFailure(run(root), /#review-external .*resolves outside the artifact root/);
 
 	write(
 		join(root, "node_modules", "review-missing-package", "package.json"),
