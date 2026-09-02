@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runtimePackageExcludes } from "../scripts/runtime-package-closure.mjs";
 
 const artifactArgument = process.argv[2];
 if (!artifactArgument) throw new Error("Usage: packaged-runtime-probe.mjs <unpacked-artifact-root>");
@@ -48,8 +49,8 @@ try {
 	});
 	assert.equal(checked.status, 0, output(checked));
 
-	for (const excluded of ["tsx", "esbuild", "@esbuild", "vitest", "@standard-schema/spec"]) {
-		assert.equal(existsSync(join(artifactRoot, "node_modules", ...excluded.split("/"))), false, `${excluded} must not ship`);
+	for (const excluded of runtimePackageExcludes(authorityRoot)) {
+		assert.equal(existsSync(join(artifactRoot, ...excluded.split("/"))), false, `${excluded} must not ship`);
 	}
 
 	const launcher = join(artifactRoot, "vinci", "bin", "vinci");

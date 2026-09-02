@@ -57,14 +57,17 @@ function excluded(relativePath) {
 		|| /\/node_modules\/ssh2\/test(?:\/|$)/.test(nestedPath);
 }
 
-function emit(relativePath) {
-	if (excluded(relativePath)) return;
+function collect(relativePath) {
+	if (excluded(relativePath)) return [];
 	const path = join(root, ...relativePath.split("/"));
 	if (!existsSync(path)) throw new Error(`Required package entry is missing: ${relativePath}`);
 	const stat = lstatSync(path);
-	process.stdout.write(`${relativePath}\n`);
-	if (!stat.isDirectory() || stat.isSymbolicLink()) return;
-	for (const entry of readdirSync(path).sort()) emit(`${relativePath}/${entry}`);
+	if (!stat.isDirectory() || stat.isSymbolicLink()) return [relativePath];
+	const descendants = readdirSync(path).sort().flatMap((entry) => collect(`${relativePath}/${entry}`));
+	if (descendants.length === 0 && /(?:^|\/)node_modules\/@[^/]+$/.test(relativePath)) return [];
+	return [relativePath, ...descendants];
 }
 
-for (const relativePath of releaseRoots) emit(relativePath);
+for (const relativePath of releaseRoots) {
+	for (const entry of collect(relativePath)) process.stdout.write(`${entry}\n`);
+}
