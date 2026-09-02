@@ -2,10 +2,11 @@
 //
 // Every published tarball through 0.0.51 omitted `vinci/worker/` while checkout-based workers
 // looked perfectly healthy, so a capability of the embedded runtime may only ever be claimed from
-// the INSTALLED artifact. This test packs the real artifact with the real producer
-// (`vinci/scripts/package-entries.mjs` + the same `tar --no-recursion -T` invocation
-// `vinci/package.sh` uses), unpacks it into a clean temp prefix, and drives the embedded runtime
-// adapter FROM THAT PREFIX.
+// the INSTALLED artifact. This test packs the real artifact by INVOKING THE PUBLISHED PRODUCER
+// ITSELF — `bash vinci/package.sh <temp-out-dir>`, the script that builds every shipped tarball —
+// unpacks the result into a clean temp prefix, and drives the embedded runtime adapter FROM THAT
+// PREFIX. Nothing about the packaging is reimplemented here: no entry list, no exclude list, no
+// `tar` invocation. See the note above section 1 for why that is load-bearing.
 //
 // WHERE EACH SIDE RUNS. This test file runs from the SOURCE TREE and is never part of the
 // artifact (first-party test paths are excluded from the package). Only the two runtime modules —
@@ -43,12 +44,14 @@
 //      come up on the shipped SDK with the decoy marker never written.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -75,9 +78,13 @@ const MUST_SHIP = [
   "vinci/worker/run-events-sink.mjs",
   "vinci/worker/run.mjs",
 ];
-// Must be ABSENT — first-party test paths are excluded from the artifact. Asserted in this
-// direction on purpose: an assertion expecting a test file inside the artifact would pass today
-// and invert the moment the two-sided packaging predicate lands.
+// Must be ABSENT — the published artifact carries no first-party test path. Asserted against the
+// tarball's ACTUAL MEMBER LIST and never against an exclusion mechanism: the base this proof was
+// first written for kept test paths out via an entry-list predicate, the current base keeps them
+// out simply by not naming `vinci/test` in package.sh's path list, and a future base may use a
+// two-sided predicate. The artifact's contents are the claim; how the producer arrives at them is
+// not this test's business. Asserted in this direction on purpose: an assertion expecting a test
+// file inside the artifact would pass today and invert the moment the packaging changes.
 const MUST_NOT_SHIP = [
   "vinci/test/worker-runtime-adapter-events.mjs",
   "vinci/test/worker-runtime-adapter-tools.mjs",
@@ -110,6 +117,13 @@ const IMPORT_ROOT = installPrefix;
 
 const savedHome = process.env.HOME;
 process.env.HOME = home;
+
+// The producer runs the real build (`npm run build` per package) and `npm ls`; those want the
+// developer's actual HOME, not the empty temp home this test plants for the ambient-isolation
+// assertion. Everything AFTER packing still runs under the temp HOME.
+const producerEnv = { ...process.env };
+if (savedHome === undefined) delete producerEnv.HOME;
+else producerEnv.HOME = savedHome;
 
 let passed = 0;
 function check(condition, message) {
@@ -161,16 +175,42 @@ function installedPackageEntry(packageName, subpath = ".") {
 
 try {
   // ---- 1. Pack the real artifact with the real producer ---------------------------------------
-  const entriesPath = join(root, "package-entries.txt");
-  const entries = execFileSync("node", [join(CHECKOUT_ROOT, "vinci/scripts/package-entries.mjs"), CHECKOUT_ROOT], {
+  // BASE-COUPLING RULE: invoke the producer, never reimplement it. An earlier revision of this
+  // proof shelled out to `vinci/scripts/package-entries.mjs` and then repeated package.sh's own
+  // `tar --no-recursion -T` invocation. That module is a packaging INTERNAL: it exists on some
+  // bases and not others, and when this branch was rebased onto a base that builds an EXCLUDE list
+  // (`vinci/scripts/package-excludes.mjs`) and hands tar an explicit path list instead, the proof
+  // died with MODULE_NOT_FOUND — an installed-artifact proof taken out by a detail of how the
+  // artifact happens to be assembled. `bash vinci/package.sh <out-dir>` is the published producer
+  // on every base, so that is what runs here; a temp out-dir keeps the release files out of the
+  // repo and the `finally` below deletes them.
+  const producerPath = join(CHECKOUT_ROOT, "vinci/package.sh");
+  check(existsSync(producerPath), `the published producer exists at ${producerPath}`);
+  const releaseDir = join(root, "release");
+  execFileSync("bash", [producerPath, releaseDir], {
+    cwd: CHECKOUT_ROOT,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
+    env: producerEnv,
   });
-  writeFileSync(entriesPath, entries, "utf8");
-  const tarballPath = join(root, "vinci-code-test.tgz");
-  execFileSync("tar", ["--no-recursion", "-czf", tarballPath, "-C", CHECKOUT_ROOT, "-T", entriesPath], {
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  // Discover the archive instead of reconstructing its filename from identity.json — the naming
+  // scheme is another producer internal. package.sh emits the versioned archive plus an identical
+  // `vinci-code.tgz` compatibility copy (and an installer + checksum beside them), so requiring
+  // every emitted archive to be byte-identical makes "take the first one" a checked choice rather
+  // than an arbitrary one, and makes a base that starts emitting two DIFFERENT archives fail here,
+  // loudly, instead of silently proving something about whichever one sorted first.
+  const tarballNames = readdirSync(releaseDir)
+    .filter((name) => name.endsWith(".tgz"))
+    .sort();
+  check(tarballNames.length > 0, `the producer emitted at least one archive into ${releaseDir}`);
+  const archiveDigests = new Set(
+    tarballNames.map((name) => createHash("sha256").update(readFileSync(join(releaseDir, name))).digest("hex")),
+  );
+  check(
+    archiveDigests.size === 1,
+    `the archives the producer emitted are byte-identical (${tarballNames.join(", ")})`,
+  );
+  const tarballPath = join(releaseDir, tarballNames[0]);
   const members = new Set(
     execFileSync("tar", ["-tzf", tarballPath], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 })
       .split("\n")
