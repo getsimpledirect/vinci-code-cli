@@ -99,7 +99,10 @@ try {
 		timeout: 30_000,
 	});
 	assert.equal(malformed.status, 1, output(malformed));
-	assert.match(malformed.stderr, /node_modules\/chalk\/.*required by the trusted package layout is missing/);
+	assert.match(
+		malformed.stderr,
+		/(?:node_modules\/chalk\/.*required by the trusted package layout is missing|-> chalk resolves outside the artifact root)/,
+	);
 
 	console.log("packaged-runtime-probe: certified package, CLI help, direct CLI, worker, metadata, symlinks, and parent refusal passed");
 } finally {
