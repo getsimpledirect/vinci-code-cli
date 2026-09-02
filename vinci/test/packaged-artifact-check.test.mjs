@@ -73,6 +73,18 @@ function write(path, content) {
 	writeFileSync(path, content);
 }
 
+function git(root, args) {
+	const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8", timeout: 10_000 });
+	assert.equal(result.status, 0, result.stdout + result.stderr);
+	return result.stdout.trim();
+}
+
+function sealAuthority(authorityRoot) {
+	git(authorityRoot, ["add", "--all"]);
+	const status = git(authorityRoot, ["status", "--porcelain=v1"]);
+	if (status !== "") git(authorityRoot, ["commit", "-qm", "fixture authority"]);
+}
+
 function fixture() {
 	const root = mkdtempSync(join(tmpdir(), "vinci-packaged-check-"));
 	fixtureRoots.push(root);
@@ -101,6 +113,11 @@ function fixture() {
 	const authorityRoot = mkdtempSync(join(tmpdir(), "vinci-packaged-authority-"));
 	fixtureRoots.push(authorityRoot);
 	cpSync(root, authorityRoot, { recursive: true });
+	git(authorityRoot, ["init", "-q"]);
+	git(authorityRoot, ["config", "user.name", "Vinci Test"]);
+	git(authorityRoot, ["config", "user.email", "vinci-test@example.invalid"]);
+	git(authorityRoot, ["remote", "add", "origin", "https://github.com/getsimpledirect/vinci-code-cli.git"]);
+	sealAuthority(authorityRoot);
 	authorityRoots.set(root, authorityRoot);
 	return root;
 }
@@ -124,11 +141,13 @@ function authorize(root, relativePath) {
 	cpSync(source, target, { recursive: true });
 }
 
-function run(root, cwd = tmpdir()) {
+function run(root, cwd = tmpdir(), { seal = true } = {}) {
+	const authorityRoot = authorityRoots.get(root);
+	if (seal) sealAuthority(authorityRoot);
 	return spawnSync(process.execPath, [checker, root], {
 		cwd,
 		encoding: "utf8",
-		env: { ...process.env, VINCI_PACKAGED_AUTHORITY_ROOT: authorityRoots.get(root) },
+		env: { ...process.env, VINCI_PACKAGED_AUTHORITY_ROOT: authorityRoot },
 		timeout: 10_000,
 	});
 }
@@ -289,6 +308,53 @@ test("package selection keeps the runtime graph and excludes whole development g
 	assert.equal(excluded.has("node_modules/tsx"), true);
 	assert.equal(excluded.has("node_modules/esbuild"), true);
 	for (const [, name] of workspaces) assert.equal(excluded.has(`node_modules/${name}`), false);
+});
+
+function addClosedRuntimeLayout(base) {
+	const workspaces = [
+		["agent", "@earendil-works/pi-agent-core", {}],
+		["ai", "@earendil-works/pi-ai", {}],
+		["coding-agent", "@earendil-works/pi-coding-agent", { runtime: "1.0.0" }],
+		["orchestrator", "@earendil-works/pi-orchestrator", {}],
+		["tui", "@earendil-works/pi-tui", {}],
+	];
+	write(join(base, "package-lock.json"), "{}\n");
+	for (const [directory, name, dependencies] of workspaces) {
+		write(
+			join(base, "packages", directory, "package.json"),
+			JSON.stringify({ name, type: "module", main: "./dist/index.js", dependencies }),
+		);
+		write(join(base, "packages", directory, "dist", "index.js"), "export const ready = true;\n");
+		const linkedRoot = join(base, "node_modules", ...name.split("/"));
+		mkdirSync(dirname(linkedRoot), { recursive: true });
+		symlinkSync(`../../packages/${directory}`, linkedRoot);
+	}
+	write(
+		join(base, "node_modules", "runtime", "package.json"),
+		JSON.stringify({ name: "runtime", type: "module", exports: "./index.js" }),
+	);
+	write(join(base, "node_modules", "runtime", "index.js"), "export const runtime = true;\n");
+	write(
+		join(base, "node_modules", "@biomejs", "biome", "package.json"),
+		JSON.stringify({ name: "@biomejs/biome", type: "module", exports: "./index.js" }),
+	);
+	write(join(base, "node_modules", "@biomejs", "biome", "index.js"), "export const devOnly = true;\n");
+	for (const directory of ["themes", "assets", "updater"]) mkdirSync(join(base, "vinci", directory), { recursive: true });
+	write(join(base, "vinci", "scripts", "reap-heal-temp.mjs"), reaperSource);
+	write(join(base, "vinci", "NOTICE"), "test notice\n");
+}
+
+test("authority-identical packages outside the production closure are rejected", () => {
+	const root = fixture();
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	addClosedRuntimeLayout(root);
+	addClosedRuntimeLayout(authorityRoot);
+	rmSync(join(root, "package-lock.json"));
+	expectFailure(run(root), /@biomejs\/biome belongs to a package outside the production runtime closure/);
+	rmSync(join(root, "node_modules", "@biomejs", "biome"), { recursive: true });
+	const restored = run(root);
+	assert.equal(restored.status, 0, restored.stderr);
 });
 
 test("the reviewed maintenance helper is packaged, traversed, and fault-restorable", () => {
@@ -741,7 +807,7 @@ test("external package imports cannot resolve from a malicious parent node_modul
 		join(outer, "node_modules", "review-missing-package", "index.js"),
 		'export const marker = "PARENT_PACKAGE_EXECUTED";\n',
 	);
-	expectFailure(run(root), /imports.*external target review-missing-package resolves outside its root/);
+	expectFailure(run(root), /#review-external resolves outside the artifact root/);
 
 	write(
 		join(root, "node_modules", "review-missing-package", "package.json"),
@@ -760,6 +826,47 @@ test("external package imports cannot resolve from a malicious parent node_modul
 	});
 	assert.equal(reached.status, 0, reached.stderr);
 	assert.match(reached.stdout, /PACKAGED_PACKAGE_EXECUTED/);
+});
+
+test("every declared package export binds bare imports to the artifact", () => {
+	const { outer, root } = nestedFixture();
+	write(
+		join(root, "node_modules", "runtime", "package.json"),
+		JSON.stringify({
+			name: "runtime",
+			type: "module",
+			main: "./index.js",
+			exports: { ".": "./index.js", "./rpc-entry": "./rpc-entry.js" },
+		}),
+	);
+	write(join(root, "node_modules", "runtime", "index.js"), "export const runtime = true;\n");
+	write(
+		join(root, "node_modules", "runtime", "rpc-entry.js"),
+		'import { marker } from "tsx";\nconsole.log(marker);\n',
+	);
+	authorize(root, "node_modules/runtime");
+	write(
+		join(outer, "node_modules", "tsx", "package.json"),
+		JSON.stringify({ name: "tsx", type: "module", exports: "./index.js" }),
+	);
+	write(join(outer, "node_modules", "tsx", "index.js"), 'export const marker = "PARENT_TSX_EXECUTED";\n');
+	expectFailure(run(root), /runtime\/rpc-entry\.js -> tsx resolves outside the artifact root/);
+
+	write(
+		join(root, "node_modules", "tsx", "package.json"),
+		JSON.stringify({ name: "tsx", type: "module", exports: "./index.js" }),
+	);
+	write(join(root, "node_modules", "tsx", "index.js"), 'export const marker = "PACKAGED_TSX_EXECUTED";\n');
+	authorize(root, "node_modules/tsx");
+	const restored = run(root);
+	assert.equal(restored.status, 0, restored.stderr);
+	const reached = spawnSync(process.execPath, [join(root, "node_modules", "runtime", "rpc-entry.js")], {
+		cwd: outer,
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /PACKAGED_TSX_EXECUTED/);
 });
 
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
@@ -947,6 +1054,30 @@ test("artifact identity prevents a wrong repository from certifying", () => {
 	const root = fixture();
 	write(join(root, "vinci", "identity.json"), JSON.stringify({ productName: "Other", command: "vinci" }));
 	expectFailure(run(root), /artifact identity is not Vinci Code/);
+});
+
+test("the executable authority must be the expected Git repository", () => {
+	const root = fixture();
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	git(authorityRoot, ["remote", "set-url", "origin", "https://github.com/example/wrong-repository.git"]);
+	expectFailure(run(root, tmpdir(), { seal: false }), /wrong repository identity/);
+});
+
+test("an authority without Git commit and tree identity cannot certify", () => {
+	const root = fixture();
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	renameSync(join(authorityRoot, ".git"), join(authorityRoot, ".git-disabled"));
+	expectFailure(run(root, tmpdir(), { seal: false }), /readable Git checkout/);
+});
+
+test("tracked authority changes cannot certify between commits", () => {
+	const root = fixture();
+	const authorityRoot = authorityRoots.get(root);
+	assert.ok(authorityRoot);
+	write(join(authorityRoot, "vinci", "worker", "worker.mjs"), "export const changed = true;\n");
+	expectFailure(run(root, tmpdir(), { seal: false }), /authority has tracked modifications/);
 });
 
 test("artifact resolution is independent of the caller working directory", () => {

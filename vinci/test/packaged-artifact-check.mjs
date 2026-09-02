@@ -48,6 +48,50 @@ if (
 }
 const authorityRoot = realpathSync(suppliedAuthorityRoot);
 
+const expectedAuthorityRepository = "https://github.com/getsimpledirect/vinci-code-cli";
+
+function gitOutput(args) {
+  const result = spawnSync("git", ["-C", authorityRoot, ...args], {
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "" },
+    timeout: 10_000,
+  });
+  if (result.status !== 0) {
+    refuse("trusted executable authority must be a readable Git checkout", [
+      `git ${args.join(" ")}: ${(result.stderr || result.stdout || "failed").trim()}`,
+    ]);
+  }
+  return result.stdout.trim();
+}
+
+function normalizedRemote(remote) {
+  return remote
+    .replace(/^git@github\.com:/, "https://github.com/")
+    .replace(/^ssh:\/\/git@github\.com\//, "https://github.com/")
+    .replace(/\.git$/, "")
+    .replace(/\/$/, "");
+}
+
+function readAuthorityGitIdentity() {
+  const topLevel = realpathSync(gitOutput(["rev-parse", "--show-toplevel"]));
+  if (topLevel !== authorityRoot) {
+    refuse("trusted executable authority root must be the Git worktree root", [topLevel]);
+  }
+  const remote = normalizedRemote(gitOutput(["remote", "get-url", "origin"]));
+  if (remote !== expectedAuthorityRepository) {
+    refuse("trusted executable authority has the wrong repository identity", [remote]);
+  }
+  const status = gitOutput(["status", "--porcelain=v1", "--untracked-files=no"]);
+  if (status !== "") refuse("trusted executable authority has tracked modifications", status.split("\n"));
+  return {
+    commit: gitOutput(["rev-parse", "HEAD"]),
+    tree: gitOutput(["rev-parse", "HEAD^{tree}"]),
+    remote,
+  };
+}
+
+const initialAuthorityGitIdentity = readAuthorityGitIdentity();
+
 function relativeToRoot(path) {
   return relative(root, path).split(sep).join("/");
 }
@@ -393,7 +437,45 @@ function resolveImport(file, specifier) {
   return null;
 }
 
-function checkGraph(entryFiles, label) {
+function resolveBareSpecifier(file, specifier, isCommonJs) {
+  if (isBuiltin(specifier)) return { builtin: true };
+  const expression = isCommonJs
+    ? "import{createRequire}from'node:module';import{pathToFileURL}from'node:url';process.stdout.write(createRequire(pathToFileURL(process.argv[1])).resolve(process.argv[2]))"
+    : "process.stdout.write(import.meta.resolve(process.argv[1]))";
+  const args = isCommonJs
+    ? ["--input-type=module", "--eval", expression, file, specifier]
+    : ["--input-type=module", "--eval", expression, specifier];
+  const resolved = spawnSync(process.execPath, args, {
+    cwd: dirname(file),
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "" },
+    timeout: 5_000,
+  });
+  if (resolved.status !== 0) return { error: "does not resolve" };
+  let path = resolved.stdout;
+  if (!isCommonJs) {
+    if (!path.startsWith("file:")) return { error: `resolves to unsupported URL ${path}` };
+    try {
+      path = fileURLToPath(path);
+    } catch (error) {
+      return { error: `has an invalid resolution: ${error.message}` };
+    }
+  }
+  if (!existsSync(path)) return { error: "resolves to a missing file" };
+  let canonical;
+  try {
+    canonical = realpathSync(path);
+  } catch (error) {
+    return { error: `has no canonical target: ${error.message}` };
+  }
+  const rel = relative(root, canonical);
+  if (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) {
+    return { error: "resolves outside the artifact root" };
+  }
+  return { path: canonical };
+}
+
+function checkGraph(entryFiles, label, { strict = true, bindBare = false } = {}) {
   const queue = [...entryFiles];
   const visited = new Set();
   const failures = [];
@@ -421,6 +503,7 @@ function checkGraph(entryFiles, label) {
       continue;
     }
     const specifiers = [];
+    const bareSpecifiers = [];
     function addFailure(message) {
       failures.push(`${relativeToRoot(file)} ${message}`);
     }
@@ -429,10 +512,12 @@ function checkGraph(entryFiles, label) {
         addFailure("uses a non-literal module specifier");
         return;
       }
-      if (moduleSpecifier.text === "module" || moduleSpecifier.text === "node:module") {
+      if (strict && (moduleSpecifier.text === "module" || moduleSpecifier.text === "node:module")) {
         addFailure("imports Node module-loader authority; the static artifact proof refuses it");
       } else if (moduleSpecifier.text.startsWith(".")) {
         specifiers.push(moduleSpecifier.text);
+      } else if (bindBare) {
+        bareSpecifiers.push({ specifier: moduleSpecifier.text, commonJs: false });
       }
     }
     const constantCandidates = new Map();
@@ -513,29 +598,36 @@ function checkGraph(entryFiles, label) {
         addFailure("uses runtime import-equals loading; the static artifact proof refuses it");
       } else if (ts.isCallExpression(node)) {
         if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-          addFailure("uses dynamic/runtime module loading; the static artifact proof refuses it");
+          if (strict) {
+            addFailure("uses dynamic/runtime module loading; the static artifact proof refuses it");
+          } else if (node.arguments.length === 1 && ts.isStringLiteralLike(node.arguments[0])) {
+            if (node.arguments[0].text.startsWith(".")) specifiers.push(node.arguments[0].text);
+            else if (bindBare) bareSpecifiers.push({ specifier: node.arguments[0].text, commonJs: false });
+          }
         } else if (ts.isIdentifier(node.expression) && node.expression.text === "require") {
-          if (!isCommonJs) {
+          if (!isCommonJs && strict) {
             addFailure("uses a CommonJS loader in an ESM module");
           } else if (node.arguments.length !== 1 || !ts.isStringLiteralLike(node.arguments[0])) {
-            addFailure("uses dynamic/runtime module loading; the static artifact proof refuses it");
-          } else if (node.arguments[0].text === "module" || node.arguments[0].text === "node:module") {
+            if (strict) addFailure("uses dynamic/runtime module loading; the static artifact proof refuses it");
+          } else if (strict && (node.arguments[0].text === "module" || node.arguments[0].text === "node:module")) {
             addFailure("loads Node module-loader authority; the static artifact proof refuses it");
           } else if (node.arguments[0].text.startsWith(".")) {
             specifiers.push(node.arguments[0].text);
+          } else if (bindBare) {
+            bareSpecifiers.push({ specifier: node.arguments[0].text, commonJs: true });
           }
         }
-      } else if (ts.isIdentifier(node) && (node.text === "eval" || node.text === "Function")) {
+      } else if (strict && ts.isIdentifier(node) && (node.text === "eval" || node.text === "Function")) {
         addFailure("references a dynamic code loader; the static artifact proof refuses it");
-      } else if (
+      } else if (strict && (
         ts.isIdentifier(node)
         && (node.text === "require" || node.text === "createRequire")
         && !(ts.isCallExpression(node.parent) && node.parent.expression === node && node.text === "require")
-      ) {
+      )) {
         addFailure("aliases a runtime module loader; the static artifact proof refuses it");
-      } else if (ts.isIdentifier(node) && node.text === "module" && !isAllowedCommonJsModuleReference(node)) {
+      } else if (strict && ts.isIdentifier(node) && node.text === "module" && !isAllowedCommonJsModuleReference(node)) {
         addFailure("uses module through an unverifiable runtime access");
-      } else if (
+      } else if (strict && (
         (
           ts.isPropertyAccessExpression(node)
           && [
@@ -552,25 +644,25 @@ function checkGraph(entryFiles, label) {
             staticPropertyName(node.argumentExpression),
           )
         )
-      ) {
+      )) {
         addFailure("aliases a runtime module loader; the static artifact proof refuses it");
-      } else if (
+      } else if (strict && (
         ts.isElementAccessExpression(node)
         && ts.isIdentifier(node.expression)
         && ["Module", "module", "global", "globalThis"].includes(node.expression.text)
-      ) {
+      )) {
         addFailure("uses computed runtime access that the static artifact proof cannot verify");
-      } else if (
+      } else if (strict && (
         !isCommonJs
         && ts.isIdentifier(node)
         && (node.text === "exports" || node.text === "module")
-      ) {
+      )) {
         addFailure("uses CommonJS globals in an ESM module");
-      } else if (
+      } else if (strict && (
         isCommonJs
         && ts.isMetaProperty(node)
         && node.keywordToken === ts.SyntaxKind.ImportKeyword
-      ) {
+      )) {
         addFailure("uses import.meta in a .cjs module");
       }
       ts.forEachChild(node, visit);
@@ -582,9 +674,14 @@ function checkGraph(entryFiles, label) {
       if (!dependency) failures.push(`${relativeToRoot(file)} -> ${specifier}`);
       else if (/\.(?:cjs|js|mjs|ts)$/.test(dependency)) queue.push(dependency);
     }
+    for (const { specifier, commonJs } of bareSpecifiers) {
+      imports += 1;
+      const resolution = resolveBareSpecifier(file, specifier, commonJs);
+      if (resolution.error) failures.push(`${relativeToRoot(file)} -> ${specifier} ${resolution.error}`);
+    }
   }
   if (failures.length > 0) refuse(`${label} has ${failures.length} unverifiable dependency edge(s)`, failures);
-  return { files: visited.size, imports };
+  return { files: visited.size, imports, paths: visited };
 }
 
 const extensionsRoot = assertExactRealPath(join(root, "vinci", "extensions"), "vinci/extensions");
@@ -625,6 +722,9 @@ const dispatchEntries = [resolverPath, ...maintenanceEntries, ...nodeTargets.map
   return path;
 })];
 const dispatchGraph = checkGraph(dispatchEntries, "launcher dispatch graph");
+const reviewedExecutablePaths = new Set(
+  [...dispatchGraph.paths, ...extensionGraph.paths].map((path) => relativeToRoot(path)),
+);
 
 // The parser checks above provide useful, local diagnostics for malformed launchers and dependency
 // graphs. They are not the trust boundary: shell and JavaScript both expose many equivalent ways to
@@ -646,6 +746,7 @@ let authorityFiles = 0;
 let authorityLinks = 0;
 let requiredAuthorityEntries = 0;
 const artifactPackageManifests = [];
+const packageEntryFiles = new Set();
 
 function containedCanonicalRelative(base, path, label) {
   let canonical;
@@ -676,27 +777,33 @@ function compareAuthorityDirectory(artifactDirectory, relativeDirectory = "") {
   for (const entry of readdirSync(artifactDirectory).sort()) {
     const relativePath = relativeDirectory ? `${relativeDirectory}/${entry}` : entry;
     const artifactPath = join(artifactDirectory, entry);
-    const trustedPath = join(authorityRoot, ...relativePath.split("/"));
-    if (!existsSync(trustedPath) && !lstatExists(trustedPath)) {
+    if (!isAllowedReleasePath(relativePath)) {
+      authorityFailures.push(`${relativePath} is outside the calculated production release surface`);
+      continue;
+    }
+    if (belongsToExcludedPackage(relativePath)) {
+      authorityFailures.push(`${relativePath} belongs to a package outside the production runtime closure`);
+      continue;
+    }
+    const trusted = authoritySnapshot.get(relativePath);
+    if (!trusted) {
       authorityFailures.push(`${relativePath} is not present in the trusted executable authority`);
       continue;
     }
     const artifactStat = lstatSync(artifactPath);
-    const trustedStat = lstatSync(trustedPath);
     if (artifactStat.isDirectory()) {
-      if (!trustedStat.isDirectory() || trustedStat.isSymbolicLink()) {
+      if (trusted.type !== "directory") {
         authorityFailures.push(`${relativePath} differs in type from the trusted executable authority`);
       } else {
         compareAuthorityDirectory(artifactPath, relativePath);
       }
     } else if (artifactStat.isSymbolicLink()) {
       authorityLinks += 1;
-      if (!trustedStat.isSymbolicLink() || readlinkSync(artifactPath) !== readlinkSync(trustedPath)) {
+      if (trusted.type !== "symlink" || readlinkSync(artifactPath) !== trusted.link) {
         authorityFailures.push(`${relativePath} differs from the trusted executable authority`);
       } else {
         const artifactTarget = containedCanonicalRelative(root, artifactPath, `${relativePath} artifact symlink`);
-        const trustedTarget = containedCanonicalRelative(authorityRoot, trustedPath, `${relativePath} authority symlink`);
-        if (artifactTarget !== null && trustedTarget !== null && artifactTarget !== trustedTarget) {
+        if (artifactTarget !== null && trusted.canonical !== null && artifactTarget !== trusted.canonical) {
           authorityFailures.push(`${relativePath} symlink resolves to a different trusted path`);
         }
       }
@@ -706,13 +813,12 @@ function compareAuthorityDirectory(artifactDirectory, relativeDirectory = "") {
         artifactPackageManifests.push(artifactPath);
       }
       if (
-        !trustedStat.isFile()
-        || trustedStat.isSymbolicLink()
+        trusted.type !== "file"
         || artifactStat.nlink !== 1
-        || trustedStat.nlink !== 1
-        || (artifactStat.mode & 0o111) !== (trustedStat.mode & 0o111)
-        || artifactStat.size !== trustedStat.size
-        || fileDigest(artifactPath) !== fileDigest(trustedPath)
+        || trusted.nlink !== 1
+        || (artifactStat.mode & 0o111) !== trusted.executableMode
+        || artifactStat.size !== trusted.size
+        || fileDigest(artifactPath) !== trusted.digest
       ) {
         authorityFailures.push(`${relativePath} differs from the trusted executable authority`);
       }
@@ -786,24 +892,71 @@ function excludedFromReleaseAuthority(relativePath) {
     || relativePath === "node_modules/.package-lock.json"
   ) return true;
   const nestedPath = `/${relativePath}`;
-  if (
-    /\/node_modules\/(?:typescript|unbash|esbuild|@typescript|@biomejs|@types|@esbuild)(?:\/|$)/.test(nestedPath)
-    || /\/node_modules\/(?:\.cache|\.vite|\.bin)(?:\/|$)/.test(nestedPath)
-    || /\/node_modules\/ssh2\/test(?:\/|$)/.test(nestedPath)
-  ) return true;
+  if (/\/node_modules\/(?:\.cache|\.vite|\.bin)(?:\/|$)/.test(nestedPath)) return true;
+  if (/\/node_modules\/ssh2\/test(?:\/|$)/.test(nestedPath)) return true;
   return belongsToExcludedPackage(relativePath);
+}
+
+function isAllowedReleasePath(relativePath) {
+  return [...releaseAuthorityRoots, ...reviewedExecutablePaths].some((releaseRoot) => (
+    relativePath === releaseRoot
+    || relativePath.startsWith(`${releaseRoot}/`)
+    || releaseRoot.startsWith(`${relativePath}/`)
+  ));
+}
+
+const authoritySnapshot = new Map();
+
+function snapshotAuthorityEntry(relativePath) {
+  if (!isAllowedReleasePath(relativePath) || excludedFromReleaseAuthority(relativePath)) return;
+  const trustedPath = join(authorityRoot, ...relativePath.split("/"));
+  if (!lstatExists(trustedPath)) return;
+  const before = lstatSync(trustedPath);
+  if (before.isDirectory() && !before.isSymbolicLink()) {
+    const children = readdirSync(trustedPath).sort();
+    authoritySnapshot.set(relativePath, { type: "directory", children });
+    for (const entry of children) snapshotAuthorityEntry(`${relativePath}/${entry}`);
+  } else if (before.isSymbolicLink()) {
+    authoritySnapshot.set(relativePath, {
+      type: "symlink",
+      link: readlinkSync(trustedPath),
+      canonical: containedCanonicalRelative(authorityRoot, trustedPath, `${relativePath} authority symlink`),
+    });
+  } else if (before.isFile()) {
+    const digest = fileDigest(trustedPath);
+    const after = lstatSync(trustedPath);
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+    ) {
+      authorityFailures.push(`${relativePath} changed while the trusted authority snapshot was captured`);
+    }
+    authoritySnapshot.set(relativePath, {
+      type: "file",
+      digest,
+      executableMode: before.mode & 0o111,
+      nlink: before.nlink,
+      size: before.size,
+    });
+  }
+}
+
+for (const relativePath of new Set(releaseAuthorityRoots.map((path) => path.split("/")[0]))) {
+  snapshotAuthorityEntry(relativePath);
 }
 
 function requireAuthorityEntry(relativePath) {
   if (excludedFromReleaseAuthority(relativePath)) return;
-  const trustedPath = join(authorityRoot, ...relativePath.split("/"));
-  if (!lstatExists(trustedPath)) {
+  const trusted = authoritySnapshot.get(relativePath);
+  if (!trusted) {
     authorityFailures.push(`${relativePath} is absent from the trusted package layout`);
     return;
   }
-  const trustedStat = lstatSync(trustedPath);
-  if (trustedStat.isDirectory() && !trustedStat.isSymbolicLink()) {
-    for (const entry of readdirSync(trustedPath).sort()) {
+  if (trusted.type === "directory") {
+    for (const entry of trusted.children) {
       requireAuthorityEntry(`${relativePath}/${entry}`);
     }
     return;
@@ -866,44 +1019,12 @@ function validatePackageManifest(manifestPath) {
   for (const { label, target, legacy = false } of targets) {
     if (!legacy && !target.startsWith("./")) {
       if (label.startsWith("imports")) {
-        if (isBuiltin(target)) continue;
-        // Package imports may legally redirect to a bare dependency. Resolve that target with the
-        // ESM import conditions from the declaring package, without evaluating artifact code, and
-        // require the selected file to exist canonically inside this payload. Otherwise a missing
-        // package can be supplied by an attacker-controlled parent node_modules directory.
-        const resolved = spawnSync(
-          process.execPath,
-          [
-            "--input-type=module",
-            "--eval",
-            "process.stdout.write(import.meta.resolve(process.argv[1]))",
-            target,
-          ],
-          {
-            cwd: packageRoot,
-            encoding: "utf8",
-            env: { PATH: process.env.PATH ?? "" },
-            timeout: 5_000,
-          },
-        );
-        if (resolved.status !== 0 || !resolved.stdout.startsWith("file:")) {
-          authorityFailures.push(
-            `${relativeManifest} ${label} external target ${target} does not resolve inside the package`,
-          );
-          continue;
+        const resolution = resolveBareSpecifier(manifestPath, target, false);
+        if (resolution.error) {
+          authorityFailures.push(`${relativeManifest} ${label} external target ${target} ${resolution.error}`);
+        } else if (resolution.path && /\.(?:cjs|js|mjs|ts)$/.test(resolution.path)) {
+          packageEntryFiles.add(resolution.path);
         }
-        let resolvedPath;
-        try {
-          resolvedPath = fileURLToPath(resolved.stdout);
-        } catch (error) {
-          authorityFailures.push(`${relativeManifest} ${label} external target ${target} is invalid: ${error.message}`);
-          continue;
-        }
-        if (!lstatExists(resolvedPath)) {
-          authorityFailures.push(`${relativeManifest} ${label} external target ${target} is missing`);
-          continue;
-        }
-        containedCanonicalRelative(root, resolvedPath, `${relativeManifest} ${label} external target ${target}`);
         continue;
       }
       authorityFailures.push(`${relativeManifest} ${label} target ${target} is not package-relative`);
@@ -928,13 +1049,17 @@ function validatePackageManifest(manifestPath) {
       authorityFailures.push(`${relativeManifest} ${label} target ${target} is missing`);
       continue;
     }
-    containedCanonicalRelative(root, targetPath, `${relativeManifest} ${label} target ${target}`);
+    const canonical = containedCanonicalRelative(root, targetPath, `${relativeManifest} ${label} target ${target}`);
+    if (canonical !== null && /\.(?:cjs|js|mjs|ts)$/.test(targetPath)) packageEntryFiles.add(targetPath);
   }
 }
 
 for (const manifestPath of artifactPackageManifests) validatePackageManifest(manifestPath);
+const packageEntryGraph = checkGraph(packageEntryFiles, "package entry graph", { strict: false, bindBare: true });
 if (runtimePackageExclusions === null) {
-  for (const entry of readdirSync(authorityRoot).sort()) requireAuthorityEntry(entry);
+  for (const relativePath of authoritySnapshot.keys()) {
+    if (!relativePath.includes("/")) requireAuthorityEntry(relativePath);
+  }
 } else {
   for (const relativePath of releaseAuthorityRoots) requireAuthorityEntry(relativePath);
 }
@@ -946,10 +1071,23 @@ if (authorityFailures.length > 0) {
   refuse(`artifact violates the closed executable authority (${authorityFailures.length} mismatch(es))`, visible);
 }
 
+const finalAuthorityGitIdentity = readAuthorityGitIdentity();
+if (
+  finalAuthorityGitIdentity.commit !== initialAuthorityGitIdentity.commit
+  || finalAuthorityGitIdentity.tree !== initialAuthorityGitIdentity.tree
+  || finalAuthorityGitIdentity.remote !== initialAuthorityGitIdentity.remote
+) {
+  refuse("trusted executable authority identity changed during verification", [
+    `before ${initialAuthorityGitIdentity.commit}/${initialAuthorityGitIdentity.tree}`,
+    `after ${finalAuthorityGitIdentity.commit}/${finalAuthorityGitIdentity.tree}`,
+  ]);
+}
+
 console.log(
   `  ✓ packaged artifact: ${manifest.dispatches.length} manifest-driven launcher dispatches; `
   + `${dispatchGraph.files} dispatch files/${dispatchGraph.imports} imports and `
   + `${extensionGraph.files} extension files/${extensionGraph.imports} imports resolve inside the tarball; `
+  + `${packageEntryGraph.files} package entry files/${packageEntryGraph.imports} imports bind inside the tarball; `
   + `${authorityFiles} files/${authorityLinks} links match the closed executable authority; `
   + `${requiredAuthorityEntries} required entries close parent-directory dependency resolution`,
 );

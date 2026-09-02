@@ -31,13 +31,6 @@ node "${ROOT}/vinci/scripts/package-excludes.mjs" "${ROOT}" > "${EXCLUDES}"
 # tests, docs, infrastructure state, and release tooling must never enter the public archive.
 tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude-from="${EXCLUDES}" \
-  --exclude='node_modules/typescript' \
-  --exclude='node_modules/unbash' \
-  --exclude='node_modules/@typescript' \
-  --exclude='node_modules/@biomejs' \
-  --exclude='node_modules/@types' \
-  --exclude='node_modules/esbuild' \
-  --exclude='node_modules/@esbuild' \
   --exclude='node_modules/ssh2/test' \
   --exclude='node_modules/.cache' \
   --exclude='node_modules/.vite' \
