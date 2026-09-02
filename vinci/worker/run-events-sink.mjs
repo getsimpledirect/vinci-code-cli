@@ -92,11 +92,20 @@ export function createJsonlSink(path) {
     return sequence;
   }
 
-  // Rebuild sequence/idempotency state from the file on disk, independent of any in-memory state.
-  // This is what lets a resumed process prove continuity: replay() after reopen reports the same
-  // lastSequence the previous process last wrote, so the next append is lastSequence+1.
+  // Rebuild sequence/idempotency state from the file on disk, DISCARDING whatever this object held
+  // in memory, and adopt it. This is what lets a resumed process prove continuity: replay() reports
+  // the same lastSequence the previous process last durably wrote, and the next append is
+  // lastSequence+1. Adopting (not merely reporting) matters when the sink object is behind the file
+  // — a stale counter would re-issue sequence numbers that are already on disk, so `replay()` is the
+  // step that keeps "contiguous, never reused" true across a process replacement.
+  // A pathless (in-memory) sink has no disk to replay from: reporting zero is honest, but adopting
+  // zero would silently rewind it, so adoption is confined to the file-backed case.
   function replay() {
     const state = loadFromDisk(path);
+    if (path) {
+      lastSequence = state.lastSequence;
+      index = state.index;
+    }
     return { lastSequence: state.lastSequence, keys: [...state.index.keys()] };
   }
 

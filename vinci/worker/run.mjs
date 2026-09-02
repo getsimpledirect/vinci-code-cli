@@ -1195,6 +1195,132 @@ export function applyEnvDelta(base, delta) {
   return env;
 }
 
+// IR-02 Lane B: the default tool grant. The subprocess path passes it to `vinci -p --tools` as a
+// CSV; the embedded path passes the same names as an array to the runtime adapter, so ONE list
+// governs both lanes and they cannot drift apart.
+export const DEFAULT_GRANTED_TOOLS = Object.freeze(["read", "grep", "find", "ls", "bash", "edit", "write"]);
+
+// The SDK's own session-id predicate (packages/coding-agent assertValidSessionId). A task id that
+// does not satisfy it is NOT forced through: the adapter falls back to a generated session id and
+// the run still records its transcript, it is simply not addressable by the task's own id.
+const SDK_SESSION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+
+/**
+ * IR-02 Lane B: run the agent IN-PROCESS through the embedded runtime adapter instead of spawning
+ * `vinci -p`. Reached only from `runVinci` when `envelope.runtime === "embedded"`.
+ *
+ * The adapter and the SDK are imported DYNAMICALLY so that an envelope without `runtime` never
+ * pays for — or is affected by — loading the coding-agent SDK.
+ *
+ * The resolved value is the SAME shape the subprocess path resolves with, because worker.mjs
+ * spreads it straight into the lifecycle record and reads `exit_code`, `limit_tripped`, `cost_usd`,
+ * `outcome`, `harness_stops` and `unattended_policy` off it. Every one of those is read back from
+ * the session transcript by the same `readSessionState` the subprocess path uses; a field the
+ * embedded lane cannot populate honestly (there is no `vinci-task-outcome` entry unless the agent
+ * writes one) comes back as the same absent/empty value the subprocess path would produce.
+ */
+async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId, abortSignal, embedded }) {
+  const { createJsonlSink } = await import("./run-events-sink.mjs");
+  const { createRunSession } = await import("./runtime-adapter.mjs");
+
+  const sessionDir = join(stateDir, "sessions", taskId);
+  const grantedTools =
+    Array.isArray(envelope.tools) && envelope.tools.length > 0 ? [...envelope.tools] : [...DEFAULT_GRANTED_TOOLS];
+  const eventsPath = join(stateDir, "run-events.jsonl");
+  mkdirSync(sessionDir, { recursive: true });
+
+  const run = {
+    runId: taskId,
+    attemptId: sessionId,
+    workspaceId: typeof envelope.repo === "string" ? envelope.repo : null,
+    contextManifestDigest: null,
+    provider: envelope.provider,
+    model: envelope.model,
+  };
+  // Only present on a digest-form envelope; omitted rather than invented on a prose one.
+  if (typeof envelope.work_order_id === "string") run.workOrderId = envelope.work_order_id;
+  if (typeof envelope.work_order_digest === "string") run.workOrderDigest = envelope.work_order_digest;
+
+  const sink = createJsonlSink(eventsPath);
+  let limitTripped = null;
+  let aborted = null;
+  let handle = null;
+  let exitCode = 0;
+
+  const stop = async (limit) => {
+    if (limitTripped || !handle) return;
+    limitTripped = limit;
+    // "budget" is the only tripped limit the run.paused enum names; a runtime/deadline stop aborts
+    // the turn without claiming a reason code the contract does not define for it.
+    if (limit === "budget_usd") await handle.interrupt("budget").catch(() => {});
+    else await handle.session.abort().catch(() => {});
+  };
+  const onAbort = async () => {
+    if (aborted || !handle) return;
+    aborted = String(abortSignal?.reason ?? "aborted");
+    await handle.interrupt("worker_lost").catch(() => {});
+  };
+
+  const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
+  const runtimeTimer = setTimeout(() => void stop("max_runtime_s"), envelope.max_runtime_s * 1000);
+  runtimeTimer.unref();
+  const pollTimer = setInterval(() => {
+    if (envelope.deadline && Date.now() >= Date.parse(envelope.deadline)) {
+      void stop("deadline");
+      return;
+    }
+    if (readSessionState(sessionDir, sessionId).costUsd >= envelope.budget_usd) void stop("budget_usd");
+  }, pollMs);
+  pollTimer.unref();
+  if (abortSignal) {
+    if (abortSignal.aborted) void onAbort();
+    else abortSignal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  try {
+    handle = await createRunSession({
+      run,
+      grantedTools,
+      cwd: repoDir,
+      sessionDir,
+      sessionId: SDK_SESSION_ID.test(String(sessionId ?? "")) ? sessionId : undefined,
+      sink,
+      ...(embedded && embedded.authStorage ? { authStorage: embedded.authStorage } : {}),
+      ...(embedded && embedded.model ? { model: embedded.model } : {}),
+    });
+    await handle.prompt(envelope.spec);
+  } catch {
+    exitCode = 1;
+  } finally {
+    clearTimeout(runtimeTimer);
+    clearInterval(pollTimer);
+    if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
+  }
+
+  const session = readSessionState(sessionDir, sessionId);
+  if (!limitTripped && session.costUsd >= envelope.budget_usd) limitTripped = "budget_usd";
+  if (!limitTripped && envelope.deadline && Date.now() >= Date.parse(envelope.deadline)) limitTripped = "deadline";
+  if (handle) {
+    handle.complete({
+      outcome: exitCode === 0 && !limitTripped && !aborted ? "SUCCEEDED" : "FAILED",
+      tierReached: "NONE",
+    });
+    await handle.dispose().catch(() => {});
+  }
+  sink.close();
+
+  const result = {
+    exit_code: exitCode,
+    limit_tripped: limitTripped,
+    cost_usd: session.costUsd,
+    outcome: session.outcome,
+    harness_stops: session.harnessStops,
+    unattended_policy: session.unattendedPolicy ?? [],
+  };
+  if (abortSignal) result.aborted = aborted;
+  return result;
+}
+
 // `abortSignal` (optional, Wave 1B): an AbortSignal the daemon fires on LOSS OF AUTHORITY (the
 // Governor lease could not be renewed). Aborting SIGTERMs the child's process group, then SIGKILLs
 // after `abortKillGraceMs` (10 s unless VINCI_WORKER_LEASE_KILL_GRACE_MS says otherwise); the
@@ -1202,7 +1328,18 @@ export function applyEnvDelta(base, delta) {
 // rather than a tripped limit. Without a signal the function is unchanged.
 // `env` (clean-room mode, #24) and `envDelta` (unattended policy, W2) are orthogonal to it: all
 // three are optional and compose.
-export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, envDelta, abortSignal }) {
+// `embedded` (optional, IR-02 Lane B): read ONLY by the embedded runtime lane. It carries the
+// SDK `authStorage`/`model` the in-process session authenticates with — the embedded lane's
+// counterpart to `env` on the subprocess lane, since the adapter's provider isolation refuses to
+// read ambient credentials out of process.env. Ignored entirely when `runtime` is not "embedded".
+export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, envDelta, abortSignal, embedded }) {
+  // IR-02 Lane B compatibility switch. `runtime: "embedded"` runs the agent IN-PROCESS through the
+  // runtime adapter; ANY other value — including the absent one every envelope carries today —
+  // falls through to the subprocess path below, which is unchanged. The branch is deliberately the
+  // first statement in the function so that "runtime absent" reaches byte-identical code.
+  if (envelope.runtime === "embedded") {
+    return runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId, abortSignal, embedded });
+  }
   const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;

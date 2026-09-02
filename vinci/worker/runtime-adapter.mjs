@@ -14,6 +14,7 @@
 // Provider isolation mirrors run.mjs's envDelta idiom: the adapter builds an in-memory AuthStorage
 // and never reads ambient provider keys, so only the Run's own provider can ever authenticate.
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   AuthStorage,
@@ -28,6 +29,10 @@ import { getModel } from "@earendil-works/pi-ai/compat";
 export const ALLOWLISTED_CUSTOM_TOOLS = Object.freeze([]);
 
 const VALID_PAUSE_REASONS = Object.freeze(["manual", "steer", "budget", "worker_lost"]);
+
+// The custom session entry that binds a persisted session file to the Run it was opened for.
+// resumeRunSession refuses to reopen a session whose recorded identity is not this Run's.
+export const VINCI_RUN_ENTRY = "vinci_run";
 
 function sha256Hex(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
@@ -121,8 +126,24 @@ function lastAssistantUsage(messages) {
   return null;
 }
 
-function openSession({ run, grantedTools, customTools, cwd, sessionDir, persistent, authStorage, model }) {
-  const manager = persistent ? SessionManager.create(cwd, sessionDir) : SessionManager.inMemory(cwd);
+function openSession({
+  run,
+  grantedTools,
+  customTools,
+  cwd,
+  sessionDir,
+  persistent,
+  authStorage,
+  model,
+  sessionId,
+  sessionManager,
+}) {
+  const newSessionOptions = sessionId ? { id: sessionId } : undefined;
+  const manager =
+    sessionManager ??
+    (persistent
+      ? SessionManager.create(cwd, sessionDir, newSessionOptions)
+      : SessionManager.inMemory(cwd, newSessionOptions));
   const modelInstance = model ?? getModel(run.provider, run.model);
   const auth = isolateAuthStorage(authStorage ?? AuthStorage.inMemory(), run.provider);
   const allowlistedCustom = (Array.isArray(customTools) ? customTools : []).filter((tool) =>
@@ -386,6 +407,9 @@ function attachTranslator({ run, session, authStorage, sink, clock, grantedTools
  * @param {object} [options.authStorage] - SDK AuthStorage (test seam; default in-memory). It is
  *   provider-isolated in place (isolateAuthStorage) before the session sees it.
  * @param {object} [options.model] - SDK Model (test seam; default getModel(run.provider, run.model))
+ * @param {string} [options.sessionId] - explicit session id, so the worker's session accounting
+ *   (session-read.mjs readSessionState(sessionDir, sessionId)) finds this session's transcript the
+ *   same way it finds a `vinci -p --session-id` subprocess's.
  * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session, authStorage}>}
  */
 export async function createRunSession({
@@ -399,6 +423,7 @@ export async function createRunSession({
   clock,
   authStorage,
   model,
+  sessionId,
 }) {
   const opened = await openSession({
     run,
@@ -409,10 +434,11 @@ export async function createRunSession({
     persistent,
     authStorage,
     model,
+    sessionId,
   });
   const { session } = opened;
   // Record the run identity as a custom entry so resume can verify it.
-  session.sessionManager.appendCustomEntry("vinci_run", { runId: run.runId, attemptId: run.attemptId });
+  session.sessionManager.appendCustomEntry(VINCI_RUN_ENTRY, { runId: run.runId, attemptId: run.attemptId });
 
   const entryCount = Number.isInteger(run.contextManifestEntryCount) && run.contextManifestEntryCount >= 0
     ? run.contextManifestEntryCount
@@ -443,13 +469,41 @@ export async function createRunSession({
   });
 }
 
+// Every run identity the persisted session file recorded, oldest first. createRunSession writes
+// one on create; a resume that adopts a new attempt of the same run writes another.
+function recordedRunIdentities(sessionManager) {
+  const entries = sessionManager.getEntries();
+  return entries
+    .filter((entry) => entry && entry.type === "custom" && entry.customType === VINCI_RUN_ENTRY)
+    .map((entry) => (entry.data && typeof entry.data === "object" ? entry.data : {}));
+}
+
+function identityMismatch(message) {
+  const error = new Error(`run identity mismatch: ${message}`);
+  error.code = "run_identity_mismatch";
+  return error;
+}
+
 /**
  * Reopen a persisted run session after the previous process was replaced (e.g. SIGKILLed).
- * Reopens the sink passed in (which reloads sequence state from disk), verifies the recorded run
- * identity, emits run.resumed, and returns the same handle shape as createRunSession.
  *
- * @param {object} options - same as createRunSession, plus `sessionPath` (returned for clarity)
- * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session, authStorage}>}
+ * Ordering is load-bearing. The session file is opened and its recorded run identity is verified
+ * BEFORE the agent session is constructed and before a single line reaches the sink, so a resume
+ * pointed at the wrong run, at a missing file, or at a file that is not a pi session leaves the
+ * event log byte-identical.
+ *
+ * `sink.replay()` re-reads the events file from disk and RESETS the sink's in-memory sequence
+ * counter and idempotency index to what the killed process actually durably wrote. Without it a
+ * sink object whose in-memory state is behind the file (constructed before the previous process's
+ * last writes landed) would re-issue sequence numbers that are already on disk, and the run-event
+ * contract's "contiguous, never reused" guarantee would be broken by the resume itself.
+ *
+ * @param {object} options - same as createRunSession, plus:
+ * @param {string} options.sessionPath - the persisted session file to reopen (handle.sessionPath)
+ * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session, authStorage,
+ *   resumedFromSequence, resumedAtSequence}>}
+ * @throws {Error} code "session_not_found" when sessionPath is absent/missing (nothing appended)
+ * @throws {Error} code "session_unreadable" when the file is not a pi session (nothing appended)
  * @throws {Error} code "run_identity_mismatch" when the persisted runId differs (nothing appended)
  */
 export async function resumeRunSession({
@@ -464,6 +518,58 @@ export async function resumeRunSession({
   authStorage,
   model,
 }) {
+  // (1) The file must exist. SessionManager.open() on a missing path silently starts a BRAND NEW
+  // session at that path, which would read as a successful resume of an empty run.
+  if (typeof sessionPath !== "string" || sessionPath.length === 0) {
+    const error = new Error("resumeRunSession: sessionPath is required");
+    error.code = "session_not_found";
+    throw error;
+  }
+  if (!existsSync(sessionPath)) {
+    const error = new Error(`resumeRunSession: session file does not exist: ${sessionPath}`);
+    error.code = "session_not_found";
+    throw error;
+  }
+
+  // (2) Parse the file. A non-empty file that is not a pi session throws here; an EMPTY file is
+  // accepted by the SDK (it initializes a header in place), so it is caught by (3) instead.
+  let sessionManager;
+  try {
+    sessionManager = SessionManager.open(sessionPath, sessionDir, cwd);
+  } catch (cause) {
+    const error = new Error(
+      `resumeRunSession: cannot read session file ${sessionPath}: ${cause && cause.message ? cause.message : cause}`,
+    );
+    error.code = "session_unreadable";
+    error.cause = cause;
+    throw error;
+  }
+
+  // (3) Verify the recorded run identity BEFORE constructing the agent session (createAgentSession
+  // appends thinking-level/model-change entries to the file) and before touching the sink.
+  const identities = recordedRunIdentities(sessionManager);
+  if (identities.length === 0) {
+    throw identityMismatch(
+      `session file ${sessionPath} records no ${VINCI_RUN_ENTRY} entry; it was not opened by this adapter for run ${JSON.stringify(run.runId)}`,
+    );
+  }
+  // EVERY recorded identity must name this run. The attemptId may legitimately be a NEW attempt of
+  // the same run, so it is not compared; a crossed attemptId (one the file binds to a different
+  // run) is already a runId divergence and is refused by this same check — a second condition on
+  // `identity.attemptId === run.attemptId && identity.runId !== run.runId` would be unreachable,
+  // and an unreachable second guard is what makes a mutation of the first one look survivable.
+  for (const identity of identities) {
+    if (identity.runId !== run.runId) {
+      throw identityMismatch(
+        `persisted runId ${JSON.stringify(identity.runId ?? null)} != ${JSON.stringify(run.runId)}`,
+      );
+    }
+  }
+
+  // (4) Re-sync the sink to what is durably on disk, so the first post-resume append is
+  // lastSequence+1 — no gap, no reuse.
+  const replayed = sink.replay();
+
   const opened = await openSession({
     run,
     grantedTools,
@@ -473,20 +579,19 @@ export async function resumeRunSession({
     persistent: true,
     authStorage,
     model,
+    sessionManager,
   });
   const { session } = opened;
-
-  const recordedRunId = sessionRunId(session);
-  if (recordedRunId !== run.runId) {
-    const error = new Error(
-      `run identity mismatch: persisted runId ${JSON.stringify(recordedRunId)} != ${JSON.stringify(run.runId)}`,
-    );
-    error.code = "run_identity_mismatch";
-    session.dispose();
-    throw error;
+  // Bind this attempt to the run in the transcript too, so a later resume verifies against it.
+  if (!identities.some((identity) => identity.attemptId === run.attemptId)) {
+    session.sessionManager.appendCustomEntry(VINCI_RUN_ENTRY, {
+      runId: run.runId,
+      attemptId: run.attemptId,
+    });
   }
 
-  return attachTranslator({
+  let resumedAtSequence = null;
+  const handle = attachTranslator({
     run,
     session,
     authStorage: opened.authStorage,
@@ -494,21 +599,14 @@ export async function resumeRunSession({
     clock,
     grantedTools,
     onStart: (emit) => {
-      emit("run.resumed", { attemptId: kinded("id", run.attemptId) });
+      resumedAtSequence = emit(
+        "run.resumed",
+        { attemptId: kinded("id", run.attemptId) },
+        `run:${run.attemptId}:resumed`,
+      );
     },
   });
-}
-
-function sessionRunId(session) {
-  try {
-    const entries = session.sessionManager.getEntries();
-    const runEntry = entries.find(
-      (entry) => entry && entry.type === "custom" && entry.customType === "vinci_run",
-    );
-    return runEntry && runEntry.data && typeof runEntry.data.runId === "string"
-      ? runEntry.data.runId
-      : null;
-  } catch {
-    return null;
-  }
+  handle.resumedFromSequence = replayed.lastSequence;
+  handle.resumedAtSequence = resumedAtSequence;
+  return handle;
 }
