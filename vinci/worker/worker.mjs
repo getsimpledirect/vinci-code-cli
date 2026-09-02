@@ -22,6 +22,7 @@ import { BranchLeaseClient, branchLeaseFence } from "./branch-lease.mjs";
 import { composeFences } from "./publisher.mjs";
 import { readSessionState, summarizeUnattendedPolicy } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
+import { buildEconomicsSummary, canonicalJson, economicsSha256 } from "./economics.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
 
 // W0.5: the exact build this daemon runs from, computed once at startup. `version` keeps the
@@ -1284,6 +1285,41 @@ async function processHandoff(
     // runs AFTER the evidence upload below, because only an uploaded attempt is prunable (F6).
     if (cleanRoom) sealAttemptDir(repository.attemptDir);
     const logTail = recentLogTail(200);
+    // WStep-3 economics: build the canonical work-order economics summary BEFORE evidence so the
+    // bundle always carries economics-summary.json. Never throws: buildEconomicsSummary returns a
+    // minimal payload with an `incomplete[]` list on malformed input.
+    const economicsInput = {
+      task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt },
+      attemptLabel: `${taskId}/${attempt.attempt}`,
+      lease: lease || null,
+      sessionState: session,
+      usageEntries: [],
+      taskOutcome: outcome ? { head_sha: head ?? null } : null,
+      run: {
+        exit_code: run?.exit_code ?? null,
+        limit_tripped: run?.limit_tripped ?? null,
+        harness_stops: run?.harness_stops ?? [],
+      },
+      workerBuild,
+      vinciBinary,
+      started: run?.started_at ?? null,
+      finished: run?.finished_at ?? null,
+      work: contractFields ? {
+        class: contractFields.work_class,
+        risk_class: contractFields.risk_class,
+        repository: envelopeToUse.repo,
+        base_sha: contractFields.base_commit,
+        required_terminal: contractFields.required_terminal,
+      } : null,
+      changed_files: typeof published?.changed_files === "number" ? published.changed_files : null,
+      pr_number: typeof published?.pr === "number" ? published.pr : null,
+      taskState: intendedState,
+    };
+    const economicsSummary = buildEconomicsSummary(economicsInput);
+    const economicsCanonical = canonicalJson(economicsSummary);
+    const economicsSha = economicsSha256(economicsCanonical);
+    extraFiles["economics-summary.json"] = economicsCanonical;
+    resultJson.economics_sha256 = economicsSha;
     const evidenceResult = await uploadEvidence({
       sessionJsonl,
       gitDiff,
@@ -1295,6 +1331,7 @@ async function processHandoff(
       busToken: bus.token,
       ref: envelopeToUse.ref,
       fence: lease ? fence : null,
+      economics: { summary: economicsSummary, sha256: economicsSha },
       extraFiles,
     });
 
