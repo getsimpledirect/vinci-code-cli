@@ -166,7 +166,7 @@ function messageCostUsd(entry) {
 export function readSessionState(sessionDir, sessionId) {
   const session = fileForSession(sessionDir, sessionId);
   if (!session)
-    return { costUsd: 0, outcome: undefined, harnessStops: [], unattendedPolicy: [], path: undefined };
+    return { costUsd: 0, outcome: undefined, harnessStops: [], unattendedPolicy: [], path: undefined, source: undefined };
 
   let accumulatedCostUsd = 0;
   let hasUsageEntries = false;
@@ -204,7 +204,12 @@ export function readSessionState(sessionDir, sessionId) {
   const costUsd =
     outcomeCostUsd ??
     (hasUsageEntries || accumulatedCostUsd > 0 ? accumulatedCostUsd : messageFallbackCostUsd);
-  return { costUsd, outcome, harnessStops, unattendedPolicy, path: session.path };
+  const source = outcomeCostUsd !== undefined
+    ? "outcome"
+    : hasUsageEntries || accumulatedCostUsd > 0
+      ? "usage_entries"
+      : "message_fallback";
+  return { costUsd, outcome, harnessStops, unattendedPolicy, path: session.path, source };
 }
 
 export function readSessionOutcome(sessionDir, sessionId) {
