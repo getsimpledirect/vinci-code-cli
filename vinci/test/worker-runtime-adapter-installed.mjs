@@ -38,10 +38,12 @@
 //      ambient-AGENTS.md-marker assertion is then run against that copy and MUST FAIL — proving
 //      the assertion is connected to the artifact under test rather than passing vacuously.
 //   6. HOSTILE-PARENT CONTROL: a decoy `@earendil-works/pi-coding-agent` is planted in a
-//      `node_modules` ABOVE the install prefix. A child process first proves the decoy is
-//      genuinely reachable from that ancestor chain (a bare import from a file beside the prefix
-//      loads it and it writes its marker), then imports the installed adapter: the adapter must
-//      come up on the shipped SDK with the decoy marker never written.
+//      `node_modules` ABOVE the install prefix, and driven from TWO SEPARATE child processes. One
+//      proves the decoy is genuinely reachable from that ancestor chain (a bare import from a file
+//      beside the prefix loads it and it writes its own marker); a second, FRESH process imports
+//      ONLY the installed adapter, so that import faces a cold ESM module cache and the decoy's
+//      marker is a live signal. The adapter must come up on the shipped SDK with the decoy's
+//      marker never written during that second process.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -98,7 +100,28 @@ const AMBIENT_MARKER = "AMBIENT-MARKER-INSTALLED-4d17";
 const PROMPT_MARKER = "vinci-ir02-installed-prompt-marker-9b2e";
 const PROMPT = `List the files in this directory. ${PROMPT_MARKER}`;
 const LS_TARGET_FILE = "ir02-installed-target-6a3f.txt";
-const DECOY_MARKER_BASENAME = "decoy-was-loaded.marker";
+// MARKER STRUCTURE — the property that makes the marker assertion in section 6 mean something.
+// The requirement is not "the marker fires under the mutation we happened to try"; it is that the
+// marker is UNSATISFIABLE BY SETUP: nothing this test does can write, warm or pre-satisfy the file
+// the adapter child's assertion reads. That is arranged structurally rather than by remembering to
+// clear things:
+//
+//   * each child gets its OWN marker DIRECTORY, freshly created and asserted empty;
+//   * the decoy — the only code in this test that ever writes a marker — writes to
+//     <IR02_DECOY_MARKER_DIR>/decoy-loaded-pid-<process.pid>.marker, so the filename is not
+//     knowable to the parent before that child exists, and cannot collide across children;
+//   * the two children are separate processes, so they share no ESM module cache.
+//
+// A future editor cannot re-break this by forgetting a cleanup step: there is no cleanup step.
+const DECOY_MARKER_DIR_REACH = "decoy-markers-reachability-child";
+const DECOY_MARKER_DIR_ADAPTER = "decoy-markers-adapter-child";
+const DECOY_MARKER_PREFIX = "decoy-loaded-pid-";
+// The decoy must be LINK-COMPATIBLE with the installed adapter's named import block. ESM linking
+// happens BEFORE evaluation: a decoy missing one of these names makes the adapter's import fail to
+// link, so the decoy's top-level marker write never runs and the marker assertion below cannot
+// fire even when the decoy really did answer the specifier. Checked against the artifact in
+// section 6 rather than trusted.
+const DECOY_SDK_EXPORTS = ["AuthStorage", "SessionManager", "createAgentSession", "createExtensionRuntime"];
 
 const root = mkdtempSync(join(realpathSync(tmpdir()), "vinci-ir02-installed-"));
 const installPrefix = join(root, "install");
@@ -458,9 +481,48 @@ try {
   await patchedHandle.dispose();
 
   // ---- 6. Hostile parent node_modules ----------------------------------------------------------
-  // A decoy for a dependency the adapter actually imports, planted ABOVE the install prefix. The
-  // child proves the decoy is reachable from that chain, then imports the installed adapter.
-  const decoyMarker = join(root, DECOY_MARKER_BASENAME);
+  // A decoy for a dependency the adapter actually imports, planted ABOVE the install prefix, and
+  // driven from TWO SEPARATE CHILD PROCESSES:
+  //
+  //   child A (REACHABILITY) imports the decoy by bare specifier from a file beside the prefix and
+  //     reports that its top-level side effect ran, writing marker A;
+  //   child B (THE CONTROL) imports ONLY the installed adapter — nothing else — so that import
+  //     faces a COLD ESM module cache, and marker B is written if and only if the decoy answered
+  //     the adapter's own bare specifier during child B's run.
+  //
+  // They MUST be separate processes. An earlier revision proved reachability and then imported the
+  // adapter in ONE child: Node's ESM module cache handed the already-evaluated decoy to the
+  // adapter's import without re-running its top level, so the marker stayed unwritten whether or
+  // not the decoy had answered. That was demonstrated — with the shipped SDK deleted from the
+  // prefix the child reported decoyReachable:true, the decoy plainly answering the adapter's
+  // specifier, and markerAfterAdapter:false regardless. The marker assertion could not fire; only
+  // the adapter-export assertions were doing work. Distinct marker paths per child (via
+  // IR02_DECOY_MARKER_DIR) keep one child's evidence from being read as the other's.
+  //
+  // UNSATISFIABLE BY SETUP (see the marker-structure note at the top): each child gets a fresh,
+  // empty marker DIRECTORY, and the decoy names its file after the pid of the process it is
+  // executing in. Nothing here — not this parent, not the other child — can write into the adapter
+  // child's directory under a name that child would read, so a non-empty directory after that
+  // child ran can only mean the decoy's top level executed inside it.
+  const decoyMarkerDirReach = join(root, DECOY_MARKER_DIR_REACH);
+  const decoyMarkerDirAdapter = join(root, DECOY_MARKER_DIR_ADAPTER);
+  mkdirSync(decoyMarkerDirReach, { recursive: true });
+  mkdirSync(decoyMarkerDirAdapter, { recursive: true });
+  check(decoyMarkerDirReach !== decoyMarkerDirAdapter, "the two children get DISTINCT marker directories");
+  check(
+    !decoyMarkerDirAdapter.startsWith(decoyMarkerDirReach + sep) &&
+      !decoyMarkerDirReach.startsWith(decoyMarkerDirAdapter + sep),
+    "neither child's marker directory is nested inside the other's",
+  );
+  check(readdirSync(decoyMarkerDirReach).length === 0, "the reachability child's marker directory starts EMPTY");
+  check(readdirSync(decoyMarkerDirAdapter).length === 0, "the adapter child's marker directory starts EMPTY");
+  // Reachability proved from `root` transfers to the adapter only because `root` is on the
+  // installed adapter's own parent-resolution chain. Stated as an assertion, not an assumption.
+  check(
+    installPrefix.startsWith(root + sep),
+    "the hostile node_modules sits on the installed adapter's own parent-resolution chain",
+  );
+
   const decoyDir = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
   mkdirSync(decoyDir, { recursive: true });
   writeFileSync(
@@ -468,49 +530,143 @@ try {
     JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.0.0-decoy", type: "module", exports: { ".": { import: "./index.js" } } }),
     "utf8",
   );
+  // FIXTURE ADEQUACY: the decoy is only a live hazard if it can LINK against the installed
+  // adapter's named import block, because ESM linking precedes evaluation — a decoy short one name
+  // makes the adapter's import fail before the decoy's top level runs, and the marker below goes
+  // back to being unable to fire. Checked against the artifact's own source so that adding an SDK
+  // import to the adapter fails HERE, loudly, instead of quietly re-vacuating the control.
+  const adapterSdkImportBlock = readFileSync(installedAdapterPath, "utf8")
+    .match(/import\s*\{([^}]*)\}\s*from\s*"@earendil-works\/pi-coding-agent"/);
+  assert.ok(adapterSdkImportBlock, "the installed adapter has a named import block from the SDK");
+  passed += 1;
+  const adapterSdkImports = adapterSdkImportBlock[1]
+    .split(",")
+    .map((entry) => entry.trim().split(/\s+as\s+/)[0].trim())
+    .filter(Boolean);
+  check(adapterSdkImports.length > 0, `the installed adapter imports names from the SDK (${adapterSdkImports.join(", ")})`);
+  for (const name of adapterSdkImports) {
+    check(
+      DECOY_SDK_EXPORTS.includes(name),
+      `the decoy exports ${name}, so it can LINK against the installed adapter and its marker CAN fire`,
+    );
+  }
   writeFileSync(
     join(decoyDir, "index.js"),
-    `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(decoyMarker)}, "loaded\\n");\nexport const DECOY = true;\n`,
+    [
+      'import { appendFileSync } from "node:fs";',
+      'import { join } from "node:path";',
+      "// THE ONLY WRITER OF ANY MARKER IN THIS TEST. The directory comes from the environment (one",
+      "// per child process) and the filename from the pid of whatever process is evaluating this",
+      "// module, so a marker can only ever be created by this top level running in that child.",
+      "const dir = process.env.IR02_DECOY_MARKER_DIR;",
+      'if (!dir) throw new Error("decoy: IR02_DECOY_MARKER_DIR is unset");',
+      `appendFileSync(join(dir, ${JSON.stringify(DECOY_MARKER_PREFIX)} + process.pid + ".marker"), "loaded\\n");`,
+      "export const DECOY = true;",
+      // Link-compatible stand-ins. They throw if CALLED: this decoy exists to be resolved, never to
+      // work, so a hostile parent that answered and then quietly functioned cannot look like a pass.
+      ...DECOY_SDK_EXPORTS.map(
+        (name) => `export function ${name}() { throw new Error("decoy ${name} was called"); }`,
+      ),
+      "",
+    ].join("\n"),
     "utf8",
   );
-  const childPath = join(root, "hostile-parent-child.mjs");
+
+  // -- child A: reachability, in its own process --------------------------------------------------
+  const reachChildPath = join(root, "hostile-parent-reachability-child.mjs");
   writeFileSync(
-    childPath,
-    `// Runs from ${JSON.stringify(root)}: the decoy in ./node_modules is on THIS file's resolution
-// chain and on the install prefix's. Reports what each side resolved to.
-import { existsSync, rmSync } from "node:fs";
-const marker = ${JSON.stringify(decoyMarker)};
-const result = { decoyReachable: false, decoyExports: [], adapterExports: [], adapterError: null, markerAfterAdapter: false };
+    reachChildPath,
+    `// Lives at ${JSON.stringify(root)}, directly ABOVE the install prefix: the decoy in
+// ./node_modules is on THIS file's resolution chain, and (see the assertion above) on the
+// installed adapter's. This process imports ONLY the decoy and NEVER the adapter.
+import { readdirSync } from "node:fs";
+const dir = process.env.IR02_DECOY_MARKER_DIR;
+const result = { pid: process.pid, markersBefore: readdirSync(dir), decoyExports: [], decoyIsDecoy: false, markersAfter: [] };
 const decoy = await import("@earendil-works/pi-coding-agent");
-result.decoyReachable = existsSync(marker);
-result.decoyExports = Object.keys(decoy);
-if (existsSync(marker)) rmSync(marker);
-try {
-  const adapter = await import(${JSON.stringify(pathToFileURL(installedAdapterPath).href)});
-  result.adapterExports = Object.keys(adapter);
-} catch (error) {
-  result.adapterError = String(error && error.message ? error.message : error);
-}
-result.markerAfterAdapter = existsSync(marker);
+result.decoyExports = Object.keys(decoy).sort();
+result.decoyIsDecoy = decoy.DECOY === true;
+result.markersAfter = readdirSync(dir);
 process.stdout.write(JSON.stringify(result));
 `,
     "utf8",
   );
-  const childOutput = execFileSync("node", [childPath], { encoding: "utf8", cwd: root });
-  const hostile = JSON.parse(childOutput);
-  // Reachability first: without this the control could "pass" because the decoy was never live.
-  check(hostile.decoyReachable === true, "REACHABILITY: the decoy above the prefix is loadable from that ancestor chain");
-  assert.deepEqual(hostile.decoyExports, ["DECOY"], "the decoy is what answered the bare specifier beside the prefix");
+  const reach = JSON.parse(
+    execFileSync("node", [reachChildPath], {
+      encoding: "utf8",
+      cwd: root,
+      env: { ...process.env, IR02_DECOY_MARKER_DIR: decoyMarkerDirReach },
+    }),
+  );
+  // Reachability first: without it the control cannot tell "the guard held" from "the decoy was
+  // never reachable in the first place".
+  assert.deepEqual(reach.markersBefore, [], "REACHABILITY: the reachability child saw an empty marker directory");
+  assert.deepEqual(
+    reach.markersAfter,
+    [`${DECOY_MARKER_PREFIX}${reach.pid}.marker`],
+    "REACHABILITY: the decoy above the prefix LOADED and ran its side effect, under THIS child's pid",
+  );
+  passed += 2;
+  check(reach.decoyIsDecoy === true, "REACHABILITY: the bare specifier beside the prefix resolved to the DECOY");
+  assert.deepEqual(
+    reach.decoyExports,
+    [...DECOY_SDK_EXPORTS, "DECOY"].sort(),
+    "the decoy answered with its own exports, link-compatible with the adapter's SDK import",
+  );
   passed += 1;
+  assert.deepEqual(
+    readdirSync(decoyMarkerDirReach),
+    [`${DECOY_MARKER_PREFIX}${reach.pid}.marker`],
+    "REACHABILITY: the reachability marker is on disk, and is the only file in that directory",
+  );
+  passed += 1;
+
+  // -- child B: the control, in a FRESH process with a cold module cache -------------------------
+  const adapterChildPath = join(root, "hostile-parent-adapter-child.mjs");
+  writeFileSync(
+    adapterChildPath,
+    `// A FRESH process that imports ONLY the installed adapter. Nothing has pre-loaded the decoy
+// here, so the ESM module cache is cold and the decoy's top-level marker write is a real signal:
+// it happens if and only if the decoy answered the ADAPTER's own bare specifier.
+import { readdirSync } from "node:fs";
+const dir = process.env.IR02_DECOY_MARKER_DIR;
+const result = { pid: process.pid, markersBefore: readdirSync(dir), adapterExports: [], adapterError: null, markersAfter: [] };
+try {
+  const adapter = await import(${JSON.stringify(pathToFileURL(installedAdapterPath).href)});
+  result.adapterExports = Object.keys(adapter).sort();
+} catch (error) {
+  result.adapterError = String(error && error.message ? error.message : error);
+}
+result.markersAfter = readdirSync(dir);
+process.stdout.write(JSON.stringify(result));
+`,
+    "utf8",
+  );
+  const hostile = JSON.parse(
+    execFileSync("node", [adapterChildPath], {
+      encoding: "utf8",
+      cwd: root,
+      env: { ...process.env, IR02_DECOY_MARKER_DIR: decoyMarkerDirAdapter },
+    }),
+  );
+  assert.deepEqual(hostile.markersBefore, [], "the adapter child started with an EMPTY marker directory");
+  check(hostile.pid !== reach.pid, "the adapter child is a DIFFERENT process from the reachability child");
+  // THE assertion this control is about, and the one the single-child structure could not fire.
+  assert.deepEqual(
+    hostile.markersAfter,
+    [],
+    "the decoy was NEVER loaded while importing the installed adapter (it resolved inside the artifact)",
+  );
+  assert.deepEqual(
+    readdirSync(decoyMarkerDirAdapter),
+    [],
+    "the adapter child's marker directory is still empty on disk afterwards",
+  );
+  passed += 3;
   assert.equal(hostile.adapterError, null, `the installed adapter imported cleanly under a hostile parent node_modules (${hostile.adapterError})`);
   assert.deepEqual(
-    hostile.adapterExports.sort(),
+    hostile.adapterExports,
     ["ALLOWLISTED_CUSTOM_TOOLS", "VINCI_RUN_ENTRY", "createRunSession", "isolateAuthStorage", "resumeRunSession"],
     "the installed adapter came up on the SHIPPED SDK, with its real exports",
-  );
-  check(
-    hostile.markerAfterAdapter === false,
-    "the decoy was NEVER loaded while importing the installed adapter (it resolved inside the artifact)",
   );
   passed += 2;
 
