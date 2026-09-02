@@ -1061,3 +1061,44 @@ Covered by `vinci/test/worker-unattended-policy.mjs`.
 - `evidence_ref:` — Alias for `ref` header; clarifies that this ref identifies evidence in the ledger.
 
 Both hooks are independent: you can use Governor lease without evidence upload, or evidence upload without Governor lease. If neither is configured, Stage 2 has zero overhead; the daemon behaves identically to Stage 1.
+
+## Embedded runtime (IR-02 skeleton)
+
+`vinci/worker/runtime-adapter.mjs` runs an agent session **in-process** under an exact Run
+definition instead of spawning `vinci -p`. `createRunSession()` opens the session (exact granted
+tool allowlist, provider-isolated `AuthStorage`, optional explicit `sessionId` so
+`readSessionState` finds the transcript), records the Run identity in the session file, emits
+`run.started` (+ `context.loaded`), and returns `{prompt, steer, interrupt, complete, dispose,
+sessionPath, session}`. `resumeRunSession()` reopens a persisted session after the previous process
+was replaced: it verifies the file exists, parses, and records **this** Run before constructing
+anything (a mismatch throws `session_not_found` / `session_unreadable` / `run_identity_mismatch`
+with the event log byte-identical), then `sink.replay()` re-adopts the on-disk sequence so the
+first post-resume append is `lastSequence + 1` — no gap, no reuse. Events go to
+`run-events-sink.mjs`: append-only JSONL, contiguous 1-based `sequence`, per-event-identity
+`idempotencyKey` (same key + payload dedupes; a conflicting payload is `idempotency_conflict`).
+
+**Control plane / data plane.** Nothing on disk or in the environment can widen a Run. The session
+gets an empty ResourceLoader, so no extension, skill, prompt template, theme, `AGENTS.md` or
+system-prompt append is ever loaded, whatever exists in `cwd`, the agent dir or `~/.pi/agent`; the
+tool registry is exactly the granted names (a call to anything else is answered with
+`capability.refused{not_attested}` and never executes); and `isolateAuthStorage` makes the
+credential store answer only for the Run's own provider from stored/runtime credentials, so an
+ambient `OPENAI_API_KEY` cannot make another provider look configured. Payload values are kinded
+and content-free — digests, ids, counts, never prompt text or tool output.
+
+**Enabling it.** Set `runtime: "embedded"` on the envelope; any other value (including the absent
+one every envelope carries today) takes the unchanged subprocess lane. Credentials come in through
+the `embedded: {authStorage, model}` seam on `runVinci` — the embedded lane never reads ambient
+provider env.
+
+**Explicitly NOT done.** No GPU Control transport: the sink is a local file under `stateDir`, not
+the run-event registry, and nothing publishes it. No harness attestation. `SUPPORTED_CAPABILITIES`
+in `task.mjs` is still an empty set, so a `requiredCapabilities` header still refuses. And no
+`CAPABILITY_MATRIX` flag was flipped: `steering` and `pause` have working in-process mechanisms but
+no bus command kind reaches them (the daemon's inbox delivers only `handoff`), `abort` likewise,
+`activityStream` has a durable stream with no transport, and `safeResume` stays false because the
+SIGKILL resume proof covers the adapter's session and event sink on a lane a handoff does not
+select — not the task file, cursor, checkout and push the flag names.
+
+Covered by `worker-runtime-adapter-{events,tools,steer,resume,compat,installed}.mjs` and
+`worker-capability-declaration.mjs` in `vinci/test/`.

@@ -385,6 +385,32 @@ export const DECLARATION_REFRESH_DEFAULT_S = 21600;
 // overclaim the validator refuses. `buildDigest` is omitted: the matrix demands a SHA-256 and the
 // daemon's build identity is a 40-hex git commit — that rides in the lease request's
 // worker_build_digest instead, and the declaration's own digest names this record exactly.
+//
+// IR-02 (embedded runtime adapter) REVIEWED EVERY CANDIDATE FLAG AND FLIPPED NONE. The adapter
+// adds real mechanisms — steer, interrupt, a durable per-run event stream, resume across a SIGKILL
+// — but this matrix answers "what can a CALLER make this worker do", and no caller path reaches
+// any of them. Each verdict below is MEASURED, not asserted, by
+// vinci/test/worker-capability-declaration.mjs, which pins the flag to the measurement:
+//   steering       false  worker-runtime-adapter-steer.mjs proves the adapter steers in-process
+//                         (steer.received carries the instruction digest and the model observes
+//                         the steer), but the daemon's inbox delivers ONLY kind "handoff": a bus
+//                         "steer" addressed to this worker is dropped by BusClient.poll, so
+//                         nothing a caller sends reaches handle.steer()
+//   pause          false  the adapter appends run.paused and stops the turn (same test), and the
+//                         embedded lane calls it on a tripped budget and on lease loss — neither
+//                         is caller-issued, and no bus "pause" is delivered
+//   abort          false  unchanged, and for the same reason: an abort command is not delivered
+//   activityStream false  the embedded lane's run events are durable, but the sink is a LOCAL
+//                         file under stateDir and the worker's bus client refuses every kind but
+//                         status/finding/blocker — the run's activity has no transport, so the
+//                         control plane still sees claimed/terminal posts only
+//   safeResume     false  worker-runtime-adapter-resume.mjs proves the EMBEDDED adapter resumes
+//                         across a SIGKILL with no sequence gap and no reuse. That is a different
+//                         object from the one this flag names: it covers the adapter's session and
+//                         event sink, not the task file, cursor, checkout or push, and it covers a
+//                         lane a handoff does not select (`runtime` is absent on every envelope
+//                         today, so the daemon takes the subprocess lane)
+// A flag whose only evidence is "the code exists" stays false.
 export const CAPABILITY_MATRIX = Object.freeze({
   activityStream: false,
   questions: false,
