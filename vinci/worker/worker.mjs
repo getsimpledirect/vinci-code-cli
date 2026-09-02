@@ -492,8 +492,8 @@ async function emitEconomics({
       run: run || { exit_code: lifecycle?.snapshot?.()?.exit_code ?? null, limit_tripped: lifecycle?.snapshot?.()?.limit_tripped ?? null, harness_stops: [] },
       workerBuild: wb || workerBuild,
       vinciBinary: vb || vinciBinary,
-      started: started || null,
-      finished: finished || new Date().toISOString(),
+      started: started || lifecycle?.snapshot?.()?.started_at || null,
+      finished: finished || lifecycle?.snapshot?.()?.finished_at || new Date().toISOString(),
       work: contractFields ? {
         class: contractFields.work_class,
         risk_class: contractFields.risk_class,
@@ -1393,8 +1393,9 @@ async function processHandoff(
       },
       workerBuild,
       vinciBinary,
-      started: run?.started_at ?? null,
-      finished: run?.finished_at ?? null,
+      // The lifecycle stamped the attempt start; the terminal is now.
+      started: lifecycle.snapshot().started_at ?? run?.started_at ?? null,
+      finished: lifecycle.snapshot().finished_at ?? new Date().toISOString(),
       work: contractFields ? {
         class: contractFields.work_class,
         risk_class: contractFields.risk_class,
@@ -1414,7 +1415,10 @@ async function processHandoff(
     // Local copy beside the attempt: a box without VINCI_EVIDENCE_URI_PREFIX uploads nothing, and
     // the runs that actually spent must not be the only ones that leave no file behind.
     try {
-      if (repository?.attemptDir) writeFileSync(join(repository.attemptDir, "economics-summary.json"), economicsCanonical, "utf8");
+      // Clean-room runs have an attempt dir; standard runs land beside the early-terminal copies.
+      const localDir = repository?.attemptDir ?? join(stateDir, "economics", taskId);
+      mkdirSync(localDir, { recursive: true });
+      writeFileSync(join(localDir, "economics-summary.json"), economicsCanonical, "utf8");
     } catch {
       // the bundle copy is the primary; a failed local write is not a terminal failure
     }
