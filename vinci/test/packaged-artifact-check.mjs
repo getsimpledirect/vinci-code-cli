@@ -13,6 +13,8 @@ import {
   readdirSync,
   realpathSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { isBuiltin } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -863,7 +865,47 @@ function validatePackageManifest(manifestPath) {
 
   for (const { label, target, legacy = false } of targets) {
     if (!legacy && !target.startsWith("./")) {
-      if (label.startsWith("imports")) continue;
+      if (label.startsWith("imports")) {
+        if (isBuiltin(target)) continue;
+        // Package imports may legally redirect to a bare dependency. Resolve that target with the
+        // ESM import conditions from the declaring package, without evaluating artifact code, and
+        // require the selected file to exist canonically inside this payload. Otherwise a missing
+        // package can be supplied by an attacker-controlled parent node_modules directory.
+        const resolved = spawnSync(
+          process.execPath,
+          [
+            "--input-type=module",
+            "--eval",
+            "process.stdout.write(import.meta.resolve(process.argv[1]))",
+            target,
+          ],
+          {
+            cwd: packageRoot,
+            encoding: "utf8",
+            env: { PATH: process.env.PATH ?? "" },
+            timeout: 5_000,
+          },
+        );
+        if (resolved.status !== 0 || !resolved.stdout.startsWith("file:")) {
+          authorityFailures.push(
+            `${relativeManifest} ${label} external target ${target} does not resolve inside the package`,
+          );
+          continue;
+        }
+        let resolvedPath;
+        try {
+          resolvedPath = fileURLToPath(resolved.stdout);
+        } catch (error) {
+          authorityFailures.push(`${relativeManifest} ${label} external target ${target} is invalid: ${error.message}`);
+          continue;
+        }
+        if (!lstatExists(resolvedPath)) {
+          authorityFailures.push(`${relativeManifest} ${label} external target ${target} is missing`);
+          continue;
+        }
+        containedCanonicalRelative(root, resolvedPath, `${relativeManifest} ${label} external target ${target}`);
+        continue;
+      }
       authorityFailures.push(`${relativeManifest} ${label} target ${target} is not package-relative`);
       continue;
     }

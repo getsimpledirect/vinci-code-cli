@@ -717,6 +717,51 @@ test("all literal package main, bin, imports, and conditional exports targets mu
 	assert.equal(run(root).status, 0);
 });
 
+test("external package imports cannot resolve from a malicious parent node_modules", () => {
+	const { outer, root } = nestedFixture();
+	write(
+		join(root, "node_modules", "chalk", "package.json"),
+		JSON.stringify({
+			name: "chalk",
+			type: "module",
+			imports: { "#review-external": "review-missing-package" },
+			exports: "./source/index.js",
+		}),
+	);
+	write(
+		join(root, "node_modules", "chalk", "source", "index.js"),
+		'import { marker } from "#review-external";\nconsole.log(marker);\n',
+	);
+	authorize(root, "node_modules/chalk");
+	write(
+		join(outer, "node_modules", "review-missing-package", "package.json"),
+		JSON.stringify({ name: "review-missing-package", type: "module", exports: "./index.js" }),
+	);
+	write(
+		join(outer, "node_modules", "review-missing-package", "index.js"),
+		'export const marker = "PARENT_PACKAGE_EXECUTED";\n',
+	);
+	expectFailure(run(root), /imports.*external target review-missing-package resolves outside its root/);
+
+	write(
+		join(root, "node_modules", "review-missing-package", "package.json"),
+		JSON.stringify({ name: "review-missing-package", type: "module", exports: "./index.js" }),
+	);
+	write(
+		join(root, "node_modules", "review-missing-package", "index.js"),
+		'export const marker = "PACKAGED_PACKAGE_EXECUTED";\n',
+	);
+	authorize(root, "node_modules/review-missing-package");
+	assert.equal(run(root).status, 0);
+	const reached = spawnSync(process.execPath, [join(root, "node_modules", "chalk", "source", "index.js")], {
+		cwd: outer,
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	assert.equal(reached.status, 0, reached.stderr);
+	assert.match(reached.stdout, /PACKAGED_PACKAGE_EXECUTED/);
+});
+
 test("missing, malformed, null, and wrong-type manifests refuse", () => {
 	const cases = [
 		{ value: null, pattern: /wrong schema or no dispatches/ },
