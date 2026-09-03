@@ -480,7 +480,15 @@ process.exit(r.status ?? 1);
         });
         request.on("end", () => {
           const evidence = JSON.parse(body);
-          const invalidRefs = (evidence.refs ?? []).filter((ref) => !LEDGER_REF.test(ref));
+          // The worker sends `job_ref`, never `refs` — so the old `evidence.refs` filter here was
+          // a branch nothing could reach, and `rejectedPosts.length === 0` was a check that could
+          // not fail. Worse, this fake accepted ANY job_ref, including ones the real server
+          // refuses: vinci-gpu-control's POST /v1/evidence 422s a job_ref outside
+          // ("job_", "exp_", "bk_") (MESSAGE_REF_PREFIXES). A test could therefore file under a
+          // `wo-`-shaped ref here and pass while production refused it. Mirror the real rule.
+          const invalidRefs = [evidence.job_ref, ...(evidence.refs ?? [])]
+            .filter((ref) => ref !== undefined && ref !== null)
+            .filter((ref) => typeof ref !== "string" || !LEDGER_REF.test(ref));
           if (invalidRefs.length > 0) {
             this.rejectedPosts.push(evidence);
             response.writeHead(422, { "content-type": "application/json" });
