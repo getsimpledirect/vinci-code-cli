@@ -100,9 +100,6 @@ function build(script, outputDirectory) {
 }
 
 const work = mkdtempSync(join(tmpdir(), "vinci-package-first-party-tests-"));
-// PR #50's tar-list edit, applied to a DISPOSABLE copy of package.sh. package.sh derives ROOT from its
-// own location, so the copy has to sit in vinci/ for the build to find the repository.
-const simulationScript = join(root, "vinci", "package.pr50-simulation.tmp.sh");
 // Exactly what this run brought into existence, so the cleanup can remove that and nothing else. An
 // earlier version deleted the probes' enclosing directories by NAME and recursively
 // (rmSync("vinci/themes/specs", { recursive: true })). That is correct only while those directories
@@ -160,47 +157,46 @@ try {
 	// it is still handled so a future reader does not mistake this rule for the thing that covers it.
 	check("no node_modules/ssh2/test member ships", ![...shipped].some((m) => m.startsWith("node_modules/ssh2/test")));
 
-	// ── The PR #50 case, which main CANNOT exercise ─────────────────────────────────────────────────
-	// SCOPE: this block does NOT assert main's current behaviour. On main, vinci/worker is not in
-	// package.sh's tar path list at all, so nothing under it ships and there is nothing to exclude. PR
-	// #50 (cf196e63) adds `vinci/worker` to that list and excludes only vinci/worker/README.md; from
-	// that moment the two real files below would ship, and #50's own checker has no unexpected-file or
-	// closure check to notice. The simulation below reproduces #50's tar block exactly so this branch
-	// can prove the archive is closed BEFORE #50 merges.
-	check("on main, vinci/worker is not tarred at all", ![...shipped].some((m) => m.startsWith("vinci/worker")));
-
-	const packageScript = readFileSync(join(root, "vinci", "package.sh"), "utf8");
-	const simulated = packageScript
-		.replace("  --exclude='*.ts.map' \\\n", "  --exclude='*.ts.map' \\\n  --exclude='vinci/worker/README.md' \\\n")
-		.replace(
-			"  vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater \\\n",
-			"  vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater vinci/worker \\\n",
-		);
-	check("the #50 simulation actually edited package.sh's tar list", simulated !== packageScript && simulated.includes("vinci/updater vinci/worker \\"));
-	writeFileSync(simulationScript, simulated);
-
-	const shippedUnderPr50 = build(simulationScript, join(work, "release-pr50"));
-	// The two real files #49 put on main — named literally, because these are the files at stake.
+	// ── The PR #50 case, now MEASURED rather than simulated ─────────────────────────────────────────
+	// SCOPE: these assertions are about the REAL archive built above by the REAL vinci/package.sh, on a
+	// tree where BOTH halves are present.
+	//
+	// Before the base was integrated this could only be a simulation. vinci/worker was not in
+	// package.sh's tar path list, so nothing under it shipped and there was nothing to exclude; this
+	// file reproduced #50's tar block on a disposable copy of package.sh and asserted against that
+	// copy's output. The simulation's prediction was that 21 members under vinci/worker/ would ship and
+	// the two test files would not. Merging origin/main (through PR #51, e85c5d0f) into this branch put
+	// #50's tar-list edit and #51's shape-predicate exclusion in ONE tree for the first time, and the
+	// real artifact reproduces that prediction exactly — so the simulation is retired here and the same
+	// claims are now stated against `shipped`.
+	//
+	// The two real files #49 put on main are named literally, because they are the files at stake:
+	// #50's own packaged-artifact checker has no unexpected-file or closure check that would notice
+	// them shipping.
+	check("vinci/worker is tarred at all — PR #50's tar-list edit is live in this tree", [...shipped].some((m) => m.startsWith("vinci/worker")));
 	for (const workerTest of ["vinci/worker/test/economics.test.mjs", "vinci/worker/test/economics-session.test.mjs"]) {
-		check(`#50 SIMULATION: real worker test file is absent from the archive: ${workerTest}`, !shippedUnderPr50.has(workerTest));
+		check(`real worker test file is absent from the archive: ${workerTest}`, !shipped.has(workerTest));
 	}
-	check("#50 SIMULATION: the vinci/worker/test directory itself is absent", !shippedUnderPr50.has("vinci/worker/test"));
-	// Positive reachability control for the simulation: worker runtime DID ship, so the absences above
-	// are the exclusion working and not the root failing to be tarred at all.
-	check("#50 SIMULATION: worker runtime still ships", shippedUnderPr50.has("vinci/worker/worker.mjs") && shippedUnderPr50.has("vinci/worker/run.mjs"));
+	check("the vinci/worker/test directory itself is absent", !shipped.has("vinci/worker/test"));
+	// Positive reachability control through the same entry point: worker runtime DID ship, so the
+	// absences above are the exclusion working and not the root failing to be tarred at all. Note
+	// economics.mjs is asserted alongside worker.mjs on purpose — it is the runtime SIBLING of
+	// economics.test.mjs, so an exclusion that over-matched on the name would drop it.
 	check(
-		"#50 SIMULATION: every other vinci/worker member survived (21 runtime paths)",
-		[...shippedUnderPr50].filter((m) => m.startsWith("vinci/worker/")).length === 21,
+		"worker runtime still ships",
+		shipped.has("vinci/worker/worker.mjs") && shipped.has("vinci/worker/run.mjs") && shipped.has("vinci/worker/economics.mjs"),
+	);
+	check(
+		"every other vinci/worker member survived (21 runtime paths)",
+		[...shipped].filter((m) => m.startsWith("vinci/worker/")).length === 21,
 	);
 
-	// Closure check over the WHOLE archive, not just the paths this test planted or named. The two
-	// checks above are the non-circular evidence (planted probes, and the two real files named
-	// literally); this one catches a first-party test path nobody thought to enumerate. It is stated
-	// over the artifact's members, so it holds identically for the entry-list producer in PR #48.
-	for (const listing of [shipped, shippedUnderPr50]) {
-		const leaked = [...listing].filter((member) => isFirstPartyTestPath(member));
-		check(`archive carries no first-party test path at all (found ${leaked.length}: ${leaked.join(", ") || "none"})`, leaked.length === 0);
-	}
+	// Closure check over the WHOLE archive, not just the paths this test planted or named. The checks
+	// above are the non-circular evidence (planted probes, and the two real files named literally);
+	// this one catches a first-party test path nobody thought to enumerate. It is stated over the
+	// artifact's members, so it holds identically for the entry-list producer in PR #48.
+	const leaked = [...shipped].filter((member) => isFirstPartyTestPath(member));
+	check(`archive carries no first-party test path at all (found ${leaked.length}: ${leaked.join(", ") || "none"})`, leaked.length === 0);
 } finally {
 	// Files first, then only the directories this run created — deepest first, so a created parent is
 	// removed after any created child. Directories that already existed are never named here at all.
@@ -208,7 +204,6 @@ try {
 	for (const directory of [...createdDirectories].sort((a, b) => b.length - a.length)) {
 		rmSync(directory, { recursive: true, force: true });
 	}
-	rmSync(simulationScript, { force: true });
 	rmSync(work, { recursive: true, force: true });
 }
 
