@@ -4,10 +4,12 @@
 // `vinci -p` subprocess (the subprocess path in run.mjs stays untouched as the compatibility
 // lane). The adapter:
 //
-//   * registers EXACTLY the granted tools, and runs them under an environment the Run defines.
+//   * registers EXACTLY the granted tools, and runs `bash` — the one granted tool whose child
+//     environment this adapter can own — under an environment the Run defines.
 //     Nothing on disk under the run's cwd or in ~/.pi — extensions, skills, prompt templates,
 //     AGENTS.md/context files, project or global settings.json — and nothing in the daemon's own
-//     process environment can widen a Run. Four mechanisms carry it, each load-bearing alone:
+//     process environment can widen the session's CONFIGURATION. Four mechanisms carry it, each
+//     load-bearing alone:
 //       - a null ResourceLoader: no extensions, skills, prompt templates, AGENTS.md/context
 //         files, themes or system-prompt appends, regardless of what exists on disk;
 //       - an in-memory, project-UNTRUSTED SettingsManager: neither `<cwd>/.pi/settings.json` nor
@@ -28,10 +30,44 @@
 //         runtime cannot register ever becomes a handle. The `tools` allowlist is what REFUSES an
 //         ungranted call; the `capability.refused` event is the RECORD of that refusal, and it is
 //         emitted only for a name the pin has already proven has no implementation to run.
-//     What this does NOT claim: the granted tools still read and write the real filesystem at
-//     `cwd`, so ambient FILES remain visible to a granted `read`/`ls`/`grep`/`bash`. The guarantee
-//     is over CONFIGURATION — what the session is set up to do, and with what environment — not
-//     over the contents of the workspace the Run was pointed at.
+//     What this does NOT claim, part 1 — THE ENVIRONMENT SENTENCE IS ABOUT `bash` AND ONLY `bash`.
+//     Three of the seven registrable tools spawn a child process: `bash`, `grep` (ripgrep) and
+//     `find` (fd). SPAWNING_TOOLS names those three and ENVIRONMENT_HOOKED_TOOLS names the subset
+//     whose child environment the adapter owns — today exactly `bash`. `grep` and `find` call
+//     `spawn(binary, args, { stdio })` with NO `env` option, so their children inherit
+//     `process.env`: in-process that is the DAEMON's whole environment, including the
+//     debris-authority capabilities and provider keys `taskEnvironment()` deletes for `bash`.
+//     The SDK's grep/find factories expose only an `operations` seam (isDirectory/readFile/glob),
+//     never a spawn or env hook, so there is no equivalent of bash's `spawnHook` to register; the
+//     sentence is narrowed rather than the behaviour changed. Bounded, not closed: those binaries
+//     do not echo their environment, the model cannot set the variables that would matter, and the
+//     capability file descriptor is not inherited because stdio is not inherited — but a Run
+//     granted only read-only tools still hands `rg`/`fd` the daemon's environment, and a Run that
+//     needs that closed must not grant `grep`/`find` on this lane. The two constants below are
+//     asserted against a LIVE inheritance probe in worker-runtime-adapter-tools.mjs, so this
+//     paragraph cannot drift from what the tools actually do.
+//     What this does NOT claim, part 2 — NO CWD CONTAINMENT. The granted tools read and write the
+//     REAL FILESYSTEM. There is no `cwd` qualifier to put on that: the SDK's path resolution
+//     returns an ABSOLUTE path unchanged (`resolvePath` = `isAbsolute(p) ? resolve(p) : resolve(base, p)`)
+//     and nothing rejects a resolved path outside `cwd`, so a granted `read` returns a file from
+//     anywhere the daemon user can read. The guarantee is over CONFIGURATION — what the session is
+//     set up to do, and with what environment — not over which FILES are reachable.
+//     OPEN, PLATFORM-SPECIFIC, AND UNVERIFIED HERE: on Linux the process environment is readable
+//     as a FILE (`/proc/self/environ`), so a granted `read` could re-admit through the file channel
+//     exactly the configuration the bash environment guard exists to exclude. The fleet's daemon
+//     runs on Linux; this host is macOS, which has no `/proc`, so the question is INVISIBLE here.
+//     It is neither closed nor demonstrated broken. worker-runtime-adapter-tools.mjs carries a test
+//     that would fail on Linux and skips on macOS; as of this commit it HAS NEVER RUN.
+//     F6, bounded and NOT fixed by taskEnv: the SDK's tool bootstrapper fetches a missing `rg`/`fd`
+//     from a GitHub release unless an offline flag is set, and unset is the default — so on a host
+//     lacking one of them the first `grep`/`find` call in an otherwise contained run reaches the
+//     network. Setting `PI_OFFLINE` in the Run's `taskEnv` would be an INERT guard here for the
+//     same root cause as part 1: `isOfflineModeEnabled()` reads `process.env.PI_OFFLINE` directly
+//     and `ensureTool` calls `shouldBootstrapTools()` with no argument, so both read the DAEMON's
+//     environment, which `taskEnv` never becomes on this lane. The control that does work is a
+//     deployment one (`PI_OFFLINE` in the daemon's own environment, without the
+//     `VINCI_CODE`+`VINCI_TOOL_BOOTSTRAP` exception); the subprocess lane, where `taskEnv` IS the
+//     child's `process.env`, is deliberately left untouched. Pinned in worker-runtime-adapter-tools.mjs.
 //   * translates native agent-session events into the Vinci run-event vocabulary, writing them to
 //     a durable sink (run-events-sink.mjs);
 //   * supports steer / interrupt / resume-after-process-replacement.
@@ -62,6 +98,16 @@ const VALID_PAUSE_REASONS = Object.freeze(["manual", "steer", "budget", "worker_
 // the debris-authority capabilities run.mjs deletes from a subprocess child. Granting it without
 // a taskEnv is refused at construction rather than silently widened.
 export const ENVIRONMENT_BEARING_TOOL = "bash";
+
+// The registrable tools whose implementation SPAWNS A CHILD PROCESS, and the subset of those whose
+// child environment this adapter owns. The header's environment sentence is exactly the claim
+// `ENVIRONMENT_HOOKED_TOOLS`, no more: `grep` and `find` spawn `rg`/`fd` with no `env` option, so
+// their children inherit the daemon's `process.env`. These are not decoration — a live inheritance
+// probe in worker-runtime-adapter-tools.mjs asserts the measured contained set EQUALS
+// ENVIRONMENT_HOOKED_TOOLS and the measured spawning set EQUALS SPAWNING_TOOLS, so widening either
+// list without a hook, or adding a hook without widening the list, fails.
+export const SPAWNING_TOOLS = Object.freeze(["bash", "grep", "find"]);
+export const ENVIRONMENT_HOOKED_TOOLS = Object.freeze([ENVIRONMENT_BEARING_TOOL]);
 
 // capability.refused names a tool the MODEL chose, so its name is unbounded free text on a stream
 // documented as content-free. The name is emitted verbatim only when it is a conservative
@@ -312,10 +358,19 @@ function openSession({
       : SessionManager.inMemory(cwd, newSessionOptions));
   const modelInstance = model ?? getModel(run.provider, run.model);
   const auth = isolateAuthStorage(authStorage ?? AuthStorage.inMemory(), run.provider);
+  // 🔴 MASKED PAIR, half 1 of 2. This filter and the append order below each look spare, because
+  // each masks the other: delete this filter and a caller-supplied `bash` still loses, because the
+  // adapter's own definition is appended LAST and the SDK's registry is a Map (last write wins);
+  // reverse the order below and the caller's `bash` still loses, because this filter already
+  // dropped it. Delete BOTH and a caller-supplied `bash` — with the daemon's `process.env` —
+  // becomes the session's bash while every name-set and registry-pin assertion stays green. Do not
+  // remove either without removing the other's comment too. Killed by the shadowing pair in
+  // worker-runtime-adapter-tools.mjs, which asserts on the EXECUTED implementation.
   const allowlistedCustom = (Array.isArray(customTools) ? customTools : []).filter((tool) =>
     ALLOWLISTED_CUSTOM_TOOLS.includes(tool && tool.name),
   );
   // `bash` is only ever registered as the adapter's own definition, whose environment is the Run's.
+  // 🔴 MASKED PAIR, half 2 of 2: the adapter's bash is appended LAST on purpose — see half 1.
   const registeredCustom = grantedTools.includes(ENVIRONMENT_BEARING_TOOL)
     ? [...allowlistedCustom, embeddedBashTool(cwd, taskEnv)]
     : allowlistedCustom;

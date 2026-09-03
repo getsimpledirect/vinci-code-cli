@@ -1201,9 +1201,33 @@ export function applyEnvDelta(base, delta) {
 export const DEFAULT_GRANTED_TOOLS = Object.freeze(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 
 // Debris-authority capabilities are the DAEMON'S and are never a task's: an inherited FD number,
-// the adapter path and its digest, the service digest and the signing public key. Anything holding
-// them can speak for the daemon (debris-authority.mjs reads exactly these names out of
-// process.env), so they are deleted from a task's environment on BOTH lanes.
+// the adapter path and its digest, the service digest and the signing public key, plus the debris
+// ROOT ANCHOR path and its digest. Anything holding them can speak for the daemon, so they are
+// deleted from a task's environment on BOTH lanes.
+//
+// CORRECTION (second containment pass): an earlier version of this comment said
+// "debris-authority.mjs reads exactly these names out of process.env". It does not. Measured:
+// debris-authority.mjs reads FIVE of the seven (AUTHORITY_ADAPTER, AUTHORITY_ADAPTER_SHA256,
+// AUTHORITY_CAPABILITY_FD, AUTHORITY_PUBLIC_KEY_SPKI, AUTHORITY_SERVICE_SHA256); the remaining two
+// (DEBRIS_ROOT_ANCHOR, DEBRIS_ROOT_ANCHOR_SHA256) are read by this file, in the debris root
+// identity check. Seven is the size of the DELETION SET, which is a different thing from the size
+// of any one reader's set, and the two were conflated. The deletion set is deliberately the wider
+// of the two: a name is deleted because holding it speaks for the daemon, not because a particular
+// module reads it back.
+//
+// The same conflation reached the commit message that recorded why scrubbing `process.env` was
+// rejected. That claim named THREE concurrent readers — the debris-authority reader, the governor
+// declaration refresh and the lease heartbeat. Measured, only the first is one:
+//   * lease heartbeat — vinci/worker/lease.mjs contains ZERO `process.env` reads, as does
+//     vinci/worker/governor.mjs;
+//   * declaration refresh — worker.mjs's `declarationRefreshSeconds()` does read
+//     VINCI_DECLARATION_REFRESH_S, but it is called ONCE, in the `setInterval(...)` argument list
+//     at daemon start; the periodic refresh that follows re-reads nothing.
+// Both are concurrent ACTIVITY, not concurrent readers. History is not rewritten; the correction is
+// recorded here. The decision is unchanged and stands on the debris-authority reader alone (plus
+// clean-room mode, which passes an allowlisted subset), which is sufficient on its own: scrubbing
+// would strip the daemon's own configuration out from under its own reader for the duration of
+// every task.
 export const DAEMON_ONLY_ENV = Object.freeze([
   "VINCI_WORKER_DEBRIS_ROOT_ANCHOR",
   "VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256",

@@ -859,6 +859,13 @@ process.stdout.write(JSON.stringify(result));
       "ALLOWLISTED_CUSTOM_TOOLS",
       "CAPABILITY_ID_MAX_LENGTH",
       "ENVIRONMENT_BEARING_TOOL",
+      // The two constants the header's environment sentence is pinned to (second containment
+      // pass): SPAWNING_TOOLS names every granted tool that spawns a child, ENVIRONMENT_HOOKED_TOOLS
+      // the subset whose child environment the adapter owns. They are part of the installed
+      // artifact's surface because worker-runtime-adapter-tools.mjs asserts a live inheritance
+      // probe against them.
+      "ENVIRONMENT_HOOKED_TOOLS",
+      "SPAWNING_TOOLS",
       "VINCI_RUN_ENTRY",
       "assertRegistryPinnedToGrant",
       "capabilityIdFields",
