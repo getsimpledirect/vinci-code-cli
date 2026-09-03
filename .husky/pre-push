@@ -27,6 +27,9 @@
 # Escape hatch, for a rebase onto a moved main or a run already known stale:
 #     GIT_ALLOW_PUSH_OVER_CI=1 git push ...
 # Prefer that over `--no-verify`, which would also disable every other hook.
+# `HUSKY=0 git push` ALSO skips this silently -- husky honours that variable
+# before it reaches this script. Documented because an undocumented bypass is
+# one people find by accident and then keep using.
 
 [ "${GIT_ALLOW_PUSH_OVER_CI:-}" = "1" ] && exit 0
 command -v gh >/dev/null 2>&1 || exit 0
@@ -79,9 +82,11 @@ while read -r _local_ref local_sha remote_ref _remote_sha; do
       printf '       %-28s %s\n' "$name" "$url"
     done
     echo ""
-    echo "  Pushing now cancels those runs. A cancelled run still bills every"
-    echo "  minute it already burned and produces no answer — 15% of this org's"
-    echo "  September Actions bill was exactly that."
+    echo "  Either way you pay twice for one answer:"
+    echo "    - if that workflow sets cancel-in-progress, pushing KILLS the run"
+    echo "      and you are still billed every minute it already burned;"
+    echo "    - if it does NOT (vinci-tests.yml does not), the old run KEEPS GOING"
+    echo "      and you now pay for two concurrent matrices."
     echo ""
     echo "  Wait for it, or fold this commit into the next push."
     echo ""
