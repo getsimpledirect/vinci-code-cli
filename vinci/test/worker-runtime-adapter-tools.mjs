@@ -55,10 +55,16 @@
 //       equal the rest of SPAWNING_TOOLS, so the adapter header's environment sentence cannot drift
 //       from the tools' behaviour. Same block: a granted `read` returns a file from OUTSIDE cwd
 //       (F3 — there is no cwd containment, which is why the header no longer says "at cwd"), a
-//       Linux-only /proc/self/environ assertion that HAS NEVER RUN because this host is macOS, and
-//       the F6 pin showing that PI_OFFLINE in a taskEnv would be inert because `ensureTool` reads
-//       the daemon's process.env. PI_OFFLINE is set for the whole block, so nothing here can fetch
-//       a binary from the network; a host missing rg or fd reports that half as SKIPPED.
+//       Linux-only /proc/self/environ assertion that HAS NEVER RUN because this host is macOS —
+//       guarded by a PRECONDITION (non-error, non-empty, un-truncated content) so it cannot pass on
+//       a read that failed or came back as a size-cap notice, and exercised on EVERY host by six
+//       surrogate controls that drive the same probe over readable, marker-bearing, unreadable,
+//       over-byte-cap, empty and over-line-cap files (IR02_FORCE_PROC_PROBE=1 points it at the real
+//       /proc path anywhere) — and the F6 pin showing that PI_OFFLINE in a taskEnv would be inert. That
+//       pin is taken on the BUILT artifact the package specifier resolves to (dist), not on the
+//       TypeScript source, and reaches the real `ensureTool` call site with globalThis.fetch
+//       replaced by a recorder that throws. PI_OFFLINE is set for the whole block, so nothing here
+//       can fetch a binary from the network; a host missing rg or fd reports that half as SKIPPED.
 //   POSITIVE: a scripted `ls` yields tool.started then tool.completed with a 64-hex outputDigest.
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -100,7 +106,27 @@ const PARENT_ONLY_VALUE = "ir02-parent-only-9c1d";
 // F3: a file planted OUTSIDE the session's cwd, which a granted `read` still returns.
 const OUTSIDE_CWD_FILE = "ir02-outside-cwd-2f6b.txt";
 const OUTSIDE_CWD_VALUE = "ir02-outside-cwd-value-7a30";
+// F3, Linux half: the process environment as a FILE. Never read on this host — but the probe that
+// would read it is exercised here against surrogates, and can be pointed at the real path on any
+// host with IR02_FORCE_PROC_PROBE=1 (which is how the precondition below was demonstrated to catch
+// a failed read rather than pass over it).
+const PROC_ENVIRON_PATH = "/proc/self/environ";
+const FORCE_PROC_PROBE = process.env.IR02_FORCE_PROC_PROBE === "1";
+// The two ways a `read` can come back WITHOUT the file's bytes in it. Either one would satisfy a
+// bare "the marker is absent" assertion while proving nothing at all.
+const READ_FIRST_LINE_CAP_NOTICE = /^\[Line \d+ is [^\]]*exceeds [^\]]*limit\./;
+const READ_TRUNCATION_NOTICE = /\[Showing lines \d+-\d+ of \d+/;
 let linuxProcProbe = "not reached";
+
+/** The text a tool result actually carries, as the model would see it (never "[]" for an empty one). */
+function toolResultText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part && part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n");
+}
 
 const root = mkdtempSync(join(tmpdir(), "vinci-ir02-tools-"));
 const cwd = join(root, "cwd");
@@ -843,7 +869,13 @@ try {
         (message) => message.role === "toolResult" && message.toolName === toolName,
       );
       const last = results[results.length - 1];
-      return { isError: Boolean(last && last.isError === true), text: JSON.stringify(last && last.content) };
+      return {
+        isError: Boolean(last && last.isError === true),
+        text: JSON.stringify(last && last.content),
+        // The result's own text parts, for assertions that must distinguish "the file came back"
+        // from "something came back" — JSON.stringify of an empty content array is still "[]".
+        body: toolResultText(last && last.content),
+      };
     }
 
     // -- grep --------------------------------------------------------------------------------------
@@ -933,19 +965,162 @@ try {
     // shape: nobody should read a green run on macOS as evidence about Linux. When it first runs on
     // Linux it will either pass (the platform does not expose it under this runtime) or fail with
     // the recovered value in the message, and either outcome is the finding.
-    if (process.platform === "linux") {
-      process.env.IR02_PARENT_ONLY_MARKER = PARENT_ONLY_VALUE;
-      const procRead = await callTool("read", { path: "/proc/self/environ" });
-      delete process.env.IR02_PARENT_ONLY_MARKER;
+    //
+    // 🔴 THE THIRD OUTCOME, and why the PRECONDITION below exists. "The marker is absent from the
+    // result" is satisfied by every way the read can come back WITHOUT the file in it: the path
+    // does not exist (this host — no /proc at all), the read errors for any other reason, or the
+    // content trips the read tool's first-line byte cap, which replaces the body with
+    // `[Line 1 is …, exceeds … limit. Use bash: …]` — and /proc/self/environ is NUL-separated, so
+    // it is exactly one line and that is the cap it hits. Each of those is a NON-MEASUREMENT that
+    // looks like success, which would make the header's "either outcome is the finding" false. So
+    // the probe first asserts the read RETURNED THE FILE — non-error, non-empty, not a size-cap or
+    // truncation notice — and only then asserts the marker's absence.
+    async function probeEnvironChannel(path, label) {
+      const result = await callTool("read", { path });
+      const seen = JSON.stringify(result.body.slice(0, 300));
       check(
-        !procRead.text.includes(PARENT_ONLY_VALUE),
-        "LINUX ONLY (first execution of this assertion anywhere): a granted `read` of "
-          + "/proc/self/environ must not return the daemon's own environment, got "
-          + `${procRead.text.slice(0, 300)}`,
+        !result.isError,
+        `${label}: PRECONDITION — the read returned a non-error result, got ${seen}`,
       );
-      linuxProcProbe = "ran";
-    } else {
-      linuxProcProbe = `skipped(${process.platform}: no /proc — NEVER RUN)`;
+      check(
+        result.body.trim().length > 0,
+        `${label}: PRECONDITION — the read returned non-empty content, got ${seen}`,
+      );
+      check(
+        !READ_FIRST_LINE_CAP_NOTICE.test(result.body),
+        `${label}: PRECONDITION — the read returned file content, not the first-line size-cap `
+          + `notice (which contains none of the file), got ${seen}`,
+      );
+      check(
+        !READ_TRUNCATION_NOTICE.test(result.body),
+        `${label}: PRECONDITION — the read was not truncated, so an absence claim covers the whole `
+          + `file, got ${seen}`,
+      );
+      check(
+        !result.body.includes(PARENT_ONLY_VALUE),
+        `${label}: a granted \`read\` of ${path} must not return the daemon's own environment, `
+          + `got ${seen}`,
+      );
+    }
+
+    // -- A1: the in-branch controls that make the probe above mean something -----------------------
+    //
+    // The Linux target cannot be read here, so what IS exercised on every host is the probe itself.
+    // Four controls, all through the same granted `read`, the same session and the same entry point,
+    // with the parent-only marker set in process.env exactly as the real probe sets it:
+    //   1. an environ-shaped file that is readable and marker-free -> the whole probe PASSES. This
+    //      is the positive reachability control: the precondition is satisfiable and the absence
+    //      assertion is reachable, so a later failure is about the file and not about the probe.
+    //   2. the same file with the marker planted inside it -> the ABSENCE assertion fails. The leak
+    //      assertion is not vacuous by construction; it can fail on content.
+    //   3. a path that does not exist -> the PRECONDITION fails on the failed read. This is exactly
+    //      the shape a forced run takes on this macOS host (IR02_FORCE_PROC_PROBE=1), which before
+    //      the precondition passed silently.
+    //   4. one line larger than the read tool's byte cap, with the marker BEYOND the cap -> the
+    //      PRECONDITION fails on the size-cap notice instead of passing over a body that contains
+    //      none of the file.
+    //   5. a readable but EMPTY file -> the PRECONDITION fails on empty content. Without this one
+    //      the non-empty clause has no control of its own: control 3 is refused earlier, by the
+    //      non-error clause, so deleting the non-empty clause would leave every other control green.
+    //   6. a file past the read tool's LINE cap, with the marker in the tail -> the PRECONDITION
+    //      fails on the truncation notice. /proc/self/environ is newline-free so only control 4's
+    //      shape can happen there, but the probe is a general one and the clause is otherwise
+    //      uncontrolled: without this, deleting it changes no other control's outcome.
+    const environSurrogateDir = join(envProbeRoot, "environ-surrogate");
+    mkdirSync(environSurrogateDir, { recursive: true });
+    const environReadable = join(environSurrogateDir, "environ-readable");
+    const environLeaky = join(environSurrogateDir, "environ-leaky");
+    const environOversize = join(environSurrogateDir, "environ-oversize");
+    const environAbsent = join(environSurrogateDir, "environ-absent");
+    const environEmpty = join(environSurrogateDir, "environ-empty");
+    const environManyLines = join(environSurrogateDir, "environ-many-lines");
+    // NUL-separated and newline-free, the shape /proc/self/environ actually has.
+    const NUL = "\u0000";
+    writeFileSync(environReadable, `PATH=/usr/bin${NUL}HOME=/tmp${NUL}`, "utf8");
+    writeFileSync(
+      environLeaky,
+      `PATH=/usr/bin${NUL}IR02_PARENT_ONLY_MARKER=${PARENT_ONLY_VALUE}${NUL}`,
+      "utf8",
+    );
+    // 64KB of padding puts the marker past the read tool's 50KB default first-line cap.
+    writeFileSync(
+      environOversize,
+      `PAD=${"x".repeat(64 * 1024)}${NUL}IR02_PARENT_ONLY_MARKER=${PARENT_ONLY_VALUE}${NUL}`,
+      "utf8",
+    );
+    writeFileSync(environEmpty, "", "utf8");
+    // 3000 lines is past the read tool's 2000-line default cap, so the marker in the tail never
+    // reaches the result and the body ends in a "[Showing lines ...]" notice instead.
+    writeFileSync(
+      environManyLines,
+      `${"PAD=x\n".repeat(3000)}IR02_PARENT_ONLY_MARKER=${PARENT_ONLY_VALUE}\n`,
+      "utf8",
+    );
+    assert.ok(!existsSync(environAbsent), "the unreadable-path control really points at nothing");
+    passed += 1;
+
+    async function expectProbeFailure(path, label, expectedFragment) {
+      let message = null;
+      try {
+        await probeEnvironChannel(path, label);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      check(message !== null, `${label}: the probe FAILED rather than passing vacuously`);
+      check(
+        message !== null && message.includes(expectedFragment),
+        `${label}: it failed on ${JSON.stringify(expectedFragment)}, got `
+          + `${JSON.stringify(String(message).slice(0, 300))}`,
+      );
+    }
+
+    process.env.IR02_PARENT_ONLY_MARKER = PARENT_ONLY_VALUE;
+    try {
+      await probeEnvironChannel(
+        environReadable,
+        "environ-channel control 1 (readable, marker-free — POSITIVE reachability)",
+      );
+      await expectProbeFailure(
+        environLeaky,
+        "environ-channel control 2 (marker present in the file)",
+        "must not return the daemon's own environment",
+      );
+      await expectProbeFailure(
+        environAbsent,
+        "environ-channel control 3 (unreadable path — the forced-macOS shape)",
+        "PRECONDITION — the read returned a non-error result",
+      );
+      await expectProbeFailure(
+        environOversize,
+        "environ-channel control 4 (first line over the read tool's byte cap)",
+        "PRECONDITION — the read returned file content, not the first-line size-cap notice",
+      );
+      await expectProbeFailure(
+        environEmpty,
+        "environ-channel control 5 (readable but empty)",
+        "PRECONDITION — the read returned non-empty content",
+      );
+      await expectProbeFailure(
+        environManyLines,
+        "environ-channel control 6 (past the read tool's line cap)",
+        "PRECONDITION — the read was not truncated",
+      );
+
+      if (process.platform === "linux" || FORCE_PROC_PROBE) {
+        const forced = process.platform !== "linux";
+        await probeEnvironChannel(
+          PROC_ENVIRON_PATH,
+          forced
+            ? `/proc probe FORCED on ${process.platform} via IR02_FORCE_PROC_PROBE (this platform `
+              + "has no /proc, so the precondition is expected to refuse the read)"
+            : "LINUX (first execution of this assertion anywhere)",
+        );
+        linuxProcProbe = forced ? `ran(FORCED on ${process.platform})` : "ran";
+      } else {
+        linuxProcProbe = `skipped(${process.platform}: no /proc — NEVER RUN)`;
+      }
+    } finally {
+      delete process.env.IR02_PARENT_ONLY_MARKER;
     }
 
     // -- F6: the offline flag is read from process.env, so taskEnv cannot carry it ------------------
@@ -957,37 +1132,151 @@ try {
     // `isOfflineModeEnabled()` reads `process.env.PI_OFFLINE` directly. The tools run in-process, so
     // taskEnv is never the environment consulted. The subprocess lane, where taskEnv IS the child's
     // process.env, is deliberately untouched.
-    const toolsManager = await createJiti(import.meta.url, { moduleCache: false, tryNative: false }).import(
+    //
+    // 🔴 A2: MEASURED ON THE ARTIFACT THAT EXECUTES, NOT ON THE SOURCE. The adapter imports
+    // "@earendil-works/pi-coding-agent", whose exports map resolves to
+    // packages/coding-agent/dist/index.js — the BUILT output is what runs. An earlier version of
+    // this pin mutated and measured the TypeScript source through jiti, so a build that stopped
+    // matching src/ would have been invisible to the very pin whose job is to notice it. Everything
+    // below is taken from the file the SPECIFIER resolves to. The source is still measured, but
+    // only as a divergence check: if dist ever stops agreeing with src, the deepEqual fails.
+    const codingAgentEntryUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const builtToolsManagerUrl = new URL("./utils/tools-manager.js", codingAgentEntryUrl);
+    const builtToolsManagerPath = fileURLToPath(builtToolsManagerUrl);
+    check(
+      existsSync(builtToolsManagerPath),
+      "the artifact the package specifier resolves to carries utils/tools-manager.js "
+        + `(${builtToolsManagerPath}) — if the built layout moves, this pin must move with it`,
+    );
+    const builtToolsManager = await import(builtToolsManagerUrl.href);
+    const sourceToolsManager = await createJiti(import.meta.url, { moduleCache: false, tryNative: false }).import(
       resolve(dirname(fileURLToPath(import.meta.url)), "../../packages/coding-agent/src/utils/tools-manager.ts"),
       { default: false },
     );
-    const taskEnvWithOffline = { PATH: process.env.PATH, PI_OFFLINE: "1" };
-    // POSITIVE CONTROL: the value is well-formed and the function does answer to it — when it is the
-    // argument. So the negative below is about the CALL SITE, not about a typo in the flag.
+    // The three decisions that separate "the flag is in the Run's taskEnv" from "the flag is in the
+    // daemon's process.env", taken through one module so src and dist can be compared like for like.
+    function measureBootstrapDecision(mod) {
+      const savedProcessOffline = process.env.PI_OFFLINE;
+      try {
+        // The value is well-formed and the function DOES answer to it — when it is the argument.
+        const withTaskEnvArgument = mod.shouldBootstrapTools({ PATH: process.env.PATH, PI_OFFLINE: "1" });
+        delete process.env.PI_OFFLINE;
+        const noArgWithoutProcessOffline = mod.shouldBootstrapTools();
+        process.env.PI_OFFLINE = "1";
+        const noArgWithProcessOffline = mod.shouldBootstrapTools();
+        return { withTaskEnvArgument, noArgWithoutProcessOffline, noArgWithProcessOffline };
+      } finally {
+        if (savedProcessOffline === undefined) delete process.env.PI_OFFLINE;
+        else process.env.PI_OFFLINE = savedProcessOffline;
+      }
+    }
+    const builtDecision = measureBootstrapDecision(builtToolsManager);
+    const sourceDecision = measureBootstrapDecision(sourceToolsManager);
+    // POSITIVE CONTROL: so the negative below is about the CALL SITE, not about a typo in the flag.
     check(
-      toolsManager.shouldBootstrapTools(taskEnvWithOffline) === false,
-      "F6 control: PI_OFFLINE=1 in a taskEnv-shaped map DOES suppress the bootstrap when that map is "
-        + "the argument",
+      builtDecision.withTaskEnvArgument === false,
+      "F6 control (BUILT artifact): PI_OFFLINE=1 in a taskEnv-shaped map DOES suppress the bootstrap "
+        + "when that map is the argument",
     );
-    const savedProcessOffline = process.env.PI_OFFLINE;
-    delete process.env.PI_OFFLINE;
-    const noArgWithoutProcessOffline = toolsManager.shouldBootstrapTools();
-    process.env.PI_OFFLINE = "1";
-    const noArgWithProcessOffline = toolsManager.shouldBootstrapTools();
-    if (savedProcessOffline === undefined) delete process.env.PI_OFFLINE;
-    else process.env.PI_OFFLINE = savedProcessOffline;
     // NEGATIVE: with the flag ONLY in taskEnv (i.e. absent from process.env), the call `ensureTool`
     // actually makes still permits the fetch.
     check(
-      noArgWithoutProcessOffline === true,
-      "MEASURED: the no-argument call `ensureTool` makes still permits a network fetch while "
-        + "PI_OFFLINE lives only in the Run's taskEnv — the taskEnv fix would be INERT on this lane",
+      builtDecision.noArgWithoutProcessOffline === true,
+      "MEASURED on the BUILT artifact: the no-argument call `ensureTool` makes still permits a "
+        + "network fetch while PI_OFFLINE lives only in the Run's taskEnv — the taskEnv fix would be "
+        + "INERT on this lane",
     );
     // POSITIVE: the control that DOES work is a daemon/deployment-level one.
     check(
-      noArgWithProcessOffline === false,
-      "MEASURED: the same no-argument call refuses the fetch when PI_OFFLINE is in the DAEMON's "
-        + "process.env — that, not taskEnv, is the reachable control",
+      builtDecision.noArgWithProcessOffline === false,
+      "MEASURED on the BUILT artifact: the same no-argument call refuses the fetch when PI_OFFLINE is "
+        + "in the DAEMON's process.env — that, not taskEnv, is the reachable control",
+    );
+    // DIVERGENCE PIN: the source this repo edits and the artifact it ships must decide alike.
+    assert.deepEqual(
+      builtDecision,
+      sourceDecision,
+      "the built artifact and the TypeScript source make the SAME bootstrap decisions "
+        + `(built=${JSON.stringify(builtDecision)} source=${JSON.stringify(sourceDecision)}) — a `
+        + "difference means dist/ no longer matches src/ and every claim taken from src/ is void",
+    );
+    passed += 1;
+
+    // -- F6, the CALL SITE itself, measured on the built artifact ----------------------------------
+    //
+    // Everything above is about `shouldBootstrapTools`. The claim is about `ensureTool`, so this
+    // drives the real built `ensureTool` to its decision and watches whether it reaches the network.
+    // NO NETWORK: globalThis.fetch is replaced by a recorder that throws before any socket opens, so
+    // "reached the fetch" is observed rather than performed.
+    //
+    // Making the tool count as MISSING is the whole difficulty: `ensureTool` returns early if the
+    // binary is already there, and on this host it is (that is why the find/grep probes above did
+    // not report SKIPPED — ~/.pi/agent/bin carries fd and rg). So a SECOND INSTANCE of the same
+    // built file is loaded with a cache-busting query while VINCI_CODING_AGENT_DIR points at an
+    // empty directory, which is what its module-level TOOLS_DIR is computed from, and PATH is
+    // emptied so the system-binary fallback finds nothing either. Same file, same call site.
+    const bootstrapProbeDir = join(root, "bootstrap-probe-agent-dir");
+    mkdirSync(join(bootstrapProbeDir, "bin"), { recursive: true });
+    const savedAgentDirEnv = process.env.VINCI_CODING_AGENT_DIR;
+    const savedProbePath = process.env.PATH;
+    const savedFetch = globalThis.fetch;
+    const savedProbeOffline = process.env.PI_OFFLINE;
+    let fetchAttempts = 0;
+    let attemptsTaskEnvOnly = -1;
+    let attemptsProcessOffline = -1;
+    let resultTaskEnvOnly = "unset";
+    let resultProcessOffline = "unset";
+    let probeToolPath = "unset";
+    try {
+      process.env.VINCI_CODING_AGENT_DIR = bootstrapProbeDir;
+      const freshBuilt = await import(`${builtToolsManagerUrl.href}?ir02-bootstrap-call-site=1`);
+      process.env.PATH = "";
+      globalThis.fetch = () => {
+        fetchAttempts += 1;
+        throw new Error("IR02 fetch recorder: this test never opens a socket");
+      };
+      probeToolPath = freshBuilt.getToolPath("rg");
+      // (A) the flag lives ONLY in a taskEnv-shaped map — i.e. it is absent from process.env.
+      delete process.env.PI_OFFLINE;
+      fetchAttempts = 0;
+      resultTaskEnvOnly = await freshBuilt.ensureTool("rg", true);
+      attemptsTaskEnvOnly = fetchAttempts;
+      // (B) the same call with the flag in the DAEMON's process.env.
+      process.env.PI_OFFLINE = "1";
+      fetchAttempts = 0;
+      resultProcessOffline = await freshBuilt.ensureTool("rg", true);
+      attemptsProcessOffline = fetchAttempts;
+    } finally {
+      globalThis.fetch = savedFetch;
+      if (savedProbePath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedProbePath;
+      if (savedAgentDirEnv === undefined) delete process.env.VINCI_CODING_AGENT_DIR;
+      else process.env.VINCI_CODING_AGENT_DIR = savedAgentDirEnv;
+      if (savedProbeOffline === undefined) delete process.env.PI_OFFLINE;
+      else process.env.PI_OFFLINE = savedProbeOffline;
+    }
+    // PRECONDITION: without this the two cases below would BOTH return the installed path and agree
+    // for a reason that has nothing to do with the offline flag.
+    check(
+      probeToolPath === null,
+      `call-site probe precondition: rg counts as NOT installed under the empty probe dir, got ${JSON.stringify(probeToolPath)}`,
+    );
+    // NEGATIVE, on the artifact that runs: taskEnv-only PI_OFFLINE did not stop it going for the wire.
+    check(
+      attemptsTaskEnvOnly === 1,
+      "MEASURED on the BUILT `ensureTool`: with PI_OFFLINE only in a taskEnv-shaped map it reached "
+        + `the network fetch (recorder saw ${attemptsTaskEnvOnly} attempt(s)) — the taskEnv fix is INERT`,
+    );
+    // POSITIVE: the daemon-level control stops the same call before the wire.
+    check(
+      attemptsProcessOffline === 0,
+      "MEASURED on the BUILT `ensureTool`: with PI_OFFLINE in the DAEMON's process.env it never "
+        + `reached the fetch (recorder saw ${attemptsProcessOffline} attempt(s))`,
+    );
+    check(
+      resultTaskEnvOnly === undefined && resultProcessOffline === undefined,
+      "both call-site cases end with no binary (the recorder makes the download fail), so the "
+        + `discriminator is the fetch attempt and not the return value, got ${JSON.stringify([resultTaskEnvOnly, resultProcessOffline])}`,
     );
 
     // -- bash: the one that IS hooked, through the same session and the same entry point -----------
