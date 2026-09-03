@@ -533,7 +533,10 @@ await test('release failure is logged and never changes the state', async () => 
 await test('declaration digest = sha256(canonical declaration) and the daemon never overclaims control', async () => {
   const declaration = buildDeclaration({ workerId: 'w1', workerVersion: '0.0.51', adapterVersion: '0.0.51' });
   assert.deepEqual(declaration.supports, CAPABILITY_MATRIX);
-  assert.equal(declaration.controlLevel, 'inventoried', 'activityStream=false caps the derived rung at inventoried');
+  // controlLevel is a HAND-WRITTEN literal in buildDeclaration, not a derivation — no function in
+  // this repo computes a rung from the matrix (lease.mjs says so at the literal). This pins the
+  // hand-written value against the measured activityStream; it does not claim a mechanism.
+  assert.equal(declaration.controlLevel, 'inventoried', 'activityStream is false, so the hand-written controlLevel literal must be the lowest rung');
   const digest = declarationDigest(declaration);
   assert.match(digest, /^[0-9a-f]{64}$/);
   assert.equal(digest, sha256('{"adapter":{"id":"vinci-worker-daemon","version":"0.0.51"},"controlLevel":"inventoried","schemaVersion":1,"supports":{"abort":false,"activityStream":false,"approvals":"none","filesystemEnforcement":false,"independentVerification":false,"nativeReceipts":false,"networkEnforcement":false,"pause":false,"questions":false,"restrictToReadOnly":false,"safeResume":false,"steering":false,"structuredEvidence":false},"worker":{"id":"w1","name":"Vinci Code worker","version":"0.0.51"}}'));

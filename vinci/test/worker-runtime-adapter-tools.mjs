@@ -56,17 +56,23 @@
 //       from the tools' behaviour. Same block: a granted `read` returns a file from OUTSIDE cwd
 //       (F3 — there is no cwd containment, which is why the header no longer says "at cwd"), a
 //       Linux-only /proc/self/environ assertion that HAS NEVER RUN because this host is macOS —
-//       guarded by a PRECONDITION (non-error, non-empty, un-truncated content) so it cannot pass on
-//       a read that failed or came back as a size-cap notice, and exercised on EVERY host by six
-//       surrogate controls that drive the same probe over readable, marker-bearing, unreadable,
-//       over-byte-cap, empty and over-line-cap files (IR02_FORCE_PROC_PROBE=1 points it at the real
-//       /proc path anywhere) — and the F6 pin showing that PI_OFFLINE in a taskEnv would be inert. That
+//       whose polarity is that RETURNING that file is the leak (RED) and failing to return it is the
+//       desired state (GREEN), discriminating on an EXEC-TIME marker and on the readability of the
+//       block itself, and exercised on EVERY host by six surrogate controls: three that must go RED
+//       (a readable block, a real child process's exec-time block carrying the marker, and a
+//       line-cap truncation that still returns the block's first lines) and three that must go
+//       GREEN for a RECORDED and asserted reason (a refused read, an empty read, and — the genuine
+//       positive — a SUCCESSFUL non-empty read whose first line exceeds the byte cap, so none of the
+//       file comes back). IR02_FORCE_PROC_PROBE=1 points it at the real /proc path anywhere, and a
+//       forced run off Linux asserts itself a NON-MEASUREMENT rather than reporting a pass.
+//       — and the F6 pin showing that PI_OFFLINE in a taskEnv would be inert. That
 //       pin is taken on the BUILT artifact the package specifier resolves to (dist), not on the
 //       TypeScript source, and reaches the real `ensureTool` call site with globalThis.fetch
 //       replaced by a recorder that throws. PI_OFFLINE is set for the whole block, so nothing here
 //       can fetch a binary from the network; a host missing rg or fd reports that half as SKIPPED.
 //   POSITIVE: a scripted `ls` yields tool.started then tool.completed with a 64-hex outputDigest.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -108,12 +114,34 @@ const OUTSIDE_CWD_FILE = "ir02-outside-cwd-2f6b.txt";
 const OUTSIDE_CWD_VALUE = "ir02-outside-cwd-value-7a30";
 // F3, Linux half: the process environment as a FILE. Never read on this host — but the probe that
 // would read it is exercised here against surrogates, and can be pointed at the real path on any
-// host with IR02_FORCE_PROC_PROBE=1 (which is how the precondition below was demonstrated to catch
-// a failed read rather than pass over it).
+// host with IR02_FORCE_PROC_PROBE=1.
 const PROC_ENVIRON_PATH = "/proc/self/environ";
 const FORCE_PROC_PROBE = process.env.IR02_FORCE_PROC_PROBE === "1";
-// The two ways a `read` can come back WITHOUT the file's bytes in it. Either one would satisfy a
-// bare "the marker is absent" assertion while proving nothing at all.
+// The platform selector for that probe, as a FUNCTION so it has a control that does not need a
+// Linux host: the table below drives it over (platform, forced) pairs this host cannot be, and the
+// live branch calls this same function so the branch actually taken is asserted, not merely logged.
+function shouldRunProcProbe(platform, forced) {
+  return platform === "linux" || forced === true;
+}
+// The EXEC-TIME discriminator. A process's environment block (what `/proc/self/environ` exposes) is
+// written from the environment handed to execve; a value assigned to `process.env` afterwards is a
+// RUNTIME value and is not in it. So the marker this probe discriminates on must be present at EXEC
+// time or it can never appear in the thing being discriminated on. Two ways it gets there:
+//   * for the real /proc path: the runner supplies IR02_EXEC_TIME_MARKER in this process's own
+//     environment, captured HERE at module load, before any test code mutates process.env. Absent,
+//     the content clause reports itself UNARMED and the probe runs on readability alone.
+//   * for the surrogate exercised on every host: a child is SPAWNED with the marker in its env and
+//     dumps its own environment block, so the file carries the marker by construction.
+// The two values are DELIBERATELY DIFFERENT. The surrogate's whole claim is "this process never
+// held this value, so the only way it reached the child's environment block was execve" — and that
+// claim would be false the moment a runner armed the real path with the same spelling.
+const EXEC_TIME_MARKER_NAME = "IR02_EXEC_TIME_MARKER";
+const EXEC_TIME_MARKER_FROM_EXEC = process.env[EXEC_TIME_MARKER_NAME] ?? null;
+const EXEC_TIME_SURROGATE_NAME = "IR02_EXEC_TIME_SURROGATE";
+const EXEC_TIME_SURROGATE_VALUE = "ir02-exec-time-surrogate-4d8f";
+// The two ways a `read` can come back WITHOUT the file's bytes in it. Under this probe's polarity
+// they are the DESIRED outcomes (the environment block did not reach the model), so they are
+// classified and reported by name rather than asserted against.
 const READ_FIRST_LINE_CAP_NOTICE = /^\[Line \d+ is [^\]]*exceeds [^\]]*limit\./;
 const READ_TRUNCATION_NOTICE = /\[Showing lines \d+-\d+ of \d+/;
 let linuxProcProbe = "not reached";
@@ -958,78 +986,130 @@ try {
     // `read` that just crossed the cwd boundary could open `/proc/self/environ` and recover exactly
     // the daemon configuration the bash environment hook exists to exclude — re-admitting it
     // through the file channel instead of the process channel. The fleet's daemon runs on Linux.
-    // This host is macOS, which has no /proc, so the branch below has never executed and its
-    // outcome is UNKNOWN — not closed, and not demonstrated broken.
+    // This host is macOS, which has no /proc, so the branch below has never executed against the
+    // real path and its outcome there is UNKNOWN — not closed, and not demonstrated broken.
     //
-    // The assertion is written to FAIL on Linux if the leak is real, because that is the honest
-    // shape: nobody should read a green run on macOS as evidence about Linux. When it first runs on
-    // Linux it will either pass (the platform does not expose it under this runtime) or fail with
-    // the recovered value in the message, and either outcome is the finding.
+    // 🔴 POLARITY, and the inversion this replaced. RETURNING THAT FILE IS THE HAZARD. Failing to
+    // return it is the desired state. So:
+    //     the granted read RETURNS the environment block  -> RED (this is the leak)
+    //     the granted read does NOT return it             -> GREEN (nothing was re-admitted)
+    // The previous version required the read to succeed as a PRECONDITION before checking content,
+    // which inverted the test on the only platform it targets: an unreadable /proc/self/environ (NO
+    // leak) failed the precondition and went RED, while a readable, marker-free one (the leak
+    // SUCCEEDING) satisfied every clause and went GREEN. Both were executed by review.
     //
-    // 🔴 THE THIRD OUTCOME, and why the PRECONDITION below exists. "The marker is absent from the
-    // result" is satisfied by every way the read can come back WITHOUT the file in it: the path
-    // does not exist (this host — no /proc at all), the read errors for any other reason, or the
-    // content trips the read tool's first-line byte cap, which replaces the body with
-    // `[Line 1 is …, exceeds … limit. Use bash: …]` — and /proc/self/environ is NUL-separated, so
-    // it is exactly one line and that is the cap it hits. Each of those is a NON-MEASUREMENT that
-    // looks like success, which would make the header's "either outcome is the finding" false. So
-    // the probe first asserts the read RETURNED THE FILE — non-error, non-empty, not a size-cap or
-    // truncation notice — and only then asserts the marker's absence.
-    async function probeEnvironChannel(path, label) {
+    // 🔴 THE DISCRIMINATOR, and why it cannot be a runtime value. That precondition existed to stop
+    // a marker-absence claim passing over a body that never held the file. The marker it protected
+    // was set with `process.env.X = ...` at RUNTIME, while the file carries the process's EXEC-TIME
+    // environment block — so the value could never appear in the thing being discriminated on, and
+    // no threshold fixes that. This probe therefore discriminates on two things that CAN be true of
+    // that file: (1) an EXEC-TIME marker — EXEC_TIME_MARKER_NAME, supplied to this process by the
+    // runner, for the real /proc path; EXEC_TIME_SURROGATE_NAME, placed in a spawned child's
+    // environment at execve, for the surrogate, so it is in that child's block by construction and
+    // this process provably never held it — and (2) the readability of the block itself, which
+    // needs no marker at all: /proc/self/environ IS the daemon's environment, so any of its bytes
+    // reaching the model is the leak whatever they spell.
+    //
+    // The ways the read can come back WITHOUT the file's bytes — error, empty, first-line byte-cap
+    // notice — are now GREEN, but each is a different reason and the reason is recorded and
+    // asserted by the controls, so "contained because the read tool capped a 50KB line" can never be
+    // read as "contained because something guarded it". A TRUNCATION notice is RED: the body still
+    // carries the file's first lines, and a partial environment block is still an environment block.
+    function classifyEnvironRead(result) {
+      if (result.isError) return { returnedFile: false, reason: "the read returned an error" };
+      if (result.body.trim().length === 0) {
+        return { returnedFile: false, reason: "the read returned empty content" };
+      }
+      if (READ_FIRST_LINE_CAP_NOTICE.test(result.body)) {
+        return {
+          returnedFile: false,
+          reason: "the read returned the first-line size-cap notice, which carries none of the file",
+        };
+      }
+      if (READ_TRUNCATION_NOTICE.test(result.body)) {
+        return {
+          returnedFile: true,
+          reason: "the read returned the file's first lines plus a truncation notice",
+        };
+      }
+      return { returnedFile: true, reason: "the read returned the file's content" };
+    }
+
+    // `execTimeMarker` is REQUIRED and explicit: a string arms the content clause, `null` says no
+    // exec-time value is available to discriminate on, in which case the probe runs on readability
+    // alone and the caller reports the content clause UNARMED. It is not optional, because an
+    // omitted argument would arrive as `undefined` and silently search the body for "undefined".
+    async function probeEnvironChannel(path, label, execTimeMarker) {
+      assert.ok(
+        typeof execTimeMarker === "string" || execTimeMarker === null,
+        `${label}: the probe was called with an explicit exec-time marker or an explicit null, got `
+          + `${JSON.stringify(execTimeMarker)}`,
+      );
       const result = await callTool("read", { path });
       const seen = JSON.stringify(result.body.slice(0, 300));
+      const outcome = classifyEnvironRead(result);
+      const armed = execTimeMarker !== null;
+      if (armed) {
+        check(
+          !result.body.includes(execTimeMarker),
+          `${label}: LEAK — a granted \`read\` of ${path} returned content carrying the EXEC-TIME `
+            + `marker ${JSON.stringify(execTimeMarker)}, so the daemon's own environment came back `
+            + `through the file channel, got ${seen}`,
+        );
+      }
       check(
-        !result.isError,
-        `${label}: PRECONDITION — the read returned a non-error result, got ${seen}`,
+        !outcome.returnedFile,
+        `${label}: LEAK — a granted \`read\` of ${path} RETURNED THE FILE (${outcome.reason}). That `
+          + `file IS the process's environment block, so returning any of it re-admits exactly the `
+          + `daemon configuration the environment hook exists to exclude, got ${seen}`,
       );
-      check(
-        result.body.trim().length > 0,
-        `${label}: PRECONDITION — the read returned non-empty content, got ${seen}`,
-      );
-      check(
-        !READ_FIRST_LINE_CAP_NOTICE.test(result.body),
-        `${label}: PRECONDITION — the read returned file content, not the first-line size-cap `
-          + `notice (which contains none of the file), got ${seen}`,
-      );
-      check(
-        !READ_TRUNCATION_NOTICE.test(result.body),
-        `${label}: PRECONDITION — the read was not truncated, so an absence claim covers the whole `
-          + `file, got ${seen}`,
-      );
-      check(
-        !result.body.includes(PARENT_ONLY_VALUE),
-        `${label}: a granted \`read\` of ${path} must not return the daemon's own environment, `
-          + `got ${seen}`,
-      );
+      return { ...outcome, armed, isError: result.isError === true, body: result.body };
     }
 
     // -- A1: the in-branch controls that make the probe above mean something -----------------------
     //
     // The Linux target cannot be read here, so what IS exercised on every host is the probe itself.
-    // Four controls, all through the same granted `read`, the same session and the same entry point,
-    // with the parent-only marker set in process.env exactly as the real probe sets it:
-    //   1. an environ-shaped file that is readable and marker-free -> the whole probe PASSES. This
-    //      is the positive reachability control: the precondition is satisfiable and the absence
-    //      assertion is reachable, so a later failure is about the file and not about the probe.
-    //   2. the same file with the marker planted inside it -> the ABSENCE assertion fails. The leak
-    //      assertion is not vacuous by construction; it can fail on content.
-    //   3. a path that does not exist -> the PRECONDITION fails on the failed read. This is exactly
-    //      the shape a forced run takes on this macOS host (IR02_FORCE_PROC_PROBE=1), which before
-    //      the precondition passed silently.
-    //   4. one line larger than the read tool's byte cap, with the marker BEYOND the cap -> the
-    //      PRECONDITION fails on the size-cap notice instead of passing over a body that contains
-    //      none of the file.
-    //   5. a readable but EMPTY file -> the PRECONDITION fails on empty content. Without this one
-    //      the non-empty clause has no control of its own: control 3 is refused earlier, by the
-    //      non-error clause, so deleting the non-empty clause would leave every other control green.
-    //   6. a file past the read tool's LINE cap, with the marker in the tail -> the PRECONDITION
-    //      fails on the truncation notice. /proc/self/environ is newline-free so only control 4's
-    //      shape can happen there, but the probe is a general one and the clause is otherwise
-    //      uncontrolled: without this, deleting it changes no other control's outcome.
+    // Six controls, all through the same granted `read`, the same session and the same entry point,
+    // all with the content clause ARMED (so the exec-time clause is evaluated in every one of them
+    // and fires in exactly one). Under this probe's polarity they split three and three:
+    //
+    //   RED-EXPECTED — the environment block, or part of it, reached the model:
+    //     1. a readable, marker-FREE environment block -> the probe FAILS on READABILITY ALONE.
+    //        This is the control that proves the leak assertion needs no marker: /proc/self/environ
+    //        IS the daemon's environment, so any of its bytes coming back is the leak whatever they
+    //        spell. The content clause is armed here and does NOT fire, so the failure is
+    //        attributable to readability and not to the marker.
+    //     2. a REAL child process's EXEC-TIME environment block -> the probe FAILS on the CONTENT
+    //        clause, naming the exec-time marker. The child is spawned with the marker in the
+    //        environment handed to execve and dumps its own `process.env` as a NUL-separated block
+    //        before running any other code, so the marker is in the block BY CONSTRUCTION. The
+    //        parent asserts it never held that marker itself, which is what makes this exec-time
+    //        rather than the runtime assignment the previous version used (and which could never
+    //        appear in an exec-time block).
+    //     6. a file past the read tool's LINE cap -> the body carries the file's first 2000 lines
+    //        plus a "[Showing lines ...]" notice, and a PARTIAL environment block is still an
+    //        environment block, so the probe FAILS. The marker sits in the tail beyond the cap, so
+    //        the content clause is armed, does not fire, and the failure is again readability.
+    //
+    //   GREEN-EXPECTED — nothing of the block reached the model. Each is contained for a DIFFERENT
+    //   reason, the reason is recorded by classifyEnvironRead and asserted here, so "contained
+    //   because the read tool capped a 50KB line" can never be read as "contained because something
+    //   guarded it":
+    //     3. a path that does not exist -> contained because the READ WAS REFUSED. This is exactly
+    //        the shape a forced run takes on this macOS host (IR02_FORCE_PROC_PROBE=1), and it is
+    //        the reason a forced green is asserted below to be a NON-MEASUREMENT.
+    //     5. a readable but EMPTY file -> contained because the read returned nothing. Without this
+    //        one the empty branch of classifyEnvironRead has no control of its own.
+    //     4. 🔴 THE GENUINE POSITIVE CONTROL. One line larger than the read tool's byte cap, with
+    //        the exec-time marker BEYOND the cap. The read SUCCEEDS — non-error, non-empty, a real
+    //        tool result comes back — and yet none of the file's bytes are in it, so the probe
+    //        passes with both clauses evaluated and neither firing. That is a pass for the right
+    //        reason rather than a pass because everything refused: without it, deleting the whole
+    //        probe body would still leave controls 3 and 5 green.
     const environSurrogateDir = join(envProbeRoot, "environ-surrogate");
     mkdirSync(environSurrogateDir, { recursive: true });
     const environReadable = join(environSurrogateDir, "environ-readable");
-    const environLeaky = join(environSurrogateDir, "environ-leaky");
+    const environExecTime = join(environSurrogateDir, "environ-exec-time");
     const environOversize = join(environSurrogateDir, "environ-oversize");
     const environAbsent = join(environSurrogateDir, "environ-absent");
     const environEmpty = join(environSurrogateDir, "environ-empty");
@@ -1037,32 +1117,72 @@ try {
     // NUL-separated and newline-free, the shape /proc/self/environ actually has.
     const NUL = "\u0000";
     writeFileSync(environReadable, `PATH=/usr/bin${NUL}HOME=/tmp${NUL}`, "utf8");
-    writeFileSync(
-      environLeaky,
-      `PATH=/usr/bin${NUL}IR02_PARENT_ONLY_MARKER=${PARENT_ONLY_VALUE}${NUL}`,
-      "utf8",
+    // Control 2's file is not hand-written: a child is SPAWNED with the marker in the environment
+    // handed to execve, and its only job is to serialise its own environment as a NUL-separated
+    // block. Nothing in that child assigns to process.env, so what lands on disk is the exec-time
+    // block — the same thing /proc/self/environ exposes on Linux.
+    const environDumpScript = "const fs = require('node:fs');"
+      + "const block = Object.entries(process.env).map(([k, v]) => `${k}=${v}`).join('\\u0000');"
+      + "fs.writeFileSync(process.argv[1], `${block}\\u0000`);";
+    const environDump = spawnSync(
+      process.execPath,
+      ["-e", environDumpScript, environExecTime],
+      {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          [EXEC_TIME_SURROGATE_NAME]: EXEC_TIME_SURROGATE_VALUE,
+        },
+        encoding: "utf8",
+      },
+    );
+    check(
+      environDump.status === 0,
+      `the exec-time surrogate child exited 0, got status=${environDump.status} `
+        + `stderr=${JSON.stringify(String(environDump.stderr ?? "").slice(0, 200))}`,
+    );
+    const environExecTimeBody = readFileSync(environExecTime, "utf8");
+    check(
+      environExecTimeBody.includes(`${EXEC_TIME_SURROGATE_NAME}=${EXEC_TIME_SURROGATE_VALUE}`),
+      "the spawned child's own environment block carries the exec-time marker BY CONSTRUCTION, got "
+        + JSON.stringify(environExecTimeBody.slice(0, 200)),
+    );
+    // 🔴 This is what makes the discriminator EXEC-TIME and not runtime, demonstrated rather than
+    // asserted: the parent never holds the marker, so the only path by which it reached the child's
+    // environment block is the environment handed to execve.
+    check(
+      process.env[EXEC_TIME_SURROGATE_NAME] !== EXEC_TIME_SURROGATE_VALUE,
+      "this process never assigned the exec-time marker to its own environment, so the child got it "
+        + `only through execve, got ${JSON.stringify(process.env[EXEC_TIME_SURROGATE_NAME] ?? null)}`,
+    );
+    check(
+      !environExecTimeBody.includes("\n"),
+      "the exec-time surrogate is newline-free, the shape /proc/self/environ actually has, got "
+        + JSON.stringify(environExecTimeBody.slice(0, 120)),
     );
     // 64KB of padding puts the marker past the read tool's 50KB default first-line cap.
     writeFileSync(
       environOversize,
-      `PAD=${"x".repeat(64 * 1024)}${NUL}IR02_PARENT_ONLY_MARKER=${PARENT_ONLY_VALUE}${NUL}`,
+      `PAD=${"x".repeat(64 * 1024)}${NUL}${EXEC_TIME_SURROGATE_NAME}=${EXEC_TIME_SURROGATE_VALUE}${NUL}`,
       "utf8",
     );
     writeFileSync(environEmpty, "", "utf8");
     // 3000 lines is past the read tool's 2000-line default cap, so the marker in the tail never
-    // reaches the result and the body ends in a "[Showing lines ...]" notice instead.
+    // reaches the result and the body ends in a "[Showing lines ...]" notice instead — but the
+    // first 2000 lines DO come back, which under this polarity is a leak of a partial block.
     writeFileSync(
       environManyLines,
-      `${"PAD=x\n".repeat(3000)}IR02_PARENT_ONLY_MARKER=${PARENT_ONLY_VALUE}\n`,
+      `${"PAD=x\n".repeat(3000)}${EXEC_TIME_SURROGATE_NAME}=${EXEC_TIME_SURROGATE_VALUE}\n`,
       "utf8",
     );
-    assert.ok(!existsSync(environAbsent), "the unreadable-path control really points at nothing");
+    assert.ok(!existsSync(environAbsent), "the refused-read control really points at nothing");
     passed += 1;
 
-    async function expectProbeFailure(path, label, expectedFragment) {
+    // A control that expects the probe to go RED, and to go red for the STATED reason — so a
+    // control cannot be satisfied by some other clause failing first.
+    async function expectProbeLeak(path, label, expectedFragment) {
       let message = null;
       try {
-        await probeEnvironChannel(path, label);
+        await probeEnvironChannel(path, label, EXEC_TIME_SURROGATE_VALUE);
       } catch (error) {
         message = error instanceof Error ? error.message : String(error);
       }
@@ -1074,54 +1194,133 @@ try {
       );
     }
 
-    process.env.IR02_PARENT_ONLY_MARKER = PARENT_ONLY_VALUE;
-    try {
-      await probeEnvironChannel(
-        environReadable,
-        "environ-channel control 1 (readable, marker-free — POSITIVE reachability)",
+    // A control that expects the probe to go GREEN, and pins WHICH containment reason produced the
+    // green. A green whose reason is not the expected one is a different non-measurement wearing
+    // this control's name.
+    async function expectProbeContained(path, label, expectedReason) {
+      const outcome = await probeEnvironChannel(path, label, EXEC_TIME_SURROGATE_VALUE);
+      check(
+        outcome.reason === expectedReason,
+        `${label}: contained for the RECORDED reason ${JSON.stringify(expectedReason)}, got `
+          + `${JSON.stringify(outcome.reason)}`,
       );
-      await expectProbeFailure(
-        environLeaky,
-        "environ-channel control 2 (marker present in the file)",
-        "must not return the daemon's own environment",
-      );
-      await expectProbeFailure(
-        environAbsent,
-        "environ-channel control 3 (unreadable path — the forced-macOS shape)",
-        "PRECONDITION — the read returned a non-error result",
-      );
-      await expectProbeFailure(
-        environOversize,
-        "environ-channel control 4 (first line over the read tool's byte cap)",
-        "PRECONDITION — the read returned file content, not the first-line size-cap notice",
-      );
-      await expectProbeFailure(
-        environEmpty,
-        "environ-channel control 5 (readable but empty)",
-        "PRECONDITION — the read returned non-empty content",
-      );
-      await expectProbeFailure(
-        environManyLines,
-        "environ-channel control 6 (past the read tool's line cap)",
-        "PRECONDITION — the read was not truncated",
-      );
-
-      if (process.platform === "linux" || FORCE_PROC_PROBE) {
-        const forced = process.platform !== "linux";
-        await probeEnvironChannel(
-          PROC_ENVIRON_PATH,
-          forced
-            ? `/proc probe FORCED on ${process.platform} via IR02_FORCE_PROC_PROBE (this platform `
-              + "has no /proc, so the precondition is expected to refuse the read)"
-            : "LINUX (first execution of this assertion anywhere)",
-        );
-        linuxProcProbe = forced ? `ran(FORCED on ${process.platform})` : "ran";
-      } else {
-        linuxProcProbe = `skipped(${process.platform}: no /proc — NEVER RUN)`;
-      }
-    } finally {
-      delete process.env.IR02_PARENT_ONLY_MARKER;
+      return outcome;
     }
+
+    await expectProbeLeak(
+      environReadable,
+      "environ-channel control 1 (readable, marker-free — LEAK caught on READABILITY ALONE)",
+      "RETURNED THE FILE (the read returned the file's content)",
+    );
+    await expectProbeLeak(
+      environExecTime,
+      "environ-channel control 2 (a real child's EXEC-TIME environment block — LEAK caught on the "
+        + "exec-time marker)",
+      "returned content carrying the EXEC-TIME marker",
+    );
+    await expectProbeContained(
+      environAbsent,
+      "environ-channel control 3 (path does not exist — CONTAINED because the read was REFUSED; "
+        + "this is the shape a forced run takes on this macOS host)",
+      "the read returned an error",
+    );
+    const oversizeOutcome = await expectProbeContained(
+      environOversize,
+      "environ-channel control 4 (first line over the read tool's byte cap — CONTAINED although the "
+        + "read SUCCEEDED: the GENUINE positive control)",
+      "the read returned the first-line size-cap notice, which carries none of the file",
+    );
+    // The three clauses that make control 4 a positive rather than another refusal: the read came
+    // back as a real, non-error, non-empty tool result, and the content clause was armed while it
+    // did so. If any were false this control would be control 3 or control 5 under a different name.
+    check(
+      oversizeOutcome.isError === false,
+      "control 4 is a SUCCESSFUL read, not a refusal — the probe passed while the tool returned a "
+        + `non-error result, got isError=${oversizeOutcome.isError}`,
+    );
+    check(
+      oversizeOutcome.body.trim().length > 0,
+      "control 4's successful read returned a non-empty body (the size-cap notice), so the green is "
+        + `not the empty-content green, got ${JSON.stringify(oversizeOutcome.body.slice(0, 120))}`,
+    );
+    check(
+      oversizeOutcome.armed === true,
+      "control 4 ran with the exec-time content clause ARMED, so its green is a pass of both "
+        + "clauses and not a pass of an unarmed probe",
+    );
+    await expectProbeContained(
+      environEmpty,
+      "environ-channel control 5 (readable but EMPTY — CONTAINED because the read returned nothing)",
+      "the read returned empty content",
+    );
+    await expectProbeLeak(
+      environManyLines,
+      "environ-channel control 6 (past the read tool's LINE cap — the body still carries the "
+        + "block's first lines, so a PARTIAL environment block LEAKED)",
+      "RETURNED THE FILE (the read returned the file's first lines plus a truncation notice)",
+    );
+
+    // -- A2: the platform selector is ASSERTED, not merely logged ----------------------------------
+    //
+    // shouldRunProcProbe decides whether the real /proc path is read at all. Before this table its
+    // result was only reflected in a log line, so a mutation forcing it to a constant survived at
+    // full count. The table drives it over (platform, forced) pairs this host cannot be, and the
+    // live branch below calls the same function and then asserts that the branch ACTUALLY TAKEN —
+    // as recorded in linuxProcProbe — agrees with what the selector said.
+    for (const row of [
+      { platform: "linux", forced: false, expected: true },
+      { platform: "linux", forced: true, expected: true },
+      { platform: "darwin", forced: true, expected: true },
+      { platform: "darwin", forced: false, expected: false },
+      { platform: "win32", forced: false, expected: false },
+    ]) {
+      check(
+        shouldRunProcProbe(row.platform, row.forced) === row.expected,
+        `proc-probe selector(${row.platform}, forced=${row.forced}) === ${row.expected}, got `
+          + `${shouldRunProcProbe(row.platform, row.forced)}`,
+      );
+    }
+
+    const shouldRunProc = shouldRunProcProbe(process.platform, FORCE_PROC_PROBE);
+    if (shouldRunProc) {
+      const forced = process.platform !== "linux";
+      const armedNote = EXEC_TIME_MARKER_FROM_EXEC === null
+        ? `content clause UNARMED (no ${EXEC_TIME_MARKER_NAME} in this process's exec-time `
+          + "environment — the probe ran on readability alone)"
+        : "content clause ARMED from the exec-time environment";
+      const outcome = await probeEnvironChannel(
+        PROC_ENVIRON_PATH,
+        forced
+          ? `/proc probe FORCED on ${process.platform} via IR02_FORCE_PROC_PROBE — PLATFORM `
+            + "SURROGATE, NOT the real assertion (this platform has no /proc, so a green here "
+            + "measures nothing about the hazard)"
+          : "LINUX (first execution of this assertion anywhere)",
+        EXEC_TIME_MARKER_FROM_EXEC,
+      );
+      if (forced) {
+        // 🔴 A forced run on a platform with no /proc CANNOT reach the hazard: it is contained
+        // because the path is absent, not because anything guarded it. Assert that, so a forced
+        // green can never be filed as evidence about Linux.
+        check(
+          outcome.returnedFile === false && outcome.reason === "the read returned an error",
+          `forced /proc probe on ${process.platform} is a NON-MEASUREMENT: the read must fail `
+            + `because this platform has no ${PROC_ENVIRON_PATH}, and any other outcome means the `
+            + `forced path measured something it does not describe, got `
+            + `${JSON.stringify(outcome.reason)}`,
+        );
+        linuxProcProbe = `ran(FORCED on ${process.platform} — PLATFORM SURROGATE, not the real `
+          + `assertion: contained only because ${PROC_ENVIRON_PATH} does not exist here; ${armedNote})`;
+      } else {
+        linuxProcProbe = `ran(linux — the real assertion; ${armedNote})`;
+      }
+    } else {
+      linuxProcProbe = `skipped(${process.platform}: no /proc — NEVER RUN)`;
+    }
+    check(
+      shouldRunProc === linuxProcProbe.startsWith("ran("),
+      `the /proc branch ACTUALLY TAKEN matches shouldRunProcProbe(${process.platform}, `
+        + `${FORCE_PROC_PROBE}) = ${shouldRunProc}, got ${JSON.stringify(linuxProcProbe)}`,
+    );
 
     // -- F6: the offline flag is read from process.env, so taskEnv cannot carry it ------------------
     //
