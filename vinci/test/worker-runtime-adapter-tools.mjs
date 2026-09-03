@@ -132,6 +132,19 @@ const FORCE_PROC_PROBE = process.env.IR02_FORCE_PROC_PROBE === "1";
 function shouldRunProcProbe(platform, forced) {
   return platform === "linux" || forced === true;
 }
+// The summary line that probe writes into this file's one-line result, as a FUNCTION for the same
+// reason: the linux branch NEVER RUNS on this host, so an inline template could only be checked on
+// Linux, and the table beside the surrogate controls drives both branches here. It carries the
+// CONTAINMENT REASON because without it a green is textually identical whether the read was
+// refused, capped or empty — and on the pass path nothing else prints, so that line is the whole
+// record of the first real execution of this assertion.
+function describeProcProbeRun(forced, platform, armedNote, reason) {
+  return forced
+    ? `ran(FORCED on ${platform} — PLATFORM SURROGATE, not the real assertion: contained only `
+      + `because ${PROC_ENVIRON_PATH} does not exist here; ${armedNote}; contained because `
+      + `${reason})`
+    : `ran(linux — the real assertion; ${armedNote}; contained because ${reason})`;
+}
 // The EXEC-TIME discriminator. A process's environment block (what `/proc/self/environ` exposes) is
 // written from the environment handed to execve; a value assigned to `process.env` afterwards is a
 // RUNTIME value and is not in it. So the marker this probe discriminates on must be present at EXEC
@@ -161,6 +174,19 @@ const EXEC_TIME_SURROGATE_VALUE = "ir02-exec-time-surrogate-4d8f";
 // an environment block is NUL-separated — bytes spliced INSIDE the brackets break the match too,
 // which an end anchor alone would not catch. The notice's exact shape is read.js's
 // `[Line N is <size>, exceeds <cap> limit. Use bash: sed -n 'Np' <path> | head -c <bytes>]`.
+//
+// 🔴 THE RESIDUAL GAP, NAMED HERE SO THE NEXT READER DOES NOT REDISCOVER IT AS A FINDING. Both
+// clauses are now pinned directly (see the pattern-and-window pins below the surrogate controls:
+// the end anchor and the NUL exclusion each get a body the other clause alone would admit). What
+// neither clause catches is a splice INSIDE the brackets that is itself NUL-FREE, NEWLINE-FREE and
+// `]`-free: the character classes cross it happily, so such a body still reads as the bare notice.
+// That is ACCEPTED DELIBERATELY and no speculative third clause should be added for it. It is
+// contrived for the file this probe targets — `/proc/self/environ` IS a NUL-separated block, so a
+// body carrying any of it carries a NUL — and, more to the point, this pattern is NO LONGER THE
+// ONLY CLASSIFIER: probeEnvironChannel now MEASURES, at the entry point, that a body it is about
+// to call contained shares no ENVIRON_SHARED_RUN_CHARS-character run with the target file. A body
+// that evades this pattern by any route, this one included, is caught there as a FACT rather than
+// acquitted by a LABEL.
 const READ_FIRST_LINE_CAP_NOTICE = /^\[Line \d+ is [^\]\n\u0000]*exceeds [^\]\n\u0000]*limit\.[^\]\n\u0000]*\]$/;
 const READ_TRUNCATION_NOTICE = /\[Showing lines \d+-\d+ of \d+/;
 let linuxProcProbe = "not reached";
@@ -181,9 +207,24 @@ const ENVIRON_REPORT_MAX_NAMES = 40;
  * So a failure reports LENGTH, a DIGEST, and a REDACTED SHAPE: how many NUL-separated entries the
  * body held, and the variable NAMES with the BYTE LENGTH of each value in place of the value. An
  * entry is named only when its name is genuinely variable-shaped ([A-Za-z0-9_.-], at most 64
- * characters); anything else is counted and not printed, so nothing can smuggle a value out
- * through the name field. The digest lets two runs be compared, and a maintainer be told "this is
- * the same body as before", without either run publishing it.
+ * characters); anything else is counted and not printed. The digest lets two runs be compared, and
+ * a maintainer be told "this is the same body as before", without either run publishing it.
+ *
+ * 🔴 WHAT THE NAME FIELD ACTUALLY BOUNDS — an earlier version of this sentence said "nothing can
+ * smuggle a value out through the name field", which overstates it. AT MOST 64 BYTES OF
+ * NAME-SHAPED TEXT can print: the guard is a shape and a length, not an impossibility. The reach
+ * is narrow but real — [A-Za-z0-9_.-] contains the whole base64url alphabet, so a token of 64
+ * characters or fewer would satisfy it — and it exists only on a body that is NOT NUL-separated,
+ * where `entries` is the whole body and the text before its first "=" is the body's own opening
+ * bytes rather than a variable name. On the body this probe actually targets that case does not
+ * arise: /proc/self/environ is NUL-separated, so the text before each "=" IS a variable name.
+ *
+ * 64 is kept on purpose rather than tightened. It is the shape of the real names a maintainer needs
+ * from a red run (AWS_SECRET_ACCESS_KEY, NPM_CONFIG_USERCONFIG), and any lower bound starts eliding
+ * legitimate names from the only report that says WHAT leaked — trading a certain loss of
+ * diagnosis against a contrived gain, on the anomalous branch, while the length and the digest
+ * still identify the body without any name at all. The bound is stated so a future reader can
+ * revisit that trade with the real number in front of them instead of the word "nothing".
  */
 function describeEnvironBody(body) {
   const bytes = Buffer.byteLength(body, "utf8");
@@ -1159,7 +1200,51 @@ try {
           + `file IS the process's environment block, so returning any of it re-admits exactly the `
           + `daemon configuration the environment hook exists to exclude, got ${seen}`,
       );
-      return { ...outcome, armed, isError: result.isError === true, body: result.body };
+      // 🔴 THE FACT CHECK, AT THE ENTRY POINT — and it was NOT here when this file first claimed
+      // it. The measurement below existed only in control 4's block, which is a SURROGATE. The
+      // clause above is the one the real Linux call site goes through, and it classified on the
+      // regex alone: an evasion that satisfied the pattern was acquitted by the probe and caught,
+      // if at all, by an assertion the Linux path never executes. Review proved the separation from
+      // the stack frames — with the prefix defect restored and a notice-prefixed body, the failure
+      // surfaced at TOP LEVEL, meaning this function had already returned "contained".
+      //
+      // So the fact is measured HERE, on every caller, real path included: a body this probe is
+      // about to call contained must share no ENVIRON_SHARED_RUN_CHARS-character run with the file
+      // it read. The classifier's verdict and the file's bytes are two independent things, and the
+      // one that decides is the bytes. `sharedRunMeasured` is returned rather than assumed, because
+      // a measurement that silently skipped (unreadable path, file shorter than the window) is
+      // indistinguishable from one that ran and found nothing — callers that depend on this having
+      // happened assert it.
+      let sharedRunMeasured = false;
+      let sharedRun = -1;
+      if (!outcome.returnedFile) {
+        let targetBody = null;
+        try {
+          targetBody = readFileSync(path, "utf8");
+        } catch {
+          targetBody = null; // refused/absent: control 3 and the forced /proc run land here.
+        }
+        if (targetBody !== null && targetBody.length >= ENVIRON_SHARED_RUN_CHARS) {
+          sharedRunMeasured = true;
+          sharedRun = sharedRunOffset(result.body, targetBody);
+          check(
+            sharedRun === -1,
+            `${label}: LEAK — the classifier called this read CONTAINED (${outcome.reason}), but `
+              + `the body it returned shares a run of ${ENVIRON_SHARED_RUN_CHARS} characters with `
+              + `${path}, starting at body offset ${sharedRun}. Containment is what the classifier `
+              + `SAID; this is what the bytes DO, and the bytes decide: some of that file came back `
+              + `however the read result was labelled, got ${seen}`,
+          );
+        }
+      }
+      return {
+        ...outcome,
+        armed,
+        isError: result.isError === true,
+        body: result.body,
+        sharedRunMeasured,
+        sharedRunAt: sharedRun,
+      };
     }
 
     // -- A1: the in-branch controls that make the probe above mean something -----------------------
@@ -1388,6 +1473,20 @@ try {
     // claim its reason string makes: no run of ENVIRON_SHARED_RUN_CHARS characters is common to the
     // body and the target file. This is the assertion that would have caught the evasion with the
     // regex still broken, and it is why the reason and the fact are now two independent things.
+    //
+    // 🔴 THE MEASUREMENT NOW RUNS INSIDE probeEnvironChannel TOO, and control 4's copy is kept
+    // rather than relocated: this block reads the file itself, so it is a check of the probe's
+    // arithmetic by an independent route, and it carries the positive control the probe cannot
+    // carry (a body that DOES share a run — the probe would throw on one). What the probe cannot
+    // report about itself is whether it measured at all, so that is asserted here: a skipped
+    // measurement (unreadable path, file shorter than the window) returns the same -1 as one that
+    // ran and found nothing, and control 4 is the surrogate whose whole job is a SUCCESSFUL read.
+    check(
+      oversizeOutcome.sharedRunMeasured === true,
+      "control 4's read was measured against the target file INSIDE probeEnvironChannel — the "
+        + "entry point the Linux assertion goes through — and not only by this block; a false here "
+        + `means the moved fact check silently skipped, got ${JSON.stringify(oversizeOutcome.sharedRunMeasured)}`,
+    );
     const oversizeFileBody = readFileSync(environOversize, "utf8");
     const oversizeSharedRun = sharedRunOffset(oversizeOutcome.body, oversizeFileBody);
     check(
@@ -1438,11 +1537,141 @@ try {
         + "three-refusals and two-refusals versions of this count were both wrong",
     );
     passed += 1;
+    // 🔴 A RESTATEMENT, NOT INDEPENDENT COVERAGE, and labelled as one. This check cannot be the
+    // discriminating assertion for anything: any change making an errored read classify as a leak
+    // kills control 3 first (expectProbeContained runs the probe, the probe's own leak clause
+    // throws, and execution never reaches this line). It is kept because the deepEqual above needs
+    // its premise stated where the premise is used — "one refusal" is a claim about all six
+    // controls only if an errored read is always contained — but it is documentation of the
+    // argument, not a guard. c81c2080's message counted it as one of six added checks; the honest
+    // count of NEW COVERAGE there was five.
     check(
       classifyEnvironRead({ isError: true, body: "anything at all" }).returnedFile === false,
-      "an errored read is ALWAYS classified contained, which is what makes the refusal population a "
-        + "statement about all six controls and not only about the three green ones",
+      "RESTATEMENT (masked by control 3, which fails first on any mutation this would catch): an "
+        + "errored read is ALWAYS classified contained, which is what makes the refusal population "
+        + "a statement about all six controls and not only about the three green ones",
     );
+
+    // -- A1b: the pattern's clauses and the measurement's WINDOW, pinned ----------------------------
+    //
+    // 🔴 WHY THESE ARE HERE AND NOT EARLIER. Each is a direct call on the pure function, with a body
+    // built to isolate ONE clause, because none of the six surrogates above exercises these axes:
+    // the cap notice they produce is the bare notice, which every variant of this pattern accepts.
+    // They sit AFTER the controls deliberately — a pattern defect that a surrogate can reach should
+    // be reported by the surrogate (and, since the fact check moved into probeEnvironChannel, from
+    // inside the probe), not pre-empted by a unit pin further up the file.
+    //
+    // The NUL exclusion was added on reasoning and nothing held it there: deleting NUL from the
+    // three character classes passed at full count. The end anchor is the clause the review's
+    // evasion defeated. Each gets a body that the OTHER clause alone would admit, so neither pin
+    // can be satisfied by the clause it is not about.
+    const CAP_NOTICE_HEAD = "[Line 1 is 65536 bytes, exceeds 51200 byte limit. Use bash: sed -n '1p'";
+    const cleanCapNotice = `${CAP_NOTICE_HEAD} /tmp/x | head -c 51200]`;
+    const SPLICED_BLOCK = `${NUL}PATH=/usr/bin${NUL}HOME=/tmp${NUL}`;
+    // POSITIVE CONTROL FIRST, and it names WHAT STILL SUCCEEDS: the legitimate input — the exact
+    // notice read.js emits — is still classified contained. A pattern that had stopped matching
+    // anything would pass both negative pins below, so this is what stops them being vacuous.
+    check(
+      classifyEnvironRead({ isError: false, body: cleanCapNotice }).returnedFile === false,
+      "the real first-line size-cap notice is STILL accepted as containment — the clause pins below "
+        + `must not be satisfiable by a pattern that matches nothing, got ${JSON.stringify(
+          classifyEnvironRead({ isError: false, body: cleanCapNotice }).reason,
+        )}`,
+    );
+    // THE NUL EXCLUSION. A splice INSIDE the brackets, NUL-separated the way an environment block
+    // is. An end-anchor-only pattern ACCEPTS this body (it does end in `]`), so the NUL exclusion is
+    // the only clause that can refuse it — which is what makes that clause load-bearing rather than
+    // decorative, and what was completely unpinned until now.
+    const nulSplicedNotice = `${CAP_NOTICE_HEAD}${SPLICED_BLOCK} | head -c 51200]`;
+    check(
+      classifyEnvironRead({ isError: false, body: nulSplicedNotice }).returnedFile === true,
+      "a body carrying a NUL-separated environment block SPLICED INSIDE the notice's brackets is a "
+        + "LEAK, not the notice — the clause an end anchor alone would miss; without this pin, "
+        + `deleting NUL from the character classes passes at full count, got ${JSON.stringify(
+          classifyEnvironRead({ isError: false, body: nulSplicedNotice }).reason,
+        )}`,
+    );
+    // THE END ANCHOR, the clause the review's evasion defeated: the notice, then the block. A
+    // NUL-excluding pattern anchored only at the START accepts this; only the end anchor refuses it.
+    const appendedNotice = `${cleanCapNotice}${SPLICED_BLOCK}`;
+    check(
+      classifyEnvironRead({ isError: false, body: appendedNotice }).returnedFile === true,
+      "a body that BEGINS with the notice and then carries the environment block is a LEAK — the "
+        + "shape review executed against the real read tool while the suite stayed green at full "
+        + `count, got ${JSON.stringify(classifyEnvironRead({ isError: false, body: appendedNotice }).reason)}`,
+    );
+    // THE WINDOW ITSELF, AT ITS BOUNDARY. ENVIRON_SHARED_RUN_CHARS was a single-valued axis: every
+    // caller ran it at 24 and nothing said what 24 MEANS, so an off-by-one would silently widen the
+    // measurement (the main guard firing on coincidence) or narrow it (a leak one character under
+    // the window walking through).
+    //
+    // 🔴 THE FIXTURES ARE LITERAL, NOT DERIVED FROM THE CONSTANT. A body built as
+    // `slice(0, ENVIRON_SHARED_RUN_CHARS - 1)` moves WITH the constant, so an off-by-one changes the
+    // threshold and the fixture together and the test cannot see it — it would pass the very defect
+    // it exists to catch. These two runs are 23 and 24 characters AS WRITTEN. If the window is ever
+    // changed deliberately, exactly one of these goes red and must be rewritten by hand; that is the
+    // intended cost of pinning a boundary.
+    const runSource = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const RUN_BELOW_WINDOW = "ABCDEFGHIJKLMNOPQRSTUVW"; // 23 characters, written out
+    const RUN_AT_WINDOW = "ABCDEFGHIJKLMNOPQRSTUVWX"; // 24 characters, written out
+    check(
+      sharedRunOffset(`<<${RUN_BELOW_WINDOW}>>`, runSource) === -1,
+      "a body sharing 23 characters with the source — one BELOW the window — does not trip the "
+        + `measurement; if ENVIRON_SHARED_RUN_CHARS (${ENVIRON_SHARED_RUN_CHARS}) was lowered on `
+        + "purpose, rewrite this literal fixture, got "
+        + `${sharedRunOffset(`<<${RUN_BELOW_WINDOW}>>`, runSource)}`,
+    );
+    check(
+      sharedRunOffset(`<<${RUN_AT_WINDOW}>>`, runSource) === 2,
+      "a body sharing 24 characters — EXACTLY the window — does trip it, at the offset where the "
+        + `run starts; if ENVIRON_SHARED_RUN_CHARS (${ENVIRON_SHARED_RUN_CHARS}) was raised on `
+        + "purpose, rewrite this literal fixture, got "
+        + `${sharedRunOffset(`<<${RUN_AT_WINDOW}>>`, runSource)}`,
+    );
+
+    // THE REDACTOR'S NAME SHAPE, the other clause that was single-valued: every surrogate body above
+    // is a well-formed NUL-separated block, so the name filter never DECIDES anything in them and
+    // widening it to accept any 64 characters passed at full count. It is a DISCLOSURE guard — the
+    // one that decides which bytes of a red run reach a CI log — so it is pinned on the two axes the
+    // comment on describeEnvironBody now claims: SHAPE and LENGTH.
+    const unshapedBody = "the read failed: no such file=/etc/shadow-contents";
+    const unshapedReport = describeEnvironBody(unshapedBody);
+    check(
+      unshapedReport.includes("named=0 unnamed=1") && !unshapedReport.includes("the read failed"),
+      "text before the first \"=\" that is NOT variable-shaped is COUNTED, never printed — in a body "
+        + "that is not NUL-separated that text is the body's own opening bytes, and printing it "
+        + `would smuggle the payload out through the name field, got ${unshapedReport}`,
+    );
+    const overlongName = "A".repeat(65);
+    const overlongReport = describeEnvironBody(`${overlongName}=value`);
+    check(
+      overlongReport.includes("named=0 unnamed=1") && !overlongReport.includes(overlongName),
+      "and the bound is 64: a name-shaped run of 65 characters is counted, not printed. This is the "
+        + "number describeEnvironBody's comment states as what the name field bounds — AT MOST 64 "
+        + `BYTES of name-shaped text — so the number and the code cannot drift apart, got ${overlongReport}`,
+    );
+
+    // -- A1c: the /proc summary LINE, over both branches --------------------------------------------
+    //
+    // 🔴 F-F: on the pass path a green contained by REFUSAL was textually identical to a green
+    // contained by the byte cap or by emptiness — the summary dropped `outcome.reason`, and with the
+    // redaction the error text is gone too, so the first Linux run would have printed a line that
+    // could not distinguish "the sandbox denied /proc/self/environ" from "the read was capped". That
+    // is the exact confusion the rest of this block exists to prevent, on the one path where nothing
+    // else prints. describeProcProbeRun now carries the reason, and it is a FUNCTION for the same
+    // reason shouldRunProcProbe is one: the linux branch NEVER RUNS on this host, so an inline
+    // string could only be pinned on Linux. This table drives both branches here.
+    for (const row of [
+      { forced: false, reason: "the read returned an error" },
+      { forced: true, reason: "the read returned empty content" },
+    ]) {
+      const line = describeProcProbeRun(row.forced, "linux", "content clause ARMED", row.reason);
+      check(
+        line.startsWith("ran(") && line.includes(row.reason),
+        `the /proc summary for forced=${row.forced} names the CONTAINMENT REASON, so a green by `
+          + `refusal cannot read as a green by the byte cap, got ${JSON.stringify(line)}`,
+      );
+    }
 
     // -- A2: the platform selector is ASSERTED, not merely logged ----------------------------------
     //
@@ -1492,10 +1721,9 @@ try {
             + `forced path measured something it does not describe, got `
             + `${JSON.stringify(outcome.reason)}`,
         );
-        linuxProcProbe = `ran(FORCED on ${process.platform} — PLATFORM SURROGATE, not the real `
-          + `assertion: contained only because ${PROC_ENVIRON_PATH} does not exist here; ${armedNote})`;
+        linuxProcProbe = describeProcProbeRun(true, process.platform, armedNote, outcome.reason);
       } else {
-        linuxProcProbe = `ran(linux — the real assertion; ${armedNote})`;
+        linuxProcProbe = describeProcProbeRun(false, process.platform, armedNote, outcome.reason);
       }
     } else {
       linuxProcProbe = `skipped(${process.platform}: no /proc — NEVER RUN)`;
