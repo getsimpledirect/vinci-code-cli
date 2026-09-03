@@ -76,14 +76,25 @@
 //       forced run off Linux asserts itself a NON-MEASUREMENT rather than reporting a pass. A RED
 //       there IS the daemon's environment, so a failure reports the body's LENGTH, a DIGEST and the
 //       variable NAMES with each value's byte length — never the bytes — and that redaction is
-//       itself checked end to end on a canary value planted in control 1's block. Two further
-//       invocations of the same probe sit beside those six, neither of them a surrogate for the
+//       itself checked end to end on a canary value planted in control 1's block. FURTHER
+//       invocations of the same probe sit beside those six, and none of them is a surrogate for the
 //       hazard: one with an explicit null marker, which is the shape the first Linux run takes when
 //       the runner supplies none, one called wrongly on purpose to pin the argument's type guard,
-//       and one on the EVASION fixture — a body the classifier acquits while it IS the file, which
+//       one on the EVASION fixture — a body the classifier acquits while it IS the file, which
 //       is the only invocation whose measured offset is not -1 and therefore the only place the
-//       probe's measured-offset PROPAGATION can be pinned at all, paired with a capped-read
-//       reachability control through the same entry point. The redactor's own disclosure bound is the PRODUCT of its two factors — at most 40
+//       probe's measured-offset PROPAGATION can be pinned at all — and a capped-read
+//       reachability control through the same entry point.
+//
+//       🔴 NO NUMBER IS STATED HERE, FOR THE REASON THE CONTROL TALLY ABOVE IS GONE. This sentence
+//       used to open "TWO further invocations ... NEITHER of them" while FOUR existed; the numeral
+//       and the dual pronoun were true at e39a9fa8 and were invalidated by the very commit that
+//       extended the list by hand — eleven lines below a paragraph claiming to have repaired
+//       exactly this failure mode. Hand-updating the number is what failed the first two times, so
+//       the third attempt does not update it: the count is DERIVED AND ASSERTED at the end of the
+//       /proc block, where every entry into the probe is ledgered by label and the ledger is
+//       compared against the population this paragraph describes. Adding an invocation without
+//       listing it there is the commit that turns this file red.
+//       The redactor's own disclosure bound is the PRODUCT of its two factors — at most 40
 //       names of at most 64 characters. Stated as a bound on POSITION rather than on harm: NO bytes
 //       in VALUE position, and up to 2560 bytes in NAME position, INCLUDING a token that happens to
 //       be name-shaped (base64url is a subset of [A-Za-z0-9_.-], so a 63-byte JWT-shaped token
@@ -1130,6 +1141,22 @@ try {
   let measuredLeaking = [];
   try {
     process.env.PI_OFFLINE = "1";
+    // 🔴 THIS DELETION IS LOAD-BEARING FOR SOMETHING IT WAS NOT WRITTEN FOR, AND THE DEPENDENCY IS
+    // WRITTEN DOWN HERE RATHER THAN LEFT INCIDENTAL. It exists so the tool-bootstrap probe below
+    // sees a plain environment. But VINCI_CODE=1 also enables the result budget in
+    // core/tools/vinci-result-budget.ts — 24KB, gated on `VINCI_CODE === "1" &&
+    // VINCI_NO_RESULT_BUDGET !== "1"`, falling back to upstream's 2000 lines / 50KB otherwise — and
+    // the /proc block's control 4 is built on upstream's 50KB FIRST-LINE cap: its body must be
+    // EXACTLY the notice `expectedFirstLineCapNotice` recomputes for a 50KB cap.
+    //
+    // MEASURED, not reasoned: with this line removed and VINCI_CODE=1 in the environment, the
+    // FOURTH SITE fails — the body still comes back 196 bytes long, but it is a different
+    // 196-byte notice, so byte-equality against the 50KB expectation rejects it. That is the first
+    // failure reached; whether the block's other cap-notice-dependent assertions would also fail is
+    // NOT measured, because the run stops there. What is established is the direction: this file
+    // passes under VINCI_CODE=1 because of this line, and a maintainer who moves it, narrows it to
+    // the bootstrap probe, or deletes it takes the /proc block's byte-equality site down with it —
+    // a site that does not mention VINCI_CODE anywhere.
     delete process.env.VINCI_CODE;
     delete process.env.VINCI_TOOL_BOOTSTRAP;
     delete process.env.RIPGREP_CONFIG_PATH;
@@ -1319,7 +1346,15 @@ try {
     // exec-time value is available to discriminate on, in which case the probe runs on readability
     // alone and the caller reports the content clause UNARMED. It is not optional, because an
     // omitted argument would arrive as `undefined` and silently search the body for "undefined".
+    // 🔴 THE INVOCATION LEDGER. The header used to state the number of invocations that sit beside
+    // the six surrogates in PROSE, and the commit that added two more updated the list and not the
+    // numeral. The number is gone from the prose; this is what replaced it. Every ENTRY into the
+    // probe is recorded here by label — recorded FIRST, before the type guard, so a call that is
+    // refused still counts as an invocation — and the ledger is asserted against the population the
+    // header describes once the /proc branch has had its turn.
+    const environProbeInvocations = [];
     async function probeEnvironChannel(path, label, execTimeMarker) {
+      environProbeInvocations.push(label);
       assert.ok(
         typeof execTimeMarker === "string" || execTimeMarker === null,
         `${label}: the probe was called with an explicit exec-time marker or an explicit null, got `
@@ -1402,6 +1437,22 @@ try {
       // load-bearing for the guard itself — fold it and this check stops firing, which the evasion
       // control in A1a catches.
       const measurement = { sharedRunMeasured: false, sharedRunAt: -1 };
+      // 🔴 ONE CONSTRUCTION SITE FOR WHAT THE CALLER READS, AND IT IS REACHED ON THE FAILING PATH
+      // TOO. The comment on the third site below says the propagation is pinned in A1a. It was not:
+      // the pin covered `measurement.sharedRunAt`, the field this probe's own fact check reads,
+      // while the RETURNED object was a separate expression — appending `sharedRunAt: -1` after the
+      // spread survived at 211 green, because every invocation that RETURNS measures -1 and the one
+      // invocation that measures a real number THROWS before reaching the return. So the object is
+      // built by one function used at both exits, and the throwing exit carries it out on the
+      // error. That gives A1a's evasion control a caller-visible number that is not -1, which is
+      // the only condition under which this site can be pinned at all.
+      const outcomeOf = () => ({
+        ...outcome,
+        armed,
+        isError: result.isError === true,
+        body: result.body,
+        ...measurement,
+      });
       if (!outcome.returnedFile) {
         let targetBody = null;
         try {
@@ -1412,23 +1463,24 @@ try {
         if (targetBody !== null && targetBody.length >= ENVIRON_SHARED_RUN_CHARS) {
           measurement.sharedRunMeasured = true;
           measurement.sharedRunAt = sharedRunOffset(result.body, targetBody);
-          check(
-            measurement.sharedRunAt === -1,
-            `${label}: LEAK — the classifier called this read CONTAINED (${outcome.reason}), but `
-              + `the body it returned shares a run of ${ENVIRON_SHARED_RUN_CHARS} characters with `
-              + `${path}, starting at body offset ${measurement.sharedRunAt}. Containment is what `
-              + `the classifier SAID; this is what the bytes DO, and the bytes decide: some of that `
-              + `file came back however the read result was labelled, got ${seen}`,
-          );
+          try {
+            check(
+              measurement.sharedRunAt === -1,
+              `${label}: LEAK — the classifier called this read CONTAINED (${outcome.reason}), but `
+                + `the body it returned shares a run of ${ENVIRON_SHARED_RUN_CHARS} characters with `
+                + `${path}, starting at body offset ${measurement.sharedRunAt}. Containment is what `
+                + `the classifier SAID; this is what the bytes DO, and the bytes decide: some of that `
+                + `file came back however the read result was labelled, got ${seen}`,
+            );
+          } catch (error) {
+            // The caller-visible outcome, built by the SAME expression the return below uses, so a
+            // change to that expression is observable on the one path where the number is not -1.
+            if (error !== null && typeof error === "object") error.probeOutcome = outcomeOf();
+            throw error;
+          }
         }
       }
-      return {
-        ...outcome,
-        armed,
-        isError: result.isError === true,
-        body: result.body,
-        ...measurement,
-      };
+      return outcomeOf();
     }
 
     // -- A1: the in-branch controls that make the probe above mean something -----------------------
@@ -1673,35 +1725,70 @@ try {
     // stops catching. Executed against the `inside-brackets` defect — control 4's fixture replaced
     // by a body that is NUL-free, newline-free and "]"-free INSIDE the notice's brackets, so the
     // pattern still matches it end to end while the body IS the file. The same evasion now also
-    // exists as a PERMANENT fixture in A1a rather than only as a mutation, which is why the ladder
-    // runs three rows longer than it used to:
+    // exists as a PERMANENT fixture in A1a rather than only as a mutation, which is why so much of
+    // the ladder below is spent there:
     //
     //   inside-brackets alone                     DIES at probeEnvironChannel (the moved check)
     //   + moved-check-neutered                    DIES at top level (this block's copy)
     //   + control4-check-neutered                 DIES at the third site below
     //   + third-site-neutered                     DIES at the fourth site below (byte-equality)
     //   + fourth-site-neutered                    DIES at the A1a EVASION control
-    //   + evasion-control-neutered                DIES at the evasion control's offset assertion
-    //   + evasion-offset-neutered                 DIES at the evasion reachability control
-    //   + evasion-reachability-neutered           212/212 GREEN, the leak undetected
+    //   + evasion-control-neutered                DIES at A1a's carried-out-outcome check
+    //   + outcome-check-neutered (and its         DIES at the evasion control's offset assertion
+    //     operand re-tautologised, which is
+    //     what it takes to get past it without
+    //     a TypeError — one row, two edits)
+    //   + evasion-offset-neutered                 DIES at A1a's CALLER-VISIBLE field check
+    //   + caller-field-neutered                   DIES at the evasion reachability control
+    //   + evasion-reachability-neutered           219/219 GREEN, the leak undetected
     //
-    // 🔴 THE MINIMUM-TO-HIDE IS SEVEN, RE-MEASURED ON THIS HEAD AND NOT INHERITED. It was FOUR at
-    // e39a9fa8 (the ladder printed here before carried an older head's 178-check count and stopped
-    // three rows early, at a row that is no longer where it ends). Four of the seven are aimed at
-    // control 4; the other three are the A1a evasion block, which this leak reaches for two
+    // 🔴 THIS LADDER REQUIRES NINE NEUTERINGS ON THIS HEAD (ten rows: the defect and nine
+    // neuterings of the assertions that answer it, in the order they answer). THAT IS A PROPERTY OF
+    // THIS LADDER AND OF NOTHING ELSE, and the previous version of this line said otherwise:
+    // "THE MINIMUM-TO-HIDE IS SEVEN". A minimum is a claim over EVERY mutation set that hides this
+    // defect, and no enumeration establishes one — it is the same unprovable universal this file
+    // refuses a few lines down under "equivalent mutant", asserted here because the ladder
+    // underneath it had been re-measured and that felt like evidence for the stronger sentence. The
+    // ladder
+    // WAS re-measured; the word "minimum" was not measured at all, and it was false. Review
+    // exhibited a set of FIVE that hid the identical defect at exit 0 and 212 checks on f95bb8ed —
+    // `inside-brackets`, `if (body === source) return -1` inside sharedRunOffset, the fourth site,
+    // the evasion block's expected-offset assertion, and the two evasion-message assertions —
+    // reproduced verbatim there, and it does NOT hide it here: on this head it dies at A1a's
+    // carried-out-outcome check.
+    //
+    // NO CLAIM IS MADE HERE ABOUT OTHER MUTATION SETS, and no count in this comment should ever be
+    // read as one. Cheaper sets than this ladder existed at the last head and may exist at this
+    // one; nothing here has enumerated them. The honest statement is the one this row count makes:
+    // walking THIS path costs nine neuterings on this head, seven at f95bb8ed and four at
+    // e39a9fa8 (the ladder printed at e39a9fa8 carried an older head's 178-check count and stopped
+    // three rows early, at a row that is no longer where it ends). Four of the nine are aimed at
+    // control 4; the other five are the A1a evasion block, which this leak reaches for two
     // different reasons — neutering the moved check switches off the guard the evasion control
     // asserts fires, and the reachability control reads the same fixture this mutation replaces.
     // Blinding sharedRunOffset itself is CHEAPER in mutations but does not work: it takes out the
-    // first three sites at once and then dies at the windowed positive control below, which is
-    // what that control is for.
+    // first three sites at once and then dies at the windowed positive control below (measured on
+    // this head: `return -1` at the top of sharedRunOffset fails the spliced-body control that
+    // asserts the measurement FIRES when the file's bytes really are there), which is what that
+    // control is for. Blinding it the other way, `return 0`, dies inside probeEnvironChannel on
+    // control 4 instead.
     //
     // `sharedRunAt` is a THIRD SITE on the same measurement and is honest about being one — it
     // reads the number the probe computed. It is NOT "masked only by a mutation of sharedRunOffset
     // itself": constant-folding the propagation (`sharedRunAt: sharedRun` -> `sharedRunAt: -1`)
     // masked it too, and survived at full count, so a refactor that stopped propagating the
     // computed offset would have turned this site into an assertion about a constant and silently
-    // made "four sites" three. The propagation is pinned in A1a, where the measured offset is not
-    // -1; see the third site below for why it cannot be pinned on the green path.
+    // made "four sites" three.
+    //
+    // 🔴 AND THE SENTENCE THAT USED TO END THIS PARAGRAPH NAMED A PIN THAT DID NOT COVER THE SITE
+    // IT NAMED. It said "the propagation is pinned in A1a, where the measured offset is not -1",
+    // describing the RETURN-SITE expression — and A1a pinned the INTERNAL field instead. Appending
+    // `sharedRunAt: -1` after the spread in that return survived at 211 green, because the one
+    // invocation whose measurement is not -1 THROWS and never reaches the return. Both sites are
+    // pinned in A1a now: the internal field by the evasion control's "shares a run of" assertion,
+    // and the caller-visible field by the same control reading the outcome the probe carries out on
+    // the thrown error, which is built by the same expression the return uses. See the third site
+    // below for why neither can be pinned on the green path.
     check(
       oversizeOutcome.sharedRunMeasured === true,
       "control 4's read was measured against the target file INSIDE probeEnvironChannel — the "
@@ -1904,13 +1991,8 @@ try {
       "the evasion fixture SATISFIES the cap-notice pattern end to end — it is the body the "
         + `classifier would acquit, ${evasionBody.length} characters of it`,
     );
-    const evasionExpectedOffset = sharedRunOffset(evasionBody, evasionBody);
-    check(
-      evasionExpectedOffset === 0,
-      "and a fresh sharedRunOffset over that body and that file answers 0, not -1 — the one "
-        + `non-negative answer this file can produce, got ${evasionExpectedOffset}`,
-    );
     let evasionMessage = null;
+    let evasionOutcome = null;
     try {
       await probeEnvironChannel(
         environEvasion,
@@ -1919,6 +2001,9 @@ try {
       );
     } catch (error) {
       evasionMessage = error instanceof Error ? error.message : String(error);
+      evasionOutcome = error !== null && typeof error === "object" && error.probeOutcome !== undefined
+        ? error.probeOutcome
+        : null;
     }
     check(
       evasionMessage !== null && evasionMessage.includes("shares a run of"),
@@ -1926,12 +2011,62 @@ try {
         + "is the assertion the fact-check-at-the-entry-point exists to make, and it is the one "
         + `that constant-folding the propagation switches off, got ${JSON.stringify(String(evasionMessage).slice(0, 200))}`,
     );
+    // 🔴 THE EXPECTED OFFSET, WITH A REAL NEEDLE AND A REAL HAYSTACK — AND IT IS THE TAUTOLOGY THE
+    // FOURTH SITE WAS BLOCKED FOR, REINTRODUCED IN THE BLOCK ADDED TO REMOVE ONE. What stood here
+    // was `sharedRunOffset(evasionBody, evasionBody)`: needle and haystack the SAME expression,
+    // 0 for every input at least the window long, by construction and not by measurement. A literal
+    // `0` in its place left the suite green at 211, which is the same property the removed fourth
+    // site had.
+    //
+    // The needle is now the body the granted `read` ACTUALLY returned, carried out of the probe on
+    // its failure, and the haystack is the fixture's own bytes read from disk: two strings obtained
+    // by different routes. That alone does not make the number a measurement — for a whole-file
+    // return the answer is 0 whatever the search does, because the body's first window is the
+    // file's first window — so the number is DERIVED from a search whose answer is NOT forced: the
+    // same body behind a 7-character prefix that does not occur in the file. A constant in place of
+    // that call answers 0 where 7 is required and dies here.
+    check(
+      evasionOutcome !== null && typeof evasionOutcome.body === "string",
+      "the probe carried the outcome the CALLER would have read out on the thrown error — without "
+        + "it the measured number has no reader on the one path where it is not -1, got "
+        + `${JSON.stringify(evasionOutcome)}`,
+    );
+    const EVASION_PREFIX = "QQQQQQQ"; // 7 characters, written out, and absent from the fixture
+    check(
+      EVASION_PREFIX.length === 7 && !evasionBody.includes("Q"),
+      "the prefix below is 7 characters AS WRITTEN and shares no character with the fixture, so "
+        + "every window overlapping it is absent from the file and the first shared run can only "
+        + `start where the body starts, got ${EVASION_PREFIX.length}`,
+    );
+    const evasionPrefixedOffset = sharedRunOffset(`${EVASION_PREFIX}${evasionOutcome.body}`, evasionBody);
+    check(
+      evasionPrefixedOffset === 7,
+      "a REAL search over the read's own body against the fixture's own bytes: behind a 7-character "
+        + "prefix the file does not contain, the first shared run starts at 7 — a number no "
+        + `constant in this block is, which is what makes the offset below measured, got ${evasionPrefixedOffset}`,
+    );
+    const evasionExpectedOffset = evasionPrefixedOffset - EVASION_PREFIX.length;
     check(
       evasionMessage !== null
         && evasionMessage.includes(`starting at body offset ${evasionExpectedOffset}`),
-      "...and the offset it reports is the one a FRESH sharedRunOffset computes, so the number the "
-        + "probe carries is the number it measured — the propagation is pinned here, where the "
-        + `answer is not the constant every green path returns, got offset ${evasionExpectedOffset}`,
+      "...and the offset the probe REPORTS is the one that search implies, so the number the probe "
+        + "carries is the number it measured — pinned here, where the answer is not the constant "
+        + `every green path returns, got offset ${evasionExpectedOffset}`,
+    );
+    // 🔴 AND THE CALLER-VISIBLE FIELD, WHICH IS A DIFFERENT SITE FROM THE ONE ABOVE AND WAS PINNED
+    // NOWHERE. The message is written from `measurement.sharedRunAt` inside the probe; what a
+    // caller reads is the field on the returned object. Every invocation that RETURNS measures -1,
+    // so on the green path the two are indistinguishable and appending `sharedRunAt: -1` after the
+    // spread survived at 211 green. This invocation is the only one whose number is not -1, and the
+    // probe now carries its outcome out on the error, so the field a caller reads is observed here
+    // against the number the search implies.
+    check(
+      evasionOutcome !== null && evasionOutcome.sharedRunMeasured === true
+        && evasionOutcome.sharedRunAt === evasionExpectedOffset,
+      "the field a CALLER reads carries the measured number, not the -1 every green return carries "
+        + "— the return-site propagation, pinned at the one invocation where the two can differ, "
+        + `got measured=${evasionOutcome?.sharedRunMeasured} at=${evasionOutcome?.sharedRunAt} `
+        + `against ${evasionExpectedOffset}`,
     );
     // POSITIVE REACHABILITY control, through the SAME entry point and the same clauses, naming what
     // still succeeds: a genuine capped read of control 4's oversize target — the legitimate shape
@@ -2050,6 +2185,43 @@ try {
         + `run starts; if ENVIRON_SHARED_RUN_CHARS (${ENVIRON_SHARED_RUN_CHARS}) was raised on `
         + "purpose, rewrite this literal fixture, got "
         + `${sharedRunOffset(`<<${RUN_AT_WINDOW}>>`, runSource)}`,
+    );
+
+    // 🔴 THE IDENTITY CASE — THE SHAPE OF THE WORST LEAK THIS FILE EXISTS TO CATCH, AND NOTHING WAS
+    // AIMED AT IT. When a read returns the file WHOLE, the body and the source are the same bytes;
+    // that is the maximal leak, and it is the shape every whole-file surrogate in this block
+    // produces. A mutant that lies exactly there — `if (body === source) return -1` at the top of
+    // sharedRunOffset — reports the maximal leak as containment while every partial leak still
+    // measures correctly, so it is invisible to any fixture that splices bytes onto a notice.
+    //
+    // 🔴 STATED AS THE CLAIM IT IS, AND THE CLAIM WAS NOT WHAT REVIEW SAID IT WAS. Review put it as
+    // "a sharedRunOffset that returns -1 whenever needle and haystack are identical is caught by no
+    // existing assertion". Executed on f95bb8ed, that mutant DIES — twice: first at the evasion
+    // block's expected-offset assertion, then, with that one neutered, at the evasion message
+    // assertion. So this is not a survivor being closed, and calling it one would be a second
+    // unmeasured universal in the same file. What is true is narrower and still worth fixing: BOTH
+    // catchers were incidental. One of them was the needle-equals-haystack tautology repaired in
+    // A1a, and repairing a tautology is exactly the kind of edit that retires coverage nobody knew
+    // it carried; the other observes the identity case only because the evasion fixture happens to
+    // come back whole. Neither NAMES the case. This pin names it, on the pure function, where no
+    // fixture change can move it.
+    const IDENTITY_CASE_BODY = `${"q".repeat(40)}IDENTITY-CASE-CANARY${"q".repeat(40)}`;
+    check(
+      sharedRunOffset(IDENTITY_CASE_BODY, IDENTITY_CASE_BODY) === 0,
+      "a body that IS the source — the whole-file return, the maximal leak — is measured at offset "
+        + "0 and never at -1; a function that lies only on the identity case hides the largest leak "
+        + `there is and leaves every partial one detected, got ${sharedRunOffset(IDENTITY_CASE_BODY, IDENTITY_CASE_BODY)}`,
+    );
+    // POSITIVE CONTROL, naming what still works and refusing a constant: the SAME body behind a
+    // 5-character prefix the body does not contain answers 5, so the pin above cannot be satisfied
+    // by a function that has started answering 0 to everything.
+    const IDENTITY_CASE_PREFIX = "ZZZZZ"; // 5 characters, written out
+    check(
+      !IDENTITY_CASE_BODY.includes("Z")
+        && sharedRunOffset(`${IDENTITY_CASE_PREFIX}${IDENTITY_CASE_BODY}`, IDENTITY_CASE_BODY) === 5,
+      "...and the same function answers 5 for the same body behind a 5-character prefix absent from "
+        + "it, so the identity pin is evidence and not a comparison a constant would satisfy, got "
+        + `${sharedRunOffset(`${IDENTITY_CASE_PREFIX}${IDENTITY_CASE_BODY}`, IDENTITY_CASE_BODY)}`,
     );
 
     // THE REDACTOR'S NAME SHAPE, the other clause that was single-valued: every surrogate body above
@@ -2307,6 +2479,53 @@ try {
       `the /proc branch ACTUALLY TAKEN matches shouldRunProcProbe(${process.platform}, `
         + `${FORCE_PROC_PROBE}) = ${shouldRunProc}, got ${JSON.stringify(linuxProcProbe)}`,
     );
+
+    // 🔴 THE INVOCATION POPULATION, DERIVED AND ASSERTED — the third attempt at a sentence that
+    // rotted twice. The header said "TWO further invocations ... NEITHER of them" while four
+    // existed, and the commit that added the third and fourth extended the list by hand and left
+    // the numeral and the dual pronoun behind. Updating the number is what failed; so the number is
+    // gone from the prose and the LEDGER decides. Every entry into probeEnvironChannel recorded its
+    // label, and the population splits three ways by what the label says it is: the six lettered
+    // surrogates, the further invocations the header enumerates, and the live /proc invocation,
+    // which exists only when shouldRunProcProbe said so. Adding an invocation anywhere in this
+    // block — surrogate, further control or otherwise — moves one of these three numbers and turns
+    // this file red until the enumeration above is extended to match.
+    const ENVIRON_PROBE_SURROGATES = 6; // controls 1-6, one entry each
+    const ENVIRON_PROBE_FURTHER = 4; // unarmed, evasion, evasion reachability, type-guard
+    const ledgerSurrogates = environProbeInvocations
+      .filter((entry) => /^environ-channel control \d/.test(entry)).length;
+    const ledgerFurther = environProbeInvocations
+      .filter((entry) => entry.startsWith("environ-channel") && !/^environ-channel control \d/.test(entry)).length;
+    const ledgerLive = environProbeInvocations
+      .filter((entry) => !entry.startsWith("environ-channel")).length;
+    assert.deepEqual(
+      [ledgerSurrogates, ledgerFurther, ledgerLive],
+      [ENVIRON_PROBE_SURROGATES, ENVIRON_PROBE_FURTHER, shouldRunProc ? 1 : 0],
+      "the probe was ENTERED exactly as often as the header enumerates — six lettered surrogates, "
+        + "the further invocations that are not surrogates for the hazard, and the live /proc "
+        + `invocation only when the selector said so (shouldRunProc=${shouldRunProc}); this is the `
+        + "assertion that replaced the header's numeral, so a new invocation lands here rather than "
+        + `in a prose sentence nothing re-reads, got ${JSON.stringify(environProbeInvocations.map((entry) => entry.slice(0, 48)))}`,
+    );
+    passed += 1;
+    // POSITIVE CONTROL for the ledger, and NOT the arithmetic one. "The three buckets sum to the
+    // ledger's length" is true by how the three filters are written — one predicate and its two
+    // complements — so it could never fail and would be this file's own tautology defect again.
+    // What can fail is WHICH surrogates ran: the six control numbers are read out of the labels and
+    // must be 1 through 6, each exactly once. A control that stopped running, ran twice, or was
+    // renamed out of the surrogate shape moves this even when the totals still add up.
+    assert.deepEqual(
+      environProbeInvocations
+        .map((entry) => /^environ-channel control (\d)/.exec(entry))
+        .filter((match) => match !== null)
+        .map((match) => Number(match[1]))
+        .sort((a, b) => a - b),
+      [1, 2, 3, 4, 5, 6],
+      "the six lettered surrogates each entered the probe exactly once, identified by the control "
+        + "number in their own labels — a bucket count alone would be satisfied by one control "
+        + "running twice while another never ran",
+    );
+    passed += 1;
 
     // -- F6: the offline flag is read from process.env, so taskEnv cannot carry it ------------------
     //
