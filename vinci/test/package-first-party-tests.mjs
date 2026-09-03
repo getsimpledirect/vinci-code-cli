@@ -29,7 +29,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isFirstPartyTestPath } from "../scripts/first-party-test-paths.mjs";
 
@@ -80,7 +80,24 @@ const runtimeProbes = [
 	"vinci/extensions/ws-c4-snapshots-helper.mjs", // "snapshots" without the dunder wrapping
 	"vinci/themes/ws-c4-fixtures-extra/keep.json", // "fixtures" as a PREFIX of a directory segment
 	"vinci/assets/ws-c4-__snapshots__-data/keep.json", // "__snapshots__" as a prefix of a segment
+	// The comment above claims a substring or prefix match "in either position" would take runtime
+	// paths with it, but the four entries above only ever exercise the DIRECTORY-SEGMENT position.
+	// Un-anchoring TEST_FILE_PATTERN survived every one of them: "latest" contains "test" and
+	// "inspector" contains "spec", so vinci/updater/latest-release.json and
+	// vinci/extensions/vinci-inspector.mjs would both be dropped from the archive with the suite
+	// still green. These two put a real near-miss in the FILENAME position, which is the half the
+	// claim was making and nothing was checking.
+	"vinci/updater/ws-c4-latest-release.json", // "test" inside "latest", in a FILENAME
+	"vinci/extensions/ws-c4-inspector-helper.mjs", // "spec" inside "inspector", in a FILENAME
 ];
+
+// A file that already existed before this run, inside a directory the plant loop reaches into.
+// The cleanup's whole claim is "remove what I planted", not "remove where I planted" -- and until
+// this control existed, nothing failed when that claim was false. Recording a plant directory's
+// PARENT instead of the directory actually created deletes 64 tracked files here and still reports
+// every check passing, because no assertion looked outside the archive.
+const keeper = join(root, "vinci/themes/vinci-dark.json");
+const keeperBytesBefore = readFileSync(keeper);
 
 function listArchive(outputDirectory) {
 	const archive = join(outputDirectory, `vinci-code-${version}.tgz`);
@@ -206,5 +223,14 @@ try {
 	}
 	rmSync(work, { recursive: true, force: true });
 }
+
+// The cleanup has now run, including on the failure path. A file that existed before this run,
+// inside a directory the plant loop reached into, must still be here and byte-identical. This is
+// the assertion that was missing: the PR argues the rule is "remove what I planted" rather than
+// "remove where I planted", and without this nothing failed when that stopped being true.
+check(
+	`pre-existing file survived the cleanup byte-identical: ${relative(root, keeper)}`,
+	existsSync(keeper) && readFileSync(keeper).equals(keeperBytesBefore),
+);
 
 console.log(`\npackage-first-party-tests: ${pass}/${pass} checks passed (no first-party test path enters the release archive)`);
