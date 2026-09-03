@@ -32,8 +32,9 @@ test("a non-ledger work order id REFUSES rather than misfiling", () => {
   // task.mjs's WORK_ORDER_ID admits ids LEDGER_REF does not (the golden vector's "wo-vec-1",
   // and every order registry in vinci-gpu-control today). Such an order must post NOTHING.
   // Falling back to the envelope ref would file the bundle under a row the economics summary
-  // does not name — the summary takes contract-first unconditionally — and the ledger refuses
-  // that as binding:work_order_mismatch. The failure direction is refusal, not misfiling.
+  // does not name — the summary takes contract-first unconditionally. The ledger records that
+  // as an ECONOMICS_REFUSED binding:work_order_mismatch event but still stores the evidence row
+  // (economics never blocks evidence), so the misfile persists. Refusal here, not misfiling.
   assert.ok(!isLedgerRef("wo-vec-1"), "test premise: wo- ids are not ledger refs");
   assert.equal(resolveEvidenceRef({ contractWorkOrderId: "wo-vec-1", envelopeRef: undefined }), null);
   assert.equal(resolveEvidenceRef({ contractWorkOrderId: "wo-vec-1", envelopeRef: "job_5" }), null,

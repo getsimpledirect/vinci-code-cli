@@ -996,8 +996,11 @@ try {
     assert.equal(post.job_ref, "bk_ccm7", "the bundle is filed under the work order id, not a null ref");
     assert.equal(post.kind, "bundle");
 
-    // The two sides of the join agree BY CONSTRUCTION: the ledger compares the POST's job_ref
-    // against the summary's work_order_id and refuses binding:work_order_mismatch otherwise.
+    // The two sides of the join agree BY CONSTRUCTION. Note what that does and does not buy:
+    // the ledger compares the POST's job_ref against the summary's work_order_id and records
+    // ECONOMICS_REFUSED binding:work_order_mismatch when they differ — but it still stores the
+    // evidence row, because economics never blocks evidence. Agreement here is what keeps the
+    // pair joinable; it is not the ledger rejecting bad pairs on our behalf.
     assert.ok(post.economics_summary, "the POST carries the economics summary");
     assert.equal(post.economics_summary.work_order_id, post.job_ref, "summary key == evidence key");
     assert.match(post.economics_sha256 ?? "", /^[0-9a-f]{64}$/);

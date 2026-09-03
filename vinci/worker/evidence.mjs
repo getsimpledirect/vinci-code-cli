@@ -74,8 +74,10 @@ function command(commandName, args) {
 //
 // A non-ledger contract id returns null rather than falling through to the envelope ref. The
 // summary takes contract-first UNCONDITIONALLY (economics.mjs), so falling through could file
-// the bundle under a row the summary does not name, which the ledger refuses as
-// `binding:work_order_mismatch`. Unreachable today (a contract envelope has no ref), but the
+// the bundle under a row the summary does not name. The ledger records that as an
+// `ECONOMICS_REFUSED binding:work_order_mismatch` EVENT and still stores the evidence row —
+// economics never blocks evidence — so the misfiled row would persist with a refusal beside it,
+// which is worse than not posting. Unreachable today (a contract envelope has no ref), but the
 // failure direction must be "post nothing", never "post under a plausible wrong row".
 export function resolveEvidenceRef(input) {
   // A default parameter covers `undefined` only; an explicit `null` would throw on destructure,
