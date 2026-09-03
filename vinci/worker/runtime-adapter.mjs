@@ -96,7 +96,12 @@ function stableStringify(value) {
 
 // idempotencyKey is derived from the EVENT'S IDENTITY, never from its payload: two distinct
 // logical events with identical payloads (e.g. two manual pauses in one run) must be two lines,
-// while a true re-append of the same event (same runId + type + identity) dedupes in the sink.
+// while a true re-append of the same event (same runId + type + identity) dedupes in the sink —
+// PROVIDED the payload is itself a function of that identity. `tool.completed` is the one event on
+// this stream where it is not: its `durationMs` is a wall-clock measurement of the call, so a
+// second append of the same logical completion carries a second measurement and the sink answers
+// `idempotency_conflict` rather than deduplicating. The measurement is kept on purpose; the
+// exception is named here and in run-events-sink.mjs so the contract is not read as universal.
 // The identity is the native id where the SDK provides one (tool call id), otherwise a per-attach
 // monotonic counter scoped by the attach's traceId so a resumed process can never collide with
 // the counters of the process it replaced.
@@ -537,6 +542,29 @@ function attachTranslator({ run, session, authStorage, sink, clock, grantedTools
     await session.abort();
   }
 
+  // Stop the current turn for a limit that the run.paused vocabulary CANNOT NAME.
+  //
+  // VALID_PAUSE_REASONS is manual / steer / budget / worker_lost. A `max_runtime_s` or `deadline`
+  // stop is none of those: it is not caller-issued (the capability matrix measures that no caller
+  // command reaches this worker at all), it is not a cost limit, and it is not lease loss. Writing
+  // any of them would be a false statement in the durable record, and inventing a reason code the
+  // contract does not define is not this adapter's to do — so this path writes NO run.paused.
+  //
+  // What it does instead is the part that was actually missing: it sets the same `interrupted` flag
+  // interrupt() sets, so the killed turn does NOT emit agent.turn_finished. Before this, a limit
+  // stop called session.abort() directly and the aborted turn reported as a normally finished one —
+  // an honesty defect in the stream, since nothing distinguished "the agent finished" from "a limit
+  // killed it". A turn that started and never finished, followed by run.completed{FAILED}, is that
+  // distinction, made with vocabulary the contract already defines.
+  //
+  // The vocabulary addition this deserves: a `limit` reasonCode on run.paused (with the specific
+  // limit named in a payload field the registry allows), or the two codes `max_runtime` and
+  // `deadline`. Until the contract carries one, silence beats a wrong reason.
+  async function abortWithoutPause() {
+    interrupted = session.isStreaming === true;
+    await session.abort();
+  }
+
   function complete({ outcome = "SUCCEEDED", tierReached = "NONE" } = {}) {
     emit("run.completed", {
       outcome: kinded("enum", outcome),
@@ -555,6 +583,7 @@ function attachTranslator({ run, session, authStorage, sink, clock, grantedTools
     prompt,
     steer,
     interrupt,
+    abortWithoutPause,
     dispose,
     complete,
     // AgentSession exposes the persisted file as a getter (delegating to sessionManager.getSessionFile()).
@@ -588,7 +617,8 @@ function attachTranslator({ run, session, authStorage, sink, clock, grantedTools
  * @param {string} [options.sessionId] - explicit session id, so the worker's session accounting
  *   (session-read.mjs readSessionState(sessionDir, sessionId)) finds this session's transcript the
  *   same way it finds a `vinci -p --session-id` subprocess's.
- * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session, authStorage}>}
+ * @returns {Promise<{prompt, steer, interrupt, abortWithoutPause, dispose, complete, sessionPath,
+ *   session, authStorage}>}
  */
 export async function createRunSession({
   run,
@@ -683,8 +713,8 @@ function identityMismatch(message) {
  *
  * @param {object} options - same as createRunSession, plus:
  * @param {string} options.sessionPath - the persisted session file to reopen (handle.sessionPath)
- * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session, authStorage,
- *   resumedFromSequence, resumedAtSequence}>}
+ * @returns {Promise<{prompt, steer, interrupt, abortWithoutPause, dispose, complete, sessionPath,
+ *   session, authStorage, resumedFromSequence, resumedAtSequence}>}
  * @throws {Error} code "granted_tools_required" when grantedTools is absent/empty (nothing appended)
  * @throws {Error} code "task_env_required" when `bash` is granted without taskEnv (nothing appended)
  * @throws {Error} code "tool_registry_mismatch" when the session registers an ungranted tool

@@ -17,7 +17,8 @@
 //
 //   1. TARBALL CONTENTS (the exact regression the packaging fix exists to prevent): the packed
 //      tarball CONTAINS vinci/worker/{runtime-adapter,run-events-sink,run}.mjs, and CONTAINS NONE
-//      of this branch's six first-party test paths.
+//      of the first-party test paths under `vinci/test` — a population DERIVED by walking the
+//      checkout's own test tree, never a hand-written list (firstPartyTestPaths()).
 //   2. RESOLVED PATH: the modules that answer the import are files whose realpath is under the
 //      install prefix and NOT under this checkout.
 //   3. SELF-CONTAINMENT (the property assertion 2 alone does NOT give): no `node_modules`
@@ -88,21 +89,54 @@ const MUST_SHIP = [
   "vinci/worker/run-events-sink.mjs",
   "vinci/worker/run.mjs",
 ];
-// Must be ABSENT — the published artifact carries no first-party test path. Asserted against the
-// tarball's ACTUAL MEMBER LIST and never against an exclusion mechanism: the base this proof was
-// first written for kept test paths out via an entry-list predicate, the current base keeps them
-// out simply by not naming `vinci/test` in package.sh's path list, and a future base may use a
-// two-sided predicate. The artifact's contents are the claim; how the producer arrives at them is
-// not this test's business. Asserted in this direction on purpose: an assertion expecting a test
-// file inside the artifact would pass today and invert the moment the packaging changes.
-const MUST_NOT_SHIP = [
+// Must be ABSENT — the published artifact carries no path from this repo's own first-party test
+// tree. Asserted against the tarball's ACTUAL MEMBER LIST and never against an exclusion mechanism:
+// the base this proof was first written for kept test paths out via an entry-list predicate, the
+// current base keeps them out simply by not naming `vinci/test` in package.sh's path list, and a
+// future base may use a two-sided predicate. The artifact's contents are the claim; how the
+// producer arrives at them is not this test's business. Asserted in this direction on purpose: an
+// assertion expecting a test file inside the artifact would pass today and invert the moment the
+// packaging changes.
+//
+// THE POPULATION IS DERIVED, NOT LISTED. A hand-written list here enumerated SIX paths and called
+// itself "this branch's six first-party test paths" while the branch had EIGHT — this very file and
+// worker-capability-declaration.mjs were missing from it — so a leak of either would have gone
+// unnoticed by a proof whose comment claimed to cover them. `firstPartyTestPaths()` below walks the
+// checkout's `vinci/test` tree at run time, so every test file that exists is in the population by
+// construction and a file added tomorrow is covered without anyone remembering to add it.
+//
+// THE WINDOW, STATED: the derived population is the tree under `vinci/test` ONLY. Vendored packages
+// under node_modules ship their own test files and are not first-party; nothing here claims
+// anything about those.
+const FIRST_PARTY_TEST_ROOT = "vinci/test";
+// The IR-02 test files this branch adds. NOT the population — the population is derived — but a
+// positive control ON the derivation: if the walk ever returns an empty or truncated set (a moved
+// directory, a failed readdir swallowed into []), the absence assertion below would pass vacuously
+// over nothing. These names must appear IN the derived set.
+const DERIVATION_CONTROL_PATHS = [
   "vinci/test/worker-runtime-adapter-events.mjs",
   "vinci/test/worker-runtime-adapter-tools.mjs",
   "vinci/test/worker-runtime-adapter-steer.mjs",
   "vinci/test/worker-runtime-adapter-resume.mjs",
   "vinci/test/worker-runtime-adapter-compat.mjs",
+  "vinci/test/worker-runtime-adapter-installed.mjs",
+  "vinci/test/worker-capability-declaration.mjs",
   "vinci/test/lib/ir02-resume-child.mjs",
 ];
+
+// Every file under the checkout's first-party test tree, as tarball-relative paths.
+function firstPartyTestPaths() {
+  const found = [];
+  const walk = (relative) => {
+    for (const entry of readdirSync(join(CHECKOUT_ROOT, relative), { withFileTypes: true })) {
+      const child = `${relative}/${entry.name}`;
+      if (entry.isDirectory()) walk(child);
+      else if (entry.isFile()) found.push(child);
+    }
+  };
+  walk(FIRST_PARTY_TEST_ROOT);
+  return found;
+}
 
 const AMBIENT_MARKER = "AMBIENT-MARKER-INSTALLED-4d17";
 const PROMPT_MARKER = "vinci-ir02-installed-prompt-marker-9b2e";
@@ -278,9 +312,33 @@ try {
   for (const shipped of MUST_SHIP) {
     check(members.has(shipped), `the tarball CONTAINS ${shipped} (the 0.0.51 omission regression)`);
   }
-  for (const excluded of MUST_NOT_SHIP) {
-    check(!members.has(excluded), `the tarball does NOT contain the first-party test path ${excluded}`);
-  }
+  // The derived population, plus the positive control that the derivation actually found the tree.
+  const firstPartyTests = firstPartyTestPaths();
+  check(
+    firstPartyTests.length >= DERIVATION_CONTROL_PATHS.length,
+    `the first-party test tree ${FIRST_PARTY_TEST_ROOT} enumerates ${firstPartyTests.length} files (the walk found the tree)`,
+  );
+  const derived = new Set(firstPartyTests);
+  const missingFromDerivation = DERIVATION_CONTROL_PATHS.filter((path) => !derived.has(path));
+  check(
+    missingFromDerivation.length === 0,
+    `POSITIVE CONTROL on the derivation: every IR-02 test file is IN the derived population, missing ${JSON.stringify(missingFromDerivation)}`,
+  );
+  // ONE assertion over the WHOLE derived population, naming every offender rather than the first.
+  const leaked = firstPartyTests.filter((path) => members.has(path));
+  check(
+    leaked.length === 0,
+    `the tarball contains NONE of the ${firstPartyTests.length} first-party test paths under ${FIRST_PARTY_TEST_ROOT}, leaked ${JSON.stringify(leaked)}`,
+  );
+  // And the directory itself never appears as a member, so a future producer cannot ship the tree
+  // as an empty directory entry and read as clean.
+  const testTreeMembers = [...members].filter(
+    (member) => member === FIRST_PARTY_TEST_ROOT || member.startsWith(`${FIRST_PARTY_TEST_ROOT}/`),
+  );
+  check(
+    testTreeMembers.length === 0,
+    `no tarball member lives under ${FIRST_PARTY_TEST_ROOT} at all, got ${JSON.stringify(testTreeMembers.slice(0, 10))}`,
+  );
 
   // ---- 2. Install it into a clean temp prefix ---------------------------------------------------
   execFileSync("tar", ["-xzf", tarballPath, "-C", installPrefix], { maxBuffer: 64 * 1024 * 1024 });

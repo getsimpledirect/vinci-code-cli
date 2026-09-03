@@ -27,6 +27,16 @@
 //     two run.paused lines with two keys, while re-appending one of them dedupes to its sequence
 //   * sink idempotency: same key+payload -> same sequence, no new line; same key, different
 //     payload -> throws code "idempotency_conflict"; reopen + replay() -> lastSequence === N
+//   * SINK INTEGRITY, on purpose-built fixture files (a real truncated file, not a mock of one):
+//     a TORN FINAL LINE is discarded and the sink continues at the right sequence (with the
+//     complete-file positive control beside it); a MALFORMED INTERIOR line refuses with code
+//     run_events_corrupt; a GAPPED file (1 then 900) refuses with code run_events_sequence_gap
+//     naming 2 as the first missing sequence, where the old reader took the maximum and continued
+//     at 901; two sink objects on one path are shown to COLLIDE on one sequence (the single-writer
+//     requirement, made visible rather than locked away), and the log they leave is refused by the
+//     next open
+//   * the DOCUMENTED idempotency exception: tool.completed's durationMs is a wall-clock
+//     measurement, so a re-append of the same logical completion conflicts instead of deduping
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -405,6 +415,190 @@ try {
   assert.equal(next, N + 1, "reopened sink continues at N+1 with no gap and no reuse");
   assert.equal(lineCount(), N + 1, "the continuation is durable");
   passed += 4;
+
+  // ---- SINK INTEGRITY: a torn tail, a corrupt interior, a gap, and two writers -----------------
+  // Four properties of loadFromDisk, each on its OWN fixture file so nothing here perturbs the run
+  // above. The fixtures are written as bytes, so the truncated file is a real truncated file and
+  // not a mock of one.
+  const integrityDir = join(root, "integrity");
+  mkdirSync(integrityDir, { recursive: true });
+  function integrityLine(sequence, key) {
+    return JSON.stringify({
+      eventId: `integrity-event-${sequence}`,
+      runId: "run_ir02_integrity",
+      organizationId: null,
+      workspaceId: "ws_ir02_integrity",
+      type: "run.paused",
+      actor: "worker",
+      occurredAt: "2026-09-03T00:00:00.000Z",
+      idempotencyKey: key ?? `integrity-key-${sequence}`,
+      traceId: "integrity-trace",
+      sequence,
+      payload: { reasonCode: { kind: "enum", value: "manual" } },
+    });
+  }
+  const COMPLETE_FILE = `${[integrityLine(1), integrityLine(2), integrityLine(3)].join("\n")}\n`;
+  function freshEvent(key) {
+    return {
+      eventId: `integrity-fresh-${key}`,
+      runId: "run_ir02_integrity",
+      organizationId: null,
+      workspaceId: "ws_ir02_integrity",
+      type: "run.completed",
+      actor: "worker",
+      occurredAt: "2026-09-03T00:00:01.000Z",
+      idempotencyKey: key,
+      traceId: "integrity-trace",
+      payload: { outcome: { kind: "enum", value: "SUCCEEDED" }, tierReached: { kind: "enum", value: "NONE" } },
+    };
+  }
+
+  // (i) POSITIVE CONTROL — a COMPLETE file opens, reports its real last sequence, and continues at
+  // lastSequence+1. Without this the torn-file assertion below could be satisfied by a sink that
+  // simply ignores the file it was pointed at.
+  const wholePath = join(integrityDir, "whole.jsonl");
+  writeFileSync(wholePath, COMPLETE_FILE, "utf8");
+  const wholeSink = createJsonlSink(wholePath);
+  assert.equal(wholeSink.replay().lastSequence, 3, "a complete file opens at its real last sequence");
+  assert.equal(wholeSink.append(freshEvent("integrity-whole-next")), 4, "a complete file continues at lastSequence+1");
+  passed += 2;
+
+  // (ii) A REAL TRUNCATED FILE — the shape a process killed mid-append leaves: every complete line,
+  // then a PREFIX of one more record with no terminating newline. Before the fix, JSON.parse threw
+  // out of createJsonlSink and the whole task died on a file that was merely incomplete.
+  const tornPath = join(integrityDir, "torn.jsonl");
+  const tornBytes = `${COMPLETE_FILE}${integrityLine(4).slice(0, 37)}`;
+  writeFileSync(tornPath, tornBytes, "utf8");
+  check(!tornBytes.endsWith("\n"), "the fixture's final line really is unterminated");
+  check(readFileSync(tornPath, "utf8") === tornBytes, "the truncated fixture is on disk byte-for-byte");
+  const tornSink = createJsonlSink(tornPath);
+  assert.equal(tornSink.replay().lastSequence, 3, "a torn final line is DISCARDED: the last durable record is 3");
+  assert.equal(tornSink.append(freshEvent("integrity-torn-next")), 4, "a torn file continues at the right sequence");
+  passed += 2;
+  const tornAfter = readFileSync(tornPath, "utf8").split("\n").filter((line) => line.trim());
+  assert.equal(tornAfter.length, 4, `the repaired file holds 3 durable records plus the new one, got ${tornAfter.length}`);
+  assert.deepEqual(
+    tornAfter.map((line) => JSON.parse(line).sequence),
+    [1, 2, 3, 4],
+    "the repaired file is still 1..N contiguous, so it reopens cleanly",
+  );
+  assert.equal(createJsonlSink(tornPath).replay().lastSequence, 4, "the repaired file reopens without a second repair");
+  passed += 3;
+
+  // (ii-b) THE OTHER TORN SHAPE: the record itself landed whole and only its "\n" did not. Here the
+  // record IS durable, so it must be KEPT (discarding it would let the next append reuse sequence 4
+  // while the bytes stayed in the file — a duplicate that fails contiguity for good). The sink
+  // completes the terminator instead, and the next append lands at 5.
+  const unterminatedPath = join(integrityDir, "unterminated.jsonl");
+  writeFileSync(unterminatedPath, `${COMPLETE_FILE}${integrityLine(4)}`, "utf8");
+  check(!readFileSync(unterminatedPath, "utf8").endsWith("\n"), "the fixture's whole final record is unterminated");
+  const unterminatedSink = createJsonlSink(unterminatedPath);
+  assert.equal(unterminatedSink.replay().lastSequence, 4, "a complete-but-unterminated final record is KEPT");
+  assert.equal(unterminatedSink.append(freshEvent("integrity-unterminated-next")), 5, "and the next append lands at 5");
+  assert.deepEqual(
+    readFileSync(unterminatedPath, "utf8").split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line).sequence),
+    [1, 2, 3, 4, 5],
+    "the terminator repair leaves a contiguous, reopenable file",
+  );
+  passed += 3;
+
+  // (iii) A MALFORMED LINE THAT IS NOT THE LAST ONE is an integrity error, not a torn write:
+  // records follow it, so something dropped or interleaved lines and continuing would hide it.
+  const corruptPath = join(integrityDir, "corrupt-interior.jsonl");
+  writeFileSync(corruptPath, `${integrityLine(1)}\n{ this is not json\n${integrityLine(3)}\n`, "utf8");
+  assert.throws(
+    () => createJsonlSink(corruptPath),
+    (error) => error && error.code === "run_events_corrupt" && /line 2 of/.test(error.message),
+    "a malformed line with records after it REFUSES with code run_events_corrupt, naming the line",
+  );
+  passed += 1;
+
+  // (iv) A GAP is refused, naming the first missing sequence. The old reader took the MAXIMUM, so a
+  // file holding 1 and 900 replayed as a run that had reached 900 and continued at 901.
+  const gapPath = join(integrityDir, "gap.jsonl");
+  writeFileSync(gapPath, `${integrityLine(1)}\n${integrityLine(900)}\n`, "utf8");
+  assert.throws(
+    () => createJsonlSink(gapPath),
+    (error) =>
+      error && error.code === "run_events_sequence_gap" && /first missing sequence is 2/.test(error.message),
+    "a file holding 1 and 900 REFUSES with code run_events_sequence_gap, naming 2 as the first missing sequence",
+  );
+  passed += 1;
+  // POSITIVE CONTROL on the same predicate: 1..3 with no gap is accepted by the very same reader.
+  assert.equal(createJsonlSink(wholePath).replay().lastSequence, 4, "the contiguity rule accepts a contiguous file");
+  passed += 1;
+
+  // (v) SINGLE WRITER, DEMONSTRATED. The counter is per-object memory with no lock, so two sink
+  // objects on one path assign the SAME sequence to two DIFFERENT events. Nothing here fixes that —
+  // the design is single-writer and a lock would be a weaker claim than the requirement — so the
+  // constraint is made VISIBLE instead of implied, and the corrupt log it produces is refused by
+  // the next open rather than silently continued.
+  const collisionPath = join(integrityDir, "collision.jsonl");
+  const writerA = createJsonlSink(collisionPath);
+  const writerB = createJsonlSink(collisionPath);
+  const sequenceA = writerA.append(freshEvent("integrity-collide-a"));
+  const sequenceB = writerB.append(freshEvent("integrity-collide-b"));
+  assert.equal(sequenceA, 1, "the first writer assigns sequence 1");
+  assert.equal(
+    sequenceB,
+    sequenceA,
+    "TWO SINK OBJECTS ON ONE PATH COLLIDE: the second writer assigns the same sequence as the first",
+  );
+  passed += 2;
+  const collided = readFileSync(collisionPath, "utf8").split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line));
+  assert.deepEqual(collided.map((event) => event.sequence), [1, 1], "the collided log really holds two lines at sequence 1");
+  assert.equal(new Set(collided.map((event) => event.eventId)).size, 2, "they are two DIFFERENT events, not a dedupe");
+  passed += 2;
+  assert.throws(
+    () => createJsonlSink(collisionPath),
+    (error) => error && error.code === "run_events_sequence_gap",
+    "the log two writers left behind is REFUSED by the next open (the single-writer rule is self-reporting)",
+  );
+  passed += 1;
+
+  // (vi) THE DOCUMENTED IDEMPOTENCY EXCEPTION, pinned on the REAL tool.completed this run produced.
+  // The sink's contract ("same key + same payload dedupes") holds only for events whose payload is
+  // a function of their identity. tool.completed carries durationMs, a WALL-CLOCK measurement, so a
+  // genuine re-append of the same logical completion conflicts. The field stays; the exception is
+  // named in both module headers and pinned here so it cannot be quietly "fixed" by dropping the
+  // measurement.
+  const realToolCompleted = events.find((event) => event.type === "tool.completed");
+  check(realToolCompleted !== undefined, "the run produced a real tool.completed to pin the exception on");
+  check(
+    realToolCompleted.payload.durationMs !== undefined && realToolCompleted.payload.durationMs.kind === "count",
+    "tool.completed still carries durationMs (the wall-clock field the exception is about)",
+  );
+  const exceptionPath = join(integrityDir, "idempotency-exception.jsonl");
+  const exceptionSink = createJsonlSink(exceptionPath);
+  const replayedCompletion = { ...realToolCompleted };
+  delete replayedCompletion.sequence;
+  const firstCompletion = exceptionSink.append(replayedCompletion);
+  assert.equal(firstCompletion, 1, "the real tool.completed appends at sequence 1");
+  assert.equal(
+    exceptionSink.append({ ...replayedCompletion, eventId: "second-attempt" }),
+    firstCompletion,
+    "IDENTITY-FUNCTION HALF: the same key with a byte-identical payload dedupes to the same sequence",
+  );
+  passed += 2;
+  assert.throws(
+    () =>
+      exceptionSink.append({
+        ...replayedCompletion,
+        eventId: "third-attempt",
+        payload: {
+          ...replayedCompletion.payload,
+          durationMs: { kind: "count", value: realToolCompleted.payload.durationMs.value + 7 },
+        },
+      }),
+    (error) => error && error.code === "idempotency_conflict",
+    "THE EXCEPTION: re-appending the same logical tool.completed with a second wall-clock duration conflicts",
+  );
+  assert.equal(
+    readFileSync(exceptionPath, "utf8").split("\n").filter((line) => line.trim()).length,
+    1,
+    "the conflicting re-append wrote nothing",
+  );
+  passed += 2;
 
   console.log(`worker-runtime-adapter-events: ${passed} checks passed (N=${N} events: ${types.join(" > ")})`);
 } finally {

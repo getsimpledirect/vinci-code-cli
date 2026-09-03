@@ -23,6 +23,17 @@
 //     debris-authority capabilities the subprocess lane deletes. Both lanes are MEASURED here on
 //     the same four probe variables: the child's recorded env on one side, the tool result the
 //     model actually saw on the other.
+//   * (5) A RUN-EVENTS LOG THE SINK REFUSES. The sink was constructed OUTSIDE the embedded lane's
+//     try block, so a log left corrupt or non-contiguous by something else threw straight past
+//     runVinci's own error handling and killed the task instead of failing it. Measured both ways
+//     here: a malformed interior line FAILS the run (exit_code 1, normal result shape, log
+//     untouched), while a log torn by a kill mid-append — the shape that actually occurs — does NOT
+//     fail it and continues at the right sequence.
+//   * (6) A LIMIT-DRIVEN STOP IN THE DURABLE STREAM. A runtime/deadline stop called the session's
+//     abort directly, leaving the adapter's interrupted flag clear, so the killed turn emitted
+//     agent.turn_finished and read exactly like a turn that completed. Measured on a bash turn that
+//     is still running when the deadline poller trips, with the same script and no limit as the
+//     positive control.
 //   * (4) A SESSION ID THE SDK REFUSES. The embedded lane fell back to a generated id, after which
 //     readSessionState(sessionDir, sessionId) missed for the rest of the run — zero cost, no
 //     outcome, no harness stops, and a budget poller in that same function that could never trip.
@@ -374,6 +385,184 @@ try {
     readSessionState(join(embeddedStateDir, "sessions", "ir02-compat-embedded"), "ir02-compat-embedded-session").path !== undefined,
     "the accepted session id addresses the run's transcript (what the silent fallback broke)",
   );
+
+  // ---- (5) A BAD RUN-EVENTS LOG FAILS THE RUN, IT DOES NOT KILL THE PROCESS --------------------
+  // The sink is opened by reading the file on disk, and that read can refuse (a log left corrupt or
+  // non-contiguous by something else). It used to be constructed OUTSIDE runVinciEmbedded's try, so
+  // the refusal escaped this function's own error handling entirely and took the whole task down
+  // instead of resolving with a result the daemon can record.
+  function seedEventsLog(stateDirName, bytes) {
+    const stateDir = join(root, stateDirName);
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, "run-events.jsonl"), bytes, "utf8");
+    return stateDir;
+  }
+  const seededLine = (sequence) =>
+    JSON.stringify({
+      eventId: `compat-seed-${sequence}`,
+      runId: "ir02-compat-seed",
+      organizationId: null,
+      workspaceId: "vinci/ir02-compat",
+      type: "run.paused",
+      actor: "worker",
+      occurredAt: "2026-09-03T00:00:00.000Z",
+      idempotencyKey: `compat-seed-key-${sequence}`,
+      traceId: "compat-seed-trace",
+      sequence,
+      payload: { reasonCode: { kind: "enum", value: "manual" } },
+    });
+
+  // (5a) NEGATIVE: a log with a malformed INTERIOR line. runVinci must RESOLVE, exit_code 1.
+  const corruptStateDir = seedEventsLog(
+    "state-corrupt-events",
+    `${seededLine(1)}\n{ not json at all\n${seededLine(3)}\n`,
+  );
+  faux.setResponses([fauxAssistantMessage("Never reached.")]);
+  const corruptResult = await runVinci({
+    envelope: { ...baseEnvelope(), runtime: "embedded", provider: model.provider, model: model.id },
+    repoDir,
+    stateDir: corruptStateDir,
+    taskId: "ir02-compat-corrupt-events",
+    sessionId: "ir02-compat-corrupt-events-session",
+    env: { ...process.env },
+    embedded: { authStorage, model },
+  });
+  assert.equal(corruptResult.exit_code, 1, "a refusing sink FAILS the run (exit_code 1) instead of escaping runVinci");
+  assert.deepEqual(
+    Object.keys(corruptResult).sort(),
+    ["cost_usd", "exit_code", "harness_stops", "limit_tripped", "outcome", "unattended_policy"],
+    `a refusing sink still resolves the lane's normal result shape, got ${JSON.stringify(Object.keys(corruptResult))}`,
+  );
+  passed += 2;
+  check(
+    readFileSync(join(corruptStateDir, "run-events.jsonl"), "utf8").includes("{ not json at all"),
+    "the refused log was left exactly as found (nothing appended to a log the sink would not open)",
+  );
+
+  // (5b) POSITIVE CONTROL through the same entry point — a log torn by a kill mid-append (every
+  // complete line, then a PREFIX of one more with no newline) is NOT a refusal: the run opens it,
+  // discards the partial line and continues at the right sequence. This is the case the sink's own
+  // header promises to survive, and the case that used to throw.
+  const tornStateDir = seedEventsLog("state-torn-events", `${seededLine(1)}\n${seededLine(2).slice(0, 30)}`);
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("ls", { path: "." }, { id: "call_compat_torn" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Torn-log run finished."),
+  ]);
+  const tornResult = await runVinci({
+    envelope: { ...baseEnvelope(), runtime: "embedded", provider: model.provider, model: model.id },
+    repoDir,
+    stateDir: tornStateDir,
+    taskId: "ir02-compat-torn-events",
+    sessionId: "ir02-compat-torn-events-session",
+    env: { ...process.env },
+    embedded: { authStorage, model },
+  });
+  assert.equal(tornResult.exit_code, 0, "a torn final line does NOT fail the run");
+  const tornEvents = readFileSync(join(tornStateDir, "run-events.jsonl"), "utf8")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(
+    tornEvents.map((event) => event.sequence),
+    Array.from({ length: tornEvents.length }, (_, index) => index + 1),
+    `the resumed log is 1..N contiguous, got ${JSON.stringify(tornEvents.map((event) => event.sequence))}`,
+  );
+  assert.equal(tornEvents[0].eventId, "compat-seed-1", "the one durable pre-kill record survived byte-for-byte");
+  assert.equal(tornEvents[1].type, "run.started", "the new run continued at sequence 2, right after it");
+  passed += 4;
+
+  // ---- (6) A LIMIT-DRIVEN STOP IS DISTINGUISHABLE FROM A FINISHED TURN --------------------------
+  // A max_runtime_s or deadline stop used to call session.abort() directly, leaving the adapter's
+  // interrupted flag clear: the killed turn still emitted agent.turn_finished, so the durable stream
+  // could not tell a completed turn from one a limit killed. There is no reasonCode in
+  // VALID_PAUSE_REASONS for either limit and none is invented, so the stop writes NO run.paused —
+  // what it does write is a turn that STARTED and never FINISHED, closed by run.completed{FAILED}.
+  const savedPollMs = process.env.VINCI_WORKER_LIMIT_POLL_MS;
+  process.env.VINCI_WORKER_LIMIT_POLL_MS = "50";
+  const limitTools = ["bash", "ls"];
+  const limitEnv = { PATH: process.env.PATH, HOME: process.env.HOME };
+  function limitScript(seconds) {
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("bash", { command: `sleep ${seconds}` }, { id: "call_limit_sleep" })], {
+        stopReason: "toolUse",
+      }),
+      fauxAssistantMessage("Slept."),
+    ]);
+  }
+  function eventsOf(stateDir) {
+    return readFileSync(join(stateDir, "run-events.jsonl"), "utf8")
+      .split("\n")
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line));
+  }
+
+  // (6a) POSITIVE CONTROL FIRST, on the SAME script shape and the SAME entry point: with no limit
+  // tripped, the turn finishes and agent.turn_finished IS on the stream. Without this, "no
+  // agent.turn_finished" below could be satisfied by a lane that never emits it at all.
+  const unlimitedStateDir = join(root, "state-limit-control");
+  mkdirSync(unlimitedStateDir, { recursive: true });
+  limitScript("0.2");
+  const unlimitedResult = await runVinci({
+    envelope: { ...baseEnvelope(), runtime: "embedded", provider: model.provider, model: model.id, tools: limitTools },
+    repoDir,
+    stateDir: unlimitedStateDir,
+    taskId: "ir02-compat-limit-control",
+    sessionId: "ir02-compat-limit-control-session",
+    env: limitEnv,
+    embedded: { authStorage, model },
+  });
+  const unlimitedTypes = eventsOf(unlimitedStateDir).map((event) => event.type);
+  assert.equal(unlimitedResult.limit_tripped, null, "the control run tripped no limit");
+  check(unlimitedTypes.includes("agent.turn_started"), `the control run started a turn, got ${JSON.stringify(unlimitedTypes)}`);
+  check(
+    unlimitedTypes.includes("agent.turn_finished"),
+    `POSITIVE CONTROL: an uninterrupted bash turn DOES emit agent.turn_finished, got ${JSON.stringify(unlimitedTypes)}`,
+  );
+  passed += 1;
+
+  // (6b) The same shape with a deadline already in the past. The poller trips mid-turn while bash
+  // sleeps, and the stream must show the difference.
+  const limitStateDir = join(root, "state-limit-deadline");
+  mkdirSync(limitStateDir, { recursive: true });
+  limitScript("5");
+  const limitResult = await runVinci({
+    envelope: {
+      ...baseEnvelope(),
+      runtime: "embedded",
+      provider: model.provider,
+      model: model.id,
+      tools: limitTools,
+      deadline: "2020-01-01T00:00:00.000Z",
+    },
+    repoDir,
+    stateDir: limitStateDir,
+    taskId: "ir02-compat-limit-deadline",
+    sessionId: "ir02-compat-limit-deadline-session",
+    env: limitEnv,
+    embedded: { authStorage, model },
+  });
+  if (savedPollMs === undefined) delete process.env.VINCI_WORKER_LIMIT_POLL_MS;
+  else process.env.VINCI_WORKER_LIMIT_POLL_MS = savedPollMs;
+
+  const limitEvents = eventsOf(limitStateDir);
+  const limitTypes = limitEvents.map((event) => event.type);
+  assert.equal(limitResult.limit_tripped, "deadline", "the deadline limit is reported on the result");
+  check(limitTypes.includes("agent.turn_started"), `the limited run started a turn, got ${JSON.stringify(limitTypes)}`);
+  check(
+    !limitTypes.includes("agent.turn_finished"),
+    `THE DISTINCTION: a limit-killed turn emits NO agent.turn_finished, got ${JSON.stringify(limitTypes)}`,
+  );
+  check(
+    !limitTypes.includes("run.paused"),
+    `and no run.paused, because no reasonCode in the contract names a runtime/deadline limit, got ${JSON.stringify(limitTypes)}`,
+  );
+  assert.deepEqual(
+    limitEvents[limitEvents.length - 1].payload,
+    { outcome: { kind: "enum", value: "FAILED" }, tierReached: { kind: "enum", value: "NONE" } },
+    `the limited run closes with run.completed{FAILED}, got ${JSON.stringify(limitEvents[limitEvents.length - 1])}`,
+  );
+  assert.equal(limitTypes[limitTypes.length - 1], "run.completed", "run.completed is the last event of the limited run");
+  passed += 3;
 
   console.log(`worker-runtime-adapter-compat: ${passed} checks passed (subprocess lane intact, embedded lane wired)`);
 } finally {

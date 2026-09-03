@@ -381,8 +381,13 @@ export const DECLARATION_REFRESH_DEFAULT_S = 21600;
 //                                 test proves a kill mid-write (task file, cursor, checkout, push)
 //                                 resumes without loss or duplication; unproven ⇒ not claimed
 //   independentVerification false verification happens inside the same run that did the work
-// controlLevel is the DERIVED rung (activityStream false ⇒ "inventoried"); a higher claim is an
-// overclaim the validator refuses. `buildDigest` is omitted: the matrix demands a SHA-256 and the
+// controlLevel is a HARD-CODED LITERAL in buildDeclaration below, not a derivation: no function in
+// this repo computes a rung from the matrix, and the rung vocabulary above "inventoried" lives in
+// the Governor's validator rather than here. It is written by hand to the rung the matrix supports
+// (activityStream false ⇒ "inventoried"; a higher claim is an overclaim the validator refuses), and
+// it is that HAND-WRITTEN value the declaration test pins against the measured activityStream — so
+// flipping the flag without rewriting the literal fails there. Saying "derived" here would claim a
+// mechanism that does not exist; anyone changing a flag must change this literal themselves. `buildDigest` is omitted: the matrix demands a SHA-256 and the
 // daemon's build identity is a 40-hex git commit — that rides in the lease request's
 // worker_build_digest instead, and the declaration's own digest names this record exactly.
 //

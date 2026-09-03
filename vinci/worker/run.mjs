@@ -1281,7 +1281,17 @@ async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId
   if (typeof envelope.work_order_id === "string") run.workOrderId = envelope.work_order_id;
   if (typeof envelope.work_order_digest === "string") run.workOrderDigest = envelope.work_order_digest;
 
-  const sink = createJsonlSink(eventsPath);
+  // The sink is constructed INSIDE the try below, not here. Opening it reads the file on disk and
+  // can throw — a run-events log left corrupt or non-contiguous by an earlier process is refused by
+  // createJsonlSink on purpose — and a throw out here escapes this function's own error handling
+  // entirely, taking the whole task down instead of resolving with a FAILED result the daemon can
+  // record. (A torn FINAL line, the shape a SIGKILL mid-append actually leaves, is repaired by the
+  // sink and does not throw; this is about the shapes that legitimately refuse.)
+  // SINGLE WRITER: this is the one and only sink object for `eventsPath`. The sequence counter is
+  // per-object memory with no lock, so a second sink opened on this path — in this process or
+  // another — would assign duplicate sequences and leave a log the next open refuses. One Run, one
+  // process, one sink.
+  let sink = null;
   let limitTripped = null;
   let aborted = null;
   let handle = null;
@@ -1290,10 +1300,15 @@ async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId
   const stop = async (limit) => {
     if (limitTripped || !handle) return;
     limitTripped = limit;
-    // "budget" is the only tripped limit the run.paused enum names; a runtime/deadline stop aborts
-    // the turn without claiming a reason code the contract does not define for it.
+    // "budget" is the only tripped limit the run.paused enum names, so a budget stop takes the
+    // normal interrupt path and writes run.paused{budget}. A max_runtime_s or deadline stop has NO
+    // legitimate reason code, and it must still be DISTINGUISHABLE in the durable stream: it goes
+    // through the adapter's abortWithoutPause(), which sets the same interrupted flag interrupt()
+    // sets, so the killed turn emits no agent.turn_finished. Calling session.abort() directly (what
+    // this did before) left the adapter's flag clear, and the aborted turn reported itself as a
+    // normally finished one — a limit-killed turn and a completed turn read identically.
     if (limit === "budget_usd") await handle.interrupt("budget").catch(() => {});
-    else await handle.session.abort().catch(() => {});
+    else await handle.abortWithoutPause().catch(() => {});
   };
   const onAbort = async () => {
     if (aborted || !handle) return;
@@ -1318,6 +1333,7 @@ async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId
   }
 
   try {
+    sink = createJsonlSink(eventsPath);
     handle = await createRunSession({
       run,
       grantedTools,
@@ -1351,7 +1367,7 @@ async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId
     });
     await handle.dispose().catch(() => {});
   }
-  sink.close();
+  if (sink) sink.close();
 
   const result = {
     exit_code: exitCode,

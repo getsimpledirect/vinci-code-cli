@@ -1,11 +1,35 @@
 // IR-02 Lane B — the WorkerDeclaration's CAPABILITY_MATRIX, pinned to MEASURED behaviour.
 //
-// The matrix is the daemon's honest answer to "what can a CALLER make this worker do", and the
-// Governor derives `controlLevel` from it. The failure mode this test exists to prevent is a flag
-// flipped because a MECHANISM now exists somewhere in the process — IR-02 adds steer, interrupt
-// and a durable per-run event stream to the embedded adapter — while nothing a caller can send
-// reaches that mechanism. So every flag here is asserted EQUAL TO A VALUE MEASURED IN THIS RUN,
-// never to a literal:
+// The matrix is the daemon's honest answer to "what can a CALLER make this worker do". The failure
+// mode this test exists to prevent is a flag flipped because a MECHANISM now exists somewhere in
+// the process — IR-02 adds steer, interrupt and a durable per-run event stream to the embedded
+// adapter — while nothing a caller can send reaches that mechanism.
+//
+// WHAT IS MEASURED, AND WHAT IS NOT. The matrix has THIRTEEN entries. SEVEN of them are asserted
+// equal to a value measured in this run; the other SIX are UNPINNED LITERALS that this file only
+// proves are still `false`/`"none"` and still enumerated. Claiming more than that was itself the
+// defect: an earlier header said "every flag here is asserted EQUAL TO A VALUE MEASURED IN THIS
+// RUN", which was true of six flags and of nothing else.
+//
+//   MEASURED (7): steering, pause, abort, questions   — probe A, the daemon's real inbox
+//                 activityStream                      — probe B, what the bus client may publish
+//                 safeResume                          — probe D, which lane a handoff selects
+//                 structuredEvidence                  — probe E, buildDeclaration's one config input
+//   UNPINNED LITERALS (6): approvals, restrictToReadOnly, filesystemEnforcement,
+//                 networkEnforcement, nativeReceipts, independentVerification.
+//                 Each is `false` (or `"none"`) for reasons argued in lease.mjs's matrix comment,
+//                 and each would need a real measurement this file cannot make cheaply or honestly:
+//                 approvals/restrictToReadOnly/nativeReceipts/independentVerification name control-
+//                 plane protocol this worker has no counterpart for at all, and the two
+//                 ENFORCEMENT flags would have to demonstrate the ABSENCE of confinement over a
+//                 whole process — an unbounded claim, and one whose honest negative (a granted bash
+//                 reaching outside cwd or the network) is not something to execute in a unit test.
+//                 A `false` needing no proof is not the same as a `false` that has one, so they are
+//                 named here instead of being quietly counted as measured.
+//   The two lists are asserted to PARTITION the matrix exactly: a fourteenth flag added to
+//   CAPABILITY_MATRIX belongs to neither and fails here, so this header cannot silently go stale.
+//
+// The measured flags:
 //
 //   * steering / pause / abort / questions — measured by what the daemon's own inbox delivers. A
 //     bus serving one `handoff` and one each of `steer`, `pause`, `abort` and `question`, all
@@ -180,8 +204,26 @@ try {
     `a handoff selects no embedded runtime, got ${JSON.stringify(handoffEnvelope.runtime ?? null)}`,
   );
 
+  // ---- PROBE E: buildDeclaration's ONE config-derived flag ---------------------------------------
+  // structuredEvidence is the only entry the daemon computes rather than copies: it passes
+  // Boolean(VINCI_EVIDENCE_URI_PREFIX) as read at startup. Measured by driving buildDeclaration
+  // itself in both directions — the flag must FOLLOW the argument, not the matrix literal. (The
+  // matrix's own `structuredEvidence: false` is never what a running daemon publishes; the argument
+  // is. Asserting the declaration equals the matrix, which is what this file used to do, compared
+  // buildDeclaration's output with buildDeclaration's own input expression and could not fail.)
+  const structuredEvidenceOff = buildDeclaration({ workerId: WORKER_ID, workerVersion: "0.0.0", adapterVersion: "0.0.0" })
+    .supports.structuredEvidence;
+  const structuredEvidenceOn = buildDeclaration({
+    workerId: WORKER_ID,
+    workerVersion: "0.0.0",
+    adapterVersion: "0.0.0",
+    structuredEvidence: true,
+  }).supports.structuredEvidence;
+  check(structuredEvidenceOff === false, "with no evidence prefix configured, the declaration says structuredEvidence false");
+  check(structuredEvidenceOn === true, "POSITIVE CONTROL: configuring the evidence prefix flips the published flag to true");
+
   // ---- THE PINNING --------------------------------------------------------------------------
-  // Each flag equals a value measured above. A flag flipped without the measurement flipping
+  // Each flag below equals a value measured above. A flag flipped without the measurement flipping
   // fails here, naming the measurement that contradicts it.
   const measured = {
     // A caller command of this kind reaches a running task.
@@ -193,6 +235,8 @@ try {
     activityStream: activityStreamPublished,
     // The lane whose kill-mid-write resume is proven is the lane the daemon runs.
     safeResume: embeddedLaneSelected,
+    // The matrix's own entry is what a daemon started with no evidence prefix publishes.
+    structuredEvidence: structuredEvidenceOff,
   };
   const why = {
     steering: "the adapter can steer in-process (steer.received observed here) but no bus command kind reaches it",
@@ -201,6 +245,7 @@ try {
     questions: "no question command is delivered; the run is unattended",
     activityStream: "the run-event stream is a durable LOCAL file; the worker's bus client cannot publish it",
     safeResume: "the embedded lane's SIGKILL resume proof does not cover the lane a handoff selects, nor the task file/cursor/checkout/push",
+    structuredEvidence: "buildDeclaration publishes Boolean(VINCI_EVIDENCE_URI_PREFIX); with none configured the matrix entry is what ships",
   };
   for (const [flag, value] of Object.entries(measured)) {
     assert.equal(
@@ -211,18 +256,66 @@ try {
     passed += 1;
   }
 
-  // The derived rung follows the measurement too: nothing observes the run, so the declaration
-  // claims the lowest rung.
+  // ---- THE UNPINNED SIX, NAMED --------------------------------------------------------------
+  // These are NOT measured here. Naming them is the honest half of the claim: the header says
+  // exactly which flags carry a measurement, and this block is what keeps that list true.
+  const UNPINNED = {
+    approvals: "none",
+    restrictToReadOnly: false,
+    filesystemEnforcement: false,
+    networkEnforcement: false,
+    nativeReceipts: false,
+    independentVerification: false,
+  };
+  for (const [flag, value] of Object.entries(UNPINNED)) {
+    assert.equal(
+      CAPABILITY_MATRIX[flag],
+      value,
+      `CAPABILITY_MATRIX.${flag} is an UNPINNED literal this file only records as ${JSON.stringify(value)}; ` +
+        "changing it needs a measurement, and this file has none to offer",
+    );
+    passed += 1;
+  }
+  // The two lists PARTITION the matrix: every entry is either measured or explicitly unpinned, and
+  // no entry is both. A fourteenth flag lands in neither list and fails here rather than joining
+  // the six silently — this is what stops the header's population claim from going stale.
+  assert.deepEqual(
+    Object.keys(CAPABILITY_MATRIX).sort(),
+    [...Object.keys(measured), ...Object.keys(UNPINNED)].sort(),
+    `every CAPABILITY_MATRIX entry is either measured here or named as unpinned, got ${JSON.stringify(Object.keys(CAPABILITY_MATRIX))}`,
+  );
+  assert.equal(
+    Object.keys(measured).filter((flag) => flag in UNPINNED).length,
+    0,
+    "no flag is counted as both measured and unpinned",
+  );
+  assert.equal(Object.keys(measured).length, 7, `seven flags are measured, got ${Object.keys(measured).length}`);
+  assert.equal(Object.keys(UNPINNED).length, 6, `six flags are unpinned literals, got ${Object.keys(UNPINNED).length}`);
+  passed += 4;
+
+  // controlLevel is a HAND-WRITTEN literal in buildDeclaration, not a derivation (lease.mjs says so
+  // now; it used to say "DERIVED", which claimed a mechanism no function implements). What IS
+  // checkable is that the hand-written rung agrees with the measurement: nothing observes the run,
+  // so the lowest rung is the only honest one.
   const declaration = buildDeclaration({ workerId: WORKER_ID, workerVersion: "0.0.0", adapterVersion: "0.0.0" });
-  assert.deepEqual(declaration.supports, { ...CAPABILITY_MATRIX, structuredEvidence: false }, "the declaration posts the matrix");
+  assert.equal(
+    measured.activityStream,
+    false,
+    "the rung check below is conditioned on the measured activityStream, not on the literal",
+  );
   assert.equal(
     declaration.controlLevel,
     "inventoried",
-    "activityStream is false (measured), so the derived controlLevel is the lowest rung",
+    "activityStream is false (measured above), so the hand-written controlLevel must be the lowest rung",
   );
-  passed += 2;
+  assert.deepEqual(
+    Object.keys(declaration.supports).sort(),
+    Object.keys(CAPABILITY_MATRIX).sort(),
+    "the declaration publishes every matrix entry and invents none",
+  );
+  passed += 3;
 
-  console.log(`worker-capability-declaration: ${passed} checks passed (measured: ${JSON.stringify(measured)})`);
+  console.log(`worker-capability-declaration: ${passed} checks passed (measured: ${JSON.stringify(measured)}, unpinned: ${JSON.stringify(Object.keys(UNPINNED))})`);
 } finally {
   clearTimeout(timer);
   faux.unregister();

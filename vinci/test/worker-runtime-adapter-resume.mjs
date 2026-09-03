@@ -19,6 +19,11 @@
 // Controls:
 //   * NEGATIVE run identity: resuming with a different runId throws code run_identity_mismatch and
 //     the sink line count is unchanged;
+//   * UNIVERSALITY of that identity check: a session recording TWO vinci_run entries whose SECOND
+//     names a different run is refused. Until this fixture existed, narrowing the check's loop to
+//     its first entry passed the whole suite, because no session here had two identities that
+//     disagreed. Paired with the positive control that two identities BOTH naming this run — a
+//     legitimate second attempt — still resume;
 //   * NEGATIVE missing sessionPath: code session_not_found, nothing appended;
 //   * NEGATIVE corrupt sessionPath: code session_unreadable, nothing appended;
 //   * POSITIVE replay control: a sink object whose in-memory counter is BEHIND the file (the file
@@ -30,10 +35,10 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
+import { AuthStorage, SessionManager } from "@earendil-works/pi-coding-agent";
 import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { createJsonlSink } from "../worker/run-events-sink.mjs";
-import { resumeRunSession } from "../worker/runtime-adapter.mjs";
+import { VINCI_RUN_ENTRY, resumeRunSession } from "../worker/runtime-adapter.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CHILD = join(here, "lib", "ir02-resume-child.mjs");
@@ -340,6 +345,61 @@ try {
     "utf8",
   );
   await refuses("resuming a session with no recorded run identity", { sessionPath: foreignPath }, "run_identity_mismatch");
+
+  // A session recording TWO run identities, the SECOND of which names a DIFFERENT run. The identity
+  // check asserts that EVERY recorded identity names this run, and until this fixture existed that
+  // universality was untested: no session in the suite had two vinci_run entries, so narrowing the
+  // loop to identities[0] passed everything. The foreign entry is appended through the SDK's own
+  // SessionManager — the same writer createRunSession uses — so the fixture is a real session file
+  // and not a hand-forged line.
+  const twoIdentityDir = join(root, "sessions-two-identities");
+  mkdirSync(twoIdentityDir, { recursive: true });
+  const twoIdentityPath = join(twoIdentityDir, "two-identities-session.jsonl");
+  copyFileSync(sessionPath, twoIdentityPath);
+  const foreignWriter = SessionManager.open(twoIdentityPath, twoIdentityDir, cwd);
+  foreignWriter.appendCustomEntry(VINCI_RUN_ENTRY, {
+    runId: "run_ir02_resume_SOMEONE_ELSE",
+    attemptId: "attempt_ir02_resume_SOMEONE_ELSE",
+  });
+  const twoIdentityEntries = SessionManager.open(twoIdentityPath, twoIdentityDir, cwd)
+    .getEntries()
+    .filter((entry) => entry && entry.type === "custom" && entry.customType === VINCI_RUN_ENTRY);
+  assert.equal(twoIdentityEntries.length, 2, `the fixture records two run identities, got ${twoIdentityEntries.length}`);
+  assert.equal(twoIdentityEntries[0].data.runId, RUN_ID, "the FIRST recorded identity is this run (so a first-entry-only check would pass)");
+  assert.equal(twoIdentityEntries[1].data.runId, "run_ir02_resume_SOMEONE_ELSE", "the SECOND names a different run");
+  passed += 3;
+  await refuses(
+    "resuming a session whose SECOND recorded identity names a different run",
+    { sessionPath: twoIdentityPath, sessionDir: twoIdentityDir },
+    "run_identity_mismatch",
+  );
+
+  // POSITIVE CONTROL on the same universality, through the same entry point: two recorded
+  // identities that BOTH name this run — a legitimate second attempt — must still resume. Without
+  // it, a check that refused every multi-identity session would pass the negative above.
+  const twoAttemptsDir = join(root, "sessions-two-attempts");
+  mkdirSync(twoAttemptsDir, { recursive: true });
+  const twoAttemptsPath = join(twoAttemptsDir, "two-attempts-session.jsonl");
+  const twoAttemptsSinkPath = join(root, "state", "run-events-two-attempts.jsonl");
+  copyFileSync(sessionPath, twoAttemptsPath);
+  copyFileSync(sinkPath, twoAttemptsSinkPath);
+  const attemptWriter = SessionManager.open(twoAttemptsPath, twoAttemptsDir, cwd);
+  attemptWriter.appendCustomEntry(VINCI_RUN_ENTRY, { runId: RUN_ID, attemptId: "attempt_ir02_resume_0003" });
+  const twoAttemptsHandle = await resumeRunSession({
+    run: { ...run, attemptId: "attempt_ir02_resume_0004", provider: fauxModel.provider, model: fauxModel.id },
+    grantedTools: GRANTED_TOOLS,
+    cwd,
+    sessionDir: twoAttemptsDir,
+    sessionPath: twoAttemptsPath,
+    sink: createJsonlSink(twoAttemptsSinkPath),
+    authStorage,
+    model: fauxModel,
+  });
+  check(
+    twoAttemptsHandle.resumedAtSequence === N + 1,
+    `a session with TWO identities that both name this run still resumes, at sequence ${twoAttemptsHandle.resumedAtSequence}`,
+  );
+  await twoAttemptsHandle.dispose();
 
   // ---- POSITIVE control: sink.replay() is load-bearing -----------------------------------------
   // A sink object constructed while the file was shorter, which then grew out of band. Without the
