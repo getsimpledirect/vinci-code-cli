@@ -64,7 +64,10 @@
 //       GREEN for a RECORDED and asserted reason (a refused read, an empty read, and — the genuine
 //       positive — a SUCCESSFUL non-empty read whose first line exceeds the byte cap, so none of the
 //       file comes back). IR02_FORCE_PROC_PROBE=1 points it at the real /proc path anywhere, and a
-//       forced run off Linux asserts itself a NON-MEASUREMENT rather than reporting a pass.
+//       forced run off Linux asserts itself a NON-MEASUREMENT rather than reporting a pass. A RED
+//       there IS the daemon's environment, so a failure reports the body's LENGTH, a DIGEST and the
+//       variable NAMES with each value's byte length — never the bytes — and that redaction is
+//       itself checked end to end on a canary value planted in control 1's block.
 //       — and the F6 pin showing that PI_OFFLINE in a taskEnv would be inert. That
 //       pin is taken on the BUILT artifact the package specifier resolves to (dist), not on the
 //       TypeScript source, and reaches the real `ensureTool` call site with globalThis.fetch
@@ -73,6 +76,7 @@
 //   POSITIVE: a scripted `ls` yields tool.started then tool.completed with a 64-hex outputDigest.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -112,6 +116,11 @@ const PARENT_ONLY_VALUE = "ir02-parent-only-9c1d";
 // F3: a file planted OUTSIDE the session's cwd, which a granted `read` still returns.
 const OUTSIDE_CWD_FILE = "ir02-outside-cwd-2f6b.txt";
 const OUTSIDE_CWD_VALUE = "ir02-outside-cwd-value-7a30";
+// F3/DISCLOSURE: a value planted in the marker-FREE surrogate block, used to check end to end that
+// a leak FAILURE MESSAGE names the variable and never prints its value. It must not be the exec-time
+// marker: control 1's whole point is that it fails on readability with the content clause silent.
+const DISCLOSURE_CANARY_NAME = "IR02_DISCLOSURE_CANARY";
+const DISCLOSURE_CANARY_VALUE = "ir02-disclosure-canary-b73e";
 // F3, Linux half: the process environment as a FILE. Never read on this host — but the probe that
 // would read it is exercised here against surrogates, and can be pointed at the real path on any
 // host with IR02_FORCE_PROC_PROBE=1.
@@ -142,9 +151,85 @@ const EXEC_TIME_SURROGATE_VALUE = "ir02-exec-time-surrogate-4d8f";
 // The two ways a `read` can come back WITHOUT the file's bytes in it. Under this probe's polarity
 // they are the DESIRED outcomes (the environment block did not reach the model), so they are
 // classified and reported by name rather than asserted against.
-const READ_FIRST_LINE_CAP_NOTICE = /^\[Line \d+ is [^\]]*exceeds [^\]]*limit\./;
+// 🔴 ANCHORED AT BOTH ENDS, and the review that found this executed the evasion. The prefix-only
+// form of this pattern classified by PREFIX rather than by content: `classifyEnvironRead` tests it
+// BEFORE the content branch, so a body that BEGAN with the cap notice and then carried the
+// environment block was reported "contained — carries none of the file" while 4010 bytes of real
+// environment reached the model, and the suite stayed green at full count. The end anchor makes it
+// match only a body that is EXACTLY the notice: `[^\]\n\u0000]*` cannot cross the notice's own
+// closing bracket, so appended bytes leave nothing for `\]$` to match, and NUL is excluded because
+// an environment block is NUL-separated — bytes spliced INSIDE the brackets break the match too,
+// which an end anchor alone would not catch. The notice's exact shape is read.js's
+// `[Line N is <size>, exceeds <cap> limit. Use bash: sed -n 'Np' <path> | head -c <bytes>]`.
+const READ_FIRST_LINE_CAP_NOTICE = /^\[Line \d+ is [^\]\n\u0000]*exceeds [^\]\n\u0000]*limit\.[^\]\n\u0000]*\]$/;
 const READ_TRUNCATION_NOTICE = /\[Showing lines \d+-\d+ of \d+/;
 let linuxProcProbe = "not reached";
+
+// F3/DISCLOSURE: how many variable NAMES a redacted body report may list before it elides the rest.
+const ENVIRON_REPORT_MAX_NAMES = 40;
+
+/**
+ * A NON-DISCLOSING description of a body this probe must talk about but must not print.
+ *
+ * 🔴 The polarity repair changed this from a nicety into a hazard. While RED meant "no leak", the
+ * ~300 raw bytes these failure messages interpolated were error text. RED now means the environment
+ * block DID come back, and the first Linux run is expected to go red (a process can always read its
+ * own environment file) — so those bytes would be the daemon's real environment, written verbatim
+ * into continuous-integration logs by the very guard that exists to keep them from travelling. A
+ * guard that prints what it protects gets worse the moment it starts working.
+ *
+ * So a failure reports LENGTH, a DIGEST, and a REDACTED SHAPE: how many NUL-separated entries the
+ * body held, and the variable NAMES with the BYTE LENGTH of each value in place of the value. An
+ * entry is named only when its name is genuinely variable-shaped ([A-Za-z0-9_.-], at most 64
+ * characters); anything else is counted and not printed, so nothing can smuggle a value out
+ * through the name field. The digest lets two runs be compared, and a maintainer be told "this is
+ * the same body as before", without either run publishing it.
+ */
+function describeEnvironBody(body) {
+  const bytes = Buffer.byteLength(body, "utf8");
+  const digest = createHash("sha256").update(body, "utf8").digest("hex");
+  const entries = body.split("\u0000").filter((entry) => entry.length > 0);
+  const names = [];
+  let unnamed = 0;
+  for (const entry of entries) {
+    const eq = entry.indexOf("=");
+    if (eq <= 0) {
+      unnamed += 1;
+      continue;
+    }
+    // Only an entry whose name is actually VARIABLE-SHAPED is named. Anything else is counted and
+    // not printed: in a body that is not NUL-separated the text before the first "=" is just the
+    // body's first bytes, and printing it would smuggle the payload out through the name field.
+    const name = entry.slice(0, eq);
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(name)) {
+      unnamed += 1;
+      continue;
+    }
+    names.push(`${name}=<${Buffer.byteLength(entry.slice(eq + 1), "utf8")}B>`);
+  }
+  const shown = names.slice(0, ENVIRON_REPORT_MAX_NAMES);
+  const elided = names.length - shown.length;
+  return `REDACTED(bytes=${bytes} sha256=${digest} entries=${entries.length} named=${names.length} `
+    + `unnamed=${unnamed} names=[${shown.join(" ")}${elided > 0 ? ` +${elided} more` : ""}])`;
+}
+
+// F2: the window at which "this body carries some of that file" is MEASURED. 24 characters is far
+// past coincidence for a 196-byte bracketed notice and short enough that a single leaked variable
+// is caught.
+const ENVIRON_SHARED_RUN_CHARS = 24;
+
+/**
+ * The offset in `body` of the first ENVIRON_SHARED_RUN_CHARS-character run that also occurs in
+ * `source`, or -1. Deliberately returns an OFFSET and not the run itself: the callers report it in
+ * failure messages, and a message that quoted the matched bytes would disclose the very content the
+ * match proves leaked.
+ */
+function sharedRunOffset(body, source) {
+  for (let i = 0; i + ENVIRON_SHARED_RUN_CHARS <= body.length; i += 1) {
+    if (source.includes(body.slice(i, i + ENVIRON_SHARED_RUN_CHARS))) return i;
+  }
+  return -1;
+}
 
 /** The text a tool result actually carries, as the model would see it (never "[]" for an empty one). */
 function toolResultText(content) {
@@ -998,6 +1083,15 @@ try {
     // leak) failed the precondition and went RED, while a readable, marker-free one (the leak
     // SUCCEEDING) satisfied every clause and went GREEN. Both were executed by review.
     //
+    // 🔴 A COUNT OF MINE WAS WRONG, in the flattering direction. I recorded that THREE of the six
+    // surrogate controls changed expected outcome in this polarity repair. It is FOUR. Controls 3,
+    // 4 and 5 went RED-to-GREEN — a refused read, an empty read and a capped read each used to fail
+    // a "the read succeeded" PRECONDITION and are now the contained outcomes — and control 1 went
+    // GREEN-to-RED: a readable, marker-free block used to be the reachability positive and is now
+    // the leak caught on readability alone. Only controls 2 and 6 kept their side. Three was the
+    // number that moved in ONE direction, reported as the number that moved at all, and the error
+    // understated how much of this block the repair rewrote.
+    //
     // 🔴 THE DISCRIMINATOR, and why it cannot be a runtime value. That precondition existed to stop
     // a marker-absence claim passing over a body that never held the file. The marker it protected
     // was set with `process.env.X = ...` at RUNTIME, while the file carries the process's EXEC-TIME
@@ -1046,7 +1140,9 @@ try {
           + `${JSON.stringify(execTimeMarker)}`,
       );
       const result = await callTool("read", { path });
-      const seen = JSON.stringify(result.body.slice(0, 300));
+      // 🔴 NOT the body. See describeEnvironBody: under the repaired polarity a failure message here
+      // is a message ABOUT a leak, and printing the payload into a CI log completes it.
+      const seen = `error=${result.isError === true} ${describeEnvironBody(result.body)}`;
       const outcome = classifyEnvironRead(result);
       const armed = execTimeMarker !== null;
       if (armed) {
@@ -1098,14 +1194,28 @@ try {
     //     3. a path that does not exist -> contained because the READ WAS REFUSED. This is exactly
     //        the shape a forced run takes on this macOS host (IR02_FORCE_PROC_PROBE=1), and it is
     //        the reason a forced green is asserted below to be a NON-MEASUREMENT.
-    //     5. a readable but EMPTY file -> contained because the read returned nothing. Without this
-    //        one the empty branch of classifyEnvironRead has no control of its own.
+    //     5. a readable but EMPTY file -> contained because the read returned NOTHING, which is a
+    //        different thing from being refused: the tool answered, with a non-error result whose
+    //        body is empty. Without this one the empty branch of classifyEnvironRead has no control
+    //        of its own.
     //     4. 🔴 THE GENUINE POSITIVE CONTROL. One line larger than the read tool's byte cap, with
     //        the exec-time marker BEYOND the cap. The read SUCCEEDS — non-error, non-empty, a real
     //        tool result comes back — and yet none of the file's bytes are in it, so the probe
     //        passes with both clauses evaluated and neither firing. That is a pass for the right
-    //        reason rather than a pass because everything refused: without it, deleting the whole
+    //        reason rather than a pass because the read refused: without it, deleting the whole
     //        probe body would still leave controls 3 and 5 green.
+    //
+    //   🔴 A SECOND COUNT OF MINE WAS WRONG, also in the flattering direction, and it is the count
+    //   that was supposed to show why control 4 matters. I said THREE of the six surrogates are
+    //   containment-by-refusal; the comment above this one said TWO, by reading "controls 3 and 5
+    //   green" as "two refusals". Instrumenting every probe invocation says ONE. Only control 3
+    //   returns an error: control 5 is contained by EMPTINESS with isError false, and controls 1, 2
+    //   and 6 are leaks, which cannot be refusals at all because classifyEnvironRead maps every
+    //   errored read to contained. The refusal population is pinned mechanically below rather than
+    //   restated here, so the corrected number cannot drift back. THE CONCLUSION SURVIVES AND THE
+    //   ARGUMENT FOR IT GETS STRONGER: with only one control contained by refusal, control 4 is the
+    //   only surrogate that shows a SUCCESSFUL read returning none of the file, so it is even more
+    //   load-bearing than the inflated count made it look.
     const environSurrogateDir = join(envProbeRoot, "environ-surrogate");
     mkdirSync(environSurrogateDir, { recursive: true });
     const environReadable = join(environSurrogateDir, "environ-readable");
@@ -1116,7 +1226,11 @@ try {
     const environManyLines = join(environSurrogateDir, "environ-many-lines");
     // NUL-separated and newline-free, the shape /proc/self/environ actually has.
     const NUL = "\u0000";
-    writeFileSync(environReadable, `PATH=/usr/bin${NUL}HOME=/tmp${NUL}`, "utf8");
+    writeFileSync(
+      environReadable,
+      `PATH=/usr/bin${NUL}HOME=/tmp${NUL}${DISCLOSURE_CANARY_NAME}=${DISCLOSURE_CANARY_VALUE}${NUL}`,
+      "utf8",
+    );
     // Control 2's file is not hand-written: a child is SPAWNED with the marker in the environment
     // handed to execve, and its only job is to serialise its own environment as a NUL-separated
     // block. Nothing in that child assigns to process.env, so what lands on disk is the exec-time
@@ -1192,6 +1306,7 @@ try {
         `${label}: it failed on ${JSON.stringify(expectedFragment)}, got `
           + `${JSON.stringify(String(message).slice(0, 300))}`,
       );
+      return String(message);
     }
 
     // A control that expects the probe to go GREEN, and pins WHICH containment reason produced the
@@ -1207,10 +1322,27 @@ try {
       return outcome;
     }
 
-    await expectProbeLeak(
+    const readableLeakMessage = await expectProbeLeak(
       environReadable,
       "environ-channel control 1 (readable, marker-free — LEAK caught on READABILITY ALONE)",
       "RETURNED THE FILE (the read returned the file's content)",
+    );
+    // 🔴 THE FAILURE MESSAGE IS ITSELF GUARDED, end to end through the real entry point rather than
+    // by unit-testing the redactor. This message is what a red Linux run writes into a CI log, and
+    // under the repaired polarity red is the state where the body IS the daemon's environment. So:
+    // the canary planted in this control's block must NOT appear in the message the probe threw,
+    // and its NAME must, with the byte length of the value in the value's place.
+    check(
+      !readableLeakMessage.includes(DISCLOSURE_CANARY_VALUE),
+      "the leak failure message discloses NO VALUE from the body it reports on — this is the guard "
+        + "that stops a red Linux run from publishing the environment it exists to protect",
+    );
+    check(
+      readableLeakMessage.includes(
+        `${DISCLOSURE_CANARY_NAME}=<${Buffer.byteLength(DISCLOSURE_CANARY_VALUE, "utf8")}B>`,
+      ),
+      "...and it still NAMES the variable and the size of its value, so a maintainer reading a "
+        + `failed log can tell what leaked, got ${JSON.stringify(readableLeakMessage.slice(0, 400))}`,
     );
     await expectProbeLeak(
       environExecTime,
@@ -1218,7 +1350,7 @@ try {
         + "exec-time marker)",
       "returned content carrying the EXEC-TIME marker",
     );
-    await expectProbeContained(
+    const absentOutcome = await expectProbeContained(
       environAbsent,
       "environ-channel control 3 (path does not exist — CONTAINED because the read was REFUSED; "
         + "this is the shape a forced run takes on this macOS host)",
@@ -1241,14 +1373,41 @@ try {
     check(
       oversizeOutcome.body.trim().length > 0,
       "control 4's successful read returned a non-empty body (the size-cap notice), so the green is "
-        + `not the empty-content green, got ${JSON.stringify(oversizeOutcome.body.slice(0, 120))}`,
+        + `not the empty-content green, got ${describeEnvironBody(oversizeOutcome.body)}`,
     );
     check(
       oversizeOutcome.armed === true,
       "control 4 ran with the exec-time content clause ARMED, so its green is a pass of both "
         + "clauses and not a pass of an unarmed probe",
     );
-    await expectProbeContained(
+    // 🔴 THE REASON CHECKED AS A FACT RATHER THAN ASSERTED AS A LABEL. Everything above this line
+    // trusts classifyEnvironRead's own verdict, and a review demonstrated exactly what that costs:
+    // with the cap-notice pattern anchored only at the START, a body that BEGAN with the notice and
+    // then carried the environment block was labelled "carries none of the file" while the file's
+    // bytes went to the model, and every check above still passed. So control 4 now MEASURES the
+    // claim its reason string makes: no run of ENVIRON_SHARED_RUN_CHARS characters is common to the
+    // body and the target file. This is the assertion that would have caught the evasion with the
+    // regex still broken, and it is why the reason and the fact are now two independent things.
+    const oversizeFileBody = readFileSync(environOversize, "utf8");
+    const oversizeSharedRun = sharedRunOffset(oversizeOutcome.body, oversizeFileBody);
+    check(
+      oversizeSharedRun === -1,
+      "control 4's body carries NONE OF THE TARGET FILE'S BYTES — measured, not taken from the "
+        + `classifier's reason string; a run of ${ENVIRON_SHARED_RUN_CHARS} characters shared with `
+        + `the file starts at body offset ${oversizeSharedRun} of `
+        + `${describeEnvironBody(oversizeOutcome.body)}`,
+    );
+    // POSITIVE CONTROL for that measurement, through the same function and the same file: it DOES
+    // find a shared run when one exists, so the negative above is evidence rather than a comparison
+    // that can never fire. The spliced body is exactly the shape the review's evasion produced —
+    // the notice, then the file — so this control also pins that such a body is DETECTABLE here
+    // even if the classifier were to call it contained again.
+    check(
+      sharedRunOffset(`${oversizeOutcome.body}${oversizeFileBody.slice(0, 4096)}`, oversizeFileBody) !== -1,
+      "the shared-run measurement fires when the body really does carry the file's bytes — without "
+        + "this the check above could pass because it can never find anything",
+    );
+    const emptyOutcome = await expectProbeContained(
       environEmpty,
       "environ-channel control 5 (readable but EMPTY — CONTAINED because the read returned nothing)",
       "the read returned empty content",
@@ -1258,6 +1417,31 @@ try {
       "environ-channel control 6 (past the read tool's LINE cap — the body still carries the "
         + "block's first lines, so a PARTIAL environment block LEAKED)",
       "RETURNED THE FILE (the read returned the file's first lines plus a truncation notice)",
+    );
+
+    // 🔴 THE REFUSAL POPULATION, MEASURED RATHER THAN COUNTED IN A COMMENT. Exactly ONE of the six
+    // surrogates is contained by a REFUSAL. This is asserted in two halves so it covers all six and
+    // not merely the three that return an outcome: over the three GREEN controls, only control 3 is
+    // an errored read; and an errored read is ALWAYS classified contained, so none of the three RED
+    // controls can have been a refusal either. Both halves are needed — the first alone would leave
+    // "one refusal" a claim about half the population.
+    const refusalControls = [
+      { label: "control 3 (absent path)", outcome: absentOutcome },
+      { label: "control 4 (over the byte cap)", outcome: oversizeOutcome },
+      { label: "control 5 (empty file)", outcome: emptyOutcome },
+    ].filter((entry) => entry.outcome.isError === true).map((entry) => entry.label);
+    assert.deepEqual(
+      refusalControls,
+      ["control 3 (absent path)"],
+      "exactly ONE of the green surrogates is contained by a REFUSAL — control 5 is contained by "
+        + "EMPTINESS (a non-error result with an empty body) and control 4 by the byte cap, so the "
+        + "three-refusals and two-refusals versions of this count were both wrong",
+    );
+    passed += 1;
+    check(
+      classifyEnvironRead({ isError: true, body: "anything at all" }).returnedFile === false,
+      "an errored read is ALWAYS classified contained, which is what makes the refusal population a "
+        + "statement about all six controls and not only about the three green ones",
     );
 
     // -- A2: the platform selector is ASSERTED, not merely logged ----------------------------------
