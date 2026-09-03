@@ -4,9 +4,34 @@
 // `vinci -p` subprocess (the subprocess path in run.mjs stays untouched as the compatibility
 // lane). The adapter:
 //
-//   * registers ONLY the granted tools — nothing from cwd, extensions, skills, prompt templates,
-//     AGENTS.md/context files or ambient config can widen a Run (a null ResourceLoader guarantees
-//     this regardless of what exists on disk);
+//   * registers EXACTLY the granted tools, and runs them under an environment the Run defines.
+//     Nothing on disk under the run's cwd or in ~/.pi — extensions, skills, prompt templates,
+//     AGENTS.md/context files, project or global settings.json — and nothing in the daemon's own
+//     process environment can widen a Run. Four mechanisms carry it, each load-bearing alone:
+//       - a null ResourceLoader: no extensions, skills, prompt templates, AGENTS.md/context
+//         files, themes or system-prompt appends, regardless of what exists on disk;
+//       - an in-memory, project-UNTRUSTED SettingsManager: neither `<cwd>/.pi/settings.json` nor
+//         `<agentDir>/settings.json` is read, so a settings file planted in the very working tree
+//         the agent holds `write`/`edit` on cannot hand `shellCommandPrefix` or `shellPath` to the
+//         bash tool. Settings are re-read at every session construction, resume included, so this
+//         has to hold on both entry points;
+//       - an adapter-owned `bash` tool definition whose subprocess environment is EXACTLY the
+//         caller's `taskEnv` — never `process.env`. The SDK's own bash spawns with
+//         `getShellEnv()` = `{...process.env}` and `createAgentSession` exposes no option for
+//         that environment, so the adapter registers its own definition through `customTools`
+//         (which override same-named built-ins in the session's tool registry) and refuses to
+//         grant `bash` at all without a `taskEnv`;
+//       - a MANDATORY, non-empty `grantedTools` (an omitted allowlist registers the SDK's DEFAULT
+//         tool set, so an absent grant is the WIDEST Run this adapter can open), plus a
+//         construction-time pin of the session's tool registry to exactly that set — in both
+//         directions, so neither an ungranted tool that would be executable nor a granted tool the
+//         runtime cannot register ever becomes a handle. The `tools` allowlist is what REFUSES an
+//         ungranted call; the `capability.refused` event is the RECORD of that refusal, and it is
+//         emitted only for a name the pin has already proven has no implementation to run.
+//     What this does NOT claim: the granted tools still read and write the real filesystem at
+//     `cwd`, so ambient FILES remain visible to a granted `read`/`ls`/`grep`/`bash`. The guarantee
+//     is over CONFIGURATION — what the session is set up to do, and with what environment — not
+//     over the contents of the workspace the Run was pointed at.
 //   * translates native agent-session events into the Vinci run-event vocabulary, writing them to
 //     a durable sink (run-events-sink.mjs);
 //   * supports steer / interrupt / resume-after-process-replacement.
@@ -19,7 +44,9 @@ import { join } from "node:path";
 import {
   AuthStorage,
   SessionManager,
+  SettingsManager,
   createAgentSession,
+  createBashToolDefinition,
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { getModel } from "@earendil-works/pi-ai/compat";
@@ -29,6 +56,19 @@ import { getModel } from "@earendil-works/pi-ai/compat";
 export const ALLOWLISTED_CUSTOM_TOOLS = Object.freeze([]);
 
 const VALID_PAUSE_REASONS = Object.freeze(["manual", "steer", "budget", "worker_lost"]);
+
+// The one granted tool whose EXECUTION ENVIRONMENT the adapter has to own. The SDK's bash spawns
+// with getShellEnv() = {...process.env}; in-process that is the DAEMON's environment, including
+// the debris-authority capabilities run.mjs deletes from a subprocess child. Granting it without
+// a taskEnv is refused at construction rather than silently widened.
+export const ENVIRONMENT_BEARING_TOOL = "bash";
+
+// capability.refused names a tool the MODEL chose, so its name is unbounded free text on a stream
+// documented as content-free. The name is emitted verbatim only when it is a conservative
+// identifier within a length cap; anything else becomes a digest of the name. `capabilityIdForm`
+// says which, so a reader never has to guess whether it is looking at a name or a digest.
+const CAPABILITY_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+export const CAPABILITY_ID_MAX_LENGTH = 64;
 
 // The custom session entry that binds a persisted session file to the Run it was opened for.
 // resumeRunSession refuses to reopen a session whose recorded identity is not this Run's.
@@ -112,9 +152,128 @@ function nullResourceLoader() {
   };
 }
 
+// A settings manager that answers from NOTHING on disk. Without it createAgentSession falls
+// through to SettingsManager.create(cwd, agentDir) with project trust defaulting to TRUE, and a
+// `.pi/settings.json` in the run's cwd — a file inside the repository working tree the agent
+// itself holds `write` and `edit` on — hands `shellCommandPrefix`/`shellPath` straight to the bash
+// tool factory. `projectTrusted: false` makes the project scope unreadable; the in-memory storage
+// means the global scope has no file behind it either.
+function nullSettingsManager() {
+  return SettingsManager.inMemory({}, { projectTrusted: false });
+}
+
+// The SDK's OWN session-id rule, applied by the SDK itself: SessionManager.inMemory(cwd, {id})
+// runs assertValidSessionId. That function is not exported from the package, so asking the SDK is
+// the only way to test the rule that will actually be applied — a regex copied into this repo
+// would be a second spelling of the rule, free to drift from it. In-memory: no file is created.
+export function isValidSessionId(sessionId) {
+  if (typeof sessionId !== "string" || sessionId.length === 0) return false;
+  try {
+    SessionManager.inMemory(process.cwd(), { id: sessionId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // A payload VALUE is always kinded and content-free: { kind, value }.
 function kinded(kind, value) {
   return { kind, value };
+}
+
+// The bounded {capabilityId, capabilityIdForm} pair for a model-chosen capability name.
+export function capabilityIdFields(name) {
+  const text = typeof name === "string" ? name : String(name ?? "");
+  if (text.length > 0 && text.length <= CAPABILITY_ID_MAX_LENGTH && CAPABILITY_ID_PATTERN.test(text)) {
+    return { capabilityId: kinded("id", text), capabilityIdForm: kinded("enum", "name") };
+  }
+  return { capabilityId: kinded("digest", sha256Hex(text)), capabilityIdForm: kinded("enum", "digest") };
+}
+
+// An omitted or empty grant is not "no tools": createAgentSession registers its DEFAULT built-in
+// set (read, bash, edit, write) when `tools` is undefined, so an absent grant is the widest Run
+// this adapter can open. It is refused at construction, on both entry points.
+function assertGrantedTools(grantedTools, where) {
+  const valid =
+    Array.isArray(grantedTools) &&
+    grantedTools.length > 0 &&
+    grantedTools.every((name) => typeof name === "string" && name.length > 0);
+  if (valid) return;
+  const error = new Error(
+    `${where}: grantedTools must be a non-empty array of tool names (got ${JSON.stringify(grantedTools ?? null)}); ` +
+      "an omitted allowlist registers the SDK's DEFAULT tool set, which silently WIDENS the Run",
+  );
+  error.code = "granted_tools_required";
+  throw error;
+}
+
+// Granting the environment-bearing tool without saying what environment it runs under is the
+// silent-widening shape this adapter exists to prevent, so it is an error, not a default.
+function assertTaskEnv(grantedTools, taskEnv, where) {
+  if (!grantedTools.includes(ENVIRONMENT_BEARING_TOOL)) return;
+  if (taskEnv && typeof taskEnv === "object" && !Array.isArray(taskEnv)) return;
+  const error = new Error(
+    `${where}: granting ${JSON.stringify(ENVIRONMENT_BEARING_TOOL)} requires taskEnv — the environment its ` +
+      "subprocesses run with. Without it the SDK spawns with {...process.env}, which in-process is the " +
+      "DAEMON'S environment (debris-authority capabilities, provider keys, the unattended-policy stamp).",
+  );
+  error.code = "task_env_required";
+  throw error;
+}
+
+// Freeze the Run's environment as own, string-valued entries only: a prototype-chain or
+// non-string value would reach child_process.spawn and is not something a Run's env may carry.
+function freezeTaskEnv(taskEnv) {
+  const frozen = {};
+  for (const key of Object.keys(taskEnv)) {
+    const value = taskEnv[key];
+    if (typeof value === "string") frozen[key] = value;
+  }
+  return Object.freeze(frozen);
+}
+
+// The adapter's own `bash`, registered through `customTools` so it REPLACES the SDK's built-in
+// definition in the session's tool registry (AgentSession builds the registry from the built-ins
+// and then sets custom tools over it by name). Two differences from the built-in, both deliberate:
+//   * `spawnHook` replaces the process environment the command spawns with. The SDK's default is
+//     getShellEnv() = {...process.env}; here it is exactly the environment run.mjs computed for
+//     this task, which is the same map the subprocess lane hands its child.
+//   * no `commandPrefix`/`shellPath` is passed. With nullSettingsManager() those are undefined
+//     anyway; not passing them states that no settings file may reach this tool even if the
+//     settings manager were ever changed.
+function embeddedBashTool(cwd, taskEnv) {
+  const frozen = freezeTaskEnv(taskEnv);
+  return createBashToolDefinition(cwd, {
+    spawnHook: (context) => ({ ...context, env: { ...frozen } }),
+  });
+}
+
+// The `tools` allowlist handed to createAgentSession is the ENFORCEMENT; the capability.refused
+// event is only a RECORD of it. Pin the enforcement here, in BOTH directions, so the constructed
+// session and the Run's grant are the same set:
+//
+//   * a registered tool the Run does NOT grant would be executable, and the translator's
+//     capability.refused would then be a label on a tool that ran;
+//   * a granted tool the session did NOT register is a Run silently running NARROWER than its own
+//     definition — a misspelled or retired name in `envelope.tools` would produce a
+//     capability.refused for every call to it, attributed to "not attested" when the truth is that
+//     the grant named a tool this runtime has no implementation for.
+//
+// Either way no handle is returned, so by the time a tool_execution_start names an ungranted tool,
+// that tool provably has no implementation to run.
+export function assertRegistryPinnedToGrant(session, grantedTools, where) {
+  const granted = new Set(grantedTools);
+  const registered = new Set(session.getAllTools().map((tool) => tool.name));
+  const ungranted = [...registered].filter((name) => !granted.has(name)).sort();
+  const unregistered = [...granted].filter((name) => !registered.has(name)).sort();
+  if (ungranted.length === 0 && unregistered.length === 0) return;
+  const error = new Error(
+    `${where}: the constructed session's tool registry is not the Run's grant — registered but not granted: ` +
+      `${JSON.stringify(ungranted)}; granted but not registered: ${JSON.stringify(unregistered)} ` +
+      `(granted: ${JSON.stringify([...granted].sort())})`,
+  );
+  error.code = "tool_registry_mismatch";
+  throw error;
 }
 
 function lastAssistantUsage(messages) {
@@ -130,6 +289,7 @@ function openSession({
   run,
   grantedTools,
   customTools,
+  taskEnv,
   cwd,
   sessionDir,
   persistent,
@@ -137,6 +297,7 @@ function openSession({
   model,
   sessionId,
   sessionManager,
+  where,
 }) {
   const newSessionOptions = sessionId ? { id: sessionId } : undefined;
   const manager =
@@ -149,16 +310,24 @@ function openSession({
   const allowlistedCustom = (Array.isArray(customTools) ? customTools : []).filter((tool) =>
     ALLOWLISTED_CUSTOM_TOOLS.includes(tool && tool.name),
   );
+  // `bash` is only ever registered as the adapter's own definition, whose environment is the Run's.
+  const registeredCustom = grantedTools.includes(ENVIRONMENT_BEARING_TOOL)
+    ? [...allowlistedCustom, embeddedBashTool(cwd, taskEnv)]
+    : allowlistedCustom;
   return createAgentSession({
     cwd,
     agentDir: join(sessionDir, "agent"),
     model: modelInstance,
     authStorage: auth,
     tools: grantedTools,
-    customTools: allowlistedCustom,
+    customTools: registeredCustom,
     resourceLoader: nullResourceLoader(),
+    settingsManager: nullSettingsManager(),
     sessionManager: manager,
-  }).then((result) => ({ session: result.session, authStorage: auth }));
+  }).then((result) => {
+    assertRegistryPinnedToGrant(result.session, grantedTools, where);
+    return { session: result.session, authStorage: auth };
+  });
 }
 
 // Shared translator: subscribes to the session and returns the adapter handle (prompt/steer/
@@ -239,11 +408,16 @@ function attachTranslator({ run, session, authStorage, sink, clock, grantedTools
       }
       case "tool_execution_start": {
         if (!grantedSet.has(event.toolName)) {
+          // This branch RECORDS a refusal; it does not perform one. The refusal is performed by
+          // the `tools` allowlist handed to createAgentSession and pinned at construction
+          // (assertRegistryPinnedToGrant), which is why a name reaching here has no implementation
+          // in the session's registry and the SDK answers the call with "Tool <name> not found".
+          // The name is model-chosen, so it is bounded before it reaches the sink.
           refusedToolCalls.add(event.toolCallId);
           emit(
             "capability.refused",
             {
-              capabilityId: kinded("id", event.toolName),
+              ...capabilityIdFields(event.toolName),
               reason: kinded("enum", "not_attested"),
             },
             `tool:${event.toolCallId}:refused`,
@@ -397,8 +571,12 @@ function attachTranslator({ run, session, authStorage, sink, clock, grantedTools
  * @param {object} options
  * @param {object} options.run - {runId, workOrderId, workOrderDigest, attemptId, workspaceId,
  *   contextManifestDigest|null, contextManifestEntryCount?, provider, model}
- * @param {string[]} options.grantedTools - exact tool allowlist passed to the session
+ * @param {string[]} options.grantedTools - exact tool allowlist passed to the session. REQUIRED
+ *   and non-empty: an omitted allowlist registers the SDK's default tool set.
  * @param {object[]} [options.customTools=[]] - custom tools, gated by ALLOWLISTED_CUSTOM_TOOLS
+ * @param {object} [options.taskEnv] - the environment the Run's own subprocesses run with (the
+ *   map run.mjs computes with applyEnvDelta, minus the daemon-only variables). REQUIRED when
+ *   `bash` is granted; unused otherwise.
  * @param {string} options.cwd - working directory
  * @param {string} options.sessionDir - persistent session directory
  * @param {boolean} [options.persistent=true] - persist via SessionManager.create, else inMemory
@@ -416,6 +594,7 @@ export async function createRunSession({
   run,
   grantedTools,
   customTools = [],
+  taskEnv,
   cwd,
   sessionDir,
   persistent = true,
@@ -425,16 +604,20 @@ export async function createRunSession({
   model,
   sessionId,
 }) {
+  assertGrantedTools(grantedTools, "createRunSession");
+  assertTaskEnv(grantedTools, taskEnv, "createRunSession");
   const opened = await openSession({
     run,
     grantedTools,
     customTools,
+    taskEnv,
     cwd,
     sessionDir,
     persistent,
     authStorage,
     model,
     sessionId,
+    where: "createRunSession",
   });
   const { session } = opened;
   // Record the run identity as a custom entry so resume can verify it.
@@ -502,6 +685,9 @@ function identityMismatch(message) {
  * @param {string} options.sessionPath - the persisted session file to reopen (handle.sessionPath)
  * @returns {Promise<{prompt, steer, interrupt, dispose, complete, sessionPath, session, authStorage,
  *   resumedFromSequence, resumedAtSequence}>}
+ * @throws {Error} code "granted_tools_required" when grantedTools is absent/empty (nothing appended)
+ * @throws {Error} code "task_env_required" when `bash` is granted without taskEnv (nothing appended)
+ * @throws {Error} code "tool_registry_mismatch" when the session registers an ungranted tool
  * @throws {Error} code "session_not_found" when sessionPath is absent/missing (nothing appended)
  * @throws {Error} code "session_unreadable" when the file is not a pi session (nothing appended)
  * @throws {Error} code "run_identity_mismatch" when the persisted runId differs (nothing appended)
@@ -510,6 +696,7 @@ export async function resumeRunSession({
   run,
   grantedTools,
   customTools = [],
+  taskEnv,
   cwd,
   sessionDir,
   sessionPath,
@@ -518,6 +705,10 @@ export async function resumeRunSession({
   authStorage,
   model,
 }) {
+  // (0) The grant and the Run's environment are checked FIRST, before the session file is even
+  // opened: a resume that would widen the Run must leave the event log byte-identical too.
+  assertGrantedTools(grantedTools, "resumeRunSession");
+  assertTaskEnv(grantedTools, taskEnv, "resumeRunSession");
   // (1) The file must exist. SessionManager.open() on a missing path silently starts a BRAND NEW
   // session at that path, which would read as a successful resume of an empty run.
   if (typeof sessionPath !== "string" || sessionPath.length === 0) {
@@ -574,12 +765,14 @@ export async function resumeRunSession({
     run,
     grantedTools,
     customTools,
+    taskEnv,
     cwd,
     sessionDir,
     persistent: true,
     authStorage,
     model,
     sessionManager,
+    where: "resumeRunSession",
   });
   const { session } = opened;
   // Bind this attempt to the run in the transcript too, so a later resume verifies against it.

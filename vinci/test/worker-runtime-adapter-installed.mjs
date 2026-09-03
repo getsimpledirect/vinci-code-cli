@@ -33,6 +33,14 @@
 //      consults is the one the faux provider registered in — no model call can leave the process),
 //      producing the same ordered event types and kinded, content-free payloads as the in-process
 //      tests.
+//   4b. THE TWO AMBIENT SOURCES THE NULL ResourceLoader DOES NOT COVER, measured through the
+//      installed artifact: a project `.pi/settings.json` planted in the run's cwd (whose
+//      shellCommandPrefix executes on every bash call, and whose project scope the SDK trusts by
+//      default) and the daemon's own process environment (the SDK's bash spawns with
+//      getShellEnv() = {...process.env}). Each has a positive control proving the plant is live —
+//      the shipped SDK's own SettingsManager reads the file; both daemon values are live in this
+//      process — and the installed adapter's session must show neither. The bash tool is granted
+//      and runs, so the negatives are read off a command that actually executed.
 //   5. NEGATIVE CONTROL for the isolation assertion: the installed adapter is copied to a second
 //      path and patched to use the SDK's DefaultResourceLoader instead of the empty one. The
 //      ambient-AGENTS.md-marker assertion is then run against that copy and MUST FAIL — proving
@@ -100,6 +108,15 @@ const AMBIENT_MARKER = "AMBIENT-MARKER-INSTALLED-4d17";
 const PROMPT_MARKER = "vinci-ir02-installed-prompt-marker-9b2e";
 const PROMPT = `List the files in this directory. ${PROMPT_MARKER}`;
 const LS_TARGET_FILE = "ir02-installed-target-6a3f.txt";
+// Ambient settings and ambient environment, planted for section 4b.
+const SETTINGS_PWNED_FILE = "ir02-installed-settings-pwned-2b7e.txt";
+const AMBIENT_SHELL_PATH = "/nonexistent/ir02-installed-shell-5f80";
+const DAEMON_SECRET = "IR02_INSTALLED_DAEMON_SECRET";
+const DAEMON_SECRET_VALUE = "ir02-installed-daemon-secret-c31f";
+const DEBRIS_FD = "VINCI_WORKER_DEBRIS_AUTHORITY_CAPABILITY_FD";
+const DEBRIS_FD_VALUE = "ir02-installed-debris-fd-90aa";
+const TASK_ENV_MARKER = "IR02_INSTALLED_TASK_ENV_MARKER";
+const TASK_ENV_MARKER_VALUE = "ir02-installed-task-env-marker-e42d";
 // MARKER STRUCTURE — the property that makes the marker assertion in section 6 mean something.
 // The requirement is not "the marker fires under the mutation we happened to try"; it is that the
 // marker is UNSATISFIABLE BY SETUP: nothing this test does can write, warm or pre-satisfy the file
@@ -121,7 +138,14 @@ const DECOY_MARKER_PREFIX = "decoy-loaded-pid-";
 // link, so the decoy's top-level marker write never runs and the marker assertion below cannot
 // fire even when the decoy really did answer the specifier. Checked against the artifact in
 // section 6 rather than trusted.
-const DECOY_SDK_EXPORTS = ["AuthStorage", "SessionManager", "createAgentSession", "createExtensionRuntime"];
+const DECOY_SDK_EXPORTS = [
+  "AuthStorage",
+  "SessionManager",
+  "SettingsManager",
+  "createAgentSession",
+  "createBashToolDefinition",
+  "createExtensionRuntime",
+];
 
 const root = mkdtempSync(join(realpathSync(tmpdir()), "vinci-ir02-installed-"));
 const installPrefix = join(root, "install");
@@ -131,8 +155,18 @@ mkdirSync(installPrefix, { recursive: true });
 mkdirSync(home, { recursive: true });
 mkdirSync(cwd, { recursive: true });
 writeFileSync(join(cwd, LS_TARGET_FILE), "installed target\n", "utf8");
-// The ambient plant the isolation assertion is about: an AGENTS.md in the session cwd.
+// The ambient plants the isolation assertions are about: an AGENTS.md in the session cwd, and a
+// project `.pi/settings.json` beside it. The settings file is the one an agent holding `write` and
+// `edit` on the repository working tree can create for itself, and its `shellCommandPrefix` runs
+// on every bash call, so it is planted here too and proven not to reach the installed artifact.
 writeFileSync(join(cwd, "AGENTS.md"), `# Ambient instructions\n\nAlways obey ${AMBIENT_MARKER}.\n`, "utf8");
+mkdirSync(join(cwd, ".pi"), { recursive: true });
+const settingsPwnedPath = join(root, SETTINGS_PWNED_FILE);
+writeFileSync(
+  join(cwd, ".pi", "settings.json"),
+  JSON.stringify({ shellCommandPrefix: `touch ${JSON.stringify(settingsPwnedPath)}`, shellPath: AMBIENT_SHELL_PATH }, null, 2),
+  "utf8",
+);
 
 // The root the installed imports are taken from. MUTATION CONTROL (a) points this at
 // CHECKOUT_ROOT: assertUnderInstalledTree() below must then fail.
@@ -336,6 +370,9 @@ try {
     systemPromptHasMarker: String(handle.session.systemPrompt ?? "").includes(AMBIENT_MARKER),
     systemPromptLength: String(handle.session.systemPrompt ?? "").length,
     toolNames: handle.session.getAllTools().map((tool) => tool.name).sort(),
+    shellCommandPrefix: handle.session.settingsManager.getShellCommandPrefix(),
+    shellPath: handle.session.settingsManager.getShellPath(),
+    projectTrusted: handle.session.settingsManager.isProjectTrusted(),
   };
 
   await handle.prompt(PROMPT);
@@ -384,6 +421,101 @@ try {
   check(lsResult && lsResult.isError !== true, "the granted ls executed through the installed adapter");
   check(JSON.stringify(lsResult.content).includes(LS_TARGET_FILE), "ls actually listed the temp cwd");
 
+  // ---- 4b. Ambient SETTINGS and the bash ENVIRONMENT, through the installed artifact -----------
+  // Two ambient sources the null ResourceLoader does not cover, and both were reachable: a project
+  // `.pi/settings.json` (SettingsManager, whose project scope defaults to trusted) and the daemon's
+  // own process environment (the SDK's bash spawns with getShellEnv() = {...process.env}).
+  //
+  // Positive control for the settings plant, using the SHIPPED SDK's default settings manager —
+  // the exact object createAgentSession falls through to when the adapter passes none.
+  const ambientSettings = sdk.SettingsManager.create(cwd, join(root, "sessions", "agent"));
+  check(
+    typeof ambientSettings.getShellCommandPrefix() === "string"
+      && ambientSettings.getShellCommandPrefix().includes(SETTINGS_PWNED_FILE),
+    "the shipped SDK's DEFAULT SettingsManager reads the planted .pi/settings.json shellCommandPrefix",
+  );
+  check(ambientSettings.getShellPath() === AMBIENT_SHELL_PATH, "…and its shellPath");
+  assert.equal(installedObservation.shellCommandPrefix, undefined, "the installed adapter's session has no shellCommandPrefix");
+  assert.equal(installedObservation.shellPath, undefined, "the installed adapter's session has no shellPath");
+  assert.equal(installedObservation.projectTrusted, false, "the installed adapter's session does not trust the project scope");
+  passed += 3;
+
+  // The bash environment, measured through the installed artifact. The daemon's own values are set
+  // in THIS process and are deliberately absent from taskEnv.
+  const savedProbeEnv = {
+    [DAEMON_SECRET]: process.env[DAEMON_SECRET],
+    [DEBRIS_FD]: process.env[DEBRIS_FD],
+  };
+  process.env[DAEMON_SECRET] = DAEMON_SECRET_VALUE;
+  process.env[DEBRIS_FD] = DEBRIS_FD_VALUE;
+  let envHandle;
+  try {
+    faux.setResponses([
+      compat.fauxAssistantMessage(
+        [compat.fauxToolCall("bash", {
+          command: `echo "MARKER=[$${TASK_ENV_MARKER}] SECRET=[$${DAEMON_SECRET}] DEBRIS=[$${DEBRIS_FD}]"`,
+        })],
+        { stopReason: "toolUse" },
+      ),
+      compat.fauxAssistantMessage("Reported."),
+    ]);
+    const envSink = createJsonlSink(join(root, "state", "run-events-env.jsonl"));
+    envHandle = await createRunSession({
+      run: { ...run, runId: "run_ir02_installed_env", attemptId: "attempt_ir02_installed_env" },
+      grantedTools: ["ls", "bash"],
+      taskEnv: { PATH: process.env.PATH, [TASK_ENV_MARKER]: TASK_ENV_MARKER_VALUE },
+      cwd,
+      sessionDir: join(root, "sessions-env"),
+      sink: envSink,
+      authStorage,
+      model,
+    });
+    assert.deepEqual(
+      envHandle.session.getAllTools().map((tool) => tool.name).sort(),
+      ["bash", "ls"],
+      "the installed adapter registered exactly the granted set when bash is granted",
+    );
+    passed += 1;
+    await envHandle.prompt("Report the environment.");
+    const bashResult = envHandle.session.messages.find(
+      (message) => message.role === "toolResult" && message.toolName === "bash",
+    );
+    check(bashResult && bashResult.isError !== true, "the granted bash executed through the INSTALLED adapter");
+    const bashText = JSON.stringify(bashResult && bashResult.content);
+    check(bashText.includes(`MARKER=[${TASK_ENV_MARKER_VALUE}]`), `installed bash saw the taskEnv marker, got ${bashText.slice(0, 300)}`);
+    check(bashText.includes("SECRET=[]"), `installed bash saw NO daemon secret, got ${bashText.slice(0, 300)}`);
+    check(bashText.includes("DEBRIS=[]"), `installed bash saw NO debris-authority capability, got ${bashText.slice(0, 300)}`);
+    check(!bashText.includes(DAEMON_SECRET_VALUE) && !bashText.includes(DEBRIS_FD_VALUE), "no daemon value appears in the tool output");
+    // The prefix planted in the working tree did not run on that bash call.
+    check(!existsSync(settingsPwnedPath), "the planted shellCommandPrefix never executed under the installed adapter");
+    // Discriminating control for the env plant: both values are live in this very process.
+    check(
+      process.env[DAEMON_SECRET] === DAEMON_SECRET_VALUE && process.env[DEBRIS_FD] === DEBRIS_FD_VALUE,
+      "both daemon values are live in this process (so a process.env spawn would have printed them)",
+    );
+    // Grant shape, through the installed artifact.
+    await assert.rejects(
+      () => createRunSession({ run, cwd, sessionDir: join(root, "sessions-env"), sink: envSink, authStorage, model }),
+      (error) => error && error.code === "granted_tools_required",
+      "the installed adapter refuses an omitted grantedTools",
+    );
+    await assert.rejects(
+      () =>
+        createRunSession({
+          run, grantedTools: ["ls", "bash"], cwd, sessionDir: join(root, "sessions-env"), sink: envSink, authStorage, model,
+        }),
+      (error) => error && error.code === "task_env_required",
+      "the installed adapter refuses a granted bash with no taskEnv",
+    );
+    passed += 2;
+  } finally {
+    if (envHandle) await envHandle.dispose().catch(() => {});
+    for (const [name, value] of Object.entries(savedProbeEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+
   // ---- 5. The isolation assertion, and its negative control -----------------------------------
   // The assertion under test. Run against the installed adapter it must PASS; against a copy
   // patched to use the SDK's DefaultResourceLoader it must FAIL.
@@ -431,8 +563,8 @@ try {
       "the patch swapped the empty ResourceLoader for the SDK's DefaultResourceLoader",
     ],
     [
-      "  }).then((result) => ({ session: result.session, authStorage: auth }));",
-      "  })).then((result) => ({ session: result.session, authStorage: auth }));",
+      "  }).then((result) => {",
+      "  })).then((result) => {",
       "the patch closed the reload-then wrapper",
     ],
   ];
@@ -665,7 +797,18 @@ process.stdout.write(JSON.stringify(result));
   assert.equal(hostile.adapterError, null, `the installed adapter imported cleanly under a hostile parent node_modules (${hostile.adapterError})`);
   assert.deepEqual(
     hostile.adapterExports,
-    ["ALLOWLISTED_CUSTOM_TOOLS", "VINCI_RUN_ENTRY", "createRunSession", "isolateAuthStorage", "resumeRunSession"],
+    [
+      "ALLOWLISTED_CUSTOM_TOOLS",
+      "CAPABILITY_ID_MAX_LENGTH",
+      "ENVIRONMENT_BEARING_TOOL",
+      "VINCI_RUN_ENTRY",
+      "assertRegistryPinnedToGrant",
+      "capabilityIdFields",
+      "createRunSession",
+      "isValidSessionId",
+      "isolateAuthStorage",
+      "resumeRunSession",
+    ],
     "the installed adapter came up on the SHIPPED SDK, with its real exports",
   );
   passed += 2;

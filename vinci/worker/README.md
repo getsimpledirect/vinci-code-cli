@@ -1077,19 +1077,49 @@ first post-resume append is `lastSequence + 1` — no gap, no reuse. Events go t
 `run-events-sink.mjs`: append-only JSONL, contiguous 1-based `sequence`, per-event-identity
 `idempotencyKey` (same key + payload dedupes; a conflicting payload is `idempotency_conflict`).
 
-**Control plane / data plane.** Nothing on disk or in the environment can widen a Run. The session
-gets an empty ResourceLoader, so no extension, skill, prompt template, theme, `AGENTS.md` or
-system-prompt append is ever loaded, whatever exists in `cwd`, the agent dir or `~/.pi/agent`; the
-tool registry is exactly the granted names (a call to anything else is answered with
-`capability.refused{not_attested}` and never executes); and `isolateAuthStorage` makes the
-credential store answer only for the Run's own provider from stored/runtime credentials, so an
-ambient `OPENAI_API_KEY` cannot make another provider look configured. Payload values are kinded
-and content-free — digests, ids, counts, never prompt text or tool output.
+**Control plane / data plane.** Nothing on disk or in the daemon's environment can CONFIGURE a Run
+beyond its definition. Five mechanisms, each load-bearing on its own:
+
+* an **empty ResourceLoader**, so no extension, skill, prompt template, theme, `AGENTS.md` or
+  system-prompt append is ever loaded, whatever exists in `cwd`, the agent dir or `~/.pi/agent`;
+* an **in-memory, project-untrusted SettingsManager**, so neither `<cwd>/.pi/settings.json` nor
+  `<agentDir>/settings.json` reaches the session. Without it the SDK's default settings manager
+  trusts the project scope, and a settings file in the very working tree the agent holds `write`
+  and `edit` on hands `shellCommandPrefix`/`shellPath` to the bash tool — an agent widening its own
+  Run, re-read at every session construction including every resume;
+* a **`taskEnv`-bound bash tool**: `grantedTools` may only include `bash` when the caller also
+  passes the environment its subprocesses run with, and that environment is exactly what
+  `taskEnvironment(env, envDelta)` in `run.mjs` computes for the subprocess lane's child. The SDK's
+  own bash spawns with `getShellEnv()` = `{...process.env}`, which in-process is the DAEMON's
+  environment, so the adapter registers its own bash definition through `customTools` (custom tools
+  override same-named built-ins in the session registry) with a `spawnHook` that replaces the env.
+  There is no `createAgentSession` option for it; this is the only seam;
+* a **two-sided registry pin**: `grantedTools` is mandatory and non-empty (an omitted allowlist
+  registers the SDK's DEFAULT tool set, i.e. the widest Run), and the constructed session's tool
+  registry must EQUAL the grant. A registered-but-ungranted tool would be executable; a
+  granted-but-unregistered one is a Run silently running narrower than its own definition. Either
+  way no handle is returned. The `tools` allowlist is what refuses an ungranted call;
+  `capability.refused{not_attested}` is the RECORD of that refusal, not the thing performing it;
+* **`isolateAuthStorage`**, so the credential store answers only for the Run's own provider from
+  stored/runtime credentials and an ambient `OPENAI_API_KEY` cannot make another provider look
+  configured.
+
+Payload values are kinded and content-free — digests, ids, counts, never prompt text or tool
+output. `capability.refused.capabilityId` names a tool the MODEL chose, so it is emitted verbatim
+only when it is a conservative identifier within a 64-character cap and as a sha256 digest of the
+name otherwise; `capabilityIdForm` says which.
+
+What this does NOT claim: the granted tools still read and write the real filesystem at `cwd`, so
+ambient FILES remain visible to a granted `read`/`ls`/`grep`/`bash`.
 
 **Enabling it.** Set `runtime: "embedded"` on the envelope; any other value (including the absent
 one every envelope carries today) takes the unchanged subprocess lane. Credentials come in through
 the `embedded: {authStorage, model}` seam on `runVinci` — the embedded lane never reads ambient
-provider env.
+provider env. `env` and `envDelta` reach BOTH lanes through one `taskEnvironment()`: the subprocess
+lane as the child's `env`, the embedded lane as the adapter's `taskEnv`. A `sessionId` the SDK's
+own predicate rejects FAILS the run (`invalid_session_id`) rather than falling back to a generated
+id — `readSessionState(sessionDir, sessionId)` is how cost, outcome, harness stops and the budget
+poller are read, and under the old fallback every one of them read empty for the whole run.
 
 **Explicitly NOT done.** No GPU Control transport: the sink is a local file under `stateDir`, not
 the run-event registry, and nothing publishes it. No harness attestation. `SUPPORTED_CAPABILITIES`

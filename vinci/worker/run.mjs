@@ -1200,10 +1200,33 @@ export function applyEnvDelta(base, delta) {
 // governs both lanes and they cannot drift apart.
 export const DEFAULT_GRANTED_TOOLS = Object.freeze(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 
-// The SDK's own session-id predicate (packages/coding-agent assertValidSessionId). A task id that
-// does not satisfy it is NOT forced through: the adapter falls back to a generated session id and
-// the run still records its transcript, it is simply not addressable by the task's own id.
-const SDK_SESSION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+// Debris-authority capabilities are the DAEMON'S and are never a task's: an inherited FD number,
+// the adapter path and its digest, the service digest and the signing public key. Anything holding
+// them can speak for the daemon (debris-authority.mjs reads exactly these names out of
+// process.env), so they are deleted from a task's environment on BOTH lanes.
+export const DAEMON_ONLY_ENV = Object.freeze([
+  "VINCI_WORKER_DEBRIS_ROOT_ANCHOR",
+  "VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256",
+  "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER",
+  "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256",
+  "VINCI_WORKER_DEBRIS_AUTHORITY_CAPABILITY_FD",
+  "VINCI_WORKER_DEBRIS_AUTHORITY_SERVICE_SHA256",
+  "VINCI_WORKER_DEBRIS_AUTHORITY_PUBLIC_KEY_SPKI",
+]);
+
+/**
+ * IR-02 Lane B: the environment a task's own processes run with. ONE function governs it on BOTH
+ * lanes — the subprocess lane's `vinci -p` child and the embedded lane's in-process bash tool —
+ * so `env` (clean-room mode, #24) and `envDelta` (unattended policy, W2) cannot apply to one lane
+ * and be dropped by the other. Dropping them on the embedded lane is exactly how the daemon's
+ * whole environment reached the agent's bash: `getShellEnv()` is `{...process.env}`.
+ */
+export function taskEnvironment(env, envDelta) {
+  const taskEnv = applyEnvDelta(env ?? process.env, envDelta);
+  taskEnv.VINCI_UPDATE_DISABLED = "1";
+  for (const name of DAEMON_ONLY_ENV) delete taskEnv[name];
+  return taskEnv;
+}
 
 /**
  * IR-02 Lane B: run the agent IN-PROCESS through the embedded runtime adapter instead of spawning
@@ -1219,9 +1242,26 @@ const SDK_SESSION_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
  * embedded lane cannot populate honestly (there is no `vinci-task-outcome` entry unless the agent
  * writes one) comes back as the same absent/empty value the subprocess path would produce.
  */
-async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId, abortSignal, embedded }) {
+async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId, env, envDelta, abortSignal, embedded }) {
   const { createJsonlSink } = await import("./run-events-sink.mjs");
-  const { createRunSession } = await import("./runtime-adapter.mjs");
+  const { createRunSession, isValidSessionId } = await import("./runtime-adapter.mjs");
+
+  // A session id the SDK refuses is a HARD failure, not a fallback. This function's own budget
+  // poller, its deadline stop and its whole result — cost_usd, outcome, harness_stops,
+  // unattended_policy — are read back by readSessionState(sessionDir, sessionId). Under the old
+  // fallback the adapter wrote the transcript under a GENERATED id, so every one of those lookups
+  // missed: zero cost, no outcome, no stops, and a budget the poller could never trip. The
+  // subprocess lane hands the same id to the CLI, which refuses it; refuse it here too, before
+  // anything is created. The predicate is the SDK's own, applied by the SDK.
+  if (!isValidSessionId(sessionId)) {
+    const error = new Error(
+      `embedded lane: session id ${JSON.stringify(sessionId ?? null)} is not a valid SDK session id ` +
+        "(alphanumeric, '-', '_', '.', starting and ending alphanumeric); the run's cost, outcome, " +
+        "harness-stop and budget accounting are all keyed by it and would silently read empty",
+    );
+    error.code = "invalid_session_id";
+    throw error;
+  }
 
   const sessionDir = join(stateDir, "sessions", taskId);
   const grantedTools =
@@ -1281,9 +1321,13 @@ async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId
     handle = await createRunSession({
       run,
       grantedTools,
+      // The SAME map the subprocess lane hands its child: `env`/`envDelta` applied, daemon-only
+      // capabilities deleted. In-process the SDK's bash would otherwise spawn with
+      // {...process.env} — the daemon's own environment.
+      taskEnv: taskEnvironment(env, envDelta),
       cwd: repoDir,
       sessionDir,
-      sessionId: SDK_SESSION_ID.test(String(sessionId ?? "")) ? sessionId : undefined,
+      sessionId,
       sink,
       ...(embedded && embedded.authStorage ? { authStorage: embedded.authStorage } : {}),
       ...(embedded && embedded.model ? { model: embedded.model } : {}),
@@ -1328,34 +1372,28 @@ async function runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId
 // rather than a tripped limit. Without a signal the function is unchanged.
 // `env` (clean-room mode, #24) and `envDelta` (unattended policy, W2) are orthogonal to it: all
 // three are optional and compose.
+// `env` and `envDelta` reach BOTH lanes through taskEnvironment(): the subprocess lane as the
+// child's `env`, the embedded lane as the `taskEnv` the adapter's bash tool spawns under.
 // `embedded` (optional, IR-02 Lane B): read ONLY by the embedded runtime lane. It carries the
-// SDK `authStorage`/`model` the in-process session authenticates with — the embedded lane's
-// counterpart to `env` on the subprocess lane, since the adapter's provider isolation refuses to
-// read ambient credentials out of process.env. Ignored entirely when `runtime` is not "embedded".
+// SDK `authStorage`/`model` the in-process session authenticates with, since the adapter's
+// provider isolation refuses to read ambient credentials out of process.env. Ignored entirely
+// when `runtime` is not "embedded".
 export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, envDelta, abortSignal, embedded }) {
   // IR-02 Lane B compatibility switch. `runtime: "embedded"` runs the agent IN-PROCESS through the
   // runtime adapter; ANY other value — including the absent one every envelope carries today —
   // falls through to the subprocess path below, which is unchanged. The branch is deliberately the
   // first statement in the function so that "runtime absent" reaches byte-identical code.
   if (envelope.runtime === "embedded") {
-    return runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId, abortSignal, embedded });
+    // `env` and `envDelta` go to BOTH lanes. Dropping them here is what let the daemon's whole
+    // environment — debris-authority capabilities included — reach the in-process bash tool.
+    return runVinciEmbedded({ envelope, repoDir, stateDir, taskId, sessionId, env, envDelta, abortSignal, embedded });
   }
   const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
   const abortKillGraceMs = Number(process.env.VINCI_WORKER_LEASE_KILL_GRACE_MS) || 10_000;
   const tools = Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools.join(",") : "read,grep,find,ls,bash,edit,write";
-  const taskEnvironment = applyEnvDelta(env ?? process.env, envDelta);
-  taskEnvironment.VINCI_UPDATE_DISABLED = "1";
-  for (const name of [
-    "VINCI_WORKER_DEBRIS_ROOT_ANCHOR",
-    "VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256",
-    "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER",
-    "VINCI_WORKER_DEBRIS_AUTHORITY_ADAPTER_SHA256",
-    "VINCI_WORKER_DEBRIS_AUTHORITY_CAPABILITY_FD",
-    "VINCI_WORKER_DEBRIS_AUTHORITY_SERVICE_SHA256",
-    "VINCI_WORKER_DEBRIS_AUTHORITY_PUBLIC_KEY_SPKI",
-  ]) delete taskEnvironment[name];
+  const childEnvironment = taskEnvironment(env, envDelta);
   mkdirSync(sessionDir, { recursive: true });
 
   return new Promise((resolveRun) => {
@@ -1384,8 +1422,9 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
         cwd: repoDir,
         detached: true,
         // `env` (clean-room mode) may be an allowlisted subset; `envDelta` is the per-run policy
-        // stamp. Debris-authority capabilities are daemon-only and are always removed above.
-        env: taskEnvironment,
+        // stamp. Debris-authority capabilities are daemon-only and are always removed, by the
+        // SAME taskEnvironment() the embedded lane's bash tool runs under.
+        env: childEnvironment,
         stdio: ["ignore", "inherit", "inherit"],
       },
     );

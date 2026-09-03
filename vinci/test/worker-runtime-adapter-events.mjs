@@ -13,6 +13,14 @@
 //   * every payload value is kinded {kind, value} with kind in the six kinds
 //   * every string value is <=128 chars or exactly 64 lowercase hex; none carries the prompt text
 //     or the tool output (content-free by construction)
+//   * that scan REACHES capability.refused, whose capabilityId is the only MODEL-CHOSEN string on
+//     the stream. It used to never see one: nothing in this file made the model call an ungranted
+//     tool, so an unbounded free-text name passed a scan that had no such event to scan. Three
+//     ungranted calls are scripted here — a 419-character name, a 44-character name carrying
+//     credential-shaped text (inside the length cap, so ONLY the identifier pattern catches it,
+//     and a pattern that accepts anything survives every other assertion), and `bash` — and the
+//     event is asserted to carry the name verbatim only in the last case, with capabilityIdForm
+//     saying which form was emitted and the digest form pinned to sha256 of the name
 //   * run.started payload keys are exactly ["attemptId"] (the registry allowlist refuses more)
 //   * context.loaded.entryCount is the contextManifestEntryCount passed in, not a constant
 //   * idempotencyKey is per-event IDENTITY, not type+payload: two manual interrupts in one run are
@@ -35,6 +43,9 @@ const EXPECTED_TYPES = [
   "run.started",
   "context.loaded",
   "agent.turn_started",
+  "capability.refused",
+  "capability.refused",
+  "capability.refused",
   "tool.started",
   "tool.completed",
   "agent.turn_finished",
@@ -42,6 +53,16 @@ const EXPECTED_TYPES = [
   "run.paused",
 ];
 const CONTEXT_MANIFEST_ENTRY_COUNT = 3;
+
+// Three ungranted tool names the model chooses, each a different shape for the capabilityId bound.
+// OVERLONG is past the length cap; CREDENTIAL_SHAPED is short enough to clear the length cap
+// and is caught only by the identifier pattern; SAFE is what a real ungranted tool name looks like
+// and must still be emitted verbatim, so the digest branch cannot be "always digest".
+const OVERLONG_TOOL_NAME = `${"X".repeat(400)}-LEAKED-PROMPT-TEXT`;
+// 44 characters — comfortably INSIDE CAPABILITY_ID_MAX_LENGTH (64), so the length cap cannot be
+// what catches it. Only the identifier pattern can: it carries spaces, "=" and "@".
+const CREDENTIAL_SHAPED_TOOL_NAME = "AWS_KEY=AKIAEXFILTRATE0123 alice@example.com";
+const SAFE_UNGRANTED_TOOL_NAME = "bash";
 
 // Distinctive markers: the prompt text and the file the `ls` output will name. Neither may appear
 // in any payload string.
@@ -61,6 +82,14 @@ writeFileSync(join(cwd, LS_TARGET_FILE), LS_TARGET_CONTENT, "utf8");
 const faux = registerFauxProvider();
 const model = faux.getModel();
 faux.setResponses([
+  fauxAssistantMessage(
+    [
+      fauxToolCall(OVERLONG_TOOL_NAME, {}),
+      fauxToolCall(CREDENTIAL_SHAPED_TOOL_NAME, {}),
+      fauxToolCall(SAFE_UNGRANTED_TOOL_NAME, { command: "true" }),
+    ],
+    { stopReason: "toolUse" },
+  ),
   fauxAssistantMessage([fauxToolCall("ls", { path: "." })], { stopReason: "toolUse" }),
   fauxAssistantMessage("Listed the directory."),
 ]);
@@ -121,8 +150,8 @@ try {
   await handle.interrupt("manual");
   await handle.dispose();
 
-  check(faux.getPendingResponseCount() === 0, "scripted model consumed both responses");
-  check(faux.state.callCount === 2, `faux model called twice (tool turn + finish), got ${faux.state.callCount}`);
+  check(faux.getPendingResponseCount() === 0, "scripted model consumed all three responses");
+  check(faux.state.callCount === 3, `faux model called three times (refused turn + tool turn + finish), got ${faux.state.callCount}`);
 
   const events = readEvents();
   const types = events.map((event) => event.type);
@@ -162,8 +191,21 @@ try {
   assert.equal(new Set(events.map((event) => event.traceId)).size, 1, "one traceId for the whole run session");
   passed += 3;
 
-  // Every payload value is kinded and content-free.
-  const lsOutputMarkers = [PROMPT_MARKER, PROMPT, LS_TARGET_FILE, LS_TARGET_CONTENT.trim()];
+  // Every payload value is kinded and content-free. The scan is only worth its green if it
+  // actually reaches the model-chosen strings, so assert first that a capability.refused is in
+  // the set it is about to walk — the scan passed for a year without ever seeing one.
+  const lsOutputMarkers = [
+    PROMPT_MARKER,
+    PROMPT,
+    LS_TARGET_FILE,
+    LS_TARGET_CONTENT.trim(),
+    OVERLONG_TOOL_NAME,
+    CREDENTIAL_SHAPED_TOOL_NAME,
+    "AKIAEXFILTRATE0123",
+    "alice@example.com",
+  ];
+  const scannedTypes = new Set(events.map((event) => event.type));
+  check(scannedTypes.has("capability.refused"), "the kind/length scan below covers a capability.refused event");
   for (const event of events) {
     for (const [field, value] of Object.entries(event.payload)) {
       const where = `${event.type}.${field}`;
@@ -190,7 +232,60 @@ try {
   }
 
   // Per-type payload shape.
-  const [started, loaded, turnStarted, toolStarted, toolCompleted, turnFinished, pausedA, pausedB] = events;
+  const [started, loaded, turnStarted, refusedOverlong, refusedCredential, refusedSafe, toolStarted, toolCompleted, turnFinished, pausedA, pausedB] = events;
+
+  // ---- capability.refused: a MODEL-CHOSEN name, bounded before it reaches the sink -------------
+  // Digest form for the overlong name and for the credential-shaped one; verbatim for the safe
+  // one. The digest is pinned to sha256 of the exact name, so "emit a digest" cannot degrade to
+  // "emit any 64 hex characters".
+  const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+  assert.deepEqual(
+    refusedOverlong.payload,
+    {
+      capabilityId: { kind: "digest", value: sha256(OVERLONG_TOOL_NAME) },
+      capabilityIdForm: { kind: "enum", value: "digest" },
+      reason: { kind: "enum", value: "not_attested" },
+    },
+    "a 419-character tool name is emitted as sha256 of the name, form=digest",
+  );
+  assert.deepEqual(
+    refusedCredential.payload,
+    {
+      capabilityId: { kind: "digest", value: sha256(CREDENTIAL_SHAPED_TOOL_NAME) },
+      capabilityIdForm: { kind: "enum", value: "digest" },
+      reason: { kind: "enum", value: "not_attested" },
+    },
+    "a credential-shaped tool name SHORT ENOUGH to clear a length cap is still emitted as a digest",
+  );
+  assert.deepEqual(
+    refusedSafe.payload,
+    {
+      capabilityId: { kind: "id", value: SAFE_UNGRANTED_TOOL_NAME },
+      capabilityIdForm: { kind: "enum", value: "name" },
+      reason: { kind: "enum", value: "not_attested" },
+    },
+    "a conservative identifier within the cap is still emitted VERBATIM, form=name",
+  );
+  passed += 3;
+  check(
+    refusedOverlong.payload.capabilityId.value !== refusedCredential.payload.capabilityId.value,
+    "the two digests differ: the digest is of the name, not a constant",
+  );
+  // Not one of these three calls executed: no tool.started, tool.completed or tool.failed names
+  // any of them, and none of them is `ls`.
+  for (const name of [OVERLONG_TOOL_NAME, CREDENTIAL_SHAPED_TOOL_NAME, SAFE_UNGRANTED_TOOL_NAME]) {
+    check(
+      !events.some(
+        (event) =>
+          (event.type === "tool.started" || event.type === "tool.completed" || event.type === "tool.failed")
+          && event.payload.toolId
+          && event.payload.toolId.value === name,
+      ),
+      `no tool.* event for the refused ${JSON.stringify(name.slice(0, 24))}`,
+    );
+  }
+  // Positive reachability control through the SAME translator: the granted ls ran afterwards.
+  check(toolStarted.sequence > refusedSafe.sequence, "the granted ls executed after all three refusals");
   assert.equal(started.payload.attemptId.value, run.attemptId, "run.started carries attemptId");
   assert.equal(started.payload.attemptId.kind, "id");
   // Defect (b): run.started carried an extra kinded runId; the registry allowlist is exactly {attemptId}.
@@ -236,10 +331,20 @@ try {
   // The tool really executed in the temp cwd: the ls result reached the session transcript, but
   // only its digest reached the sink (positive control for the content-free assertions above).
   const toolResults = handle.session.messages.filter((message) => message.role === "toolResult");
-  assert.equal(toolResults.length, 1, "exactly one tool result in the session transcript");
-  const toolResultText = JSON.stringify(toolResults[0].content);
+  assert.equal(toolResults.length, 4, "four tool results in the transcript: three refused calls plus ls");
+  const succeeded = toolResults.filter((message) => message.isError !== true);
+  assert.equal(succeeded.length, 1, "exactly ONE tool call succeeded — the granted ls");
+  passed += 1;
+  const toolResultText = JSON.stringify(succeeded[0].content);
   check(toolResultText.includes(LS_TARGET_FILE), "ls actually listed the temp cwd");
-  check(toolResults[0].isError !== true, "ls succeeded");
+  check(succeeded[0].toolName === "ls", "the one successful tool result is ls");
+  // The three ungranted calls were answered by the SDK's registry, which has no such tool.
+  const refusedResults = toolResults.filter((message) => message.isError === true);
+  assert.equal(refusedResults.length, 3, "the three ungranted calls all came back as errors");
+  passed += 1;
+  for (const message of refusedResults) {
+    check(JSON.stringify(message.content).includes("not found"), "an ungranted call is answered 'Tool … not found'");
+  }
 
   // ---- Sink idempotency controls -------------------------------------------------------------
   const linesBefore = lineCount();
