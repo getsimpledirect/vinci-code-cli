@@ -51,6 +51,13 @@ on:
   # PRs to main made every such PR unmergeable without an admin bypass (found on
   # PR #3, 2026-08-27). The push trigger stays main-only.
   pull_request:
+    # Spelling `types` at all REPLACES the default [opened, synchronize,
+    # reopened] rather than adding to it, so all three are repeated here.
+    # `ready_for_review` is the addition, and the draft lane in `offline`
+    # below is what makes it necessary: marking a PR ready pushes no commit
+    # and so fires no `synchronize`, which without this line would let a PR
+    # go draft -> ready -> merged having only ever run the Node 24 leg.
+    types: [opened, synchronize, reopened, ready_for_review]
 jobs:
   # biome + tsgo + the pinned-deps/shrinkwrap/install-lock checks. `ci.yml` runs these
   # only for `branches: [main]`, so nothing gated them on a vinci-targeted PR: a
@@ -142,7 +149,30 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: ["22", "24"]
+        # A DRAFT pull request runs the Node 24 leg only; every other event
+        # runs both. Measured across the org 1-3 Sep 2026 (reconstructed from
+        # the Actions jobs API): `offline` billed 618 of this repo's 1,353
+        # minutes, split almost exactly in half between the two legs, and the
+        # org is on track for ~162,000 minutes against a 50,000 budget.
+        #
+        # 24 is the leg to keep when only one runs: it is the LTS the release
+        # targets, and per the comment below it executes every type-stripping
+        # lane while 22 skips them. The 22 leg is a floor check -- it earns its
+        # place on a PR that is actually asking to be merged, not on every
+        # push to work in progress.
+        #
+        # SAFE BY FAIL-CLOSED, and the direction matters. `offline (22)` is a
+        # REQUIRED status check on the `main` ruleset. Dropping the leg means
+        # that context never reports, so it stays PENDING and the PR cannot
+        # merge -- which is the correct state for a draft, and the opposite of
+        # the trap that a job skipped by an `if:` would spring, since a skipped
+        # job reports SUCCESS and would hand a draft a green required check it
+        # never earned. Marking the PR ready (see `ready_for_review` above)
+        # runs both legs and clears the pending context.
+        #
+        # 🔴 So do NOT "fix" a stuck draft by removing `offline (22)` from the
+        # required list. Pending IS the mechanism.
+        node: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft == true) && '["24"]' || '["22","24"]') }}
       fail-fast: false
     steps:
       - uses: actions/checkout@v4

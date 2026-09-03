@@ -1,0 +1,93 @@
+#!/bin/sh
+
+# Refuse a push that would land on top of a CI run that is still going.
+#
+# WHY. Measured across the getsimpledirect org 1-3 Sep 2026, reconstructing
+# per-job billable minutes from the Actions jobs API (735 runs, 2,135 jobs):
+# 1,786 of 11,873 billable minutes -- 15% of the entire bill -- were runs in
+# `cancelled`. A cancelled run still bills every minute it burned and returns
+# no answer, so those minutes buy nothing. The cause is a push landing on a
+# branch whose CI is mid-run.
+#
+# `concurrency: cancel-in-progress` is not a fix for this. It saves LATENCY,
+# never spend: it kills the old run after the minutes are already gone. The
+# only thing that saves money is not starting the second run.
+#
+# This lives in `.husky/` rather than in a global hook because husky sets
+# `core.hooksPath` to `.husky/_` in this repo's LOCAL git config, and local
+# config beats global -- a machine-wide pre-push hook is silently shadowed
+# here. Committing it also means it protects everyone, not one workstation.
+#
+# It FAILS OPEN by construction: no gh, no auth, no network, a slow or
+# unparseable response all exit 0. Nobody should ever be unable to push
+# because a cost optimisation could not reach GitHub. It ignores `main`
+# (a push there is a merge), ignores branch deletions, and ignores every
+# remote outside this org.
+#
+# Escape hatch, for a rebase onto a moved main or a run already known stale:
+#     GIT_ALLOW_PUSH_OVER_CI=1 git push ...
+# Prefer that over `--no-verify`, which would also disable every other hook.
+
+[ "${GIT_ALLOW_PUSH_OVER_CI:-}" = "1" ] && exit 0
+command -v gh >/dev/null 2>&1 || exit 0
+
+# git passes the remote NAME as $1 and its URL as $2; when the push target is
+# a bare URL both are that URL. Prefer $2 and fall back to resolving $1, so
+# this still works for `git push https://... branch`, which has no named
+# remote to look up.
+remote_url="${2:-}"
+[ -n "$remote_url" ] || remote_url=$(git remote get-url "${1:-origin}" 2>/dev/null) || exit 0
+case "$remote_url" in
+  *getsimpledirect/*) ;;
+  *) exit 0 ;;
+esac
+slug=$(printf '%s\n' "$remote_url" \
+  | sed -e 's#^git@github.com:##' -e 's#^https://github.com/##' -e 's#\.git$##')
+[ -n "$slug" ] || exit 0
+
+blocked=0
+zero='0000000000000000000000000000000000000000'
+
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  [ -n "$remote_ref" ] || continue
+  [ "$local_sha" = "$zero" ] && continue
+
+  branch=${remote_ref#refs/heads/}
+  [ "$branch" = "$remote_ref" ] && continue
+  [ "$branch" = "main" ] && continue
+
+  # Two calls, not one: the `status` filter accepts a single value, and
+  # `queued` matters as much as `in_progress` -- a fast second push most often
+  # lands on a run that has been created but has not picked up a runner yet.
+  live=''
+  for st in in_progress queued; do
+    got=$(gh api "/repos/$slug/actions/runs?branch=$branch&status=$st&per_page=20" \
+            --jq '.workflow_runs[] | "\(.name)\t\(.html_url)"' 2>/dev/null) || got=''
+    [ -n "$got" ] && live="$live$got
+"
+  done
+  live=$(printf '%s' "$live" | sed '/^$/d')
+  [ -n "$live" ] || continue
+
+  n=$(printf '%s\n' "$live" | wc -l | tr -d ' ')
+  blocked=1
+  {
+    echo ""
+    echo "  ✋ CI is still running on '$branch' ($slug) — $n run(s) in flight:"
+    echo ""
+    printf '%s\n' "$live" | while IFS='	' read -r name url; do
+      printf '       %-28s %s\n' "$name" "$url"
+    done
+    echo ""
+    echo "  Pushing now cancels those runs. A cancelled run still bills every"
+    echo "  minute it already burned and produces no answer — 15% of this org's"
+    echo "  September Actions bill was exactly that."
+    echo ""
+    echo "  Wait for it, or fold this commit into the next push."
+    echo ""
+    echo "  To push anyway:  GIT_ALLOW_PUSH_OVER_CI=1 git push ..."
+    echo ""
+  } >&2
+done
+
+exit $blocked
