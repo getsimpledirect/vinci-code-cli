@@ -89,14 +89,29 @@ const runtimeProbes = [
 	// claim was making and nothing was checking.
 	"vinci/updater/ws-c4-latest-release.json", // "test" inside "latest", in a FILENAME
 	"vinci/extensions/ws-c4-inspector-helper.mjs", // "spec" inside "inspector", in a FILENAME
+	// Both of the above end in .json or -helper.mjs, which lets three over-match mutations survive.
+	// This one is a bare .mjs whose stem ends in "latest", so the anchored-pattern half is exercised
+	// on its own rather than only alongside a distinctive suffix.
+	"vinci/updater/ws-c4-latest.mjs", // "test" inside "latest", bare .mjs filename
 ];
 
 // A file that already existed before this run, inside a directory the plant loop reaches into.
 // The cleanup's whole claim is "remove what I planted", not "remove where I planted" -- and until
 // this control existed, nothing failed when that claim was false. Recording a plant directory's
-// PARENT instead of the directory actually created deletes 64 tracked files here and still reports
+// PARENT instead of the directory actually created destroys tracked files here and still reports
 // every check passing, because no assertion looked outside the archive.
-const keeper = join(root, "vinci/themes/vinci-dark.json");
+//
+// PLACEMENT IS THE WHOLE CONTROL. A keeper OUTSIDE every plant directory only fires for a strictly
+// wider mutant -- one that removes vinci/themes wholesale. It does NOT fire for the exact scenario
+// this file's own comments name: "the day a real vinci/themes/specs holds real files". So the
+// keeper is created INSIDE a plant directory, before the plant loop. mkdirSync then returns
+// undefined for that directory on the plant, so it is never recorded as created, and a correct
+// cleanup must leave it alone. Restoring the original by-name recursive rmSync destroys it.
+const keeperDirectory = join(root, "vinci/themes/specs");
+const keeper = join(keeperDirectory, "ws-c4-preexisting-keeper.json");
+const keeperDirectoryPreexisted = existsSync(keeperDirectory);
+mkdirSync(keeperDirectory, { recursive: true });
+writeFileSync(keeper, '{"note":"existed before the plant loop; a correct cleanup never touches it"}\n');
 const keeperBytesBefore = readFileSync(keeper);
 
 function listArchive(outputDirectory) {
@@ -126,6 +141,7 @@ const work = mkdtempSync(join(tmpdir(), "vinci-package-first-party-tests-"));
 // "remove what I planted".
 const plantedFiles = [];
 const createdDirectories = [];
+let thrown;
 try {
 	for (const probe of [...probes, ...runtimeProbes]) {
 		const absolute = join(root, probe);
@@ -157,16 +173,22 @@ try {
 	for (const runtimeProbe of runtimeProbes) {
 		check(`near-miss runtime path still ships (rule did not over-match): ${runtimeProbe}`, shipped.has(runtimeProbe));
 	}
-	// The unplanted artifact is unchanged by all of this: every member the archive carries that this
-	// test did not plant is a path the repository already had. Stated as a set difference so it also
-	// catches the archive GAINING a member — a widened rule cannot add one, but the simulation copy of
-	// package.sh below could, and this is the check that would see it.
-	const plantedMembers = new Set([...probes, ...runtimeProbes]);
+	// WHAT THIS DOES AND DOES NOT DO. An earlier version of this comment claimed the pair was "stated
+	// as a set difference so it also catches the archive GAINING a member". It did not: `unexpected`
+	// filtered `shipped` against `probes` alone -- a duplicate of the loop a few lines above, which
+	// fires first -- and the second conjunct compared a Set's size against the count it was built
+	// from, which is constant-true for every possible archive. Proven by execution: the archive
+	// gained vinci/install.sh and vinci/build.sh, which package.sh's own comment forbids as release
+	// tooling, and the suite stayed green. Detecting a GAINED member needs a baseline listing to
+	// difference against, which this test does not take; claiming it here was the same overclaim
+	// this file exists to prevent, committed in the comment rather than the code.
+	// So these two now say only what they check: no planted TEST probe shipped, and every planted
+	// RUNTIME probe did.
 	const unexpected = [...shipped].filter((member) => probes.includes(member));
 	check(`no planted test probe is a member of the archive (found ${unexpected.length}: ${unexpected.join(", ") || "none"})`, unexpected.length === 0);
 	check(
 		"every planted runtime probe is accounted for in the archive",
-		runtimeProbes.every((runtimeProbe) => shipped.has(runtimeProbe)) && plantedMembers.size === probes.length + runtimeProbes.length,
+		runtimeProbes.every((runtimeProbe) => shipped.has(runtimeProbe)),
 	);
 	check("the shipped extension layer is still populated", [...shipped].filter((m) => m.startsWith("vinci/extensions/")).length > 10);
 	check("the shipped built packages are still populated", [...shipped].filter((m) => m.startsWith("packages/coding-agent/dist/")).length > 10);
@@ -214,6 +236,8 @@ try {
 	// artifact's members, so it holds identically for the entry-list producer in PR #48.
 	const leaked = [...shipped].filter((member) => isFirstPartyTestPath(member));
 	check(`archive carries no first-party test path at all (found ${leaked.length}: ${leaked.join(", ") || "none"})`, leaked.length === 0);
+} catch (error) {
+	thrown = error;
 } finally {
 	// Files first, then only the directories this run created — deepest first, so a created parent is
 	// removed after any created child. Directories that already existed are never named here at all.
@@ -224,13 +248,32 @@ try {
 	rmSync(work, { recursive: true, force: true });
 }
 
-// The cleanup has now run, including on the failure path. A file that existed before this run,
-// inside a directory the plant loop reached into, must still be here and byte-identical. This is
-// the assertion that was missing: the PR argues the rule is "remove what I planted" rather than
-// "remove where I planted", and without this nothing failed when that stopped being true.
+// These run on BOTH paths. The previous version sat after try/finally with no catch, so any
+// earlier assertion throw skipped them entirely -- the comment claimed "including on the failure
+// path" while the code could not deliver it, and a failing probe destroyed tracked files with
+// nothing saying so. `thrown` is captured, the cleanup assertions run, and the original error is
+// re-thrown afterwards so the first failure is still what a reader sees.
+
+// OVER-deletion: a file that existed before the plant loop, inside a plant directory, byte-identical.
 check(
 	`pre-existing file survived the cleanup byte-identical: ${relative(root, keeper)}`,
 	existsSync(keeper) && readFileSync(keeper).equals(keeperBytesBefore),
 );
+
+// UNDER-deletion, which nothing checked in either direction. A no-op cleanup passed every other
+// assertion here while leaving planted files behind -- and seven of them are runtimeProbes, which by
+// design are NOT excluded, so a regressed cleanup puts junk straight into the released tarball.
+const leftBehind = plantedFiles.filter((file) => existsSync(file));
+check(
+	`the cleanup actually ran: no planted file remains (found ${leftBehind.length}: ${leftBehind.map((f) => relative(root, f)).join(", ") || "none"})`,
+	leftBehind.length === 0,
+);
+
+// This test's own keeper is removed last, after it has done its work; the directory only if this
+// run created it.
+rmSync(keeper, { force: true });
+if (!keeperDirectoryPreexisted) rmSync(keeperDirectory, { recursive: true, force: true });
+
+if (thrown !== undefined) throw thrown;
 
 console.log(`\npackage-first-party-tests: ${pass}/${pass} checks passed (no first-party test path enters the release archive)`);
