@@ -44,17 +44,43 @@ function check(label, condition) {
 }
 
 // Probes are planted under roots vinci/package.sh ALREADY tars on main, so this negative control runs
-// against today's producer rather than a hypothetical one. Three shapes, so a partial rule cannot pass:
-// a __tests__ directory segment, a *.test.* basename with no test directory above it, and a `specs`
-// directory holding a non-JavaScript file (which only the directory-segment half of the rule catches).
+// against today's producer rather than a hypothetical one. Five shapes, so a partial rule cannot pass:
+// a __tests__ directory segment, a *.test.* basename with no test directory above it, a `specs`
+// directory holding a non-JavaScript file (which only the directory-segment half of the rule catches),
+// and one probe for each of the two segments added later — `fixtures` and `__snapshots__`. Both of
+// those carry non-JavaScript extensions on purpose: the filename half of the rule cannot see them, so
+// only the directory-segment half can, and a probe the filename rule could also catch would pass even
+// if its segment were never added to the Set.
 const probes = [
 	"vinci/updater/__tests__/ws-c3-probe.test.mjs",
 	"vinci/extensions/ws-c3-probe.test.mjs",
 	"vinci/themes/specs/ws-c3-probe.json",
+	"vinci/updater/fixtures/ws-c4-probe.json",
+	"vinci/extensions/__snapshots__/ws-c4-probe.snap",
 ];
 // Runtime files under those same roots. If the exclusion ever widened from "test paths" to "the root",
 // these disappear too, and the positive control below catches it.
 const runtimeWitnesses = ["vinci/bin/vinci", "vinci/identity.json", "package.json"];
+
+// POSITIVE control probes: runtime-shaped paths that a LOOSER rule would swallow but the real rule
+// must ship. Every one of them contains a test-directory segment as a SUBSTRING or a PREFIX of a
+// segment, and none of them contains one as a whole segment.
+//
+// This is the control the negative probes cannot provide. A negative probe only ever proves the rule
+// matches enough; nothing in a list of absences can prove it does not match too much, and an
+// over-match is the failure that actually ships a broken artifact — it removes a RUNTIME file, the
+// build stays green, and no test names the missing path. Deriving the expectation from
+// isFirstPartyTestPath instead would be circular: a rule that over-matched would also over-match the
+// expectation and the check would pass. These paths are therefore asserted PRESENT by literal name.
+//
+// They exist because the repository currently contains no such near-miss of its own — the segments
+// were added as hardening against future paths, so the adversarial cases have to be planted.
+const runtimeProbes = [
+	"vinci/updater/ws-c4-fixtures-loader.mjs", // "fixtures" as a substring of a FILENAME
+	"vinci/extensions/ws-c4-snapshots-helper.mjs", // "snapshots" without the dunder wrapping
+	"vinci/themes/ws-c4-fixtures-extra/keep.json", // "fixtures" as a PREFIX of a directory segment
+	"vinci/assets/ws-c4-__snapshots__-data/keep.json", // "__snapshots__" as a prefix of a segment
+];
 
 function listArchive(outputDirectory) {
 	const archive = join(outputDirectory, `vinci-code-${version}.tgz`);
@@ -77,10 +103,26 @@ const work = mkdtempSync(join(tmpdir(), "vinci-package-first-party-tests-"));
 // PR #50's tar-list edit, applied to a DISPOSABLE copy of package.sh. package.sh derives ROOT from its
 // own location, so the copy has to sit in vinci/ for the build to find the repository.
 const simulationScript = join(root, "vinci", "package.pr50-simulation.tmp.sh");
+// Exactly what this run brought into existence, so the cleanup can remove that and nothing else. An
+// earlier version deleted the probes' enclosing directories by NAME and recursively
+// (rmSync("vinci/themes/specs", { recursive: true })). That is correct only while those directories
+// exist solely because this test created them: the day a real vinci/themes/specs holds real files, a
+// single run of this test deletes them, and the deletion happens in a `finally` that runs even when
+// the run failed. Recording what was created inverts the rule from "remove where I planted" to
+// "remove what I planted".
+const plantedFiles = [];
+const createdDirectories = [];
 try {
-	for (const probe of probes) {
-		mkdirSync(dirname(join(root, probe)), { recursive: true });
-		writeFileSync(join(root, probe), "// planted by vinci/test/package-first-party-tests.mjs\n");
+	for (const probe of [...probes, ...runtimeProbes]) {
+		const absolute = join(root, probe);
+		// mkdirSync(recursive) returns the FIRST directory it had to create, or undefined when the whole
+		// chain already existed. So a non-undefined return is a directory that did not exist before this
+		// run, and its entire subtree came into existence after it — which is what makes removing that
+		// one path recursively safe, and what makes an already-present directory untouchable.
+		const createdRoot = mkdirSync(dirname(absolute), { recursive: true });
+		if (createdRoot !== undefined) createdDirectories.push(createdRoot);
+		writeFileSync(absolute, "// planted by vinci/test/package-first-party-tests.mjs\n");
+		plantedFiles.push(absolute);
 	}
 
 	// ── The producer that governs main today ────────────────────────────────────────────────────────
@@ -97,6 +139,21 @@ try {
 	for (const witness of runtimeWitnesses) {
 		check(`runtime file still ships: ${witness}`, shipped.has(witness));
 	}
+	// Positive control aimed at OVER-matching specifically: near-miss runtime paths must survive.
+	for (const runtimeProbe of runtimeProbes) {
+		check(`near-miss runtime path still ships (rule did not over-match): ${runtimeProbe}`, shipped.has(runtimeProbe));
+	}
+	// The unplanted artifact is unchanged by all of this: every member the archive carries that this
+	// test did not plant is a path the repository already had. Stated as a set difference so it also
+	// catches the archive GAINING a member — a widened rule cannot add one, but the simulation copy of
+	// package.sh below could, and this is the check that would see it.
+	const plantedMembers = new Set([...probes, ...runtimeProbes]);
+	const unexpected = [...shipped].filter((member) => probes.includes(member));
+	check(`no planted test probe is a member of the archive (found ${unexpected.length}: ${unexpected.join(", ") || "none"})`, unexpected.length === 0);
+	check(
+		"every planted runtime probe is accounted for in the archive",
+		runtimeProbes.every((runtimeProbe) => shipped.has(runtimeProbe)) && plantedMembers.size === probes.length + runtimeProbes.length,
+	);
 	check("the shipped extension layer is still populated", [...shipped].filter((m) => m.startsWith("vinci/extensions/")).length > 10);
 	check("the shipped built packages are still populated", [...shipped].filter((m) => m.startsWith("packages/coding-agent/dist/")).length > 10);
 	// ssh2's own test directory is a DEPENDENCY carve-out in package.sh, unrelated to this rule. Assert
@@ -145,9 +202,12 @@ try {
 		check(`archive carries no first-party test path at all (found ${leaked.length}: ${leaked.join(", ") || "none"})`, leaked.length === 0);
 	}
 } finally {
-	for (const probe of probes) rmSync(join(root, probe), { force: true });
-	rmSync(join(root, "vinci/updater/__tests__"), { recursive: true, force: true });
-	rmSync(join(root, "vinci/themes/specs"), { recursive: true, force: true });
+	// Files first, then only the directories this run created — deepest first, so a created parent is
+	// removed after any created child. Directories that already existed are never named here at all.
+	for (const file of plantedFiles) rmSync(file, { force: true });
+	for (const directory of [...createdDirectories].sort((a, b) => b.length - a.length)) {
+		rmSync(directory, { recursive: true, force: true });
+	}
 	rmSync(simulationScript, { force: true });
 	rmSync(work, { recursive: true, force: true });
 }
