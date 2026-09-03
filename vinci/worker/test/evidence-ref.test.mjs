@@ -28,14 +28,31 @@ test("a prose handoff is unchanged", () => {
   assert.equal(resolveEvidenceRef({ contractWorkOrderId: null, envelopeRef: "job_17" }), "job_17");
 });
 
-test("the gate is NOT widened: a non-ledger work order id falls through", () => {
-  // task.mjs's WORK_ORDER_ID admits ids LEDGER_REF does not (e.g. the golden vector's
-  // "wo-vec-1"). Those must behave exactly as before — fall back, and post nothing when
-  // there is nothing to fall back to.
+test("a non-ledger work order id REFUSES rather than misfiling", () => {
+  // task.mjs's WORK_ORDER_ID admits ids LEDGER_REF does not (the golden vector's "wo-vec-1",
+  // and every order registry in vinci-gpu-control today). Such an order must post NOTHING.
+  // Falling back to the envelope ref would file the bundle under a row the economics summary
+  // does not name — the summary takes contract-first unconditionally — and the ledger refuses
+  // that as binding:work_order_mismatch. The failure direction is refusal, not misfiling.
   assert.ok(!isLedgerRef("wo-vec-1"), "test premise: wo- ids are not ledger refs");
-  assert.equal(resolveEvidenceRef({ contractWorkOrderId: "wo-vec-1", envelopeRef: "job_5" }), "job_5");
   assert.equal(resolveEvidenceRef({ contractWorkOrderId: "wo-vec-1", envelopeRef: undefined }), null);
-  assert.ok(!isLedgerRef(resolveEvidenceRef({ contractWorkOrderId: "wo-vec-1", envelopeRef: undefined })));
+  assert.equal(resolveEvidenceRef({ contractWorkOrderId: "wo-vec-1", envelopeRef: "job_5" }), null,
+    "a contract naming an unfilable row does not borrow another row");
+  // And the gate is still not widened: nothing non-ledger ever leaves here.
+  for (const id of ["wo-vec-1", "wo-example-001", "../etc", "bk", "bk_", " bk_1"]) {
+    const out = resolveEvidenceRef({ contractWorkOrderId: id, envelopeRef: undefined });
+    assert.ok(out === null || isLedgerRef(out), `${id} -> ${out}`);
+  }
+});
+
+test("a contract id that disagrees with the summary cannot be filed under a third row", () => {
+  // The summary uses contract-first unconditionally; if the resolver used anything else while
+  // the contract id was present, job_ref and summary.work_order_id would disagree.
+  for (const [contractId, envelopeRef] of [["bk_a", "bk_b"], ["wo-x", "bk_b"], ["bk_a", undefined]]) {
+    const out = resolveEvidenceRef({ contractWorkOrderId: contractId, envelopeRef });
+    assert.ok(out === null || out === contractId,
+      `a present contract id must yield itself or nothing, got ${out} for ${contractId}/${envelopeRef}`);
+  }
 });
 
 test("malformed input never throws and never invents a ref", () => {

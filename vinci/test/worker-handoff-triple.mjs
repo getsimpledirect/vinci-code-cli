@@ -1001,6 +1001,29 @@ try {
     assert.ok(post.economics_summary, "the POST carries the economics summary");
     assert.equal(post.economics_summary.work_order_id, post.job_ref, "summary key == evidence key");
     assert.match(post.economics_sha256 ?? "", /^[0-9a-f]{64}$/);
+  
+    // NEWLY REACHABLE FAILURE SURFACE. Before this change a governed attempt never POSTed, so a
+    // POST failure could not affect it. Now it can: a non-2xx downgrades COMPLETED to UNVERIFIED
+    // and records evidence_error. That must be true for a governed attempt too, not just a prose
+    // one — the only existing coverage was prose (worker-evidence-integration.mjs).
+    const bkFail = orderFor("bk_ccm8");
+    debrisAuthority.reserveTask("m-ccm-postfail");
+    f.busMessages.push(handoff("m-ccm-postfail", register(bkFail, specFor(bkFail, { targetBranch: "feat/ccm-postfail" }))));
+    f.evidencePostStatus = 500;
+    try {
+      r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "ccm-postfail.txt", ...evidenceEnv } });
+    } finally {
+      f.evidencePostStatus = null;
+    }
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    const failState = taskState("m-ccm-postfail");
+    assert.equal(failState.state, "UNVERIFIED", `a governed attempt whose evidence POST fails is not COMPLETED: ${JSON.stringify(failState)}`);
+    assert.ok(failState.evidence_error, "the failure is recorded, not swallowed");
+    // The LAST post in the thread is the terminal; the first is `claimed`.
+    const failPost = f.getPostedMessages().filter((m) => m.in_reply_to === "m-ccm-postfail").at(-1);
+    assert.ok(failPost, "the governed attempt still posts a terminal");
+    assert.match(failPost.body, /evidence_error=/, failPost.body);
   }
 
   console.log("PASS worker-handoff-triple");

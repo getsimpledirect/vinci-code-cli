@@ -62,18 +62,29 @@ function command(commandName, args) {
 // A PROSE handoff names its row in `ref:`. A GOVERNED (contract) handoff does not: task.mjs
 // builds its envelope with `ref: undefined` and carries the identity in the contract triple
 // instead, so `isLedgerRef(envelope.ref)` was false and the bundle was never POSTed at all —
-// the summary landed on disk and nothing reached the ledger. The work order id IS the row, and
-// real ids are `bk_`-shaped, which `isLedgerRef` already admits.
+// the summary landed on disk and nothing reached the ledger.
 //
-// This resolves the ref; it does NOT widen the gate. A work order id that is not ledger-shaped
-// (`WORK_ORDER_ID` in task.mjs is broader than `LEDGER_REF`) falls through to the envelope ref
-// and, failing that, posts nothing — exactly today's behaviour. So this can only turn
-// "posted nowhere" into "posted under the work order", never "posted under the wrong row".
+// PRECONDITION, and it is not satisfied everywhere: this only files a governed bundle when the
+// contract's `work_order_id` is itself a ledger ref. `WORK_ORDER_ID` (task.mjs) is broader than
+// `LEDGER_REF`, ids are caller-supplied rather than minted in one shape, and the order registries
+// in vinci-gpu-control today use `wo-`-shaped ids while live backlog rows are `bk_`. So for a
+// `wo-` order this changes nothing at all — the governed path stays unfiled until the issuer
+// mints ledger-shaped work-order ids. Do not read this as "governed attempts now reach the
+// ledger"; read it as "they reach it exactly when their id names a ledger row".
+//
+// A non-ledger contract id returns null rather than falling through to the envelope ref. The
+// summary takes contract-first UNCONDITIONALLY (economics.mjs), so falling through could file
+// the bundle under a row the summary does not name, which the ledger refuses as
+// `binding:work_order_mismatch`. Unreachable today (a contract envelope has no ref), but the
+// failure direction must be "post nothing", never "post under a plausible wrong row".
 export function resolveEvidenceRef(input) {
   // A default parameter covers `undefined` only; an explicit `null` would throw on destructure,
   // and this runs on the terminal path where a throw loses the whole evidence bundle.
   const { contractWorkOrderId = null, envelopeRef = null } = (typeof input === "object" && input !== null) ? input : {};
   if (isLedgerRef(contractWorkOrderId)) return contractWorkOrderId;
+  // A contract that named an id we cannot file under does not get to fall back to some other
+  // row: refuse the POST instead of misfiling it.
+  if (typeof contractWorkOrderId === "string" && contractWorkOrderId) return null;
   // Only a string or null leaves here. Anything else would reach `isLedgerRef` at the gate
   // (which would refuse it) and the POST body (which would not), so it is normalised once.
   return typeof envelopeRef === "string" ? envelopeRef : null;
