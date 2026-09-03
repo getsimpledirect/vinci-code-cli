@@ -480,19 +480,32 @@ process.exit(r.status ?? 1);
         });
         request.on("end", () => {
           const evidence = JSON.parse(body);
-          // The worker sends `job_ref`, never `refs` — so the old `evidence.refs` filter here was
-          // a branch nothing could reach, and `rejectedPosts.length === 0` was a check that could
-          // not fail. Worse, this fake accepted ANY job_ref, including ones the real server
-          // refuses: vinci-gpu-control's POST /v1/evidence 422s a job_ref outside
-          // ("job_", "exp_", "bk_") (MESSAGE_REF_PREFIXES). A test could therefore file under a
-          // `wo-`-shaped ref here and pass while production refused it. Mirror the real rule.
-          const invalidRefs = [evidence.job_ref, ...(evidence.refs ?? [])]
-            .filter((ref) => ref !== undefined && ref !== null)
-            .filter((ref) => typeof ref !== "string" || !LEDGER_REF.test(ref));
-          if (invalidRefs.length > 0) {
+          // MIRROR THE REAL SERVER'S REFUSALS, not just its happy path. This fake previously
+          // filtered `evidence.refs` — a key the worker never sends — so its 422 branch was dead
+          // and `rejectedPosts.length === 0` could not fail. The consequence was worse than a
+          // vacuous assertion: it accepted ANY job_ref, so an integration test could file under a
+          // `wo-`-shaped ref and pass while production 422s it. That is why a green suite sat on
+          // top of the disjoint-namespace collision in vinci-gpu-control#295 without a murmur.
+          //
+          // vinci-gpu-control app.py POST /v1/evidence, in order:
+          //   1. job_ref, sha256, uri, kind, produced_at must each be a non-blank string
+          //   2. job_ref must start with MESSAGE_REF_PREFIXES ("job_", "exp_", "bk_")
+          // A MISSING field is refused by (1) — it is not "nothing to check". Both rules are
+          // enforced here so a test cannot pass on a request the real server would reject.
+          const missing = ["job_ref", "sha256", "uri", "kind", "produced_at"]
+            .filter((field) => typeof evidence[field] !== "string" || !evidence[field].trim());
+          const invalidRefs = missing.includes("job_ref")
+            ? []
+            : [evidence.job_ref, ...(evidence.refs ?? [])]
+              .filter((ref) => typeof ref !== "string" || !LEDGER_REF.test(ref));
+          if (missing.length > 0 || invalidRefs.length > 0) {
             this.rejectedPosts.push(evidence);
             response.writeHead(422, { "content-type": "application/json" });
-            response.end(JSON.stringify({ error: `invalid refs: ${invalidRefs.join(", ")}` }));
+            response.end(JSON.stringify({
+              error: missing.length > 0
+                ? `missing or blank: ${missing.join(", ")}`
+                : `invalid refs: ${invalidRefs.join(", ")}`,
+            }));
             return;
           }
           if (this.evidencePostStatus) {
