@@ -67,7 +67,13 @@
 //       forced run off Linux asserts itself a NON-MEASUREMENT rather than reporting a pass. A RED
 //       there IS the daemon's environment, so a failure reports the body's LENGTH, a DIGEST and the
 //       variable NAMES with each value's byte length — never the bytes — and that redaction is
-//       itself checked end to end on a canary value planted in control 1's block.
+//       itself checked end to end on a canary value planted in control 1's block. Two further
+//       invocations of the same probe sit beside those six, neither of them a surrogate for the
+//       hazard: one with an explicit null marker, which is the shape the first Linux run takes when
+//       the runner supplies none, and one called wrongly on purpose to pin the argument's type
+//       guard. The redactor's own disclosure bound is the PRODUCT of its two factors — at most 40
+//       names of at most 64 characters, so 2560 bytes of name-shaped text and no value bytes at all
+//       — and both factors, the product and the elision branch are pinned.
 //       — and the F6 pin showing that PI_OFFLINE in a taskEnv would be inert. That
 //       pin is taken on the BUILT artifact the package specifier resolves to (dist), not on the
 //       TypeScript source, and reaches the real `ensureTool` call site with globalThis.fetch
@@ -210,21 +216,44 @@ const ENVIRON_REPORT_MAX_NAMES = 40;
  * characters); anything else is counted and not printed. The digest lets two runs be compared, and
  * a maintainer be told "this is the same body as before", without either run publishing it.
  *
- * 🔴 WHAT THE NAME FIELD ACTUALLY BOUNDS — an earlier version of this sentence said "nothing can
- * smuggle a value out through the name field", which overstates it. AT MOST 64 BYTES OF
- * NAME-SHAPED TEXT can print: the guard is a shape and a length, not an impossibility. The reach
- * is narrow but real — [A-Za-z0-9_.-] contains the whole base64url alphabet, so a token of 64
- * characters or fewer would satisfy it — and it exists only on a body that is NOT NUL-separated,
- * where `entries` is the whole body and the text before its first "=" is the body's own opening
- * bytes rather than a variable name. On the body this probe actually targets that case does not
- * arise: /proc/self/environ is NUL-separated, so the text before each "=" IS a variable name.
+ * 🔴 WHAT THE NAME FIELD ACTUALLY BOUNDS, AND TWO MEASUREMENTS OF IT THAT WERE WRONG. The first
+ * version of this sentence said "nothing can smuggle a value out through the name field", which
+ * overstates the guard. The version that replaced it said "AT MOST 64 BYTES of name-shaped text",
+ * which UNDERSTATES it by a factor of 40: 64 bounds ONE name, and this report prints up to
+ * ENVIRON_REPORT_MAX_NAMES of them. The bound that matters is neither factor but the PRODUCT:
  *
- * 64 is kept on purpose rather than tightened. It is the shape of the real names a maintainer needs
- * from a red run (AWS_SECRET_ACCESS_KEY, NPM_CONFIG_USERCONFIG), and any lower bound starts eliding
- * legitimate names from the only report that says WHAT leaked — trading a certain loss of
- * diagnosis against a contrived gain, on the anomalous branch, while the length and the digest
- * still identify the body without any name at all. The bound is stated so a future reader can
- * revisit that trade with the real number in front of them instead of the word "nothing".
+ *     ENVIRON_REPORT_MAX_NAMES (40) x 64 characters = 2560 BYTES of name-shaped text,
+ *
+ * which is the ACCEPTED DISCLOSURE BOUND of this report. That figure is measured rather than
+ * reasoned: the pin in A1b runs a NUL-separated body of 100 entries whose names are 64 base64url
+ * characters and asserts that exactly 40 of them, 2560 bytes, print verbatim.
+ *
+ * 🔴 AND THAT SENTENCE SAID THE REACH EXISTS "only on a body that is NOT NUL-separated". FALSE, and
+ * backwards. The not-NUL-separated shape — where `entries` is the whole body and the text before its
+ * first "=" is the body's own opening bytes rather than a variable name — is real, and it is the
+ * SMALLER of the two, because such a body is ONE entry and so bounded at 64 bytes. A NUL-separated
+ * body is where 2560 comes from: every entry between two NULs gets its own name field. So on
+ * /proc/self/environ, which IS NUL-separated, the reach is at its MAXIMUM, not absent.
+ *
+ * 🔴 WHY 64 IS KEPT — on a different argument from the one this comment used to give, because that
+ * one is refuted by its own examples. It said any tightening is a "certain diagnostic loss" and
+ * cited AWS_SECRET_ACCESS_KEY and NPM_CONFIG_USERCONFIG. Both are 21 characters. Both survive a
+ * tightening all the way to {1,22}, so they are evidence for no bound above 22 and cannot justify
+ * 64. The real argument is a distinction the old one never drew: A VARIABLE NAME IS NOT A SECRET;
+ * ITS VALUE IS. This function exists to withhold VALUES — every value is replaced by its byte
+ * length, and nothing here weakens that — while NAMES are what make a red run diagnosable at all.
+ * 2560 bytes of name-shaped text is therefore accepted DELIBERATELY, on the ground that none of it
+ * is value bytes.
+ *
+ * The number itself is a headroom judgement, and this is the measurement behind it rather than an
+ * assertion: this host's own process environment holds 61 variables, longest name 34 characters,
+ * p95 25, and SIX names longer than 22 (`Object.keys(process.env).map((k) => k.length)`). 64 is
+ * about twice the longest real name seen, which is the headroom a bound wants when the cost of
+ * being too tight is a name elided from the only report that says WHAT leaked.
+ *
+ * BOTH FACTORS AND THE PRODUCT ARE PINNED (A1b), and 64 is pinned from BELOW as well as from above:
+ * a 64-character name must still PRINT, so a tightening to {1,22} dies, and a 65-character one must
+ * not, so a widening dies.
  */
 function describeEnvironBody(body) {
   const bytes = Buffer.byteLength(body, "utf8");
@@ -234,6 +263,14 @@ function describeEnvironBody(body) {
   let unnamed = 0;
   for (const entry of entries) {
     const eq = entry.indexOf("=");
+    // 🔴 NO PIN HERE, AND THIS IS THE REASON RATHER THAN AN OVERSIGHT. `<=` vs `<` on this line is
+    // an EQUIVALENT MUTANT, provably and not merely by failed search: `entries` is filtered to
+    // length > 0, so the only case the two spellings disagree on is eq === 0, i.e. an entry that
+    // begins with "=". Under `<=` it is counted unnamed here. Under `<` it falls through, `name`
+    // becomes the empty string, and /^[A-Za-z0-9_.-]{1,64}$/ rejects the empty string because the
+    // quantifier requires at least one character — so it is counted unnamed there instead. Same
+    // increment, same continue, no observable difference at any input. A test written for it could
+    // only assert what both spellings already do, which is decoration.
     if (eq <= 0) {
       unnamed += 1;
       continue;
@@ -1208,13 +1245,33 @@ try {
       // the stack frames — with the prefix defect restored and a notice-prefixed body, the failure
       // surfaced at TOP LEVEL, meaning this function had already returned "contained".
       //
-      // So the fact is measured HERE, on every caller, real path included: a body this probe is
-      // about to call contained must share no ENVIRON_SHARED_RUN_CHARS-character run with the file
-      // it read. The classifier's verdict and the file's bytes are two independent things, and the
-      // one that decides is the bytes. `sharedRunMeasured` is returned rather than assumed, because
-      // a measurement that silently skipped (unreadable path, file shorter than the window) is
-      // indistinguishable from one that ran and found nothing — callers that depend on this having
-      // happened assert it.
+      // So the fact is measured HERE, at the entry point the real Linux call site goes through: a
+      // body this probe is about to call contained must share no ENVIRON_SHARED_RUN_CHARS-character
+      // run with the file it read. The classifier's verdict and the file's bytes are two independent
+      // things, and the one that decides is the bytes. `sharedRunMeasured` is returned rather than
+      // assumed, because a measurement that silently skipped (unreadable path, file shorter than the
+      // window) is indistinguishable from one that ran and found nothing — callers that depend on
+      // this having happened assert it.
+      //
+      // 🔴 AN EARLIER VERSION OF THIS COMMENT SAID "on every caller". OVER-SCOPED. It is on every
+      // caller's PATH, which is the property that matters and is not the same claim: on this host it
+      // actually MEASURES in ONE of the six surrogates. Instrumented at the return, the six split:
+      //
+      //   control 1 (readable, marker-free)  NOT measured — the leak clause above THREW first
+      //   control 2 (exec-time block)        NOT measured — the armed content clause THREW first
+      //   control 6 (past the line cap)      NOT measured — the leak clause above THREW first
+      //   control 3 (absent path)            NOT measured — readFileSync threw, targetBody is null
+      //   control 5 (empty file)             NOT measured — the file is 0 bytes, below the window
+      //   control 4 (over the byte cap)      MEASURED — the only surrogate with a readable target
+      //
+      // Two distinct reasons, and neither is a defect: the three RED controls never reach this block
+      // because the probe has already thrown (and the `!outcome.returnedFile` gate would skip them
+      // anyway — a body that DID return the file is a leak by the clause above, not by this one),
+      // and two of the three GREEN ones have no target bytes to compare against. The live /proc
+      // caller reaches this block on no host today: it is not called at all on darwin, and on Linux
+      // a readable /proc/self/environ makes `returnedFile` true, so the clause above throws first.
+      // What this block is for is the case that has never happened yet — a Linux read the classifier
+      // calls CONTAINED over a file that is there and readable.
       let sharedRunMeasured = false;
       let sharedRun = -1;
       if (!outcome.returnedFile) {
@@ -1481,6 +1538,26 @@ try {
     // report about itself is whether it measured at all, so that is asserted here: a skipped
     // measurement (unreadable path, file shorter than the window) returns the same -1 as one that
     // ran and found nothing, and control 4 is the surrogate whose whole job is a SUCCESSFUL read.
+    //
+    // 🔴 KEEPING IT MAKES A REQUIRED PAIR, AND THAT IS WHAT AN EARLIER MASKER CLAIM GOT WRONG.
+    // fd6ac5dc's message reported ONE survivor, `moved-check-neutered`, and explained it with "no
+    // clean-tree fixture produces a body that evades the classifier". That is not the masker. The
+    // masker is THIS BLOCK: the duplicated copy, kept deliberately, catches what the moved check
+    // stops catching. There are TWO survivors, they are a required pair, and both are named here.
+    // Executed against the `inside-brackets` defect — control 4's fixture replaced by a 4093-byte
+    // body that is NUL-free, newline-free and "]"-free INSIDE the notice's brackets, so the pattern
+    // still matches it end to end while the body IS the file:
+    //
+    //   inside-brackets alone                      DIES at probeEnvironChannel (the moved check)
+    //   + moved-check-neutered                     DIES at top level (this block's copy)
+    //   + control4-check-neutered  [2nd survivor]  DIES at probeEnvironChannel (the moved check)
+    //   + BOTH neutered                            178/178 GREEN, a 4093-byte leak undetected
+    //
+    // The last row is why the two checks below exist. `sharedRunAt` is a THIRD SITE on the same
+    // measurement and is honest about being one — it reads the number the probe computed, so it
+    // survives both neuterings but not a mutation of sharedRunOffset itself. The whole-body check
+    // after it is a DIFFERENT PREDICATE on a different primitive (substring containment, not the
+    // 24-character window), so it holds even when sharedRunOffset is made to return -1 always.
     check(
       oversizeOutcome.sharedRunMeasured === true,
       "control 4's read was measured against the target file INSIDE probeEnvironChannel — the "
@@ -1505,6 +1582,34 @@ try {
       sharedRunOffset(`${oversizeOutcome.body}${oversizeFileBody.slice(0, 4096)}`, oversizeFileBody) !== -1,
       "the shared-run measurement fires when the body really does carry the file's bytes — without "
         + "this the check above could pass because it can never find anything",
+    );
+    // THIRD SITE, and labelled as one rather than sold as a third mechanism: the number the probe
+    // COMPUTED, asserted where neither of the two checks above can be neutered to hide it. This is
+    // the assertion that kills the both-neutered row; it is masked only by a mutation of
+    // sharedRunOffset itself, which the positive control above already kills.
+    check(
+      oversizeOutcome.sharedRunAt === -1,
+      "the offset probeEnvironChannel MEASURED for control 4 is -1, asserted at a third site so "
+        + "that neutering the probe's own check AND this block's copy still leaves the number "
+        + `stated somewhere, got ${oversizeOutcome.sharedRunAt}`,
+    );
+    // A DIFFERENT PREDICATE, not a fourth copy of the same one: whole-body substring containment
+    // rather than the 24-character window. It survives making sharedRunOffset return -1 always,
+    // which is what makes it independent of the three sites above rather than a restatement of them.
+    check(
+      !oversizeFileBody.includes(oversizeOutcome.body),
+      "control 4's body does not occur ANYWHERE in the target file — measured by substring "
+        + "containment, a different primitive from the windowed shared-run measurement, so a defect "
+        + "that defeats sharedRunOffset does not also defeat this, got "
+        + `${describeEnvironBody(oversizeOutcome.body)}`,
+    );
+    // POSITIVE CONTROL for that predicate, on the REAL body: planted in a haystack that genuinely
+    // embeds it, the same containment test does find it. Without this, the check above could be
+    // passing because it can never match anything.
+    check(
+      `${"z".repeat(64)}${oversizeOutcome.body}${"z".repeat(64)}`.includes(oversizeOutcome.body),
+      "the containment predicate DOES find control 4's real body in a haystack that carries it, so "
+        + "the negative above is evidence and not a comparison that can never fire",
     );
     const emptyOutcome = await expectProbeContained(
       environEmpty,
@@ -1550,6 +1655,57 @@ try {
       "RESTATEMENT (masked by control 3, which fails first on any mutation this would catch): an "
         + "errored read is ALWAYS classified contained, which is what makes the refusal population "
         + "a statement about all six controls and not only about the three green ones",
+    );
+
+    // -- A1a: the probe's own two single-valued axes -----------------------------------------------
+    //
+    // 🔴 `armed` IS TRUE IN ALL SIX SURROGATES, so the null branch — the branch that says "no
+    // exec-time value is available, run on readability alone" — had never executed anywhere and a
+    // mutation forcing `armed` to a constant true survived at full count. That branch is not
+    // hypothetical: it is the DEFAULT shape of the first real Linux run, which takes
+    // EXEC_TIME_MARKER_FROM_EXEC and gets null unless the runner supplies IR02_EXEC_TIME_MARKER. So
+    // it is pinned on the one surrogate that can carry it without changing any other control:
+    // control 3's absent path, called a second time with an explicit null.
+    const unarmedOutcome = await probeEnvironChannel(
+      environAbsent,
+      "environ-channel UNARMED (the shape the first Linux run takes when the runner supplies no "
+        + `${EXEC_TIME_MARKER_NAME}) — the null branch of \`armed\`, which no surrogate reaches`,
+      null,
+    );
+    check(
+      unarmedOutcome.armed === false,
+      "an explicit null marker leaves the content clause UNARMED — the branch every surrogate above "
+        + `misses, and the one the first Linux run takes by default, got ${unarmedOutcome.armed}`,
+    );
+    // POSITIVE CONTROL, naming what still works: the unarmed probe still CLASSIFIES, and for the
+    // same recorded reason as the armed call on the same path. An unarmed probe that had stopped
+    // deciding anything would satisfy the check above.
+    check(
+      unarmedOutcome.returnedFile === false && unarmedOutcome.reason === absentOutcome.reason,
+      "and the unarmed probe still reaches its verdict on readability alone, with the same recorded "
+        + `reason as the armed call on the same path (${JSON.stringify(absentOutcome.reason)}), got `
+        + `${JSON.stringify(unarmedOutcome.reason)}`,
+    );
+    // 🔴 THE TYPE ASSERTION AT THE TOP OF THE PROBE, which was equally unheld: making it `true`
+    // survived at full count. Its whole purpose is that an OMITTED third argument arrives as
+    // `undefined`, arms the clause, and silently searches the body for the text "undefined" — a
+    // probe that reports itself armed while discriminating on nothing. Pinned by calling it the
+    // wrong way on purpose.
+    let markerTypeError = null;
+    try {
+      await probeEnvironChannel(environAbsent, "environ-channel type-guard control", undefined);
+    } catch (error) {
+      markerTypeError = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      markerTypeError !== null,
+      "an omitted exec-time marker is REFUSED by the probe rather than silently arming the content "
+        + "clause on the string \"undefined\"",
+    );
+    check(
+      markerTypeError !== null && markerTypeError.includes("explicit exec-time marker"),
+      "...and the refusal NAMES the argument, so a caller reading the failure knows which one, got "
+        + `${JSON.stringify(String(markerTypeError).slice(0, 200))}`,
     );
 
     // -- A1b: the pattern's clauses and the measurement's WINDOW, pinned ----------------------------
@@ -1646,9 +1802,110 @@ try {
     const overlongReport = describeEnvironBody(`${overlongName}=value`);
     check(
       overlongReport.includes("named=0 unnamed=1") && !overlongReport.includes(overlongName),
-      "and the bound is 64: a name-shaped run of 65 characters is counted, not printed. This is the "
-        + "number describeEnvironBody's comment states as what the name field bounds — AT MOST 64 "
-        + `BYTES of name-shaped text — so the number and the code cannot drift apart, got ${overlongReport}`,
+      "the bound is 64 FROM ABOVE: a name-shaped run of 65 characters is counted, not printed, so a "
+        + `widening of the length bound dies here, got ${overlongReport}`,
+    );
+    // 🔴 AND FROM BELOW — the half fd6ac5dc's message claimed and did not have. Its wording was "64
+    // is now pinned by test, so the number and the code cannot drift". Only the UPPER side was
+    // pinned: with the check above as the only one, tightening the shape to {1,22} passed at
+    // 178/178, and the whole 23-64 band — the band the argument for keeping 64 was about — was
+    // unexercised. A name of EXACTLY 64 characters must still PRINT.
+    //
+    // The fixture is a LITERAL 64-character string, for the reason the window fixtures below are
+    // literal: one derived from the bound would move with it and could not see the change it exists
+    // to catch. Its shape is the base64url alphabet on purpose — that alphabet is what makes the
+    // reach real, since every one of its characters satisfies [A-Za-z0-9_.-].
+    const NAME_AT_BOUND = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    check(
+      NAME_AT_BOUND.length === 64,
+      `the at-bound fixture is 64 characters AS WRITTEN, not derived from the bound, got ${NAME_AT_BOUND.length}`,
+    );
+    const atBoundReport = describeEnvironBody(`${NAME_AT_BOUND}=value`);
+    check(
+      atBoundReport.includes(`${NAME_AT_BOUND}=<5B>`) && atBoundReport.includes("named=1 unnamed=0"),
+      "and the bound is 64 FROM BELOW: a name of EXACTLY 64 characters still PRINTS, so tightening "
+        + "the shape to {1,22} — which every example the old justification cited would have survived "
+        + `— dies here instead of passing at full count, got ${atBoundReport}`,
+    );
+
+    // 🔴 THE PRODUCT, WHICH IS THE BOUND THAT ACTUALLY MATTERS AND WAS ASSERTED NOWHERE. 64 bounds
+    // ONE name; this report prints up to ENVIRON_REPORT_MAX_NAMES of them, so the disclosure bound
+    // is 40 x 64 = 2560 bytes of name-shaped text. fd6ac5dc's docstring stated 64 and thereby
+    // understated it by a factor of 40, and it located the reach on a body that is NOT
+    // NUL-separated — which is backwards, since that shape is ONE entry and so the smaller case.
+    //
+    // This fixture is the larger case, executed: a NUL-separated body (the shape
+    // /proc/self/environ actually has) of 100 entries whose names are 64 base64url characters. The
+    // numbers below are LITERAL — 40, 60, 2560 — so a change to ENVIRON_REPORT_MAX_NAMES or to the
+    // length bound moves the behaviour without moving the fixture, and exactly one of them goes red.
+    const PRODUCT_NAME_STEM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345678"; // 61, literal
+    const productName = (i) => `${PRODUCT_NAME_STEM}${String(i).padStart(3, "0")}`;
+    check(
+      productName(0).length === 64 && PRODUCT_NAME_STEM.length === 61,
+      `each product-bound fixture name is 64 characters, got ${productName(0).length}`,
+    );
+    const productBody = `${Array.from({ length: 100 }, (_, i) => `${productName(i)}=v`).join(NUL)}${NUL}`;
+    const productReport = describeEnvironBody(productBody);
+    const productShown = productReport
+      .slice(productReport.indexOf("names=[") + "names=[".length, productReport.lastIndexOf("])"))
+      .split(" ")
+      .filter((field) => field.includes("=<"))
+      .map((field) => field.slice(0, field.indexOf("=<")));
+    check(
+      productShown.length === 40,
+      "the number of names printed is capped at 40 — ENVIRON_REPORT_MAX_NAMES as a LITERAL, so "
+        + `widening the cap dies here rather than passing at full count, got ${productShown.length}`,
+    );
+    check(
+      productShown.reduce((total, name) => total + Buffer.byteLength(name, "utf8"), 0) === 2560,
+      "and the ACCEPTED DISCLOSURE BOUND of this report is the PRODUCT of the two factors: 2560 "
+        + "bytes of name-shaped text print verbatim from a NUL-SEPARATED body — the shape "
+        + "/proc/self/environ has, and the shape the old docstring said the reach did NOT exist on. "
+        + "It is accepted deliberately because a variable NAME is not a secret and none of these "
+        + `bytes are value bytes, got ${productShown.reduce((t, n) => t + Buffer.byteLength(n, "utf8"), 0)}`,
+    );
+    check(
+      productReport.includes(" +60 more") && !productReport.includes(productName(40)),
+      "and the ELISION BRANCH really runs on that body: the 60 names past the cap are summarised, "
+        + "not printed, and the 41st name is absent from the report. Every surrogate above holds 1-3 "
+        + "entries against a cap of 40, so this fixture is the only thing that executes that branch "
+        + `at all — deleting it passed at full count, got ${productReport.slice(-120)}`,
+    );
+
+    // 🔴 `bytes=` AND `sha256=`, THE TWO FIELDS THE DOCSTRING CALLS LOAD-BEARING AND NOTHING HELD.
+    // The docstring says the digest "lets two runs be compared, and a maintainer be told 'this is
+    // the same body as before'". On the first Linux red that digest is the identifier the whole
+    // report is organised around — and making it a constant, or making the byte length a constant,
+    // passed at 178/178. A field described as load-bearing and asserted nowhere is the worst
+    // combination in the file, so both are pinned on VALUE and on MOVEMENT: the value must be the
+    // real one, and it must differ between two different bodies (a constant satisfies neither, but
+    // the movement half is what catches a digest computed over something other than the body).
+    const digestBodyA = `${NAME_AT_BOUND}=value`;
+    const digestBodyB = `${NAME_AT_BOUND}=valuex`;
+    const reportA = describeEnvironBody(digestBodyA);
+    const reportB = describeEnvironBody(digestBodyB);
+    const fieldOf = (report, key) => {
+      const at = report.indexOf(`${key}=`);
+      return at < 0 ? null : report.slice(at + key.length + 1).split(" ")[0];
+    };
+    check(
+      fieldOf(reportA, "bytes") === String(Buffer.byteLength(digestBodyA, "utf8"))
+        && fieldOf(reportA, "bytes") !== fieldOf(reportB, "bytes"),
+      "`bytes=` is the body's REAL byte length and MOVES with the body — a constant there would "
+        + "make every red run report the same size for a different leak, got "
+        + `${fieldOf(reportA, "bytes")} and ${fieldOf(reportB, "bytes")}`,
+    );
+    check(
+      HEX64.test(fieldOf(reportA, "sha256") ?? "")
+        && fieldOf(reportA, "sha256") === createHash("sha256").update(digestBodyA, "utf8").digest("hex"),
+      "`sha256=` is 64 hex characters and is the REAL digest of the body it reports on — this is the "
+        + "identifier the docstring says a maintainer uses to compare two runs on the first Linux "
+        + `red, and it was asserted nowhere, got ${JSON.stringify(fieldOf(reportA, "sha256"))}`,
+    );
+    check(
+      fieldOf(reportA, "sha256") !== fieldOf(reportB, "sha256"),
+      "...and it MOVES with the body: two bodies differing by ONE byte get different digests, so "
+        + "\"this is the same body as before\" is a statement about the body and not about the code",
     );
 
     // -- A1c: the /proc summary LINE, over both branches --------------------------------------------
