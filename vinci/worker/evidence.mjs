@@ -152,6 +152,11 @@ export async function uploadEvidence({
     // Post evidence metadata to the bus evidence endpoint. Only ledger refs
     // (job_/exp_/bk_) are attached as refs; any other ref (or none) skips the
     // bus entirely — the server would reject the post with 422.
+    // This gate is MASKED by the resolver's gate: widening it alone changes no observable
+    // behaviour, because resolveEvidenceRef has already returned null for anything that would
+    // fail here. It is defence in depth, not dead code — no test fails when it alone is
+    // removed, which is exactly the evidence that gets a real guard deleted. See the mutation
+    // table in worker/test/evidence-ref.test.mjs.
     if (busUrl && busToken && isLedgerRef(ref)) {
       // Wave 1B L3: the evidence POST is a consequential side effect — ask the lease fence first.
       // A stale generation records `fenced_out:<reason>` and never reaches the ledger.

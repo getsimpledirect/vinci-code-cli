@@ -990,6 +990,11 @@ try {
     assert.equal(r.status, 0, r.stderr);
     vinciRuns += 1;
 
+    // The fake now enforces the server's job_ref rule, so a widened gate shows up as a REFUSED
+    // post rather than an extra accepted one. Assert both: nothing was refused, and exactly one
+    // landed. Without the first, widening both gates files a `wo-` ref, gets 422'd, and no
+    // assertion here notices — the count is unchanged because the post never landed.
+    assert.deepEqual(f.rejectedPosts, [], `the bus refused a post the worker should never have sent: ${JSON.stringify(f.rejectedPosts)}`);
     const posts = f.getEvidencePosts();
     assert.equal(posts.length, postsBefore + 1, `exactly one evidence POST, from the governed run: ${JSON.stringify(posts)}`);
     const post = posts.at(-1);

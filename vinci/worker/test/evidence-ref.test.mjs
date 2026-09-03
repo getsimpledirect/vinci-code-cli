@@ -4,6 +4,31 @@
 // on a contract envelope, so `isLedgerRef(ref)` was false and uploadEvidence skipped the bus.
 // The economics summary was written to disk and never reached the ledger, which is the join
 // the whole measurement depends on.
+// WHY THESE UNIT TESTS ARE NOT REDUNDANT WITH THE INTEGRATION CONTROL.
+//
+// There are two gates on the evidence ref: the resolver's (`isLedgerRef` inside
+// resolveEvidenceRef) and the POST's (`isLedgerRef(ref)` before the fetch). They MASK EACH
+// OTHER, so no single control discriminates either one alone. Measured by mutation against
+// worker-handoff-triple.mjs at this head, re-run after every change below:
+//
+//   widen the RESOLVER gate only  -> integration SURVIVES; these unit tests FAIL
+//   widen the POST gate only      -> integration SURVIVES; these unit tests PASS
+//                                    (masked: the resolver already returned null, so the
+//                                     widened gate is never reached)
+//   widen BOTH gates              -> integration FAILS
+//
+// So the integration test pins the PAIR, and the resolver's own gate is pinned ONLY here.
+// Deleting these as "already covered by the integration test" would silently unpin the
+// resolver gate and leave a widened POST gate undetectable by any test in the repo.
+//
+// The both-gates row is load-bearing and was NOT free: it holds only because the integration
+// test asserts `f.rejectedPosts` is empty. Once the fake bus began enforcing the server's
+// job_ref rule, a widened pair stopped producing an EXTRA accepted post (which a count
+// assertion caught) and started producing a REFUSED one (which no count assertion sees).
+// The measured table said FAILS while the code said SURVIVES for one commit, which is how
+// the missing assertion was found. If that assertion is removed, this row reverts to
+// SURVIVES and nothing in the repo detects a widened pair.
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolveEvidenceRef } from "../evidence.mjs";
