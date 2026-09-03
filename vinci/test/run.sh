@@ -746,6 +746,9 @@ run_group memory-integration node "${ROOT}/vinci/test/memory-integration.mjs"
 run_group report-wrong-integration node "${ROOT}/vinci/test/report-wrong-integration.mjs"
 run_group verify-routing-integration node "${ROOT}/vinci/test/verify-routing-integration.mjs"
 run_group acceptance-packaged-integration node "${ROOT}/vinci/test/acceptance-packaged-integration.mjs"
+# No first-party test path enters the release archive. Builds two REAL tarballs (~15s each warm), so it
+# is also the only lane that exercises package.sh under GNU tar in CI — the local suite runs bsdtar.
+run_group package-first-party-tests node "${ROOT}/vinci/test/package-first-party-tests.mjs"
 run_group remote-verdict-integration node "${ROOT}/vinci/test/remote-verdict-integration.mjs"
 run_group accept-tool-integration node "${ROOT}/vinci/test/accept-tool-integration.mjs"
 run_group receipt-remote-verdict node "${ROOT}/vinci/test/receipt-remote-verdict.mjs"
