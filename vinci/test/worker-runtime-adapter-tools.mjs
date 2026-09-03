@@ -1,8 +1,17 @@
 // IR-02 Lane B — embedded runtime adapter: tools isolation.
 //
 // Offline; same faux-provider idiom as worker-runtime-adapter-events.mjs (no model/provider call
-// can leave the process). Three NEGATIVE controls, each pinned to the mechanism it exercises, and
-// one POSITIVE control proving granted tools still execute through the very path that refused.
+// can leave the process). The lettered blocks below enumerate what this file covers, each pinned to
+// the mechanism it exercises, and each carrying its own positive controls proving the guarded
+// operation stayed reachable.
+//
+// 🔴 NO COUNT IS STATED IN THIS PROSE, AND THAT IS THE REPAIR. This paragraph used to open with a
+// tally of negative and positive controls that the enumeration below had long outgrown, and it
+// survived THREE enumeration-repair rounds — one of them a round whose entire subject was stale
+// enumerations — because a prose tally understates, understating alarms nobody, and nothing
+// re-reads it. Updating the number is what failed three times. So the letters are ASSERTED instead:
+// HEADER_BLOCK_LETTERS is compared against the `(x)` labels parsed out of this very header, and the
+// commit that adds a block is the commit that turns this file red until it is listed.
 //
 //   (a) ambient resources: an extension registering `ambient_tool`, a skill, an AGENTS.md
 //       carrying AMBIENT-MARKER-7f3a, and a `.pi/settings.json` are planted in the session cwd,
@@ -70,11 +79,19 @@
 //       itself checked end to end on a canary value planted in control 1's block. Two further
 //       invocations of the same probe sit beside those six, neither of them a surrogate for the
 //       hazard: one with an explicit null marker, which is the shape the first Linux run takes when
-//       the runner supplies none, and one called wrongly on purpose to pin the argument's type
-//       guard. The redactor's own disclosure bound is the PRODUCT of its two factors — at most 40
-//       names of at most 64 characters, so 2560 bytes of name-shaped text and no value bytes at all
-//       — and both factors, the product and the elision branch are pinned.
-//       — and the F6 pin showing that PI_OFFLINE in a taskEnv would be inert. That
+//       the runner supplies none, one called wrongly on purpose to pin the argument's type guard,
+//       and one on the EVASION fixture — a body the classifier acquits while it IS the file, which
+//       is the only invocation whose measured offset is not -1 and therefore the only place the
+//       probe's measured-offset PROPAGATION can be pinned at all, paired with a capped-read
+//       reachability control through the same entry point. The redactor's own disclosure bound is the PRODUCT of its two factors — at most 40
+//       names of at most 64 characters. Stated as a bound on POSITION rather than on harm: NO bytes
+//       in VALUE position, and up to 2560 bytes in NAME position, INCLUDING a token that happens to
+//       be name-shaped (base64url is a subset of [A-Za-z0-9_.-], so a 63-byte JWT-shaped token
+//       prints verbatim, and 40 of them in a NUL-separated body all print). Both factors, the
+//       product, the elision branch and BOTH POSITIONS are pinned — the value-position canary
+//       end to end through the probe's real failure message, the name-position one directly on
+//       the redactor. Beside them sits the F6 pin showing that PI_OFFLINE in a taskEnv would be
+//       inert. That
 //       pin is taken on the BUILT artifact the package specifier resolves to (dist), not on the
 //       TypeScript source, and reaches the real `ensureTool` call site with globalThis.fetch
 //       replaced by a recorder that throws. PI_OFFLINE is set for the whole block, so nothing here
@@ -242,18 +259,45 @@ const ENVIRON_REPORT_MAX_NAMES = 40;
  * 64. The real argument is a distinction the old one never drew: A VARIABLE NAME IS NOT A SECRET;
  * ITS VALUE IS. This function exists to withhold VALUES — every value is replaced by its byte
  * length, and nothing here weakens that — while NAMES are what make a red run diagnosable at all.
- * 2560 bytes of name-shaped text is therefore accepted DELIBERATELY, on the ground that none of it
- * is value bytes.
+ * 2560 bytes of name-shaped text is therefore accepted DELIBERATELY.
+ *
+ * 🔴 THE BOUND, STATED PRECISELY — AND A RETRACTED SENTENCE RESTORED, BECAUSE THE REPAIR THAT FIXED
+ * THE PARAGRAPH ABOVE DELETED IT AND PUT THE OVERSTATEMENT BACK. This docstring said "no value bytes
+ * at all", which is the SAME SHAPE of claim as the "nothing can smuggle a value out" that round one
+ * blocked: read as a disclosure bound it says nothing sensitive can travel, and that is false. The
+ * sentence that used to say so — "the reach is narrow but real: [A-Za-z0-9_.-] contains the whole
+ * base64url alphabet, so a token of 64 characters or fewer would satisfy it" — was dropped, not
+ * refuted. It is restored, and the bound is stated as one about POSITION rather than about harm:
+ *
+ *     NO bytes in VALUE position — every value is replaced by its byte length, and nothing here
+ *     weakens that — and up to the product bound, 2560 bytes, in NAME position, INCLUDING a token
+ *     that merely happens to be name-shaped.
+ *
+ * That is not hypothetical. Executed against this function: a 63-byte JWT-shaped token in name
+ * position prints VERBATIM (`names=[eyJhbGciOiJIUzI1NiJ9.…=<1B>]`), and 40 such names in a
+ * NUL-separated body yield a 2890-byte report with all 40 verbatim. So "a variable NAME is not a
+ * secret" is an argument about what USUALLY occupies that position, not a guarantee about what CAN.
+ * The guard bounds the QUANTITY of name-shaped text, and the value-position canary — which is what
+ * the file had — never covered this at all: it plants its payload after the "=". A NAME-POSITION
+ * CANARY is now pinned in A1b beside it, so the sentence above is held by a check rather than by a
+ * third round of prose.
  *
  * The number itself is a headroom judgement, and this is the measurement behind it rather than an
- * assertion: this host's own process environment holds 61 variables, longest name 34 characters,
- * p95 25, and SIX names longer than 22 (`Object.keys(process.env).map((k) => k.length)`). 64 is
- * about twice the longest real name seen, which is the headroom a bound wants when the cost of
- * being too tight is a name elided from the only report that says WHAT leaked.
+ * assertion. MEASURED ON ONE HOST (this one, darwin) and environment-dependent by construction —
+ * another machine reported 62 variables and SEVEN longer than 22 for the same invocation, which
+ * moves none of the argument:
  *
- * BOTH FACTORS AND THE PRODUCT ARE PINNED (A1b), and 64 is pinned from BELOW as well as from above:
- * a 64-character name must still PRINT, so a tightening to {1,22} dies, and a 65-character one must
- * not, so a widening dies.
+ *     node -e 'const L=Object.keys(process.env).map(k=>k.length).sort((a,b)=>a-b);
+ *              console.log(JSON.stringify({count:L.length,longest:L[L.length-1],
+ *              p95:L[Math.floor(L.length*0.95)],over22:L.filter(n=>n>22).length}))'
+ *     -> {"count":61,"longest":34,"p95":25,"over22":6}
+ *
+ * 64 is about twice the longest real name seen, which is the headroom a bound wants when the cost
+ * of being too tight is a name elided from the only report that says WHAT leaked.
+ *
+ * BOTH FACTORS, THE PRODUCT AND BOTH POSITIONS ARE PINNED (A1b), and 64 is pinned from BELOW as
+ * well as from above: a 64-character name must still PRINT, so a tightening to {1,22} dies, and a
+ * 65-character one must not, so a widening dies.
  */
 function describeEnvironBody(body) {
   const bytes = Buffer.byteLength(body, "utf8");
@@ -307,6 +351,40 @@ function sharedRunOffset(body, source) {
     if (source.includes(body.slice(i, i + ENVIRON_SHARED_RUN_CHARS))) return i;
   }
   return -1;
+}
+
+// read.js's own first-line byte cap and size formatting, REIMPLEMENTED HERE ON PURPOSE. The point
+// of the byte-equality site below is that the TEST states what the cap notice must be and read.js
+// states what it is, and the two must agree byte for byte; importing read.js's own copy would make
+// the comparison circular, and reading the value out of the body under test would make it
+// tautological — which is exactly the failure the site it replaces had.
+const READ_DEFAULT_MAX_BYTES = 50 * 1024;
+function formatReadSize(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/**
+ * The EXACT first-line size-cap notice the read tool emits for `path`, recomputed from the TARGET
+ * FILE's own bytes rather than from the body under test. read.js's shape is
+ * `[Line N is <size>, exceeds <cap> limit. Use bash: sed -n 'Np' <path> | head -c <bytes>]`.
+ */
+function expectedFirstLineCapNotice(path, fileBody) {
+  const firstLineBytes = Buffer.byteLength(fileBody.split("\n")[0], "utf8");
+  return `[Line 1 is ${formatReadSize(firstLineBytes)}, exceeds `
+    + `${formatReadSize(READ_DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '1p' ${path} `
+    + `| head -c ${READ_DEFAULT_MAX_BYTES}]`;
+}
+
+/**
+ * Whether `body` is EXACTLY that notice — and therefore carries no other byte, from that file or
+ * from anywhere else. A DIFFERENT PRIMITIVE from the ENVIRON_SHARED_RUN_CHARS window: equality
+ * against an independently constructed expectation rather than a search over the body, so any extra
+ * byte fails it regardless of what the byte spells.
+ */
+function bodyIsExactlyCapNotice(body, path, fileBody) {
+  return body === expectedFirstLineCapNotice(path, fileBody);
 }
 
 /** The text a tool result actually carries, as the model would see it (never "[]" for an empty one). */
@@ -438,6 +516,36 @@ let passed = 0;
 function check(condition, message) {
   assert.ok(condition, message);
   passed += 1;
+}
+
+// 🔴 F4: THE OPENING ENUMERATION, MADE ASSERTABLE INSTEAD OF RE-COUNTED. The header used to claim
+// "Three NEGATIVE controls and one POSITIVE control" over seven lettered blocks and at least five
+// positive controls, and it survived three enumeration-repair rounds — one of them a round whose
+// whole subject was stale enumerations — because updating a number in prose is a change nothing
+// re-reads. So the number is gone from the prose and the LETTERS are pinned: this reads the header
+// of THIS FILE and compares the `(x)` labels it finds against the list below. Adding block (h)
+// without listing it here is the commit that turns this file red.
+const HEADER_BLOCK_LETTERS = ["a", "b", "c", "d", "e", "f", "g"];
+{
+  const ownSource = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  const header = ownSource.slice(0, ownSource.indexOf("\nimport "));
+  const letters = [...header.matchAll(/^\/\/ {3}\(([a-z])\)/gm)].map((match) => match[1]);
+  assert.deepEqual(
+    letters,
+    HEADER_BLOCK_LETTERS,
+    "the lettered blocks the header actually carries are exactly HEADER_BLOCK_LETTERS — the "
+      + "enumeration is ASSERTED rather than restated, so a block added without being listed goes "
+      + `red here, got ${JSON.stringify(letters)}`,
+  );
+  // POSITIVE CONTROL for the parser, naming what it still finds: the extraction really reaches the
+  // header (a regex that matched nothing would satisfy nothing but an empty expectation), and it
+  // stops at the imports rather than sweeping the whole file for parenthesised letters.
+  check(
+    letters.length > 0 && header.includes("(a) ambient resources") && !header.includes("import "),
+    "the header parser reaches a real header and stops before the imports — without this, an "
+      + `extraction that found nothing could pass against an empty list, got ${letters.length} `
+      + "letters",
+  );
 }
 
 const timer = setTimeout(() => {
@@ -1267,13 +1375,33 @@ try {
       // Two distinct reasons, and neither is a defect: the three RED controls never reach this block
       // because the probe has already thrown (and the `!outcome.returnedFile` gate would skip them
       // anyway — a body that DID return the file is a leak by the clause above, not by this one),
-      // and two of the three GREEN ones have no target bytes to compare against. The live /proc
-      // caller reaches this block on no host today: it is not called at all on darwin, and on Linux
-      // a readable /proc/self/environ makes `returnedFile` true, so the clause above throws first.
+      // and two of the three GREEN ones have no target bytes to compare against.
+      //
+      // 🔴 THE LIVE /proc PATH DOES NOT REACH THIS BLOCK TODAY — CONDITIONALLY, NOT STRUCTURALLY,
+      // and the previous version of this comment asserted it as a fact about shape. The condition
+      // is the gate `!outcome.returnedFile`, and what makes that gate false on Linux today is an
+      // IMPLEMENTATION DETAIL of the read tool: `dist/core/tools/read.js` reads the file with a
+      // plain `fs/promises` readFile (`readFile: (path) => fsReadFile(path)`) and truncates the
+      // content afterwards — there is no stat-size short-circuit anywhere in it. So a readable
+      // /proc/self/environ comes back with bytes in it, `returnedFile` is true, and the leak clause
+      // above throws before this block. procfs, however, reports `stat().size === 0` for that file:
+      // it is synthetic, and its size is not its length. The moment any future read implementation
+      // short-circuits on a zero-size stat — returning empty rather than reading — `returnedFile`
+      // becomes FALSE and this block DOES execute on the live path. That is one refactor away, on
+      // an assumption this file does not own, which is why this block is not dead code. (On darwin
+      // the probe is not called on the live path at all; this host cannot demonstrate either half.)
       // What this block is for is the case that has never happened yet — a Linux read the classifier
       // calls CONTAINED over a file that is there and readable.
-      let sharedRunMeasured = false;
-      let sharedRun = -1;
+      //
+      // 🔴 THE MEASUREMENT AND WHAT THE CALLER READS ARE ONE FIELD, DELIBERATELY. `sharedRunAt` used
+      // to be a second copy of the number, assigned at the return, and a caller asserting on it was
+      // asserting on a value nothing else depended on: constant-folding that assignment to -1
+      // survived at full count, masked the top-level third site, and would have made a refactor
+      // that stopped propagating the computed offset invisible. Building the object FIRST and
+      // running this probe's own fact check through `measurement.sharedRunAt` makes the propagation
+      // load-bearing for the guard itself — fold it and this check stops firing, which the evasion
+      // control in A1a catches.
+      const measurement = { sharedRunMeasured: false, sharedRunAt: -1 };
       if (!outcome.returnedFile) {
         let targetBody = null;
         try {
@@ -1282,15 +1410,15 @@ try {
           targetBody = null; // refused/absent: control 3 and the forced /proc run land here.
         }
         if (targetBody !== null && targetBody.length >= ENVIRON_SHARED_RUN_CHARS) {
-          sharedRunMeasured = true;
-          sharedRun = sharedRunOffset(result.body, targetBody);
+          measurement.sharedRunMeasured = true;
+          measurement.sharedRunAt = sharedRunOffset(result.body, targetBody);
           check(
-            sharedRun === -1,
+            measurement.sharedRunAt === -1,
             `${label}: LEAK — the classifier called this read CONTAINED (${outcome.reason}), but `
               + `the body it returned shares a run of ${ENVIRON_SHARED_RUN_CHARS} characters with `
-              + `${path}, starting at body offset ${sharedRun}. Containment is what the classifier `
-              + `SAID; this is what the bytes DO, and the bytes decide: some of that file came back `
-              + `however the read result was labelled, got ${seen}`,
+              + `${path}, starting at body offset ${measurement.sharedRunAt}. Containment is what `
+              + `the classifier SAID; this is what the bytes DO, and the bytes decide: some of that `
+              + `file came back however the read result was labelled, got ${seen}`,
           );
         }
       }
@@ -1299,8 +1427,7 @@ try {
         armed,
         isError: result.isError === true,
         body: result.body,
-        sharedRunMeasured,
-        sharedRunAt: sharedRun,
+        ...measurement,
       };
     }
 
@@ -1543,21 +1670,38 @@ try {
     // fd6ac5dc's message reported ONE survivor, `moved-check-neutered`, and explained it with "no
     // clean-tree fixture produces a body that evades the classifier". That is not the masker. The
     // masker is THIS BLOCK: the duplicated copy, kept deliberately, catches what the moved check
-    // stops catching. There are TWO survivors, they are a required pair, and both are named here.
-    // Executed against the `inside-brackets` defect — control 4's fixture replaced by a 4093-byte
-    // body that is NUL-free, newline-free and "]"-free INSIDE the notice's brackets, so the pattern
-    // still matches it end to end while the body IS the file:
+    // stops catching. Executed against the `inside-brackets` defect — control 4's fixture replaced
+    // by a body that is NUL-free, newline-free and "]"-free INSIDE the notice's brackets, so the
+    // pattern still matches it end to end while the body IS the file. The same evasion now also
+    // exists as a PERMANENT fixture in A1a rather than only as a mutation, which is why the ladder
+    // runs three rows longer than it used to:
     //
-    //   inside-brackets alone                      DIES at probeEnvironChannel (the moved check)
-    //   + moved-check-neutered                     DIES at top level (this block's copy)
-    //   + control4-check-neutered  [2nd survivor]  DIES at probeEnvironChannel (the moved check)
-    //   + BOTH neutered                            178/178 GREEN, a 4093-byte leak undetected
+    //   inside-brackets alone                     DIES at probeEnvironChannel (the moved check)
+    //   + moved-check-neutered                    DIES at top level (this block's copy)
+    //   + control4-check-neutered                 DIES at the third site below
+    //   + third-site-neutered                     DIES at the fourth site below (byte-equality)
+    //   + fourth-site-neutered                    DIES at the A1a EVASION control
+    //   + evasion-control-neutered                DIES at the evasion control's offset assertion
+    //   + evasion-offset-neutered                 DIES at the evasion reachability control
+    //   + evasion-reachability-neutered           212/212 GREEN, the leak undetected
     //
-    // The last row is why the two checks below exist. `sharedRunAt` is a THIRD SITE on the same
-    // measurement and is honest about being one — it reads the number the probe computed, so it
-    // survives both neuterings but not a mutation of sharedRunOffset itself. The whole-body check
-    // after it is a DIFFERENT PREDICATE on a different primitive (substring containment, not the
-    // 24-character window), so it holds even when sharedRunOffset is made to return -1 always.
+    // 🔴 THE MINIMUM-TO-HIDE IS SEVEN, RE-MEASURED ON THIS HEAD AND NOT INHERITED. It was FOUR at
+    // e39a9fa8 (the ladder printed here before carried an older head's 178-check count and stopped
+    // three rows early, at a row that is no longer where it ends). Four of the seven are aimed at
+    // control 4; the other three are the A1a evasion block, which this leak reaches for two
+    // different reasons — neutering the moved check switches off the guard the evasion control
+    // asserts fires, and the reachability control reads the same fixture this mutation replaces.
+    // Blinding sharedRunOffset itself is CHEAPER in mutations but does not work: it takes out the
+    // first three sites at once and then dies at the windowed positive control below, which is
+    // what that control is for.
+    //
+    // `sharedRunAt` is a THIRD SITE on the same measurement and is honest about being one — it
+    // reads the number the probe computed. It is NOT "masked only by a mutation of sharedRunOffset
+    // itself": constant-folding the propagation (`sharedRunAt: sharedRun` -> `sharedRunAt: -1`)
+    // masked it too, and survived at full count, so a refactor that stopped propagating the
+    // computed offset would have turned this site into an assertion about a constant and silently
+    // made "four sites" three. The propagation is pinned in A1a, where the measured offset is not
+    // -1; see the third site below for why it cannot be pinned on the green path.
     check(
       oversizeOutcome.sharedRunMeasured === true,
       "control 4's read was measured against the target file INSIDE probeEnvironChannel — the "
@@ -1578,38 +1722,87 @@ try {
     // that can never fire. The spliced body is exactly the shape the review's evasion produced —
     // the notice, then the file — so this control also pins that such a body is DETECTABLE here
     // even if the classifier were to call it contained again.
+    // The leak shape both positive controls below are aimed at, built ONCE from the REAL target
+    // file: the cap notice the read actually returned, with 4096 real bytes of that file spliced
+    // onto it. Measured on this host — file 65596 bytes, body 196, spliced 4292.
+    const oversizeLeakedBody = `${oversizeOutcome.body}${oversizeFileBody.slice(0, 4096)}`;
     check(
-      sharedRunOffset(`${oversizeOutcome.body}${oversizeFileBody.slice(0, 4096)}`, oversizeFileBody) !== -1,
+      sharedRunOffset(oversizeLeakedBody, oversizeFileBody) !== -1,
       "the shared-run measurement fires when the body really does carry the file's bytes — without "
         + "this the check above could pass because it can never find anything",
     );
     // THIRD SITE, and labelled as one rather than sold as a third mechanism: the number the probe
-    // COMPUTED, asserted where neither of the two checks above can be neutered to hide it. This is
-    // the assertion that kills the both-neutered row; it is masked only by a mutation of
-    // sharedRunOffset itself, which the positive control above already kills.
+    // COMPUTED, asserted where neither of the two checks above can be neutered to hide it.
+    //
+    // 🔴 AND THE PLUMBING IS PINNED — BUT NOT HERE, AND SAYING SO IS THE POINT. This site used to
+    // assert only `sharedRunAt === -1` under a comment claiming it was "masked ONLY by a mutation
+    // of sharedRunOffset itself". False: constant-folding the propagation
+    // (`sharedRunAt: sharedRun` -> `sharedRunAt: -1`) survived at full count and masked this site,
+    // after which the ladder fell through to the fourth site.
+    //
+    // Recomputing the offset and comparing does NOT fix that, and the obvious repair is worth
+    // recording as refuted: EVERY green return of probeEnvironChannel carries sharedRunAt === -1,
+    // so on a clean tree the propagated number and the constant -1 are indistinguishable and any
+    // comparison here is satisfied by both. What fixes it is structural and lives in two places:
+    // the probe's OWN fact check now reads `measurement.sharedRunAt`, so folding the field switches
+    // the guard off rather than only the report; and the EVASION control in A1a is the one
+    // invocation whose measured offset is not -1, so it observes the field carrying a real number.
+    // Fold the propagation and that control goes red. This line is kept as the third SITE on the
+    // green path, and the comparison below is stated for what it is.
     check(
-      oversizeOutcome.sharedRunAt === -1,
-      "the offset probeEnvironChannel MEASURED for control 4 is -1, asserted at a third site so "
-        + "that neutering the probe's own check AND this block's copy still leaves the number "
-        + `stated somewhere, got ${oversizeOutcome.sharedRunAt}`,
+      oversizeOutcome.sharedRunAt === -1 && oversizeOutcome.sharedRunAt === oversizeSharedRun,
+      "the offset probeEnvironChannel MEASURED for control 4 is -1 AND equals the offset this "
+        + "block recomputed from the file — a third site on the green path; the propagation itself "
+        + `is pinned by the EVASION control, where the answer is not -1, got `
+        + `${oversizeOutcome.sharedRunAt} propagated vs ${oversizeSharedRun} recomputed`,
     );
-    // A DIFFERENT PREDICATE, not a fourth copy of the same one: whole-body substring containment
-    // rather than the 24-character window. It survives making sharedRunOffset return -1 always,
-    // which is what makes it independent of the three sites above rather than a restatement of them.
+    // FOURTH SITE — A DIFFERENT PREDICATE, AND RE-AIMED. What stood here was
+    // `!oversizeFileBody.includes(oversizeOutcome.body)`: whether the BODY occurs inside the FILE.
+    //
+    // 🔴 THAT IS THE HAZARD POINTED BACKWARDS, and it is the worse half of what review found. A
+    // leak is part of the FILE appearing INSIDE the BODY. Measured on this file's own spliced
+    // fixture — the notice plus 4096 real bytes of the target, the exact shape review caught while
+    // the suite stayed green: file 65596 bytes, body 196, spliced 4292 — the WINDOWED measurement
+    // returns offset 196 and DETECTS it, while `file.includes(body)` is FALSE and does not. The old
+    // predicate fired only on the degenerate `body === file` shape, which is the one shape the
+    // surrogate harness happens to produce, so it was independent of sharedRunOffset without being
+    // a fourth DEFENCE. Its positive control was worse: `"z".repeat(64) + body + "z".repeat(64)`
+    // contains `body` for every body, needle and haystack being the same expression — emptying both
+    // repeats left the suite green at full count, and it never touched the target file at all.
+    //
+    // What replaces it is EXACT BYTE-EQUALITY against a freshly recomputed expected notice: the
+    // body must be, byte for byte, the notice read.js emits for THIS path and THIS file's own
+    // first-line size. The primitive is genuinely different from the 24-character window — equality
+    // against an independently constructed expectation rather than a search over the body — and any
+    // extra byte fails it regardless of what the byte spells, which is what makes it detect
+    // file-content-inside-body rather than the reverse.
     check(
-      !oversizeFileBody.includes(oversizeOutcome.body),
-      "control 4's body does not occur ANYWHERE in the target file — measured by substring "
-        + "containment, a different primitive from the windowed shared-run measurement, so a defect "
-        + "that defeats sharedRunOffset does not also defeat this, got "
-        + `${describeEnvironBody(oversizeOutcome.body)}`,
+      bodyIsExactlyCapNotice(oversizeOutcome.body, environOversize, oversizeFileBody),
+      "control 4's body is EXACTLY the first-line cap notice recomputed from the TARGET FILE's own "
+        + "bytes — byte-equality against an independent expectation, so any extra byte fails it "
+        + `whatever it spells, got ${describeEnvironBody(oversizeOutcome.body)} against an expected `
+        + `${Buffer.byteLength(expectedFirstLineCapNotice(environOversize, oversizeFileBody), "utf8")}`
+        + "-byte notice",
     );
-    // POSITIVE CONTROL for that predicate, on the REAL body: planted in a haystack that genuinely
-    // embeds it, the same containment test does find it. Without this, the check above could be
-    // passing because it can never match anything.
+    // POSITIVE CONTROL for that predicate, ON THE REAL TARGET FILE and therefore able to FAIL: the
+    // same predicate, given the body with 4096 REAL bytes of that file spliced onto it, says NO.
+    // Emptying the splice turns this control red — which is the property the control it replaces
+    // did not have.
     check(
-      `${"z".repeat(64)}${oversizeOutcome.body}${"z".repeat(64)}`.includes(oversizeOutcome.body),
-      "the containment predicate DOES find control 4's real body in a haystack that carries it, so "
-        + "the negative above is evidence and not a comparison that can never fire",
+      !bodyIsExactlyCapNotice(oversizeLeakedBody, environOversize, oversizeFileBody),
+      "...and the byte-equality predicate REJECTS a body carrying the target file's real bytes, so "
+        + "the check above is evidence and not a comparison that can never fire; the leaked body is "
+        + `${oversizeLeakedBody.length} characters against the body's ${oversizeOutcome.body.length}`,
+    );
+    // ...and a REACHABILITY control for the recomputation itself, naming what still works: the
+    // expected notice is derived from the file, not echoed back from the body, so it is non-empty,
+    // it names the real target path, and it is what a legitimate capped read still produces.
+    check(
+      expectedFirstLineCapNotice(environOversize, oversizeFileBody).includes(environOversize)
+        && READ_FIRST_LINE_CAP_NOTICE.test(expectedFirstLineCapNotice(environOversize, oversizeFileBody)),
+      "the recomputed expectation is built from the target file and its path — a legitimate capped "
+        + "read still satisfies it, so this site refuses leaked bytes rather than refusing "
+        + `everything, got ${JSON.stringify(expectedFirstLineCapNotice(environOversize, oversizeFileBody).slice(0, 60))}`,
     );
     const emptyOutcome = await expectProbeContained(
       environEmpty,
@@ -1686,6 +1879,80 @@ try {
         + `reason as the armed call on the same path (${JSON.stringify(absentOutcome.reason)}), got `
         + `${JSON.stringify(unarmedOutcome.reason)}`,
     );
+    // 🔴 THE EVASION, AS A PERMANENT CONTROL RATHER THAN AS A MUTATION — and the only place in this
+    // file where the measurement's answer is NOT -1. It is what pins the PROPAGATION: every green
+    // return of this probe carries sharedRunAt === -1, so on a clean tree "the propagated number"
+    // and "the constant -1" are indistinguishable, and the top-level third site cannot tell them
+    // apart no matter what it recomputes. Here it can. The file is the shape review's evasion
+    // produced — NUL-free, newline-free and "]"-free INSIDE the cap notice's brackets, so
+    // READ_FIRST_LINE_CAP_NOTICE matches it end to end while the body IS the file — so the
+    // classifier says CONTAINED and the bytes say otherwise, at a non-negative offset.
+    const environEvasion = join(environSurrogateDir, "environ-evasion");
+    writeFileSync(
+      environEvasion,
+      `[Line 1 is 64.1KB, exceeds 50.0KB limit. `
+        + `${"PATH=/usr/bin AWS_SECRET_ACCESS_KEY=present-and-name-shaped ".repeat(70)}`
+        + `Use bash: sed -n '1p' x | head -c 51200]`,
+      "utf8",
+    );
+    const evasionBody = readFileSync(environEvasion, "utf8");
+    // The premises, stated where they are used: the classifier really is fooled, and the bytes
+    // really are shared. Without both, a green here would be a different control wearing this name.
+    check(
+      READ_FIRST_LINE_CAP_NOTICE.test(evasionBody) && !evasionBody.includes(NUL)
+        && !evasionBody.includes("\n"),
+      "the evasion fixture SATISFIES the cap-notice pattern end to end — it is the body the "
+        + `classifier would acquit, ${evasionBody.length} characters of it`,
+    );
+    const evasionExpectedOffset = sharedRunOffset(evasionBody, evasionBody);
+    check(
+      evasionExpectedOffset === 0,
+      "and a fresh sharedRunOffset over that body and that file answers 0, not -1 — the one "
+        + `non-negative answer this file can produce, got ${evasionExpectedOffset}`,
+    );
+    let evasionMessage = null;
+    try {
+      await probeEnvironChannel(
+        environEvasion,
+        "environ-channel EVASION (a body the classifier acquits while it IS the file)",
+        EXEC_TIME_SURROGATE_VALUE,
+      );
+    } catch (error) {
+      evasionMessage = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      evasionMessage !== null && evasionMessage.includes("shares a run of"),
+      "the probe CATCHES it as a fact rather than acquitting it on the classifier's label — this "
+        + "is the assertion the fact-check-at-the-entry-point exists to make, and it is the one "
+        + `that constant-folding the propagation switches off, got ${JSON.stringify(String(evasionMessage).slice(0, 200))}`,
+    );
+    check(
+      evasionMessage !== null
+        && evasionMessage.includes(`starting at body offset ${evasionExpectedOffset}`),
+      "...and the offset it reports is the one a FRESH sharedRunOffset computes, so the number the "
+        + "probe carries is the number it measured — the propagation is pinned here, where the "
+        + `answer is not the constant every green path returns, got offset ${evasionExpectedOffset}`,
+    );
+    // POSITIVE REACHABILITY control, through the SAME entry point and the same clauses, naming what
+    // still succeeds: a genuine capped read of control 4's oversize target — the legitimate shape
+    // this probe must keep passing — still comes back CONTAINED with the measurement PERFORMED. So
+    // the evasion above is refused for its spliced payload, not because this probe has started
+    // refusing every cap-notice-shaped body. (A file small enough to be returned whole is always a
+    // leak under this polarity, body and file being the same bytes, so the honest control is a
+    // capped read and not a shorter notice.)
+    const evasionReachability = await probeEnvironChannel(
+      environOversize,
+      "environ-channel EVASION reachability control (a genuine capped read still passes)",
+      EXEC_TIME_SURROGATE_VALUE,
+    );
+    check(
+      evasionReachability.returnedFile === false && evasionReachability.sharedRunMeasured === true
+        && evasionReachability.sharedRunAt === -1,
+      "a legitimate capped read still passes this probe WITH the measurement performed, so the "
+        + "evasion control discriminates on the spliced payload rather than on the notice's shape, "
+        + `got measured=${evasionReachability.sharedRunMeasured} at=${evasionReachability.sharedRunAt}`,
+    );
+
     // 🔴 THE TYPE ASSERTION AT THE TOP OF THE PROBE, which was equally unheld: making it `true`
     // survived at full count. Its whole purpose is that an OMITTED third argument arrives as
     // `undefined`, arms the clause, and silently searches the body for the text "undefined" — a
@@ -1870,6 +2137,56 @@ try {
         + "not printed, and the 41st name is absent from the report. Every surrogate above holds 1-3 "
         + "entries against a cap of 40, so this fixture is the only thing that executes that branch "
         + `at all — deleting it passed at full count, got ${productReport.slice(-120)}`,
+    );
+
+    // 🔴 THE NAME-POSITION CANARY. The file already carries a VALUE-position canary — planted in
+    // control 1's block and checked end to end through the probe's real failure message — and that
+    // canary has been carrying a claim it never covered. It plants its payload AFTER the "=", so it
+    // can only ever show that values are withheld; it says nothing about the NAME field, and the
+    // docstring's "no value bytes at all" was read as though it did. What the redactor actually
+    // bounds is POSITION: no bytes in value position, up to the product bound in name position, and
+    // a payload that merely happens to be name-shaped travels within that bound.
+    //
+    // base64url is a subset of [A-Za-z0-9_.-], so a JWT-shaped token IS name-shaped. This asserts
+    // the disclosure as a FACT — the token prints verbatim — rather than leaving it a sentence.
+    const NAME_POSITION_PAYLOAD = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVQiL";
+    check(
+      Buffer.byteLength(NAME_POSITION_PAYLOAD, "utf8") === 63
+        && /^[A-Za-z0-9_.-]{1,64}$/.test(NAME_POSITION_PAYLOAD),
+      "the name-position canary is a 63-byte JWT-shaped token that the name filter ACCEPTS, written "
+        + `as a literal rather than derived from the filter, got ${NAME_POSITION_PAYLOAD.length}`,
+    );
+    const nameLeakReport = describeEnvironBody(`${NAME_POSITION_PAYLOAD}=x${NUL}`);
+    check(
+      nameLeakReport.includes(NAME_POSITION_PAYLOAD),
+      "a name-position payload prints VERBATIM in this report — the disclosure bound is about "
+        + "POSITION, not about harm, and the value-position canary never covered this. If this ever "
+        + "goes green-by-absence the docstring's stated bound has moved and must move with it, got "
+        + `${nameLeakReport}`,
+    );
+    // The PAIRED value-position half, on the SAME payload and the same function, so the two
+    // positions are discriminated by one variable: in value position the very same bytes do NOT
+    // print, and the byte length stands in for them.
+    const valueSafeReport = describeEnvironBody(`SECRET=${NAME_POSITION_PAYLOAD}${NUL}`);
+    check(
+      !valueSafeReport.includes(NAME_POSITION_PAYLOAD)
+        && valueSafeReport.includes(`SECRET=<${Buffer.byteLength(NAME_POSITION_PAYLOAD, "utf8")}B>`),
+      "and the SAME bytes in VALUE position do not print at all — one variable, two positions, "
+        + `which is what makes the bound a statement about position, got ${valueSafeReport}`,
+    );
+    // The PRODUCT of the two, in name position: 40 such tokens in a NUL-separated body all print.
+    const nameLeakTokens = Array.from(
+      { length: ENVIRON_REPORT_MAX_NAMES },
+      (_, i) => `${NAME_POSITION_PAYLOAD.slice(0, 60)}${String(i).padStart(3, "0")}`,
+    );
+    const nameLeakManyReport = describeEnvironBody(
+      `${nameLeakTokens.map((token) => `${token}=x`).join(NUL)}${NUL}`,
+    );
+    check(
+      nameLeakTokens.every((token) => nameLeakManyReport.includes(token)),
+      "and 40 name-shaped payloads in a NUL-separated body — the shape /proc/self/environ has — ALL "
+        + `print, which is the product bound reached with tokens rather than with variable names, `
+        + `in a ${Buffer.byteLength(nameLeakManyReport, "utf8")}-byte report`,
     );
 
     // 🔴 `bytes=` AND `sha256=`, THE TWO FIELDS THE DOCSTRING CALLS LOAD-BEARING AND NOTHING HELD.
