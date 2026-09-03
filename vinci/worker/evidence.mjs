@@ -57,6 +57,28 @@ function command(commandName, args) {
   });
 }
 
+// Which ledger row an evidence bundle is filed under.
+//
+// A PROSE handoff names its row in `ref:`. A GOVERNED (contract) handoff does not: task.mjs
+// builds its envelope with `ref: undefined` and carries the identity in the contract triple
+// instead, so `isLedgerRef(envelope.ref)` was false and the bundle was never POSTed at all —
+// the summary landed on disk and nothing reached the ledger. The work order id IS the row, and
+// real ids are `bk_`-shaped, which `isLedgerRef` already admits.
+//
+// This resolves the ref; it does NOT widen the gate. A work order id that is not ledger-shaped
+// (`WORK_ORDER_ID` in task.mjs is broader than `LEDGER_REF`) falls through to the envelope ref
+// and, failing that, posts nothing — exactly today's behaviour. So this can only turn
+// "posted nowhere" into "posted under the work order", never "posted under the wrong row".
+export function resolveEvidenceRef(input) {
+  // A default parameter covers `undefined` only; an explicit `null` would throw on destructure,
+  // and this runs on the terminal path where a throw loses the whole evidence bundle.
+  const { contractWorkOrderId = null, envelopeRef = null } = (typeof input === "object" && input !== null) ? input : {};
+  if (isLedgerRef(contractWorkOrderId)) return contractWorkOrderId;
+  // Only a string or null leaves here. Anything else would reach `isLedgerRef` at the gate
+  // (which would refuse it) and the POST body (which would not), so it is normalised once.
+  return typeof envelopeRef === "string" ? envelopeRef : null;
+}
+
 export async function uploadEvidence({
   sessionJsonl,
   gitDiff,

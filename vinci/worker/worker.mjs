@@ -21,7 +21,7 @@ import { DECLARATION_REFRESH_DEFAULT_S, LEASE_TIMEOUT_MS, LeaseClient, buildDecl
 import { BranchLeaseClient, branchLeaseFence } from "./branch-lease.mjs";
 import { composeFences } from "./publisher.mjs";
 import { readSessionState, summarizeUnattendedPolicy } from "./session-read.mjs";
-import { uploadEvidence } from "./evidence.mjs";
+import { uploadEvidence, resolveEvidenceRef } from "./evidence.mjs";
 import { buildEconomicsSummary, canonicalJson, economicsSha256 } from "./economics.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
 
@@ -1468,7 +1468,8 @@ async function processHandoff(
       taskId,
       busUrl: bus.serverUrl,
       busToken: bus.token,
-      ref: envelopeToUse.ref,
+      // A governed handoff files its bundle under the work order; a prose one under `ref:`.
+      ref: resolveEvidenceRef({ contractWorkOrderId: contractFields?.work_order_id ?? null, envelopeRef: envelopeToUse.ref ?? null }),
       fence: lease ? fence : null,
       economics: { summary: economicsSummary, sha256: economicsSha },
       extraFiles,

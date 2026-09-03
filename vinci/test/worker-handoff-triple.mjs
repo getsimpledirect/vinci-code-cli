@@ -958,6 +958,51 @@ try {
     assert.equal(f.getVinciCalls().length, vinciRuns, "neither invalid handoff spawns");
   }
 
+  // --- CCM-v0: a GOVERNED attempt files its evidence under its work order ---
+  //
+  // task.mjs builds a contract envelope with `ref: undefined`, so uploadEvidence's
+  // `isLedgerRef(ref)` gate was false and a governed attempt POSTed no evidence at all — its
+  // economics summary reached disk and never reached the ledger. The work order id IS the row.
+  // The gate is unchanged: a work order id that is not ledger-shaped still posts nothing, which
+  // is what every `wo-…` case above exercises.
+  {
+    const awsRecord = join(f.tempDir, "aws-ccm-calls.txt");
+    const evidenceEnv = { VINCI_EVIDENCE_URI_PREFIX: "s3://evidence-bucket/worker/", FAKE_AWS_RECORD: awsRecord };
+    const postsBefore = f.getEvidencePosts().length;
+
+    // Negative control FIRST, on the same harness: a non-ledger work order id posts nothing.
+    const woOrder = orderFor("wo-ccm-control");
+    debrisAuthority.reserveTask("m-ccm-control");
+    f.busMessages.push(handoff("m-ccm-control", register(woOrder, specFor(woOrder, { targetBranch: "feat/ccm-control" }))));
+    let r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "ccm-control.txt", ...evidenceEnv } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    assert.equal(
+      f.getEvidencePosts().length, postsBefore,
+      "control: a work order id that is not a ledger ref must still post no evidence",
+    );
+
+    // Positive: a bk_-shaped work order id is a ledger row, so the bundle is filed under it.
+    const bkOrder = orderFor("bk_ccm7");
+    debrisAuthority.reserveTask("m-ccm-governed");
+    f.busMessages.push(handoff("m-ccm-governed", register(bkOrder, specFor(bkOrder, { targetBranch: "feat/ccm-governed" }))));
+    r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "ccm-governed.txt", ...evidenceEnv } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+
+    const posts = f.getEvidencePosts();
+    assert.equal(posts.length, postsBefore + 1, `exactly one evidence POST, from the governed run: ${JSON.stringify(posts)}`);
+    const post = posts.at(-1);
+    assert.equal(post.job_ref, "bk_ccm7", "the bundle is filed under the work order id, not a null ref");
+    assert.equal(post.kind, "bundle");
+
+    // The two sides of the join agree BY CONSTRUCTION: the ledger compares the POST's job_ref
+    // against the summary's work_order_id and refuses binding:work_order_mismatch otherwise.
+    assert.ok(post.economics_summary, "the POST carries the economics summary");
+    assert.equal(post.economics_summary.work_order_id, post.job_ref, "summary key == evidence key");
+    assert.match(post.economics_sha256 ?? "", /^[0-9a-f]{64}$/);
+  }
+
   console.log("PASS worker-handoff-triple");
 } finally {
   await f.cleanup();
