@@ -10,11 +10,20 @@
 // entitled to ship whatever its own package contents are, and pruning those by name would change
 // which bytes of a third-party package the artifact carries.
 //
-// Both the producer (package-entries.mjs, which writes tar's entry list) and the verifier
-// (packaged-artifact-check.mjs, which decides the trusted release surface) import this one
-// predicate. Splitting the rule across the two is the pairwise failure this file exists to prevent:
-// a producer-only exclusion makes every artifact fail verification as "required by the trusted
-// package layout is missing", and a verifier-only exclusion lets the files ship uninspected.
+// On this branch the only importer is the producer, package-excludes.mjs, which emits one exclusion
+// per matching path into the file package.sh already passes to tar's --exclude-from. The verifier
+// here (packaged-artifact-check.mjs) does NOT import it, and does not need to: this producer's
+// checker has no closure requirement over first-party roots, so a producer-only rule is complete.
+//
+// That is worth stating because it is NOT true of every branch. On the entry-list producer the rule
+// has to be two-sided -- that checker requires every authority entry under vinci/worker, so a
+// producer-only exclusion would make every artifact fail verification as "required by the trusted
+// package layout is missing", and a verifier-only exclusion would let the files ship uninspected.
+// An earlier version of this comment described that two-sided arrangement while sitting on this
+// branch, where it is false: it named package-entries.mjs and packaged-artifact-check.mjs as the
+// importers when neither imports it here. A header that asserts a pairwise property the branch does
+// not have is the same defect the file exists to prevent, one level up -- so it says what is true
+// here, and names the other configuration as the other configuration.
 // `fixtures` and `__snapshots__` are near-universal conventions for test DATA, and test data under a
 // tarred first-party root ships exactly like test code does. Both were added as HARDENING, not as a
 // behaviour change: at the time they were added the repository held no first-party `fixtures` or
