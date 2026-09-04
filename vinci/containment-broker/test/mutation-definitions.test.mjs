@@ -1,9 +1,273 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { createHash, createHmac } from "node:crypto";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { test } from "node:test";
 
 import { CRASH_EDGES, EFFECT_CRASH_EDGES, LOCAL_EVIDENCE_CLASSIFICATION, MUTATION_CASES, NATIVE_LINUX_CASES } from "./harnesses.mjs";
+
+const RECEIPT_KEY = Buffer.alloc(32, 0x43);
+
+function replaceExactly(source, target, replacement, expectedCount = 1) {
+  assert.equal(source.split(target).length - 1, expectedCount, `mutation target count: ${target}`);
+  return source.replaceAll(target, replacement);
+}
+
+async function importCanonicalMutant(name, mutate) {
+  const source = readFileSync(new URL("../src/canonical.mjs", import.meta.url), "utf8");
+  const mutated = mutate(source);
+  assert.notEqual(mutated, source, `${name}: mutation must change the source`);
+  const directory = mkdtempSync(join(tmpdir(), `vinci-canonical-${name}-`));
+  const path = join(directory, "canonical.mjs");
+  writeFileSync(path, mutated);
+  return import(`${pathToFileURL(path).href}?mutant=${name}`);
+}
+
+function historicalReceipt(payload) {
+  const body = Buffer.from(
+    '{"key_id":"root-key:v3","kind":"terminal","payload":{"$bytes_base64":"3q2+7w=="},"schema":"vinci.containment-broker.receipt/v3"}',
+  );
+  return {
+    authentication: {
+      algorithm: "hmac-sha256",
+      mac: createHmac("sha256", RECEIPT_KEY).update(body).digest("hex"),
+    },
+    body_sha256: createHash("sha256").update(body).digest("hex"),
+    key_id: "root-key:v3",
+    kind: "terminal",
+    payload,
+    schema: "vinci.containment-broker.receipt/v3",
+  };
+}
+
+async function assertMutationKilled(name, mutate, securityProperty) {
+  const mutant = await importCanonicalMutant(name, mutate);
+  assert.equal(await securityProperty(mutant), false, `${name}: mutant survived its security discriminator`);
+}
+
+test("canonical security mutations are each killed by a behavioral discriminator", async () => {
+  await assertMutationKilled("proxy-prototype-chain", (source) => replaceExactly(
+    source,
+    "if (isProxy(current)) return true;",
+    "if (current === value && isProxy(current)) return true;",
+  ), (mutant) => {
+    let trapCalls = 0;
+    const prototype = new Proxy(Object.prototype, {
+      getPrototypeOf(target) {
+        trapCalls += 1;
+        return Reflect.getPrototypeOf(target);
+      },
+    });
+    const payload = Object.create(prototype);
+    Object.defineProperty(payload, "decision", { enumerable: true, value: "safe" });
+    try {
+      mutant.canonicalBytes(payload);
+    } catch {
+      // Rejection alone is insufficient: no Proxy trap may run before it.
+    }
+    return trapCalls === 0;
+  });
+
+  await assertMutationKilled("proxy-guard", (source) => replaceExactly(
+    source,
+    'if (hasProxyInPrototypeChain(value)) throw new TypeError("Proxy values are not canonical");',
+    'if (false) throw new TypeError("Proxy values are not canonical");',
+  ), (mutant) => {
+    const payload = new Proxy({ $bytes_base64: "3q2+7w==" }, {
+      has(target, property) {
+        if (property === "$bytes_base64") return false;
+        return Reflect.has(target, property);
+      },
+    });
+    try {
+      mutant.canonicalBytes({ payload });
+      return false;
+    } catch {
+      return true;
+    }
+  });
+
+  await assertMutationKilled("verification-receipt-proxy-entry", (source) => replaceExactly(
+    source,
+    "if (hasProxyInPrototypeChain(receipt)) return false;",
+    "if (false) return false;",
+  ), (mutant) => {
+    const receipt = mutant.authenticateReceipt({
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: RECEIPT_KEY,
+      payload: { decision: "safe" },
+    });
+    let trapCalls = 0;
+    const receiptProxy = new Proxy(receipt, {
+      getPrototypeOf(target) {
+        trapCalls += 1;
+        return Reflect.getPrototypeOf(target);
+      },
+    });
+    return mutant.verifyReceipt(receiptProxy, {
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: RECEIPT_KEY,
+    }) === false && trapCalls === 0;
+  });
+
+  await assertMutationKilled("verification-snapshot", (source) => replaceExactly(
+    source,
+    "receipt = snapshotCanonicalValue(receipt);",
+    "receipt = receipt;",
+  ), (mutant) => {
+    const receipt = mutant.authenticateReceipt({
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: RECEIPT_KEY,
+      payload: { decision: "safe" },
+    });
+    let coercionCalls = 0;
+    const mac = {};
+    Object.defineProperty(mac, Symbol.toPrimitive, {
+      value() {
+        coercionCalls += 1;
+        return receipt.authentication.mac;
+      },
+    });
+    const hostileReceipt = {
+      ...receipt,
+      authentication: { ...receipt.authentication, mac },
+    };
+    return mutant.verifyReceipt(hostileReceipt, {
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: RECEIPT_KEY,
+    }) === false && coercionCalls === 0;
+  });
+
+  await assertMutationKilled("verification-fail-closed", (source) => replaceExactly(
+    source,
+    `export function verifyReceipt(receipt, options) {
+  try {
+    if (hasProxyInPrototypeChain(receipt)) return false;
+    options = snapshotVerifyOptions(options);
+    return verifyReceiptUnchecked(receipt, options);
+  } catch {
+    return false;
+  }
+}`,
+    `export function verifyReceipt(receipt, options) {
+  if (hasProxyInPrototypeChain(receipt)) return false;
+  options = snapshotVerifyOptions(options);
+  return verifyReceiptUnchecked(receipt, options);
+}`,
+  ), (mutant) => {
+    const receipt = historicalReceipt({ $bytes_base64: "3q2+7w==" });
+    Object.defineProperty(receipt, "authentication", {
+      enumerable: true,
+      get() {
+        throw new Error("hostile getter");
+      },
+    });
+    try {
+      return mutant.verifyReceipt(receipt, {
+        kind: "terminal",
+        keyId: "root-key:v3",
+        key: RECEIPT_KEY,
+      }) === false;
+    } catch {
+      return false;
+    }
+  });
+
+  await assertMutationKilled("verification-options-snapshot", (source) => replaceExactly(
+    source,
+    "options = snapshotVerifyOptions(options);",
+    "options = options;",
+  ), (mutant) => {
+    const receipt = mutant.authenticateReceipt({
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: RECEIPT_KEY,
+      payload: { decision: "safe" },
+    });
+    let getterCalls = 0;
+    const options = {};
+    for (const [name, value] of [["kind", "terminal"], ["keyId", "root-key:v3"], ["key", RECEIPT_KEY]]) {
+      Object.defineProperty(options, name, {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return value;
+        },
+      });
+    }
+    return mutant.verifyReceipt(receipt, options) === false && getterCalls === 0;
+  });
+
+  await assertMutationKilled("intrinsic-key-length", (source) => replaceExactly(
+    source,
+    'if (byteLength < 32) throw new TypeError("receipt authentication key must be at least 32 bytes");',
+    'if (false) throw new TypeError("receipt authentication key must be at least 32 bytes");',
+  ), (mutant) => {
+    const key = Buffer.alloc(0);
+    Object.defineProperty(key, "length", { configurable: true, value: 32 });
+    try {
+      const receipt = mutant.authenticateReceipt({
+        kind: "terminal",
+        keyId: "root-key:v3",
+        key,
+        payload: { decision: "must-refuse-empty-key" },
+      });
+      return mutant.verifyReceipt(receipt, {
+        kind: "terminal",
+        keyId: "root-key:v3",
+        key,
+      }) === false;
+    } catch {
+      return true;
+    }
+  });
+
+  await assertMutationKilled("reserved-field", (source) => replaceExactly(
+    source,
+    "if (RESERVED_BYTES_FIELD in value) {",
+    "if (false) {",
+    2,
+  ), (mutant) => {
+    try {
+      mutant.canonicalBytes({ nested: { $bytes_base64: "AA==" } });
+      return false;
+    } catch {
+      return true;
+    }
+  });
+
+  await assertMutationKilled("exact-byte-equality", (source) => replaceExactly(
+    source,
+    "if (!encoded.equals(bytes)) {",
+    "if (false) {",
+  ), (mutant) => {
+    try {
+      mutant.decodeCanonicalBytes(Buffer.from('{"value":1,"value":1}'));
+      return false;
+    } catch {
+      return true;
+    }
+  });
+
+  await assertMutationKilled("safe-integer", (source) => replaceExactly(
+    source,
+    "if (Number.isInteger(value) && !Number.isSafeInteger(value)) {",
+    "if (false) {",
+  ), (mutant) => {
+    try {
+      mutant.canonicalBytes({ value: Number.MAX_SAFE_INTEGER + 1 });
+      return false;
+    } catch {
+      return true;
+    }
+  });
+});
 
 test("crash harness names every irreversible launch, close, seal and receipt edge", () => {
   assert.equal(CRASH_EDGES.length, 29);

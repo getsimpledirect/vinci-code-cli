@@ -28,6 +28,11 @@ causality, consumer integration or safe deployment.
 - Exact lifecycle ordering and absorbing `UNCONTAINED` recovery after every
   nonterminal process restart or corrupt/torn journal.
 - Canonical HMAC-SHA-256 authenticated prelaunch/terminal receipt primitives.
+- Canonical JSON accepts only finite JSON primitives, safe integral numbers, dense plain arrays and
+  plain data objects.
+  Raw `Buffer` values and the reserved `$bytes_base64` field are refused at every depth so binary
+  data cannot authenticate as an ordinary object. Raw bytes remain hashable with `sha256(Buffer)`;
+  receipt payloads bind their digest, length and encoding instead of embedding them.
 - Fail-closed host, fixed-trampoline, privilege, namespace, cgroup-view and
   complete inherited-FD allowlist validation.
 - A portable broker-mediated capture model that closes ingress before accepting
@@ -85,6 +90,30 @@ No PID, PGID, process-group, `/proc`, pipe-EOF, subreaper, `pkill`, daemon-cgrou
 or post-start attachment fallback is admissible.
 
 ## Local checks
+
+### Canonical receipt compatibility
+
+The receipt schema remains v3, and canonical bytes for every previously valid plain-data receipt are
+unchanged. Repository-wide inspection found no containment-broker producer that embeds a `Buffer` or
+emits `$bytes_base64` in a canonical value. Those two formerly accepted shapes now fail closed, as do
+sparse/extended arrays, accessor or hidden object fields, symbols, and non-plain prototypes; each had
+structure that JSON serialization could erase. Negative zero and repeated object references are also
+refused rather than collapsing to zero or duplicated subtrees. Unsafe integral numbers are rejected
+at both canonicalization and decoding boundaries so arbitrary-precision producers cannot collapse two
+mathematical integers into one JavaScript value. Proxies and values with a Proxy anywhere in their prototype
+chain are rejected recursively through Node's native Proxy detector before any trap-visible structural or
+brand operation. Receipt Proxy chains are rejected at the verifier entry point before even the Buffer brand
+check; object-form verification then creates a detached, immutable
+canonical snapshot and handles every inspection failure as `false`, never an escaped exception. Verifier
+options must be an exact plain object whose `kind`, `keyId`, and `key` members are
+enumerable data fields; option accessors, option/key Proxy chains, inherited fields, hidden fields, and extras
+are rejected without invoking user code. Authentication keys are copied into a detached Buffer and must
+have an intrinsic TypedArray byte length of at least 32, so a shadowed `length` property is never trusted
+or invoked. Persisted receipts can be passed to `verifyReceipt` as
+their exact `Buffer` bytes, which rejects non-canonical ordering, whitespace, duplicate JSON members,
+reserved fields and invalid UTF-8 before authenticating. Callers that already parsed bytes may still
+pass the resulting plain object, but only exact canonical bytes can establish that the source encoding
+itself contained no duplicate members.
 
 ```sh
 cd vinci/containment-broker
