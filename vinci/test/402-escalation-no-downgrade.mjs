@@ -53,9 +53,10 @@ async function assert402StopsEscalation(site, body, run, leadingResponses = []) 
 	const sourceId = `402-escalation-${site}`;
 	const calls = [];
 	const notices = [];
+	const terminalError = Object.assign(new Error(body), { status: 402 });
 	const steps = [
 		...leadingResponses,
-		{ error: Object.assign(new Error(body), { status: 402 }) },
+		{ error: terminalError },
 		{ error: Object.assign(new Error(body), { status: 402 }) },
 		{ text: "CHEAPER FALLBACK MUST NOT RUN" },
 	];
@@ -96,6 +97,7 @@ async function assert402StopsEscalation(site, body, run, leadingResponses = []) 
 			(error) => {
 				assert.match(error.message, /will not downgrade after an account or terminal error/i);
 				assert.equal(error.cause?.status, 402, `${site}: the terminal error must retain the real HTTP status`);
+				assert.strictEqual(error.cause, terminalError, `${site}: the terminal wrapper must preserve the provider error`);
 				return true;
 			},
 			`${site}: a 402 must throw instead of returning a cheaper-class result`,
