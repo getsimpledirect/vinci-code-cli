@@ -7,6 +7,7 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { streamSimpleOpenAICompletions } from "@earendil-works/pi-ai/compat";
+import { Value } from "typebox/value";
 import {
   acquireQwenFleetPermit,
   assertQwenCircuitClosed,
@@ -52,9 +53,14 @@ function validUsage(message: { usage?: unknown }): boolean {
   return Math.abs((cost.total as number) - costParts) <= Number.EPSILON * Math.max(1, costParts) * 8;
 }
 
-function validSemanticMessage(message: { content?: unknown; stopReason?: unknown }, context: Context): boolean {
+function validSemanticMessage(
+  message: { content?: unknown; responseId?: unknown; stopReason?: unknown },
+  context: Context,
+  settlement: QwenSemanticSettlement,
+): boolean {
   if (!Array.isArray(message.content) || !["stop", "length", "toolUse"].includes(String(message.stopReason))) return false;
-  const qualifiedTools = new Set((context.tools ?? []).map((tool) => tool.name));
+  if (!settlement.accepted?.response_id || message.responseId !== settlement.accepted.response_id) return false;
+  const qualifiedTools = new Map((context.tools ?? []).map((tool) => [tool.name, tool]));
   let toolCalls = 0;
   for (const block of message.content) {
     if (!block || typeof block !== "object") return false;
@@ -73,6 +79,11 @@ function validSemanticMessage(message: { content?: unknown; stopReason?: unknown
       typeof value.name !== "string" || !qualifiedTools.has(value.name) ||
       !value.arguments || typeof value.arguments !== "object" || Array.isArray(value.arguments)
     ) return false;
+    try {
+      if (!Value.Check(qualifiedTools.get(value.name)!.parameters, value.arguments)) return false;
+    } catch {
+      return false;
+    }
     toolCalls += 1;
   }
   return (message.stopReason === "toolUse") === (toolCalls > 0);
@@ -151,7 +162,7 @@ export function qwenProviderConfig(
                   message.provider !== QWEN_PROVIDER ||
                   message.model !== QWEN_MODEL ||
                   !validUsage(message) ||
-                  !validSemanticMessage(message, context)
+                  !validSemanticMessage(message, context, semanticSettlement)
                 ) {
                   throw new Error("qwen_semantic_invalid: terminal response failed exact identity, usage, finish, or tool semantics");
                 }

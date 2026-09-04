@@ -69,7 +69,7 @@ function qwenExtensionBuildSha256() {
   return sha256(Buffer.concat([Buffer.from("vinci-qwen-provider.ts\0"), provider, Buffer.from("\0qwen-runtime.ts\0"), runtime]));
 }
 
-function qwenClientBuildSha256() {
+export function qwenClientBuildSha256({ undiciPath = join(REPO_ROOT, "node_modules", "undici") } = {}) {
   const hash = createHash("sha256");
   const add = (path, label) => {
     const stat = lstatSync(path);
@@ -88,11 +88,27 @@ function qwenClientBuildSha256() {
     hash.update(readFileSync(path));
     hash.update("\0");
   };
+  const addDependency = (path, label, expectedName) => {
+    if (!path || !isAbsolute(path)) throw new Error(`${label} dependency path is required and must be absolute`);
+    let manifest;
+    try {
+      manifest = JSON.parse(readFileSync(join(path, "package.json"), "utf8"));
+    } catch {
+      throw new Error(`${label} dependency manifest is unavailable`);
+    }
+    if (manifest?.name !== expectedName || typeof manifest.version !== "string" || !manifest.version) {
+      throw new Error(`${label} dependency identity is invalid`);
+    }
+    hash.update(`dependency\0${manifest.name}\0${manifest.version}\0`);
+    add(path, label);
+  };
   hash.update(`node\0${process.versions.node}\0`);
   add(resolveBin("vinci"), "vinci-launcher");
   add(join(REPO_ROOT, "packages", "ai", "dist"), "packages/ai/dist");
   add(join(REPO_ROOT, "packages", "coding-agent", "dist"), "packages/coding-agent/dist");
-  add(join(REPO_ROOT, "node_modules", "openai"), "node_modules/openai");
+  addDependency(join(REPO_ROOT, "node_modules", "openai"), "node_modules/openai", "openai");
+  addDependency(undiciPath, "node_modules/undici", "undici");
+  addDependency(join(REPO_ROOT, "node_modules", "typebox"), "node_modules/typebox", "typebox");
   return hash.digest("hex");
 }
 

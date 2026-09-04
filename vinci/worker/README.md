@@ -350,8 +350,9 @@ bodies, validates and hashes the exact serialized request bytes after SDK hooks,
 OpenAI chunk object/model/usage identities and `[DONE]`, and disables SDK retries. A raw complete
 SSE body is only transport acceptance: success is recorded only after the OpenAI parser produces a
 valid terminal finish reason, usage, and qualified tool semantics. Parser and semantic failures
-count toward the atomically persisted circuit just like HTTP and transport/protocol failures; three
-failures open it for 60 seconds by default. `VINCI_QWEN_CIRCUIT_THRESHOLD` and
+include conflicting streamed response IDs and tool arguments that fail the exact signed JSON
+schema; they count toward the atomically persisted circuit just like HTTP and transport/protocol
+failures. Three failures open it for 60 seconds by default. `VINCI_QWEN_CIRCUIT_THRESHOLD` and
 `VINCI_QWEN_CIRCUIT_OPEN_MS` are bounded operator overrides.
 
 Concurrency is fixed at 1. The external VGC record carries a five-minute-or-shorter permit for the
@@ -422,7 +423,8 @@ The independent reviewer verifies the evidence, adds issuer/timestamps/review pr
 the canonical qualification with the separately controlled key. VGC installs the trust pin and live
 permit in the root-owned authority boundary; the Worker cannot nominate them through environment.
 The Qwen builder/operator must not possess the signing key. The client-build digest covers the
-executed launcher, Node version, AI parser, OpenAI SDK, and coding-agent distribution.
+executed launcher, Node version, AI parser, OpenAI SDK, Undici transport, TypeBox schema validator,
+and coding-agent distribution, including each directly used package's version and content.
 Requalification is mandatory after a failed/expired canary or any change to capabilities/limits,
 client build, endpoint identity/address policy, model/revision, outbound encoding, pricing basis,
 runtime artifact/arguments, system prompt, or tool schema/policy.

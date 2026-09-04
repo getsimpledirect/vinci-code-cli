@@ -190,6 +190,7 @@ export type QwenAttemptRecord = {
   input_tokens: number;
   output_tokens: number;
   request_sha256: string;
+  response_id: string | null;
 };
 
 export type QwenAuthorityBoundary = {
@@ -1173,7 +1174,7 @@ function validateUsage(value: unknown): { input: number; output: number } {
   return { input: prompt, output: completion };
 }
 
-function validateSseData(data: string): { done: boolean; usage?: { input: number; output: number } } {
+function validateSseData(data: string): { done: boolean; responseId?: string; usage?: { input: number; output: number } } {
   if (data === "[DONE]") return { done: true };
   let chunk: unknown;
   try {
@@ -1185,13 +1186,13 @@ function validateSseData(data: string): { done: boolean; usage?: { input: number
   const record = chunk as Record<string, unknown>;
   const allowed = new Set(["id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"]);
   if (Object.keys(record).some((key) => !allowed.has(key))) fail("stream_invalid", "inference stream chunk has an unexpected field");
-  if (record.object !== "chat.completion.chunk" || record.model !== QWEN_MODEL || !Array.isArray(record.choices)) {
+  if (typeof record.id !== "string" || !record.id || record.object !== "chat.completion.chunk" || record.model !== QWEN_MODEL || !Array.isArray(record.choices)) {
     fail("response_identity_mismatch", "inference stream chunk does not identify the exact qualified model/object");
   }
   if (record.usage !== undefined && record.usage !== null) {
-    return { done: false, usage: validateUsage(record.usage) };
+    return { done: false, responseId: record.id, usage: validateUsage(record.usage) };
   }
-  return { done: false };
+  return { done: false, responseId: record.id };
 }
 
 function retryDelayMs(response: Response, maximum: number): number {
@@ -1234,7 +1235,7 @@ function inferenceBody(
   response: Response,
   config: QwenRuntimeConfig,
   abort: AbortController,
-  finish: (outcome: string, status: number | null, inputTokens?: number, outputTokens?: number) => void,
+  finish: (outcome: string, status: number | null, inputTokens?: number, outputTokens?: number, responseId?: string | null) => void,
 ): ReadableStream<Uint8Array> {
   if (!response.body) fail("stream_invalid", "successful inference response has no body");
   const reader = response.body.getReader();
@@ -1245,11 +1246,12 @@ function inferenceBody(
   let usageSeen = false;
   let inputTokens = 0;
   let outputTokens = 0;
+  let responseId: string | null = null;
   let settled = false;
   const settle = (outcome: string, status: number | null) => {
     if (settled) return;
     settled = true;
-    finish(outcome, status);
+    finish(outcome, status, 0, 0, responseId);
   };
   const inspect = (text: string, final: boolean) => {
     pending += text;
@@ -1261,6 +1263,10 @@ function inferenceBody(
       if (!line.startsWith("data:")) fail("stream_invalid", "inference stream contains a non-SSE field");
       if (doneSeen) fail("stream_invalid", "inference stream contains data after [DONE]");
       const result = validateSseData(line.slice(5).trim());
+      if (result.responseId && responseId && result.responseId !== responseId) {
+        fail("response_identity_mismatch", "inference stream changed response id between chunks");
+      }
+      responseId ??= result.responseId ?? null;
       if (result.usage && usageSeen) fail("usage_invalid", "inference stream contains more than one usage object");
       if (result.done && !usageSeen) fail("stream_invalid", "inference stream ended before its strict usage object");
       doneSeen = result.done;
@@ -1281,7 +1287,7 @@ function inferenceBody(
           if (!doneSeen || !usageSeen) fail("stream_invalid", "inference stream omitted [DONE] or its strict usage object");
           if (!settled) {
             settled = true;
-            finish("transport_accepted", response.status, inputTokens, outputTokens);
+            finish("transport_accepted", response.status, inputTokens, outputTokens, responseId);
           }
           controller.close();
           return;
@@ -1359,7 +1365,7 @@ export function createQwenInferenceFetch(
         headers.set("x-vinci-idempotency-key", `${requestId}/${transportAttempt}`);
         headers.set("x-vinci-qwen-request-sha256", requestSha256);
         let attemptReported = false;
-        const finishAttempt = (outcome: string, status: number | null, inputTokens = 0, outputTokens = 0) => {
+        const finishAttempt = (outcome: string, status: number | null, inputTokens = 0, outputTokens = 0, responseId: string | null = null) => {
           if (attemptReported) return;
           attemptReported = true;
           real?.close();
@@ -1378,6 +1384,7 @@ export function createQwenInferenceFetch(
             input_tokens: inputTokens,
             output_tokens: outputTokens,
             request_sha256: requestSha256,
+            response_id: responseId,
           };
           if (outcome === "transport_accepted") {
             semanticSettlement.accepted = record;
@@ -1436,10 +1443,10 @@ export function createQwenInferenceFetch(
           finishAttempt("content_type_invalid", response.status);
           fail("stream_invalid", "inference response is not text/event-stream");
         }
-        const finish = (outcome: string, status: number | null, inputTokens = 0, outputTokens = 0) => {
+        const finish = (outcome: string, status: number | null, inputTokens = 0, outputTokens = 0, responseId: string | null = null) => {
           clearTimeout(timeout);
           externalSignal?.removeEventListener("abort", abort);
-          finishAttempt(outcome, status, inputTokens, outputTokens);
+          finishAttempt(outcome, status, inputTokens, outputTokens, responseId);
         };
         const body = inferenceBody(response, config, controller, finish);
         timerOwnedByBody = true;

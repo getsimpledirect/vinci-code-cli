@@ -11,7 +11,7 @@ import { qwenProviderConfig } from "../extensions/vinci-qwen-provider.ts";
 import * as cleanroom from "../worker/cleanroom.mjs";
 import * as digest from "../worker/contracts/digest.mjs";
 import * as economics from "../worker/economics.mjs";
-import { runVinci } from "../worker/run.mjs";
+import { qwenClientBuildSha256, runVinci } from "../worker/run.mjs";
 import { TaskLifecycle } from "../worker/task.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
@@ -459,7 +459,7 @@ try {
       model: runtime.QWEN_MODEL,
       choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: "report_ready", arguments: '{"status":"ready"}' } }] } }],
     })}`,
-    `data: ${JSON.stringify({ id: "canary-usage", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+    `data: ${JSON.stringify({ id: "canary-tool", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [], usage })}`,
     "data: [DONE]",
     "",
   ].join("\n\n");
@@ -634,6 +634,26 @@ try {
   assert.equal(successRecords[0].input_tokens, 10);
   assert.equal(successRecords[0].output_tokens, 2);
   assert.equal(successRecords[0].cost_usd, 0.000004);
+  assert.equal(successRecords[0].response_id, "chunk-1");
+
+  const conflictingIdSse = [
+    `data: ${JSON.stringify({ id: "response-a", object: "chat.completion.chunk", created: 1, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }] })}`,
+    `data: ${JSON.stringify({ id: "response-b", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const conflictingIdRecords = [];
+  const conflictingIdConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "conflicting-id.json"), VINCI_QWEN_CIRCUIT_THRESHOLD: "1" });
+  conflictingIdConfig.endpointAddresses = ["93.184.216.34"];
+  const conflictingIdResponse = await runtime.createQwenInferenceFetch(
+    conflictingIdConfig,
+    "request-conflicting-id",
+    (record) => conflictingIdRecords.push(record),
+    async () => new Response(conflictingIdSse, { headers: identityHeaders() }),
+  )(conflictingIdConfig.chatUrl, { method: "POST", body: requestBody });
+  await assert.rejects(conflictingIdResponse.text(), /response id/);
+  assert.equal(conflictingIdRecords[0].outcome, "response_identity_mismatch");
+  assert.throws(() => runtime.assertQwenCircuitClosed(conflictingIdConfig), /qwen_circuit_open/);
 
   const invalidUsage = { ...usage, total_tokens: 99 };
   const invalidUsageSse = [
@@ -678,8 +698,8 @@ try {
   const context = { systemPrompt, messages: [{ role: "user", content: workOrderPrompt, timestamp: Date.now() }], tools };
   const parserValidSse = [
     `data: ${JSON.stringify({ id: "parsed-1", object: "chat.completion.chunk", created: 1, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] })}`,
-    `data: ${JSON.stringify({ id: "parsed-2", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
-    `data: ${JSON.stringify({ id: "parsed-usage", object: "chat.completion.chunk", created: 3, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+    `data: ${JSON.stringify({ id: "parsed-1", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
+    `data: ${JSON.stringify({ id: "parsed-1", object: "chat.completion.chunk", created: 3, model: runtime.QWEN_MODEL, choices: [], usage })}`,
     "data: [DONE]",
     "",
   ].join("\n\n");
@@ -722,7 +742,7 @@ try {
 
   const missingFinishSse = [
     `data: ${JSON.stringify({ id: "missing-finish", object: "chat.completion.chunk", created: 1, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }] })}`,
-    `data: ${JSON.stringify({ id: "missing-finish-usage", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+    `data: ${JSON.stringify({ id: "missing-finish", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [], usage })}`,
     "data: [DONE]",
     "",
   ].join("\n\n");
@@ -743,8 +763,8 @@ try {
 
   const unknownToolSse = [
     `data: ${JSON.stringify({ id: "bad-tool-1", object: "chat.completion.chunk", created: 1, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: "unqualified_tool", arguments: "{}" } }] }, finish_reason: null }] })}`,
-    `data: ${JSON.stringify({ id: "bad-tool-2", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}`,
-    `data: ${JSON.stringify({ id: "bad-tool-usage", object: "chat.completion.chunk", created: 3, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+    `data: ${JSON.stringify({ id: "bad-tool-1", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}`,
+    `data: ${JSON.stringify({ id: "bad-tool-1", object: "chat.completion.chunk", created: 3, model: runtime.QWEN_MODEL, choices: [], usage })}`,
     "data: [DONE]",
     "",
   ].join("\n\n");
@@ -763,6 +783,31 @@ try {
   assert.equal(toolRecords[0].outcome, "parser_semantic_invalid");
   assert.throws(() => runtime.assertQwenCircuitClosed(toolConfig), /qwen_circuit_open/);
 
+  const invalidArgumentsSse = [
+    `data: ${JSON.stringify({ id: "bad-arguments", object: "chat.completion.chunk", created: 1, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-2", type: "function", function: { name: "read", arguments: '{"path":42}' } }] }, finish_reason: null }] })}`,
+    `data: ${JSON.stringify({ id: "bad-arguments", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}`,
+    `data: ${JSON.stringify({ id: "bad-arguments", object: "chat.completion.chunk", created: 3, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const argumentRecords = [];
+  const argumentConfig = freshenPermit(loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "tool-arguments.json"), VINCI_QWEN_CIRCUIT_THRESHOLD: "1" }));
+  argumentConfig.endpointAddresses = ["93.184.216.34"];
+  const argumentProvider = qwenProviderConfig(
+    argumentConfig,
+    sourceStreamSimpleOpenAICompletions,
+    (record) => argumentRecords.push(record),
+    async () => new Response(invalidArgumentsSse, { headers: identityHeaders() }),
+  );
+  const badArguments = await argumentProvider.streamSimple(
+    { ...argumentProvider.models[0], provider: runtime.QWEN_PROVIDER, api: runtime.QWEN_API, baseUrl: argumentProvider.baseUrl },
+    context,
+  ).result();
+  assert.equal(badArguments.stopReason, "error");
+  assert.match(badArguments.errorMessage, /qwen_semantic_invalid/);
+  assert.equal(argumentRecords[0].outcome, "parser_semantic_invalid");
+  assert.throws(() => runtime.assertQwenCircuitClosed(argumentConfig), /qwen_circuit_open/);
+
   const vectors = join(root, "vinci/test/fixtures/contract-vectors");
   const emptyCriteriaOrder = {
     ...JSON.parse(readFileSync(join(vectors, "work-order-1-minimal/input.json"), "utf8")),
@@ -772,8 +817,12 @@ try {
 
   const fakeBin = join(temp, "bin");
   const fakeVinci = join(fakeBin, "vinci");
+  const mutatedUndici = join(temp, "mutated-undici");
   const spawnRecord = join(temp, "spawn-record.json");
   mkdirSync(fakeBin);
+  mkdirSync(mutatedUndici);
+  writeFileSync(join(mutatedUndici, "package.json"), JSON.stringify({ name: "undici", version: "0.0.0-mutated" }), { mode: 0o600 });
+  writeFileSync(join(mutatedUndici, "index.js"), "export const mutation = true;\n", { mode: 0o600 });
   writeFileSync(fakeVinci, `#!/usr/bin/env node
 import { fstatSync, readFileSync, writeFileSync } from "node:fs";
 let stdin = "";
@@ -788,7 +837,19 @@ writeFileSync(process.env.QWEN_TEST_SPAWN_RECORD, JSON.stringify({ argv: process
   writeFileSync(join(stateDir, "tasks", "task-spawn.json"), JSON.stringify({ attempt: 1 }), { mode: 0o600 });
   const originalPath = process.env.PATH;
   process.env.PATH = `${fakeBin}:${originalPath}`;
+  let expectedClientBuild;
   try {
+    expectedClientBuild = qwenClientBuildSha256();
+    assert.notEqual(
+      qwenClientBuildSha256({ undiciPath: mutatedUndici }),
+      expectedClientBuild,
+      "changing the directly used undici version/content must change the client-build identity",
+    );
+    assert.throws(
+      () => qwenClientBuildSha256({ undiciPath: "" }),
+      /undici dependency path is required/,
+      "omitting undici must refuse client-build identity generation",
+    );
     await runVinci({
       envelope: {
         provider: runtime.QWEN_PROVIDER,
@@ -821,6 +882,7 @@ writeFileSync(process.env.QWEN_TEST_SPAWN_RECORD, JSON.stringify({ argv: process
   assert.equal(spawned.stdin.includes("synthetic-test-secret"), false);
   assert.deepEqual(spawned.qwenEnvKeys, ["VINCI_QWEN_SECRET_FD"]);
   assert.match(spawned.clientBuild, /^[0-9a-f]{64}$/);
+  assert.equal(spawned.clientBuild, expectedClientBuild);
   assert.notEqual(spawned.clientBuild, runtime.qwenSha256(readFileSync(fakeVinci)), "client build must include executed parser and coding-agent dependencies, not only the launcher");
   assert.equal(spawned.secretBytes, spawned.secretReadBytes);
 
