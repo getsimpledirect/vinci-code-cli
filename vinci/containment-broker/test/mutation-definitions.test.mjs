@@ -89,12 +89,14 @@ test("canonical security mutations are each killed by a behavioral discriminator
     source,
     `export function verifyReceipt(receipt, options) {
   try {
+    options = snapshotVerifyOptions(options);
     return verifyReceiptUnchecked(receipt, options);
   } catch {
     return false;
   }
 }`,
     `export function verifyReceipt(receipt, options) {
+  options = snapshotVerifyOptions(options);
   return verifyReceiptUnchecked(receipt, options);
 }`,
   ), (mutant) => {
@@ -114,6 +116,31 @@ test("canonical security mutations are each killed by a behavioral discriminator
     } catch {
       return false;
     }
+  });
+
+  await assertMutationKilled("verification-options-snapshot", (source) => replaceExactly(
+    source,
+    "options = snapshotVerifyOptions(options);",
+    "options = options;",
+  ), (mutant) => {
+    const receipt = mutant.authenticateReceipt({
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: RECEIPT_KEY,
+      payload: { decision: "safe" },
+    });
+    let getterCalls = 0;
+    const options = {};
+    for (const [name, value] of [["kind", "terminal"], ["keyId", "root-key:v3"], ["key", RECEIPT_KEY]]) {
+      Object.defineProperty(options, name, {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return value;
+        },
+      });
+    }
+    return mutant.verifyReceipt(receipt, options) === false && getterCalls === 0;
   });
 
   await assertMutationKilled("reserved-field", (source) => replaceExactly(

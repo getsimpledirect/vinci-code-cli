@@ -137,6 +137,69 @@ test("receipt verification rejects Proxy values before traps and always fails cl
   });
   assert.doesNotThrow(() => verifyReceipt(nestedReceipt, throwingOptions));
   assert.equal(verifyReceipt(nestedReceipt, throwingOptions), false);
+
+  let optionGetterCalls = 0;
+  const accessorOptions = {};
+  for (const [name, value] of [["kind", "terminal"], ["keyId", "root-key:v3"], ["key", KEY]]) {
+    Object.defineProperty(accessorOptions, name, {
+      enumerable: true,
+      get() {
+        optionGetterCalls += 1;
+        return value;
+      },
+    });
+  }
+  assert.equal(verifyReceipt(nestedReceipt, accessorOptions), false);
+  assert.equal(optionGetterCalls, 0, "verification option accessors must not be invoked");
+
+  let optionTrapCalls = 0;
+  const proxyOptions = new Proxy({ kind: "terminal", keyId: "root-key:v3", key: KEY }, {
+    get(target, property, receiver) {
+      optionTrapCalls += 1;
+      return Reflect.get(target, property, receiver);
+    },
+    getPrototypeOf(target) {
+      optionTrapCalls += 1;
+      return Reflect.getPrototypeOf(target);
+    },
+    ownKeys(target) {
+      optionTrapCalls += 1;
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      optionTrapCalls += 1;
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  assert.equal(verifyReceipt(nestedReceipt, proxyOptions), false);
+  assert.equal(optionTrapCalls, 0, "verification option Proxy traps must not be invoked");
+
+  let keyTrapCalls = 0;
+  const proxyKey = new Proxy(KEY, {
+    get(target, property, receiver) {
+      keyTrapCalls += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  assert.equal(verifyReceipt(nestedReceipt, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: proxyKey,
+  }), false);
+  assert.equal(keyTrapCalls, 0, "verification key Proxy traps must not be invoked");
+
+  assert.equal(verifyReceipt(nestedReceipt, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+    extra: true,
+  }), false);
+  const inheritedOptions = Object.create({ kind: "terminal" });
+  Object.assign(inheritedOptions, { keyId: "root-key:v3", key: KEY });
+  assert.equal(verifyReceipt(nestedReceipt, inheritedOptions), false);
+  const hiddenOptions = { kind: "terminal", keyId: "root-key:v3" };
+  Object.defineProperty(hiddenOptions, "key", { enumerable: false, value: KEY });
+  assert.equal(verifyReceipt(nestedReceipt, hiddenOptions), false);
 });
 
 test("canonical snapshots resist descriptor, prototype, and post-validation mutation", () => {

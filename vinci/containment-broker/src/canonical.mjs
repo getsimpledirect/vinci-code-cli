@@ -5,6 +5,7 @@ export const RECEIPT_SCHEMA = "vinci.containment-broker.receipt/v3";
 
 const { isProxy } = utilTypes;
 const RESERVED_BYTES_FIELD = "$bytes_base64";
+const VERIFY_OPTION_KEYS = ["key", "keyId", "kind"];
 
 function plainObjectEntries(value) {
   const prototype = Object.getPrototypeOf(value);
@@ -101,9 +102,35 @@ export function sha256(value) {
 }
 
 function requireKey(key) {
-  if (!Buffer.isBuffer(key) || key.length < 32) {
+  if (isProxy(key) || !Buffer.isBuffer(key) || key.length < 32) {
     throw new TypeError("receipt authentication key must be at least 32 bytes");
   }
+}
+
+function snapshotVerifyOptions(options) {
+  if (isProxy(options)) throw new TypeError("Proxy verification options are not supported");
+  if (options === null || typeof options !== "object") {
+    throw new TypeError("verification options must be a plain object");
+  }
+  const prototype = Object.getPrototypeOf(options);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("verification options must be a plain object");
+  }
+  const keys = Reflect.ownKeys(options);
+  if (keys.some((key) => typeof key !== "string")
+    || JSON.stringify([...keys].sort()) !== JSON.stringify(VERIFY_OPTION_KEYS)) {
+    throw new TypeError("verification options must contain exactly kind, keyId, and key");
+  }
+  const snapshot = Object.create(null);
+  for (const key of VERIFY_OPTION_KEYS) {
+    const descriptor = Object.getOwnPropertyDescriptor(options, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw new TypeError(`verification option must be an enumerable data field: ${key}`);
+    }
+    snapshot[key] = descriptor.value;
+  }
+  if (isProxy(snapshot.key)) throw new TypeError("Proxy verification keys are not supported");
+  return Object.freeze(snapshot);
 }
 
 function deepFreeze(value) {
@@ -200,6 +227,7 @@ function verifyReceiptUnchecked(receipt, { kind, keyId, key }) {
 
 export function verifyReceipt(receipt, options) {
   try {
+    options = snapshotVerifyOptions(options);
     return verifyReceiptUnchecked(receipt, options);
   } catch {
     return false;

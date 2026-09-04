@@ -103,7 +103,9 @@ at both canonicalization and decoding boundaries so arbitrary-precision producer
 mathematical integers into one JavaScript value. Proxies are rejected recursively through Node's native
 Proxy detector before any trap-visible structural operation. Object-form verification first creates a
 detached, immutable canonical snapshot and handles every inspection failure as `false`, never an escaped
-exception. Persisted receipts can be passed to `verifyReceipt` as
+exception. Verifier options must be an exact plain object whose `kind`, `keyId`, and `key` members are
+enumerable data fields; option/key Proxies, accessors, inherited fields, hidden fields, and extras are
+rejected without invoking user code. Persisted receipts can be passed to `verifyReceipt` as
 their exact `Buffer` bytes, which rejects non-canonical ordering, whitespace, duplicate JSON members,
 reserved fields and invalid UTF-8 before authenticating. Callers that already parsed bytes may still
 pass the resulting plain object, but only exact canonical bytes can establish that the source encoding
