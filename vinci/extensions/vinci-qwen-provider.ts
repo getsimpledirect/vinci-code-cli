@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { streamSimpleOpenAICompletions } from "@earendil-works/pi-ai/compat";
 import {
+  acquireQwenFleetPermit,
   assertQwenCircuitClosed,
   assertQwenContextBindings,
   createQwenInferenceFetch,
@@ -20,7 +21,10 @@ import {
   qwenSha256,
   scrubQwenBootstrapEnvironment,
   type QwenAttemptRecord,
+  type QwenFetch,
   type QwenRuntimeConfig,
+  type QwenSemanticSettlement,
+  settleQwenSemanticOutcome,
   validateQwenOutboundPayload,
 } from "./lib/qwen-runtime.ts";
 
@@ -48,10 +52,37 @@ function validUsage(message: { usage?: unknown }): boolean {
   return Math.abs((cost.total as number) - costParts) <= Number.EPSILON * Math.max(1, costParts) * 8;
 }
 
+function validSemanticMessage(message: { content?: unknown; stopReason?: unknown }, context: Context): boolean {
+  if (!Array.isArray(message.content) || !["stop", "length", "toolUse"].includes(String(message.stopReason))) return false;
+  const qualifiedTools = new Set((context.tools ?? []).map((tool) => tool.name));
+  let toolCalls = 0;
+  for (const block of message.content) {
+    if (!block || typeof block !== "object") return false;
+    const value = block as Record<string, unknown>;
+    if (value.type === "text") {
+      if (typeof value.text !== "string") return false;
+      continue;
+    }
+    if (value.type === "thinking") {
+      if (typeof value.thinking !== "string") return false;
+      continue;
+    }
+    if (
+      value.type !== "toolCall" ||
+      typeof value.id !== "string" || !value.id ||
+      typeof value.name !== "string" || !qualifiedTools.has(value.name) ||
+      !value.arguments || typeof value.arguments !== "object" || Array.isArray(value.arguments)
+    ) return false;
+    toolCalls += 1;
+  }
+  return (message.stopReason === "toolUse") === (toolCalls > 0);
+}
+
 export function qwenProviderConfig(
   runtime: QwenRuntimeConfig,
   streamOpenAI = streamSimpleOpenAICompletions,
   onAttempt: (record: QwenAttemptRecord) => void = () => {},
+  injectedFetch?: QwenFetch,
 ) {
   let inFlight = 0;
   let requestOrdinal = 0;
@@ -68,15 +99,21 @@ export function qwenProviderConfig(
       if (inFlight >= runtime.qualification.limits.max_concurrency) {
         throw new Error("qwen_concurrency_exceeded: the qualified single-request bound is already in use");
       }
+      const releaseFleetPermit = acquireQwenFleetPermit(runtime);
       inFlight += 1;
       let released = false;
       const release = () => {
         if (released) return;
         released = true;
-        inFlight -= 1;
+        try {
+          releaseFleetPermit();
+        } finally {
+          inFlight -= 1;
+        }
       };
       requestOrdinal += 1;
       const requestId = qwenSha256(`${runtime.attribution.workOrderId}\0${runtime.attribution.runId}\0${runtime.attribution.attemptId}\0${requestOrdinal}`);
+      const semanticSettlement: QwenSemanticSettlement = { transportFailed: false, settled: false };
       let source;
       try {
         source = streamOpenAI(
@@ -88,12 +125,10 @@ export function qwenProviderConfig(
             headers: { ...options?.headers, ...qwenProviderHeaders(runtime, requestId) },
             timeoutMs: runtime.qualification.limits.total_timeout_ms,
             maxRetries: 0,
-            fetch: createQwenInferenceFetch(runtime, requestId, onAttempt),
-            onPayload: async (payload, requestModel) => {
-              const candidate = await options?.onPayload?.(payload, requestModel);
-              const finalPayload = candidate ?? payload;
-              validateQwenOutboundPayload(runtime, finalPayload);
-              return finalPayload;
+            fetch: createQwenInferenceFetch(runtime, requestId, onAttempt, injectedFetch, semanticSettlement),
+            onPayload: (payload) => {
+              validateQwenOutboundPayload(runtime, payload);
+              return payload;
             },
           } as SimpleStreamOptions & { fetch: typeof globalThis.fetch },
         );
@@ -108,9 +143,22 @@ export function qwenProviderConfig(
           for await (const event of source) {
             if (event.type === "done" || event.type === "error") {
               terminalSeen = true;
-              const message = event.type === "done" ? event.message : event.error;
-              if (message.provider !== QWEN_PROVIDER || message.model !== QWEN_MODEL || !validUsage(message)) {
-                throw new Error("qwen_usage_invalid: terminal response lacks exact model identity or strict usage/cost telemetry");
+              if (event.type === "error") {
+                settleQwenSemanticOutcome(runtime, semanticSettlement, false, "parser_error", onAttempt);
+              } else {
+                const message = event.message;
+                if (
+                  message.provider !== QWEN_PROVIDER ||
+                  message.model !== QWEN_MODEL ||
+                  !validUsage(message) ||
+                  !validSemanticMessage(message, context)
+                ) {
+                  throw new Error("qwen_semantic_invalid: terminal response failed exact identity, usage, finish, or tool semantics");
+                }
+                // A permit-release failure is itself a failed request. Never persist semantic
+                // success until the external concurrency authority has been released cleanly.
+                release();
+                settleQwenSemanticOutcome(runtime, semanticSettlement, true, "success", onAttempt);
               }
               // Release before the terminal event can resolve result() or become observable to a
               // caller that immediately starts the next qualified request.
@@ -120,6 +168,7 @@ export function qwenProviderConfig(
           }
           if (!terminalSeen) throw new Error("qwen_stream_truncated: provider stream ended without a terminal event");
         } catch (error) {
+          settleQwenSemanticOutcome(runtime, semanticSettlement, false, "parser_semantic_invalid", onAttempt);
           release();
           const message = {
             role: "assistant" as const,

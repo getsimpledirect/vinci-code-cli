@@ -11,6 +11,8 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
@@ -29,6 +31,7 @@ import { readSessionState } from "./session-read.mjs";
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const WORKER_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(WORKER_DIR, "../..");
 const MAX_QWEN_PROMPT_BYTES = 1024 * 1024;
 
 function sha256(value) {
@@ -64,6 +67,33 @@ function qwenExtensionBuildSha256() {
   const provider = readFileSync(join(WORKER_DIR, "..", "extensions", "vinci-qwen-provider.ts"));
   const runtime = readFileSync(join(WORKER_DIR, "..", "extensions", "lib", "qwen-runtime.ts"));
   return sha256(Buffer.concat([Buffer.from("vinci-qwen-provider.ts\0"), provider, Buffer.from("\0qwen-runtime.ts\0"), runtime]));
+}
+
+function qwenClientBuildSha256() {
+  const hash = createHash("sha256");
+  const add = (path, label) => {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      hash.update(`link\0${label}\0${readlinkSync(path)}\0`);
+      add(realpathSync(path), `${label}@resolved`);
+      return;
+    }
+    if (stat.isDirectory()) {
+      hash.update(`dir\0${label}\0`);
+      for (const name of readdirSync(path).sort()) add(join(path, name), `${label}/${name}`);
+      return;
+    }
+    if (!stat.isFile()) throw new Error(`unsupported client build entry: ${label}`);
+    hash.update(`file\0${label}\0${stat.size}\0`);
+    hash.update(readFileSync(path));
+    hash.update("\0");
+  };
+  hash.update(`node\0${process.versions.node}\0`);
+  add(resolveBin("vinci"), "vinci-launcher");
+  add(join(REPO_ROOT, "packages", "ai", "dist"), "packages/ai/dist");
+  add(join(REPO_ROOT, "packages", "coding-agent", "dist"), "packages/coding-agent/dist");
+  add(join(REPO_ROOT, "node_modules", "openai"), "node_modules/openai");
+  return hash.digest("hex");
 }
 
 function canonicalBytes(value) {
@@ -1287,7 +1317,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
       authority: "Governor",
       safe_resume: false,
     }));
-    taskEnvironment.VINCI_QWEN_CLIENT_BUILD_SHA256 = sha256(readFileSync(resolveBin("vinci")));
+    taskEnvironment.VINCI_QWEN_CLIENT_BUILD_SHA256 = qwenClientBuildSha256();
     taskEnvironment.VINCI_QWEN_EXTENSION_BUILD_SHA256 = qwenExtensionBuildSha256();
     taskEnvironment.VINCI_QWEN_CIRCUIT_FILE = join(stateDir, "qwen-h200", "circuit.json");
     qwenSecretReference = taskEnvironment.VINCI_QWEN_SECRET_REF;

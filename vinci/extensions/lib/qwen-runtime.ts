@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { isIP } from "node:net";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Context, Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import { Agent, fetch as undiciFetch } from "undici";
@@ -43,6 +43,7 @@ const MAX_CANARY_AGE_AT_ISSUE_MS = 24 * 60 * 60 * 1000;
 const LOCK_WAIT_MS = 1_000;
 const LOCK_POLL_MS = 10;
 const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+const QWEN_AUTHORITY_ROOT = "/run/vinci/qwen-authority";
 
 export const QWEN_REQUEST_ENCODING = Object.freeze({
   schema: "vinci.qwen-openai-chat-request.v1",
@@ -188,6 +189,33 @@ export type QwenAttemptRecord = {
   cost_usd: number;
   input_tokens: number;
   output_tokens: number;
+  request_sha256: string;
+};
+
+export type QwenAuthorityBoundary = {
+  qualificationTrust: {
+    issuer: string;
+    publicKeyFile: string;
+    publicKeySha256: string;
+  };
+  fleetPermit: {
+    schema: "vinci.qwen-fleet-permit.v1";
+    authority: "vgc-fleet-permit-authority";
+    permitId: string;
+    workOrderId: string;
+    runId: string;
+    attemptId: string;
+    maxConcurrency: number;
+    lockDirectory: string;
+    issuedAt: string;
+    expiresAt: string;
+  };
+};
+
+export type QwenSemanticSettlement = {
+  accepted?: QwenAttemptRecord;
+  transportFailed: boolean;
+  settled: boolean;
 };
 
 export type QwenRuntimeConfig = {
@@ -204,6 +232,11 @@ export type QwenRuntimeConfig = {
   circuitFile: string;
   circuitThreshold: number;
   circuitOpenMs: number;
+  fleetPermit: {
+    permitId: string;
+    lockDirectory: string;
+    expiresAt: string;
+  };
   attribution: {
     workOrderId: string;
     runId: string;
@@ -534,6 +567,108 @@ function secureRegularFile(path: string, label: string, maximumBytes: number): B
   return bytes;
 }
 
+function secureAuthorityFile(path: string, label: string, maximumBytes: number): Buffer {
+  const bytes = secureRegularFile(path, label, maximumBytes);
+  if (lstatSync(path).uid !== 0) fail("authority_boundary_unsafe", `${label} must be owned by root`);
+  return bytes;
+}
+
+function pathWithin(root: string, candidate: string): boolean {
+  const remainder = relative(root, candidate);
+  return remainder !== "" && remainder !== ".." && !remainder.startsWith(`..${sep}`) && !isAbsolute(remainder);
+}
+
+function validateProductionAuthorityRoot(): void {
+  let stat;
+  try {
+    stat = lstatSync(QWEN_AUTHORITY_ROOT);
+  } catch {
+    fail("config_unavailable", "Qwen independent authority root is unavailable");
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) {
+    fail("authority_boundary_unsafe", "Qwen independent authority root must be a root-owned non-writable directory");
+  }
+}
+
+function loadIndependentAuthority(
+  workOrderId: string,
+  runId: string,
+  attemptId: string,
+  nowMs: number,
+  injected?: QwenAuthorityBoundary,
+): QwenAuthorityBoundary {
+  let boundary: QwenAuthorityBoundary;
+  if (injected) boundary = injected;
+  else {
+    validateProductionAuthorityRoot();
+    const identity = qwenSha256(`${workOrderId}\0${runId}\0${attemptId}`);
+    const bytes = secureAuthorityFile(
+      join(QWEN_AUTHORITY_ROOT, `${identity}.json`),
+      "Qwen independent authority record",
+      MAX_QUALIFICATION_BYTES,
+    );
+    try {
+      boundary = JSON.parse(bytes.toString("utf8")) as QwenAuthorityBoundary;
+    } catch {
+      fail("authority_boundary_invalid", "Qwen independent authority record is not JSON");
+    }
+  }
+  exactKeys(boundary, ["qualificationTrust", "fleetPermit"], "independent authority boundary");
+  exactKeys(boundary.qualificationTrust, ["issuer", "publicKeyFile", "publicKeySha256"], "qualification trust boundary");
+  const trust = boundary.qualificationTrust;
+  if (!IDENTIFIER.test(trust.issuer) || !isAbsolute(trust.publicKeyFile) || !HEX64.test(trust.publicKeySha256)) {
+    fail("authority_boundary_invalid", "qualification trust boundary is malformed");
+  }
+  exactKeys(
+    boundary.fleetPermit,
+    ["schema", "authority", "permitId", "workOrderId", "runId", "attemptId", "maxConcurrency", "lockDirectory", "issuedAt", "expiresAt"],
+    "fleet permit",
+  );
+  const permit = boundary.fleetPermit;
+  if (permit.schema !== "vinci.qwen-fleet-permit.v1" || permit.authority !== "vgc-fleet-permit-authority") {
+    fail("fleet_permit_invalid", "Qwen requires the external VGC fleet permit authority");
+  }
+  nonEmptyString(permit.permitId, "fleet permit id");
+  if (permit.workOrderId !== workOrderId || permit.runId !== runId || permit.attemptId !== attemptId) {
+    fail("fleet_permit_invalid", "fleet permit attribution does not match this exact WorkOrder/Run/Attempt");
+  }
+  if (permit.maxConcurrency !== 1) fail("fleet_permit_invalid", "current Qwen fleet permit must enforce concurrency 1");
+  if (!isAbsolute(permit.lockDirectory)) fail("fleet_permit_invalid", "fleet permit lock directory must be absolute");
+  const issued = timestamp(permit.issuedAt, "fleet permit issuedAt");
+  const expires = timestamp(permit.expiresAt, "fleet permit expiresAt");
+  if (issued.time > nowMs + 30_000 || expires.time <= nowMs || expires.time - issued.time > 5 * 60_000) {
+    fail("fleet_permit_invalid", "fleet permit must be current and live for no more than five minutes");
+  }
+  if (!injected) {
+    const keyRoot = join(QWEN_AUTHORITY_ROOT, "keys");
+    let keyRootStat;
+    try {
+      keyRootStat = lstatSync(keyRoot);
+    } catch {
+      fail("config_unavailable", "qualification trust key root is unavailable");
+    }
+    if (!keyRootStat.isDirectory() || keyRootStat.isSymbolicLink() || keyRootStat.uid !== 0 || (keyRootStat.mode & 0o022) !== 0) {
+      fail("authority_boundary_unsafe", "qualification trust key root must be a root-owned non-writable directory");
+    }
+    if (!pathWithin(keyRoot, trust.publicKeyFile) || dirname(trust.publicKeyFile) !== keyRoot) {
+      fail("authority_boundary_unsafe", "qualification trust key must be inside the independent authority key root");
+    }
+    if (permit.lockDirectory !== join(QWEN_AUTHORITY_ROOT, "locks")) {
+      fail("authority_boundary_unsafe", "fleet permit lock directory must be the independent authority lock root");
+    }
+    let lockStat;
+    try {
+      lockStat = lstatSync(permit.lockDirectory);
+    } catch {
+      fail("config_unavailable", "fleet permit lock directory is unavailable");
+    }
+    if (!lockStat.isDirectory() || lockStat.isSymbolicLink() || lockStat.uid !== 0 || (lockStat.mode & 0o1000) === 0) {
+      fail("authority_boundary_unsafe", "fleet permit lock directory must be a root-owned sticky directory");
+    }
+  }
+  return boundary;
+}
+
 function readSecretDescriptor(env: NodeJS.ProcessEnv): string {
   const raw = env.VINCI_QWEN_SECRET_FD;
   delete env.VINCI_QWEN_SECRET_FD;
@@ -642,19 +777,23 @@ export async function pinQwenEndpoint(config: QwenRuntimeConfig, lookupImpl: Qwe
   config.endpointAddresses = addresses;
 }
 
-function readQualification(env: NodeJS.ProcessEnv, nowMs: number): { qualification: Qualification; digest: string } {
+function readQualification(
+  env: NodeJS.ProcessEnv,
+  nowMs: number,
+  trust: QwenAuthorityBoundary["qualificationTrust"],
+  injectedAuthority: boolean,
+): { qualification: Qualification; digest: string } {
   const path = env.VINCI_QWEN_QUALIFICATION_FILE;
   const expectedDigest = env.VINCI_QWEN_QUALIFICATION_SHA256;
-  const publicKeyPath = env.VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_FILE;
-  const publicKeyDigest = env.VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_SHA256;
-  const expectedIssuer = env.VINCI_QWEN_QUALIFICATION_ISSUER;
   if (!path || !expectedDigest || !HEX64.test(expectedDigest)) fail("config_missing", "qualification file and byte digest pin are required");
-  if (!publicKeyPath || !publicKeyDigest || !HEX64.test(publicKeyDigest)) fail("config_missing", "qualification public key file and digest pin are required");
-  if (!expectedIssuer || !IDENTIFIER.test(expectedIssuer)) fail("config_missing", "a bounded qualification issuer pin is required");
   const bytes = secureRegularFile(path, "Qwen qualification artifact", MAX_QUALIFICATION_BYTES);
   if (qwenSha256(bytes) !== expectedDigest) fail("qualification_digest_mismatch", "qualification bytes do not match the process pin");
-  const publicKeyBytes = secureRegularFile(publicKeyPath, "Qwen qualification public key", 64 * 1024);
-  if (qwenSha256(publicKeyBytes) !== publicKeyDigest) fail("qualification_key_mismatch", "qualification public key bytes do not match the process pin");
+  const publicKeyBytes = injectedAuthority
+    ? secureRegularFile(trust.publicKeyFile, "Qwen qualification public key", 64 * 1024)
+    : secureAuthorityFile(trust.publicKeyFile, "Qwen qualification public key", 64 * 1024);
+  if (qwenSha256(publicKeyBytes) !== trust.publicKeySha256) {
+    fail("qualification_key_mismatch", "qualification public key bytes do not match the independent authority pin");
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(bytes.toString("utf8"));
@@ -680,13 +819,22 @@ function readQualification(env: NodeJS.ProcessEnv, nowMs: number): { qualificati
   if (!verify(null, signedBytes, publicKey, Buffer.from(parsed.signature.signature_base64, "base64"))) {
     fail("qualification_signature_invalid", "qualification signature does not verify under the pinned trust key");
   }
-  return { qualification: validateQualification(parsed.qualification, expectedIssuer, nowMs), digest: expectedDigest };
+  return { qualification: validateQualification(parsed.qualification, trust.issuer, nowMs), digest: expectedDigest };
 }
 
-export function loadQwenRuntimeConfig(env: NodeJS.ProcessEnv = process.env, nowMs = Date.now()): QwenRuntimeConfig {
+export function loadQwenRuntimeConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  nowMs = Date.now(),
+  injectedAuthority?: QwenAuthorityBoundary,
+): QwenRuntimeConfig {
   const urls = normalizeQwenBaseUrl(env.VINCI_QWEN_BASE_URL);
   const secret = readSecretDescriptor(env);
-  const admitted = readQualification(env, nowMs);
+  const workOrderId = env.VINCI_QWEN_WORK_ORDER_ID;
+  const runId = env.VINCI_QWEN_RUN_ID;
+  const attemptId = env.VINCI_QWEN_ATTEMPT_ID;
+  if (!workOrderId || !runId || !attemptId) fail("attribution_missing", "WorkOrder, Run, and Attempt attribution are required");
+  const authority = loadIndependentAuthority(workOrderId, runId, attemptId, nowMs, injectedAuthority);
+  const admitted = readQualification(env, nowMs, authority.qualificationTrust, injectedAuthority !== undefined);
   const qualification = admitted.qualification;
   const bindings = qualification.bindings;
   if (bindings.endpoint_sha256 !== qwenSha256(urls.baseUrl)) fail("endpoint_mismatch", "qualification is bound to a different base URL");
@@ -701,13 +849,9 @@ export function loadQwenRuntimeConfig(env: NodeJS.ProcessEnv = process.env, nowM
   if (env.VINCI_UNATTENDED_POLICY !== "governed" || !env.VINCI_UNATTENDED_LEASE) {
     fail("authority_forbidden", "Qwen Worker runs require a deterministic Governor lease");
   }
-  if (qualification.limits.max_concurrency > 1) {
-    fail("fleet_permit_authority_missing", "concurrency above one requires the future fleet-wide permit authority interface");
+  if (qualification.limits.max_concurrency !== authority.fleetPermit.maxConcurrency) {
+    fail("fleet_permit_invalid", "qualification concurrency differs from the external fleet permit");
   }
-  const workOrderId = env.VINCI_QWEN_WORK_ORDER_ID;
-  const runId = env.VINCI_QWEN_RUN_ID;
-  const attemptId = env.VINCI_QWEN_ATTEMPT_ID;
-  if (!workOrderId || !runId || !attemptId) fail("attribution_missing", "WorkOrder, Run, and Attempt attribution are required");
   const circuitFile = env.VINCI_QWEN_CIRCUIT_FILE;
   if (!circuitFile || !isAbsolute(circuitFile)) fail("config_missing", "VINCI_QWEN_CIRCUIT_FILE must be an absolute path");
   return {
@@ -719,6 +863,11 @@ export function loadQwenRuntimeConfig(env: NodeJS.ProcessEnv = process.env, nowM
     circuitFile,
     circuitThreshold: boundedInteger(Number(env.VINCI_QWEN_CIRCUIT_THRESHOLD ?? "3"), 1, 10, "VINCI_QWEN_CIRCUIT_THRESHOLD"),
     circuitOpenMs: boundedInteger(Number(env.VINCI_QWEN_CIRCUIT_OPEN_MS ?? "60000"), 1_000, 3_600_000, "VINCI_QWEN_CIRCUIT_OPEN_MS"),
+    fleetPermit: {
+      permitId: authority.fleetPermit.permitId,
+      lockDirectory: authority.fleetPermit.lockDirectory,
+      expiresAt: authority.fleetPermit.expiresAt,
+    },
     attribution: { workOrderId, runId, attemptId },
   };
 }
@@ -982,9 +1131,9 @@ export async function probeQwenReadiness(
 
 export async function ensureQwenReady(
   env: NodeJS.ProcessEnv = process.env,
-  options: { fetchImpl?: QwenFetch; signal?: AbortSignal; nowMs?: number; lookupImpl?: QwenLookup } = {},
+  options: { fetchImpl?: QwenFetch; signal?: AbortSignal; nowMs?: number; lookupImpl?: QwenLookup; authorityBoundary?: QwenAuthorityBoundary } = {},
 ): Promise<QwenRuntimeConfig> {
-  const config = loadQwenRuntimeConfig(env, options.nowMs);
+  const config = loadQwenRuntimeConfig(env, options.nowMs, options.authorityBoundary);
   await pinQwenEndpoint(config, options.lookupImpl);
   await probeQwenReadiness(config, options);
   return config;
@@ -1072,12 +1221,12 @@ async function cancellableDelay(delayMs: number, signal: AbortSignal): Promise<v
   });
 }
 
-function bodyByteLength(body: RequestInit["body"]): number {
-  if (body === undefined || body === null) return 0;
-  if (typeof body === "string") return Buffer.byteLength(body);
-  if (body instanceof URLSearchParams) return Buffer.byteLength(body.toString());
-  if (body instanceof ArrayBuffer) return body.byteLength;
-  if (ArrayBuffer.isView(body)) return body.byteLength;
+function bodyBytes(body: RequestInit["body"]): Buffer {
+  if (body === undefined || body === null) return Buffer.alloc(0);
+  if (typeof body === "string") return Buffer.from(body);
+  if (body instanceof URLSearchParams) return Buffer.from(body.toString());
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
   fail("request_invalid", "Qwen request body must be a bounded in-memory encoding");
 }
 
@@ -1132,7 +1281,7 @@ function inferenceBody(
           if (!doneSeen || !usageSeen) fail("stream_invalid", "inference stream omitted [DONE] or its strict usage object");
           if (!settled) {
             settled = true;
-            finish("success", response.status, inputTokens, outputTokens);
+            finish("transport_accepted", response.status, inputTokens, outputTokens);
           }
           controller.close();
           return;
@@ -1162,19 +1311,35 @@ export function createQwenInferenceFetch(
   requestId: string,
   onAttempt: (record: QwenAttemptRecord) => void,
   injectedFetch?: QwenFetch,
+  semanticSettlement: QwenSemanticSettlement = { transportFailed: false, settled: false },
 ): QwenFetch {
   return async (input, init = {}) => {
     assertQwenCircuitClosed(config);
+    const sourceRequest = input instanceof Request ? input : undefined;
     const target = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
-    if (target.href !== config.chatUrl || (init.method ?? "GET").toUpperCase() !== "POST") {
+    const method = (init.method ?? sourceRequest?.method ?? "GET").toUpperCase();
+    if (target.href !== config.chatUrl || method !== "POST") {
       fail("ssrf_forbidden", "inference transport may call only the exact qualified chat-completions URL");
     }
-    if (bodyByteLength(init.body) > config.qualification.limits.max_request_bytes) {
+    const requestBytes = init.body !== undefined
+      ? bodyBytes(init.body)
+      : sourceRequest
+        ? Buffer.from(await sourceRequest.clone().arrayBuffer())
+        : Buffer.alloc(0);
+    if (requestBytes.length > config.qualification.limits.max_request_bytes) {
       fail("request_oversized", "inference request exceeded the signed request-byte bound");
     }
+    let finalPayload: unknown;
+    try {
+      finalPayload = JSON.parse(requestBytes.toString("utf8"));
+    } catch {
+      fail("request_invalid", "final serialized Qwen request body is not JSON");
+    }
+    validateQwenOutboundPayload(config, finalPayload);
+    const requestSha256 = qwenSha256(requestBytes);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort("total_timeout"), config.qualification.limits.total_timeout_ms);
-    const externalSignal = init.signal;
+    const externalSignal = init.signal ?? sourceRequest?.signal;
     const abort = () => controller.abort(externalSignal?.reason ?? "cancelled");
     if (externalSignal?.aborted) abort();
     else externalSignal?.addEventListener("abort", abort, { once: true });
@@ -1185,17 +1350,21 @@ export function createQwenInferenceFetch(
         const started = Date.now();
         const startedAt = new Date(started).toISOString();
         const real = injectedFetch ? null : realPinnedFetch(config, transportAttempt);
-        const headers = new Headers(init.headers);
+        const headers = new Headers(sourceRequest?.headers);
+        if (init.headers) new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+        headers.set("authorization", `Bearer ${config.secret}`);
+        for (const [name, value] of Object.entries(qwenProviderHeaders(config, requestId))) {
+          if (value !== null) headers.set(name, value);
+        }
         headers.set("x-vinci-idempotency-key", `${requestId}/${transportAttempt}`);
+        headers.set("x-vinci-qwen-request-sha256", requestSha256);
         let attemptReported = false;
         const finishAttempt = (outcome: string, status: number | null, inputTokens = 0, outputTokens = 0) => {
           if (attemptReported) return;
           attemptReported = true;
           real?.close();
           const finished = Date.now();
-          if (outcome === "success") recordQwenCircuitOutcome(config, true, "success", finished);
-          else if (outcome !== "cancelled") recordQwenCircuitOutcome(config, false, outcome, finished);
-          onAttempt({
+          const record: QwenAttemptRecord = {
             request_id: requestId,
             transport_attempt: transportAttempt,
             started_at: startedAt,
@@ -1203,17 +1372,28 @@ export function createQwenInferenceFetch(
             latency_ms: finished - started,
             outcome,
             status,
-            cost_usd: outcome === "success"
+            cost_usd: outcome === "transport_accepted"
               ? (inputTokens * config.qualification.pricing.input_per_million_usd + outputTokens * config.qualification.pricing.output_per_million_usd) / 1_000_000
               : 0,
             input_tokens: inputTokens,
             output_tokens: outputTokens,
-          });
+            request_sha256: requestSha256,
+          };
+          if (outcome === "transport_accepted") {
+            semanticSettlement.accepted = record;
+          } else {
+            semanticSettlement.transportFailed = true;
+            semanticSettlement.settled = true;
+            if (outcome !== "cancelled") recordQwenCircuitOutcome(config, false, outcome, finished);
+            onAttempt(record);
+          }
         };
         let response: Response;
         try {
           response = await (injectedFetch ?? real!.fetchImpl)(target, {
             ...init,
+            method,
+            body: requestBytes,
             headers,
             redirect: "error",
             signal: controller.signal,
@@ -1275,6 +1455,30 @@ export function createQwenInferenceFetch(
   };
 }
 
+export function settleQwenSemanticOutcome(
+  config: QwenRuntimeConfig,
+  settlement: QwenSemanticSettlement,
+  accepted: boolean,
+  reason: string,
+  onAttempt: (record: QwenAttemptRecord) => void,
+): void {
+  if (settlement.settled) return;
+  settlement.settled = true;
+  if (!settlement.accepted) {
+    if (!settlement.transportFailed) recordQwenCircuitOutcome(config, false, reason);
+    return;
+  }
+  const finished = Date.now();
+  const outcome = accepted ? "success" : reason;
+  recordQwenCircuitOutcome(config, accepted, outcome, finished);
+  onAttempt({
+    ...settlement.accepted,
+    finished_at: new Date(finished).toISOString(),
+    latency_ms: Math.max(0, finished - Date.parse(settlement.accepted.started_at)),
+    outcome,
+  });
+}
+
 export function assertQwenContextBindings(config: QwenRuntimeConfig, context: Context): void {
   const bindings = config.qualification.bindings;
   const workOrderMessage = context.messages.find((message) => message.role === "user");
@@ -1315,6 +1519,34 @@ export function validateQwenOutboundPayload(config: QwenRuntimeConfig, payload: 
     fail("request_invalid", "outbound request must stream the exact qualified model and messages");
   }
   if (!Array.isArray(value.tools)) fail("request_invalid", "outbound request must carry the qualified tool schemas");
+  const messages = value.messages as Array<unknown>;
+  const records = messages.filter((message): message is Record<string, unknown> => Boolean(message) && typeof message === "object" && !Array.isArray(message));
+  if (records.length !== messages.length) fail("request_invalid", "outbound messages must be objects");
+  const system = records.find((message) => message.role === "system" || message.role === "developer");
+  const workOrder = records.find((message) => message.role === "user");
+  if (!system || typeof system.content !== "string" || qwenSha256(system.content) !== config.qualification.bindings.system_prompt_sha256) {
+    fail("system_prompt_mismatch", "final serialized request does not contain the exact qualified system prompt");
+  }
+  if (!workOrder || typeof workOrder.content !== "string" || qwenSha256(workOrder.content) !== config.qualification.bindings.work_order_prompt_sha256) {
+    fail("prompt_mismatch", "final serialized request does not contain the exact qualified WorkOrder prompt");
+  }
+  const wireTools = (value.tools as Array<unknown>).map((tool) => {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) fail("request_invalid", "outbound tool schema must be an object");
+    const wire = tool as Record<string, unknown>;
+    exactKeys(wire, ["type", "function"], "outbound tool schema");
+    if (wire.type !== "function" || !wire.function || typeof wire.function !== "object" || Array.isArray(wire.function)) {
+      fail("request_invalid", "outbound tool schema must be an OpenAI function");
+    }
+    const fn = wire.function as Record<string, unknown>;
+    exactKeys(fn, ["name", "description", "parameters"], "outbound tool function");
+    return { name: fn.name, description: fn.description, parameters: fn.parameters };
+  });
+  if (qwenSha256(qwenCanonical(wireTools.map((tool) => tool.name))) !== config.qualification.bindings.tool_names_sha256) {
+    fail("tools_mismatch", "final serialized request tool order differs from qualification");
+  }
+  if (qwenSha256(qwenCanonical(wireTools)) !== config.qualification.bindings.tool_schemas_sha256) {
+    fail("tool_schema_mismatch", "final serialized request tool schemas differ from qualification");
+  }
   if (typeof value.max_tokens !== "number" || !Number.isSafeInteger(value.max_tokens) || value.max_tokens < 1 || value.max_tokens > config.qualification.limits.max_tokens) {
     fail("request_invalid", "outbound max_tokens exceeds the signed bound");
   }
@@ -1322,6 +1554,32 @@ export function validateQwenOutboundPayload(config: QwenRuntimeConfig, payload: 
   if (!streamOptions || typeof streamOptions !== "object" || (streamOptions as Record<string, unknown>).include_usage !== true) {
     fail("request_invalid", "outbound stream must request usage telemetry");
   }
+}
+
+export function acquireQwenFleetPermit(config: QwenRuntimeConfig): () => void {
+  const expiresAt = Date.parse(config.fleetPermit.expiresAt);
+  if (!Number.isFinite(expiresAt) || expiresAt - Date.now() < config.qualification.limits.total_timeout_ms) {
+    fail("fleet_permit_expired", "the external Qwen fleet permit cannot cover the full bounded request deadline");
+  }
+  const lockPath = join(config.fleetPermit.lockDirectory, "qwen-h200-concurrency-1");
+  try {
+    mkdirSync(lockPath, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      fail("concurrency_exceeded", "the external Qwen fleet permit is already held by another provider process");
+    }
+    fail("fleet_permit_unavailable", "the external Qwen fleet permit could not be acquired");
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try {
+      rmdirSync(lockPath);
+    } catch {
+      fail("fleet_permit_release_failed", "the external Qwen fleet permit could not be released cleanly");
+    }
+  };
 }
 
 function canaryConfig(env: NodeJS.ProcessEnv): QwenRuntimeConfig {
@@ -1404,6 +1662,7 @@ function canaryConfig(env: NodeJS.ProcessEnv): QwenRuntimeConfig {
     circuitFile: "/canary/unused",
     circuitThreshold: 1,
     circuitOpenMs: 1_000,
+    fleetPermit: { permitId: "canary-only", lockDirectory: "/canary", expiresAt: new Date(Date.now() + 1_000).toISOString() },
     attribution: { workOrderId: "canary-read-only", runId: "canary-read-only", attemptId: "canary-read-only/1" },
   };
 }
@@ -1648,9 +1907,6 @@ export function scrubQwenBootstrapEnvironment(env: NodeJS.ProcessEnv = process.e
   for (const name of [
     "VINCI_QWEN_QUALIFICATION_FILE",
     "VINCI_QWEN_QUALIFICATION_SHA256",
-    "VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_FILE",
-    "VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_SHA256",
-    "VINCI_QWEN_QUALIFICATION_ISSUER",
   ]) delete env[name];
 }
 
@@ -1660,6 +1916,7 @@ export function qwenProviderHeaders(config: QwenRuntimeConfig, requestId: string
     "x-vinci-run-id": config.attribution.runId,
     "x-vinci-attempt-id": config.attribution.attemptId,
     "x-vinci-qwen-request-id": requestId,
+    "x-vinci-qwen-fleet-permit-id": config.fleetPermit.permitId,
     "x-vinci-qwen-output-authority": "non-authoritative",
     "x-vinci-qwen-qualification-sha256": config.qualificationSha256,
   };

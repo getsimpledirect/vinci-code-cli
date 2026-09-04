@@ -323,10 +323,12 @@ The lane is fail-closed. Runtime registration requires all of the following:
   is removed before spawn, the child consumes and closes the descriptor during provider bootstrap,
   and neither the secret nor its reference is put in general child environment, argv, logs, or a
   generated file. The WorkOrder prompt is sent on stdin, never argv.
-- `VINCI_QWEN_QUALIFICATION_FILE` plus its exact `VINCI_QWEN_QUALIFICATION_SHA256`, and an
-  independently controlled Ed25519 trust key plus `VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_SHA256` and
-  `VINCI_QWEN_QUALIFICATION_ISSUER`. Qualification bytes and key bytes must be non-writable regular
-  files. An unsigned or self-admitted record is invalid.
+- `VINCI_QWEN_QUALIFICATION_FILE` plus its exact `VINCI_QWEN_QUALIFICATION_SHA256`. Trust never
+  comes from Worker environment: a root-owned, non-writable record under
+  `/run/vinci/qwen-authority` pins the independent issuer, Ed25519 key path and digest, and a live
+  VGC fleet permit for the exact WorkOrder/Run/Attempt. The pinned key is also root-owned beneath
+  that authority root. An unsigned record, a Worker-selected key, or a self-admitted record is
+  invalid.
 - a deterministic Governor lease and worker-derived WorkOrder, Run, and Attempt identities. Model
   output supplies none of them. Each Worker attempt has its own session; every bounded transport
   retry is recorded beneath that Attempt with a distinct idempotency key.
@@ -344,21 +346,27 @@ Authenticated `/health` and `/v1/models` must succeed while anonymous requests t
 The models response and every successful inference response must repeat the exact model, revision,
 endpoint identity, and runtime tuple. The chat transport calls only the qualified URL, refuses
 redirects, keeps one total deadline across headers/body/retries, bounds error and successful SSE
-bodies, requires strict OpenAI chunk object/model/usage identities and `[DONE]`, and disables SDK
-retries. Real HTTP 500s and transport/protocol failures count toward an atomically persisted circuit;
-three failures open it for 60 seconds by default. `VINCI_QWEN_CIRCUIT_THRESHOLD` and
+bodies, validates and hashes the exact serialized request bytes after SDK hooks, requires strict
+OpenAI chunk object/model/usage identities and `[DONE]`, and disables SDK retries. A raw complete
+SSE body is only transport acceptance: success is recorded only after the OpenAI parser produces a
+valid terminal finish reason, usage, and qualified tool semantics. Parser and semantic failures
+count toward the atomically persisted circuit just like HTTP and transport/protocol failures; three
+failures open it for 60 seconds by default. `VINCI_QWEN_CIRCUIT_THRESHOLD` and
 `VINCI_QWEN_CIRCUIT_OPEN_MS` are bounded operator overrides.
 
-Concurrency defaults to 1. The signed schema understands only the ladder
+Concurrency is fixed at 1. The external VGC record carries a five-minute-or-shorter permit for the
+exact WorkOrder/Run/Attempt and names the shared authority lock directory. Every provider instance
+and process must atomically hold the same fleet lock before it can start inference; the local
+closure counter is defense in depth. A crash leaves the lock closed until the external authority
+reclaims it, rather than permitting overlapping work. The signed schema understands only the ladder
 `1 → 2 → 4 → 8 → 16 → 24 → 32`, never an intermediate value, and never above Ayush's advertised
 ceiling. Any stage above 1 must cite the immediately prior stage with at least 168 continuous hours
 and 1,000 WorkOrders, 100% acceptance pass and usage coverage, at most 0.5% transport errors, and
 zero identity failures, verification failures, circuit opens, resource alarms, or Governor stops.
-Promotion is a new independent review and signature; it is never automatic. Today the runtime has
-only its single-process permit, so every signed value above 1 still fails closed with
-`fleet_permit_authority_missing`. A future fleet authority must issue bounded, expiring, fenced
-permits keyed by WorkOrder/Run/Attempt, enforce the signed and advertised ceilings atomically across
-workers, and define a bounded queue before any stage above 1 can run.
+Promotion is a new independent review and signature; it is never automatic. Today VGC issues only
+concurrency-1 permits, so every signed value above 1 fails closed. A future permit schema must retain
+bounded, expiring, fenced admission keyed by WorkOrder/Run/Attempt, enforce signed and advertised
+ceilings atomically across workers, and define a bounded queue before any stage above 1 can run.
 
 Qwen output gets a `vinci-qwen-output-label` session record marking it non-authoritative and
 requiring independent checking. It is never permission, a Governor ruling, merge authorization,
@@ -411,10 +419,13 @@ node --experimental-strip-types vinci/extensions/lib/qwen-runtime.ts --qualifica
 ```
 
 The independent reviewer verifies the evidence, adds issuer/timestamps/review provenance, and signs
-the canonical qualification with the separately controlled key. The Qwen builder/operator must not
-possess that signing key. Requalification is mandatory after a failed/expired canary or any change
-to capabilities/limits, client build, endpoint identity/address policy, model/revision, outbound
-encoding, pricing basis, runtime artifact/arguments, system prompt, or tool schema/policy.
+the canonical qualification with the separately controlled key. VGC installs the trust pin and live
+permit in the root-owned authority boundary; the Worker cannot nominate them through environment.
+The Qwen builder/operator must not possess the signing key. The client-build digest covers the
+executed launcher, Node version, AI parser, OpenAI SDK, and coding-agent distribution.
+Requalification is mandatory after a failed/expired canary or any change to capabilities/limits,
+client build, endpoint identity/address policy, model/revision, outbound encoding, pricing basis,
+runtime artifact/arguments, system prompt, or tool schema/policy.
 
 Per-attempt telemetry remains in the existing economics summary: `work_order_id`, `session_id`
 (Run), `attempt_label`, `started_at`/`finished_at` (wall latency), terminal `local_result`, and the
