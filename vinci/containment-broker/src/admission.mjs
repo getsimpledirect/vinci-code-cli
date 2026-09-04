@@ -117,11 +117,11 @@ export function validatePrelaunchAttestation(attestation, policy) {
   if (attestation?.no_new_privs !== true) reasons.push("no_new_privs_required");
   for (const setName of ["permitted", "effective", "inheritable", "ambient", "bounding"]) {
     const capabilities = attestation?.capabilities?.[setName];
-    if (!sortedUniqueStrings(capabilities ?? [])) reasons.push(`capability_set_invalid:${setName}`);
+    if (!sortedUniqueStrings(capabilities)) reasons.push(`capability_set_invalid:${setName}`);
     else if (sha256(capabilities) !== sha256(policy?.capabilities?.[setName] ?? [])) {
       reasons.push(`capability_allowlist_mismatch:${setName}`);
     }
-    if ((capabilities ?? []).some((capability) => FORBIDDEN_CAPABILITIES.includes(capability))) {
+    if (Array.isArray(capabilities) && capabilities.some((capability) => FORBIDDEN_CAPABILITIES.includes(capability))) {
       reasons.push(`forbidden_capability:${setName}`);
     }
   }
