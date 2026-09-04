@@ -13,6 +13,7 @@
 - Added public SDK exports for CLI-equivalent model and scoped-model resolution ([#6201](https://github.com/earendil-works/pi/issues/6201)).
 - Added extension entry renderers for persisted display-only session entries that are rendered in interactive mode without being sent to the model context.
 - Added optional terminal and process-handler injection to `InteractiveMode` for deterministic embedded and UI-test environments.
+- Added a fail-closed, qualified Vinci Worker lane for the exact non-authoritative `Qwen/Qwen3.8-27B` H200 endpoint.
 
 ### Changed
 

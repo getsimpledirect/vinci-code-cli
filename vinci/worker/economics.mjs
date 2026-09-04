@@ -254,7 +254,15 @@ export function buildEconomicsSummary(input = {}) {
     summary.finished_at = finishedAt;
     if (work !== null) summary.work = work;
     if (usage.length > 0) summary.usage = usage;
-    summary.route = { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] };
+    // The worker runs exactly one provider/model per attempt. Recording the first usage row makes
+    // that route attributable without inventing a provider when no inference occurred. There is
+    // deliberately no in-attempt fallback: an OpenRouter fallback is a separate authorized attempt.
+    summary.route = {
+      policy_id: "single-provider-no-automatic-fallback",
+      initial_provider: usage[0]?.provider ?? null,
+      initial_model: usage[0]?.model ?? null,
+      escalations: [],
+    };
     summary.assets_consumed = [];
     summary.compactions = 0;
     summary.human_interventions = [];

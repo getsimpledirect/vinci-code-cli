@@ -98,12 +98,21 @@ export const CLEAN_ROOM_ENV_ALLOWLIST = Object.freeze([
   "VINCI_SOURCE_CLI",
 ]);
 
-// ONLY the key the envelope's provider authenticates with (vinci/bin/vinci reads exactly these).
-// An unknown provider gets no key at all and the launcher refuses it, as it does today.
+// ONLY the authentication and provider-routing environment selected by the envelope. An unknown
+// provider gets none and the launcher refuses it, as it does today. Qwen receives references and
+// non-secret pins/settings here; the resolved bearer value is never a worker config value.
 export const PROVIDER_KEY_ENV = Object.freeze({
   openrouter: ["OPENROUTER_API_KEY"],
   vinci: ["VINCI_API_KEY"],
   deepinfra: ["VINCI_INTERNAL_DEEPINFRA_API_KEY"],
+  "qwen-h200": [
+    "VINCI_QWEN_BASE_URL",
+    "VINCI_QWEN_SECRET_REF",
+    "VINCI_QWEN_QUALIFICATION_FILE",
+    "VINCI_QWEN_QUALIFICATION_SHA256",
+    "VINCI_QWEN_CIRCUIT_THRESHOLD",
+    "VINCI_QWEN_CIRCUIT_OPEN_MS",
+  ],
 });
 
 // Every provider credential and authentication-routing value the bundled coding agent knows how
@@ -113,6 +122,12 @@ export const PROVIDER_KEY_ENV = Object.freeze({
 // inventory was fail-open — an OpenRouter child still received Anthropic, OpenAI and public
 // DeepInfra credentials.
 export const PROVIDER_CREDENTIAL_ENV = Object.freeze([
+  "VINCI_QWEN_BASE_URL",
+  "VINCI_QWEN_SECRET_REF",
+  "VINCI_QWEN_QUALIFICATION_FILE",
+  "VINCI_QWEN_QUALIFICATION_SHA256",
+  "VINCI_QWEN_CIRCUIT_THRESHOLD",
+  "VINCI_QWEN_CIRCUIT_OPEN_MS",
   "AI_GATEWAY_API_KEY",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_OAUTH_TOKEN",
@@ -161,6 +176,15 @@ export const PROVIDER_CREDENTIAL_ENV = Object.freeze([
   "ZAI_CODING_CN_API_KEY",
 ]);
 
+const QWEN_ENV_SECRET_REFERENCE = /^env:([A-Z][A-Z0-9_]{0,127})$/;
+
+function qwenSecretEnvName(base) {
+  const match = typeof base.VINCI_QWEN_SECRET_REF === "string"
+    ? base.VINCI_QWEN_SECRET_REF.match(QWEN_ENV_SECRET_REFERENCE)
+    : null;
+  return match?.[1];
+}
+
 // The provider boundary for the NORMAL (non-clean-room) path.
 //
 // PROVIDER_KEY_ENV above promises a child gets ONLY the key its envelope's provider
@@ -188,6 +212,8 @@ export function providerScopedEnv({ base = process.env, provider, agentDir }) {
   const keep = new Set(Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : []);
   const env = { ...base };
   for (const key of PROVIDER_CREDENTIAL_ENV) if (!keep.has(key)) delete env[key];
+  const referencedQwenSecret = qwenSecretEnvName(base);
+  if (provider !== "qwen-h200" && referencedQwenSecret) delete env[referencedQwenSecret];
   // Do not let normal mode's provider selection be bypassed by the daemon's shared auth.json.
   // This is a resolution boundary, not uid isolation: a same-uid child can still deliberately
   // read the daemon's files. Both launchers resolve stored credentials from this isolated slot.
@@ -221,6 +247,10 @@ export function cleanRoomEnv({ base = process.env, provider, homeDir, tmpDir }) 
   // Same prototype-chain hazard as providerScopedEnv below.
   const providerKeys = Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : [];
   for (const key of providerKeys) if (base[key] !== undefined) env[key] = base[key];
+  const referencedQwenSecret = qwenSecretEnvName(base);
+  if (provider === "qwen-h200" && referencedQwenSecret && base[referencedQwenSecret] !== undefined) {
+    env[referencedQwenSecret] = base[referencedQwenSecret];
+  }
   const vinciHome = base.VINCI_HOME ?? (base.HOME ? join(base.HOME, ".vinci-code") : undefined);
   if (vinciHome !== undefined) env.VINCI_HOME = vinciHome;
   env.HOME = homeDir;
