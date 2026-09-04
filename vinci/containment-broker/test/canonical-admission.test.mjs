@@ -421,6 +421,95 @@ function policyFor(attestation) {
   };
 }
 
+function assertAdmissionRefused(attestation, policy, expectedReasons) {
+  assert.throws(
+    () => validatePrelaunchAttestation(attestation, policy),
+    (error) => {
+      assert.ok(error instanceof AdmissionRefusedError);
+      assert.equal(error.code, "CONTAINMENT_ADMISSION_REFUSED");
+      assert.deepEqual(error.reasons, expectedReasons);
+      assert.equal(Object.isFrozen(error.reasons), true);
+      return true;
+    },
+  );
+}
+
+test("portable prelaunch schema accepts complete canonical capability sets", () => {
+  const empty = validAttestation();
+  assert.match(validatePrelaunchAttestation(empty, policyFor(empty)).attestation_sha256, /^[0-9a-f]{64}$/);
+
+  const allowed = validAttestation();
+  allowed.capabilities.permitted = ["CAP_CHOWN"];
+  allowed.capabilities.bounding = ["CAP_CHOWN", "CAP_NET_BIND_SERVICE"];
+  assert.match(validatePrelaunchAttestation(allowed, policyFor(allowed)).attestation_sha256, /^[0-9a-f]{64}$/);
+});
+
+test("missing, null, and partially absent capability sets are enumerated refusals", () => {
+  const allSetReasons = ["permitted", "effective", "inheritable", "ambient", "bounding"]
+    .map((setName) => `capability_set_invalid:${setName}`);
+
+  const missing = validAttestation();
+  delete missing.capabilities;
+  assertAdmissionRefused(missing, policyFor(validAttestation()), allSetReasons);
+
+  const nullCapabilities = validAttestation();
+  nullCapabilities.capabilities = null;
+  assertAdmissionRefused(nullCapabilities, policyFor(validAttestation()), allSetReasons);
+
+  const partial = validAttestation();
+  delete partial.capabilities.effective;
+  assertAdmissionRefused(partial, policyFor(validAttestation()), ["capability_set_invalid:effective"]);
+});
+
+test("wrong capability container and set types are enumerated refusals", () => {
+  const allSetReasons = ["permitted", "effective", "inheritable", "ambient", "bounding"]
+    .map((setName) => `capability_set_invalid:${setName}`);
+  const policy = policyFor(validAttestation());
+
+  for (const capabilities of ["none", 0, {}]) {
+    const wrongContainer = validAttestation();
+    wrongContainer.capabilities = capabilities;
+    assertAdmissionRefused(wrongContainer, policy, allSetReasons);
+  }
+
+  for (const effective of [null, {}, [null], ["CAP_CHOWN", 7]]) {
+    const wrongSet = validAttestation();
+    wrongSet.capabilities.effective = effective;
+    assertAdmissionRefused(wrongSet, policy, ["capability_set_invalid:effective"]);
+  }
+});
+
+test("capability refusals retain every simultaneous reason in stable order", () => {
+  const malformed = validAttestation();
+  malformed.uid = 0;
+  malformed.no_new_privs = false;
+  delete malformed.capabilities.permitted;
+  malformed.capabilities.effective = ["CAP_SYS_ADMIN"];
+  malformed.capabilities.inheritable = ["CAP_CHOWN", "CAP_CHOWN"];
+  assertAdmissionRefused(malformed, policyFor(validAttestation()), [
+    "episode_uid_forbidden",
+    "no_new_privs_required",
+    "capability_set_invalid:permitted",
+    "capability_allowlist_mismatch:effective",
+    "forbidden_capability:effective",
+    "capability_set_invalid:inheritable",
+  ]);
+});
+
+test("unrelated malformed attestation fields retain their refusal classification", () => {
+  const policy = policyFor(validAttestation());
+  const cases = [
+    ["supplementary_groups", null, ["supplementary_groups_not_canonical"]],
+    ["inherited_fds", null, ["fd_allowlist_missing_or_invalid"]],
+    ["ingress", null, ["ingress_invalid"]],
+  ];
+  for (const [field, value, reasons] of cases) {
+    const malformed = validAttestation();
+    malformed[field] = value;
+    assertAdmissionRefused(malformed, policy, reasons);
+  }
+});
+
 test("portable prelaunch schema requires exact privilege and FD facts", () => {
   const attestation = validAttestation();
   assert.match(validatePrelaunchAttestation(attestation, policyFor(attestation)).attestation_sha256, /^[0-9a-f]{64}$/);
