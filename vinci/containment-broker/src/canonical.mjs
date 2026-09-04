@@ -235,6 +235,7 @@ function verifyReceiptUnchecked(receipt, { kind, keyId, key }) {
 
 export function verifyReceipt(receipt, options) {
   try {
+    if (isProxy(receipt)) return false;
     options = snapshotVerifyOptions(options);
     return verifyReceiptUnchecked(receipt, options);
   } catch {

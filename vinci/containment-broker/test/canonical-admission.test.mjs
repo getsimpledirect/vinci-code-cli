@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
 import { test } from "node:test";
+import { runInNewContext } from "node:vm";
 
 import {
   AdmissionRefusedError,
@@ -110,6 +111,27 @@ test("receipt verification rejects Proxy values before traps and always fails cl
     key: KEY,
     payload: { nested: { value: true } },
   });
+  let receiptTrapCalls = 0;
+  const receiptProxyHandler = {
+    getPrototypeOf(target) {
+      receiptTrapCalls += 1;
+      return Reflect.getPrototypeOf(target);
+    },
+  };
+  const directReceiptProxy = new Proxy(nestedReceipt, receiptProxyHandler);
+  const crossRealmReceiptProxy = runInNewContext(
+    "new Proxy(receipt, handler)",
+    { receipt: nestedReceipt, handler: receiptProxyHandler },
+  );
+  for (const receiptProxy of [directReceiptProxy, crossRealmReceiptProxy]) {
+    assert.equal(verifyReceipt(receiptProxy, {
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: KEY,
+    }), false);
+  }
+  assert.equal(receiptTrapCalls, 0, "receipt Proxies must reject before brand or structural checks");
+
   const nestedProxy = new Proxy({ value: true }, {
     getPrototypeOf(target) {
       trapCalls += 1;
@@ -147,6 +169,24 @@ test("receipt verification rejects Proxy values before traps and always fails cl
     keyId: "root-key:v3",
     key: KEY,
   }), false);
+
+  let macCoercionCalls = 0;
+  const coerciveMac = {};
+  Object.defineProperty(coerciveMac, Symbol.toPrimitive, {
+    value() {
+      macCoercionCalls += 1;
+      return nestedReceipt.authentication.mac;
+    },
+  });
+  assert.equal(verifyReceipt({
+    ...nestedReceipt,
+    authentication: { ...nestedReceipt.authentication, mac: coerciveMac },
+  }, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+  }), false);
+  assert.equal(macCoercionCalls, 0, "receipt snapshots must reject hidden coercion hooks");
 
   const throwingOptions = new Proxy({}, {
     get() {
