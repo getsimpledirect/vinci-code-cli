@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash, createHmac } from "node:crypto";
 import { test } from "node:test";
 
 import {
@@ -6,14 +7,118 @@ import {
   authenticateReceipt,
   buildPrelaunchReceipt,
   buildTerminalReceipt,
+  canonicalBytes,
+  decodeCanonicalBytes,
   evaluateHostAdmission,
   NATIVE_IMPLEMENTATION_ADMITTED,
   requireNativeAdmission,
+  sha256,
   validatePrelaunchAttestation,
   verifyReceipt,
 } from "../src/index.mjs";
 
 const KEY = Buffer.alloc(32, 0x43);
+
+test("canonical values reject the historical Buffer/plain-object receipt collision", () => {
+  const bytes = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
+  assert.throws(
+    () => canonicalBytes({ payload: bytes }),
+    /binary Buffer values are not canonical/,
+  );
+  assert.throws(
+    () => canonicalBytes({ payload: { $bytes_base64: bytes.toString("base64") } }),
+    /reserved canonical field: \$bytes_base64/,
+  );
+  assert.throws(
+    () => authenticateReceipt({
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: KEY,
+      payload: { nested: [{ $bytes_base64: bytes.toString("base64") }] },
+    }),
+    /reserved canonical field: \$bytes_base64/,
+  );
+
+  // This is the exact v3 receipt body that the vulnerable encoder authenticated for either
+  // structural input. Verification must reject the historical ambiguous representation too.
+  const legacyBody = Buffer.from(
+    '{"key_id":"root-key:v3","kind":"terminal","payload":{"$bytes_base64":"3q2+7w=="},"schema":"vinci.containment-broker.receipt/v3"}',
+  );
+  const legacyReceipt = {
+    authentication: {
+      algorithm: "hmac-sha256",
+      mac: createHmac("sha256", KEY).update(legacyBody).digest("hex"),
+    },
+    body_sha256: createHash("sha256").update(legacyBody).digest("hex"),
+    key_id: "root-key:v3",
+    kind: "terminal",
+    payload: { $bytes_base64: "3q2+7w==" },
+    schema: "vinci.containment-broker.receipt/v3",
+  };
+  assert.equal(verifyReceipt(legacyReceipt, { kind: "terminal", keyId: "root-key:v3", key: KEY }), false);
+});
+
+test("canonical JSON has one stable round-trip representation", () => {
+  const left = { z: 3, a: { y: true, x: "value" }, list: [null, false, 4.5] };
+  const right = { list: [null, false, 4.5], a: { x: "value", y: true }, z: 3 };
+  const expected = '{"a":{"x":"value","y":true},"list":[null,false,4.5],"z":3}';
+  assert.equal(canonicalBytes(left).toString("utf8"), expected);
+  assert.equal(canonicalBytes(right).toString("utf8"), expected);
+  assert.equal(canonicalBytes(decodeCanonicalBytes(Buffer.from(expected))).toString("utf8"), expected);
+  assert.notEqual(sha256(left), sha256({ ...left, z: 4 }));
+
+  for (let index = 0; index < 128; index += 1) {
+    const sample = {
+      id: index,
+      flags: [index % 2 === 0, null, `value-${index}`],
+      nested: { quotient: index / 7, remainder: index % 7 },
+    };
+    const reordered = {
+      nested: { remainder: index % 7, quotient: index / 7 },
+      flags: [index % 2 === 0, null, `value-${index}`],
+      id: index,
+    };
+    const bytes = canonicalBytes(sample);
+    assert.equal(canonicalBytes(reordered).toString("hex"), bytes.toString("hex"));
+    assert.equal(canonicalBytes(decodeCanonicalBytes(bytes)).toString("hex"), bytes.toString("hex"));
+    assert.notEqual(sha256(sample), sha256({ ...sample, id: index + 1 }));
+  }
+});
+
+test("canonical JSON rejects hidden, inherited, accessor, sparse, and extra structure", () => {
+  const hidden = { visible: true };
+  Object.defineProperty(hidden, "hidden", { value: true });
+  assert.throws(() => canonicalBytes(hidden), /non-enumerable canonical field/);
+
+  const inherited = Object.create({ inherited: true });
+  inherited.visible = true;
+  assert.throws(() => canonicalBytes(inherited), /only plain objects/);
+
+  const accessor = {};
+  Object.defineProperty(accessor, "value", { enumerable: true, get: () => 1 });
+  assert.throws(() => canonicalBytes(accessor), /accessor canonical field/);
+
+  const sparse = new Array(2);
+  sparse[1] = "present";
+  assert.throws(() => canonicalBytes(sparse), /dense and contain no extra fields/);
+
+  const extra = ["value"];
+  extra.label = "hidden by JSON.stringify";
+  assert.throws(() => canonicalBytes(extra), /dense and contain no extra fields/);
+
+  assert.throws(() => canonicalBytes({ [Symbol("hidden")]: true }), /symbol canonical fields/);
+  assert.throws(() => canonicalBytes({ value: -0 }), /negative zero/);
+
+  const shared = { value: true };
+  assert.throws(
+    () => canonicalBytes({ first: shared, duplicate: shared }),
+    /duplicate object references/,
+  );
+  assert.throws(
+    () => canonicalBytes({ nested: Object.assign(Object.create(null), { $bytes_base64: "AA==", extra: true }) }),
+    /reserved canonical field/,
+  );
+});
 
 test("canonical authenticated receipts reject tampering and wrong keys", () => {
   const receipt = authenticateReceipt({
@@ -22,7 +127,17 @@ test("canonical authenticated receipts reject tampering and wrong keys", () => {
     key: KEY,
     payload: { episode_id: "episode-1", decision: "SEALED/contained" },
   });
+  assert.equal(receipt.body_sha256, "5240574f147b42dabfc74542702a1326b5c9f51965c89f003caba0dba9c6a636");
+  assert.equal(receipt.authentication.mac, "c034b00a8d7eecd658026a61c4ed1f3c846801e42eb873241a786c75a3e56f13");
   assert.equal(verifyReceipt(receipt, { kind: "terminal", keyId: "root-key:v3", key: KEY }), true);
+  const receiptBytes = canonicalBytes(receipt);
+  assert.equal(verifyReceipt(receiptBytes, { kind: "terminal", keyId: "root-key:v3", key: KEY }), true);
+  const duplicateSchema = Buffer.from(receiptBytes.toString("utf8").replace(
+    /,"schema":("[^"]+")}$/,
+    ',"schema":$1,"schema":$1}',
+  ));
+  assert.notEqual(duplicateSchema.toString("utf8"), receiptBytes.toString("utf8"));
+  assert.equal(verifyReceipt(duplicateSchema, { kind: "terminal", keyId: "root-key:v3", key: KEY }), false);
   const tampered = structuredClone(receipt);
   tampered.payload.decision = "SEALED/unproven";
   assert.equal(verifyReceipt(tampered, { kind: "terminal", keyId: "root-key:v3", key: KEY }), false);
