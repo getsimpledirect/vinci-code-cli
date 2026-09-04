@@ -158,10 +158,21 @@ const consumers = [
 	["loopbreak", ({ ctx }) => getUnstuck(ctx, "bash repeated", [], "Fix the loop"), []],
 ];
 
+const requestedConsumer = process.env.VINCI_TEST_402_CONSUMER?.trim();
+const selectedConsumers = requestedConsumer
+	? consumers.filter(([site]) => site === requestedConsumer)
+	: consumers;
+assert.ok(
+	selectedConsumers.length > 0,
+	`VINCI_TEST_402_CONSUMER must name one of: ${consumers.map(([site]) => site).join(", ")}`,
+);
+
 for (const [variant, body] of BILLING_ERRORS) {
-	for (const [site, run, leadingResponses] of consumers) {
+	for (const [site, run, leadingResponses] of selectedConsumers) {
 		await assert402StopsEscalation(`${site}-${variant}`, body, run, leadingResponses);
 	}
 }
 
-console.log("402-escalation-no-downgrade: all four consumers reject both 402 variants without downgrade");
+const consumerSummary = requestedConsumer ?? "all four consumers";
+const consumerVerb = requestedConsumer ? "rejects" : "reject";
+console.log(`402-escalation-no-downgrade: ${consumerSummary} ${consumerVerb} both 402 variants without downgrade`);
