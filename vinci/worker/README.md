@@ -298,9 +298,9 @@ id (`auto` is deliberately never a class — a contract names a class, not "what
 resolves to"). A spec-level `provider` pin must EQUAL the configured provider for the class
 (`provider_mismatch` otherwise); it never overrides it.
 
-### Qualified direct Qwen H200 lane
+### Qwen H200 lane (NO-GO pending upstream authority)
 
-`qwen-h200` is an internal OpenAI-compatible provider for the exact model
+`qwen-h200` is a local candidate client for the exact model
 `Qwen/Qwen3.8-27B`. It is not an inference service and never manages a GPU: the operator supplies
 Ayush's already-running endpoint. A digest-form class entry is:
 
@@ -308,21 +308,27 @@ Ayush's already-running endpoint. A digest-form class entry is:
 {"qwen-38-27b":{"provider":"qwen-h200","model":"Qwen/Qwen3.8-27B"}}
 ```
 
-Enable it only in the Worker process that should admit the lane by including `qwen-h200` in
+Configuration does not make this lane admissible. If the upstream dependencies are later supplied,
+select it only in the Worker process intended for the lane by including `qwen-h200` in
 `VINCI_WORKER_ALLOWED_PROVIDERS` and the entry above in `VINCI_WORKER_MODEL_CLASSES`. Qwen is
 digest-WorkOrder-only; legacy prose handoffs are refused because they cannot carry the validated
 acceptance criteria and immutable contract binding required by this lane.
+
+The current authority ruling is **NO-GO for joined WorkOrders**. Production has no integrated
+separate-UID, credential-owning dispatcher and no independently deployed endpoint-global VGC
+reservation service. The client therefore has no production reservation authority and fails before
+transport. The process-local test adapter is adversarial-test scaffolding only; it cannot admit a
+real request, activate the lane, or count as canary/burn-in evidence.
 
 The lane is fail-closed. Runtime registration requires all of the following:
 
 - `VINCI_QWEN_BASE_URL`: the operator HTTPS endpoint. Credentials, query strings, fragments,
   redirects, IPv6, and private/local/reserved DNS answers are refused; loopback HTTP exists only for
   tests. Every connection uses the public IPv4 addresses resolved and pinned during readiness.
-- `VINCI_QWEN_SECRET_REF=file:/absolute/private/path`: the worker opens a private, regular,
-  non-symlinked credential file and passes only inherited descriptor 3 to the child. The reference
-  is removed before spawn, the child consumes and closes the descriptor during provider bootstrap,
-  and neither the secret nor its reference is put in general child environment, argv, logs, or a
-  generated file. The WorkOrder prompt is sent on stdin, never argv.
+- `VINCI_QWEN_SECRET_REF=file:/absolute/private/path` is retained only for local candidate tests.
+  It is not an acceptable production credential boundary: a joined WorkOrder must use the
+  separate-UID dispatcher, which owns the endpoint credential and never exposes it to the Worker or
+  model process. The WorkOrder prompt is sent on stdin, never argv.
 - `VINCI_QWEN_QUALIFICATION_FILE` plus its exact `VINCI_QWEN_QUALIFICATION_SHA256`. Trust never
   comes from Worker environment: a root-owned, non-writable record under
   `/run/vinci/qwen-authority` pins the independent issuer, Ed25519 key path and digest, and a live
@@ -330,8 +336,11 @@ The lane is fail-closed. Runtime registration requires all of the following:
   that authority root. An unsigned record, a Worker-selected key, or a self-admitted record is
   invalid.
 - a deterministic Governor lease and worker-derived WorkOrder, Run, and Attempt identities. Model
-  output supplies none of them. Each Worker attempt has its own session; every bounded transport
-  retry is recorded beneath that Attempt with a distinct idempotency key.
+  output supplies none of them. Before every endpoint request, the dispatcher must return a fresh,
+  server-minted, endpoint-global reservation binding the exact invocation/request digest, permit,
+  WorkOrder, Run, Attempt, lease id, fencing generation, session, worker principal/build, contract,
+  execution spec, endpoint identity/digest, and deployment revision. Missing, stale, extra, or
+  mismatched reservation fields fail before dispatch.
 
 The signed v2 envelope has a maximum seven-day lifetime, cites a canary no more than 24 hours old,
 and binds the independent review message/body digest and burn-in report digest. Its closed payload
@@ -355,11 +364,12 @@ schema; they count toward the atomically persisted circuit just like HTTP and tr
 failures. Three failures open it for 60 seconds by default. `VINCI_QWEN_CIRCUIT_THRESHOLD` and
 `VINCI_QWEN_CIRCUIT_OPEN_MS` are bounded operator overrides.
 
-Concurrency is fixed at 1. The external VGC record carries a five-minute-or-shorter permit for the
-exact WorkOrder/Run/Attempt and names the shared authority lock directory. Every provider instance
-and process must atomically hold the same fleet lock before it can start inference; the local
-closure counter is defense in depth. A crash leaves the lock closed until the external authority
-reclaims it, rather than permitting overlapping work. The signed schema understands only the ladder
+Concurrency is fixed at 1. The filesystem occupancy record and provider closure counter are only
+same-host defense in depth; neither is endpoint-global authority. The external VGC service must
+atomically reserve the endpoint before generation and bind that reservation to the invocation. The
+client durably records `PREPARED → DISPATCHED → RESPONSE_OBSERVED → RECONCILED`; a crash or ambiguous
+transport result retains occupancy across restart until a trusted VGC reconciliation proves the
+remote outcome. The signed schema understands only the ladder
 `1 → 2 → 4 → 8 → 16 → 24 → 32`, never an intermediate value, and never above Ayush's advertised
 ceiling. Any stage above 1 must cite the immediately prior stage with at least 168 continuous hours
 and 1,000 WorkOrders, 100% acceptance pass and usage coverage, at most 0.5% transport errors, and
@@ -376,8 +386,12 @@ verification, review, and no-merge boundaries remain authoritative. There is no 
 switching. OpenRouter fallback means a new, separately authorized attempt whose envelope explicitly
 selects `openrouter` and whose operator allowlist permits it.
 
-Post-launch canary (readiness/auth GETs plus one bounded inference request; no deployment, GPU,
-credential, or remote-state mutation):
+Do not run a canary while the dispatcher, endpoint-global reservation service, or independent
+reconciliation producer is absent. Once all three are independently deployed and an operator
+authorizes it, the only admissible canary is retries-zero and tool-free, uses the same dispatcher and
+reservation path as a future WorkOrder, requires the exact text `READY`, strict usage and `[DONE]`,
+and remains non-countable evidence. The command below is a future operator procedure, not an
+activation instruction:
 
 ```
 VINCI_QWEN_BASE_URL=https://operator-endpoint.example \
@@ -385,9 +399,7 @@ VINCI_QWEN_SECRET_REF=file:/run/secrets/vinci-qwen-token \
 node --experimental-strip-types vinci/extensions/lib/qwen-runtime.ts --canary
 ```
 
-The canary requests one streaming `report_ready` tool call, requires exact arguments
-`{ "status": "ready" }` plus strict usage, and prints a non-authoritative JSON report. It cannot
-write or admit qualification.
+The canary prints a non-authoritative JSON report. It cannot write or admit qualification.
 
 After reviewing the canary and numeric burn-in report, generate an **unsigned request** for the
 never-builder reviewer. The command prints JSON only. The full system-prompt, tool-schema, canary,
@@ -686,9 +698,10 @@ configured nothing changes (no downgrade), so soak boxes may run without it.
 - `VINCI_DECLARATION_REFRESH_S`: how often (seconds) a governed daemon re-posts its capability declaration; default `21600` (6h), and anything that is not a positive number falls back to the default. It must stay comfortably below the Governor's `VGC_DECLARATION_MAX_AGE_S` (default 86400), which is when a declaration expires and admission starts answering `eligible: false, reason: stale_declaration`. **The default is chosen against row retention, not liveness** (gpu-control §32): the Governor's `worker_declarations` table is append-only with a DELETE trigger and every refresh writes an audit row, so the volume cannot be pruned later. 6h keeps four refreshes inside the 24h window — three consecutive failed re-posts can be absorbed before one goes stale — at a quarter the rows of hourly, which buys no liveness at all
 - `GH_TOKEN`: (optional) GitHub machine user token for cloning/pushing private repos and creating PRs
 - `OPENROUTER_API_KEY`: (or provider-specific key) via vinci's standard configuration
-- `VINCI_QWEN_BASE_URL` + `VINCI_QWEN_SECRET_REF=file:/absolute/private/path`: direct Qwen endpoint
-  and worker-only credential-file reference; the worker converts the reference to child descriptor
-  3 and removes it before spawn. Never place the credential value in worker configuration
+- `VINCI_QWEN_BASE_URL` + `VINCI_QWEN_SECRET_REF=file:/absolute/private/path`: candidate-test-only
+  direct endpoint settings. They do not authorize production use. Joined WorkOrders remain refused
+  until a separate-UID dispatcher owns the endpoint credential and supplies the server-minted
+  point-of-use reservation and reconciliation contracts described above
 
 Never hardcode. Use systemd SecureString parameters, AWS Secrets Manager, or similar.
 
@@ -848,9 +861,11 @@ endpoint/worker-only secret-reference/qualification/circuit settings above — t
 `vinci/bin/vinci` and the install shim read to find the backend and the run mode. Plus **only** the
 key the envelope's `provider:` authenticates with: `OPENROUTER_API_KEY` for `openrouter`,
 `VINCI_API_KEY` for `vinci`, `VINCI_INTERNAL_DEEPINFRA_API_KEY` for `deepinfra` (an unknown provider
-gets no key and the launcher refuses it, as today). `qwen-h200` carries no credential value through
-the allowlist; immediately before spawn the worker replaces its narrow file reference with inherited
-descriptor 3, and the extension consumes that descriptor during bootstrap. Set by the daemon, never copied: `HOME` and
+gets no key and the launcher refuses it, as today). The current candidate `qwen-h200` path carries no
+credential value through the allowlist; immediately before spawn the worker replaces its narrow file
+reference with inherited descriptor 3, and the extension consumes that descriptor during bootstrap.
+That is test scaffolding, not the required separate-UID production boundary, so it cannot admit a
+joined WorkOrder. Set by the daemon, never copied: `HOME` and
 `TMPDIR` (per attempt), `VINCI_CODING_AGENT_DIR` and `PI_CODING_AGENT_DIR` (both spellings, both
 `<attempt>.home/agent` — the daemon's own slot is **not** passed through: it holds `auth.json` for
 every provider, every prior session and `bin/`), `VINCI_HOME` (the launcher's install root — the

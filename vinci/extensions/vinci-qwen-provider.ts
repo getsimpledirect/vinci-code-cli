@@ -9,7 +9,6 @@ import {
 import { streamSimpleOpenAICompletions } from "@earendil-works/pi-ai/compat";
 import { Value } from "typebox/value";
 import {
-  acquireQwenFleetPermit,
   assertQwenCircuitClosed,
   assertQwenContextBindings,
   createQwenInferenceFetch,
@@ -24,6 +23,7 @@ import {
   type QwenAttemptRecord,
   type QwenFetch,
   type QwenRuntimeConfig,
+  type QwenReservationAuthority,
   type QwenSemanticSettlement,
   settleQwenSemanticOutcome,
   validateQwenOutboundPayload,
@@ -94,6 +94,7 @@ export function qwenProviderConfig(
   streamOpenAI = streamSimpleOpenAICompletions,
   onAttempt: (record: QwenAttemptRecord) => void = () => {},
   injectedFetch?: QwenFetch,
+  reservationAuthority?: QwenReservationAuthority,
 ) {
   let inFlight = 0;
   let requestOrdinal = 0;
@@ -110,17 +111,12 @@ export function qwenProviderConfig(
       if (inFlight >= runtime.qualification.limits.max_concurrency) {
         throw new Error("qwen_concurrency_exceeded: the qualified single-request bound is already in use");
       }
-      const releaseFleetPermit = acquireQwenFleetPermit(runtime);
       inFlight += 1;
       let released = false;
       const release = () => {
         if (released) return;
         released = true;
-        try {
-          releaseFleetPermit();
-        } finally {
-          inFlight -= 1;
-        }
+        inFlight -= 1;
       };
       requestOrdinal += 1;
       const requestId = qwenSha256(`${runtime.attribution.workOrderId}\0${runtime.attribution.runId}\0${runtime.attribution.attemptId}\0${requestOrdinal}`);
@@ -136,7 +132,7 @@ export function qwenProviderConfig(
             headers: { ...options?.headers, ...qwenProviderHeaders(runtime, requestId) },
             timeoutMs: runtime.qualification.limits.total_timeout_ms,
             maxRetries: 0,
-            fetch: createQwenInferenceFetch(runtime, requestId, onAttempt, injectedFetch, semanticSettlement),
+            fetch: createQwenInferenceFetch(runtime, requestId, onAttempt, injectedFetch, semanticSettlement, reservationAuthority),
             onPayload: (payload) => {
               validateQwenOutboundPayload(runtime, payload);
               return payload;
@@ -166,9 +162,6 @@ export function qwenProviderConfig(
                 ) {
                   throw new Error("qwen_semantic_invalid: terminal response failed exact identity, usage, finish, or tool semantics");
                 }
-                // A permit-release failure is itself a failed request. Never persist semantic
-                // success until the external concurrency authority has been released cleanly.
-                release();
                 settleQwenSemanticOutcome(runtime, semanticSettlement, true, "success", onAttempt);
               }
               // Release before the terminal event can resolve result() or become observable to a
@@ -242,6 +235,13 @@ export default async function (pi: ExtensionAPI) {
   if (process.env.VINCI_QWEN_SELECTED !== "1") {
     throw new Error("qwen_not_selected: the Qwen extension may load only for a Worker-selected Qwen attempt");
   }
+  // Deliberate production NO-GO. The reservation callback used by the tests is not an authority
+  // implementation, and an environment flag would let the Worker nominate its own authority.
+  // Replace this stop only when the separately deployed, separate-UID credential-owning dispatcher
+  // has a concrete client that returns authenticated server-minted reservations and reconciliations.
+  throw new Error("qwen_dispatcher_unavailable: joined Qwen WorkOrders are disabled until the separate-UID VGC dispatcher is integrated");
+
+  /* c8 ignore start -- retained integration path, unreachable until the upstream dispatcher lands */
   let runtime: QwenRuntimeConfig;
   try {
     runtime = await ensureQwenReady();
@@ -287,4 +287,5 @@ export default async function (pi: ExtensionAPI) {
       session_id: ctx.sessionManager.getSessionId(),
     });
   });
+  /* c8 ignore stop */
 }

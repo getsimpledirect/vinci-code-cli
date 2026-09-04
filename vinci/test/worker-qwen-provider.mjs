@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { streamSimple as sourceStreamSimpleOpenAICompletions } from "../../packages/ai/src/api/openai-completions.ts";
 import * as runtime from "../extensions/lib/qwen-runtime.ts";
-import { qwenProviderConfig } from "../extensions/vinci-qwen-provider.ts";
+import qwenExtension, { qwenProviderConfig as rawQwenProviderConfig } from "../extensions/vinci-qwen-provider.ts";
 import * as cleanroom from "../worker/cleanroom.mjs";
 import * as digest from "../worker/contracts/digest.mjs";
 import * as economics from "../worker/economics.mjs";
@@ -25,6 +25,7 @@ const burnInFile = join(temp, "burn-in.json");
 const qualificationFile = join(temp, "qualification.json");
 const publicKeyFile = join(temp, "qualification-key.pem");
 const permitLockDirectory = join(temp, "permit-locks");
+const reconciliationDirectory = join(temp, "reconciliations");
 const endpointIdentity = "12".repeat(32);
 const revision = "ab".repeat(20);
 const runtimeTuple = {
@@ -79,35 +80,6 @@ recordQwenCircuitOutcome({ circuitFile, circuitThreshold: 100, circuitOpenMs: 60
   })));
 }
 
-async function exerciseCrossProcessFleetPermit(config) {
-  const release = runtime.acquireQwenFleetPermit(config);
-  const workerFile = join(temp, "permit-worker.mjs");
-  const runtimeUrl = pathToFileURL(join(root, "vinci/extensions/lib/qwen-runtime.ts")).href;
-  writeFileSync(workerFile, `import { acquireQwenFleetPermit } from ${JSON.stringify(runtimeUrl)};
-const [lockDirectory, permitId, expiresAt] = process.argv.slice(2);
-try {
-  acquireQwenFleetPermit({ fleetPermit: { lockDirectory, permitId, expiresAt }, qualification: { limits: { total_timeout_ms: 1_000 } } });
-  process.exitCode = 2;
-} catch (error) {
-  if (error?.code !== "concurrency_exceeded") throw error;
-}
-`, { mode: 0o600 });
-  try {
-    const child = spawn(process.execPath, [...process.execArgv, workerFile, config.fleetPermit.lockDirectory, config.fleetPermit.permitId, config.fleetPermit.expiresAt], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    await new Promise((resolveExit, rejectExit) => {
-      let stderr = "";
-      child.stderr.setEncoding("utf8");
-      child.stderr.on("data", (chunk) => { stderr += chunk; });
-      child.on("error", rejectExit);
-      child.on("exit", (code) => code === 0 ? resolveExit() : rejectExit(new Error(`permit worker exited ${code}: ${stderr}`)));
-    });
-  } finally {
-    release();
-  }
-}
-
 function freshenPermit(config) {
   config.fleetPermit.expiresAt = new Date(Date.now() + 60_000).toISOString();
   return config;
@@ -115,6 +87,7 @@ function freshenPermit(config) {
 
 writeFileSync(secretFile, "synthetic-test-secret\n", { mode: 0o600 });
 mkdirSync(permitLockDirectory, { mode: 0o700 });
+mkdirSync(reconciliationDirectory, { mode: 0o700 });
 writeFileSync(promptFile, workOrderPrompt, { mode: 0o400 });
 writeFileSync(systemPromptFile, systemPrompt, { mode: 0o400 });
 writeFileSync(toolSchemasFile, `${JSON.stringify(tools)}\n`, { mode: 0o400 });
@@ -286,6 +259,14 @@ const authorityBoundary = {
     attemptId: "task-test/1",
     maxConcurrency: 1,
     lockDirectory: permitLockDirectory,
+    reconciliationDirectory,
+    leaseId: "lease-authority-test",
+    fencingGeneration: 7,
+    sessionId: "run-test",
+    workerPrincipal: "worker:test",
+    workerBuildSha256: "31".repeat(32),
+    contractDigest: "32".repeat(32),
+    executionSpecDigest: "33".repeat(32),
     issuedAt: "2026-09-04T17:59:00.000Z",
     expiresAt: "2026-09-04T18:04:00.000Z",
   },
@@ -296,12 +277,58 @@ function runtimeEnv(overrides = {}) {
 }
 
 function loadConfig(overrides = {}) {
-  return runtime.loadQwenRuntimeConfig(runtimeEnv(overrides), nowMs, authorityBoundary);
+  return freshenPermit(runtime.loadQwenRuntimeConfig(runtimeEnv(overrides), nowMs, authorityBoundary));
 }
 
-function identityHeaders(overrides = {}) {
+const reservationRequests = [];
+function reservationAuthority(request) {
+  reservationRequests.push(structuredClone(request));
+  const issuedAt = new Date().toISOString();
+  return {
+    ...request,
+    schema: "vinci.qwen-point-of-use-reservation.v1",
+    authority: "vgc-fleet-permit-authority",
+    scope: "endpoint-global",
+    reservation_id: `reservation:${request.invocation_id}`,
+    issued_at: issuedAt,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+  };
+}
+
+function inferenceFetch(config, requestId, onAttempt, fetchImpl, settlement) {
+  return runtime.createQwenInferenceFetch(config, requestId, onAttempt, fetchImpl, settlement, reservationAuthority);
+}
+
+function qwenProviderConfig(config, streamOpenAI, onAttempt, fetchImpl) {
+  return rawQwenProviderConfig(config, streamOpenAI, onAttempt, fetchImpl, reservationAuthority);
+}
+
+function invocationHeaders(init = {}, overrides = {}) {
+  const requestHeaders = new Headers(init.headers);
+  return {
+    "x-vinci-qwen-invocation-id": requestHeaders.get("x-vinci-qwen-invocation-id"),
+    "x-vinci-qwen-request-sha256": requestHeaders.get("x-vinci-qwen-request-sha256"),
+    "x-vinci-qwen-reservation-id": requestHeaders.get("x-vinci-qwen-reservation-id"),
+    "x-vinci-model-revision": revision,
+    "x-vinci-qwen-fleet-permit-id": requestHeaders.get("x-vinci-qwen-fleet-permit-id"),
+    "x-vinci-lease-id": requestHeaders.get("x-vinci-lease-id"),
+    "x-vinci-fencing-generation": requestHeaders.get("x-vinci-fencing-generation"),
+    "x-vinci-session-id": requestHeaders.get("x-vinci-session-id"),
+    "x-vinci-worker-principal": requestHeaders.get("x-vinci-worker-principal"),
+    "x-vinci-worker-build-sha256": requestHeaders.get("x-vinci-worker-build-sha256"),
+    "x-vinci-contract-digest": requestHeaders.get("x-vinci-contract-digest"),
+    "x-vinci-execution-spec-digest": requestHeaders.get("x-vinci-execution-spec-digest"),
+    "x-vinci-qwen-permit-authority": "vgc-fleet-permit-authority",
+    "x-vinci-qwen-permit-scope": "endpoint-global",
+    "x-vinci-qwen-permit-state": "held",
+    ...overrides,
+  };
+}
+
+function identityHeaders(overrides = {}, init = {}) {
   return {
     "content-type": "text/event-stream",
+    ...invocationHeaders(init),
     "x-vinci-model-id": runtime.QWEN_MODEL,
     "x-vinci-model-revision": revision,
     "x-vinci-endpoint-identity-sha256": endpointIdentity,
@@ -311,6 +338,42 @@ function identityHeaders(overrides = {}) {
     "x-vinci-runtime-arguments-sha256": runtimeTuple.arguments_sha256,
     ...overrides,
   };
+}
+
+function reconcileActive(config) {
+  const active = JSON.parse(readFileSync(join(config.fleetPermit.lockDirectory, "qwen-h200-concurrency-1"), "utf8"));
+  const ledger = JSON.parse(readFileSync(active.ledger_path, "utf8"));
+  const status = ledger.status ?? 599;
+  process.env.VINCI_QWEN_TEST_RECONCILIATION = "1";
+  try {
+    runtime.reconcileQwenInvocationFromAuthority(config, {
+      schema: "vinci.qwen-invocation-reconciliation.v1",
+      authority: "vgc-fleet-permit-authority",
+      invocation_id: ledger.invocation_id,
+      reservation_id: ledger.reservation_id,
+      request_sha256: ledger.request_sha256,
+      permit_id: ledger.permit_id,
+      work_order_id: ledger.work_order_id,
+      run_id: ledger.run_id,
+      attempt_id: ledger.attempt_id,
+      lease_id: ledger.lease_id,
+      fencing_generation: ledger.fencing_generation,
+      session_id: ledger.session_id,
+      worker_principal: ledger.worker_principal,
+      worker_build_sha256: ledger.worker_build_sha256,
+      contract_digest: ledger.contract_digest,
+      execution_spec_digest: ledger.execution_spec_digest,
+      endpoint_sha256: ledger.endpoint_sha256,
+      endpoint_identity_sha256: ledger.endpoint_identity_sha256,
+      deployment_revision: ledger.deployment_revision,
+      status,
+      response_id: ledger.response_id ?? (status >= 200 && status < 300 ? "authority-reconciled" : null),
+      usage: ledger.usage ?? (status >= 200 && status < 300 ? { input: 0, output: 0 } : null),
+    });
+  } finally {
+    delete process.env.VINCI_QWEN_TEST_RECONCILIATION;
+  }
+  return ledger;
 }
 
 const usage = {
@@ -335,12 +398,24 @@ const requestBody = JSON.stringify({
 });
 
 try {
+  process.env.VINCI_QWEN_SELECTED = "1";
+  try {
+    await assert.rejects(qwenExtension({}), /qwen_dispatcher_unavailable/, "joined WorkOrders must remain NO-GO without the upstream dispatcher");
+  } finally {
+    delete process.env.VINCI_QWEN_SELECTED;
+  }
+  assert.equal(
+    runtime.buildQwenQualificationRequest({ ...requestEnv, VINCI_QWEN_MAX_RETRIES: undefined }).candidate.limits.max_retries,
+    0,
+    "automatic Qwen retries must default to zero",
+  );
   assert.equal(qualification.safe_resume, false);
   assert.equal(qualification.limits.max_concurrency, 1);
   assert.equal(qualification.limits.advertised_max_concurrency, 32);
   assert.equal(qualification.bindings.request_encoding_sha256, runtime.qwenSha256(runtime.qwenCanonical(runtime.QWEN_REQUEST_ENCODING)));
   const config = loadConfig();
   assert.equal(config.secret, "synthetic-test-secret");
+  assert.equal(config.fleetPermit.leaseId, "lease-authority-test", "Worker environment must not choose the authoritative lease");
   assert.equal(config.qualification.provenance.authority, "independent-never-builder-review");
   assert.throws(
     () => runtime.loadQwenRuntimeConfig(runtimeEnv(), nowMs),
@@ -434,47 +509,48 @@ try {
   const readyFetch = async (url, init = {}) => {
     const headers = new Headers(init.headers);
     observed.push({ url: String(url), authorization: headers.get("authorization") });
-    if (String(url).endsWith("/health") && !headers.has("authorization")) return Response.json({}, { status: 401 });
-    if (String(url).endsWith("/health")) return Response.json({ status: "ready" });
-    if (String(url).endsWith("/v1/models") && !headers.has("authorization")) return Response.json({}, { status: 401 });
+    if (String(url).endsWith("/health") && !headers.has("authorization")) return Response.json({}, { status: 401, headers: invocationHeaders(init) });
+    if (String(url).endsWith("/health")) return Response.json({ status: "ready" }, { headers: invocationHeaders(init) });
+    if (String(url).endsWith("/v1/models") && !headers.has("authorization")) return Response.json({}, { status: 401, headers: invocationHeaders(init) });
     if (String(url).endsWith("/v1/models")) {
       return Response.json({
         object: "list",
         data: [{ id: runtime.QWEN_MODEL, revision, runtime: runtimeTuple, endpoint_identity_sha256: endpointIdentity }],
-      });
+      }, { headers: invocationHeaders(init) });
     }
     throw new Error(`unexpected fake URL ${url}`);
   };
   const lookupPublic = async () => [{ address: "93.184.216.34", family: 4 }];
   const readyConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "ready-circuit.json") });
-  const identity = await runtime.probeQwenReadiness(readyConfig, { fetchImpl: readyFetch, lookupImpl: lookupPublic, nowMs });
+  const identity = await runtime.probeQwenReadiness(readyConfig, { fetchImpl: readyFetch, lookupImpl: lookupPublic, nowMs, reservationAuthority });
   assert.equal(identity.endpointIdentity, endpointIdentity);
   assert.deepEqual(observed.map((entry) => entry.authorization), ["Bearer synthetic-test-secret", "Bearer synthetic-test-secret", null, null]);
 
   const canarySse = [
     `data: ${JSON.stringify({
-      id: "canary-tool",
+      id: "canary-ready",
       object: "chat.completion.chunk",
       created: 1,
       model: runtime.QWEN_MODEL,
-      choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: "report_ready", arguments: '{"status":"ready"}' } }] } }],
+      choices: [{ index: 0, delta: { content: "READY" }, finish_reason: null }],
     })}`,
-    `data: ${JSON.stringify({ id: "canary-tool", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+    `data: ${JSON.stringify({ id: "canary-ready", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
+    `data: ${JSON.stringify({ id: "canary-ready", object: "chat.completion.chunk", created: 3, model: runtime.QWEN_MODEL, choices: [], usage })}`,
     "data: [DONE]",
     "",
   ].join("\n\n");
   const canaryFetch = async (url, init = {}) => {
     const target = String(url);
     const authenticated = new Headers(init.headers).has("authorization");
-    if (!authenticated && (target.endsWith("/health") || target.endsWith("/v1/models"))) return Response.json({}, { status: 401 });
-    if (target.endsWith("/health")) return Response.json({ status: "ready" });
+    if (!authenticated && (target.endsWith("/health") || target.endsWith("/v1/models"))) return Response.json({}, { status: 401, headers: invocationHeaders(init) });
+    if (target.endsWith("/health")) return Response.json({ status: "ready" }, { headers: invocationHeaders(init) });
     if (target.endsWith("/v1/models")) {
       return Response.json({
         object: "list",
         data: [{ id: runtime.QWEN_MODEL, revision, runtime: runtimeTuple, endpoint_identity_sha256: endpointIdentity }],
-      });
+      }, { headers: invocationHeaders(init) });
     }
-    if (target.endsWith("/v1/chat/completions")) return new Response(canarySse, { headers: identityHeaders() });
+    if (target.endsWith("/v1/chat/completions")) return new Response(canarySse, { headers: identityHeaders({}, init) });
     throw new Error(`unexpected canary URL ${target}`);
   };
   const canaryReport = await runtime.runQwenCanary(
@@ -482,9 +558,31 @@ try {
       VINCI_QWEN_BASE_URL: requestEnv.VINCI_QWEN_BASE_URL,
       VINCI_QWEN_SECRET_REF: `file:${secretFile}`,
       VINCI_QWEN_CANARY_TIMEOUT_MS: "1000",
+      VINCI_QWEN_CANARY_WORK_ORDER_ID: "qwen-canary",
+      VINCI_QWEN_CANARY_RUN_ID: "canary-run",
+      VINCI_QWEN_CANARY_ATTEMPT_ID: "canary-attempt/1",
+      VINCI_QWEN_SERVED_REVISION: revision,
+      VINCI_QWEN_RUNTIME_ENGINE: runtimeTuple.engine,
+      VINCI_QWEN_RUNTIME_VERSION: runtimeTuple.version,
+      VINCI_QWEN_RUNTIME_ARTIFACT_SHA256: runtimeTuple.artifact_sha256,
+      VINCI_QWEN_RUNTIME_ARGUMENTS_SHA256: runtimeTuple.arguments_sha256,
+      VINCI_QWEN_ENDPOINT_IDENTITY_SHA256: endpointIdentity,
     },
     canaryFetch,
     lookupPublic,
+    {
+      ...authorityBoundary,
+      fleetPermit: {
+        ...authorityBoundary.fleetPermit,
+        workOrderId: "qwen-canary",
+        runId: "canary-run",
+        sessionId: "canary-run",
+        attemptId: "canary-attempt/1",
+        issuedAt: new Date(Date.now() - 1_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    },
+    reservationAuthority,
   );
   assert.equal(canaryReport.safe_resume, false);
   assert.equal(canaryReport.endpoint_identity_sha256, endpointIdentity);
@@ -493,6 +591,119 @@ try {
   const privateConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "private-circuit.json") });
   await assert.rejects(runtime.pinQwenEndpoint(privateConfig, async () => [{ address: "169.254.169.254", family: 4 }]), /ssrf_forbidden/);
 
+  const unavailableDispatcherConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "dispatcher-unavailable.json") });
+  unavailableDispatcherConfig.endpointAddresses = ["93.184.216.34"];
+  let unauthorizedTransportCalls = 0;
+  await assert.rejects(
+    runtime.createQwenInferenceFetch(unavailableDispatcherConfig, "request-no-dispatcher", () => {}, async () => {
+      unauthorizedTransportCalls += 1;
+      throw new Error("must not dispatch");
+    })(unavailableDispatcherConfig.chatUrl, { method: "POST", body: requestBody }),
+    /dispatcher_unavailable/,
+  );
+  assert.equal(unauthorizedTransportCalls, 0, "missing separate-UID dispatcher authority must fail before transport");
+  assert.equal(existsSync(join(permitLockDirectory, "qwen-h200-concurrency-1")), false, "an undispatched reservation refusal must not retain occupancy");
+
+  const forgedReservationConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "forged-reservation.json") });
+  forgedReservationConfig.endpointAddresses = ["93.184.216.34"];
+  await assert.rejects(
+    runtime.createQwenInferenceFetch(
+      forgedReservationConfig,
+      "request-forged-reservation",
+      () => {},
+      async () => { throw new Error("must not dispatch"); },
+      undefined,
+      (request) => reservationAuthority({ ...request, lease_id: "forged-lease" }),
+    )(forgedReservationConfig.chatUrl, { method: "POST", body: requestBody }),
+    /reservation_invalid/,
+  );
+  assert.equal(existsSync(join(permitLockDirectory, "qwen-h200-concurrency-1")), false);
+
+  const restartConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "restart-reconcile.json") });
+  restartConfig.endpointAddresses = ["93.184.216.34"];
+  restartConfig.qualification.limits.max_retries = 0;
+  let lostConnectionCalls = 0;
+  await assert.rejects(
+    inferenceFetch(restartConfig, "request-connection-loss", () => {}, async () => {
+      lostConnectionCalls += 1;
+      throw new Error("connection lost after dispatch");
+    })(restartConfig.chatUrl, { method: "POST", body: requestBody }),
+    /connection lost/,
+  );
+  assert.equal(lostConnectionCalls, 1);
+  const activeAfterLoss = JSON.parse(readFileSync(join(permitLockDirectory, "qwen-h200-concurrency-1"), "utf8"));
+  const lossLedger = JSON.parse(readFileSync(activeAfterLoss.ledger_path, "utf8"));
+  assert.equal(lossLedger.state, "DISPATCHED");
+  assert.deepEqual(lossLedger.history.map((event) => event.state), ["PREPARED", "DISPATCHED"]);
+  assert.equal(lossLedger.invocation_id, reservationRequests.at(-1).invocation_id);
+  assert.equal(lossLedger.request_sha256, runtime.qwenSha256(requestBody));
+  assert.equal(lossLedger.lease_id, authorityBoundary.fleetPermit.leaseId);
+  assert.equal(lossLedger.fencing_generation, authorityBoundary.fleetPermit.fencingGeneration);
+  assert.equal(lossLedger.contract_digest, authorityBoundary.fleetPermit.contractDigest);
+
+  let restartTransportCalls = 0;
+  await assert.rejects(
+    inferenceFetch(restartConfig, "request-after-restart", () => {}, async () => {
+      restartTransportCalls += 1;
+      return new Response(validSse);
+    })(restartConfig.chatUrl, { method: "POST", body: requestBody }),
+    /invocation_unresolved/,
+  );
+  assert.equal(restartTransportCalls, 0, "restart must retain ambiguous occupancy before any new dispatch");
+  const validReconciliation = {
+    schema: "vinci.qwen-invocation-reconciliation.v1",
+    authority: "vgc-fleet-permit-authority",
+    invocation_id: lossLedger.invocation_id,
+    reservation_id: lossLedger.reservation_id,
+    request_sha256: lossLedger.request_sha256,
+    permit_id: lossLedger.permit_id,
+    work_order_id: lossLedger.work_order_id,
+    run_id: lossLedger.run_id,
+    attempt_id: lossLedger.attempt_id,
+    lease_id: lossLedger.lease_id,
+    fencing_generation: lossLedger.fencing_generation,
+    session_id: lossLedger.session_id,
+    worker_principal: lossLedger.worker_principal,
+    worker_build_sha256: lossLedger.worker_build_sha256,
+    contract_digest: lossLedger.contract_digest,
+    execution_spec_digest: lossLedger.execution_spec_digest,
+    endpoint_sha256: lossLedger.endpoint_sha256,
+    endpoint_identity_sha256: lossLedger.endpoint_identity_sha256,
+    deployment_revision: lossLedger.deployment_revision,
+    status: 599,
+    response_id: null,
+    usage: null,
+  };
+  assert.throws(
+    () => runtime.reconcileQwenInvocationFromAuthority(restartConfig, validReconciliation),
+    /authority_forbidden/,
+    "Worker memory must not self-authorize reconciliation",
+  );
+  process.env.VINCI_QWEN_TEST_RECONCILIATION = "1";
+  try {
+    assert.throws(
+      () => runtime.reconcileQwenInvocationFromAuthority(restartConfig, { ...validReconciliation, status: "599" }),
+      /invocation_reconciliation_invalid/,
+    );
+  } finally {
+    delete process.env.VINCI_QWEN_TEST_RECONCILIATION;
+  }
+  assert.equal(existsSync(join(permitLockDirectory, "qwen-h200-concurrency-1")), true, "invalid reconciliation must retain occupancy");
+  reconcileActive(restartConfig);
+
+  const recoveryResponse = await inferenceFetch(
+    restartConfig,
+    "request-after-trusted-reconciliation",
+    () => {},
+    async (_url, init = {}) => new Response(validSse, { headers: identityHeaders({}, init) }),
+  )(restartConfig.chatUrl, { method: "POST", body: requestBody });
+  assert.equal(await recoveryResponse.text(), validSse);
+  const recoveredInvocationId = reservationRequests.at(-1).invocation_id;
+  const recoveryLedger = JSON.parse(readFileSync(join(permitLockDirectory, `qwen-invocation-${recoveredInvocationId}.json`), "utf8"));
+  assert.equal(recoveryLedger.state, "RECONCILED");
+  assert.deepEqual(recoveryLedger.history.map((event) => event.state), ["PREPARED", "DISPATCHED", "RESPONSE_OBSERVED", "RECONCILED"]);
+  assert.equal(existsSync(join(permitLockDirectory, "qwen-h200-concurrency-1")), false);
+
   const records = [];
   const breakerConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "breaker.json") });
   breakerConfig.endpointAddresses = ["93.184.216.34"];
@@ -500,7 +711,7 @@ try {
   const retryKeys = [];
   const requestDigests = [];
   const fleetPermitIds = [];
-  const failingTransport = runtime.createQwenInferenceFetch(
+  const failingTransport = inferenceFetch(
     breakerConfig,
     "request-500",
     (record) => records.push(record),
@@ -510,7 +721,7 @@ try {
       retryKeys.push(headers.get("x-vinci-idempotency-key"));
       requestDigests.push(headers.get("x-vinci-qwen-request-sha256"));
       fleetPermitIds.push(headers.get("x-vinci-qwen-fleet-permit-id"));
-      return new Response("failure", { status: 500 });
+      return new Response("failure", { status: 500, headers: invocationHeaders(init) });
     },
   );
   await assert.rejects(
@@ -519,7 +730,9 @@ try {
   );
   assert.equal(failedCalls, 2, "threshold two must count both real HTTP 500 responses");
   assert.equal(records.length, 2);
-  assert.deepEqual(retryKeys, ["request-500/0", "request-500/1"]);
+  assert.ok(retryKeys.every((key) => typeof key === "string" && /^[0-9a-f]{64}$/.test(key)));
+  assert.equal(new Set(retryKeys).size, 2, "each retry must use its durable invocation id as the idempotency key");
+  assert.deepEqual(retryKeys, records.map((record) => record.invocation_id));
   assert.deepEqual(requestDigests, [runtime.qwenSha256(requestBody), runtime.qwenSha256(requestBody)]);
   assert.deepEqual(fleetPermitIds, [authorityBoundary.fleetPermit.permitId, authorityBoundary.fleetPermit.permitId]);
   assert.deepEqual(records.map((record) => record.transport_attempt), [0, 1]);
@@ -535,46 +748,48 @@ try {
 
   const mismatchConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "mismatch.json") });
   mismatchConfig.endpointAddresses = ["93.184.216.34"];
-  const mismatchTransport = runtime.createQwenInferenceFetch(
+  const mismatchTransport = inferenceFetch(
     mismatchConfig,
     "request-mismatch",
     () => {},
-    async () => new Response(validSse, { headers: identityHeaders({ "x-vinci-model-id": "Qwen/wrong" }) }),
+    async (_url, init = {}) => new Response(validSse, { headers: identityHeaders({ "x-vinci-model-id": "Qwen/wrong" }, init) }),
   );
   await assert.rejects(mismatchTransport(mismatchConfig.chatUrl, { method: "POST", body: requestBody }), /response_identity_mismatch/);
+  reconcileActive(mismatchConfig);
 
   const runtimeMismatchRecords = [];
   const runtimeMismatchConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "runtime-mismatch.json") });
   runtimeMismatchConfig.endpointAddresses = ["93.184.216.34"];
   await assert.rejects(
-    runtime.createQwenInferenceFetch(
+    inferenceFetch(
       runtimeMismatchConfig,
       "request-runtime-mismatch",
       (record) => runtimeMismatchRecords.push(record),
-      async () => new Response(validSse, { headers: identityHeaders({ "x-vinci-runtime-version": "wrong" }) }),
+      async (_url, init = {}) => new Response(validSse, { headers: identityHeaders({ "x-vinci-runtime-version": "wrong" }, init) }),
     )(runtimeMismatchConfig.chatUrl, { method: "POST", body: requestBody }),
     /response_identity_mismatch/,
   );
   assert.equal(runtimeMismatchRecords[0].outcome, "response_identity_mismatch");
+  reconcileActive(runtimeMismatchConfig);
 
   const redirectConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "redirect.json") });
   redirectConfig.endpointAddresses = ["93.184.216.34"];
   await assert.rejects(
-    runtime.createQwenInferenceFetch(redirectConfig, "request-redirect", () => {}, async () => new Response("", { status: 302 }))(
+    inferenceFetch(redirectConfig, "request-redirect", () => {}, async (_url, init = {}) => new Response("", { status: 302, headers: invocationHeaders(init) }))(
       redirectConfig.chatUrl,
       { method: "POST", body: requestBody },
     ),
     /redirect_forbidden/,
   );
   await assert.rejects(
-    runtime.createQwenInferenceFetch(redirectConfig, "request-ssrf", () => {}, async () => new Response(validSse, { headers: identityHeaders() }))(
+    inferenceFetch(redirectConfig, "request-ssrf", () => {}, async (_url, init = {}) => new Response(validSse, { headers: identityHeaders({}, init) }))(
       "http://169.254.169.254/latest/meta-data",
       { method: "POST", body: requestBody },
     ),
     /ssrf_forbidden/,
   );
   await assert.rejects(
-    runtime.createQwenInferenceFetch(redirectConfig, "request-too-large", () => {}, async () => new Response(validSse, { headers: identityHeaders() }))(
+    inferenceFetch(redirectConfig, "request-too-large", () => {}, async (_url, init = {}) => new Response(validSse, { headers: identityHeaders({}, init) }))(
       redirectConfig.chatUrl,
       { method: "POST", body: "x".repeat(5_000) },
     ),
@@ -582,7 +797,7 @@ try {
   );
   const mutatedBody = JSON.stringify({ ...JSON.parse(requestBody), messages: [{ role: "system", content: systemPrompt }, { role: "user", content: "post-hook mutation" }] });
   await assert.rejects(
-    runtime.createQwenInferenceFetch(redirectConfig, "request-mutated", () => {}, async () => new Response(validSse, { headers: identityHeaders() }))(
+    inferenceFetch(redirectConfig, "request-mutated", () => {}, async (_url, init = {}) => new Response(validSse, { headers: identityHeaders({}, init) }))(
       redirectConfig.chatUrl,
       { method: "POST", body: mutatedBody },
     ),
@@ -596,10 +811,10 @@ try {
   const retryAbort = new AbortController();
   let cancelledCalls = 0;
   await assert.rejects(
-    runtime.createQwenInferenceFetch(cancelledConfig, "request-cancelled", () => {}, async () => {
+    inferenceFetch(cancelledConfig, "request-cancelled", () => {}, async (_url, init = {}) => {
       cancelledCalls += 1;
       queueMicrotask(() => retryAbort.abort("operator_stop"));
-      return new Response("retry", { status: 429, headers: { "retry-after": "1" } });
+      return new Response("retry", { status: 429, headers: invocationHeaders(init, { "retry-after": "1" }) });
     })(cancelledConfig.chatUrl, { method: "POST", body: requestBody, signal: retryAbort.signal }),
     /cancelled/,
   );
@@ -608,23 +823,24 @@ try {
   const oversizedConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "oversized.json") });
   oversizedConfig.endpointAddresses = ["93.184.216.34"];
   await assert.rejects(
-    runtime.createQwenInferenceFetch(oversizedConfig, "request-oversized", () => {}, async () => new Response("x".repeat(300), { status: 500 }))(
+    inferenceFetch(oversizedConfig, "request-oversized", () => {}, async (_url, init = {}) => new Response("x".repeat(300), { status: 500, headers: invocationHeaders(init) }))(
       oversizedConfig.chatUrl,
       { method: "POST", body: requestBody },
     ),
     /response_oversized/,
   );
+  reconcileActive(oversizedConfig);
 
   const successRecords = [];
   const successConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "success.json") });
   successConfig.endpointAddresses = ["93.184.216.34"];
   const successSettlement = { transportFailed: false, settled: false };
   const recordSuccess = (record) => successRecords.push(record);
-  const successResponse = await runtime.createQwenInferenceFetch(
+  const successResponse = await inferenceFetch(
     successConfig,
     "request-success",
     recordSuccess,
-    async () => new Response(validSse, { headers: identityHeaders() }),
+    async (_url, init = {}) => new Response(validSse, { headers: identityHeaders({}, init) }),
     successSettlement,
   )(successConfig.chatUrl, { method: "POST", body: requestBody });
   assert.equal(await successResponse.text(), validSse);
@@ -645,15 +861,16 @@ try {
   const conflictingIdRecords = [];
   const conflictingIdConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "conflicting-id.json"), VINCI_QWEN_CIRCUIT_THRESHOLD: "1" });
   conflictingIdConfig.endpointAddresses = ["93.184.216.34"];
-  const conflictingIdResponse = await runtime.createQwenInferenceFetch(
+  const conflictingIdResponse = await inferenceFetch(
     conflictingIdConfig,
     "request-conflicting-id",
     (record) => conflictingIdRecords.push(record),
-    async () => new Response(conflictingIdSse, { headers: identityHeaders() }),
+    async (_url, init = {}) => new Response(conflictingIdSse, { headers: identityHeaders({}, init) }),
   )(conflictingIdConfig.chatUrl, { method: "POST", body: requestBody });
   await assert.rejects(conflictingIdResponse.text(), /response id/);
   assert.equal(conflictingIdRecords[0].outcome, "response_identity_mismatch");
   assert.throws(() => runtime.assertQwenCircuitClosed(conflictingIdConfig), /qwen_circuit_open/);
+  reconcileActive(conflictingIdConfig);
 
   const invalidUsage = { ...usage, total_tokens: 99 };
   const invalidUsageSse = [
@@ -663,27 +880,29 @@ try {
   ].join("\n\n");
   const invalidUsageConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "invalid-usage.json") });
   invalidUsageConfig.endpointAddresses = ["93.184.216.34"];
-  const invalidUsageResponse = await runtime.createQwenInferenceFetch(
+  const invalidUsageResponse = await inferenceFetch(
     invalidUsageConfig,
     "request-invalid-usage",
     () => {},
-    async () => new Response(invalidUsageSse, { headers: identityHeaders() }),
+    async (_url, init = {}) => new Response(invalidUsageSse, { headers: identityHeaders({}, init) }),
   )(invalidUsageConfig.chatUrl, { method: "POST", body: requestBody });
   await assert.rejects(invalidUsageResponse.text(), /usage_invalid/);
+  reconcileActive(invalidUsageConfig);
 
   const oversizedSuccessConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "oversized-success.json") });
   oversizedSuccessConfig.endpointAddresses = ["93.184.216.34"];
-  const oversizedSuccessResponse = await runtime.createQwenInferenceFetch(
+  const oversizedSuccessResponse = await inferenceFetch(
     oversizedSuccessConfig,
     "request-oversized-success",
     () => {},
-    async () => new Response(`data: ${"x".repeat(5_000)}\n`, { headers: identityHeaders() }),
+    async (_url, init = {}) => new Response(`data: ${"x".repeat(5_000)}\n`, { headers: identityHeaders({}, init) }),
   )(oversizedSuccessConfig.chatUrl, { method: "POST", body: requestBody });
   await assert.rejects(oversizedSuccessResponse.text(), /response_oversized/);
+  reconcileActive(oversizedSuccessConfig);
 
   const timeoutConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "timeout.json") });
   timeoutConfig.endpointAddresses = ["93.184.216.34"];
-  const timeoutResponse = await runtime.createQwenInferenceFetch(
+  const timeoutResponse = await inferenceFetch(
     timeoutConfig,
     "request-timeout",
     () => {},
@@ -691,9 +910,11 @@ try {
       start(controller) {
         init.signal.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")), { once: true });
       },
-    }), { headers: identityHeaders() }),
+    }), { headers: identityHeaders({}, init) }),
   )(timeoutConfig.chatUrl, { method: "POST", body: requestBody });
   await assert.rejects(timeoutResponse.text(), /AbortError|aborted/);
+  const timedOutLedger = reconcileActive(timeoutConfig);
+  assert.equal(timedOutLedger.state, "RESPONSE_OBSERVED");
 
   const context = { systemPrompt, messages: [{ role: "user", content: workOrderPrompt, timestamp: Date.now() }], tools };
   const parserValidSse = [
@@ -704,27 +925,43 @@ try {
     "",
   ].join("\n\n");
   let parserTransportCalls = 0;
-  const parserTransport = async () => {
+  const parserTransport = async (_url, init = {}) => {
     parserTransportCalls += 1;
-    return new Response(parserValidSse, { headers: identityHeaders() });
+    return new Response(parserValidSse, { headers: identityHeaders({}, init) });
   };
   const permitConfig = freshenPermit(loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "permit.json") }));
   permitConfig.endpointAddresses = ["93.184.216.34"];
-  assert.throws(
-    () => runtime.acquireQwenFleetPermit({ ...permitConfig, fleetPermit: { ...permitConfig.fleetPermit, expiresAt: new Date(Date.now() - 1).toISOString() } }),
+  await assert.rejects(
+    inferenceFetch(
+      { ...permitConfig, fleetPermit: { ...permitConfig.fleetPermit, expiresAt: new Date(Date.now() - 1).toISOString() } },
+      "expired-permit",
+      () => {},
+      parserTransport,
+    )(permitConfig.chatUrl, { method: "POST", body: requestBody }),
     /fleet_permit_expired/,
   );
-  await exerciseCrossProcessFleetPermit(permitConfig);
   const semanticRecords = [];
-  const provider = qwenProviderConfig(permitConfig, sourceStreamSimpleOpenAICompletions, (record) => semanticRecords.push(record), parserTransport);
+  let unblockFirstTransport;
+  let firstTransportEntered;
+  let gatedTransportCalls = 0;
+  const firstTransportReady = new Promise((resolveReady) => { firstTransportEntered = resolveReady; });
+  const gatedTransport = async (_url, init = {}) => {
+    gatedTransportCalls += 1;
+    if (gatedTransportCalls === 1) {
+      firstTransportEntered();
+      await new Promise((resolveTransport) => { unblockFirstTransport = resolveTransport; });
+    }
+    return new Response(parserValidSse, { headers: identityHeaders({}, init) });
+  };
+  const provider = qwenProviderConfig(permitConfig, sourceStreamSimpleOpenAICompletions, (record) => semanticRecords.push(record), gatedTransport);
   const model = { ...provider.models[0], provider: runtime.QWEN_PROVIDER, api: runtime.QWEN_API, baseUrl: provider.baseUrl };
   const firstPermitStream = provider.streamSimple(model, context);
+  await firstTransportReady;
   const competingProvider = qwenProviderConfig(permitConfig, sourceStreamSimpleOpenAICompletions, () => {}, parserTransport);
-  assert.throws(
-    () => competingProvider.streamSimple(model, context),
-    /concurrency_exceeded/,
-    "two provider instances sharing an external permit must not run concurrently",
-  );
+  const competing = await competingProvider.streamSimple(model, context).result();
+  assert.equal(competing.stopReason, "error");
+  assert.equal(parserTransportCalls, 0, "endpoint-global occupancy must block before a competing dispatch reaches transport");
+  unblockFirstTransport();
   let secondPermitStream;
   let firstPermitError;
   for await (const event of firstPermitStream) {
@@ -753,7 +990,7 @@ try {
     truncatedConfig,
     sourceStreamSimpleOpenAICompletions,
     (record) => truncatedRecords.push(record),
-    async () => new Response(missingFinishSse, { headers: identityHeaders() }),
+    async (_url, init = {}) => new Response(missingFinishSse, { headers: identityHeaders({}, init) }),
   );
   const truncated = await truncatedProvider.streamSimple({ ...truncatedProvider.models[0], provider: runtime.QWEN_PROVIDER, api: runtime.QWEN_API, baseUrl: truncatedProvider.baseUrl }, context).result();
   assert.equal(truncated.stopReason, "error");
@@ -775,7 +1012,7 @@ try {
     toolConfig,
     sourceStreamSimpleOpenAICompletions,
     (record) => toolRecords.push(record),
-    async () => new Response(unknownToolSse, { headers: identityHeaders() }),
+    async (_url, init = {}) => new Response(unknownToolSse, { headers: identityHeaders({}, init) }),
   );
   const badTool = await toolProvider.streamSimple({ ...toolProvider.models[0], provider: runtime.QWEN_PROVIDER, api: runtime.QWEN_API, baseUrl: toolProvider.baseUrl }, context).result();
   assert.equal(badTool.stopReason, "error");
@@ -797,7 +1034,7 @@ try {
     argumentConfig,
     sourceStreamSimpleOpenAICompletions,
     (record) => argumentRecords.push(record),
-    async () => new Response(invalidArgumentsSse, { headers: identityHeaders() }),
+    async (_url, init = {}) => new Response(invalidArgumentsSse, { headers: identityHeaders({}, init) }),
   );
   const badArguments = await argumentProvider.streamSimple(
     { ...argumentProvider.models[0], provider: runtime.QWEN_PROVIDER, api: runtime.QWEN_API, baseUrl: argumentProvider.baseUrl },

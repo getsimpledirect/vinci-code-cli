@@ -32,6 +32,26 @@ const receiptEntry = {
   data: { schemaVersion: 1, taskId: SESSION_ID, state: "DONE", changedFiles: ["a.ts"], verificationStatus: "passed", verificationCommand: "npm test", usage: { modelCalls: 3, estimatedCostUsd: 0.03 } },
 };
 const crewEntry = { type: "custom", customType: "vinci-crew-helper", data: { agentId: "helper-1", task: "x" } };
+const qwenAttemptEntry = {
+  type: "custom",
+  customType: "vinci-qwen-transport-attempt",
+  data: {
+    outcome: "success",
+    response_id: "qwen-response-1",
+    invocation_id: "invocation-1",
+    reservation_id: "reservation-1",
+    work_order_id: "wo-1",
+    run_id: "run-1",
+    attempt_id: "task-1/1",
+    lease_id: "lease-1",
+    fencing_generation: 7,
+    session_id: "run-1",
+    worker_principal: "worker:test",
+    worker_build_sha256: "31".repeat(32),
+    contract_digest: "32".repeat(32),
+    execution_spec_digest: "33".repeat(32),
+  },
+};
 
 function withSession(entries, fn) {
   const dir = mkdtempSync(join(tmpdir(), "econ-session-"));
@@ -75,6 +95,35 @@ test("session-read: usage entries are mapped and a duplicated responseKey is one
       assert.equal(b.input_tokens, 7);
       assert.equal(a.cost_microusd, 10000);
       assert.equal(summary.cost_reconstruction, "outcome");
+    },
+  );
+});
+
+test("Qwen transport authority joins its invocation tuple into economics by response id", () => {
+  withSession(
+    [
+      qwenAttemptEntry,
+      usageEntry({ id: "qwen-call", responseKey: "qwen-h200\0qwen-response-1", provider: "qwen-h200", model: "Qwen/Qwen3.8-27B", input: 10, output: 2, cost: 0.000004 }),
+      receiptEntry,
+    ],
+    (state) => {
+      assert.equal(state.usageEntries[0].invocation_id, "invocation-1");
+      assert.equal(state.usageEntries[0].reservation_id, "reservation-1");
+      const summary = buildEconomicsSummary(base(state));
+      assert.deepEqual(summary.usage[0].invocations, [{
+        invocation_id: "invocation-1",
+        reservation_id: "reservation-1",
+        work_order_id: "wo-1",
+        run_id: "run-1",
+        attempt_id: "task-1/1",
+        lease_id: "lease-1",
+        session_id: "run-1",
+        worker_principal: "worker:test",
+        worker_build_sha256: "31".repeat(32),
+        contract_digest: "32".repeat(32),
+        execution_spec_digest: "33".repeat(32),
+        fencing_generation: 7,
+      }]);
     },
   );
 });

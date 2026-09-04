@@ -84,6 +84,8 @@ function rollupUsage(entries, flags) {
         // skipped (calls, tokens and cost), otherwise cost double-counts while calls do not.
         cost_basis: null,
         cost_confidence: null,
+        invocations: [],
+        invocationIds: new Set(),
       };
       rollup.set(key, group);
     }
@@ -91,6 +93,27 @@ function rollupUsage(entries, flags) {
     if (typeof entry.responseId === "string" && entry.responseId) {
       if (seenResponseIds.has(entry.responseId)) continue;
       seenResponseIds.add(entry.responseId);
+    }
+    const invocationId = str(entry.invocation_id);
+    if (entry.invocation_id != null && invocationId === null) flags.malformed = true;
+    if (invocationId && !group.invocationIds.has(invocationId)) {
+      const stringFields = [
+        "reservation_id", "work_order_id", "run_id", "attempt_id", "lease_id", "session_id", "worker_principal",
+        "worker_build_sha256", "contract_digest", "execution_spec_digest",
+      ];
+      const invocation = { invocation_id: invocationId };
+      for (const field of stringFields) {
+        const value = str(entry[field]);
+        if (entry[field] != null && value === null) flags.malformed = true;
+        if (value !== null) invocation[field] = value;
+      }
+      if (Number.isSafeInteger(entry.fencing_generation) && entry.fencing_generation >= 1) {
+        invocation.fencing_generation = entry.fencing_generation;
+      } else if (entry.fencing_generation != null) {
+        flags.malformed = true;
+      }
+      group.invocationIds.add(invocationId);
+      group.invocations.push(invocation);
     }
     if (typeof entry.model_calls === "number" && entry.model_calls > 0) group.model_calls += entry.model_calls;
     if (typeof entry.input_tokens === "number") group.input_tokens += entry.input_tokens;
@@ -106,7 +129,7 @@ function rollupUsage(entries, flags) {
 
   const result = [];
   for (const group of rollup.values()) {
-    result.push({
+    const row = {
       phase: group.phase,
       cost_category: group.cost_category,
       provider: group.provider,
@@ -121,7 +144,9 @@ function rollupUsage(entries, flags) {
       cost_microusd: group.cost_microusd,
       cost_basis: group.cost_basis ?? "estimated",
       cost_confidence: group.cost_confidence ?? "estimated",
-    });
+    };
+    if (group.invocations.length > 0) row.invocations = group.invocations;
+    result.push(row);
   }
   return result;
 }

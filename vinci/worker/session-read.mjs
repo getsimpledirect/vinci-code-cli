@@ -153,10 +153,29 @@ function usageEntryToRecord(entry) {
 // economics summary can roll up real usage instead of an empty array.
 function usageEntries(entries) {
   const result = [];
+  const qwenAttempts = new Map();
+  for (const entry of entries) {
+    if (entry?.type !== "custom" || entry.customType !== "vinci-qwen-transport-attempt") continue;
+    const data = entry.data;
+    if (!data || typeof data !== "object" || data.outcome !== "success" || typeof data.response_id !== "string" || !data.response_id) continue;
+    qwenAttempts.set(data.response_id, data);
+  }
   for (const entry of entries) {
     if (entry?.type !== "custom" || entry.customType !== "vinci-task-usage") continue;
     const record = usageEntryToRecord(entry);
-    if (record) result.push(record);
+    if (!record) continue;
+    const responseKey = record.responseId;
+    const responseId = typeof responseKey === "string" ? responseKey.slice(responseKey.lastIndexOf("\0") + 1) : null;
+    const attempt = responseId ? qwenAttempts.get(responseId) : null;
+    if (attempt) {
+      for (const key of [
+        "invocation_id", "reservation_id", "work_order_id", "run_id", "attempt_id", "lease_id", "fencing_generation",
+        "session_id", "worker_principal", "worker_build_sha256", "contract_digest", "execution_spec_digest",
+      ]) {
+        if (attempt[key] !== undefined) record[key] = attempt[key];
+      }
+    }
+    result.push(record);
   }
   return result;
 }
