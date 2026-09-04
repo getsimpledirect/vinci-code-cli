@@ -260,6 +260,82 @@ test("receipt verification rejects Proxy values before traps and always fails cl
   assert.equal(verifyReceipt(nestedReceipt, hiddenOptions), false);
 });
 
+test("Proxy prototype chains reject before brand or structural traps", () => {
+  const validReceipt = authenticateReceipt({
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+    payload: { decision: "safe" },
+  });
+
+  for (const realm of ["direct", "cross-realm"]) {
+    let trapCalls = 0;
+    const coordinatedValues = [];
+    const handler = {
+      getPrototypeOf(target) {
+        trapCalls += 1;
+        for (const value of coordinatedValues) {
+          Object.defineProperty(value, "trap_was_invoked", { configurable: true, value: true });
+        }
+        return Reflect.getPrototypeOf(target);
+      },
+    };
+    const makeProxy = (target) => realm === "direct"
+      ? new Proxy(target, handler)
+      : runInNewContext("new Proxy(target, handler)", { target, handler });
+
+    const receipt = structuredClone(validReceipt);
+    Object.setPrototypeOf(receipt, makeProxy(Object.prototype));
+    const canonical = Object.create(makeProxy(Object.prototype));
+    Object.defineProperty(canonical, "decision", { enumerable: true, value: "safe" });
+    const key = Buffer.alloc(32, 0x43);
+    Object.setPrototypeOf(key, makeProxy(Buffer.prototype));
+    coordinatedValues.push(receipt, canonical, key);
+
+    assert.equal(verifyReceipt(receipt, {
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key: KEY,
+    }), false);
+    assert.throws(() => canonicalBytes(canonical), /Proxy values are not canonical/);
+    assert.equal(verifyReceipt(validReceipt, {
+      kind: "terminal",
+      keyId: "root-key:v3",
+      key,
+    }), false);
+    assert.equal(trapCalls, 0, `${realm} Proxy prototypes must reject without traps`);
+    for (const value of coordinatedValues) {
+      assert.equal(Object.hasOwn(value, "trap_was_invoked"), false);
+    }
+  }
+
+  const revocable = Proxy.revocable(Object.prototype, {});
+  const revokedReceipt = structuredClone(validReceipt);
+  Object.setPrototypeOf(revokedReceipt, revocable.proxy);
+  const revokedCanonical = Object.create(revocable.proxy);
+  Object.defineProperty(revokedCanonical, "decision", { enumerable: true, value: "safe" });
+  const revokedKey = Buffer.alloc(32, 0x43);
+  Object.setPrototypeOf(revokedKey, revocable.proxy);
+  revocable.revoke();
+
+  assert.doesNotThrow(() => verifyReceipt(revokedReceipt, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+  }));
+  assert.equal(verifyReceipt(revokedReceipt, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+  }), false);
+  assert.throws(() => canonicalBytes(revokedCanonical), /Proxy values are not canonical/);
+  assert.equal(verifyReceipt(validReceipt, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: revokedKey,
+  }), false);
+});
+
 test("authentication keys use intrinsic byte length without invoking shadows", () => {
   for (const actualByteLength of [0, 1, 31]) {
     for (const shadowKind of ["data", "accessor"]) {

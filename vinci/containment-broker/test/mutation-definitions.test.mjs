@@ -48,9 +48,31 @@ async function assertMutationKilled(name, mutate, securityProperty) {
 }
 
 test("canonical security mutations are each killed by a behavioral discriminator", async () => {
+  await assertMutationKilled("proxy-prototype-chain", (source) => replaceExactly(
+    source,
+    "if (isProxy(current)) return true;",
+    "if (current === value && isProxy(current)) return true;",
+  ), (mutant) => {
+    let trapCalls = 0;
+    const prototype = new Proxy(Object.prototype, {
+      getPrototypeOf(target) {
+        trapCalls += 1;
+        return Reflect.getPrototypeOf(target);
+      },
+    });
+    const payload = Object.create(prototype);
+    Object.defineProperty(payload, "decision", { enumerable: true, value: "safe" });
+    try {
+      mutant.canonicalBytes(payload);
+    } catch {
+      // Rejection alone is insufficient: no Proxy trap may run before it.
+    }
+    return trapCalls === 0;
+  });
+
   await assertMutationKilled("proxy-guard", (source) => replaceExactly(
     source,
-    'if (isProxy(value)) throw new TypeError("Proxy values are not canonical");',
+    'if (hasProxyInPrototypeChain(value)) throw new TypeError("Proxy values are not canonical");',
     'if (false) throw new TypeError("Proxy values are not canonical");',
   ), (mutant) => {
     const payload = new Proxy({ $bytes_base64: "3q2+7w==" }, {
@@ -69,7 +91,7 @@ test("canonical security mutations are each killed by a behavioral discriminator
 
   await assertMutationKilled("verification-receipt-proxy-entry", (source) => replaceExactly(
     source,
-    "if (isProxy(receipt)) return false;",
+    "if (hasProxyInPrototypeChain(receipt)) return false;",
     "if (false) return false;",
   ), (mutant) => {
     const receipt = mutant.authenticateReceipt({
@@ -126,7 +148,7 @@ test("canonical security mutations are each killed by a behavioral discriminator
     source,
     `export function verifyReceipt(receipt, options) {
   try {
-    if (isProxy(receipt)) return false;
+    if (hasProxyInPrototypeChain(receipt)) return false;
     options = snapshotVerifyOptions(options);
     return verifyReceiptUnchecked(receipt, options);
   } catch {
@@ -134,7 +156,7 @@ test("canonical security mutations are each killed by a behavioral discriminator
   }
 }`,
     `export function verifyReceipt(receipt, options) {
-  if (isProxy(receipt)) return false;
+  if (hasProxyInPrototypeChain(receipt)) return false;
   options = snapshotVerifyOptions(options);
   return verifyReceiptUnchecked(receipt, options);
 }`,

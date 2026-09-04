@@ -4,11 +4,22 @@ import { types as utilTypes } from "node:util";
 export const RECEIPT_SCHEMA = "vinci.containment-broker.receipt/v3";
 
 const { isProxy } = utilTypes;
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
 const RESERVED_BYTES_FIELD = "$bytes_base64";
 const VERIFY_OPTION_KEYS = ["key", "keyId", "kind"];
 const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
 const TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "byteLength").get;
 const TYPED_ARRAY_SET = Uint8Array.prototype.set;
+
+function hasProxyInPrototypeChain(value) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  let current = value;
+  while (current !== null) {
+    if (isProxy(current)) return true;
+    current = OBJECT_GET_PROTOTYPE_OF(current);
+  }
+  return false;
+}
 
 function plainObjectEntries(value) {
   const prototype = Object.getPrototypeOf(value);
@@ -61,7 +72,7 @@ function denseArrayValues(value) {
 }
 
 function normalize(value, seen) {
-  if (isProxy(value)) throw new TypeError("Proxy values are not canonical");
+  if (hasProxyInPrototypeChain(value)) throw new TypeError("Proxy values are not canonical");
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new TypeError("canonical values require finite numbers");
@@ -100,12 +111,13 @@ export function canonicalBytes(value) {
 }
 
 export function sha256(value) {
+  if (hasProxyInPrototypeChain(value)) throw new TypeError("Proxy values are not hashable");
   const bytes = Buffer.isBuffer(value) ? value : canonicalBytes(value);
   return createHash("sha256").update(bytes).digest("hex");
 }
 
 function snapshotKey(key) {
-  if (isProxy(key) || !Buffer.isBuffer(key)) {
+  if (hasProxyInPrototypeChain(key) || !Buffer.isBuffer(key)) {
     throw new TypeError("receipt authentication key must be at least 32 bytes");
   }
   const byteLength = TYPED_ARRAY_BYTE_LENGTH.call(key);
@@ -116,7 +128,7 @@ function snapshotKey(key) {
 }
 
 function snapshotVerifyOptions(options) {
-  if (isProxy(options)) throw new TypeError("Proxy verification options are not supported");
+  if (hasProxyInPrototypeChain(options)) throw new TypeError("Proxy verification options are not supported");
   if (options === null || typeof options !== "object") {
     throw new TypeError("verification options must be a plain object");
   }
@@ -137,7 +149,7 @@ function snapshotVerifyOptions(options) {
     }
     snapshot[key] = descriptor.value;
   }
-  if (isProxy(snapshot.key)) throw new TypeError("Proxy verification keys are not supported");
+  if (hasProxyInPrototypeChain(snapshot.key)) throw new TypeError("Proxy verification keys are not supported");
   return Object.freeze(snapshot);
 }
 
@@ -150,7 +162,9 @@ function deepFreeze(value) {
 }
 
 export function decodeCanonicalBytes(bytes) {
-  if (!Buffer.isBuffer(bytes)) throw new TypeError("canonical input must be a Buffer");
+  if (hasProxyInPrototypeChain(bytes) || !Buffer.isBuffer(bytes)) {
+    throw new TypeError("canonical input must be a Buffer");
+  }
   let value;
   try {
     value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
@@ -235,7 +249,7 @@ function verifyReceiptUnchecked(receipt, { kind, keyId, key }) {
 
 export function verifyReceipt(receipt, options) {
   try {
-    if (isProxy(receipt)) return false;
+    if (hasProxyInPrototypeChain(receipt)) return false;
     options = snapshotVerifyOptions(options);
     return verifyReceiptUnchecked(receipt, options);
   } catch {

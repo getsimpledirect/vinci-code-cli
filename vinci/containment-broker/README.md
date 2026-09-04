@@ -100,12 +100,13 @@ sparse/extended arrays, accessor or hidden object fields, symbols, and non-plain
 structure that JSON serialization could erase. Negative zero and repeated object references are also
 refused rather than collapsing to zero or duplicated subtrees. Unsafe integral numbers are rejected
 at both canonicalization and decoding boundaries so arbitrary-precision producers cannot collapse two
-mathematical integers into one JavaScript value. Proxies are rejected recursively through Node's native
-Proxy detector before any trap-visible structural operation. Receipt Proxies are rejected at the verifier
-entry point before even the Buffer brand check; object-form verification then creates a detached, immutable
+mathematical integers into one JavaScript value. Proxies and values with a Proxy anywhere in their prototype
+chain are rejected recursively through Node's native Proxy detector before any trap-visible structural or
+brand operation. Receipt Proxy chains are rejected at the verifier entry point before even the Buffer brand
+check; object-form verification then creates a detached, immutable
 canonical snapshot and handles every inspection failure as `false`, never an escaped exception. Verifier
 options must be an exact plain object whose `kind`, `keyId`, and `key` members are
-enumerable data fields; option accessors, option/key Proxies, inherited fields, hidden fields, and extras
+enumerable data fields; option accessors, option/key Proxy chains, inherited fields, hidden fields, and extras
 are rejected without invoking user code. Authentication keys are copied into a detached Buffer and must
 have an intrinsic TypedArray byte length of at least 32, so a shadowed `length` property is never trusted
 or invoked. Persisted receipts can be passed to `verifyReceipt` as
