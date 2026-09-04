@@ -36,6 +36,24 @@ function historicalReceipt(payload) {
   };
 }
 
+function receiptAuthenticatedWithRawKey(key) {
+  const body = {
+    schema: "vinci.containment-broker.receipt/v3",
+    kind: "terminal",
+    key_id: "root-key:v3",
+    payload: { decision: "short-key-probe" },
+  };
+  const bodyBytes = canonicalBytes(body);
+  return {
+    ...body,
+    body_sha256: createHash("sha256").update(bodyBytes).digest("hex"),
+    authentication: {
+      algorithm: "hmac-sha256",
+      mac: createHmac("sha256", key).update(bodyBytes).digest("hex"),
+    },
+  };
+}
+
 test("canonical values reject the historical Buffer/plain-object receipt collision", () => {
   const bytes = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
   assert.throws(
@@ -200,6 +218,59 @@ test("receipt verification rejects Proxy values before traps and always fails cl
   const hiddenOptions = { kind: "terminal", keyId: "root-key:v3" };
   Object.defineProperty(hiddenOptions, "key", { enumerable: false, value: KEY });
   assert.equal(verifyReceipt(nestedReceipt, hiddenOptions), false);
+});
+
+test("authentication keys use intrinsic byte length without invoking shadows", () => {
+  for (const actualByteLength of [0, 1, 31]) {
+    for (const shadowKind of ["data", "accessor"]) {
+      let getterCalls = 0;
+      const key = Buffer.alloc(actualByteLength, 0x43);
+      const descriptor = shadowKind === "data"
+        ? { value: 32 }
+        : {
+            get() {
+              getterCalls += 1;
+              return 32;
+            },
+          };
+      Object.defineProperty(key, "length", { configurable: true, ...descriptor });
+      const forgedReceipt = receiptAuthenticatedWithRawKey(key);
+      assert.throws(() => authenticateReceipt({
+        kind: "terminal",
+        keyId: "root-key:v3",
+        key,
+        payload: { decision: "must-refuse-short-key" },
+      }), /at least 32 bytes/, `${shadowKind} shadow with ${actualByteLength} bytes must reject authentication`);
+      assert.equal(verifyReceipt(forgedReceipt, {
+        kind: "terminal",
+        keyId: "root-key:v3",
+        key,
+      }), false, `${shadowKind} shadow with ${actualByteLength} bytes must reject verification`);
+      assert.equal(getterCalls, 0, "key length accessors must not be invoked");
+    }
+  }
+
+  let validGetterCalls = 0;
+  const validKey = Buffer.alloc(32, 0x43);
+  Object.defineProperty(validKey, "length", {
+    configurable: true,
+    get() {
+      validGetterCalls += 1;
+      throw new Error("shadowed length must not be read");
+    },
+  });
+  const receipt = authenticateReceipt({
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: validKey,
+    payload: { decision: "intrinsic-key-length" },
+  });
+  assert.equal(verifyReceipt(receipt, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: validKey,
+  }), true);
+  assert.equal(validGetterCalls, 0);
 });
 
 test("canonical snapshots resist descriptor, prototype, and post-validation mutation", () => {

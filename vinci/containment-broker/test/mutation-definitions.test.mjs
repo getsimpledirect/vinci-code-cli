@@ -143,6 +143,30 @@ test("canonical security mutations are each killed by a behavioral discriminator
     return mutant.verifyReceipt(receipt, options) === false && getterCalls === 0;
   });
 
+  await assertMutationKilled("intrinsic-key-length", (source) => replaceExactly(
+    source,
+    'if (byteLength < 32) throw new TypeError("receipt authentication key must be at least 32 bytes");',
+    'if (false) throw new TypeError("receipt authentication key must be at least 32 bytes");',
+  ), (mutant) => {
+    const key = Buffer.alloc(0);
+    Object.defineProperty(key, "length", { configurable: true, value: 32 });
+    try {
+      const receipt = mutant.authenticateReceipt({
+        kind: "terminal",
+        keyId: "root-key:v3",
+        key,
+        payload: { decision: "must-refuse-empty-key" },
+      });
+      return mutant.verifyReceipt(receipt, {
+        kind: "terminal",
+        keyId: "root-key:v3",
+        key,
+      }) === false;
+    } catch {
+      return true;
+    }
+  });
+
   await assertMutationKilled("reserved-field", (source) => replaceExactly(
     source,
     "if (RESERVED_BYTES_FIELD in value) {",

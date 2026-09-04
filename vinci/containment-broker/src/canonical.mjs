@@ -6,6 +6,9 @@ export const RECEIPT_SCHEMA = "vinci.containment-broker.receipt/v3";
 const { isProxy } = utilTypes;
 const RESERVED_BYTES_FIELD = "$bytes_base64";
 const VERIFY_OPTION_KEYS = ["key", "keyId", "kind"];
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, "byteLength").get;
+const TYPED_ARRAY_SET = Uint8Array.prototype.set;
 
 function plainObjectEntries(value) {
   const prototype = Object.getPrototypeOf(value);
@@ -101,10 +104,15 @@ export function sha256(value) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function requireKey(key) {
-  if (isProxy(key) || !Buffer.isBuffer(key) || key.length < 32) {
+function snapshotKey(key) {
+  if (isProxy(key) || !Buffer.isBuffer(key)) {
     throw new TypeError("receipt authentication key must be at least 32 bytes");
   }
+  const byteLength = TYPED_ARRAY_BYTE_LENGTH.call(key);
+  if (byteLength < 32) throw new TypeError("receipt authentication key must be at least 32 bytes");
+  const snapshot = Buffer.allocUnsafe(byteLength);
+  TYPED_ARRAY_SET.call(snapshot, key);
+  return snapshot;
 }
 
 function snapshotVerifyOptions(options) {
@@ -172,7 +180,7 @@ function hasExactPlainFields(value, expectedKeys) {
 export function authenticateReceipt({ kind, keyId, key, payload }) {
   if (!/^[a-z][a-z0-9_.-]{2,63}$/.test(kind)) throw new TypeError("invalid receipt kind");
   if (!/^[A-Za-z0-9_.:-]{3,128}$/.test(keyId)) throw new TypeError("invalid receipt key id");
-  requireKey(key);
+  key = snapshotKey(key);
   const body = {
     schema: RECEIPT_SCHEMA,
     kind,
@@ -191,7 +199,7 @@ export function authenticateReceipt({ kind, keyId, key, payload }) {
 }
 
 function verifyReceiptUnchecked(receipt, { kind, keyId, key }) {
-  requireKey(key);
+  key = snapshotKey(key);
   if (Buffer.isBuffer(receipt)) {
     receipt = decodeCanonicalBytes(receipt);
   } else {
