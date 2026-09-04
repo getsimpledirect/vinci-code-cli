@@ -110,6 +110,9 @@ export const PROVIDER_KEY_ENV = Object.freeze({
     "VINCI_QWEN_SECRET_REF",
     "VINCI_QWEN_QUALIFICATION_FILE",
     "VINCI_QWEN_QUALIFICATION_SHA256",
+    "VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_FILE",
+    "VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_SHA256",
+    "VINCI_QWEN_QUALIFICATION_ISSUER",
     "VINCI_QWEN_CIRCUIT_THRESHOLD",
     "VINCI_QWEN_CIRCUIT_OPEN_MS",
   ],
@@ -126,6 +129,9 @@ export const PROVIDER_CREDENTIAL_ENV = Object.freeze([
   "VINCI_QWEN_SECRET_REF",
   "VINCI_QWEN_QUALIFICATION_FILE",
   "VINCI_QWEN_QUALIFICATION_SHA256",
+  "VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_FILE",
+  "VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_SHA256",
+  "VINCI_QWEN_QUALIFICATION_ISSUER",
   "VINCI_QWEN_CIRCUIT_THRESHOLD",
   "VINCI_QWEN_CIRCUIT_OPEN_MS",
   "AI_GATEWAY_API_KEY",
@@ -176,15 +182,6 @@ export const PROVIDER_CREDENTIAL_ENV = Object.freeze([
   "ZAI_CODING_CN_API_KEY",
 ]);
 
-const QWEN_ENV_SECRET_REFERENCE = /^env:([A-Z][A-Z0-9_]{0,127})$/;
-
-function qwenSecretEnvName(base) {
-  const match = typeof base.VINCI_QWEN_SECRET_REF === "string"
-    ? base.VINCI_QWEN_SECRET_REF.match(QWEN_ENV_SECRET_REFERENCE)
-    : null;
-  return match?.[1];
-}
-
 // The provider boundary for the NORMAL (non-clean-room) path.
 //
 // PROVIDER_KEY_ENV above promises a child gets ONLY the key its envelope's provider
@@ -212,8 +209,6 @@ export function providerScopedEnv({ base = process.env, provider, agentDir }) {
   const keep = new Set(Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : []);
   const env = { ...base };
   for (const key of PROVIDER_CREDENTIAL_ENV) if (!keep.has(key)) delete env[key];
-  const referencedQwenSecret = qwenSecretEnvName(base);
-  if (provider !== "qwen-h200" && referencedQwenSecret) delete env[referencedQwenSecret];
   // Do not let normal mode's provider selection be bypassed by the daemon's shared auth.json.
   // This is a resolution boundary, not uid isolation: a same-uid child can still deliberately
   // read the daemon's files. Both launchers resolve stored credentials from this isolated slot.
@@ -247,10 +242,6 @@ export function cleanRoomEnv({ base = process.env, provider, homeDir, tmpDir }) 
   // Same prototype-chain hazard as providerScopedEnv below.
   const providerKeys = Object.hasOwn(PROVIDER_KEY_ENV, provider) ? PROVIDER_KEY_ENV[provider] : [];
   for (const key of providerKeys) if (base[key] !== undefined) env[key] = base[key];
-  const referencedQwenSecret = qwenSecretEnvName(base);
-  if (provider === "qwen-h200" && referencedQwenSecret && base[referencedQwenSecret] !== undefined) {
-    env[referencedQwenSecret] = base[referencedQwenSecret];
-  }
   const vinciHome = base.VINCI_HOME ?? (base.HOME ? join(base.HOME, ".vinci-code") : undefined);
   if (vinciHome !== undefined) env.VINCI_HOME = vinciHome;
   env.HOME = homeDir;

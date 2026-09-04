@@ -2,7 +2,9 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -15,6 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { resolveBin } from "./build.mjs";
 import { command } from "./exec.mjs";
@@ -25,9 +28,42 @@ import { readSessionState } from "./session-read.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const WORKER_DIR = dirname(fileURLToPath(import.meta.url));
+const MAX_QWEN_PROMPT_BYTES = 1024 * 1024;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function openQwenSecretReference(reference) {
+  if (typeof reference !== "string" || !reference.startsWith("file:")) {
+    throw blocked("qwen_credential_invalid", "qwen_credential_invalid: qwen-h200 requires a file:/absolute/private/path secret reference");
+  }
+  const path = reference.slice(5);
+  if (!isAbsolute(path)) throw blocked("qwen_credential_invalid", "qwen_credential_invalid: Qwen secret path must be absolute");
+  let before;
+  let descriptor;
+  try {
+    before = lstatSync(path);
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const after = fstatSync(descriptor);
+    if (
+      !before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || (before.mode & 0o077) !== 0 ||
+      !after.isFile() || after.nlink !== 1 || (after.mode & 0o077) !== 0 || before.dev !== after.dev || before.ino !== after.ino
+    ) {
+      throw new Error("unsafe identity or permissions");
+    }
+    return descriptor;
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    throw blocked("qwen_credential_invalid", `qwen_credential_invalid: Qwen secret descriptor could not be opened safely (${error.message})`);
+  }
+}
+
+function qwenExtensionBuildSha256() {
+  const provider = readFileSync(join(WORKER_DIR, "..", "extensions", "vinci-qwen-provider.ts"));
+  const runtime = readFileSync(join(WORKER_DIR, "..", "extensions", "lib", "qwen-runtime.ts"));
+  return sha256(Buffer.concat([Buffer.from("vinci-qwen-provider.ts\0"), provider, Buffer.from("\0qwen-runtime.ts\0"), runtime]));
 }
 
 function canonicalBytes(value) {
@@ -1208,8 +1244,13 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
   const abortKillGraceMs = Number(process.env.VINCI_WORKER_LEASE_KILL_GRACE_MS) || 10_000;
   const tools = Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools.join(",") : "read,grep,find,ls,bash,edit,write";
+  const transmittedPrompt = envelope.provider === "qwen-h200" ? envelope.spec.trim() : envelope.spec;
+  if (envelope.provider === "qwen-h200" && (!transmittedPrompt || Buffer.byteLength(transmittedPrompt) > MAX_QWEN_PROMPT_BYTES)) {
+    throw blocked("qwen_prompt_invalid", `qwen_prompt_invalid: Qwen WorkOrder prompt must be 1-${MAX_QWEN_PROMPT_BYTES} UTF-8 bytes`);
+  }
   const taskEnvironment = applyEnvDelta(env ?? process.env, envDelta);
   taskEnvironment.VINCI_UPDATE_DISABLED = "1";
+  let qwenSecretReference;
   // The direct H200 lane is one exact, pre-qualified provider. These values are derived by the
   // worker, not accepted from the model or repository, and bind the provider extension to the
   // WorkOrder/Run/Attempt plus the exact prompt and tool surface for this invocation.
@@ -1237,9 +1278,21 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
     taskEnvironment.VINCI_QWEN_WORK_ORDER_ID = workOrderId;
     taskEnvironment.VINCI_QWEN_RUN_ID = sessionId;
     taskEnvironment.VINCI_QWEN_ATTEMPT_ID = `${taskId}/${attempt}`;
-    taskEnvironment.VINCI_QWEN_PROMPT_SHA256 = sha256(envelope.spec);
-    taskEnvironment.VINCI_QWEN_TOOLS_SHA256 = sha256(canonicalize(Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools : tools.split(",")));
+    const orderedTools = Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools : tools.split(",");
+    taskEnvironment.VINCI_QWEN_PROMPT_SHA256 = sha256(transmittedPrompt);
+    taskEnvironment.VINCI_QWEN_TOOLS_SHA256 = sha256(canonicalize(orderedTools));
+    taskEnvironment.VINCI_QWEN_TOOL_POLICY_SHA256 = sha256(canonicalize({
+      ordered_tools: orderedTools,
+      unattended_policy: "governed",
+      authority: "Governor",
+      safe_resume: false,
+    }));
+    taskEnvironment.VINCI_QWEN_CLIENT_BUILD_SHA256 = sha256(readFileSync(resolveBin("vinci")));
+    taskEnvironment.VINCI_QWEN_EXTENSION_BUILD_SHA256 = qwenExtensionBuildSha256();
     taskEnvironment.VINCI_QWEN_CIRCUIT_FILE = join(stateDir, "qwen-h200", "circuit.json");
+    qwenSecretReference = taskEnvironment.VINCI_QWEN_SECRET_REF;
+    delete taskEnvironment.VINCI_QWEN_SECRET_REF;
+    taskEnvironment.VINCI_QWEN_SECRET_FD = "3";
   } else {
     for (const name of [
       "VINCI_QWEN_SELECTED",
@@ -1248,7 +1301,11 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
       "VINCI_QWEN_ATTEMPT_ID",
       "VINCI_QWEN_PROMPT_SHA256",
       "VINCI_QWEN_TOOLS_SHA256",
+      "VINCI_QWEN_TOOL_POLICY_SHA256",
+      "VINCI_QWEN_CLIENT_BUILD_SHA256",
+      "VINCI_QWEN_EXTENSION_BUILD_SHA256",
       "VINCI_QWEN_CIRCUIT_FILE",
+      "VINCI_QWEN_SECRET_FD",
     ]) delete taskEnvironment[name];
   }
   for (const name of [
@@ -1263,9 +1320,13 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
   mkdirSync(sessionDir, { recursive: true });
 
   return new Promise((resolveRun) => {
-    const child = spawn(
-      resolveBin("vinci"),
-      [
+    let child;
+    let qwenSecretDescriptor;
+    try {
+      if (envelope.provider === "qwen-h200") qwenSecretDescriptor = openQwenSecretReference(qwenSecretReference);
+      child = spawn(
+        resolveBin("vinci"),
+        [
         "-p",
         "--session-id",
         sessionId,
@@ -1277,8 +1338,8 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
         envelope.model,
         "--tools",
         tools,
-        envelope.spec,
-      ],
+        ...(envelope.provider === "qwen-h200" ? [] : [envelope.spec]),
+        ],
       // Post-0.0.51 rule (#18): a task NEVER runs under a self-updating launcher. The daemon
       // probes `vinci --version` immediately before this spawn and records it as the task's
       // `vinci_binary`; with VINCI_UPDATE_DISABLED=1 the launcher cannot swap its payload between
@@ -1290,9 +1351,18 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
         // `env` (clean-room mode) may be an allowlisted subset; `envDelta` is the per-run policy
         // stamp. Debris-authority capabilities are daemon-only and are always removed above.
         env: taskEnvironment,
-        stdio: ["ignore", "inherit", "inherit"],
+        stdio: envelope.provider === "qwen-h200"
+          ? ["pipe", "inherit", "inherit", qwenSecretDescriptor]
+          : ["ignore", "inherit", "inherit"],
       },
-    );
+      );
+    } finally {
+      if (qwenSecretDescriptor !== undefined) closeSync(qwenSecretDescriptor);
+    }
+    if (envelope.provider === "qwen-h200") {
+      child.stdin.on("error", () => {});
+      child.stdin.end(transmittedPrompt);
+    }
     let limitTripped = null;
     let aborted = null;
     let killTimer;

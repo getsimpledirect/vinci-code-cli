@@ -436,6 +436,18 @@ case "${VINCI_PROVIDER}" in
     }
     export VINCI_DEEPINFRA_QUALIFICATION=1
     ;;
+  qwen-h200)
+    [ "${VINCI_QWEN_SELECTED:-0}" = "1" ] || {
+      echo "✗ qwen-h200 is a Worker-only qualified provider" >&2
+      exit 2
+    }
+    [ "${VINCI_MODEL}" = "Qwen/Qwen3.8-27B" ] || {
+      echo "✗ The Qwen H200 lane is pinned to Qwen/Qwen3.8-27B" >&2
+      exit 2
+    }
+    VINCI_QWEN_EXTENSION="${VINCI}/extensions/vinci-qwen-provider.ts"
+    set -- --extension "${VINCI_QWEN_EXTENSION}" "$@"
+    ;;
   *)
     # Offline process-level regressions inject a faux provider without reopening public CLI flags.
     [ "${VINCI_INTERNAL_PROVIDER_TEST:-0}" = "1" ] || {

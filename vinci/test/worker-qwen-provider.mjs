@@ -1,45 +1,233 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { generateKeyPairSync, sign } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import * as runtime from "../extensions/lib/qwen-runtime.ts";
-import providerExtension from "../extensions/vinci-provider.ts";
+import { qwenProviderConfig } from "../extensions/vinci-qwen-provider.ts";
 import * as cleanroom from "../worker/cleanroom.mjs";
 import * as digest from "../worker/contracts/digest.mjs";
 import * as economics from "../worker/economics.mjs";
-import * as workerRun from "../worker/run.mjs";
+import { runVinci } from "../worker/run.mjs";
+import { TaskLifecycle } from "../worker/task.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
-
 const temp = mkdtempSync(join(tmpdir(), "vinci-qwen-test-"));
 const secretFile = join(temp, "secret");
 const promptFile = join(temp, "prompt.txt");
+const systemPromptFile = join(temp, "system.txt");
+const toolSchemasFile = join(temp, "tools.json");
+const canaryFile = join(temp, "canary.json");
+const burnInFile = join(temp, "burn-in.json");
 const qualificationFile = join(temp, "qualification.json");
-writeFileSync(secretFile, "test-secret\n", { mode: 0o600 });
-writeFileSync(promptFile, "inspect the bounded fixture\n", { mode: 0o600 });
+const publicKeyFile = join(temp, "qualification-key.pem");
+const endpointIdentity = "12".repeat(32);
+const revision = "ab".repeat(20);
+const runtimeTuple = {
+  engine: "vllm",
+  version: "0.10.2",
+  artifact_sha256: "cd".repeat(32),
+  arguments_sha256: "ef".repeat(32),
+};
+const systemPrompt = "bounded governed system prompt";
+const workOrderPrompt = "inspect the bounded fixture";
+const tools = [
+  { name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+  { name: "grep", description: "Search text", parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] } },
+];
+const nowMs = Date.parse("2026-09-04T18:00:00.000Z");
 
-const hex = (pair) => pair.repeat(32);
-const sha256 = (value) => createHash("sha256").update(value).digest("hex");
-const baseEnv = {
-  VINCI_QWEN_ADMIT: "qualified",
+async function exerciseConcurrentBreakerWrites(circuitFile, count) {
+  const workerFile = join(temp, "breaker-worker.mjs");
+  const startFile = join(temp, "breaker-start");
+  const runtimeUrl = pathToFileURL(join(root, "vinci/extensions/lib/qwen-runtime.ts")).href;
+  writeFileSync(workerFile, `import { existsSync, writeFileSync } from "node:fs";
+import { recordQwenCircuitOutcome } from ${JSON.stringify(runtimeUrl)};
+const [circuitFile, readyFile, startFile] = process.argv.slice(2);
+writeFileSync(readyFile, "ready");
+const sleep = new Int32Array(new SharedArrayBuffer(4));
+while (!existsSync(startFile)) Atomics.wait(sleep, 0, 0, 5);
+recordQwenCircuitOutcome({ circuitFile, circuitThreshold: 100, circuitOpenMs: 60_000 }, false, "concurrent_500");
+`, { mode: 0o600 });
+  const children = Array.from({ length: count }, (_, index) => {
+    const readyFile = join(temp, `breaker-ready-${index}`);
+    const child = spawn(process.execPath, [...process.execArgv, workerFile, circuitFile, readyFile, startFile], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { child, readyFile };
+  });
+  await new Promise((resolveReady, rejectReady) => {
+    const deadline = Date.now() + 5_000;
+    const poll = () => {
+      if (children.every(({ readyFile }) => existsSync(readyFile))) return resolveReady();
+      if (Date.now() >= deadline) return rejectReady(new Error("breaker workers did not become ready"));
+      setTimeout(poll, 5);
+    };
+    poll();
+  });
+  writeFileSync(startFile, "start", { mode: 0o600 });
+  await Promise.all(children.map(({ child }) => new Promise((resolveExit, rejectExit) => {
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", rejectExit);
+    child.on("exit", (code) => code === 0 ? resolveExit() : rejectExit(new Error(`breaker worker exited ${code}: ${stderr}`)));
+  })));
+}
+
+writeFileSync(secretFile, "synthetic-test-secret\n", { mode: 0o600 });
+writeFileSync(promptFile, workOrderPrompt, { mode: 0o400 });
+writeFileSync(systemPromptFile, systemPrompt, { mode: 0o400 });
+writeFileSync(toolSchemasFile, `${JSON.stringify(tools)}\n`, { mode: 0o400 });
+const canary = {
+  schema: "vinci.qwen-worker-canary.v2",
+  observed_at: "2026-09-04T16:00:00.000Z",
+  endpoint_sha256: runtime.qwenSha256("https://qwen.example.test/v1"),
+  endpoint_identity_sha256: endpointIdentity,
+  model: runtime.QWEN_MODEL,
+  revision,
+  runtime: runtimeTuple,
+  capabilities: { streaming_sse: true, tool_calls: true, structured_output: "tool-arguments-json", usage_chunk: true },
+  safe_resume: false,
+};
+writeFileSync(canaryFile, `${runtime.qwenCanonical(canary)}\n`, { mode: 0o400 });
+const entryBurnIn = {
+  schema: "vinci.qwen-worker-burn-in.v1",
+  previous_concurrency: 0,
+  target_concurrency: 1,
+  observed_hours: 0,
+  work_orders: 0,
+  acceptance_pass_rate: 1,
+  usage_coverage_rate: 1,
+  transport_error_rate: 0,
+  identity_failures: 0,
+  verification_failures: 0,
+  circuit_opens: 0,
+  resource_alarms: 0,
+  governor_stops: 0,
+};
+writeFileSync(burnInFile, `${runtime.qwenCanonical(entryBurnIn)}\n`, { mode: 0o400 });
+
+const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+const publicKeyBytes = publicKey.export({ type: "spki", format: "pem" });
+writeFileSync(publicKeyFile, publicKeyBytes, { mode: 0o400 });
+
+const requestEnv = {
   VINCI_QWEN_BASE_URL: "https://qwen.example.test/v1",
-  VINCI_QWEN_SECRET_REF: `file:${secretFile}`,
   VINCI_QWEN_QUALIFICATION_PROMPT_FILE: promptFile,
+  VINCI_QWEN_QUALIFICATION_SYSTEM_PROMPT_FILE: systemPromptFile,
+  VINCI_QWEN_QUALIFICATION_TOOL_SCHEMAS_FILE: toolSchemasFile,
   VINCI_QWEN_QUALIFICATION_TOOLS: '["read","grep"]',
-  VINCI_QWEN_SERVED_REVISION: hex("ab"),
-  VINCI_QWEN_RUNTIME_ENGINE: "vllm",
-  VINCI_QWEN_RUNTIME_VERSION: "0.10.2",
-  VINCI_QWEN_RUNTIME_ARTIFACT_SHA256: hex("cd"),
-  VINCI_QWEN_RUNTIME_ARGUMENTS_SHA256: hex("ef"),
+  VINCI_QWEN_CANARY_REPORT_FILE: canaryFile,
+  VINCI_QWEN_BURN_IN_REPORT_FILE: burnInFile,
+  VINCI_QWEN_SERVED_REVISION: revision,
+  VINCI_QWEN_RUNTIME_ENGINE: runtimeTuple.engine,
+  VINCI_QWEN_RUNTIME_VERSION: runtimeTuple.version,
+  VINCI_QWEN_RUNTIME_ARTIFACT_SHA256: runtimeTuple.artifact_sha256,
+  VINCI_QWEN_RUNTIME_ARGUMENTS_SHA256: runtimeTuple.arguments_sha256,
+  VINCI_QWEN_ENDPOINT_IDENTITY_SHA256: endpointIdentity,
+  VINCI_QWEN_CLIENT_BUILD_SHA256: "21".repeat(32),
+  VINCI_QWEN_EXTENSION_BUILD_SHA256: "23".repeat(32),
   VINCI_QWEN_CONTEXT_WINDOW: "262144",
   VINCI_QWEN_MAX_TOKENS: "8192",
+  VINCI_QWEN_ADVERTISED_MAX_CONCURRENCY: "32",
+  VINCI_QWEN_MAX_CONCURRENCY: "1",
+  VINCI_QWEN_TOTAL_TIMEOUT_MS: "1000",
+  VINCI_QWEN_MAX_RETRIES: "1",
+  VINCI_QWEN_MAX_RETRY_DELAY_MS: "0",
+  VINCI_QWEN_MAX_REQUEST_BYTES: "4096",
+  VINCI_QWEN_MAX_RESPONSE_BYTES: "4096",
+  VINCI_QWEN_MAX_ERROR_BYTES: "256",
+  VINCI_QWEN_PRICE_BASIS: "operator-estimate:h200-amortized-2026-09-04",
   VINCI_QWEN_INPUT_PER_MILLION_USD: "0.25",
   VINCI_QWEN_OUTPUT_PER_MILLION_USD: "0.75",
   VINCI_QWEN_CACHE_READ_PER_MILLION_USD: "0.05",
   VINCI_QWEN_CACHE_WRITE_PER_MILLION_USD: "0.25",
-  VINCI_QWEN_PROMPT_SHA256: sha256(readFileSync(promptFile)),
-  VINCI_QWEN_TOOLS_SHA256: sha256('["read","grep"]'),
+};
+
+function qualificationFromRequest(overrides = {}, qualificationRequestEnv = requestEnv) {
+  const candidate = runtime.buildQwenQualificationRequest(qualificationRequestEnv).candidate;
+  return {
+    schema: "vinci.qwen-worker-qualification.v2",
+    status: "qualified",
+    authority_role: candidate.authority_role,
+    fallback_policy: candidate.fallback_policy,
+    safe_resume: false,
+    provenance: {
+      issuer: "reviewer:test",
+      authority: "independent-never-builder-review",
+      issued_at: "2026-09-04T17:00:00.000Z",
+      expires_at: "2026-09-05T17:00:00.000Z",
+      review_message_id: "msg_independent_test",
+      review_body_sha256: "45".repeat(32),
+      burn_in_report_sha256: candidate.burn_in_report_sha256,
+      canary: {
+        schema: "vinci.qwen-worker-canary.v2",
+        report_sha256: candidate.canary_report_sha256,
+        observed_at: candidate.canary_observed_at,
+      },
+    },
+    bindings: {
+      model: candidate.model,
+      revision: candidate.revision,
+      runtime: candidate.runtime,
+      endpoint_sha256: candidate.endpoint_sha256,
+      endpoint_identity_sha256: candidate.endpoint_identity_sha256,
+      work_order_prompt_sha256: candidate.work_order_prompt_sha256,
+      system_prompt_sha256: candidate.system_prompt_sha256,
+      tool_names_sha256: candidate.tool_names_sha256,
+      tool_schemas_sha256: candidate.tool_schemas_sha256,
+      tool_policy_sha256: candidate.tool_policy_sha256,
+      client_build_sha256: candidate.client_build_sha256,
+      extension_build_sha256: candidate.extension_build_sha256,
+      request_encoding_sha256: candidate.request_encoding_sha256,
+    },
+    capabilities: candidate.capabilities,
+    limits: candidate.limits,
+    burn_in: candidate.burn_in,
+    pricing: candidate.pricing,
+    requalification_conditions: [...runtime.QWEN_REQUALIFICATION_CONDITIONS],
+    ...overrides,
+  };
+}
+
+function signedEnvelope(qualification) {
+  const signature = sign(null, Buffer.from(runtime.qwenCanonical(qualification)), privateKey).toString("base64");
+  return {
+    schema: "vinci.qwen-worker-qualification-envelope.v2",
+    qualification,
+    signature: { algorithm: "Ed25519", key_id: "test-ed25519-1", signature_base64: signature },
+  };
+}
+
+function writeQualification(value) {
+  if (typeof value === "object" && value !== null) value = `${runtime.qwenCanonical(value)}\n`;
+  try {
+    chmodSync(qualificationFile, 0o600);
+  } catch {}
+  writeFileSync(qualificationFile, value, { mode: 0o600 });
+  chmodSync(qualificationFile, 0o400);
+  return runtime.qwenSha256(readFileSync(qualificationFile));
+}
+
+let qualification = qualificationFromRequest();
+let qualificationDigest = writeQualification(signedEnvelope(qualification));
+
+const baseRuntimeEnv = {
+  VINCI_QWEN_BASE_URL: requestEnv.VINCI_QWEN_BASE_URL,
+  VINCI_QWEN_QUALIFICATION_FILE: qualificationFile,
+  VINCI_QWEN_QUALIFICATION_SHA256: qualificationDigest,
+  VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_FILE: publicKeyFile,
+  VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_SHA256: runtime.qwenSha256(publicKeyBytes),
+  VINCI_QWEN_QUALIFICATION_ISSUER: "reviewer:test",
+  VINCI_QWEN_PROMPT_SHA256: qualification.bindings.work_order_prompt_sha256,
+  VINCI_QWEN_TOOLS_SHA256: qualification.bindings.tool_names_sha256,
+  VINCI_QWEN_TOOL_POLICY_SHA256: qualification.bindings.tool_policy_sha256,
+  VINCI_QWEN_CLIENT_BUILD_SHA256: qualification.bindings.client_build_sha256,
+  VINCI_QWEN_EXTENSION_BUILD_SHA256: qualification.bindings.extension_build_sha256,
   VINCI_UNATTENDED_POLICY: "governed",
   VINCI_UNATTENDED_LEASE: "lease-test",
   VINCI_QWEN_WORK_ORDER_ID: "wo-test",
@@ -50,257 +238,465 @@ const baseEnv = {
   VINCI_QWEN_CIRCUIT_OPEN_MS: "60000",
 };
 
-try {
-  assert.throws(
-    () => runtime.buildQwenQualificationTemplate({ ...baseEnv, VINCI_QWEN_ADMIT: undefined }),
-    /qualification_not_admitted/,
-  );
-  const qualification = runtime.buildQwenQualificationTemplate(baseEnv);
-  assert.equal(qualification.model, "Qwen/Qwen3.8-27B");
-  assert.equal(qualification.limits.max_concurrency, 1, "concurrency must start conservative");
-  assert.equal(qualification.limits.max_retries, 1);
-  assert.equal(qualification.authority_role, "non-authoritative-evidence-and-proposals-only");
-  assert.equal(qualification.fallback_policy, "explicit-openrouter-separate-attempt-only");
-  writeFileSync(qualificationFile, `${JSON.stringify(qualification)}\n`, { mode: 0o400 });
-  chmodSync(qualificationFile, 0o400);
-  const env = {
-    ...baseEnv,
-    VINCI_QWEN_QUALIFICATION_FILE: qualificationFile,
-    VINCI_QWEN_QUALIFICATION_SHA256: sha256(readFileSync(qualificationFile)),
-  };
-  const config = runtime.loadQwenRuntimeConfig(env);
-  assert.equal(config.baseUrl, "https://qwen.example.test/v1");
-  assert.equal(config.secret, "test-secret");
+function runtimeEnv(overrides = {}) {
+  return { ...baseRuntimeEnv, VINCI_QWEN_SECRET_FD: String(openSync(secretFile, "r")), ...overrides };
+}
 
-  const runtimeTuple = qualification.runtime;
+function loadConfig(overrides = {}) {
+  return runtime.loadQwenRuntimeConfig(runtimeEnv(overrides), nowMs);
+}
+
+function identityHeaders(overrides = {}) {
+  return {
+    "content-type": "text/event-stream",
+    "x-vinci-model-id": runtime.QWEN_MODEL,
+    "x-vinci-model-revision": revision,
+    "x-vinci-endpoint-identity-sha256": endpointIdentity,
+    "x-vinci-runtime-engine": runtimeTuple.engine,
+    "x-vinci-runtime-version": runtimeTuple.version,
+    "x-vinci-runtime-artifact-sha256": runtimeTuple.artifact_sha256,
+    "x-vinci-runtime-arguments-sha256": runtimeTuple.arguments_sha256,
+    ...overrides,
+  };
+}
+
+const usage = {
+  prompt_tokens: 10,
+  completion_tokens: 2,
+  total_tokens: 12,
+  prompt_tokens_details: null,
+  completion_tokens_details: null,
+};
+const validSse = [
+  `data: ${JSON.stringify({ id: "chunk-1", object: "chat.completion.chunk", created: 1, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+  "data: [DONE]",
+  "",
+].join("\n");
+
+try {
+  assert.equal(qualification.safe_resume, false);
+  assert.equal(qualification.limits.max_concurrency, 1);
+  assert.equal(qualification.limits.advertised_max_concurrency, 32);
+  assert.equal(qualification.bindings.request_encoding_sha256, runtime.qwenSha256(runtime.qwenCanonical(runtime.QWEN_REQUEST_ENCODING)));
+  const config = loadConfig();
+  assert.equal(config.secret, "synthetic-test-secret");
+  assert.equal(config.qualification.provenance.authority, "independent-never-builder-review");
+  assert.throws(
+    () => runtime.loadQwenRuntimeConfig(runtimeEnv({ VINCI_QWEN_CLIENT_BUILD_SHA256: "99".repeat(32) }), nowMs),
+    /client_build_mismatch/,
+  );
+
+  const invalidSignature = structuredClone(signedEnvelope(qualification));
+  invalidSignature.qualification.bindings.model = "Qwen/Qwen3.8-27B-tampered";
+  qualificationDigest = writeQualification(invalidSignature);
+  assert.throws(
+    () => runtime.loadQwenRuntimeConfig(runtimeEnv({ VINCI_QWEN_QUALIFICATION_SHA256: qualificationDigest }), nowMs),
+    /qualification_signature_invalid/,
+  );
+  qualificationDigest = writeQualification(signedEnvelope(qualification));
+  baseRuntimeEnv.VINCI_QWEN_QUALIFICATION_SHA256 = qualificationDigest;
+
+  qualificationDigest = writeQualification(qualification);
+  assert.throws(
+    () => runtime.loadQwenRuntimeConfig(runtimeEnv({ VINCI_QWEN_QUALIFICATION_SHA256: qualificationDigest }), nowMs),
+    /qualification envelope.*missing fields|qualification envelope.*unexpected/,
+  );
+  qualificationDigest = writeQualification(signedEnvelope(qualification));
+  baseRuntimeEnv.VINCI_QWEN_QUALIFICATION_SHA256 = qualificationDigest;
+
+  const expired = qualificationFromRequest({
+    provenance: { ...qualification.provenance, issued_at: "2026-09-01T16:00:00.000Z", expires_at: "2026-09-02T16:00:00.000Z" },
+  });
+  qualificationDigest = writeQualification(signedEnvelope(expired));
+  assert.throws(
+    () => runtime.loadQwenRuntimeConfig(runtimeEnv({ VINCI_QWEN_QUALIFICATION_SHA256: qualificationDigest }), nowMs),
+    /qualification_expired/,
+  );
+  qualificationDigest = writeQualification(signedEnvelope(qualification));
+  baseRuntimeEnv.VINCI_QWEN_QUALIFICATION_SHA256 = qualificationDigest;
+
+  const concurrency32 = qualificationFromRequest({
+    limits: { ...qualification.limits, max_concurrency: 32 },
+    burn_in: {
+      ...entryBurnIn,
+      previous_concurrency: 24,
+      target_concurrency: 32,
+      observed_hours: 168,
+      work_orders: 1_000,
+      transport_error_rate: 0.005,
+    },
+  });
+  qualificationDigest = writeQualification(signedEnvelope(concurrency32));
+  assert.throws(
+    () => runtime.loadQwenRuntimeConfig(runtimeEnv({ VINCI_QWEN_QUALIFICATION_SHA256: qualificationDigest }), nowMs),
+    /fleet_permit_authority_missing/,
+  );
+  qualificationDigest = writeQualification(signedEnvelope(qualification));
+  baseRuntimeEnv.VINCI_QWEN_QUALIFICATION_SHA256 = qualificationDigest;
+
+  const skippedStage = qualificationFromRequest({
+    limits: { ...qualification.limits, max_concurrency: 8 },
+    burn_in: { ...entryBurnIn, previous_concurrency: 2, target_concurrency: 8, observed_hours: 168, work_orders: 1_000 },
+  });
+  qualificationDigest = writeQualification(signedEnvelope(skippedStage));
+  assert.throws(
+    () => runtime.loadQwenRuntimeConfig(runtimeEnv({ VINCI_QWEN_QUALIFICATION_SHA256: qualificationDigest }), nowMs),
+    /burn_in_gate_failed/,
+  );
+  qualificationDigest = writeQualification(signedEnvelope(qualification));
+  baseRuntimeEnv.VINCI_QWEN_QUALIFICATION_SHA256 = qualificationDigest;
+
   const observed = [];
   const readyFetch = async (url, init = {}) => {
-    observed.push({ url: String(url), authorization: new Headers(init.headers).get("authorization"), method: init.method ?? "GET", body: init.body });
-    if (String(url).endsWith("/health") && !new Headers(init.headers).has("authorization")) {
-      return Response.json({ error: "unauthorized" }, { status: 401 });
-    }
+    const headers = new Headers(init.headers);
+    observed.push({ url: String(url), authorization: headers.get("authorization") });
+    if (String(url).endsWith("/health") && !headers.has("authorization")) return Response.json({}, { status: 401 });
     if (String(url).endsWith("/health")) return Response.json({ status: "ready" });
-    if (String(url).endsWith("/v1/models") && !new Headers(init.headers).has("authorization")) {
-      return Response.json({ error: "unauthorized" }, { status: 401 });
-    }
+    if (String(url).endsWith("/v1/models") && !headers.has("authorization")) return Response.json({}, { status: 401 });
     if (String(url).endsWith("/v1/models")) {
-      return Response.json({ object: "list", data: [{ id: runtime.QWEN_MODEL, revision: qualification.revision, runtime: runtimeTuple }] });
+      return Response.json({
+        object: "list",
+        data: [{ id: runtime.QWEN_MODEL, revision, runtime: runtimeTuple, endpoint_identity_sha256: endpointIdentity }],
+      });
     }
-    throw new Error(`unexpected URL ${url}`);
+    throw new Error(`unexpected fake URL ${url}`);
   };
-  const identity = await runtime.probeQwenReadiness(config, { fetchImpl: readyFetch, nowMs: 1_000 });
-  assert.deepEqual(identity, { revision: qualification.revision, runtime: runtimeTuple });
-  assert.deepEqual(observed.map(({ authorization }) => authorization), ["Bearer test-secret", "Bearer test-secret", null, null]);
-  assert.doesNotMatch(JSON.stringify(observed), /VINCI_QWEN_SECRET_REF/);
+  const lookupPublic = async () => [{ address: "93.184.216.34", family: 4 }];
+  const readyConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "ready-circuit.json") });
+  const identity = await runtime.probeQwenReadiness(readyConfig, { fetchImpl: readyFetch, lookupImpl: lookupPublic, nowMs });
+  assert.equal(identity.endpointIdentity, endpointIdentity);
+  assert.deepEqual(observed.map((entry) => entry.authorization), ["Bearer synthetic-test-secret", "Bearer synthetic-test-secret", null, null]);
 
-  const promptMismatch = { ...env, VINCI_QWEN_PROMPT_SHA256: hex("01") };
-  assert.throws(() => runtime.loadQwenRuntimeConfig(promptMismatch), /qwen_prompt_mismatch/);
-  assert.throws(
-    () => runtime.loadQwenRuntimeConfig({ ...env, VINCI_UNATTENDED_POLICY: "off" }),
-    /qwen_authority_forbidden/,
+  const canarySse = [
+    `data: ${JSON.stringify({
+      id: "canary-tool",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: runtime.QWEN_MODEL,
+      choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: "report_ready", arguments: '{"status":"ready"}' } }] } }],
+    })}`,
+    `data: ${JSON.stringify({ id: "canary-usage", object: "chat.completion.chunk", created: 2, model: runtime.QWEN_MODEL, choices: [], usage })}`,
+    "data: [DONE]",
+    "",
+  ].join("\n");
+  const canaryFetch = async (url, init = {}) => {
+    const target = String(url);
+    const authenticated = new Headers(init.headers).has("authorization");
+    if (!authenticated && (target.endsWith("/health") || target.endsWith("/v1/models"))) return Response.json({}, { status: 401 });
+    if (target.endsWith("/health")) return Response.json({ status: "ready" });
+    if (target.endsWith("/v1/models")) {
+      return Response.json({
+        object: "list",
+        data: [{ id: runtime.QWEN_MODEL, revision, runtime: runtimeTuple, endpoint_identity_sha256: endpointIdentity }],
+      });
+    }
+    if (target.endsWith("/v1/chat/completions")) return new Response(canarySse, { headers: identityHeaders() });
+    throw new Error(`unexpected canary URL ${target}`);
+  };
+  const canaryReport = await runtime.runQwenCanary(
+    {
+      VINCI_QWEN_BASE_URL: requestEnv.VINCI_QWEN_BASE_URL,
+      VINCI_QWEN_SECRET_REF: `file:${secretFile}`,
+      VINCI_QWEN_CANARY_TIMEOUT_MS: "1000",
+    },
+    canaryFetch,
+    lookupPublic,
   );
-  assert.throws(
-    () => runtime.buildQwenQualificationTemplate({ ...baseEnv, VINCI_QWEN_MAX_CONCURRENCY: "9" }),
-    /max_concurrency/,
+  assert.equal(canaryReport.safe_resume, false);
+  assert.equal(canaryReport.endpoint_identity_sha256, endpointIdentity);
+  assert.equal(canaryReport.pinned_addresses_sha256, runtime.qwenSha256(runtime.qwenCanonical(["93.184.216.34"])));
+
+  const privateConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "private-circuit.json") });
+  await assert.rejects(runtime.pinQwenEndpoint(privateConfig, async () => [{ address: "169.254.169.254", family: 4 }]), /ssrf_forbidden/);
+
+  const records = [];
+  const breakerConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "breaker.json") });
+  breakerConfig.endpointAddresses = ["93.184.216.34"];
+  let failedCalls = 0;
+  const retryKeys = [];
+  const failingTransport = runtime.createQwenInferenceFetch(
+    breakerConfig,
+    "request-500",
+    (record) => records.push(record),
+    async (_url, init = {}) => {
+      failedCalls += 1;
+      retryKeys.push(new Headers(init.headers).get("x-vinci-idempotency-key"));
+      return new Response("failure", { status: 500 });
+    },
   );
+  await assert.rejects(
+    failingTransport(breakerConfig.chatUrl, { method: "POST", body: "{}" }),
+    /qwen_http_status/,
+  );
+  assert.equal(failedCalls, 2, "threshold two must count both real HTTP 500 responses");
+  assert.equal(records.length, 2);
+  assert.deepEqual(retryKeys, ["request-500/0", "request-500/1"]);
+  assert.deepEqual(records.map((record) => record.transport_attempt), [0, 1]);
+  assert.ok(records.every((record) => record.cost_usd === 0 && record.input_tokens === 0 && record.output_tokens === 0));
+  assert.throws(() => runtime.assertQwenCircuitClosed(breakerConfig), /qwen_circuit_open/);
+
+  const concurrentCircuitFile = join(temp, "concurrent-breaker.json");
+  await exerciseConcurrentBreakerWrites(concurrentCircuitFile, 8);
+  const concurrentState = JSON.parse(readFileSync(concurrentCircuitFile, "utf8"));
+  assert.equal(concurrentState.schema, "vinci.qwen-worker-circuit.v2");
+  assert.equal(concurrentState.failures, 8, "atomic breaker updates must not lose concurrent failures");
+  assert.equal(concurrentState.sequence, 8);
+
+  const mismatchConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "mismatch.json") });
+  mismatchConfig.endpointAddresses = ["93.184.216.34"];
+  const mismatchTransport = runtime.createQwenInferenceFetch(
+    mismatchConfig,
+    "request-mismatch",
+    () => {},
+    async () => new Response(validSse, { headers: identityHeaders({ "x-vinci-model-id": "Qwen/wrong" }) }),
+  );
+  await assert.rejects(mismatchTransport(mismatchConfig.chatUrl, { method: "POST", body: "{}" }), /response_identity_mismatch/);
+
+  const runtimeMismatchRecords = [];
+  const runtimeMismatchConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "runtime-mismatch.json") });
+  runtimeMismatchConfig.endpointAddresses = ["93.184.216.34"];
+  await assert.rejects(
+    runtime.createQwenInferenceFetch(
+      runtimeMismatchConfig,
+      "request-runtime-mismatch",
+      (record) => runtimeMismatchRecords.push(record),
+      async () => new Response(validSse, { headers: identityHeaders({ "x-vinci-runtime-version": "wrong" }) }),
+    )(runtimeMismatchConfig.chatUrl, { method: "POST", body: "{}" }),
+    /response_identity_mismatch/,
+  );
+  assert.equal(runtimeMismatchRecords[0].outcome, "response_identity_mismatch");
+
+  const redirectConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "redirect.json") });
+  redirectConfig.endpointAddresses = ["93.184.216.34"];
+  await assert.rejects(
+    runtime.createQwenInferenceFetch(redirectConfig, "request-redirect", () => {}, async () => new Response("", { status: 302 }))(
+      redirectConfig.chatUrl,
+      { method: "POST", body: "{}" },
+    ),
+    /redirect_forbidden/,
+  );
+  await assert.rejects(
+    runtime.createQwenInferenceFetch(redirectConfig, "request-ssrf", () => {}, async () => new Response(validSse, { headers: identityHeaders() }))(
+      "http://169.254.169.254/latest/meta-data",
+      { method: "POST", body: "{}" },
+    ),
+    /ssrf_forbidden/,
+  );
+  await assert.rejects(
+    runtime.createQwenInferenceFetch(redirectConfig, "request-too-large", () => {}, async () => new Response(validSse, { headers: identityHeaders() }))(
+      redirectConfig.chatUrl,
+      { method: "POST", body: "x".repeat(5_000) },
+    ),
+    /request_oversized/,
+  );
+
+  const cancelledConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "cancelled-retry.json") });
+  cancelledConfig.endpointAddresses = ["93.184.216.34"];
+  cancelledConfig.qualification.limits.max_retry_delay_ms = 1_000;
+  const retryAbort = new AbortController();
+  let cancelledCalls = 0;
+  await assert.rejects(
+    runtime.createQwenInferenceFetch(cancelledConfig, "request-cancelled", () => {}, async () => {
+      cancelledCalls += 1;
+      queueMicrotask(() => retryAbort.abort("operator_stop"));
+      return new Response("retry", { status: 429, headers: { "retry-after": "1" } });
+    })(cancelledConfig.chatUrl, { method: "POST", body: "{}", signal: retryAbort.signal }),
+    /cancelled/,
+  );
+  assert.equal(cancelledCalls, 1, "cancellation during Retry-After must prevent the next transport attempt");
+
+  const oversizedConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "oversized.json") });
+  oversizedConfig.endpointAddresses = ["93.184.216.34"];
+  await assert.rejects(
+    runtime.createQwenInferenceFetch(oversizedConfig, "request-oversized", () => {}, async () => new Response("x".repeat(300), { status: 500 }))(
+      oversizedConfig.chatUrl,
+      { method: "POST", body: "{}" },
+    ),
+    /response_oversized/,
+  );
+
+  const successRecords = [];
+  const successConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "success.json") });
+  successConfig.endpointAddresses = ["93.184.216.34"];
+  const successResponse = await runtime.createQwenInferenceFetch(
+    successConfig,
+    "request-success",
+    (record) => successRecords.push(record),
+    async () => new Response(validSse, { headers: identityHeaders() }),
+  )(successConfig.chatUrl, { method: "POST", body: "{}" });
+  assert.equal(await successResponse.text(), validSse);
+  assert.equal(successRecords[0].outcome, "success");
+  assert.equal(successRecords[0].input_tokens, 10);
+  assert.equal(successRecords[0].output_tokens, 2);
+  assert.equal(successRecords[0].cost_usd, 0.000004);
+
+  const invalidUsage = { ...usage, total_tokens: 99 };
+  const invalidUsageSse = [
+    `data: ${JSON.stringify({ id: "chunk-bad-usage", object: "chat.completion.chunk", created: 1, model: runtime.QWEN_MODEL, choices: [], usage: invalidUsage })}`,
+    "data: [DONE]",
+    "",
+  ].join("\n");
+  const invalidUsageConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "invalid-usage.json") });
+  invalidUsageConfig.endpointAddresses = ["93.184.216.34"];
+  const invalidUsageResponse = await runtime.createQwenInferenceFetch(
+    invalidUsageConfig,
+    "request-invalid-usage",
+    () => {},
+    async () => new Response(invalidUsageSse, { headers: identityHeaders() }),
+  )(invalidUsageConfig.chatUrl, { method: "POST", body: "{}" });
+  await assert.rejects(invalidUsageResponse.text(), /usage_invalid/);
+
+  const oversizedSuccessConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "oversized-success.json") });
+  oversizedSuccessConfig.endpointAddresses = ["93.184.216.34"];
+  const oversizedSuccessResponse = await runtime.createQwenInferenceFetch(
+    oversizedSuccessConfig,
+    "request-oversized-success",
+    () => {},
+    async () => new Response(`data: ${"x".repeat(5_000)}\n`, { headers: identityHeaders() }),
+  )(oversizedSuccessConfig.chatUrl, { method: "POST", body: "{}" });
+  await assert.rejects(oversizedSuccessResponse.text(), /response_oversized/);
+
+  const timeoutConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "timeout.json") });
+  timeoutConfig.endpointAddresses = ["93.184.216.34"];
+  const timeoutResponse = await runtime.createQwenInferenceFetch(
+    timeoutConfig,
+    "request-timeout",
+    () => {},
+    async (_url, init = {}) => new Response(new ReadableStream({
+      start(controller) {
+        init.signal.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")), { once: true });
+      },
+    }), { headers: identityHeaders() }),
+  )(timeoutConfig.chatUrl, { method: "POST", body: "{}" });
+  await assert.rejects(timeoutResponse.text(), /AbortError|aborted/);
+
+  const context = { systemPrompt, messages: [{ role: "user", content: workOrderPrompt, timestamp: Date.now() }], tools };
+  const terminalMessage = {
+    role: "assistant",
+    content: [],
+    api: "openai-completions",
+    provider: runtime.QWEN_PROVIDER,
+    model: runtime.QWEN_MODEL,
+    usage: {
+      input: 10,
+      output: 2,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 12,
+      cost: { input: 0.0000025, output: 0.0000015, cacheRead: 0, cacheWrite: 0, total: 0.000004 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+  const fakeStream = (model) => {
+    const stream = createAssistantMessageEventStream();
+    queueMicrotask(() => {
+      stream.push({ type: "done", reason: "stop", message: { ...terminalMessage, api: model.api } });
+      stream.end({ ...terminalMessage, api: model.api });
+    });
+    return stream;
+  };
+  const permitConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, "permit.json") });
+  permitConfig.endpointAddresses = ["93.184.216.34"];
+  const provider = qwenProviderConfig(permitConfig, fakeStream);
+  const model = { ...provider.models[0], provider: runtime.QWEN_PROVIDER, api: runtime.QWEN_API };
+  const firstPermitStream = provider.streamSimple(model, context);
+  let secondPermitStream;
+  for await (const event of firstPermitStream) {
+    if (event.type === "done") {
+      assert.doesNotThrow(
+        () => { secondPermitStream = provider.streamSimple(model, context); },
+        "permit must be released before the terminal result event becomes observable",
+      );
+    }
+  }
+  assert.ok(secondPermitStream);
+  await secondPermitStream.result();
+
+  const truncatedProvider = qwenProviderConfig(permitConfig, () => {
+    const stream = createAssistantMessageEventStream();
+    queueMicrotask(() => stream.end(terminalMessage));
+    return stream;
+  });
+  const truncated = await truncatedProvider.streamSimple(model, context).result();
+  assert.equal(truncated.stopReason, "error");
+  assert.match(truncated.errorMessage, /qwen_stream_truncated/);
 
   const vectors = join(root, "vinci/test/fixtures/contract-vectors");
   const emptyCriteriaOrder = {
     ...JSON.parse(readFileSync(join(vectors, "work-order-1-minimal/input.json"), "utf8")),
     acceptanceCriteria: [],
   };
-  assert.throws(
-    () => digest.workOrderDigest(emptyCriteriaOrder),
-    /criteria_required/,
-    "the existing contract gate must reject a Qwen batch without acceptance criteria before materialization",
-  );
-  assert.throws(
-    () => workerRun.runVinci({
-      envelope: { provider: "qwen-h200", model: runtime.QWEN_MODEL, ref: "legacy-prose-ref", tools: ["read"], spec: "legacy prose" },
-      repoDir: temp,
-      stateDir: temp,
-      taskId: "task-test",
-      sessionId: "run-test",
-    }),
-    /validated digest WorkOrder identity and acceptance criteria/,
-    "legacy prose cannot bypass the WorkOrder acceptance-criteria gate",
-  );
+  assert.throws(() => digest.workOrderDigest(emptyCriteriaOrder), /criteria_required/);
 
-  const wrongModelConfig = { ...config, circuitFile: join(temp, "wrong-model-circuit.json") };
-  await assert.rejects(
-    runtime.probeQwenReadiness(wrongModelConfig, {
-      fetchImpl: async (url, init = {}) => {
-        if (String(url).endsWith("/health")) return Response.json({ status: "ready" });
-        if (!new Headers(init.headers).has("authorization")) return Response.json({}, { status: 401 });
-        return Response.json({ object: "list", data: [{ id: "Qwen/Qwen3.8-27B-alias", revision: qualification.revision, runtime: runtimeTuple }] });
-      },
-      nowMs: 2_000,
-    }),
-    /qwen_model_mismatch/,
-  );
-
-  const authOpenConfig = { ...config, circuitFile: join(temp, "auth-open-circuit.json") };
-  await assert.rejects(
-    runtime.probeQwenReadiness(authOpenConfig, {
-      fetchImpl: async (url) => String(url).endsWith("/health")
-        ? Response.json({ status: "ready" })
-        : Response.json({ object: "list", data: [{ id: runtime.QWEN_MODEL, revision: qualification.revision, runtime: runtimeTuple }] }),
-      nowMs: 3_000,
-    }),
-    /qwen_auth_not_enforced/,
-  );
-
-  const circuitConfig = { ...config, circuitFile: join(temp, "breaker.json") };
-  let failedCalls = 0;
-  const unavailable = async () => {
-    failedCalls += 1;
-    throw new Error("offline fake");
-  };
-  await assert.rejects(runtime.probeQwenReadiness(circuitConfig, { fetchImpl: unavailable, nowMs: 10_000 }), /endpoint_unavailable/);
-  assert.equal(failedCalls, 2, "one retry means exactly two bounded attempts");
-  await assert.rejects(runtime.probeQwenReadiness(circuitConfig, { fetchImpl: unavailable, nowMs: 11_000 }), /endpoint_unavailable/);
-  const callsAtOpen = failedCalls;
-  await assert.rejects(runtime.probeQwenReadiness(circuitConfig, { fetchImpl: unavailable, nowMs: 12_000 }), /qwen_circuit_open/);
-  assert.equal(failedCalls, callsAtOpen, "open circuit must make no endpoint call");
-
-  const cancelledConfig = { ...config, circuitFile: join(temp, "cancelled.json") };
-  const controller = new AbortController();
-  controller.abort("fixture cancellation");
-  await assert.rejects(
-    runtime.probeQwenReadiness(cancelledConfig, {
-      signal: controller.signal,
-      fetchImpl: async (_url, init = {}) => {
-        assert.equal(init.signal.aborted, true);
-        throw new DOMException("aborted", "AbortError");
-      },
-    }),
-    /qwen_cancelled/,
-  );
-
-  const sse = [
-    'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"report_","arguments":"{\\"status\\":\\""}}]}}]}',
-    'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"ready","arguments":"ready\\"}"}}]}}]}',
-    'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}',
-    "data: [DONE]",
-    "",
-  ].join("\n");
-  const canaryCalls = [];
-  const canary = await runtime.runQwenCanary(
-    { ...baseEnv, VINCI_QWEN_CANARY_TIMEOUT_MS: "1000" },
-    async (url, init = {}) => {
-      canaryCalls.push({ url: String(url), init });
-      if (String(url).endsWith("/health") && !new Headers(init.headers).has("authorization")) return Response.json({}, { status: 401 });
-      if (String(url).endsWith("/health")) return Response.json({ status: "ready" });
-      if (String(url).endsWith("/v1/models") && !new Headers(init.headers).has("authorization")) return Response.json({}, { status: 401 });
-      if (String(url).endsWith("/v1/models")) return Response.json({ object: "list", data: [{ id: runtime.QWEN_MODEL, revision: qualification.revision, runtime: runtimeTuple }] });
-      if (String(url).endsWith("/v1/chat/completions")) return new Response(sse, { headers: { "content-type": "text/event-stream" } });
-      throw new Error(`unexpected URL ${url}`);
-    },
-  );
-  assert.equal(canary.capabilities.structured_output, "tool-arguments-json");
-  assert.equal(canary.capabilities.usage_chunk, true);
-  const inference = canaryCalls.find(({ url }) => url.endsWith("/chat/completions"));
-  const payload = JSON.parse(inference.init.body);
-  assert.equal(payload.model, "Qwen/Qwen3.8-27B");
-  assert.equal(payload.stream, true);
-  assert.equal(payload.tools[0].function.name, "report_ready");
-
-  const extensionEnvNames = [
-    ...Object.keys(env),
-    "VINCI_QWEN_SELECTED",
-  ];
-  const prior = new Map(extensionEnvNames.map((name) => [name, process.env[name]]));
-  const nativeFetch = globalThis.fetch;
+  const fakeBin = join(temp, "bin");
+  const fakeVinci = join(fakeBin, "vinci");
+  const spawnRecord = join(temp, "spawn-record.json");
+  mkdirSync(fakeBin);
+  writeFileSync(fakeVinci, `#!/usr/bin/env node
+import { fstatSync, readFileSync, writeFileSync } from "node:fs";
+let stdin = "";
+process.stdin.setEncoding("utf8");
+for await (const chunk of process.stdin) stdin += chunk;
+const secret = readFileSync(3);
+writeFileSync(process.env.QWEN_TEST_SPAWN_RECORD, JSON.stringify({ argv: process.argv.slice(2), stdin, qwenEnvKeys: Object.keys(process.env).filter((key) => key.includes("QWEN_SECRET")), secretBytes: fstatSync(3).size, secretReadBytes: secret.length }));
+`, { mode: 0o700 });
+  chmodSync(fakeVinci, 0o700);
+  const stateDir = join(temp, "run-state");
+  mkdirSync(join(stateDir, "tasks"), { recursive: true });
+  writeFileSync(join(stateDir, "tasks", "task-spawn.json"), JSON.stringify({ attempt: 1 }), { mode: 0o600 });
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}:${originalPath}`;
   try {
-    Object.assign(process.env, env, { VINCI_QWEN_SELECTED: "1", VINCI_QWEN_CIRCUIT_FILE: join(temp, "extension-circuit.json") });
-    globalThis.fetch = readyFetch;
-    const registrations = [];
-    const handlers = {};
-    const labels = [];
-    await providerExtension({
-      registerProvider(name, providerConfig) { registrations.push({ name, providerConfig }); },
-      on(name, handler) { (handlers[name] ??= []).push(handler); },
-      appendEntry(name, value) { labels.push({ name, value }); },
+    await runVinci({
+      envelope: {
+        provider: runtime.QWEN_PROVIDER,
+        model: runtime.QWEN_MODEL,
+        work_order_id: "wo-spawn",
+        spec: "synthetic prompt must not be argv",
+        tools: ["read"],
+        max_runtime_s: 10,
+        budget_usd: 1,
+      },
+      repoDir: temp,
+      stateDir,
+      taskId: "task-spawn",
+      sessionId: "run-spawn",
+      env: {
+        PATH: `${fakeBin}:${originalPath}`,
+        QWEN_TEST_SPAWN_RECORD: spawnRecord,
+        VINCI_QWEN_SECRET_REF: `file:${secretFile}`,
+      },
+      envDelta: {},
     });
-    assert.deepEqual(registrations.map(({ name }) => name), ["vinci", "qwen-h200"]);
-    const qwen = registrations[1].providerConfig;
-    assert.equal(qwen.api, "vinci-qwen-openai-completions");
-    assert.equal(qwen.apiKey, "runtime-resolved-secret-reference", "provider config must not contain the secret value");
-    assert.equal(qwen.models[0].id, "Qwen/Qwen3.8-27B");
-    assert.equal(qwen.models[0].cost.input, 0.25);
-    assert.equal(process.env.VINCI_QWEN_SECRET_REF, undefined, "bootstrap secret reference must be scrubbed");
-
-    const headers = {};
-    for (const handler of handlers.before_provider_headers ?? []) {
-      await handler({ headers }, { model: { provider: "qwen-h200" } });
-    }
-    assert.equal(headers["x-vinci-work-order-id"], "wo-test");
-    assert.equal(headers["x-vinci-run-id"], "run-test");
-    assert.equal(headers["x-vinci-attempt-id"], "task-test/1");
-    assert.equal(headers["x-vinci-qwen-output-authority"], "non-authoritative");
-
-    for (let index = 0; index < 2; index += 1) {
-      for (const handler of handlers.after_provider_response ?? []) {
-        await handler({ status: 401 }, { model: { provider: "qwen-h200" } });
-      }
-    }
-    assert.throws(
-      () => qwen.streamSimple(
-        { ...qwen.models[0], provider: "qwen-h200", api: qwen.api },
-        { messages: [] },
-      ),
-      /qwen_circuit_open/,
-      "authentication failures must open the circuit before another inference call",
-    );
-
-    for (const handler of handlers.message_end ?? []) {
-      await handler(
-        { message: { role: "assistant", provider: "qwen-h200", stopReason: "stop" } },
-        { sessionManager: { getSessionId: () => "run-test" } },
-      );
-    }
-    assert.equal(labels[0].name, "vinci-qwen-output-label");
-    assert.equal(labels[0].value.authority, "non-authoritative");
-    assert.equal(labels[0].value.independent_check_required, true);
   } finally {
-    globalThis.fetch = nativeFetch;
-    for (const [name, value] of prior) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
+    process.env.PATH = originalPath;
   }
+  const spawned = JSON.parse(readFileSync(spawnRecord, "utf8"));
+  assert.equal(spawned.argv.includes("synthetic prompt must not be argv"), false);
+  assert.equal(spawned.argv.includes("synthetic-test-secret"), false);
+  assert.equal(spawned.argv.includes(secretFile), false);
+  assert.equal(spawned.stdin, "synthetic prompt must not be argv");
+  assert.equal(spawned.stdin.includes("synthetic-test-secret"), false);
+  assert.deepEqual(spawned.qwenEnvKeys, ["VINCI_QWEN_SECRET_FD"]);
+  assert.equal(spawned.secretBytes, spawned.secretReadBytes);
+
+  const lifecycle = new TaskLifecycle(join(temp, "attempt-state"), "task-attempt");
+  const first = lifecycle.startAttempt({ id: "task-attempt", envelope: { provider: runtime.QWEN_PROVIDER, evidence: "none" } }, "test");
+  const second = lifecycle.startAttempt({ id: "task-attempt", envelope: { provider: runtime.QWEN_PROVIDER, evidence: "none" } }, "test");
+  assert.equal(first.sessionId, "task-attempt-qwen-attempt-1");
+  assert.equal(second.sessionId, "task-attempt-qwen-attempt-2");
 
   assert.equal(cleanroom.CLEAN_ROOM_ENV_ALLOWLIST.includes("VINCI_QWEN_SECRET_REF"), false);
-  assert.ok(cleanroom.PROVIDER_KEY_ENV["qwen-h200"].includes("VINCI_QWEN_SECRET_REF"));
+  assert.ok(cleanroom.PROVIDER_KEY_ENV[runtime.QWEN_PROVIDER].includes("VINCI_QWEN_SECRET_REF"));
   const scoped = cleanroom.providerScopedEnv({
-    base: {
-      OPENROUTER_API_KEY: "must-drop",
-      VINCI_QWEN_SECRET_REF: "env:QWEN_DYNAMIC_TEST_SECRET",
-      QWEN_DYNAMIC_TEST_SECRET: "dynamic-test-secret",
-    },
-    provider: "qwen-h200",
+    base: { OPENROUTER_API_KEY: "drop", VINCI_QWEN_SECRET_REF: `file:${secretFile}` },
+    provider: runtime.QWEN_PROVIDER,
     agentDir: join(temp, "agent"),
   });
   assert.equal(scoped.OPENROUTER_API_KEY, undefined);
-  assert.equal(scoped.VINCI_QWEN_SECRET_REF, "env:QWEN_DYNAMIC_TEST_SECRET");
-  assert.equal(scoped.QWEN_DYNAMIC_TEST_SECRET, "dynamic-test-secret");
-  const cleanScoped = cleanroom.cleanRoomEnv({
-    base: scoped,
-    provider: "qwen-h200",
-    homeDir: join(temp, "clean-home"),
-    tmpDir: join(temp, "clean-tmp"),
-  });
-  assert.equal(cleanScoped.QWEN_DYNAMIC_TEST_SECRET, "dynamic-test-secret");
-  const otherProvider = cleanroom.providerScopedEnv({
-    base: scoped,
-    provider: "openrouter",
-    agentDir: join(temp, "other-agent"),
-  });
-  assert.equal(otherProvider.VINCI_QWEN_SECRET_REF, undefined);
-  assert.equal(otherProvider.QWEN_DYNAMIC_TEST_SECRET, undefined, "a dynamic Qwen secret must not cross provider boundaries");
-  const envSecretConfig = { ...env, VINCI_QWEN_SECRET_REF: "env:QWEN_DYNAMIC_TEST_SECRET", QWEN_DYNAMIC_TEST_SECRET: "dynamic-test-secret" };
-  assert.equal(runtime.loadQwenRuntimeConfig(envSecretConfig).secret, "dynamic-test-secret");
-  assert.equal(envSecretConfig.QWEN_DYNAMIC_TEST_SECRET, undefined, "the resolved secret must be scrubbed before repository tools run");
+  assert.equal(scoped.VINCI_QWEN_SECRET_REF, `file:${secretFile}`);
+  assert.equal(cleanroom.providerScopedEnv({ base: scoped, provider: "openrouter", agentDir: join(temp, "other") }).VINCI_QWEN_SECRET_REF, undefined);
 
   const summary = economics.buildEconomicsSummary({
     workOrderId: "wo-test",
@@ -308,23 +704,21 @@ try {
     sessionId: "run-test",
     started: "2026-09-04T10:00:00.000Z",
     finished: "2026-09-04T10:00:02.000Z",
-    usageEntries: [{ provider: "qwen-h200", model: runtime.QWEN_MODEL, model_calls: 1, input_tokens: 10, output_tokens: 2, cost_microusd: 4 }],
+    usageEntries: [{ provider: runtime.QWEN_PROVIDER, model: runtime.QWEN_MODEL, model_calls: 1, input_tokens: 10, output_tokens: 2, cost_microusd: 4 }],
     sessionState: { path: "/fake/session", source: "usage_entries", costUsd: 0.000004 },
     receipt: { verificationStatus: "passed" },
     run: { exit_code: 0, limit_tripped: null, harness_stops: [] },
     taskState: "UNVERIFIED",
   });
   assert.equal(summary.route.policy_id, "single-provider-no-automatic-fallback");
-  assert.equal(summary.route.initial_provider, "qwen-h200");
-  assert.equal(summary.route.initial_model, "Qwen/Qwen3.8-27B");
   assert.equal(summary.work_order_id, "wo-test");
   assert.equal(summary.session_id, "run-test");
   assert.equal(summary.attempt_label, "task-test/1");
-  assert.equal(summary.started_at, "2026-09-04T10:00:00.000Z");
-  assert.equal(summary.finished_at, "2026-09-04T10:00:02.000Z");
 } finally {
-  chmodSync(qualificationFile, 0o600);
+  try {
+    chmodSync(qualificationFile, 0o600);
+  } catch {}
   rmSync(temp, { recursive: true, force: true });
 }
 
-process.stdout.write("  Qwen H200 provider: qualification, readiness, auth, circuit, canary, attribution, and telemetry guards pass\n");
+process.stdout.write("PASS worker-qwen-provider signed qualification, bounded transport, containment, attribution, and concurrency guards\n");

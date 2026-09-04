@@ -110,6 +110,14 @@ function isEncryptedReasoningDetail(detail: unknown): detail is OpenAIEncryptedR
 export interface OpenAICompletionsOptions extends StreamOptions {
 	toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	/** Provider-scoped transport override for endpoint pinning and bounded response streams. */
+	fetch?: typeof globalThis.fetch;
+}
+
+export interface OpenAICompletionsSimpleOptions extends SimpleStreamOptions {
+	toolChoice?: OpenAICompletionsOptions["toolChoice"];
+	/** Provider-scoped transport override for endpoint pinning and bounded response streams. */
+	fetch?: typeof globalThis.fetch;
 }
 
 interface OpenAICompatCacheControl {
@@ -180,7 +188,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			const compat = getCompat(model);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, compat);
+			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, compat, options?.fetch);
 			let params = buildParams(model, context, options, compat, cacheRetention);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -487,22 +495,23 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 	return stream;
 };
 
-export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOptions> = (
+export const streamSimple: StreamFunction<"openai-completions", OpenAICompletionsSimpleOptions> = (
 	model: Model<"openai-completions">,
 	context: Context,
-	options?: SimpleStreamOptions,
+	options?: OpenAICompletionsSimpleOptions,
 ): AssistantMessageEventStream => {
 	getClientApiKey(model.provider, options?.apiKey, options?.headers);
 
 	const base = buildBaseOptions(model, context, options, options?.apiKey);
 	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
-	const toolChoice = (options as OpenAICompletionsOptions | undefined)?.toolChoice;
+	const toolChoice = options?.toolChoice;
 
 	return stream(model, context, {
 		...base,
 		reasoningEffort,
 		toolChoice,
+		fetch: options?.fetch,
 	} satisfies OpenAICompletionsOptions);
 };
 
@@ -513,6 +522,7 @@ function createClient(
 	optionsHeaders?: ProviderHeaders,
 	sessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
+	requestFetch?: typeof globalThis.fetch,
 ) {
 	const headers: ProviderHeaders = { ...model.headers };
 	if (model.provider === "github-copilot") {
@@ -540,6 +550,7 @@ function createClient(
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		defaultHeaders: headers,
+		fetch: requestFetch,
 	});
 }
 

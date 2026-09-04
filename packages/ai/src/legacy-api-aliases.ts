@@ -11,7 +11,7 @@ import type { MistralOptions } from "./api/mistral-conversations.ts";
 import { openAICodexResponsesApi } from "./api/openai-codex-responses.lazy.ts";
 import type { OpenAICodexResponsesOptions } from "./api/openai-codex-responses.ts";
 import { openAICompletionsApi } from "./api/openai-completions.lazy.ts";
-import type { OpenAICompletionsOptions } from "./api/openai-completions.ts";
+import type { OpenAICompletionsOptions, OpenAICompletionsSimpleOptions } from "./api/openai-completions.ts";
 import { openAIResponsesApi } from "./api/openai-responses.lazy.ts";
 import type { OpenAIResponsesOptions } from "./api/openai-responses.ts";
 import type { SimpleStreamOptions, StreamFunction } from "./types.ts";
@@ -93,7 +93,7 @@ export const streamOpenAICompletions = openAICompletionsStreams.stream as Stream
 /** @deprecated Use `streamSimple` from `@earendil-works/pi-ai/api/openai-completions` or `openAICompletionsApi().streamSimple`. */
 export const streamSimpleOpenAICompletions = openAICompletionsStreams.streamSimple as StreamFunction<
 	"openai-completions",
-	SimpleStreamOptions
+	OpenAICompletionsSimpleOptions
 >;
 
 /** @deprecated Use `stream` from `@earendil-works/pi-ai/api/openai-responses` or `openAIResponsesApi().stream`. */

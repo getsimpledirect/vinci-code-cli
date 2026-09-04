@@ -570,11 +570,17 @@ export class TaskLifecycle {
   startAttempt(task, vinciVersion, builds = {}) {
     if (this.isTerminal()) throw new Error(`cannot start an attempt on terminal state ${this.state.state}`);
     const firstAttempt = !(Number.isInteger(this.state.attempt) && this.state.attempt > 0);
-    const sessionId = typeof this.state.session_id === "string" && this.state.session_id ? this.state.session_id : task.id;
+    const nextAttempt = (Number.isInteger(this.state.attempt) ? this.state.attempt : 0) + 1;
+    // Qwen accounting is attempt-scoped. Reusing the task's durable session id blended usage and
+    // latency from a prior failed Attempt into its retry; a fresh deterministic session prevents
+    // that while the task id remains the WorkOrder lineage.
+    const sessionId = task.envelope.provider === "qwen-h200"
+      ? `${task.id}-qwen-attempt-${nextAttempt}`
+      : typeof this.state.session_id === "string" && this.state.session_id ? this.state.session_id : task.id;
     this.state = {
       ...this.state,
       task: task.id,
-      attempt: (Number.isInteger(this.state.attempt) ? this.state.attempt : 0) + 1,
+      attempt: nextAttempt,
       session_id: sessionId,
       state: "PENDING",
       started_at: new Date().toISOString(),

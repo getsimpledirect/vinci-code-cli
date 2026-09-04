@@ -313,42 +313,52 @@ Enable it only in the Worker process that should admit the lane by including `qw
 digest-WorkOrder-only; legacy prose handoffs are refused because they cannot carry the validated
 acceptance criteria and immutable contract binding required by this lane.
 
-The lane is fail-closed. Before it is registered, the client requires:
+The lane is fail-closed. Runtime registration requires all of the following:
 
-- `VINCI_QWEN_BASE_URL`: the operator-supplied HTTPS endpoint (loopback HTTP is allowed for local
-  tests). Credentials, query strings, and fragments are refused.
-- `VINCI_QWEN_SECRET_REF`: `file:/absolute/private/path` or `env:NAME`; this setting is a reference,
-  never a secret value. Credential files must be private, regular, and non-symlinked. The bootstrap
-  reference is scrubbed before repository tools run.
-- `VINCI_QWEN_QUALIFICATION_FILE` and `VINCI_QWEN_QUALIFICATION_SHA256`: an operator-owned,
-  non-writable qualification record and an exact process-level byte pin.
-- a deterministic Governor lease, plus WorkOrder, Run, and Attempt ids derived by the worker.
-  Model output supplies none of these identities.
+- `VINCI_QWEN_BASE_URL`: the operator HTTPS endpoint. Credentials, query strings, fragments,
+  redirects, IPv6, and private/local/reserved DNS answers are refused; loopback HTTP exists only for
+  tests. Every connection uses the public IPv4 addresses resolved and pinned during readiness.
+- `VINCI_QWEN_SECRET_REF=file:/absolute/private/path`: the worker opens a private, regular,
+  non-symlinked credential file and passes only inherited descriptor 3 to the child. The reference
+  is removed before spawn, the child consumes and closes the descriptor during provider bootstrap,
+  and neither the secret nor its reference is put in general child environment, argv, logs, or a
+  generated file. The WorkOrder prompt is sent on stdin, never argv.
+- `VINCI_QWEN_QUALIFICATION_FILE` plus its exact `VINCI_QWEN_QUALIFICATION_SHA256`, and an
+  independently controlled Ed25519 trust key plus `VINCI_QWEN_QUALIFICATION_PUBLIC_KEY_SHA256` and
+  `VINCI_QWEN_QUALIFICATION_ISSUER`. Qualification bytes and key bytes must be non-writable regular
+  files. An unsigned or self-admitted record is invalid.
+- a deterministic Governor lease and worker-derived WorkOrder, Run, and Attempt identities. Model
+  output supplies none of them. Each Worker attempt has its own session; every bounded transport
+  retry is recorded beneath that Attempt with a distinct idempotency key.
 
-Ayush's non-secret handoff is intentionally small: the externally reachable base URL; confirmation
-that bearer authentication is required by `/health`, `/v1/models`, and `/v1/chat/completions`; the
-exact `Qwen/Qwen3.8-27B` identifier and immutable served revision; runtime engine and version; the
-SHA-256 of the runtime artifact and canonical launch arguments; and the served context/output
-limits. `/v1/models` must return the exact revision and runtime tuple either on its one matching
-model object or through the documented `X-Vinci-Model-Revision` and `X-Vinci-Runtime-*` headers.
-Ayush supplies only the name of the operator-installed secret reference mechanism, never the
-credential itself in a WorkOrder, issue, log, or qualification record. Runtime launch flags, model
-download, GPU placement, and endpoint operation remain exclusively his lane.
+The signed v2 envelope has a maximum seven-day lifetime, cites a canary no more than 24 hours old,
+and binds the independent review message/body digest and burn-in report digest. Its closed payload
+binds the endpoint and served-identity digests; exact model and immutable revision; runtime
+engine/version/artifact/launch-arguments tuple; exact WorkOrder prompt; full assembled system
+prompt; ordered tool names, complete tool schemas, and governed tool policy; client and extension
+builds; outbound encoding; SSE/tool-call/usage capabilities; total deadline, retry and retry-delay
+caps; request/success/error body byte bounds; context/output limits; concurrency ceiling; and USD
+pricing basis/rates. Any missing, extra, stale, mismatched, or unverified field refuses registration.
 
-The closed qualification record binds the endpoint hash, exact model, immutable served revision,
-runtime engine/version/artifact/arguments tuple, exact task-prompt hash, exact ordered tool-list
-hash, streaming SSE and structured tool-call JSON, request timeout, concurrency, retries,
-retry-delay cap, context/output bounds, and operator token-cost estimates. `/health` and
-`/v1/models` are probed with authentication; an anonymous models request must be refused, and the
-model response must repeat the exact revision/runtime tuple. Three consecutive readiness failures
-open the persistent circuit for 60 seconds by default. `VINCI_QWEN_CIRCUIT_THRESHOLD` and
-`VINCI_QWEN_CIRCUIT_OPEN_MS` are bounded overrides.
+Authenticated `/health` and `/v1/models` must succeed while anonymous requests to both are refused.
+The models response and every successful inference response must repeat the exact model, revision,
+endpoint identity, and runtime tuple. The chat transport calls only the qualified URL, refuses
+redirects, keeps one total deadline across headers/body/retries, bounds error and successful SSE
+bodies, requires strict OpenAI chunk object/model/usage identities and `[DONE]`, and disables SDK
+retries. Real HTTP 500s and transport/protocol failures count toward an atomically persisted circuit;
+three failures open it for 60 seconds by default. `VINCI_QWEN_CIRCUIT_THRESHOLD` and
+`VINCI_QWEN_CIRCUIT_OPEN_MS` are bounded operator overrides.
 
-Concurrency starts at one. The qualification schema allows an explicit increase up to eight after
-burn-in; excess requests are rejected as backpressure, never queued without a bound. Transport
-retries are capped at two. High available token volume does not admit work: each digest handoff
-still needs bounded resources and acceptance criteria, and the worker refuses an invalid or
-over-broad WorkOrder before inference.
+Concurrency defaults to 1. The signed schema understands only the ladder
+`1 → 2 → 4 → 8 → 16 → 24 → 32`, never an intermediate value, and never above Ayush's advertised
+ceiling. Any stage above 1 must cite the immediately prior stage with at least 168 continuous hours
+and 1,000 WorkOrders, 100% acceptance pass and usage coverage, at most 0.5% transport errors, and
+zero identity failures, verification failures, circuit opens, resource alarms, or Governor stops.
+Promotion is a new independent review and signature; it is never automatic. Today the runtime has
+only its single-process permit, so every signed value above 1 still fails closed with
+`fleet_permit_authority_missing`. A future fleet authority must issue bounded, expiring, fenced
+permits keyed by WorkOrder/Run/Attempt, enforce the signed and advertised ceilings atomically across
+workers, and define a bounded queue before any stage above 1 can run.
 
 Qwen output gets a `vinci-qwen-output-label` session record marking it non-authoritative and
 requiring independent checking. It is never permission, a Governor ruling, merge authorization,
@@ -366,48 +376,58 @@ VINCI_QWEN_SECRET_REF=file:/run/secrets/vinci-qwen-token \
 node --experimental-strip-types vinci/extensions/lib/qwen-runtime.ts --canary
 ```
 
-The canary requires the endpoint's models response (or headers) to expose the served revision and
-runtime tuple. It requests one streaming `report_ready` tool call, checks that the assembled
-arguments are exactly `{ "status": "ready" }`, and prints JSON to stdout. It does not write or
-admit a qualification record.
+The canary requests one streaming `report_ready` tool call, requires exact arguments
+`{ "status": "ready" }` plus strict usage, and prints a non-authoritative JSON report. It cannot
+write or admit qualification.
 
-After independently reviewing that report, generate the exact per-WorkOrder qualification bytes
-locally. The command writes JSON to stdout only; redirect it to an operator-owned file, make that
-file non-writable, and pin its SHA-256 in the service environment. Required non-secret inputs are
-the endpoint, prompt file, ordered tool list, served revision, runtime engine/version, runtime
-artifact and arguments digests, context/output limits, and four estimated per-million-token rates.
-Defaults are timeout 120 seconds, one retry with a 5-second cap, and concurrency 1. Admission is an
-explicit operator act (`VINCI_QWEN_ADMIT=qualified`), never an inference result:
+After reviewing the canary and numeric burn-in report, generate an **unsigned request** for the
+never-builder reviewer. The command prints JSON only. The full system-prompt, tool-schema, canary,
+burn-in, and WorkOrder-prompt files must be operator-owned and non-writable:
 
 ```
-VINCI_QWEN_ADMIT=qualified \
 VINCI_QWEN_BASE_URL=https://operator-endpoint.example \
 VINCI_QWEN_QUALIFICATION_PROMPT_FILE=/absolute/work-order-prompt.txt \
+VINCI_QWEN_QUALIFICATION_SYSTEM_PROMPT_FILE=/absolute/full-system-prompt.txt \
+VINCI_QWEN_QUALIFICATION_TOOL_SCHEMAS_FILE=/absolute/ordered-tool-schemas.json \
 VINCI_QWEN_QUALIFICATION_TOOLS='["read","grep","find","ls","bash","edit","write"]' \
+VINCI_QWEN_CANARY_REPORT_FILE=/absolute/canary-v2.json \
+VINCI_QWEN_BURN_IN_REPORT_FILE=/absolute/burn-in-v1.json \
 VINCI_QWEN_SERVED_REVISION=<40-or-64-hex> \
 VINCI_QWEN_RUNTIME_ENGINE=vllm \
 VINCI_QWEN_RUNTIME_VERSION=<exact-version> \
 VINCI_QWEN_RUNTIME_ARTIFACT_SHA256=<64hex> \
 VINCI_QWEN_RUNTIME_ARGUMENTS_SHA256=<64hex> \
+VINCI_QWEN_ENDPOINT_IDENTITY_SHA256=<64hex> \
+VINCI_QWEN_CLIENT_BUILD_SHA256=<64hex> \
+VINCI_QWEN_EXTENSION_BUILD_SHA256=<64hex> \
+VINCI_QWEN_ADVERTISED_MAX_CONCURRENCY=<1..32> \
 VINCI_QWEN_CONTEXT_WINDOW=<tokens> VINCI_QWEN_MAX_TOKENS=<tokens> \
+VINCI_QWEN_PRICE_BASIS=<documented-estimate-basis> \
 VINCI_QWEN_INPUT_PER_MILLION_USD=<estimate> \
 VINCI_QWEN_OUTPUT_PER_MILLION_USD=<estimate> \
 VINCI_QWEN_CACHE_READ_PER_MILLION_USD=<estimate> \
 VINCI_QWEN_CACHE_WRITE_PER_MILLION_USD=<estimate> \
-node --experimental-strip-types vinci/extensions/lib/qwen-runtime.ts --qualification-template
+node --experimental-strip-types vinci/extensions/lib/qwen-runtime.ts --qualification-request
 ```
+
+The independent reviewer verifies the evidence, adds issuer/timestamps/review provenance, and signs
+the canonical qualification with the separately controlled key. The Qwen builder/operator must not
+possess that signing key. Requalification is mandatory after a failed/expired canary or any change
+to capabilities/limits, client build, endpoint identity/address policy, model/revision, outbound
+encoding, pricing basis, runtime artifact/arguments, system prompt, or tool schema/policy.
 
 Per-attempt telemetry remains in the existing economics summary: `work_order_id`, `session_id`
 (Run), `attempt_label`, `started_at`/`finished_at` (wall latency), terminal `local_result`, and the
 per-provider/model roll-up of calls, input/cache/output/reasoning tokens and estimated micro-USD.
 The route is `single-provider-no-automatic-fallback` and names Qwen when inference occurred.
 
-Burn-in is deliberately small and ordered: one canary; one WorkOrder at concurrency 1; three
-sequential WorkOrders; then a 15-minute soak of batches of at most four WorkOrders with concurrency
-still 1. Review token totals, wall latency (`started_at`/`finished_at`), terminal outcome, estimated
-cost, readiness failures, and circuit state after each step. Raise qualified concurrency to 2 only
-after every acceptance criterion passes; repeat the soak before any further explicit increase.
-Hundreds of millions of available tokens are capacity, not an acceptance signal.
+Stop admission and drain in-flight work on any identity/auth/signature mismatch, failed canary,
+acceptance or verification failure, missing/malformed usage, circuit open, resource alarm, Governor
+stop/denial, or a transport error rate above 0.5%. Do not skip a ladder stage and do not resume a
+stopped stage: `safe_resume` is always `false`; recovery requires fresh canary/burn-in evidence and a
+new independent qualification. Hundreds of millions of available tokens are capacity, not an
+acceptance signal. There is no automatic fallback: OpenRouter is a new, explicitly authorized
+attempt with its own envelope, lease, Run, Attempt, session, and accounting.
 
 ### Base checkout (`baseRef` / `baseCommit`)
 
@@ -653,8 +673,9 @@ configured nothing changes (no downgrade), so soak boxes may run without it.
 - `VINCI_DECLARATION_REFRESH_S`: how often (seconds) a governed daemon re-posts its capability declaration; default `21600` (6h), and anything that is not a positive number falls back to the default. It must stay comfortably below the Governor's `VGC_DECLARATION_MAX_AGE_S` (default 86400), which is when a declaration expires and admission starts answering `eligible: false, reason: stale_declaration`. **The default is chosen against row retention, not liveness** (gpu-control §32): the Governor's `worker_declarations` table is append-only with a DELETE trigger and every refresh writes an audit row, so the volume cannot be pruned later. 6h keeps four refreshes inside the 24h window — three consecutive failed re-posts can be absorbed before one goes stale — at a quarter the rows of hourly, which buys no liveness at all
 - `GH_TOKEN`: (optional) GitHub machine user token for cloning/pushing private repos and creating PRs
 - `OPENROUTER_API_KEY`: (or provider-specific key) via vinci's standard configuration
-- `VINCI_QWEN_BASE_URL` + `VINCI_QWEN_SECRET_REF`: direct Qwen endpoint and credential reference;
-  never place the credential value in worker configuration
+- `VINCI_QWEN_BASE_URL` + `VINCI_QWEN_SECRET_REF=file:/absolute/private/path`: direct Qwen endpoint
+  and worker-only credential-file reference; the worker converts the reference to child descriptor
+  3 and removes it before spawn. Never place the credential value in worker configuration
 
 Never hardcode. Use systemd SecureString parameters, AWS Secrets Manager, or similar.
 
@@ -810,12 +831,13 @@ byte-for-byte what it was.
 **The child's environment (exact allowlist).** Copied verbatim from the daemon when set:
 `PATH`, `LANG`, `VINCI_ENV`, `VINCI_BASE_URL`, `VINCI_PLATFORM_URL`, `VINCI_NO_BOOTSTRAP_HEAL`,
 `VINCI_TOOL_BOOTSTRAP`, `VINCI_SHOW_OTHER_PROVIDERS`, `VINCI_SOURCE_CLI`, and the Qwen
-endpoint/secret-reference/qualification/circuit settings above — the variables
+endpoint/worker-only secret-reference/qualification/circuit settings above — the variables
 `vinci/bin/vinci` and the install shim read to find the backend and the run mode. Plus **only** the
 key the envelope's `provider:` authenticates with: `OPENROUTER_API_KEY` for `openrouter`,
 `VINCI_API_KEY` for `vinci`, `VINCI_INTERNAL_DEEPINFRA_API_KEY` for `deepinfra` (an unknown provider
 gets no key and the launcher refuses it, as today). `qwen-h200` carries no credential value through
-the allowlist; its extension resolves the narrow reference during bootstrap. Set by the daemon, never copied: `HOME` and
+the allowlist; immediately before spawn the worker replaces its narrow file reference with inherited
+descriptor 3, and the extension consumes that descriptor during bootstrap. Set by the daemon, never copied: `HOME` and
 `TMPDIR` (per attempt), `VINCI_CODING_AGENT_DIR` and `PI_CODING_AGENT_DIR` (both spellings, both
 `<attempt>.home/agent` — the daemon's own slot is **not** passed through: it holds `auth.json` for
 every provider, every prior session and `bin/`), `VINCI_HOME` (the launcher's install root — the
