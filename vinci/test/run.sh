@@ -273,6 +273,7 @@ run_group ask-checklist-integration node "${ROOT}/vinci/test/ask-checklist-integ
 run_group issue-integration node "${ROOT}/vinci/test/issue-integration.mjs"
 run_group billing-codes-integration node "${ROOT}/vinci/test/billing-codes-integration.mjs"
 run_group 402-classification-integration node "${ROOT}/vinci/test/402-classification-integration.mjs"
+run_group 402-escalation-no-downgrade node "${ROOT}/vinci/test/402-escalation-no-downgrade.mjs"
 run_group no-downgrade-integration node "${ROOT}/vinci/test/no-downgrade-integration.mjs"
 run_group units node "${ROOT}/vinci/test/units.mjs"
 # Worker daemon: every vinci/test/worker-*.mjs runs, discovered by glob so a new file cannot be
