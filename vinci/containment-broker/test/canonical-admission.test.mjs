@@ -19,6 +19,23 @@ import {
 
 const KEY = Buffer.alloc(32, 0x43);
 
+function historicalReceipt(payload) {
+  const legacyBody = Buffer.from(
+    '{"key_id":"root-key:v3","kind":"terminal","payload":{"$bytes_base64":"3q2+7w=="},"schema":"vinci.containment-broker.receipt/v3"}',
+  );
+  return {
+    authentication: {
+      algorithm: "hmac-sha256",
+      mac: createHmac("sha256", KEY).update(legacyBody).digest("hex"),
+    },
+    body_sha256: createHash("sha256").update(legacyBody).digest("hex"),
+    key_id: "root-key:v3",
+    kind: "terminal",
+    payload,
+    schema: "vinci.containment-broker.receipt/v3",
+  };
+}
+
 test("canonical values reject the historical Buffer/plain-object receipt collision", () => {
   const bytes = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
   assert.throws(
@@ -41,21 +58,130 @@ test("canonical values reject the historical Buffer/plain-object receipt collisi
 
   // This is the exact v3 receipt body that the vulnerable encoder authenticated for either
   // structural input. Verification must reject the historical ambiguous representation too.
-  const legacyBody = Buffer.from(
-    '{"key_id":"root-key:v3","kind":"terminal","payload":{"$bytes_base64":"3q2+7w=="},"schema":"vinci.containment-broker.receipt/v3"}',
-  );
-  const legacyReceipt = {
-    authentication: {
-      algorithm: "hmac-sha256",
-      mac: createHmac("sha256", KEY).update(legacyBody).digest("hex"),
-    },
-    body_sha256: createHash("sha256").update(legacyBody).digest("hex"),
-    key_id: "root-key:v3",
-    kind: "terminal",
-    payload: { $bytes_base64: "3q2+7w==" },
-    schema: "vinci.containment-broker.receipt/v3",
-  };
+  const legacyReceipt = historicalReceipt({ $bytes_base64: "3q2+7w==" });
   assert.equal(verifyReceipt(legacyReceipt, { kind: "terminal", keyId: "root-key:v3", key: KEY }), false);
+});
+
+test("receipt verification rejects Proxy values before traps and always fails closed", () => {
+  let trapCalls = 0;
+  const historicalPayload = new Proxy({ $bytes_base64: "3q2+7w==" }, {
+    has(target, property) {
+      trapCalls += 1;
+      if (property === "$bytes_base64") return false;
+      return Reflect.has(target, property);
+    },
+    ownKeys(target) {
+      trapCalls += 1;
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      trapCalls += 1;
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  assert.equal(verifyReceipt(historicalReceipt(historicalPayload), {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+  }), false);
+  assert.equal(trapCalls, 0, "Proxy traps must not participate in canonical validation");
+
+  const nestedReceipt = authenticateReceipt({
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+    payload: { nested: { value: true } },
+  });
+  const nestedProxy = new Proxy({ value: true }, {
+    getPrototypeOf(target) {
+      trapCalls += 1;
+      return Reflect.getPrototypeOf(target);
+    },
+  });
+  assert.equal(verifyReceipt({
+    ...nestedReceipt,
+    payload: { nested: nestedProxy },
+  }, { kind: "terminal", keyId: "root-key:v3", key: KEY }), false);
+
+  const revocable = Proxy.revocable(structuredClone(nestedReceipt), {});
+  revocable.revoke();
+  assert.doesNotThrow(() => verifyReceipt(revocable.proxy, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+  }));
+  assert.equal(verifyReceipt(revocable.proxy, { kind: "terminal", keyId: "root-key:v3", key: KEY }), false);
+
+  const throwingAuthentication = structuredClone(nestedReceipt);
+  Object.defineProperty(throwingAuthentication, "authentication", {
+    enumerable: true,
+    get() {
+      throw new Error("authentication getter must never escape verification");
+    },
+  });
+  assert.doesNotThrow(() => verifyReceipt(throwingAuthentication, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+  }));
+  assert.equal(verifyReceipt(throwingAuthentication, {
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+  }), false);
+
+  const throwingOptions = new Proxy({}, {
+    get() {
+      throw new Error("verification option getter must never escape");
+    },
+  });
+  assert.doesNotThrow(() => verifyReceipt(nestedReceipt, throwingOptions));
+  assert.equal(verifyReceipt(nestedReceipt, throwingOptions), false);
+});
+
+test("canonical snapshots resist descriptor, prototype, and post-validation mutation", () => {
+  const target = { value: true };
+  const originalPrototype = Object.getPrototypeOf(target);
+  let trapCalls = 0;
+  const coordinated = new Proxy(target, {
+    getPrototypeOf(inner) {
+      trapCalls += 1;
+      Object.defineProperty(inner, "hidden", { value: true });
+      Object.setPrototypeOf(inner, null);
+      return null;
+    },
+  });
+  assert.throws(() => canonicalBytes({ nested: coordinated }), /Proxy values are not canonical/);
+  assert.equal(trapCalls, 0);
+  assert.equal(Object.getPrototypeOf(target), originalPrototype);
+  assert.equal(Object.hasOwn(target, "hidden"), false);
+
+  const sourcePayload = { nested: { decision: "original" } };
+  const receipt = authenticateReceipt({
+    kind: "terminal",
+    keyId: "root-key:v3",
+    key: KEY,
+    payload: sourcePayload,
+  });
+  sourcePayload.nested.decision = "mutated-after-authentication";
+  Object.setPrototypeOf(sourcePayload.nested, null);
+  assert.equal(receipt.payload.nested.decision, "original");
+  assert.equal(verifyReceipt(receipt, { kind: "terminal", keyId: "root-key:v3", key: KEY }), true);
+});
+
+test("canonical numbers reject unsafe cross-language mathematical integers", () => {
+  assert.equal(canonicalBytes({ value: Number.MIN_SAFE_INTEGER }).toString("utf8"), '{"value":-9007199254740991}');
+  assert.equal(canonicalBytes({ value: Number.MAX_SAFE_INTEGER }).toString("utf8"), '{"value":9007199254740991}');
+  assert.throws(() => canonicalBytes({ value: Number.MIN_SAFE_INTEGER - 1 }), /safe integers/);
+  assert.throws(() => canonicalBytes({ value: Number.MAX_SAFE_INTEGER + 1 }), /safe integers/);
+  assert.throws(() => decodeCanonicalBytes(Buffer.from('{"value":-9007199254740992}')), /unsupported or reserved/);
+  assert.throws(() => decodeCanonicalBytes(Buffer.from('{"value":9007199254740992}')), /unsupported or reserved/);
+
+  // Python and other arbitrary-precision decoders keep these integers distinct; JavaScript does not.
+  const lower = JSON.parse('{"value":9007199254740992}');
+  const higher = JSON.parse('{"value":9007199254740993}');
+  assert.equal(lower.value, higher.value);
+  assert.throws(() => decodeCanonicalBytes(Buffer.from('{"value":9007199254740993}')), /unsupported or reserved/);
 });
 
 test("canonical JSON has one stable round-trip representation", () => {

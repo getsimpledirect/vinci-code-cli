@@ -1,7 +1,9 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { types as utilTypes } from "node:util";
 
 export const RECEIPT_SCHEMA = "vinci.containment-broker.receipt/v3";
 
+const { isProxy } = utilTypes;
 const RESERVED_BYTES_FIELD = "$bytes_base64";
 
 function plainObjectEntries(value) {
@@ -55,10 +57,14 @@ function denseArrayValues(value) {
 }
 
 function normalize(value, seen) {
+  if (isProxy(value)) throw new TypeError("Proxy values are not canonical");
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new TypeError("canonical values require finite numbers");
     if (Object.is(value, -0)) throw new TypeError("canonical values do not support negative zero");
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new TypeError("canonical values require safe integers");
+    }
     return value;
   }
   if (Buffer.isBuffer(value)) {
@@ -81,8 +87,12 @@ function normalize(value, seen) {
   return output;
 }
 
+function snapshotCanonicalValue(value) {
+  return deepFreeze(normalize(value, new Set()));
+}
+
 export function canonicalBytes(value) {
-  return Buffer.from(JSON.stringify(normalize(value, new Set())), "utf8");
+  return Buffer.from(JSON.stringify(snapshotCanonicalValue(value)), "utf8");
 }
 
 export function sha256(value) {
@@ -140,7 +150,7 @@ export function authenticateReceipt({ kind, keyId, key, payload }) {
     schema: RECEIPT_SCHEMA,
     kind,
     key_id: keyId,
-    payload: normalize(payload, new Set()),
+    payload: snapshotCanonicalValue(payload),
   };
   const bodyBytes = canonicalBytes(body);
   return deepFreeze({
@@ -153,14 +163,12 @@ export function authenticateReceipt({ kind, keyId, key, payload }) {
   });
 }
 
-export function verifyReceipt(receipt, { kind, keyId, key }) {
+function verifyReceiptUnchecked(receipt, { kind, keyId, key }) {
   requireKey(key);
   if (Buffer.isBuffer(receipt)) {
-    try {
-      receipt = decodeCanonicalBytes(receipt);
-    } catch {
-      return false;
-    }
+    receipt = decodeCanonicalBytes(receipt);
+  } else {
+    receipt = snapshotCanonicalValue(receipt);
   }
   const receiptKeys = ["authentication", "body_sha256", "key_id", "kind", "payload", "schema"];
   if (!hasExactPlainFields(receipt, receiptKeys)
@@ -177,12 +185,7 @@ export function verifyReceipt(receipt, { kind, keyId, key }) {
     key_id: receipt.key_id,
     payload: receipt.payload,
   };
-  let bodyBytes;
-  try {
-    bodyBytes = canonicalBytes(body);
-  } catch {
-    return false;
-  }
+  const bodyBytes = canonicalBytes(body);
   if (receipt.body_sha256 !== sha256(bodyBytes)) return false;
   const expected = createHmac("sha256", key).update(bodyBytes).digest();
   let actual;
@@ -193,4 +196,12 @@ export function verifyReceipt(receipt, { kind, keyId, key }) {
     return false;
   }
   return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export function verifyReceipt(receipt, options) {
+  try {
+    return verifyReceiptUnchecked(receipt, options);
+  } catch {
+    return false;
+  }
 }
