@@ -1210,6 +1210,47 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
   const tools = Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools.join(",") : "read,grep,find,ls,bash,edit,write";
   const taskEnvironment = applyEnvDelta(env ?? process.env, envDelta);
   taskEnvironment.VINCI_UPDATE_DISABLED = "1";
+  // The direct H200 lane is one exact, pre-qualified provider. These values are derived by the
+  // worker, not accepted from the model or repository, and bind the provider extension to the
+  // WorkOrder/Run/Attempt plus the exact prompt and tool surface for this invocation.
+  if (envelope.provider === "qwen-h200") {
+    if (envelope.model !== "Qwen/Qwen3.8-27B") {
+      throw blocked("qwen_model_mismatch", "qwen_model_mismatch: qwen-h200 may serve only Qwen/Qwen3.8-27B");
+    }
+    const workOrderId = envelope.work_order_id;
+    if (typeof workOrderId !== "string" || !workOrderId) {
+      throw blocked(
+        "qwen_attribution_missing",
+        "qwen_attribution_missing: qwen-h200 requires a validated digest WorkOrder identity and acceptance criteria",
+      );
+    }
+    let attempt;
+    try {
+      attempt = JSON.parse(readFileSync(join(stateDir, "tasks", `${taskId}.json`), "utf8")).attempt;
+    } catch {
+      throw blocked("qwen_attribution_missing", "qwen_attribution_missing: task attempt state is unavailable");
+    }
+    if (!Number.isSafeInteger(attempt) || attempt < 1) {
+      throw blocked("qwen_attribution_missing", "qwen_attribution_missing: task attempt is invalid");
+    }
+    taskEnvironment.VINCI_QWEN_SELECTED = "1";
+    taskEnvironment.VINCI_QWEN_WORK_ORDER_ID = workOrderId;
+    taskEnvironment.VINCI_QWEN_RUN_ID = sessionId;
+    taskEnvironment.VINCI_QWEN_ATTEMPT_ID = `${taskId}/${attempt}`;
+    taskEnvironment.VINCI_QWEN_PROMPT_SHA256 = sha256(envelope.spec);
+    taskEnvironment.VINCI_QWEN_TOOLS_SHA256 = sha256(canonicalize(Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools : tools.split(",")));
+    taskEnvironment.VINCI_QWEN_CIRCUIT_FILE = join(stateDir, "qwen-h200", "circuit.json");
+  } else {
+    for (const name of [
+      "VINCI_QWEN_SELECTED",
+      "VINCI_QWEN_WORK_ORDER_ID",
+      "VINCI_QWEN_RUN_ID",
+      "VINCI_QWEN_ATTEMPT_ID",
+      "VINCI_QWEN_PROMPT_SHA256",
+      "VINCI_QWEN_TOOLS_SHA256",
+      "VINCI_QWEN_CIRCUIT_FILE",
+    ]) delete taskEnvironment[name];
+  }
   for (const name of [
     "VINCI_WORKER_DEBRIS_ROOT_ANCHOR",
     "VINCI_WORKER_DEBRIS_ROOT_ANCHOR_SHA256",

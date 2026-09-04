@@ -1,5 +1,23 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  type Api,
+  createAssistantMessageEventStream,
+  type Context,
+  type Model,
+  type SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
+import { streamSimple as streamOpenAICompletions } from "@earendil-works/pi-ai/api/openai-completions";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
+import {
+  assertQwenCircuitClosed,
+  ensureQwenReady,
+  QWEN_API,
+  QWEN_MODEL,
+  QWEN_PROVIDER,
+  recordQwenCircuitOutcome,
+  scrubQwenBootstrapEnvironment,
+  type QwenRuntimeConfig,
+} from "./lib/qwen-runtime.ts";
 import { setVinciConnection } from "./lib/ui-state.ts";
 import { VINCI_BILLING_URL, VINCI_GATEWAY_BASE_URL, VINCI_PLATFORM_BASE_URL } from "./vinci-links.ts";
 
@@ -134,6 +152,101 @@ function vinciClassModel(id: string, name: string) {
   };
 }
 
+function qwenProviderConfig(runtime: QwenRuntimeConfig) {
+  let inFlight = 0;
+  return {
+    name: "Qwen 3.8 27B (Vinci H200, non-authoritative)",
+    baseUrl: runtime.baseUrl,
+    // A non-secret sentinel satisfies provider registration. The resolved credential is held only
+    // in this closure and replaces this value at the actual OpenAI-compatible request boundary.
+    apiKey: "runtime-resolved-secret-reference",
+    api: QWEN_API,
+    streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
+      assertQwenCircuitClosed(runtime);
+      if (inFlight >= runtime.qualification.limits.max_concurrency) {
+        throw new Error("qwen_concurrency_exceeded: the qualified single-request bound is already in use");
+      }
+      inFlight += 1;
+      let source;
+      try {
+        source = streamOpenAICompletions(
+          { ...model, api: "openai-completions" } as Model<"openai-completions">,
+          context,
+          {
+            ...options,
+            apiKey: runtime.secret,
+            timeoutMs: runtime.qualification.limits.timeout_ms,
+            maxRetries: runtime.qualification.limits.max_retries,
+            maxRetryDelayMs: runtime.qualification.limits.max_retry_delay_ms,
+          },
+        );
+      } catch (error) {
+        inFlight -= 1;
+        throw error;
+      }
+      const bounded = createAssistantMessageEventStream();
+      void (async () => {
+        try {
+          for await (const event of source) bounded.push(event);
+        } catch (error) {
+          recordQwenCircuitOutcome(runtime, false, "stream_error");
+          const message = {
+            role: "assistant" as const,
+            content: [],
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "error" as const,
+            errorMessage: error instanceof Error ? error.message : String(error),
+            timestamp: Date.now(),
+          };
+          bounded.push({ type: "error", reason: "error", error: message });
+          bounded.end(message);
+        } finally {
+          inFlight -= 1;
+        }
+      })();
+      return bounded;
+    },
+    models: [
+      {
+        id: QWEN_MODEL,
+        name: "Qwen 3.8 27B (qualified, non-authoritative)",
+        reasoning: true,
+        thinkingLevelMap: { off: "off", minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "high" },
+        input: ["text"] as Array<"text">,
+        contextWindow: runtime.qualification.limits.context_window,
+        maxTokens: runtime.qualification.limits.max_tokens,
+        cost: {
+          input: runtime.qualification.pricing.input_per_million_usd,
+          output: runtime.qualification.pricing.output_per_million_usd,
+          cacheRead: runtime.qualification.pricing.cache_read_per_million_usd,
+          cacheWrite: runtime.qualification.pricing.cache_write_per_million_usd,
+        },
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          supportsUsageInStreaming: true,
+          maxTokensField: "max_tokens" as const,
+          requiresToolResultName: true,
+          supportsStrictMode: false,
+          supportsLongCacheRetention: false,
+          thinkingFormat: "qwen-chat-template" as const,
+        },
+      },
+    ],
+  };
+}
+
 /**
  * Compose a terminal message for a Vinci billing refusal.
  * Accepts either a full error body (for structured codes) or just the error message text (for backward compat).
@@ -253,7 +366,7 @@ async function loginVinci(callbacks: OAuthLoginCallbacks): Promise<OAuthCredenti
   throw new Error("Pairing timed out — run /login vinci again.");
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
   let pending402RetryAfterMs: number | undefined;
   let retryDelayMs: number | undefined;
   let affordableTokenLimit: number | undefined;
@@ -315,6 +428,44 @@ export default function (pi: ExtensionAPI) {
           },
         },
       ],
+    });
+  }
+
+  let qwenRuntime: QwenRuntimeConfig | undefined;
+  if (process.env.VINCI_QWEN_SELECTED === "1") {
+    qwenRuntime = await ensureQwenReady();
+    pi.registerProvider(QWEN_PROVIDER, qwenProviderConfig(qwenRuntime));
+    scrubQwenBootstrapEnvironment();
+
+    pi.on("before_provider_headers", (event, ctx) => {
+      if (ctx.model?.provider !== QWEN_PROVIDER || !qwenRuntime) return;
+      event.headers["x-vinci-work-order-id"] = qwenRuntime.attribution.workOrderId;
+      event.headers["x-vinci-run-id"] = qwenRuntime.attribution.runId;
+      event.headers["x-vinci-attempt-id"] = qwenRuntime.attribution.attemptId;
+      event.headers["x-vinci-qwen-output-authority"] = "non-authoritative";
+      event.headers["x-vinci-qwen-qualification-sha256"] = qwenRuntime.qualificationSha256;
+    });
+
+    pi.on("after_provider_response", (event, ctx) => {
+      if (ctx.model?.provider !== QWEN_PROVIDER || !qwenRuntime) return;
+      recordQwenCircuitOutcome(qwenRuntime, event.status >= 200 && event.status < 300, `http_${event.status}`);
+    });
+
+    pi.on("message_end", (event, ctx) => {
+      if (event.message.role !== "assistant" || event.message.provider !== QWEN_PROVIDER || !qwenRuntime) return;
+      pi.appendEntry("vinci-qwen-output-label", {
+        authority: "non-authoritative",
+        independent_check_required: true,
+        model: QWEN_MODEL,
+        revision: qwenRuntime.qualification.revision,
+        runtime: qwenRuntime.qualification.runtime,
+        qualification_sha256: qwenRuntime.qualificationSha256,
+        work_order_id: qwenRuntime.attribution.workOrderId,
+        run_id: qwenRuntime.attribution.runId,
+        attempt_id: qwenRuntime.attribution.attemptId,
+        outcome: event.message.stopReason,
+        session_id: ctx.sessionManager.getSessionId(),
+      });
     });
   }
 

@@ -423,6 +423,7 @@ export function materializeEnvelope(triple, registry, opts = {}) {
 
   return {
     envelope: {
+      work_order_id: triple.work_order_id,
       repo,
       evidence,
       provider,
