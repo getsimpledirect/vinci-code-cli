@@ -778,6 +778,9 @@ run_group scope-integration node "${ROOT}/vinci/test/scope-integration.mjs"
 # Mid-run steering amends the scope task; it never shrinks it to just the adjustment.
 run_group scope-amendment-integration node "${ROOT}/vinci/test/scope-amendment-integration.mjs"
 run_group shell-integration node "${ROOT}/vinci/test/shell-integration.mjs"
+# Keep the SSRF production-import lane registered in this canonical harness; the adjacent pin test
+# fails if this exact group is later dropped or silently redirected.
+run_group search-ssrf-registration node "${ROOT}/vinci/test/search-ssrf-registration.mjs"
 run_group repo-corpus-unit node "${ROOT}/vinci/test/ec2/repo-corpus-unit.mjs"
 run_group aggregate-corpus-unit node "${ROOT}/vinci/test/ec2/aggregate-corpus-unit.mjs"
 run_group verify-holdout-corpus-unit node "${ROOT}/vinci/test/ec2/verify-holdout-corpus-unit.mjs"
@@ -798,6 +801,8 @@ if node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.ex
   run_group mask-integration node --experimental-strip-types "${ROOT}/vinci/test/mask-integration.mjs"
   # prompt-injection boundary: untrusted web content fenced so a page can't hijack the agent.
   run_group search-integration node --experimental-strip-types "${ROOT}/vinci/test/search-integration.mjs"
+  # SSRF boundary: drive the real search extension through helper and WHATWG URL forms.
+  run_group search-ssrf node --experimental-strip-types "${ROOT}/vinci/extensions/vinci-search.test.mjs"
   # command sandbox: real write confinement through macOS sandbox-exec or Linux bubblewrap.
   run_group sandbox-integration node --experimental-strip-types "${ROOT}/vinci/test/sandbox-integration.mjs"
   # session auto-naming: model title reply → tidy session name for the resume picker.
