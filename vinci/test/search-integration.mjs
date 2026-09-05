@@ -73,6 +73,8 @@ const publicIps = [
   "93.184.216.34",
   "[2606:2800:220:1:248:1893:25c8:1946]",
   "2606:2800:220:1:248:1893:25c8:1946",
+  "172.32.0.1", // outside 172.16-31 → public (boundary control)
+  "100.128.0.1", // outside 100.64-127 → public (boundary control)
 ];
 for (const ip of publicIps) {
   ok(`isPrivateIp(${ip}) === false`, isPrivateIp(ip) === false);
@@ -87,12 +89,10 @@ const blocked = [
   "10.255.255.255",
   "172.16.0.1",
   "172.31.255.255",
-  "172.32.0.1", // NOT private (outside 172.16-31) — control amongst the blockers
   "192.168.1.1",
   "169.254.169.254",
   "100.64.0.1",
   "100.127.255.255",
-  "100.128.0.1", // NOT private (outside 100.64-127) — control
   "[fe80::1]",
   "[fc00::1]",
   "[fd12:3456:789a::1]",
