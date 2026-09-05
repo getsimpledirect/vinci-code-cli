@@ -208,6 +208,17 @@ function formatDocs(library: string, topic: string | undefined, docs: string, tr
 const FETCH_MAX_CHARS = 30000; // cap the extracted text — a docs page can be huge; more just bloats context
 const FETCH_MAX_BYTES = 5_000_000; // refuse to download more than ~5MB of HTML
 
+/** Decode the 32 bits after an IPv4-mapped / NAT64 /96 prefix as a dotted-quad IPv4 string.
+ *  Accepts both spellings: ``::ffff:127.0.0.1`` (dotted) and ``::ffff:7f00:1`` (hex).
+ *  Returns null when the tail isn't a valid embedded IPv4. */
+function ipv4FromTail(tail: string): string | null {
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(tail)) return tail;
+  const hex = tail.match(/^([0-9a-f]{1,4})(?::([0-9a-f]{1,4}))?$/);
+  if (!hex) return null;
+  const n = (parseInt(hex[1], 16) << 16) | (hex[2] ? parseInt(hex[2], 16) : 0);
+  return `${( n >>> 24) & 0xff}.${( n >>> 16) & 0xff}.${( n >>> 8) & 0xff}.${n & 0xff}`;
+}
+
 /** SSRF guard: is this IP literal private / loopback / link-local / cloud-metadata? Blocks the classic
  *  prompt-injection "fetch http://169.254.169.254/latest/meta-data/…" credential-theft vector. */
 export function isPrivateIp(ip: string): boolean {
@@ -224,7 +235,14 @@ export function isPrivateIp(ip: string): boolean {
   }
   const low = ip.toLowerCase().replace(/^\[|\]$/g, "");
   if (low === "::1" || low === "::") return true;
-  if (low.startsWith("::ffff:")) return isPrivateIp(low.slice(7)); // IPv4-mapped IPv6
+  // IPv4-mapped IPv6 (::ffff:127.0.0.1 / ::ffff:7f00:1) and NAT64 (64:ff9b::/96) embed an IPv4
+  // in their last 32 bits. WHATWG new URL() normalizes the dotted form to hex before we see it,
+  // so decode the embedded IPv4 and classify IT rather than assuming one spelling.
+  const mapped = low.match(/^(::ffff:|64:ff9b::)(.*)$/);
+  if (mapped) {
+    const embedded = ipv4FromTail(mapped[2] ?? "");
+    if (embedded !== null) return isPrivateIp(embedded);
+  }
   if (low.startsWith("fe80") || low.startsWith("fc") || low.startsWith("fd")) return true; // link-local / ULA
   return false;
 }
