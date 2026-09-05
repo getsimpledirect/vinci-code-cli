@@ -23,6 +23,7 @@
  * Additive: no core edit.
  */
 import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -207,6 +208,16 @@ function formatDocs(library: string, topic: string | undefined, docs: string, tr
 
 const FETCH_MAX_CHARS = 30000; // cap the extracted text — a docs page can be huge; more just bloats context
 const FETCH_MAX_BYTES = 5_000_000; // refuse to download more than ~5MB of HTML
+export const WEB_FETCH_MAX_REDIRECTS = 5;
+
+type WebFetchDependencies = {
+  fetch: typeof globalThis.fetch;
+  lookup: (hostname: string, options: { all: true }) => Promise<unknown>;
+};
+
+export type PublicPageFetchResult =
+  | { ok: true; response: Response; url: URL }
+  | { ok: false; reason: string; url?: URL };
 
 /** Decode the 32 bits after an IPv4-mapped / NAT64 /96 prefix as a dotted-quad IPv4 string.
  *  Accepts both spellings: ``::ffff:127.0.0.1`` (dotted) and ``::ffff:7f00:1`` (hex).
@@ -287,6 +298,97 @@ export function preflightUrl(raw: string): { ok: true; url: URL } | { ok: false;
     return { ok: false, reason: "That address points to an internal server, not the public web." };
   }
   return { ok: true, url };
+}
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+async function resolvePublicHost(url: URL, lookupHost: WebFetchDependencies["lookup"]): Promise<string | undefined> {
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":")) return undefined;
+  try {
+    const addrs = await lookupHost(host, { all: true });
+    if (!Array.isArray(addrs) || addrs.length === 0) return "Couldn't resolve that web address.";
+    if (
+      !addrs.every(
+        (entry): entry is { address: string } =>
+          typeof entry === "object" &&
+          entry !== null &&
+          !Array.isArray(entry) &&
+          typeof (entry as { address?: unknown }).address === "string" &&
+          (entry as { address: string }).address.length > 0,
+      )
+    ) {
+      return "Couldn't resolve that web address.";
+    }
+    if (addrs.some(({ address }) => isIP(address) === 0)) {
+      return "That web address returned an invalid DNS address — not reading it.";
+    }
+    if (addrs.some(({ address }) => isPrivateIp(address))) {
+      return "That address resolves to an internal server — not reading it.";
+    }
+  } catch {
+    return "Couldn't resolve that web address.";
+  }
+  return undefined;
+}
+
+/** Fetch one public page while applying the complete SSRF boundary before every network hop.
+ * Redirects are handled manually so the runtime cannot follow a newly supplied private target between
+ * the one-time URL/DNS checks and the final response. Five redirects are allowed; a sixth is refused. */
+export async function fetchPublicPage(
+  raw: string,
+  signal: AbortSignal,
+  dependencies: WebFetchDependencies = { fetch: globalThis.fetch, lookup },
+): Promise<PublicPageFetchResult> {
+  const initial = preflightUrl(raw);
+  if (!initial.ok) return initial;
+
+  let current = initial.url;
+  let redirects = 0;
+  const seen = new Set([current.href]);
+
+  while (true) {
+    const resolutionError = await resolvePublicHost(current, dependencies.lookup);
+    if (resolutionError) return { ok: false, reason: resolutionError, url: current };
+
+    let response: Response;
+    try {
+      response = await dependencies.fetch(current, {
+        redirect: "manual",
+        signal,
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; VinciCode/1.0; +https://getsimpledirect.com)", Accept: "text/html,text/plain,*/*" },
+      });
+    } catch (error) {
+      const reason = error instanceof Error && error.name === "TimeoutError" ? "That page took too long to load." : "Couldn't reach that page right now.";
+      return { ok: false, reason, url: current };
+    }
+
+    if (!REDIRECT_STATUSES.has(response.status)) return { ok: true, response, url: current };
+    if (redirects >= WEB_FETCH_MAX_REDIRECTS) {
+      return { ok: false, reason: `That page redirected more than ${WEB_FETCH_MAX_REDIRECTS} times — not following it.`, url: current };
+    }
+
+    const location: unknown = response.headers.get("location");
+    if (typeof location !== "string" || location.trim().length === 0) {
+      return { ok: false, reason: "That page returned a redirect without a valid Location address.", url: current };
+    }
+
+    let resolved: URL;
+    try {
+      resolved = new URL(location, current);
+    } catch {
+      return { ok: false, reason: "That page returned a redirect with a malformed Location address.", url: current };
+    }
+    const next = preflightUrl(resolved.href);
+    if (!next.ok) return { ok: false, reason: next.reason, url: current };
+    if (seen.has(next.url.href)) {
+      return { ok: false, reason: "That page entered a redirect loop — not following it.", url: current };
+    }
+
+    redirects += 1;
+    current = next.url;
+    seen.add(current.href);
+  }
 }
 
 /** Strip an HTML document down to readable text (headings/paragraphs kept as newlines). */
@@ -449,33 +551,16 @@ export default function (pi: ExtensionAPI) {
     },
     async execute(_toolCallId, params: { url: string }, signal) {
       const details: { tool: string; url: string; words: number; truncated: boolean } = { tool: "web_fetch", url: "", words: 0, truncated: false };
-      const pre = preflightUrl((params.url || "").trim());
-      if (!pre.ok) return { content: [{ type: "text", text: pre.reason }], details };
-      details.url = pre.url.href;
-
-      // Resolve the hostname and confirm EVERY IP is public (SSRF: a public name must not resolve to
-      // an internal address). IP-literal hosts were already checked in preflight.
-      const host = pre.url.hostname.replace(/^\[|\]$/g, "");
-      if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && !host.includes(":")) {
-        try {
-          const addrs = await lookup(host, { all: true });
-          if (addrs.some((a) => isPrivateIp(a.address))) {
-            return { content: [{ type: "text", text: "That address resolves to an internal server — not reading it." }], details };
-          }
-        } catch {
-          return { content: [{ type: "text", text: "Couldn't resolve that web address." }], details };
-        }
-      }
-
+      const rawUrl = typeof params?.url === "string" ? params.url.trim() : "";
       const timeout = AbortSignal.timeout(20000);
       const combined =
         typeof AbortSignal.any === "function" && signal instanceof AbortSignal ? AbortSignal.any([signal, timeout]) : timeout;
+      const fetched = await fetchPublicPage(rawUrl, combined);
+      if (!fetched.ok) return { content: [{ type: "text", text: fetched.reason }], details };
+
+      details.url = fetched.url.href;
+      const res = fetched.response;
       try {
-        const res = await fetch(pre.url, {
-          redirect: "follow",
-          signal: combined,
-          headers: { "User-Agent": "Mozilla/5.0 (compatible; VinciCode/1.0; +https://getsimpledirect.com)", Accept: "text/html,text/plain,*/*" },
-        });
         if (!res.ok) {
           // A 404/410 usually means the model GUESSED a plausible-but-fake URL. Coach it to search for
           // the real page rather than guess another URL — the observed failure mode (invented
@@ -497,7 +582,7 @@ export default function (pi: ExtensionAPI) {
         const text = truncated ? extracted.slice(0, FETCH_MAX_CHARS) : extracted;
         details.words = text.split(/\s+/).filter(Boolean).length;
         details.truncated = truncated;
-        return { content: [{ type: "text", text: formatPage(pre.url.href, text, truncated) }], details };
+        return { content: [{ type: "text", text: formatPage(fetched.url.href, text, truncated) }], details };
       } catch (e) {
         const msg = e instanceof Error && e.name === "TimeoutError" ? "That page took too long to load." : "Couldn't reach that page right now.";
         return { content: [{ type: "text", text: msg }], details };
