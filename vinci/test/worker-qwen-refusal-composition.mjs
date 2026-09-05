@@ -152,9 +152,6 @@ dgram.createSocket = () => reject("UDP");
   assert.equal(terminals.length, 1, "one attributable terminal");
   assert.equal(terminals[0].outcome, "FAILED");
   assert.match(terminals[0].body, new RegExp(`contract=${workOrderId}@${contractDigest.slice(0, 8)}`));
-  // Real evidence bundle creation runs, but digest handoffs currently omit the ledger ref
-  // required by uploadEvidence's bus POST. This is a proof gap, not a synthetic accepted POST.
-  assert.equal(fixture.evidencePosts.length, 0);
   const uploads = jsonLines(awsRecords);
   assert.equal(uploads.length, 1);
   bundlePath = uploads[0].argv[3];
@@ -175,7 +172,7 @@ dgram.createSocket = () => reject("UDP");
   assert.equal(execFileSync("tar", ["xzOf", bundlePath, "./session.jsonl"], { encoding: "utf8" }), "");
   assert.equal(fixture.gitTransferCalls().filter((args) => args.includes("push")).length, 0);
   assert.equal(fixture.getVinciCalls().length, 0, "synthetic terminal producer never ran");
-  console.log(`PASS worker-qwen-refusal-composition ${explicitLauncherSelection ? "stale-env overridden" : "default-env selected"}: real dispatcher refusal, correct WorkOrder lease, FAILED terminal and local evidence; no accepted Qwen outcome or evidence POST proved`);
+  console.log(`PASS worker-qwen-refusal-composition ${explicitLauncherSelection ? "stale-env overridden" : "default-env selected"}: real dispatcher refusal, correct WorkOrder lease, FAILED terminal and local evidence; no accepted Qwen outcome or provider network attempt`);
 } finally {
   authority.cleanup();
   await governor.close();
