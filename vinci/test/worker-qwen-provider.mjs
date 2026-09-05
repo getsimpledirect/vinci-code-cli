@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
+import { getEventListeners } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -525,6 +526,65 @@ try {
   const identity = await runtime.probeQwenReadiness(readyConfig, { fetchImpl: readyFetch, lookupImpl: lookupPublic, nowMs, reservationAuthority });
   assert.equal(identity.endpointIdentity, endpointIdentity);
   assert.deepEqual(observed.map((entry) => entry.authorization), ["Bearer synthetic-test-secret", "Bearer synthetic-test-secret", null, null]);
+
+  // Readiness must retain its deadline and caller cancellation after response headers. A
+  // separate watchdog makes removing either control fail deterministically instead of hanging CI.
+  for (const path of ["/health", "/v1/models"]) {
+    for (const interruption of ["timeout", "cancel"]) {
+      const label = `readiness-body-${path.split("/").at(-1)}-${interruption}`;
+      const boundedConfig = loadConfig({ VINCI_QWEN_CIRCUIT_FILE: join(temp, `${label}.json`) });
+      const caller = new AbortController();
+      let watchdog;
+      let cancelTimer;
+      let bodyRead = false;
+      let bodyAborted = false;
+      let requestSignal;
+      let calls = 0;
+      const started = Date.now();
+      try {
+        await assert.rejects(runtime.probeQwenReadiness(boundedConfig, {
+          lookupImpl: lookupPublic,
+          nowMs,
+          signal: caller.signal,
+          reservationAuthority,
+          fetchImpl: async (url, init = {}) => {
+            calls += 1;
+            if (!String(url).endsWith(path)) return readyFetch(url, init);
+            requestSignal = init.signal;
+            return new Response(new ReadableStream({
+              start(controller) {
+                init.signal.addEventListener("abort", () => {
+                  bodyAborted = true;
+                  controller.error(new DOMException("body aborted", "AbortError"));
+                }, { once: true });
+                watchdog = setTimeout(() => controller.error(new Error("readiness body watchdog fired")), 3_000);
+              },
+              pull() {
+                bodyRead = true;
+                if (interruption === "cancel") cancelTimer = setTimeout(() => caller.abort("operator_stop"), 10);
+              },
+            }), { headers: invocationHeaders(init) });
+          },
+        }), (error) => error.code === (interruption === "cancel" ? "cancelled" : "request_timeout"), label);
+        assert.equal(bodyRead, true, `${label}: interruption must occur during body consumption`);
+        assert.equal(bodyAborted, true, `${label}: transport must receive abort`);
+        assert.equal(requestSignal.aborted, true);
+        assert.equal(requestSignal.reason, interruption === "cancel" ? "operator_stop" : "total_timeout", label);
+        assert.ok(Date.now() - started < (interruption === "cancel" ? 500 : 2_500), `${label}: must finish at the intended interruption`);
+        assert.equal(calls, path === "/health" ? 1 : 2, `${label}: no subsequent probe or fallback`);
+        assert.equal(getEventListeners(caller.signal, "abort").length, 0, `${label}: caller listener released`);
+        const circuit = JSON.parse(readFileSync(boundedConfig.circuitFile, "utf8"));
+        assert.equal(circuit.failures, 1, `${label}: failed readiness cannot become ready`);
+        const ledger = reconcileActive(boundedConfig);
+        assert.equal(ledger.state, "RESPONSE_OBSERVED", `${label}: retain attribution until authority reconciliation`);
+        assert.equal(ledger.work_order_id, "wo-test");
+        assert.equal(ledger.contract_digest, authorityBoundary.fleetPermit.contractDigest);
+      } finally {
+        clearTimeout(watchdog);
+        clearTimeout(cancelTimer);
+      }
+    }
+  }
 
   const canarySse = [
     `data: ${JSON.stringify({
@@ -1066,7 +1126,7 @@ let stdin = "";
 process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) stdin += chunk;
 const secret = readFileSync(3);
-writeFileSync(process.env.QWEN_TEST_SPAWN_RECORD, JSON.stringify({ argv: process.argv.slice(2), stdin, qwenEnvKeys: Object.keys(process.env).filter((key) => key.includes("QWEN_SECRET")), clientBuild: process.env.VINCI_QWEN_CLIENT_BUILD_SHA256, secretBytes: fstatSync(3).size, secretReadBytes: secret.length }));
+writeFileSync(process.env.QWEN_TEST_SPAWN_RECORD, JSON.stringify({ argv: process.argv.slice(2), stdin, qwenEnvKeys: Object.keys(process.env).filter((key) => key.includes("QWEN_SECRET")), launcherProvider: process.env.VINCI_PROVIDER, launcherModel: process.env.VINCI_MODEL, clientBuild: process.env.VINCI_QWEN_CLIENT_BUILD_SHA256, secretBytes: fstatSync(3).size, secretReadBytes: secret.length }));
 `, { mode: 0o700 });
   chmodSync(fakeVinci, 0o700);
   const stateDir = join(temp, "run-state");
@@ -1104,6 +1164,8 @@ writeFileSync(process.env.QWEN_TEST_SPAWN_RECORD, JSON.stringify({ argv: process
       env: {
         PATH: `${fakeBin}:${originalPath}`,
         QWEN_TEST_SPAWN_RECORD: spawnRecord,
+        VINCI_PROVIDER: "openrouter",
+        VINCI_MODEL: "inherited/wrong-model",
         VINCI_QWEN_SECRET_REF: `file:${secretFile}`,
       },
       envDelta: {},
@@ -1118,6 +1180,8 @@ writeFileSync(process.env.QWEN_TEST_SPAWN_RECORD, JSON.stringify({ argv: process
   assert.equal(spawned.stdin, "synthetic prompt must not be argv");
   assert.equal(spawned.stdin.includes("synthetic-test-secret"), false);
   assert.deepEqual(spawned.qwenEnvKeys, ["VINCI_QWEN_SECRET_FD"]);
+  assert.equal(spawned.launcherProvider, runtime.QWEN_PROVIDER, "the validated envelope must override an inherited launcher provider selector");
+  assert.equal(spawned.launcherModel, runtime.QWEN_MODEL, "the validated envelope must override an inherited launcher model selector");
   assert.match(spawned.clientBuild, /^[0-9a-f]{64}$/);
   assert.equal(spawned.clientBuild, expectedClientBuild);
   assert.notEqual(spawned.clientBuild, runtime.qwenSha256(readFileSync(fakeVinci)), "client build must include executed parser and coding-agent dependencies, not only the launcher");

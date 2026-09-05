@@ -43,12 +43,12 @@ export const LEASE_TIMEOUT_MS = 10_000;
 export const MIN_TTL_S = 1;
 export const RELEASE_OUTCOMES = Object.freeze(["completed", "failed", "blocked", "unverified", "abandoned"]);
 
-// The lease subject: what the Governor keys the lease on. Today the envelope's `ref` (a ledger
-// job/experiment id) when present, else the bus task id. Digest handoffs will pass the real
-// work-order id later; the daemon takes this as an injectable function so that change is one
-// argument, not a rewrite.
+// The lease subject: what the Governor keys the lease on. A validated digest handoff carries the
+// immutable WorkOrder id; prose handoffs retain the ledger ref and then bus-task fallback.
+// A transport message id does not name the WorkOrder held by the Governor session, so using it
+// for a digest task would make the otherwise valid lease request fail closed at the server.
 export function leaseSubject(task) {
-  return task?.envelope?.ref ?? task?.id ?? null;
+  return task?.envelope?.work_order_id ?? task?.envelope?.ref ?? task?.id ?? null;
 }
 
 function validTtl(value) {

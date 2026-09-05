@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CLAIM_PATHS_DEPLOYED, CLAIM_PATHS_WITH_TTL, FakeGovernor, WorkerTestFixture } from './lib/worker-fixture.mjs';
+import { executionSpecDigest, workOrderDigest } from '../worker/contracts/digest.mjs';
 import { CAPABILITY_MATRIX, DECLARATION_REFRESH_DEFAULT_S, GOVERNOR_DECLARATION_MAX_AGE_S, LEASE_TIMEOUT_MS, LeaseClient, REFRESH_HEADROOM_FACTOR, buildDeclaration, declarationDigest, startHeartbeat } from '../worker/lease.mjs';
 import { prBodyFooter, publish } from '../worker/publisher.mjs';
 
@@ -27,6 +28,7 @@ const hasTerminalFailure = (posts) =>
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const TOOLS = join(ROOT, 'vinci/test/fixtures/worker-test-tools');
 const WORKER = join(ROOT, 'vinci/worker/worker.mjs');
+const CONTRACT_VECTORS = join(ROOT, 'vinci/test/fixtures/contract-vectors');
 
 let passed = 0;
 let failed = 0;
@@ -157,6 +159,58 @@ if (failed > 0) {
   console.log(`\nWorker lease loop tests: ${passed} passed, ${failed} failed`);
   process.exit(1);
 }
+
+await test('digest handoff leases the immutable WorkOrder id, not the bus message id', async () => {
+  const fixture = new WorkerTestFixture('digest-lease-subject');
+  const governor = new FakeGovernor({ mode: 'leased' });
+  await governor.start();
+  try {
+    fixture.linkTools(TOOLS);
+    const workOrder = {
+      ...JSON.parse(readFileSync(join(CONTRACT_VECTORS, 'work-order-1-minimal/input.json'), 'utf8')),
+      id: 'wo-lease-subject',
+      expiresAt: new Date(Date.now() + 7_200_000).toISOString(),
+    };
+    const contractDigest = workOrderDigest(workOrder);
+    const executionSpec = {
+      ...JSON.parse(readFileSync(join(CONTRACT_VECTORS, 'execution-spec-1-minimal/input.json'), 'utf8')),
+      workOrderId: workOrder.id,
+      workOrderDigest: contractDigest,
+      targetBranch: 'feat/lease-subject',
+      requiredCapabilities: [],
+      resourceBounds: {
+        budgetMicrousd: 1_000_000,
+        maxRuntimeS: 60,
+        deadline: new Date(Date.now() + 3_600_000).toISOString(),
+      },
+    };
+    const specDigest = executionSpecDigest(executionSpec);
+    const messageId = 'bus-message-not-work-order';
+    await fixture.startBus([
+      handoff(messageId, 'w1', JSON.stringify({
+        work_order_id: workOrder.id,
+        contract_digest: contractDigest,
+        execution_spec_digest: specDigest,
+      })),
+    ], {
+      [workOrder.id]: { work_order: workOrder, execution_spec: executionSpec },
+    });
+
+    const { code, stderr } = await runWorker(fixture, 'w1', ['--governor', governor.url], {
+      VINCI_WORKER_ALLOWED_PROVIDERS: 'openrouter,vinci',
+    });
+    assert.equal(code, 0, stderr);
+    assert.equal(governor.acquires.length, 1);
+    assert.equal(governor.acquires[0].work_order_id, workOrder.id);
+    assert.notEqual(governor.acquires[0].work_order_id, messageId);
+    assert.equal(state(fixture, messageId).state, 'BLOCKED');
+    assert.equal(existsSync(join(fixture.tempDir, 'repos')), false, 'a refused lease must stop before clone');
+    assert.equal(fixture.getVinciCalls().length, 0, 'a refused lease must stop before provider spawn');
+  } finally {
+    await governor.close();
+    await fixture.cleanup();
+  }
+});
 
 await test('happy path: acquire before clone, renew at ttl/3, fenced push+PR, release completed', async () => {
   const fixture = new WorkerTestFixture('lease-happy');

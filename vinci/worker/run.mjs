@@ -1296,6 +1296,11 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
   }
   const taskEnvironment = applyEnvDelta(env ?? process.env, envDelta);
   taskEnvironment.VINCI_UPDATE_DISABLED = "1";
+  // The launcher selects and validates provider-specific extensions from these variables before
+  // it forwards argv to Pi. The envelope is already validated and is the task's authority, so an
+  // inherited daemon selector must never choose a different launcher path than --provider/--model.
+  taskEnvironment.VINCI_PROVIDER = envelope.provider;
+  taskEnvironment.VINCI_MODEL = envelope.model;
   let qwenSecretReference;
   // The direct H200 lane is one exact, pre-qualified provider. These values are derived by the
   // worker, not accepted from the model or repository, and bind the provider extension to the
