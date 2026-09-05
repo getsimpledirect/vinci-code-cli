@@ -12,7 +12,7 @@ import {
 import { join, resolve } from "node:path";
 import { replayPending } from "./outbox.mjs";
 
-import { BusClient, isLedgerRef } from "./bus.mjs";
+import { BusClient, isEvidenceRef } from "./bus.mjs";
 import { command, finalState, noCommitOutcome, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
 import { childEnv, DEFAULT_DISK_FLOOR_MB, DEFAULT_KEEP_ATTEMPTS, markEvidenceUploaded, prepareCleanRoom, pruneAttempts, publishFromCache, sealAttemptDir } from "./cleanroom.mjs";
 import { assertTaskId, contractTag, DEFAULT_ALLOWED_PROVIDERS, isDigestHandoff, loadModelClasses, materializeEnvelope, parseAllowedProviders, parseEnvelope, parseHandoffTriple, providerAllowed, TaskLifecycle, vinciBinaryRecord } from "./task.mjs";
@@ -21,7 +21,7 @@ import { DECLARATION_REFRESH_DEFAULT_S, LEASE_TIMEOUT_MS, LeaseClient, buildDecl
 import { BranchLeaseClient, branchLeaseFence } from "./branch-lease.mjs";
 import { composeFences } from "./publisher.mjs";
 import { readSessionState, summarizeUnattendedPolicy } from "./session-read.mjs";
-import { uploadEvidence } from "./evidence.mjs";
+import { uploadEvidence, resolveEvidenceRef } from "./evidence.mjs";
 import { buildEconomicsSummary, canonicalJson, economicsSha256 } from "./economics.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
 
@@ -570,7 +570,7 @@ function blockerPostBody(record, details, fallback = null) {
   return terminalPostBody(tag ? `${tag} ${details}` : details);
 }
 
-async function postFinal(bus, message, envelope, state, evidence, economicsSha = null) {
+async function postFinal(bus, message, evidenceRef, state, evidence, economicsSha = null) {
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
   // set by uploadEvidence solely after a successful `aws s3 cp`); a failed upload also carries
@@ -625,8 +625,8 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
   const options = { inReplyTo: message.message_id };
   const outcome = terminalOutcome(state.state);
   if (outcome !== null) options.outcome = outcome;
-  if (state.state === "COMPLETED" && isLedgerRef(envelope.ref)) {
-    options.refs = [envelope.ref];
+  if (state.state === "COMPLETED" && isEvidenceRef(evidenceRef)) {
+    options.refs = [evidenceRef];
     await bus.postTerminal("finding", subject, body, options);
   } else if (state.state === "BLOCKED" && state.harness_stop) {
     // An instrument stop: the harness refused the agent's work mid-run. Say so explicitly so the
@@ -837,6 +837,14 @@ async function processHandoff(
 
   }
 
+  // Resolve the canonical evidence identity ONCE and use the same value for both the durable
+  // evidence row and the terminal bus row. `contractFields` exists only after registry fetch,
+  // record validation, digest recomputation and order/spec binding all succeeded.
+  const evidenceRef = resolveEvidenceRef({
+    contractWorkOrderId: contractFields?.work_order_id ?? null,
+    contractValidated: contractFields !== null,
+    envelopeRef: envelope.ref ?? null,
+  });
   const attempt = lifecycle.startAttempt({ id: taskId, envelope }, version, { workerBuild, serverBuild, vinciBinary });
   // Wave 1B: stamp the record with the materialized contract (work_order_id, both digests,
   // base_commit, promotion) so the snapshot and every terminal post can cite the handoff.
@@ -1255,7 +1263,7 @@ async function processHandoff(
         lifecycle.transition("BLOCKED", { outcome: { reason }, publish: "skipped", pr: null, fenced_out: reason });
         await releaseLease("BLOCKED");
         const econBranch = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
-        await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econBranch.sha256);
+        await postFinal(bus, message, evidenceRef, lifecycle.snapshot(), null, econBranch.sha256);
         return true;
       }
       branchLease = acquired.lease;
@@ -1275,7 +1283,7 @@ async function processHandoff(
       lifecycle.transition("BLOCKED", { outcome: { reason: authorityLost }, publish: "skipped", pr: null, fenced_out: authorityLost, lease: { ...lifecycle.snapshot().lease, ...lease } });
       await releaseLease("BLOCKED");
       const econLost = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
-      await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econLost.sha256);
+      await postFinal(bus, message, evidenceRef, lifecycle.snapshot(), null, econLost.sha256);
       return true;
     }
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
@@ -1468,7 +1476,8 @@ async function processHandoff(
       taskId,
       busUrl: bus.serverUrl,
       busToken: bus.token,
-      ref: envelopeToUse.ref,
+      // A governed handoff files under the validated WorkOrder; prose stays on its ledger ref.
+      ref: evidenceRef,
       fence: lease ? fence : null,
       economics: { summary: economicsSummary, sha256: economicsSha },
       extraFiles,
@@ -1507,7 +1516,7 @@ async function processHandoff(
     // L4: release with the committed state's outcome, BEFORE the final post so the lease is not
     // held across a bus retry. A release failure is logged; the state above is already final.
     await releaseLease(state);
-    await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult, economicsSha);
+    await postFinal(bus, message, evidenceRef, lifecycle.snapshot(), evidenceResult, economicsSha);
   } catch (error) {
     // A terminal state is immutable: if the failure happened after it was committed (e.g. the
     // final bus post), surface the error to the daemon loop instead of rewriting the record.
@@ -1531,7 +1540,7 @@ async function processHandoff(
     await releaseLease("FAILED");
     // A session may already have run and spent here (exception after runVinci): read it.
     const econFailed = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
-    await postFinal(bus, message, envelope, lifecycle.snapshot(), null, econFailed.sha256);
+    await postFinal(bus, message, evidenceRef, lifecycle.snapshot(), null, econFailed.sha256);
   }
   return true;
 }

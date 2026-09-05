@@ -154,8 +154,14 @@ try {
   const orderFor = (id, overrides = {}) => ({ ...workOrder, id, expiresAt: futureExpiry, ...overrides });
   // Register a (order, spec) pair under the order's id; returns the triple body. `specDigest`
   // lets a test name a spec the validator refuses (recordDigest: the raw identity).
-  const register = (order, spec, { orderDigest = workOrderDigest(order), specDigest = executionSpecDigest(spec) } = {}) => {
+  const register = (order, spec, {
+    orderDigest = workOrderDigest(order),
+    specDigest = executionSpecDigest(spec),
+    programId = f.evidenceProgramId,
+  } = {}) => {
     f.contractRegistry[order.id] = { work_order: order, execution_spec: spec };
+    if (programId === null) delete f.workOrderPrograms[order.id];
+    else f.workOrderPrograms[order.id] = programId;
     return triple(order.id, orderDigest, specDigest);
   };
 
@@ -956,6 +962,214 @@ try {
     assert.match(prosePost.body, /^invalid task id: m bad prose worker_build=/, prosePost.body);
     assert.doesNotMatch(prosePost.body, /contract=/, "a prose handoff still carries NO contract tag");
     assert.equal(f.getVinciCalls().length, vinciRuns, "neither invalid handoff spawns");
+  }
+
+  // --- CCM-v0: governed evidence and its terminal share the validated WorkOrder identity ---
+  //
+  // task.mjs builds a contract envelope with `ref: undefined`. Before #53 that meant no evidence
+  // POST; before #54 the new durable row still disagreed with an unreferenced terminal. The #295
+  // ruling keeps WorkOrder canonical, admits validated `wo-` refs, and leaves WorkOrder existence
+  // plus program binding to the evidence server. Backlog identity is never substituted.
+  {
+    const awsRecord = join(f.tempDir, "aws-ccm-calls.txt");
+    const evidenceEnv = { VINCI_EVIDENCE_URI_PREFIX: "s3://evidence-bucket/worker/", FAKE_AWS_RECORD: awsRecord };
+    const postsBefore = f.getEvidencePosts().length;
+
+    // A validated contract id outside both admitted namespaces still posts nothing and cannot
+    // borrow a plausible bk_ row from anywhere else.
+    const unfilableOrder = orderFor("contract-ccm-control");
+    debrisAuthority.reserveTask("m-ccm-control");
+    f.busMessages.push(handoff("m-ccm-control", register(
+      unfilableOrder,
+      specFor(unfilableOrder, { targetBranch: "feat/ccm-control" }),
+    )));
+    let r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "ccm-control.txt", ...evidenceEnv } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    assert.equal(
+      f.getEvidencePosts().length, postsBefore,
+      "an inadmissible WorkOrder id must post no evidence",
+    );
+    const unfilableTerminal = f.getPostedMessages().filter((m) => m.in_reply_to === "m-ccm-control").at(-1);
+    assert.equal(unfilableTerminal.kind, "status");
+    assert.equal(unfilableTerminal.refs, undefined);
+
+    // Positive: the exact `wo-` id came from the registry-validated order/spec pair. The fake
+    // server independently sees that the WorkOrder exists and is bound to its configured program.
+    const woOrder = orderFor("wo-ccm7");
+    debrisAuthority.reserveTask("m-ccm-governed");
+    f.busMessages.push(handoff("m-ccm-governed", register(
+      woOrder,
+      specFor(woOrder, { targetBranch: "feat/ccm-governed" }),
+    )));
+    r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "ccm-governed.txt", ...evidenceEnv } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+
+    assert.deepEqual(f.rejectedPosts, [], `the bus refused a post the worker should never have sent: ${JSON.stringify(f.rejectedPosts)}`);
+    const posts = f.getEvidencePosts();
+    assert.equal(posts.length, postsBefore + 1, `exactly one evidence POST, from the governed run: ${JSON.stringify(posts)}`);
+    const post = posts.at(-1);
+    assert.equal(post.job_ref, "wo-ccm7", "the bundle is filed under the WorkOrder, never a backlog surrogate");
+    assert.equal(post.kind, "bundle");
+
+    // WorkOrder + run + attempt are all explicit in the durable row. The terminal is a finding
+    // under that same ref, replying to the exact handoff message that names this run.
+    assert.ok(post.economics_summary, "the POST carries the economics summary");
+    assert.equal(post.economics_summary.work_order_id, post.job_ref, "summary key == evidence key");
+    assert.equal(post.economics_summary.attempt_label, "m-ccm-governed/1");
+    assert.match(post.economics_sha256 ?? "", /^[0-9a-f]{64}$/);
+
+    const completedPost = f.getPostedMessages().filter((m) => m.in_reply_to === "m-ccm-governed").at(-1);
+    assert.ok(completedPost, "the governed attempt posts a terminal");
+    assert.equal(completedPost.kind, "finding");
+    assert.equal(completedPost.outcome, "COMPLETED");
+    assert.deepEqual(completedPost.refs, [post.job_ref], "terminal ref == durable evidence ref");
+    const publicEvidenceRecords = JSON.stringify({ post, completedPost });
+    assert.equal(publicEvidenceRecords.includes(woOrder.request), false, "bus metadata must not disclose the WorkOrder request");
+    assert.equal(publicEvidenceRecords.includes(woOrder.scope), false, "bus metadata must not disclose the WorkOrder scope");
+
+    // Replaying the same bus page is idempotent: the cursor/lifecycle pair emits no second row or
+    // terminal for the already-terminal attempt.
+    const evidenceAfterSuccess = f.getEvidencePosts().length;
+    const terminalsAfterSuccess = f.getPostedMessages().filter((m) => m.in_reply_to === "m-ccm-governed").length;
+    r = await run({ env: evidenceEnv });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.getEvidencePosts().length, evidenceAfterSuccess);
+    assert.equal(f.getPostedMessages().filter((m) => m.in_reply_to === "m-ccm-governed").length, terminalsAfterSuccess);
+
+    // The worker cannot self-assert program binding. An existing, locally valid WorkOrder whose
+    // server-side binding is absent or stale reaches the one ingress, gets 422, downgrades to
+    // UNVERIFIED, and does not attach the refused ref to its terminal.
+    for (const [id, programId] of [["unbound", null], ["stale", "prog-stale"]]) {
+      const order = orderFor(`wo-ccm-${id}`);
+      const taskId = `m-ccm-${id}`;
+      debrisAuthority.reserveTask(taskId);
+      f.busMessages.push(handoff(taskId, register(
+        order,
+        specFor(order, { targetBranch: `feat/ccm-${id}` }),
+        { programId },
+      )));
+      const rejectedBefore = f.rejectedPosts.length;
+      r = await run({ env: { FAKE_VINCI_COMMIT_FILE: `ccm-${id}.txt`, ...evidenceEnv } });
+      assert.equal(r.status, 0, r.stderr);
+      vinciRuns += 1;
+      assert.equal(f.rejectedPosts.length, rejectedBefore + 1, `${id}: server must refuse the wo- evidence ref`);
+      assert.equal(taskState(taskId).state, "UNVERIFIED");
+      const terminal = f.getPostedMessages().filter((m) => m.in_reply_to === taskId).at(-1);
+      assert.equal(terminal.kind, "status");
+      assert.equal(terminal.refs, undefined);
+      assert.match(terminal.body, /evidence_error=Bus POST failed: 422/);
+    }
+
+    // A transport/server failure on an otherwise valid WorkOrder follows the same truthful
+    // downgrade. It is not retried as a second ingress and never claims a finding ref.
+    const woFail = orderFor("wo-ccm8");
+    debrisAuthority.reserveTask("m-ccm-postfail");
+    f.busMessages.push(handoff("m-ccm-postfail", register(woFail, specFor(woFail, { targetBranch: "feat/ccm-postfail" }))));
+    f.evidencePostStatus = 500;
+    try {
+      r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "ccm-postfail.txt", ...evidenceEnv } });
+    } finally {
+      f.evidencePostStatus = null;
+    }
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    const failState = taskState("m-ccm-postfail");
+    assert.equal(failState.state, "UNVERIFIED", `a governed attempt whose evidence POST fails is not COMPLETED: ${JSON.stringify(failState)}`);
+    assert.ok(failState.evidence_error, "the failure is recorded, not swallowed");
+    // The LAST post in the thread is the terminal; the first is `claimed`.
+    const failPost = f.getPostedMessages().filter((m) => m.in_reply_to === "m-ccm-postfail").at(-1);
+    assert.ok(failPost, "the governed attempt still posts a terminal");
+    assert.equal(failPost.kind, "status");
+    assert.equal(failPost.refs, undefined);
+    assert.match(failPost.body, /evidence_error=/, failPost.body);
+
+    // Runtime failure still emits one governed bundle under the canonical WorkOrder. FAILED is
+    // deliberately a status terminal (the finding contract remains COMPLETED-only), so it never
+    // advertises a successful evidence ref even though the diagnostic row is durable.
+    const runtimeFailOrder = orderFor("wo-ccm-runtime-fail");
+    debrisAuthority.reserveTask("m-ccm-runtime-fail");
+    f.busMessages.push(handoff("m-ccm-runtime-fail", register(
+      runtimeFailOrder,
+      specFor(runtimeFailOrder, { targetBranch: "feat/ccm-runtime-fail" }),
+    )));
+    const runtimeFailBefore = f.getEvidencePosts().length;
+    r = await run({ env: { FAKE_VINCI_EXIT: "3", ...evidenceEnv } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    const runtimeFailPosts = f.getEvidencePosts().slice(runtimeFailBefore);
+    assert.equal(runtimeFailPosts.length, 1);
+    assert.equal(runtimeFailPosts[0].job_ref, runtimeFailOrder.id);
+    assert.equal(runtimeFailPosts[0].economics_summary.attempt_label, "m-ccm-runtime-fail/1");
+    assert.equal(taskState("m-ccm-runtime-fail").state, "FAILED");
+    const runtimeFailTerminal = f.getPostedMessages().filter((m) => m.in_reply_to === "m-ccm-runtime-fail").at(-1);
+    assert.equal(runtimeFailTerminal.kind, "status");
+    assert.equal(runtimeFailTerminal.outcome, "FAILED");
+    assert.equal(runtimeFailTerminal.refs, undefined);
+
+    // A resumed non-terminal record keeps the same WorkOrder key while advancing the attempt
+    // identity. This is the retry side of the same invariant; the lifecycle table and restart
+    // integration suites separately exercise the real interruption/cancellation mechanics.
+    const retryOrder = orderFor("wo-ccm-retry");
+    const retryTaskId = "m-ccm-retry";
+    mkdirSync(join(f.tempDir, "tasks"), { recursive: true });
+    writeFileSync(
+      join(f.tempDir, "tasks", `${retryTaskId}.json`),
+      `${JSON.stringify({ task: retryTaskId, attempt: 1, session_id: "ccm-retry-session", state: "RUNNING", terminal: false })}\n`,
+    );
+    debrisAuthority.reserveTask(retryTaskId);
+    f.busMessages.push(handoff(retryTaskId, register(
+      retryOrder,
+      specFor(retryOrder, { targetBranch: "feat/ccm-retry" }),
+    )));
+    const retryBefore = f.getEvidencePosts().length;
+    r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "ccm-retry.txt", ...evidenceEnv } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 1;
+    const retryPost = f.getEvidencePosts().slice(retryBefore);
+    assert.equal(retryPost.length, 1);
+    assert.equal(retryPost[0].job_ref, retryOrder.id);
+    assert.equal(retryPost[0].economics_summary.attempt_label, `${retryTaskId}/2`);
+    assert.equal(taskState(retryTaskId).attempt, 2);
+    assert.deepEqual(
+      f.getPostedMessages().filter((m) => m.in_reply_to === retryTaskId).at(-1).refs,
+      [retryOrder.id],
+    );
+
+    // Two runs under one WorkOrder retain one canonical ref while preserving distinct run and
+    // attempt identities. Each spec is selected by its recomputed digest.
+    const multiOrder = orderFor("wo-ccm-multi");
+    const multiSpecs = [
+      specFor(multiOrder, { targetBranch: "feat/ccm-multi-a" }),
+      specFor(multiOrder, { targetBranch: "feat/ccm-multi-b" }),
+    ];
+    f.contractRegistry[multiOrder.id] = { work_order: multiOrder, execution_specs: multiSpecs };
+    f.workOrderPrograms[multiOrder.id] = f.evidenceProgramId;
+    for (const [suffix, spec] of [["a", multiSpecs[0]], ["b", multiSpecs[1]]]) {
+      const taskId = `m-ccm-multi-${suffix}`;
+      debrisAuthority.reserveTask(taskId);
+      f.busMessages.push(handoff(
+        taskId,
+        triple(multiOrder.id, workOrderDigest(multiOrder), executionSpecDigest(spec)),
+      ));
+    }
+    const multiBefore = f.getEvidencePosts().length;
+    r = await run({ env: { FAKE_VINCI_COMMIT_FILE: "ccm-multi.txt", ...evidenceEnv } });
+    assert.equal(r.status, 0, r.stderr);
+    vinciRuns += 2;
+    const multiPosts = f.getEvidencePosts().slice(multiBefore);
+    assert.equal(multiPosts.length, 2);
+    assert.deepEqual(multiPosts.map((p) => p.job_ref), [multiOrder.id, multiOrder.id]);
+    assert.deepEqual(
+      multiPosts.map((p) => p.economics_summary.attempt_label).sort(),
+      ["m-ccm-multi-a/1", "m-ccm-multi-b/1"],
+    );
+    assert.notEqual(multiPosts[0].sha256, multiPosts[1].sha256, "distinct runs retain distinct durable bundles");
+    for (const taskId of ["m-ccm-multi-a", "m-ccm-multi-b"]) {
+      const terminal = f.getPostedMessages().filter((m) => m.in_reply_to === taskId).at(-1);
+      assert.deepEqual(terminal.refs, [multiOrder.id]);
+    }
   }
 
   console.log("PASS worker-handoff-triple");

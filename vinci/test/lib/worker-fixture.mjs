@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const WORK_ORDER_EVIDENCE_REF = /^wo-[A-Za-z0-9][A-Za-z0-9._:-]{0,124}$/;
 
 function runGit(args, cwd) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -267,6 +268,11 @@ export class WorkerTestFixture {
     this.busMessages = [];
     this.evidencePosts = [];
     this.getRequests = [];
+    // The resolved #295 contract is enforced at the SERVER boundary: `wo-` is accepted only
+    // for an existing contract-registry WorkOrder bound to this program. The worker never gets
+    // to assert that binding. Tests populate workOrderPrograms alongside registry entries.
+    this.evidenceProgramId = "prog-worker-test";
+    this.workOrderPrograms = {};
     // When set (e.g. 500), every /v1/evidence POST answers with that status instead of 200.
     this.evidencePostStatus = null;
     // When set to a RegExp, every /v1/messages POST whose subject matches answers 500 and is
@@ -370,6 +376,15 @@ process.exit(r.status ?? 1);
     if (this.gitRecordFile) writeFileSync(this.gitRecordFile, "");
   }
 
+  acceptsEvidenceRef(ref) {
+    if (typeof ref !== "string") return false;
+    if (LEDGER_REF.test(ref)) return true;
+    if (!WORK_ORDER_EVIDENCE_REF.test(ref)) return false;
+    const entry = this.contractRegistry?.[ref];
+    return entry?.work_order?.id === ref
+      && this.workOrderPrograms?.[ref] === this.evidenceProgramId;
+  }
+
   // git subcommands that transfer objects or talk to origin.
   static TRANSFER = new Set(["fetch", "clone", "ls-remote", "push", "pull"]);
 
@@ -427,7 +442,7 @@ process.exit(r.status ?? 1);
         });
         request.on("end", () => {
           const message = JSON.parse(body);
-          const invalidRefs = (message.refs ?? []).filter((ref) => !LEDGER_REF.test(ref));
+          const invalidRefs = (message.refs ?? []).filter((ref) => !this.acceptsEvidenceRef(ref));
           if (invalidRefs.length > 0) {
             this.rejectedPosts.push(message);
             response.writeHead(422, { "content-type": "application/json" });
@@ -480,11 +495,33 @@ process.exit(r.status ?? 1);
         });
         request.on("end", () => {
           const evidence = JSON.parse(body);
-          const invalidRefs = (evidence.refs ?? []).filter((ref) => !LEDGER_REF.test(ref));
-          if (invalidRefs.length > 0) {
+          // MIRROR THE REAL SERVER'S REFUSALS, not just its happy path. This fake previously
+          // filtered `evidence.refs` — a key the worker never sends — so its 422 branch was dead
+          // and `rejectedPosts.length === 0` could not fail. The consequence was worse than a
+          // vacuous assertion: it accepted ANY job_ref, so an integration test could file under a
+          // `wo-`-shaped ref and pass while production 422s it. That is why a green suite sat on
+          // top of the disjoint-namespace collision in vinci-gpu-control#295 without a murmur.
+          //
+          // Resolved vinci-gpu-control#295 POST /v1/evidence contract, in order:
+          //   1. job_ref, sha256, uri, kind, produced_at must each be a non-blank string
+          //   2. a legacy ref must start job_/exp_/bk_; `wo-` must name an existing registry
+          //      WorkOrder bound to the configured program
+          // A MISSING field is refused by (1) — it is not "nothing to check". Both rules are
+          // enforced here so a test cannot pass on a request the real server would reject.
+          const missing = ["job_ref", "sha256", "uri", "kind", "produced_at"]
+            .filter((field) => typeof evidence[field] !== "string" || !evidence[field].trim());
+          const invalidRefs = missing.includes("job_ref")
+            ? []
+            : [evidence.job_ref, ...(evidence.refs ?? [])]
+              .filter((ref) => !this.acceptsEvidenceRef(ref));
+          if (missing.length > 0 || invalidRefs.length > 0) {
             this.rejectedPosts.push(evidence);
             response.writeHead(422, { "content-type": "application/json" });
-            response.end(JSON.stringify({ error: `invalid refs: ${invalidRefs.join(", ")}` }));
+            response.end(JSON.stringify({
+              error: missing.length > 0
+                ? `missing or blank: ${missing.join(", ")}`
+                : `invalid refs: ${invalidRefs.join(", ")}`,
+            }));
             return;
           }
           if (this.evidencePostStatus) {

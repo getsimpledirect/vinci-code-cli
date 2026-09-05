@@ -1,6 +1,10 @@
 import { DEFAULT_OUTBOX_DIR, clearPending, recordPending } from "./outbox.mjs";
 
 const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
+// Option 1 of vinci-gpu-control#295: a WorkOrder remains the canonical identity. `wo-` is
+// therefore an evidence/message ref only after the caller has resolved it from a validated
+// contract. This predicate is syntax only; existence and program binding stay server-side.
+const WORK_ORDER_EVIDENCE_REF = /^wo-[A-Za-z0-9][A-Za-z0-9._:-]{0,124}$/;
 
 // A terminal record says the task is OVER. The consumer keys human attention on
 // `outcome !== "COMPLETED"`, so this field is load-bearing: it is what lets a failure be
@@ -14,6 +18,14 @@ const TERMINAL_OUTCOMES = new Set(["COMPLETED", "FAILED", "BLOCKED", "REFUSED", 
 
 export function isLedgerRef(value) {
   return typeof value === "string" && LEDGER_REF.test(value);
+}
+
+export function isWorkOrderEvidenceRef(value) {
+  return typeof value === "string" && WORK_ORDER_EVIDENCE_REF.test(value);
+}
+
+export function isEvidenceRef(value) {
+  return isLedgerRef(value) || isWorkOrderEvidenceRef(value);
 }
 
 // Production rows are not all shaped like the fixtures: rows older than the server-recorded
@@ -121,8 +133,8 @@ export class BusClient {
     if (options.outcome !== undefined && !TERMINAL_OUTCOMES.has(options.outcome)) {
       throw new Error(`worker outcome must be one of ${[...TERMINAL_OUTCOMES].join(", ")} (got ${options.outcome})`);
     }
-    if (options.refs !== undefined && (!Array.isArray(options.refs) || options.refs.some((ref) => !isLedgerRef(ref)))) {
-      throw new Error("worker refs must be job_, exp_, or bk_ ledger refs");
+    if (options.refs !== undefined && (!Array.isArray(options.refs) || options.refs.some((ref) => !isEvidenceRef(ref)))) {
+      throw new Error("worker refs must be job_, exp_, bk_, or validated wo- evidence refs");
     }
     if (kind === "finding" && (!Array.isArray(options.refs) || options.refs.length === 0)) {
       throw new Error("finding messages require refs");
