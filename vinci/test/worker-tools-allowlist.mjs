@@ -41,11 +41,13 @@
 // assertion below pins the EXACT reason code, and the ordering control proves which guard
 // answered.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { executionSpecDigest, workOrderDigest } from "../worker/contracts/digest.mjs";
+import { runVinci } from "../worker/run.mjs";
 import { materializeEnvelope, SUPPORTED_TOOLS } from "../worker/task.mjs";
 
 const VECTORS = join(dirname(fileURLToPath(import.meta.url)), "fixtures/contract-vectors");
@@ -97,18 +99,156 @@ function refuses(order, spec, code, names, label) {
   return thrown;
 }
 
-// --- the allowlist IS the run.mjs default, neither more nor less ----------------------------
+// --- 0. the allowlist IS the run.mjs default, neither more nor less -------------------------
 // This restricts what a spec may REQUEST down to what run.mjs already grants by default; it must
-// not enable anything beyond that default. Pinned against the literal fallback string in
-// run.mjs:1210 so the two cannot drift apart silently in either direction — this is the LOCKSTEP
-// pin, and it is what fails if the four network tools are added to one list and not the other.
+// not enable anything beyond that default. This is the LOCKSTEP pin, and it is what fails if the
+// four network tools are added to one list and not the other.
+//
+// 🔴 HOW THIS PIN USED TO BE VACUOUS. It was carried by a source-TEXT check:
+//     assert.ok(runSource.includes(`"${DEFAULT_CSV}"`), …)
+// `includes` is satisfied by the literal appearing ANYWHERE in run.mjs — a comment included.
+// Executed mutation, 2026-09-04: reverting the LIVE fallback expression at run.mjs:1210 to the
+// old seven-tool CSV while leaving the correct eleven-tool literal in a comment above `runVinci`
+// left this suite printing PASS. The assertion pinned a string in a file, not the value the
+// worker hands to the agent. It is replaced below by a BEHAVIOURAL pin.
+//
+// Why the value matters at all: run.mjs's fallback is what the deployed fleet actually passes to
+// `--tools`, because the prose-envelope form carries no `tools` field (HEADER_KEYS has none), so
+// the fallback branch is the one production takes on every prose task.
+const DEFAULT_CSV = "read,grep,find,ls,bash,edit,write,web_search,web_fetch,web_answer,library_docs";
 {
-  const DEFAULT_CSV = "read,grep,find,ls,bash,edit,write,web_search,web_fetch,web_answer,library_docs";
   assert.deepEqual([...SUPPORTED_TOOLS], DEFAULT_CSV.split(","), "SUPPORTED_TOOLS is exactly run.mjs's default --tools set");
   assert.equal(SUPPORTED_TOOLS.length, 11, "eleven tools, nothing more");
   assert.ok(Object.isFrozen(SUPPORTED_TOOLS), "the allowlist is frozen");
+}
+
+// --- 0b. BEHAVIOURAL PIN: what `runVinci` actually puts on the command line -------------------
+// `resolveBin("vinci")` (worker/build.mjs:16) is a bare PATH scan performed at spawn time, so a
+// stub `vinci` placed first on PATH IS the executable the real `runVinci` launches. The stub
+// records its own argv; every assertion below reads that recording. Nothing here inspects source
+// text, so a comment cannot satisfy it and only the expression that survives to the spawn can.
+//
+// This block also gives `runVinci` its first test of any kind: it is imported by zero other tests
+// repo-wide, so the `envelope.tools` parameterisation path had no coverage at all.
+{
+  const RUN_BOUND_MS = 20_000;
+  const savedPath = process.env.PATH;
+  const root = mkdtempSync(join(tmpdir(), "worker-tools-argv-"));
+  try {
+    const binDir = join(root, "bin");
+    const repoDir = join(root, "repo");
+    const stateDir = join(root, "state");
+    const argvFile = join(root, "argv.json");
+    for (const directory of [binDir, repoDir, stateDir]) mkdirSync(directory, { recursive: true });
+
+    // Shebanged with this interpreter's absolute path, so the stub does not itself depend on what
+    // PATH resolves — the only PATH lookup under test is the one `resolveBin` performs for
+    // "vinci". No extension ⇒ CommonJS, hence `require`.
+    const stub = join(binDir, "vinci");
+    writeFileSync(
+      stub,
+      `#!${process.execPath}\n` +
+        `require("node:fs").writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\n` +
+        `process.exit(0);\n`,
+    );
+    chmodSync(stub, 0o755);
+    process.env.PATH = binDir + delimiter + savedPath;
+
+    // Bounded: `runVinci` polls on a timer and resolves on the child's `close`. If the stub were
+    // never spawned the promise would sit forever, and a hung suite reads as neither pass nor
+    // fail — so the wait is capped and the cap is itself an assertion failure.
+    const launch = async (envelope, label) => {
+      rmSync(argvFile, { force: true });
+      const bound = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${label}: runVinci did not settle within ${RUN_BOUND_MS}ms`)), RUN_BOUND_MS).unref(),
+      );
+      const run = await Promise.race([
+        runVinci({
+          envelope: { provider: "vinci", model: "forte", spec: "stub task", max_runtime_s: 300, budget_usd: 100, ...envelope },
+          repoDir,
+          stateDir,
+          taskId: `argv-${label}`,
+          sessionId: `argv-${label}`,
+        }),
+        bound,
+      ]);
+      assert.equal(run.exit_code, 0, `${label}: the stub ran and exited cleanly`);
+      assert.equal(run.limit_tripped, null, `${label}: no limit tripped, so the argv below is a real launch`);
+      const argv = JSON.parse(readFileSync(argvFile, "utf8"));
+      const flags = argv.filter((a) => a === "--tools");
+      assert.equal(flags.length, 1, `${label}: exactly one --tools flag on the command line: ${JSON.stringify(argv)}`);
+      const at = argv.indexOf("--tools");
+      assert.ok(at + 1 < argv.length, `${label}: --tools is followed by a value: ${JSON.stringify(argv)}`);
+      return { argv, tools: argv[at + 1] };
+    };
+
+    // (A) FALLBACK — the production path. No `tools` on the envelope, exactly as a prose handoff
+    // arrives, so run.mjs's default branch is the one taken. The expected value is the LITERAL
+    // eleven-tool CSV; it is then split and compared to SUPPORTED_TOOLS, which is what makes the
+    // two lists lockstep through the value the worker really uses.
+    {
+      const { tools, argv } = await launch({}, "fallback");
+      assert.equal(
+        tools,
+        "read,grep,find,ls,bash,edit,write,web_search,web_fetch,web_answer,library_docs",
+        `an envelope with no tools launches the eleven-tool default: ${JSON.stringify(argv)}`,
+      );
+      assert.deepEqual(tools.split(","), [...SUPPORTED_TOOLS], "the CSV the worker actually launches with IS the allowlist, element for element");
+      assert.equal(tools, DEFAULT_CSV, "…and is the literal this file pins");
+    }
+
+    // (B) NARROWING — the parameterised path, previously untested. Its value is DIFFERENT from
+    // (A)'s, which is also this instrument's positive control: it proves the recording tracks the
+    // envelope rather than echoing a constant, so (A)'s match is evidence and not an artefact.
+    {
+      const { tools, argv } = await launch({ tools: ["read", "bash"] }, "narrowed");
+      assert.equal(tools, "read,bash", `an envelope naming two tools launches exactly those two: ${JSON.stringify(argv)}`);
+      assert.notEqual(tools, DEFAULT_CSV, "the narrowed launch is not the default, so the recording is envelope-sensitive");
+    }
+
+    // (C) A single tool, and the full set spelled out — a one-element join must not gain a
+    // separator, and an envelope that names the whole default must reach the agent unchanged.
+    {
+      const { tools } = await launch({ tools: ["read"] }, "single");
+      assert.equal(tools, "read", "one tool joins to itself, with no trailing separator");
+    }
+    {
+      const { tools } = await launch({ tools: [...SUPPORTED_TOOLS] }, "explicit-full");
+      assert.equal(tools, DEFAULT_CSV, "an envelope naming the whole allowlist launches the same CSV as the fallback");
+    }
+
+    // (D) EDGE INPUTS on the fallback condition itself. run.mjs takes the default unless `tools`
+    // is a NON-EMPTY ARRAY, so each of these must land on the eleven-tool CSV rather than on ""
+    // or "undefined" — an agent launched with `--tools ""` would be a silent capability change.
+    for (const [label, tools] of [
+      ["empty-array", []],
+      ["null", null],
+      ["undefined", undefined],
+      ["string", "read,bash"],
+      ["object", { read: true }],
+    ]) {
+      const launched = await launch({ tools }, `degenerate-${label}`);
+      assert.equal(launched.tools, DEFAULT_CSV, `a ${label} tools field falls back to the eleven-tool default, not to an empty or malformed CSV`);
+    }
+  } finally {
+    process.env.PATH = savedPath;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// --- 0c. SECONDARY SMOKE (not the guarantee) --------------------------------------------------
+// Anchored on `const tools =` so a comment cannot satisfy it, unlike the `includes` check this
+// replaced. It is kept only to name run.mjs:1210 as the site under test and to fail loudly if
+// that expression is restructured; §0b is what actually pins the value, and this check would be
+// removable without weakening the guard.
+{
   const runSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../worker/run.mjs"), "utf8");
-  assert.ok(runSource.includes(`"${DEFAULT_CSV}"`), "run.mjs still carries the default this list mirrors, unchanged");
+  const live = runSource.match(/^\s*const tools = .*$/m);
+  assert.ok(live, "run.mjs still computes the --tools CSV in a `const tools =` expression");
+  assert.ok(
+    live[0].includes(`"${DEFAULT_CSV}"`),
+    `the LIVE fallback expression — not a comment — carries the eleven-tool default: ${live[0]}`,
+  );
 }
 
 // --- precondition: the fixture materializes when the tool IS advertised ---------------------
