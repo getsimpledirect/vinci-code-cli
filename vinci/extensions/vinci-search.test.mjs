@@ -3,7 +3,64 @@
 // isPrivateIp must decode and classify the embedded address in BOTH spellings.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isPrivateIp, preflightUrl } from "./vinci-search.ts";
+import registerVinciSearch, {
+  fetchPublicPage,
+  isPrivateIp,
+  preflightUrl,
+  WEB_FETCH_MAX_REDIRECTS,
+} from "./vinci-search.ts";
+
+const publicAddress = "93.184.216.34";
+const signal = new AbortController().signal;
+
+function response(status, location, body = "public page") {
+  const values = new Map([
+    ["content-type", "text/plain"],
+    ...(location === undefined ? [] : [["location", location]]),
+  ]);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => values.get(name.toLowerCase()) ?? null },
+    text: async () => body,
+  };
+}
+
+function dependencies(responses, addresses = new Map()) {
+  const requests = [];
+  const resolutions = [];
+  return {
+    requests,
+    resolutions,
+    value: {
+      fetch: async (url, init) => {
+        requests.push({ url: url.href, redirect: init?.redirect });
+        const next = responses.shift();
+        if (next instanceof Error) throw next;
+        assert.ok(next, `unexpected fetch of ${url.href}`);
+        return next;
+      },
+      lookup: async (hostname) => {
+        resolutions.push(hostname);
+        const next = addresses.get(hostname);
+        if (next instanceof Error) throw next;
+        return next ?? [{ address: publicAddress }];
+      },
+    },
+  };
+}
+
+function registeredWebFetch() {
+  const tools = [];
+  registerVinciSearch({ registerTool: (tool) => tools.push(tool) });
+  const webFetch = tools.find((tool) => tool.name === "web_fetch");
+  assert.ok(webFetch, "production extension must register web_fetch");
+  return webFetch;
+}
+
+function resultText(result) {
+  return result.content.map((part) => part.text ?? "").join("\n");
+}
 
 // Negative: every private / loopback / link-local / NAT64 form must be classified PRIVATE.
 const PRIVATE = [
@@ -115,4 +172,139 @@ test("preflightUrl still allows public mapped, NAT64, IPv4, and IPv6 hosts", () 
   assert.equal(preflightUrl("http://[64:ff9b::5db8:d822]/").ok, true);
   assert.equal(preflightUrl("http://[2606:2800:220:1:248:1893:25c8:1946]/").ok, true);
   assert.equal(preflightUrl("http://[::ffff:ffff]/").ok, true);
+});
+
+test("web_fetch production registration refuses a private redirect before a second request", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: url.href, redirect: init?.redirect });
+    return response(302, "http://127.0.0.1/private");
+  };
+  try {
+    const result = await registeredWebFetch().execute("call", { url: `https://${publicAddress}/start` }, signal);
+    assert.match(resultText(result), /internal server/);
+    assert.deepEqual(requests, [{ url: `https://${publicAddress}/start`, redirect: "manual" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("public relative and absolute redirects are fetched after URL and DNS validation at every hop", async () => {
+  const deps = dependencies([
+    response(302, "/relative"),
+    response(307, "https://final.example/page"),
+    response(200, undefined, "arrived"),
+  ]);
+  const result = await fetchPublicPage("https://start.example/root", signal, deps.value);
+  assert.equal(result.ok, true);
+  assert.equal(result.url.href, "https://final.example/page");
+  assert.deepEqual(deps.resolutions, ["start.example", "start.example", "final.example"]);
+  assert.deepEqual(deps.requests, [
+    { url: "https://start.example/root", redirect: "manual" },
+    { url: "https://start.example/relative", redirect: "manual" },
+    { url: "https://final.example/page", redirect: "manual" },
+  ]);
+});
+
+test("a later-hop hostname resolving private is refused before that hop is fetched", async () => {
+  const addresses = new Map([
+    ["start.example", [{ address: publicAddress }]],
+    ["private.example", [{ address: "10.0.0.8" }]],
+  ]);
+  const deps = dependencies([response(302, "https://private.example/secret")], addresses);
+  const result = await fetchPublicPage("https://start.example/", signal, deps.value);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /resolves to an internal server/);
+  assert.deepEqual(deps.resolutions, ["start.example", "private.example"]);
+  assert.deepEqual(deps.requests, [{ url: "https://start.example/", redirect: "manual" }]);
+});
+
+test("all redirect Location status and shape failures are typed and mechanism-reaching", async (t) => {
+  const badLocations = [
+    ["missing", undefined, /without a valid Location/],
+    ["null", null, /without a valid Location/],
+    ["empty", "   ", /without a valid Location/],
+    ["wrong type", 42, /without a valid Location/],
+    ["malformed", "http://[", /malformed Location/],
+    ["unsupported protocol", "file:///etc/passwd", /Only http\(s\)/],
+  ];
+  for (const [name, location, expected] of badLocations) {
+    await t.test(name, async () => {
+      const deps = dependencies([response(302, location)]);
+      const result = await fetchPublicPage("https://start.example/", signal, deps.value);
+      assert.equal(result.ok, false);
+      assert.match(result.reason, expected);
+      assert.equal(deps.requests.length, 1, "the redirect target must not be requested");
+    });
+  }
+});
+
+test("only defined redirect statuses consume Location", async () => {
+  for (const status of [200, 201, 300, 304, 305, 306]) {
+    const deps = dependencies([response(status, "http://127.0.0.1/private")]);
+    const result = await fetchPublicPage("https://start.example/", signal, deps.value);
+    assert.equal(result.ok, true, `HTTP ${status} is not a followed redirect`);
+    assert.equal(result.response.status, status);
+    assert.equal(deps.requests.length, 1);
+  }
+  for (const status of [301, 302, 303, 307, 308]) {
+    const deps = dependencies([response(status, "http://127.0.0.1/private")]);
+    const result = await fetchPublicPage("https://start.example/", signal, deps.value);
+    assert.equal(result.ok, false, `HTTP ${status} must enter redirect validation`);
+    assert.match(result.reason, /internal server/);
+    assert.equal(deps.requests.length, 1);
+  }
+});
+
+test("redirect loops and redirects beyond the explicit cap are refused", async () => {
+  const loopDeps = dependencies([response(302, "/b"), response(302, "/")]);
+  const loop = await fetchPublicPage("https://loop.example/", signal, loopDeps.value);
+  assert.equal(loop.ok, false);
+  assert.match(loop.reason, /redirect loop/);
+  assert.equal(loopDeps.requests.length, 2);
+
+  const excessResponses = Array.from({ length: WEB_FETCH_MAX_REDIRECTS + 1 }, (_, index) => response(302, `/hop-${index + 1}`));
+  const excessDeps = dependencies(excessResponses);
+  const excess = await fetchPublicPage("https://many.example/", signal, excessDeps.value);
+  assert.equal(excess.ok, false);
+  assert.match(excess.reason, new RegExp(`more than ${WEB_FETCH_MAX_REDIRECTS} times`));
+  assert.equal(excessDeps.requests.length, WEB_FETCH_MAX_REDIRECTS + 1);
+});
+
+test("the redirect cap still permits a public final response at its boundary", async () => {
+  const responses = Array.from({ length: WEB_FETCH_MAX_REDIRECTS }, (_, index) => response(302, `/hop-${index + 1}`));
+  responses.push(response(200));
+  const deps = dependencies(responses);
+  const result = await fetchPublicPage("https://bounded.example/", signal, deps.value);
+  assert.equal(result.ok, true);
+  assert.equal(deps.requests.length, WEB_FETCH_MAX_REDIRECTS + 1);
+});
+
+test("DNS and fetch failures return stable tool errors", async () => {
+  const dnsDeps = dependencies([], new Map([["dns-fails.example", new Error("offline")]]));
+  const dns = await fetchPublicPage("https://dns-fails.example/", signal, dnsDeps.value);
+  assert.equal(dns.ok, false);
+  assert.equal(dns.reason, "Couldn't resolve that web address.");
+  assert.equal(dnsDeps.requests.length, 0);
+
+  const fetchDeps = dependencies([new Error("offline")]);
+  const unreachable = await fetchPublicPage("https://fetch-fails.example/", signal, fetchDeps.value);
+  assert.equal(unreachable.ok, false);
+  assert.equal(unreachable.reason, "Couldn't reach that page right now.");
+
+  const timeout = new Error("slow");
+  timeout.name = "TimeoutError";
+  const timeoutDeps = dependencies([timeout]);
+  const timedOut = await fetchPublicPage("https://timeout.example/", signal, timeoutDeps.value);
+  assert.equal(timedOut.ok, false);
+  assert.equal(timedOut.reason, "That page took too long to load.");
+});
+
+test("web_fetch handles missing, null, empty, malformed, and wrong-type input without reaching fetch", async () => {
+  const webFetch = registeredWebFetch();
+  for (const params of [{}, { url: null }, { url: "" }, { url: "not a URL" }, { url: 7 }, { url: [] }]) {
+    const result = await webFetch.execute("call", params, signal);
+    assert.match(resultText(result), /valid web address/);
+  }
 });
