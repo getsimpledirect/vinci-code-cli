@@ -210,6 +210,19 @@ const FETCH_MAX_BYTES = 5_000_000; // refuse to download more than ~5MB of HTML
 
 /** SSRF guard: is this IP literal private / loopback / link-local / cloud-metadata? Blocks the classic
  *  prompt-injection "fetch http://169.254.169.254/latest/meta-data/…" credential-theft vector. */
+/** Decode the IPv4 address embedded in the low 32 bits of an IPv4-mapped or NAT64 IPv6 address.
+ *  Handles both spellings: dotted (::ffff:127.0.0.1) and WHATWG-hex (::ffff:7f00:1). */
+function decodeEmbeddedV4(addr: string): string | undefined {
+  const m = addr.match(/^(?:::ffff:|64:ff9b:)(?:::)?((?:(?:\d{1,3}\.){3}\d{1,3})|(?:[0-9a-f]{1,4}):(?:[0-9a-f]{1,4}))$/);
+  if (!m) return undefined;
+  const embed = m[1];
+  if (/^\d/.test(embed)) return embed; // dotted form – already a quad
+  // hex form – the last 16 bits are the low 16 bits of the IPv4 address; the preceding 16 are the high 16.
+  const hex = embed.split(":");
+  const v4 = ((Number.parseInt(hex[0], 16) & 0xffff) << 16) | (Number.parseInt(hex[1], 16) & 0xffff);
+  return `${(v4 >>> 24) & 0xff}.${(v4 >>> 16) & 0xff}.${(v4 >>> 8) & 0xff}.${v4 & 0xff}`;
+}
+
 export function isPrivateIp(ip: string): boolean {
   const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (v4) {
@@ -224,7 +237,12 @@ export function isPrivateIp(ip: string): boolean {
   }
   const low = ip.toLowerCase().replace(/^\[|\]$/g, "");
   if (low === "::1" || low === "::") return true;
-  if (low.startsWith("::ffff:")) return isPrivateIp(low.slice(7)); // IPv4-mapped IPv6
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d) and NAT64 (64:ff9b::/96) embed a real IPv4 address in the
+  // low 32 bits — decode it and classify THAT instead of assuming a spelling. The WHATWG URL
+  // parser renders mapped addresses in HEX (::ffff:7f00:1 for 127.0.0.1), so the dotted form
+  // (::ffff:127.0.0.1) can't be matched textually; only decoding the embedded address catches both.
+  const embeddedV4 = decodeEmbeddedV4(low);
+  if (embeddedV4) return isPrivateIp(embeddedV4);
   if (low.startsWith("fe80") || low.startsWith("fc") || low.startsWith("fd")) return true; // link-local / ULA
   return false;
 }
