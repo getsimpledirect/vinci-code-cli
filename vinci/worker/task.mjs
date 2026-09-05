@@ -197,9 +197,12 @@ export const SUPPORTED_CAPABILITIES = Object.freeze([]);
 // other and fails if either moves alone.
 //
 // The four network tools (web_search, web_fetch, web_answer, library_docs) were added to BOTH
-// lists together, on the repo owner's authorization. They are registered unconditionally by the
-// launcher (vinci/bin/vinci loads vinci/extensions/vinci-search.ts), so this was the `--tools`
-// allowlist catching up with what the child already had access to, not a new integration.
+// lists together. The authorizing decision is recorded on the bus as msg_de1a219d (corrected by
+// msg_02bb0a87) — cite that, not this comment: a source file asserting its own authorization is
+// self-attestation, and a reader has no way to check it from inside the diff. They are registered
+// unconditionally by the launcher (vinci/bin/vinci loads vinci/extensions/vinci-search.ts), so
+// this was the `--tools` allowlist catching up with what the child already had, not a new
+// integration.
 //
 // SCOPE — this is hardening, not the closure of a live hole. `spec.tools` reaches run.mjs only
 // through the DIGEST handoff form (materializeEnvelope populates `envelope.tools`); the prose

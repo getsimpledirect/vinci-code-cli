@@ -775,8 +775,9 @@ existing worker suite with the flag off.
   `--tools read,grep,find,ls,bash,edit,write,web_search,web_fetch,web_answer,library_docs`
   (enforced by `SUPPORTED_TOOLS` in `task.mjs`; a spec may ask for fewer, never more). The
   launcher's four network tools — `web_search`, `web_fetch`, `web_answer`, `library_docs` —
-  ARE in that set: they were added to both lists together on the repo owner's authorization,
-  the launcher having registered them unconditionally all along. Other launcher extension
+  ARE in that set: they were added to both lists together under the decision recorded on the bus
+  as `msg_de1a219d` (corrected by `msg_02bb0a87`), the launcher having registered them
+  unconditionally all along. Other launcher extension
   tools (`orchestrate`, `spawn_helper`, `advisor`, `convene_council`, …) remain outside it and
   are refused as `tool_unsupported`.
 - 🔴 That is a TOOL boundary, not a network boundary — and it never was one. `bash` is in the
