@@ -366,7 +366,8 @@ export const DECLARATION_REFRESH_DEFAULT_S = 21600;
 //   steering               false  no command can redirect a running task
 //   approvals              "none" nothing in the run waits for a person
 //   pause                  false  the only brake is termination
-//   restrictToReadOnly     false  the tool set is fixed at spawn (read,grep,find,ls,bash,edit,write)
+//   restrictToReadOnly     false  the tool set is fixed at spawn (read,grep,find,ls,bash,edit,
+//                                 write,web_search,web_fetch,web_answer,library_docs)
 //   abort                  false  no bus command aborts a run: the daemon consumes only kind
 //                                 "handoff" and has no abort handler. Limits, lease loss and the
 //                                 daemon's own SIGTERM end a run, but none of those is a caller-

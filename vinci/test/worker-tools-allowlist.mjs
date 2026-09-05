@@ -3,11 +3,19 @@
 // `spec.tools` becomes the `--tools` CSV handed to the unattended `vinci -p` agent
 // (run.mjs:1210). It was validated for SHAPE ONLY — a list of non-empty strings — so any string
 // passed, and the launcher (vinci/bin/vinci) unconditionally registers ~30 extension tools
-// (web_search, web_fetch, web_answer, library_docs, advisor, convene_council, orchestrate,
-// spawn_helper, …) that a spec could therefore have named. task.mjs now holds SUPPORTED_TOOLS —
-// exactly the seven tools run.mjs already falls back to — and refuses anything else as
-// `tool_unsupported`, the same fail-closed posture the adjacent `requiredCapabilities` field has
-// had against SUPPORTED_CAPABILITIES.
+// (advisor, convene_council, orchestrate, spawn_helper, …) that a spec could therefore have
+// named. task.mjs now holds SUPPORTED_TOOLS — exactly the eleven tools run.mjs already falls
+// back to — and refuses anything else as `tool_unsupported`, the same fail-closed posture the
+// adjacent `requiredCapabilities` field has had against SUPPORTED_CAPABILITIES.
+//
+// 🔴 THE ALLOWLIST GREW, SO THE NEGATIVE FIXTURES MOVED. The four network tools (`web_search`,
+// `web_fetch`, `web_answer`, `library_docs`) were added to BOTH lists together, on the repo
+// owner's authorization. Every negative case in this file used to be spelled `web_fetch`; each
+// one would now be VACUOUS — asserting a refusal for a tool that is admitted — so they are all
+// re-pointed at `orchestrate` and `spawn_helper`, which the launcher registers and which this
+// worker still does NOT advertise. The membership probes at the bottom of §5 assert both
+// directions (a newly-admitted tool is in, the refused example is out) so that a future
+// widening cannot quietly hollow these cases out the same way again.
 //
 // This is hardening of a path not yet in service, not the closure of a live hole: `spec.tools`
 // is populated ONLY by the digest handoff form, the prose envelope form has no `tools` header
@@ -29,7 +37,7 @@
 //                                          promotion, evidence
 // Guard 3 is the sharp one and is NOT optional to clear: to reach this allowlist at all, the
 // work order must GRANT the very tool we then refuse. That is the real threat model — a work
-// order that grants `tool:web_fetch` must still not get web_fetch out of this worker. Every
+// order that grants `tool:orchestrate` must still not get orchestrate out of this worker. Every
 // assertion below pins the EXACT reason code, and the ordering control proves which guard
 // answered.
 import assert from "node:assert/strict";
@@ -90,13 +98,14 @@ function refuses(order, spec, code, names, label) {
 }
 
 // --- the allowlist IS the run.mjs default, neither more nor less ----------------------------
-// This change restricts what a spec may REQUEST down to what run.mjs already grants by default;
-// it must not enable anything. Pinned against the literal fallback string in run.mjs:1210 so the
-// two cannot drift apart silently in either direction.
+// This restricts what a spec may REQUEST down to what run.mjs already grants by default; it must
+// not enable anything beyond that default. Pinned against the literal fallback string in
+// run.mjs:1210 so the two cannot drift apart silently in either direction — this is the LOCKSTEP
+// pin, and it is what fails if the four network tools are added to one list and not the other.
 {
-  const DEFAULT_CSV = "read,grep,find,ls,bash,edit,write";
+  const DEFAULT_CSV = "read,grep,find,ls,bash,edit,write,web_search,web_fetch,web_answer,library_docs";
   assert.deepEqual([...SUPPORTED_TOOLS], DEFAULT_CSV.split(","), "SUPPORTED_TOOLS is exactly run.mjs's default --tools set");
-  assert.equal(SUPPORTED_TOOLS.length, 7, "seven tools, nothing more");
+  assert.equal(SUPPORTED_TOOLS.length, 11, "eleven tools, nothing more");
   assert.ok(Object.isFrozen(SUPPORTED_TOOLS), "the allowlist is frozen");
   const runSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../worker/run.mjs"), "utf8");
   assert.ok(runSource.includes(`"${DEFAULT_CSV}"`), "run.mjs still carries the default this list mirrors, unchanged");
@@ -113,22 +122,35 @@ function refuses(order, spec, code, names, label) {
 }
 
 // --- 1. NEGATIVE: an extension tool is refused ----------------------------------------------
-// Valid in every other field. The order GRANTS tool:web_fetch, so containment is satisfied and
+// Valid in every other field. The order GRANTS tool:orchestrate, so containment is satisfied and
 // the worker's own allowlist is the only thing standing between this spec and an unattended
-// agent with network fetch. materializeEnvelope is the pre-clone boundary: worker.mjs binds its
-// result at :791 and only then reaches prepareRepository (:1208) and runVinci (:1293), so a
-// throw here means nothing was cloned and nothing was spawned.
+// agent that can spawn further agents. materializeEnvelope is the pre-clone boundary: worker.mjs
+// binds its result at :791 and only then reaches prepareRepository (:1208) and runVinci (:1293),
+// so a throw here means nothing was cloned and nothing was spawned.
+//
+// `orchestrate` replaced `web_fetch` here when the four network tools were admitted. The
+// expected-substring list below spells the FULL eleven-name supported set that the refusal
+// message prints, so this case also fails if the message stops reflecting the real list.
 {
-  const order = orderGranting(["web_fetch"]);
-  const spec = specFor(order, { tools: ["web_fetch"] });
-  const thrown = refuses(order, spec, "tool_unsupported", ['"web_fetch"', "read, grep, find, ls, bash, edit, write"], "web_fetch alone");
-  assert.match(thrown.message, /^tool_unsupported: tool "web_fetch" is not supported by this worker \(supported: /);
+  const order = orderGranting(["orchestrate"]);
+  const spec = specFor(order, { tools: ["orchestrate"] });
+  const supportedNames = "read, grep, find, ls, bash, edit, write, web_search, web_fetch, web_answer, library_docs";
+  const thrown = refuses(order, spec, "tool_unsupported", ['"orchestrate"', supportedNames], "orchestrate alone");
+  assert.match(thrown.message, /^tool_unsupported: tool "orchestrate" is not supported by this worker \(supported: /);
 }
 
-// Every extension tool the launcher registers, not just the one in the headline case.
-for (const tool of ["web_search", "web_fetch", "web_answer", "library_docs", "advisor", "convene_council", "orchestrate", "spawn_helper"]) {
+// Every extension tool the launcher registers that this worker still does NOT advertise. The
+// four network tools that used to head this list were moved to §3's positive cases when they
+// were admitted; leaving them here would have asserted a refusal that no longer happens.
+for (const tool of ["advisor", "convene_council", "orchestrate", "spawn_helper"]) {
   const order = orderGranting([tool]);
   refuses(order, specFor(order, { tools: [tool] }), "tool_unsupported", [JSON.stringify(tool)], `extension tool ${tool}`);
+}
+// …and no tool named in that loop may be one the allowlist now admits. Without this, a future
+// widening would turn each case above into a green assertion about nothing — exactly the way
+// the `web_fetch` fixtures went vacuous.
+for (const tool of ["advisor", "convene_council", "orchestrate", "spawn_helper"]) {
+  assert.equal(SUPPORTED_TOOLS.includes(tool), false, `${tool} is still outside the allowlist, so the negative case above is not vacuous`);
 }
 
 // --- 2. ORDERING CONTROL: prove WHICH guard answered ----------------------------------------
@@ -136,18 +158,25 @@ for (const tool of ["web_search", "web_fetch", "web_answer", "library_docs", "ad
 // reached. This is the hazard made visible — a fixture written without the grant would have
 // gone green on `execution_exceeds_contract` and proved nothing about this change.
 {
-  const order = orderGranting(["read"]); // deliberately does NOT grant tool:web_fetch
-  refuses(order, specFor(order, { tools: ["web_fetch"] }), "execution_exceeds_contract", ["tool_not_granted", "/tools/0"], "ungranted web_fetch");
+  const order = orderGranting(["read"]); // deliberately does NOT grant tool:orchestrate
+  refuses(order, specFor(order, { tools: ["orchestrate"] }), "execution_exceeds_contract", ["tool_not_granted", "/tools/0"], "ungranted orchestrate");
 }
 // (b) With the grant, the SAME spec gets a different code. The pair is the discriminator: the
 // only thing that changed is the order's grant, and the answering guard moved from containment
 // to the allowlist. Nothing but the new check can produce `tool_unsupported`.
 {
-  const granted = orderGranting(["web_fetch"]);
-  const thrown = refuses(granted, specFor(granted, { tools: ["web_fetch"] }), "tool_unsupported", ["web_fetch"], "granted web_fetch");
+  const granted = orderGranting(["orchestrate"]);
+  const thrown = refuses(granted, specFor(granted, { tools: ["orchestrate"] }), "tool_unsupported", ["orchestrate"], "granted orchestrate");
   for (const earlier of ["unknown_field", "invalid_spec_field", "no_tools", "capability_unsupported", "execution_exceeds_contract", "binding_mismatch"]) {
     assert.notEqual(thrown.code, earlier, `an earlier guard must not be what answered (${earlier})`);
   }
+}
+// (c) The same discriminator run on `spawn_helper`, so the pair is not a property of one name.
+{
+  const ungranted = orderGranting(["read"]);
+  refuses(ungranted, specFor(ungranted, { tools: ["spawn_helper"] }), "execution_exceeds_contract", ["tool_not_granted"], "ungranted spawn_helper");
+  const granted = orderGranting(["spawn_helper"]);
+  refuses(granted, specFor(granted, { tools: ["spawn_helper"] }), "tool_unsupported", ['"spawn_helper"'], "granted spawn_helper");
 }
 
 // --- 3. POSITIVE REACHABILITY: the guarded operation still works -----------------------------
@@ -159,31 +188,69 @@ for (const tool of ["web_search", "web_fetch", "web_answer", "library_docs", "ad
   assert.deepEqual(materialized.envelope.tools, ["read", "bash"], "a narrowed subset materializes");
 }
 {
-  // The full default set — the exact seven run.mjs would have used anyway. Behaviour for a spec
-  // using the default MUST be unchanged by this commit.
+  // The full default set — the exact eleven run.mjs would have used anyway. Behaviour for a spec
+  // using the default MUST match run.mjs's fallback exactly. The expected value is a LITERAL,
+  // not `[...SUPPORTED_TOOLS]`: comparing the list against itself would pass under any edit.
   const order = orderGranting([...SUPPORTED_TOOLS]);
   const materialized = materialize(order, specFor(order, { tools: [...SUPPORTED_TOOLS] }));
-  assert.deepEqual(materialized.envelope.tools, ["read", "grep", "find", "ls", "bash", "edit", "write"], "the whole default set materializes");
+  assert.deepEqual(
+    materialized.envelope.tools,
+    ["read", "grep", "find", "ls", "bash", "edit", "write", "web_search", "web_fetch", "web_answer", "library_docs"],
+    "the whole default set materializes",
+  );
 }
-// …and each of the seven on its own, so a typo in the list cannot hide behind its neighbours.
+// …and each of the eleven on its own, so a typo in the list cannot hide behind its neighbours.
 for (const tool of SUPPORTED_TOOLS) {
   const order = orderGranting([tool]);
   const materialized = materialize(order, specFor(order, { tools: [tool] }));
   assert.deepEqual(materialized.envelope.tools, [tool], `${tool} alone is admitted`);
 }
 
+// --- 3b. POSITIVE REACHABILITY FOR THE FOUR NEWLY-ADMITTED NETWORK TOOLS ---------------------
+// The names are LITERALS, deliberately not derived from SUPPORTED_TOOLS: a case that iterates
+// the list under test can only ever agree with it, and would stay green if the four were
+// removed again. Spelled out, these fail the moment the allowlist stops carrying them — which
+// is what makes them the positive control for this change rather than decoration.
+const NETWORK_TOOLS = ["web_search", "web_fetch", "web_answer", "library_docs"];
+for (const tool of NETWORK_TOOLS) {
+  assert.equal(SUPPORTED_TOOLS.includes(tool), true, `${tool} is advertised by this worker`);
+  const order = orderGranting([tool]);
+  const materialized = materialize(order, specFor(order, { tools: [tool] }));
+  assert.deepEqual(materialized.envelope.tools, [tool], `${tool} alone is ADMITTED and carried through to the envelope`);
+}
+// All four together, and mixed with the original seven's members, through the same entry point.
+{
+  const order = orderGranting(NETWORK_TOOLS);
+  const materialized = materialize(order, specFor(order, { tools: [...NETWORK_TOOLS] }));
+  assert.deepEqual(materialized.envelope.tools, ["web_search", "web_fetch", "web_answer", "library_docs"], "all four network tools materialize together");
+}
+{
+  const mixed = ["read", "web_fetch", "bash", "library_docs"];
+  const order = orderGranting(mixed);
+  const materialized = materialize(order, specFor(order, { tools: [...mixed] }));
+  assert.deepEqual(materialized.envelope.tools, ["read", "web_fetch", "bash", "library_docs"], "network tools mix with the original set");
+}
+
 // --- 4. MIXED: one disallowed entry poisons the list ----------------------------------------
 // The refusal must name the OFFENDING entry, not the first entry, and must not quietly drop it
 // and run with the rest.
 {
-  const order = orderGranting(["read", "web_fetch"]);
-  const thrown = refuses(order, specFor(order, { tools: ["read", "web_fetch"] }), "tool_unsupported", ['"web_fetch"'], "read + web_fetch");
+  const order = orderGranting(["read", "orchestrate"]);
+  const thrown = refuses(order, specFor(order, { tools: ["read", "orchestrate"] }), "tool_unsupported", ['"orchestrate"'], "read + orchestrate");
   assert.ok(!thrown.message.includes('tool "read"'), `the reason names the offending entry, not the admitted one: ${thrown.message}`);
 }
 {
   // …and in the other order, so the check is a scan and not a look at tools[tools.length - 1].
-  const order = orderGranting(["web_fetch", "read"]);
-  refuses(order, specFor(order, { tools: ["web_fetch", "read"] }), "tool_unsupported", ['"web_fetch"'], "web_fetch + read");
+  const order = orderGranting(["orchestrate", "read"]);
+  refuses(order, specFor(order, { tools: ["orchestrate", "read"] }), "tool_unsupported", ['"orchestrate"'], "orchestrate + read");
+}
+{
+  // …and a NEWLY-ADMITTED tool beside a refused one: the widening must not have turned the scan
+  // into "the list contains something allowed, ship it". web_fetch is admitted, orchestrate is
+  // not, and the pair must still refuse and still name orchestrate.
+  const order = orderGranting(["web_fetch", "orchestrate"]);
+  const thrown = refuses(order, specFor(order, { tools: ["web_fetch", "orchestrate"] }), "tool_unsupported", ['"orchestrate"'], "web_fetch + orchestrate");
+  assert.ok(!thrown.message.includes('tool "web_fetch"'), `the admitted network tool is not the one named: ${thrown.message}`);
 }
 
 // --- 5. EDGE INPUTS ---------------------------------------------------------------------------
@@ -251,7 +318,8 @@ for (const [label, tools, pattern] of [
 // and a repeated REFUSED tool would still be refused.
 {
   assert.equal(SUPPORTED_TOOLS.includes("read"), true);
-  assert.equal(SUPPORTED_TOOLS.includes("web_fetch"), false);
+  assert.equal(SUPPORTED_TOOLS.includes("web_fetch"), true); // admitted by this change
+  assert.equal(SUPPORTED_TOOLS.includes("orchestrate"), false); // and this is the refused example
 }
 
 // CASE — ["READ"]. DELIBERATE CHOICE: matching is EXACT and case-sensitive, so "READ" is

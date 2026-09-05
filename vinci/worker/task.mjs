@@ -190,21 +190,27 @@ export const SUPPORTED_CAPABILITIES = Object.freeze([]);
 
 // The closed set of tools this worker will hand an unattended `vinci -p` agent. It is EXACTLY the
 // default allowlist run.mjs falls back to when a spec names none ("read,grep,find,ls,bash,edit,
-// write"), so a work order may NARROW what the agent may call and never widen it. Same posture as
-// SUPPORTED_CAPABILITIES above: anything this worker does not advertise is BLOCKED
-// (`tool_unsupported`), never silently dropped. Grow this list only together with the run.mjs
-// default it mirrors.
+// write,web_search,web_fetch,web_answer,library_docs"), so a work order may NARROW what the agent
+// may call and never widen it. Same posture as SUPPORTED_CAPABILITIES above: anything this worker
+// does not advertise is BLOCKED (`tool_unsupported`), never silently dropped. Grow this list only
+// together with the run.mjs default it mirrors — worker-tools-allowlist.mjs pins the two to each
+// other and fails if either moves alone.
+//
+// The four network tools (web_search, web_fetch, web_answer, library_docs) were added to BOTH
+// lists together, on the repo owner's authorization. They are registered unconditionally by the
+// launcher (vinci/bin/vinci loads vinci/extensions/vinci-search.ts), so this was the `--tools`
+// allowlist catching up with what the child already had access to, not a new integration.
 //
 // SCOPE — this is hardening, not the closure of a live hole. `spec.tools` reaches run.mjs only
 // through the DIGEST handoff form (materializeEnvelope populates `envelope.tools`); the prose
 // envelope form has no `tools` header at all (see HEADER_KEYS above), so on the prose path
-// `envelope.tools` is undefined and run.mjs falls back to the seven-tool default regardless. The
+// `envelope.tools` is undefined and run.mjs falls back to the eleven-tool default regardless. The
 // digest path needs a contract registry that is not configured in production, so nothing has been
 // dispatched through this field. It becomes load-bearing the moment that registry is enabled —
 // which is exactly when it is too late to add. Before this list, `tools` was validated for shape
 // only, and the launcher (vinci/bin/vinci) unconditionally registers ~30 extension tools
-// (web_search, web_fetch, web_answer, library_docs, advisor, convene_council, orchestrate,
-// spawn_helper), so any string a spec named would have been forwarded verbatim to `--tools`.
+// (advisor, convene_council, orchestrate, spawn_helper, … alongside the four network tools this
+// list now admits), so any string a spec named would have been forwarded verbatim to `--tools`.
 //
 // NOT the same check as `tool_not_granted`, and it does not supersede it. Containment
 // (contracts/within-order.mjs, the vendored port of vinci-gpu-control's
@@ -213,7 +219,19 @@ export const SUPPORTED_CAPABILITIES = Object.freeze([]);
 // list asks whether THIS WORKER supports the tool at all — a question no work order can answer,
 // and one that must still refuse when a registry grants something the worker should not run. Two
 // different questions, two different reason codes, deliberately. Both must pass.
-export const SUPPORTED_TOOLS = Object.freeze(["read", "grep", "find", "ls", "bash", "edit", "write"]);
+export const SUPPORTED_TOOLS = Object.freeze([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "bash",
+  "edit",
+  "write",
+  "web_search",
+  "web_fetch",
+  "web_answer",
+  "library_docs",
+]);
 
 // B2: read the operator model-class table from VINCI_WORKER_MODEL_CLASSES. The value is a JSON
 // object `{ <class>: { provider, model } }`, or `@<path>` naming a JSON file (parsed

@@ -1207,7 +1207,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
   const abortKillGraceMs = Number(process.env.VINCI_WORKER_LEASE_KILL_GRACE_MS) || 10_000;
-  const tools = Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools.join(",") : "read,grep,find,ls,bash,edit,write";
+  const tools = Array.isArray(envelope.tools) && envelope.tools.length > 0 ? envelope.tools.join(",") : "read,grep,find,ls,bash,edit,write,web_search,web_fetch,web_answer,library_docs";
   const taskEnvironment = applyEnvDelta(env ?? process.env, envDelta);
   taskEnvironment.VINCI_UPDATE_DISABLED = "1";
   for (const name of [
