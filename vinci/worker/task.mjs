@@ -188,6 +188,33 @@ export const MODEL_CLASSES = DEFAULT_MODEL_CLASSES;
 // rather than silently unfulfilled. Grow this list only when the worker actually provides one.
 export const SUPPORTED_CAPABILITIES = Object.freeze([]);
 
+// The closed set of tools this worker will hand an unattended `vinci -p` agent. It is EXACTLY the
+// default allowlist run.mjs falls back to when a spec names none ("read,grep,find,ls,bash,edit,
+// write"), so a work order may NARROW what the agent may call and never widen it. Same posture as
+// SUPPORTED_CAPABILITIES above: anything this worker does not advertise is BLOCKED
+// (`tool_unsupported`), never silently dropped. Grow this list only together with the run.mjs
+// default it mirrors.
+//
+// SCOPE — this is hardening, not the closure of a live hole. `spec.tools` reaches run.mjs only
+// through the DIGEST handoff form (materializeEnvelope populates `envelope.tools`); the prose
+// envelope form has no `tools` header at all (see HEADER_KEYS above), so on the prose path
+// `envelope.tools` is undefined and run.mjs falls back to the seven-tool default regardless. The
+// digest path needs a contract registry that is not configured in production, so nothing has been
+// dispatched through this field. It becomes load-bearing the moment that registry is enabled —
+// which is exactly when it is too late to add. Before this list, `tools` was validated for shape
+// only, and the launcher (vinci/bin/vinci) unconditionally registers ~30 extension tools
+// (web_search, web_fetch, web_answer, library_docs, advisor, convene_council, orchestrate,
+// spawn_helper), so any string a spec named would have been forwarded verbatim to `--tools`.
+//
+// NOT the same check as `tool_not_granted`, and it does not supersede it. Containment
+// (contracts/within-order.mjs, the vendored port of vinci-gpu-control's
+// `authority/vinci_gpu_authority/contracts.py::check_within_order`) asks whether THIS WORK ORDER
+// granted `tool:<name>`; it runs earlier, at step 3.5, and refuses as `tool_not_granted`. This
+// list asks whether THIS WORKER supports the tool at all — a question no work order can answer,
+// and one that must still refuse when a registry grants something the worker should not run. Two
+// different questions, two different reason codes, deliberately. Both must pass.
+export const SUPPORTED_TOOLS = Object.freeze(["read", "grep", "find", "ls", "bash", "edit", "write"]);
+
 // B2: read the operator model-class table from VINCI_WORKER_MODEL_CLASSES. The value is a JSON
 // object `{ <class>: { provider, model } }`, or `@<path>` naming a JSON file (parsed
 // identically; `@/foo.json` reads `/foo.json`). Unset => `{ configured: false, table:
@@ -398,6 +425,17 @@ export function materializeEnvelope(triple, registry, opts = {}) {
   if (!Array.isArray(spec.tools)) refuse("invalid_spec_field", "tools is a list of tool names");
   if (spec.tools.length === 0) refuse("no_tools", "tools is empty; at least one tool is required");
   if (!spec.tools.every((t) => typeof t === "string" && t.length > 0)) refuse("invalid_spec_field", "tools entries are non-empty tool names");
+  // …and every entry must be a tool this worker advertises (SUPPORTED_TOOLS) — one unsupported
+  // entry BLOCKs the task rather than being dropped from the list. Comparison is EXACT and
+  // case-sensitive, matching both the case-sensitive `tool:<name>` grant grammar in
+  // within-order.mjs and the CSV run.mjs hands to `--tools`; "READ" is not "read". Duplicates are
+  // deliberately NOT this check's business: digest.mjs already refuses a repeated entry as
+  // `duplicate_entry` before a spec is ever selected, so a uniqueness rule here could never fire.
+  for (const tool of spec.tools) {
+    if (!SUPPORTED_TOOLS.includes(tool)) {
+      refuse("tool_unsupported", `tool ${JSON.stringify(tool)} is not supported by this worker (supported: ${SUPPORTED_TOOLS.join(", ") || "none"})`);
+    }
+  }
   const tools = [...spec.tools];
   // inputArtifacts (list): recorded as-is (no fetch in Wave 1B scope).
   if (spec.inputArtifacts !== undefined && !Array.isArray(spec.inputArtifacts)) refuse("invalid_spec_field", "inputArtifacts is a list");
