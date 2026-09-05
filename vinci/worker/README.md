@@ -59,7 +59,11 @@ WantedBy=multi-user.target
 2. **Parse**: Task envelope with headers (repo, evidence, provider, model, budget, timeout, deadline, ref)
 3. **Claim**: POST status "claimed <id> attempt N" to bus
 4. **Setup**: Clone/fetch the repo and reuse or create `worker/<task-id>` from `origin/main`
-5. **Run**: Spawn `vinci -p --session-id <id> --tools read,grep,find,ls,bash,edit,write "<spec>"`
+5. **Run**: Spawn `vinci -p --session-id <id> --tools <tools> "<spec>"`, where `<tools>` is
+   the execution spec's `tools` when the digest form supplies one and
+   `read,grep,find,ls,bash,edit,write` otherwise. A spec may NARROW that set; it cannot widen
+   it, because `SUPPORTED_TOOLS` in `task.mjs` refuses anything outside it as
+   `tool_unsupported`.
 6. **Limits**:
    - `max_runtime_s`: SIGTERM then SIGKILL after 30s
    - `budget_usd`: Poll session JSONL every 15s; kill if cost exceeds budget
@@ -766,7 +770,14 @@ existing worker suite with the flag off.
 - Outbound HTTPS to bus (`--server`)
 - Outbound HTTPS to GitHub (clone, fetch, push, PR operations)
 - NO inbound network required
-- Runs with `--tools read,grep,find,ls,bash,edit,write` only (no network tools)
+- Runs with at most `--tools read,grep,find,ls,bash,edit,write` (enforced by `SUPPORTED_TOOLS`
+  in `task.mjs`; a spec may ask for fewer, never more). None of the launcher's network tools
+  — `web_search`, `web_fetch`, `web_answer`, `library_docs` — are in that set, though the
+  launcher does register them.
+- 🔴 That is a TOOL boundary, not a network boundary. `bash` is in the set and there is no
+  egress allowlist (see "No network allowlist" under the clean-room gaps above), so the child
+  can still reach anything the box can reach. Withholding the network tools removes the
+  attributable path, not the capability.
 
 ## See Also
 
