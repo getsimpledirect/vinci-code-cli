@@ -224,7 +224,19 @@ export function isPrivateIp(ip: string): boolean {
   }
   const low = ip.toLowerCase().replace(/^\[|\]$/g, "");
   if (low === "::1" || low === "::") return true;
-  if (low.startsWith("::ffff:")) return isPrivateIp(low.slice(7)); // IPv4-mapped IPv6
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d) and NAT64 (64:ff9b::a.b.c.d) embed an IPv4 address. WHATWG
+  // new URL() normalises the dotted spelling to hex (::ffff:127.0.0.1 -> ::ffff:7f00:1), so decode
+  // the embedded address instead of assuming a spelling.
+  const embedded = low.startsWith("::ffff:") ? low.slice(7) : low.startsWith("64:ff9b::") ? low.slice(9) : null;
+  if (embedded !== null) {
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(embedded)) return isPrivateIp(embedded);
+    const tail = embedded.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (tail) {
+      const n = parseInt(tail[1], 16) * 0x10000 + parseInt(tail[2], 16);
+      return isPrivateIp(`${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`);
+    }
+    return false;
+  }
   if (low.startsWith("fe80") || low.startsWith("fc") || low.startsWith("fd")) return true; // link-local / ULA
   return false;
 }

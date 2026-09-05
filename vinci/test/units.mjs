@@ -209,7 +209,16 @@ function isPrivateIp(ip) {
   }
   const low = ip.toLowerCase().replace(/^\[|\]$/g, "");
   if (low === "::1" || low === "::") return true;
-  if (low.startsWith("::ffff:")) return isPrivateIp(low.slice(7));
+  const embedded = low.startsWith("::ffff:") ? low.slice(7) : low.startsWith("64:ff9b::") ? low.slice(9) : null;
+  if (embedded !== null) {
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(embedded)) return isPrivateIp(embedded);
+    const tail = embedded.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (tail) {
+      const n = parseInt(tail[1], 16) * 0x10000 + parseInt(tail[2], 16);
+      return isPrivateIp(`${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`);
+    }
+    return false;
+  }
   if (low.startsWith("fe80") || low.startsWith("fc") || low.startsWith("fd")) return true;
   return false;
 }
@@ -221,7 +230,25 @@ eq("fetch SSRF: 192.168.x blocked", isPrivateIp("192.168.0.1"), true);
 eq("fetch SSRF: 172.16-31 blocked", isPrivateIp("172.20.1.1"), true);
 eq("fetch SSRF: ::1 blocked", isPrivateIp("::1"), true);
 eq("fetch SSRF: v4-mapped private blocked", isPrivateIp("::ffff:127.0.0.1"), true);
+// WHATWG new URL() normalises IPv4-mapped IPv6 to hex (::ffff:127.0.0.1 -> ::ffff:7f00:1) — both
+// spellings, with or without brackets, must decode the embedded IPv4 and classify it.
+eq("fetch SSRF: hex v4-mapped loopback blocked (URL-normalised)", isPrivateIp("[::ffff:7f00:1]"), true);
+eq("fetch SSRF: hex v4-mapped loopback blocked (bare)", isPrivateIp("::ffff:7f00:1"), true);
+eq("fetch SSRF: dotted v4-mapped loopback blocked (brackets)", isPrivateIp("[::ffff:127.0.0.1]"), true);
+// NAT64 (64:ff9b::/96) embeds the same IPv4 — decode and classify it too.
+eq("fetch SSRF: NAT64 hex loopback blocked", isPrivateIp("[64:ff9b::7f00:1]"), true);
+eq("fetch SSRF: NAT64 dotted loopback blocked", isPrivateIp("64:ff9b::127.0.0.1"), true);
+eq("fetch SSRF: v4-mapped 0.0.0.0 blocked", isPrivateIp("::ffff:0:0"), true);
+// positive controls — decoding, not "always private"
+eq("fetch SSRF: public v4 allowed (control)", isPrivateIp("93.184.216.34"), false);
+eq("fetch SSRF: public v6 allowed (control)", isPrivateIp("[2606:2800:220:1:248:1893:25c8:1946]"), false);
+eq("fetch SSRF: v4-mapped PUBLIC allowed (control)", isPrivateIp("::ffff:5db8:d822"), false);
+eq("fetch SSRF: NAT64 PUBLIC allowed (control)", isPrivateIp("64:ff9b::5db8:d822"), false);
+// regression — the previously blocked families all stay blocked
 eq("fetch SSRF: public 8.8.8.8 allowed", isPrivateIp("8.8.8.8"), false);
+eq("fetch SSRF: CGNAT 100.64-127 blocked", isPrivateIp("100.64.0.1"), true);
+eq("fetch SSRF: link-local fe80 blocked", isPrivateIp("fe80::1"), true);
+eq("fetch SSRF: ULA fc/fd blocked", isPrivateIp("fc00::1") && isPrivateIp("fd00::1"), true);
 eq("fetch SSRF: public 172.15/172.32 allowed (edge)", isPrivateIp("172.15.0.1") || isPrivateIp("172.32.0.1"), false);
 
 function preflightBlocked(raw) {
