@@ -44,7 +44,7 @@ function dependencies(responses, addresses = new Map()) {
         resolutions.push(hostname);
         const next = addresses.get(hostname);
         if (next instanceof Error) throw next;
-        return next ?? [{ address: publicAddress }];
+        return addresses.has(hostname) ? next : [{ address: publicAddress }];
       },
     },
   };
@@ -220,6 +220,66 @@ test("a later-hop hostname resolving private is refused before that hop is fetch
   assert.deepEqual(deps.requests, [{ url: "https://start.example/", redirect: "manual" }]);
 });
 
+test("a later-hop mixed public/private DNS answer is refused before that hop is fetched", async () => {
+  const addresses = new Map([
+    ["start.example", [{ address: publicAddress }]],
+    ["mixed.example", [{ address: publicAddress }, { address: "10.0.0.8" }]],
+  ]);
+  const deps = dependencies([response(302, "https://mixed.example/secret")], addresses);
+  const result = await fetchPublicPage("https://start.example/", signal, deps.value);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /resolves to an internal server/);
+  assert.deepEqual(deps.resolutions, ["start.example", "mixed.example"]);
+  assert.deepEqual(deps.requests, [{ url: "https://start.example/", redirect: "manual" }]);
+});
+
+test("missing, empty, and wrong-shaped DNS evidence is refused before fetch", async (t) => {
+  const invalidAnswers = [
+    ["missing", undefined, /Couldn't resolve/],
+    ["null", null, /Couldn't resolve/],
+    ["empty array", [], /Couldn't resolve/],
+    ["object instead of array", { address: publicAddress }, /Couldn't resolve/],
+    ["string instead of array", publicAddress, /Couldn't resolve/],
+    ["null row", [null], /Couldn't resolve/],
+    ["array row", [[{ address: publicAddress }]], /Couldn't resolve/],
+    ["missing address", [{}], /Couldn't resolve/],
+    ["null address", [{ address: null }], /Couldn't resolve/],
+    ["empty address", [{ address: "" }], /Couldn't resolve/],
+    ["wrong-type address", [{ address: 7 }], /Couldn't resolve/],
+    ["malformed IPv4 address", [{ address: "999.1.1.1" }], /invalid DNS address/],
+    ["malformed IPv6 address", [{ address: "2001:::1" }], /invalid DNS address/],
+  ];
+  for (const [name, answer, expected] of invalidAnswers) {
+    await t.test(name, async () => {
+      const deps = dependencies([], new Map([["invalid-dns.example", answer]]));
+      const result = await fetchPublicPage("https://invalid-dns.example/", signal, deps.value);
+      assert.equal(result.ok, false);
+      assert.match(result.reason, expected);
+      assert.deepEqual(deps.resolutions, ["invalid-dns.example"]);
+      assert.equal(deps.requests.length, 0, "invalid resolver evidence must be rejected before fetch");
+    });
+  }
+});
+
+test("a nonempty all-public DNS answer is accepted", async () => {
+  const addresses = new Map([
+    [
+      "public.example",
+      [
+        { address: publicAddress },
+        { address: "2606:2800:220:1:248:1893:25c8:1946" },
+        { address: "::ffff:5db8:d822" },
+        { address: "64:ff9b::5db8:d822" },
+      ],
+    ],
+  ]);
+  const deps = dependencies([response(200)], addresses);
+  const result = await fetchPublicPage("https://public.example/", signal, deps.value);
+  assert.equal(result.ok, true);
+  assert.deepEqual(deps.resolutions, ["public.example"]);
+  assert.deepEqual(deps.requests, [{ url: "https://public.example/", redirect: "manual" }]);
+});
+
 test("all redirect Location status and shape failures are typed and mechanism-reaching", async (t) => {
   const badLocations = [
     ["missing", undefined, /without a valid Location/],
@@ -270,6 +330,23 @@ test("redirect loops and redirects beyond the explicit cap are refused", async (
   assert.equal(excess.ok, false);
   assert.match(excess.reason, new RegExp(`more than ${WEB_FETCH_MAX_REDIRECTS} times`));
   assert.equal(excessDeps.requests.length, WEB_FETCH_MAX_REDIRECTS + 1);
+});
+
+test("a non-initial start-to-a-to-b-to-a redirect cycle is refused", async () => {
+  const deps = dependencies([
+    response(302, "https://a.example/one"),
+    response(302, "https://b.example/two"),
+    response(302, "https://a.example/one"),
+  ]);
+  const result = await fetchPublicPage("https://start.example/", signal, deps.value);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /redirect loop/);
+  assert.deepEqual(deps.resolutions, ["start.example", "a.example", "b.example"]);
+  assert.deepEqual(deps.requests, [
+    { url: "https://start.example/", redirect: "manual" },
+    { url: "https://a.example/one", redirect: "manual" },
+    { url: "https://b.example/two", redirect: "manual" },
+  ]);
 });
 
 test("the redirect cap still permits a public final response at its boundary", async () => {

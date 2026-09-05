@@ -23,6 +23,7 @@
  * Additive: no core edit.
  */
 import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -209,10 +210,9 @@ const FETCH_MAX_CHARS = 30000; // cap the extracted text — a docs page can be 
 const FETCH_MAX_BYTES = 5_000_000; // refuse to download more than ~5MB of HTML
 export const WEB_FETCH_MAX_REDIRECTS = 5;
 
-type LookupAddress = { address: string };
 type WebFetchDependencies = {
   fetch: typeof globalThis.fetch;
-  lookup: (hostname: string, options: { all: true }) => Promise<LookupAddress[]>;
+  lookup: (hostname: string, options: { all: true }) => Promise<unknown>;
 };
 
 export type PublicPageFetchResult =
@@ -307,7 +307,23 @@ async function resolvePublicHost(url: URL, lookupHost: WebFetchDependencies["loo
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":")) return undefined;
   try {
     const addrs = await lookupHost(host, { all: true });
-    if (addrs.some((address) => isPrivateIp(address.address))) {
+    if (!Array.isArray(addrs) || addrs.length === 0) return "Couldn't resolve that web address.";
+    if (
+      !addrs.every(
+        (entry): entry is { address: string } =>
+          typeof entry === "object" &&
+          entry !== null &&
+          !Array.isArray(entry) &&
+          typeof (entry as { address?: unknown }).address === "string" &&
+          (entry as { address: string }).address.length > 0,
+      )
+    ) {
+      return "Couldn't resolve that web address.";
+    }
+    if (addrs.some(({ address }) => isIP(address) === 0)) {
+      return "That web address returned an invalid DNS address — not reading it.";
+    }
+    if (addrs.some(({ address }) => isPrivateIp(address))) {
       return "That address resolves to an internal server — not reading it.";
     }
   } catch {
