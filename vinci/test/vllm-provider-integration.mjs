@@ -1,4 +1,4 @@
-// The self-hosted vLLM lane (`--provider telus-qwen`) that the worker fleet runs inference on.
+// The self-hosted vLLM lane (`--provider vllm`) that the worker fleet runs inference on.
 //
 // Every constant asserted here was MEASURED against the live deployment on 2026-09-06, not read off
 // a model card. The probe and its verbatim response are named next to each assertion, because the
@@ -40,21 +40,21 @@ const BASE_URL = "https://qwen3-example.invalid/v1";
 const MODEL_ID = "Qwen/Qwen3.8-27B";
 
 // Registration is gated on CREDENTIAL PRESENCE rather than an opt-in flag, because the worker
-// spawns the launcher with `--provider telus-qwen` as a CLI arg and never sets VINCI_PROVIDER
+// spawns the launcher with `--provider vllm` as a CLI arg and never sets VINCI_PROVIDER
 // (vinci/worker/run.mjs) — a flag-gated registration would be missing in the one process that
 // needs it. So the gate under test is: both vars present, or no provider at all.
 function registrations({ key, baseUrl }) {
   const prior = {
-    TELUS_QWEN_API_KEY: process.env.TELUS_QWEN_API_KEY,
-    TELUS_QWEN_BASE_URL: process.env.TELUS_QWEN_BASE_URL,
+    VLLM_API_KEY: process.env.VLLM_API_KEY,
+    VLLM_BASE_URL: process.env.VLLM_BASE_URL,
     VINCI_DEEPINFRA_QUALIFICATION: process.env.VINCI_DEEPINFRA_QUALIFICATION,
   };
   // DeepInfra off, so anything beyond "vinci" in the result is this lane and not that one.
   delete process.env.VINCI_DEEPINFRA_QUALIFICATION;
-  if (key === undefined) delete process.env.TELUS_QWEN_API_KEY;
-  else process.env.TELUS_QWEN_API_KEY = key;
-  if (baseUrl === undefined) delete process.env.TELUS_QWEN_BASE_URL;
-  else process.env.TELUS_QWEN_BASE_URL = baseUrl;
+  if (key === undefined) delete process.env.VLLM_API_KEY;
+  else process.env.VLLM_API_KEY = key;
+  if (baseUrl === undefined) delete process.env.VLLM_BASE_URL;
+  else process.env.VLLM_BASE_URL = baseUrl;
   const seen = [];
   try {
     provider.default({
@@ -91,17 +91,17 @@ assert.deepEqual(
 // Positive reachability control on the same entry point: with both present the lane IS registered.
 // Without this, every assertion above would still pass if registerProvider were deleted outright.
 const enabled = registrations({ key: "k", baseUrl: BASE_URL });
-assert.deepEqual(enabled.map(({ name }) => name), ["vinci", "telus-qwen"]);
+assert.deepEqual(enabled.map(({ name }) => name), ["vinci", "vllm"]);
 
-const telus = enabled[1].config;
-assert.equal(telus.api, "openai-completions");
-assert.equal(telus.apiKey, "$TELUS_QWEN_API_KEY");
+const vllm = enabled[1].config;
+assert.equal(vllm.api, "openai-completions");
+assert.equal(vllm.apiKey, "$VLLM_API_KEY");
 // The endpoint comes from the environment. A hardcoded host would keep sending a task's prompts to
 // a rented hostname after the deployment moved, which is the reason this is asserted and not typed.
-assert.equal(telus.baseUrl, BASE_URL);
-assert.equal(telus.models.length, 1);
+assert.equal(vllm.baseUrl, BASE_URL);
+assert.equal(vllm.models.length, 1);
 
-const model = telus.models[0];
+const model = vllm.models[0];
 assert.equal(model.id, MODEL_ID);
 assert.equal(model.reasoning, true);
 // GET /v1/models reports max_model_len 32768 for this deployment.
@@ -125,27 +125,27 @@ assert.equal(model.compat.maxTokensField, "max_tokens");
 assert.equal(model.compat.supportsReasoningEffort, true);
 
 // --- clean room: the child gets this lane's key and NOTHING else's ---------------------------
-assert.deepEqual(PROVIDER_KEY_ENV["telus-qwen"], ["TELUS_QWEN_API_KEY"]);
+assert.deepEqual(PROVIDER_KEY_ENV["vllm"], ["VLLM_API_KEY"]);
 const roomBase = {
   PATH: "/usr/bin",
-  TELUS_QWEN_API_KEY: "telus-secret",
-  TELUS_QWEN_BASE_URL: BASE_URL,
+  VLLM_API_KEY: "vllm-secret",
+  VLLM_BASE_URL: BASE_URL,
   OPENROUTER_API_KEY: "openrouter-secret",
   VINCI_API_KEY: "vinci-secret",
   AWS_SECRET_ACCESS_KEY: "aws-secret",
 };
-const room = cleanRoomEnv({ base: roomBase, provider: "telus-qwen", homeDir: "/tmp/h", tmpDir: "/tmp/t" });
-assert.equal(room.TELUS_QWEN_API_KEY, "telus-secret");
+const room = cleanRoomEnv({ base: roomBase, provider: "vllm", homeDir: "/tmp/h", tmpDir: "/tmp/t" });
+assert.equal(room.VLLM_API_KEY, "vllm-secret");
 // Not a secret, but the provider does not register without it, so the task cannot run if it is
 // dropped. It travels through the allowlist, not through PROVIDER_KEY_ENV.
-assert.ok(CLEAN_ROOM_ENV_ALLOWLIST.includes("TELUS_QWEN_BASE_URL"));
-assert.equal(room.TELUS_QWEN_BASE_URL, BASE_URL);
+assert.ok(CLEAN_ROOM_ENV_ALLOWLIST.includes("VLLM_BASE_URL"));
+assert.equal(room.VLLM_BASE_URL, BASE_URL);
 for (const leaked of ["OPENROUTER_API_KEY", "VINCI_API_KEY", "AWS_SECRET_ACCESS_KEY"]) {
-  assert.equal(room[leaked], undefined, `${leaked} must not reach a telus-qwen task`);
+  assert.equal(room[leaked], undefined, `${leaked} must not reach a vllm task`);
 }
 // The reverse control: another provider's task must not receive THIS lane's key.
 const openrouterRoom = cleanRoomEnv({ base: roomBase, provider: "openrouter", homeDir: "/tmp/h", tmpDir: "/tmp/t" });
-assert.equal(openrouterRoom.TELUS_QWEN_API_KEY, undefined);
+assert.equal(openrouterRoom.VLLM_API_KEY, undefined);
 assert.equal(openrouterRoom.OPENROUTER_API_KEY, "openrouter-secret");
 
 // --- launcher: each refusal isolated to the guard it claims to test ---------------------------
@@ -155,27 +155,27 @@ function launch(env) {
   return spawnSync("bash", [launcher, "-p", "hi"], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, VINCI_PROVIDER: "telus-qwen", VINCI_MODEL: MODEL_ID, ...env },
+    env: { ...process.env, VINCI_PROVIDER: "vllm", VINCI_MODEL: MODEL_ID, ...env },
   });
 }
 
 // Missing key: the endpoint IS supplied, so a refusal here cannot be the base-URL guard answering.
-const noKey = launch({ TELUS_QWEN_API_KEY: "", TELUS_QWEN_BASE_URL: BASE_URL });
+const noKey = launch({ VLLM_API_KEY: "", VLLM_BASE_URL: BASE_URL });
 assert.equal(noKey.status, 2);
-assert.match(noKey.stderr, /TELUS_QWEN_API_KEY is required/);
+assert.match(noKey.stderr, /VLLM_API_KEY is required/);
 
 // Missing endpoint: the key IS supplied, so this isolates the other guard.
-const noUrl = launch({ TELUS_QWEN_API_KEY: "k", TELUS_QWEN_BASE_URL: "" });
+const noUrl = launch({ VLLM_API_KEY: "k", VLLM_BASE_URL: "" });
 assert.equal(noUrl.status, 2);
-assert.match(noUrl.stderr, /TELUS_QWEN_BASE_URL is required/);
+assert.match(noUrl.stderr, /VLLM_BASE_URL is required/);
 
 // Wrong model, both credentials present: neither credential guard can be the one refusing.
-const wrongModel = launch({ TELUS_QWEN_API_KEY: "k", TELUS_QWEN_BASE_URL: BASE_URL, VINCI_MODEL: "Qwen/Other" });
+const wrongModel = launch({ VLLM_API_KEY: "k", VLLM_BASE_URL: BASE_URL, VINCI_MODEL: "Qwen/Other" });
 assert.equal(wrongModel.status, 2);
 assert.match(wrongModel.stderr, /pinned to Qwen\/Qwen3\.8-27B/);
 
 // Positive reachability control through the SAME entry point and environment. Without it, every
-// refusal above would still pass if the `telus-qwen)` arm were simply `exit 2` — the lane would be
+// refusal above would still pass if the `vllm)` arm were simply `exit 2` — the lane would be
 // unreachable and the suite would stay green. With both credentials and the pinned model the
 // launcher must get PAST its guards and hand off to pi; pi then fails on the unroutable host, which
 // is a different failure with a different exit code and none of our guard messages.
@@ -185,17 +185,17 @@ const reached = spawnSync("bash", [launcher, "-p", "hi"], {
   timeout: 90_000,
   env: {
     ...process.env,
-    VINCI_PROVIDER: "telus-qwen",
+    VINCI_PROVIDER: "vllm",
     VINCI_MODEL: MODEL_ID,
-    TELUS_QWEN_API_KEY: "k",
-    TELUS_QWEN_BASE_URL: BASE_URL,
+    VLLM_API_KEY: "k",
+    VLLM_BASE_URL: BASE_URL,
     VINCI_TOOL_BOOTSTRAP: "0",
     VINCI_NO_RESUME: "1",
     VINCI_NO_VERIFY: "1",
   },
 });
-assert.notEqual(reached.status, 2, `launcher refused a fully-configured telus-qwen lane: ${reached.stderr}`);
-for (const guard of [/TELUS_QWEN_API_KEY is required/, /TELUS_QWEN_BASE_URL is required/, /pinned to Qwen/, /Unsupported VINCI_PROVIDER/]) {
+assert.notEqual(reached.status, 2, `launcher refused a fully-configured vllm lane: ${reached.stderr}`);
+for (const guard of [/VLLM_API_KEY is required/, /VLLM_BASE_URL is required/, /pinned to Qwen/, /Unsupported VINCI_PROVIDER/]) {
   assert.doesNotMatch(reached.stderr, guard, "a fully-configured lane must clear every launcher guard");
 }
 
@@ -205,11 +205,11 @@ for (const guard of [/TELUS_QWEN_API_KEY is required/, /TELUS_QWEN_BASE_URL is r
 const unknown = spawnSync("bash", [launcher, "-p", "hi"], {
   cwd: root,
   encoding: "utf8",
-  env: { ...process.env, VINCI_PROVIDER: "telus-qwn", VINCI_MODEL: MODEL_ID },
+  env: { ...process.env, VINCI_PROVIDER: "vllmm", VINCI_MODEL: MODEL_ID },
 });
 assert.equal(unknown.status, 2, "a typo'd provider must refuse, not fall back");
 assert.match(unknown.stderr, /Unsupported VINCI_PROVIDER/);
 
 process.stdout.write(
-  "  Telus Qwen lane: registers only with both credentials, pins the served model, maps --thinking high to the highest accepted effort (medium), and leaks no other provider's key\n",
+  "  vLLM lane: registers only with both credentials, pins the served model, maps --thinking high to the highest accepted effort (medium), and leaks no other provider's key\n",
 );

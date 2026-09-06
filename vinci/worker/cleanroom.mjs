@@ -98,7 +98,7 @@ export const CLEAN_ROOM_ENV_ALLOWLIST = Object.freeze([
   "VINCI_SOURCE_CLI",
   // Endpoint of the self-hosted vLLM lane. Not a secret (the key travels via PROVIDER_KEY_ENV),
   // but without it the provider does not register inside the clean room and the task cannot run.
-  "TELUS_QWEN_BASE_URL",
+  "VLLM_BASE_URL",
 ]);
 
 // ONLY the key the envelope's provider authenticates with (vinci/bin/vinci reads exactly these).
@@ -107,7 +107,7 @@ export const PROVIDER_KEY_ENV = Object.freeze({
   openrouter: ["OPENROUTER_API_KEY"],
   vinci: ["VINCI_API_KEY"],
   deepinfra: ["VINCI_INTERNAL_DEEPINFRA_API_KEY"],
-  "telus-qwen": ["TELUS_QWEN_API_KEY"],
+  "vllm": ["VLLM_API_KEY"],
 });
 
 // Every provider credential and authentication-routing value the bundled coding agent knows how

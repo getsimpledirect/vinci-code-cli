@@ -18,7 +18,7 @@ import { VINCI_BILLING_URL, VINCI_GATEWAY_BASE_URL, VINCI_PLATFORM_BASE_URL } fr
 const BASE_URL = VINCI_GATEWAY_BASE_URL;
 const PLATFORM_URL = VINCI_PLATFORM_BASE_URL;
 const DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai";
-const TELUS_QWEN_MODEL_ID = "Qwen/Qwen3.8-27B";
+const VLLM_MODEL_ID = "Qwen/Qwen3.8-27B";
 const FORT_MODEL_ID = "zai-org/GLM-5.2";
 const FAR_FUTURE = 4102444800000; // 2100 — the minted key doesn't expire, so never auto-refresh.
 const VINCI_TERMINAL_BUDGET_ERROR =
@@ -355,28 +355,29 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  // Telus AI PaaS — an OpenAI-compatible vLLM deployment on hardware we already rent, used by the
-  // worker fleet so a task's inference does not depend on a metered third-party key. Registered on
+  // Self-hosted vLLM lane — an OpenAI-compatible deployment on hardware we already rent, used by
+  // the worker fleet so a task's inference does not depend on a metered third-party key.
+  // Registered on
   // CREDENTIAL PRESENCE, not on a separate opt-in flag, because the worker spawns the launcher with
-  // `--provider telus-qwen` as a CLI arg and never sets VINCI_PROVIDER (see vinci/worker/run.mjs) —
+  // `--provider vllm` as a CLI arg and never sets VINCI_PROVIDER (see vinci/worker/run.mjs) —
   // a flag-gated registration would be absent in exactly the process that needs it. The clean room
   // forwards both vars for this provider and nothing else (vinci/worker/cleanroom.mjs).
   //
   // Every field below is MEASURED against the live server (GET /v1/models + probe requests), not
-  // inferred from the model card; see vinci/test/telus-qwen-provider-integration.mjs for the values
+  // inferred from the model card; see vinci/test/vllm-provider-integration.mjs for the values
   // and what each probe returned.
-  if (process.env.TELUS_QWEN_API_KEY && process.env.TELUS_QWEN_BASE_URL) {
-    pi.registerProvider("telus-qwen", {
-      name: "Telus Qwen3.8 27B (vLLM)",
+  if (process.env.VLLM_API_KEY && process.env.VLLM_BASE_URL) {
+    pi.registerProvider("vllm", {
+      name: "Vinci-Served-Qwen-3.8-27B",
       // No hardcoded host: the deployment URL is per-environment and a rented hostname does not
       // belong in the client. The launcher refuses the lane when this is unset.
-      baseUrl: process.env.TELUS_QWEN_BASE_URL,
-      apiKey: "$TELUS_QWEN_API_KEY",
+      baseUrl: process.env.VLLM_BASE_URL,
+      apiKey: "$VLLM_API_KEY",
       api: "openai-completions",
       models: [
         {
-          id: TELUS_QWEN_MODEL_ID,
-          name: "Telus Qwen3.8 27B",
+          id: VLLM_MODEL_ID,
+          name: "Vinci-Served-Qwen-3.8-27B",
           reasoning: true,
           // MEASURED accepted set is exactly { low, medium } -- and getting here took two passes,
           // so the reasoning is recorded rather than the conclusion alone. The server validates
