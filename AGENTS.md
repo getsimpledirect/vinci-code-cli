@@ -143,6 +143,55 @@ Release notes live in `vinci/release-notes/` and are mirrored to the public
 Signing-key handling and the operational runbook are documented in the internal ops
 repository, not here.
 
+### Cutting a release
+
+The version lives in two constants and is rendered into fifteen snapshots. All of them must
+move together or CI fails:
+
+1. Branch `release/vinci-v<version>` off `main`.
+2. Bump `vinci/identity.json` **and** `vinci/extensions/vinci-header.ts` (`VINCI_VERSION`).
+3. Regenerate the UI snapshots, which print the version in the header:
+   `UPDATE_VINCI_UI_SNAPSHOTS=1 node packages/coding-agent/node_modules/vitest/dist/cli.js --root . --run vinci/test/ui/scenarios.test.mjs`
+   The diff must be fifteen files, one line each. Anything else means something unrelated moved.
+4. Add `vinci/release-notes/<version>.md`. The workflow looks for exactly that filename; a
+   mismatched name is skipped with a warning, not an error.
+5. Merge, then annotate-tag the *merge commit* and push the tag.
+
+`build-and-verify` asserts the tag matches `vinci/identity.json`, so a tag pushed before the
+bump merges will fail.
+
+**Release tags are protected and immutable.** They cannot be moved or deleted. Tagging the
+wrong commit burns that version - cut the next one instead. `vinci-v0.0.52` was spent this
+way, which is why 0.0.51 and 0.0.52 exist as tags with nothing published under them.
+
+### When a release appears to succeed but ships nothing
+
+Both jobs are gated on `if: github.repository == '<owner>/<repo>'`, which makes forks
+structurally inert. A skipped job reports **green**, so a guard naming a stale repository
+produces a passing run that builds, signs and publishes nothing. That state persisted across
+two versions unnoticed. Before believing a release shipped, check the artifacts, not the
+checkmarks:
+
+- `gh release list` - the new version should be `Latest`
+- the live manifest should carry the new `version` and a fresh `publishedAt`
+- the `.tgz` at the manifest's `artifact.url` should return 200
+
+If `publish` fails at *Assume the release role* with `Not authorized to perform
+sts:AssumeRoleWithWebIdentity`, the role's trust policy rejected the token. Do not guess at
+the claim shape - read what was actually presented:
+
+```
+aws cloudtrail lookup-events --region <region> \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+  --max-results 1 --query 'Events[0].CloudTrailEvent' --output text
+```
+
+`userIdentity.userName` is the literal `sub` GitHub sent. This organization has GitHub's
+immutable-identifier subject claim enabled, so that subject embeds numeric org and repository
+ids (`repo:<owner>@<id>/<repo>@<id>:environment:<env>`) rather than names. A trust policy
+written in the `repo:<owner>/<repo>:...` form can never match it, whichever name it carries.
+The id form is rename-proof, which is the point.
+
 ## User Override
 
 If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.
