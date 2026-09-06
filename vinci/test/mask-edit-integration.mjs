@@ -215,4 +215,101 @@ check("ordinary edits still pass the guard untouched", cleanEdit === undefined);
   );
 }
 
-console.log(`\nmask-edit-integration: ${pass}/${pass} checks passed (masked content cannot poison edits or clobber real values)`);
+// Regression (#queue/#redaction, 2026-09-06): the same placeholder guard was missing on the one
+// channel that fires REAL requests. Observed live: the user pasted a working curl carrying a bearer
+// token, the input redactor rewrote it to `Bearer <vinci-secret>` before the model saw it, and the
+// model then ran that command for real — a 401 that reads as a broken API, not a masked view. The
+// `KEY=<vinci-secret>` shape is worse: the literal placeholder lands in a real process environment.
+{
+  const { handlers, sent, pi } = harness();
+  guard.default(pi);
+
+  // A shell command that reaches the network is confirmed by a LATER rule. Declining that confirm
+  // is what makes this control discriminating: with the placeholder rule removed the command is
+  // still blocked, just for the wrong reason, so an assertion on the reason is the only thing that
+  // can tell the two apart.
+  const shellContext = { ...context, ui: { ...context.ui, select: async (_q, options) => options[0] } };
+
+  const maskedRequest = await firstBlock(
+    handlers,
+    {
+      toolName: "bash",
+      input: {
+        command:
+          'curl -X POST https://api.example.com/v1/chat -H "Authorization: Bearer <vinci-secret>" -d @body.json',
+      },
+    },
+    shellContext,
+  );
+  check("a command that would send the placeholder as a credential is blocked", maskedRequest?.block === true);
+  check(
+    "the block names the placeholder as the reason, not a generic shell risk",
+    /secret-masking placeholder/i.test(String(maskedRequest?.reason ?? "")),
+  );
+  check(
+    "the block explains the request would actually fail rather than be masked",
+    /real endpoint|real environment variable/i.test(String(maskedRequest?.reason ?? "")),
+  );
+
+  const envAssignment = await firstBlock(
+    handlers,
+    { toolName: "bash", input: { command: "API_KEY=<vinci-secret> node scripts/deploy.js" } },
+    shellContext,
+  );
+  check("the env-variable shape is covered too", envAssignment?.block === true);
+
+  const privateKeyCommand = await firstBlock(
+    handlers,
+    { toolName: "bash", input: { command: "ssh -i <(echo '<vinci-private-key>') user@host" } },
+    shellContext,
+  );
+  check("the private-key placeholder is covered on the shell channel too", privateKeyCommand?.block === true);
+
+  // Discriminating control: this must be the placeholder rule answering, not the shell-file-write
+  // rule that sits immediately after it. A redirect carrying the placeholder hits both; the reason
+  // proves which one fired.
+  const placeholderBeatsShellWrite = await firstBlock(
+    handlers,
+    { toolName: "bash", input: { command: "echo 'API_KEY=<vinci-secret>' > .env" } },
+    shellContext,
+  );
+  check(
+    "the placeholder rule answers before the shell-file-write rule, so the reason is actionable",
+    /secret-masking placeholder/i.test(String(placeholderBeatsShellWrite?.reason ?? "")),
+  );
+
+  const coaching = String(
+    sent.find((s) => s.message?.customType === "vinci-masked-command-block")?.message?.content ?? "",
+  );
+  check(
+    "the coaching forbids reveal/reconstruct/obtain and re-smuggling the placeholder",
+    /do not attempt to reveal, reconstruct, or otherwise obtain the raw value/i.test(coaching) &&
+      /do not retry with the placeholder in a variable, a file, or a heredoc/i.test(coaching),
+  );
+  check(
+    // Positive one-of directive, so a negated mutation ("do not reference the value indirectly")
+    // no longer satisfies the assertion.
+    "the coaching states the runtime-reference path and the ask-the-user fallback affirmatively",
+    /Instead reference the value indirectly so the shell resolves it at runtime[^.]*, or ask the user to run this one command themselves/i.test(
+      coaching,
+    ),
+  );
+  check(
+    "the coaching does not solicit the secret or name dump tools that bypass the redactor",
+    !/paste/i.test(coaching) && !/xxd|hexdump|\bod\b/i.test(coaching),
+  );
+
+  // Positive reachability control: the guarded operation is still reachable. A placeholder-free
+  // command runs the same path and is not blocked by this rule.
+  const cleanCommand = await firstBlock(handlers, { toolName: "bash", input: { command: "echo ok" } }, shellContext);
+  check("placeholder-free commands still reach the shell untouched", cleanCommand === undefined);
+
+  const indirectReference = await firstBlock(
+    handlers,
+    { toolName: "bash", input: { command: 'node -e "console.log(process.env.API_KEY.length)"' } },
+    shellContext,
+  );
+  check("the runtime-reference path the coaching recommends is itself reachable", indirectReference === undefined);
+}
+
+console.log(`\nmask-edit-integration: ${pass}/${pass} checks passed (masked content cannot poison edits, clobber real values, or reach a real request)`);

@@ -327,6 +327,9 @@ export interface ExtensionContext {
 	abort(): void;
 	/** Whether there are queued messages waiting */
 	hasPendingMessages(): boolean;
+	/** How many messages are queued (steering + follow-up). The session is the authority here, so a
+	 * UI mirroring the queue should reconcile against this rather than tracking deliveries itself. */
+	pendingMessageCount(): number;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
 	shutdown(): void;
 	/** Declare an exit code for a successful headless run. Ignored when the host exits for another
@@ -1604,6 +1607,7 @@ export interface ExtensionContextActions {
 	getSignal: () => AbortSignal | undefined;
 	abort: () => void;
 	hasPendingMessages: () => boolean;
+	pendingMessageCount: () => number;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (options?: CompactOptions) => void;

@@ -2509,6 +2509,7 @@ export class AgentSession {
 					void this.abort();
 				},
 				hasPendingMessages: () => this.pendingMessageCount > 0,
+				pendingMessageCount: () => this.pendingMessageCount,
 				shutdown: () => {
 					this._extensionShutdownHandler?.();
 				},

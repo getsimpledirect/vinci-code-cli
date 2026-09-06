@@ -35,7 +35,10 @@ function isSecretProperty(name: string): boolean {
 	return SECRET_PROPERTY.test(normalized) || /^(?:access|refresh|key)$/i.test(normalized);
 }
 
-const KNOWN_SENTINEL = /^(?:‹redacted›|<vinci-(?:secret|private-key)>)$/;
+// The `:id` form is a vaulted handle for a secret the user supplied themselves (see the Vinci
+// extensions' lib/secrets.ts). It must round-trip untouched: masking a handle a second time
+// would destroy the only thing that can name the value again.
+const KNOWN_SENTINEL = /^(?:‹redacted›|<vinci-(?:secret|private-key)(?:-[0-9a-f]{8})?>)$/;
 
 function isKnownSentinel(value: string): boolean {
 	return KNOWN_SENTINEL.test(value);
