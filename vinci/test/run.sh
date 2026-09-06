@@ -772,6 +772,8 @@ run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-har
 run_group guard-integration node "${ROOT}/vinci/test/guard-integration.mjs"
 # Masked content (<vinci-secret>) can never match or overwrite raw file bytes.
 run_group mask-edit-integration node "${ROOT}/vinci/test/mask-edit-integration.mjs"
+run_group secret-handle-integration node "${ROOT}/vinci/test/secret-handle-integration.mjs"
+run_group secret-handle-e2e node "${ROOT}/vinci/test/secret-handle-e2e.mjs"
 # A network action never bundles local mutations under one approval.
 run_group network-bundle-integration node "${ROOT}/vinci/test/network-bundle-integration.mjs"
 run_group scope-integration node "${ROOT}/vinci/test/scope-integration.mjs"

@@ -30,7 +30,13 @@ import {
   VINCI_UNATTENDED_POLICY_ENTRY,
 } from "./lib/unattended-policy.ts";
 import { attachImagesFromText } from "./lib/images.ts";
-import { redactSecrets, redactSecretsDeep } from "./lib/secrets.ts";
+import {
+  redactSecrets,
+  redactSecretsDeep,
+  redactUserInput,
+  rehydrateSecrets,
+  resetSecretVault,
+} from "./lib/secrets.ts";
 import { planCommandMutates } from "./vinci-plan.ts";
 
 export { redactSecrets, redactSecretsDeep } from "./lib/secrets.ts";
@@ -42,7 +48,10 @@ let outsideWritesAllowed = false;
 // The placeholders redactSecrets() puts in everything the model sees (see lib/secrets.ts). They
 // never exist in real files, so their presence in edit/write input means the model is working from
 // its masked view.
-const MASK_PLACEHOLDER = /<vinci-(?:secret|private-key)>/;
+// Both forms count: the bare sentinel, and the `-id` handle minted for a secret the user supplied
+// themselves. A handle resolves on exactly one channel — bash, in this file — and nowhere else, so
+// to write/edit it is just as much a not-a-value as the bare sentinel is.
+const MASK_PLACEHOLDER = /<vinci-(?:secret|private-key)(?:-[0-9a-f]{8})?>/;
 
 // Generic placeholder base paths a model invents on a from-scratch build instead of using the real
 // project cwd. Absolute, and unmistakably not a real user's working directory here.
@@ -996,7 +1005,9 @@ export default function (pi: ExtensionAPI) {
     gitCheckpointApproved = userAskedForGitCheckpoint(latestUserRequest);
     const attached = await attachImagesFromText(event.text ?? "", ctx.cwd);
     for (const error of attached.errors) ctx.ui.notify(error, "warning");
-    const redacted = redactSecrets(attached.text);
+    // The user typed this, so their secrets are vaulted to handles rather than erased — the model
+    // still never sees a value, but the shell can resolve one back at execution time.
+    const redacted = redactUserInput(attached.text);
     const images = [...(event.images ?? []), ...attached.images].slice(0, 6);
     return redacted === event.text && images.length === (event.images?.length ?? 0)
       ? { action: "continue" as const }
@@ -1055,6 +1066,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     buildNetworkApprovedForSession = false; // a new session re-asks before builds reach the internet
+    resetSecretVault(); // credentials the user supplied are scoped to one session and never outlive it
     const status = sandboxBackend();
     if (status === "developer bypass") {
       ctx.ui.notify("Security warning: VINCI_NO_SANDBOX=1 allows shell filesystem and network access.", "warning");
@@ -1113,6 +1125,11 @@ export default function (pi: ExtensionAPI) {
       "“already scrubbed” or “just a placeholder” based on what you see. If asked what a " +
       "secret literally contains, or whether the real value is still there, say you can’t see it " +
       "because it’s redacted for their security — do not guess or assert the placeholder is the truth.\n\n" +
+      "A placeholder carrying an id — `<vinci-secret-a1b2c3d4>` — is a HANDLE for a credential the user " +
+      "supplied to you themselves. Pass it through verbatim in a shell command and Vinci substitutes the " +
+      "real value at the moment the command runs, so the command genuinely works. Never retype, edit, " +
+      "guess or invent a handle — only one Vinci gave you resolves — and it works in a shell command " +
+      "ONLY: writing one into a file stores the placeholder, not the credential, and is refused.\n\n" +
       "CRUCIAL — what you CAN do: the redaction hides secrets from YOUR VIEW only; it does NOT stop a " +
       "command you run from using the REAL values. A command you run (`npm run …`, a dev server, a build, " +
       "a test) loads the actual `.env` from the environment and authenticates for real — the sandbox " +
@@ -1132,8 +1149,58 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     // --- Shell commands: block catastrophic, confirm dangerous. ---
     if (event.toolName === "bash") {
-      const cmd = String((event.input as { command?: unknown }).command ?? "");
+      // Two views of one command, and the split matters in both directions.
+      // `cmd` is what will actually RUN, and is what every guard below classifies: the risk of a
+      // command is a property of the thing that executes, and a handle is not inert to a classifier
+      // — every handle ends in `>`, which reads as a shell redirect and got a plain `echo` refused
+      // as a file write. `displayCommand` is what the MODEL wrote, and is what the user is shown and
+      // what the always-allow store keys on — that store is written to disk, so it must never be
+      // handed a restored credential.
+      let cmd = String((event.input as { command?: unknown }).command ?? "");
       if (!cmd.trim()) return undefined;
+      const displayCommand = cmd;
+
+      // The masking placeholder is a hole in the model's VIEW, not a value. Shipped inside a real
+      // command it becomes a real, wrong credential: `Authorization: Bearer <vinci-secret>` is sent
+      // to the actual endpoint and comes back 401, and `KEY=<vinci-secret>` puts the literal
+      // placeholder into a real process environment. Both fail in ways that read as a broken API
+      // rather than a masked view.
+      //
+      // Bash is the ONE channel that can resolve this instead of only refusing it, and only for a
+      // secret the USER supplied, which carries a vaulted `-id` handle. Substituting the value here
+      // is what makes "the user pasted a working curl" work at all, and the model still never sees
+      // it: the swap happens after the model has spoken, on the deep-cloned argument object the tool
+      // is about to execute, so the transcript and the session file keep the handle. A bare sentinel
+      // names a secret Vinci only ever READ, and stays refused — as it does on every other channel,
+      // write and edit included.
+      //
+      // This runs before the network grant below, which HMACs the command BODY: signing the handle
+      // form and substituting afterwards would void the grant and silently cost the command its
+      // network.
+      if (MASK_PLACEHOLDER.test(cmd)) {
+        const restored = rehydrateSecrets(cmd);
+        if (restored.unresolved.length > 0 || MASK_PLACEHOLDER.test(restored.text)) {
+          sendVinciControl(
+            pi,
+            "vinci-masked-command-block",
+            "Your command contains a masking placeholder (<vinci-secret>) that names no credential Vinci can supply — it stands for a value Vinci only read from a file, or it is not a handle from this session. Running it would send the literal placeholder and fail. Do not attempt to reveal, reconstruct, or otherwise obtain the raw value, do not invent a handle, and do not retry with the placeholder in a variable, a file, or a heredoc. Instead reference the value indirectly so the shell resolves it at runtime ($API_KEY, an --env-file, or the project's own dotenv loader), or ask the user to run this one command themselves.",
+          );
+          return {
+            block: true,
+            reason:
+              "Blocked — the command contains Vinci's secret-masking placeholder, which is not the real credential; running it would send `<vinci-secret>` to the real endpoint or into a real environment variable and fail. Reference the value at runtime instead (`$VAR`, `--env-file`, the project's dotenv loader) — you do not need to see a secret to use it — or hand the user the exact command to run themselves.",
+          };
+        }
+        cmd = restored.text;
+        (event.input as { command?: unknown }).command = cmd;
+        if (ctx.hasUI) {
+          const which = restored.resolved.length === 1 ? "the credential" : `${restored.resolved.length} credentials`;
+          ctx.ui.notify(
+            `Vinci put ${which} you supplied back into this command: ${restored.resolved.join(", ")}`,
+            "info",
+          );
+        }
+      }
 
       // Never let a shell-writing workaround bypass structured file safety. This also prevents
       // documentation such as `echo '... prisma migrate reset ...' >> SETUP.md` from being mistaken
@@ -1176,7 +1243,7 @@ export default function (pi: ExtensionAPI) {
         const ok = await confirmSafely(
           ctx,
           "Vinci — expose credentials to this session?",
-          `This command may print credentials into Vinci's model context:\n\n  ${cmd}\n\nRun this exact command once? Detected values will be redacted.`,
+          `This command may print credentials into Vinci's model context:\n\n  ${displayCommand}\n\nRun this exact command once? Detected values will be redacted.`,
         );
         if (!ok) return { block: true, reason: "Blocked — the user declined the shell credential read. Do not retry it or read the file another way; use .env.example or code references, or ask them." };
         securityScopes.push("read");
@@ -1210,7 +1277,7 @@ export default function (pi: ExtensionAPI) {
           // destroy the tree the work order lives in — and none of these is a dialog the interactive
           // UX would have rubber-stamped.
           if (!ctx.hasUI) return headlessGate(pi, "network-priority-dangerous", "keep-blocking", priorityDanger[1]);
-          if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${priorityDanger[1]}):\n\n  ${cmd}\n\nRun it?`, cmd))) {
+          if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${priorityDanger[1]}):\n\n  ${displayCommand}\n\nRun it?`, displayCommand))) {
             ctx.ui.notify("Command blocked.", "info");
             return { block: true, reason: "Blocked — the user declined the risky command. Do not retry it or achieve the same effect another way; do what they asked differently, or ask them." };
           }
@@ -1221,7 +1288,7 @@ export default function (pi: ExtensionAPI) {
           // it and no revert of the branch undoes it. Explicitly named as keep-blocking in the W2
           // spec; stays a hard block under the profile.
           if (!ctx.hasUI) return headlessGate(pi, "network-priority-database", "keep-blocking", priorityDatabase[1]);
-          if (!(await confirmRisky(ctx, "Vinci — confirm a database change", `Vinci wants to ${priorityDatabase[1]}:\n\n  ${cmd}\n\nGo ahead?`, cmd))) {
+          if (!(await confirmRisky(ctx, "Vinci — confirm a database change", `Vinci wants to ${priorityDatabase[1]}:\n\n  ${displayCommand}\n\nGo ahead?`, displayCommand))) {
             ctx.ui.notify("Held off — good call.", "info");
             return { block: true, reason: `Blocked — the user declined to ${priorityDatabase[1]}. Don't run this; do what they asked another way, or ask them.` };
           }
@@ -1344,7 +1411,7 @@ export default function (pi: ExtensionAPI) {
               const okBuild = await confirmSafely(
                 ctx,
                 "Vinci — let builds reach the internet?",
-                `Installing packages and scaffolding a project needs the internet:\n\n  ${cmd}\n\nAllow build tools (npm, pip, gradle…) to reach the internet for the rest of this session? Anything else that goes online will still ask each time.`,
+                `Installing packages and scaffolding a project needs the internet:\n\n  ${displayCommand}\n\nAllow build tools (npm, pip, gradle…) to reach the internet for the rest of this session? Anything else that goes online will still ask each time.`,
               );
               if (!okBuild)
                 return {
@@ -1359,7 +1426,7 @@ export default function (pi: ExtensionAPI) {
             const ok = await confirmSafely(
               ctx,
               "Vinci — allow this network command once?",
-              `This command can connect to an external service or transfer data:\n\n  ${cmd}${effect}\n\nAllow this exact invocation once?`,
+              `This command can connect to an external service or transfer data:\n\n  ${displayCommand}${effect}\n\nAllow this exact invocation once?`,
             );
             if (!ok) return { block: true, reason: "Blocked — the user declined THIS network command. Don't retry it or run an equivalent that goes online. This applies to this one command only — a different network action the user asks for (e.g. `git push`) is NOT blocked; attempt it and it will prompt for approval. Do what they asked locally, or ask them." };
             securityScopes.push("network");
@@ -1409,7 +1476,7 @@ export default function (pi: ExtensionAPI) {
           const ok = await confirmSafely(
             ctx,
             "Vinci — save a git checkpoint?",
-            `You didn't ask Vinci to stage or commit changes in this request:\n\n  ${cmd}\n\nCreate a git checkpoint now?`,
+            `You didn't ask Vinci to stage or commit changes in this request:\n\n  ${displayCommand}\n\nCreate a git checkpoint now?`,
           );
           if (!ok) {
             sendVinciControl(
@@ -1443,7 +1510,7 @@ export default function (pi: ExtensionAPI) {
         // delete them, and there is no version of "the Governor authorized rm -rf" that a run should
         // infer for itself.
         if (!ctx.hasUI) return headlessGate(pi, "dangerous-command", "keep-blocking", why);
-        if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${why}):\n\n  ${cmd}\n\nRun it?`, cmd))) {
+        if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${why}):\n\n  ${displayCommand}\n\nRun it?`, displayCommand))) {
           ctx.ui.notify("Command blocked.", "info");
           return { block: true, reason: "Blocked — the user declined the risky command. Do not retry it or achieve the same effect another way; do what they asked differently, or ask them." };
         }
@@ -1472,7 +1539,7 @@ export default function (pi: ExtensionAPI) {
             guardClass === "database" ? "keep-blocking" : "escalate",
             hit[1],
           );
-        if (!(await confirmRisky(ctx, g.title, `Vinci wants to ${hit[1]}:\n\n  ${cmd}\n\nGo ahead?`, cmd))) {
+        if (!(await confirmRisky(ctx, g.title, `Vinci wants to ${hit[1]}:\n\n  ${displayCommand}\n\nGo ahead?`, displayCommand))) {
           ctx.ui.notify("Held off — good call.", "info");
           return { block: true, reason: `Blocked — the user declined to ${hit[1]}. Don't run this; do what they asked another way, or ask them.` };
         }
@@ -1508,7 +1575,7 @@ export default function (pi: ExtensionAPI) {
         const ok = await confirmSafely(
           ctx,
           "Vinci — put secrets into git?",
-          `This would add secret files to git, which leaks them once the repo is pushed:\n\n  ${cmd}${which}\n\nAre you sure?`,
+          `This would add secret files to git, which leaks them once the repo is pushed:\n\n  ${displayCommand}${which}\n\nAre you sure?`,
         );
         if (!ok) {
           ctx.ui.notify("Kept your secrets out of git.", "info");

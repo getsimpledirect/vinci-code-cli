@@ -448,7 +448,14 @@ try {
   const secretInput = "Use API_KEY=vinci_live_abcdefghijklmnopqrstuvwxyz123456 for the request";
   await userInput(secretInput);
   const transformed = await handlers.input.at(-1)({ type: "input", text: secretInput, source: "interactive" }, ctx);
-  check("user input secrets are removed before persistence", transformed?.text?.includes("<vinci-secret>") && !transformed.text.includes("vinci_live_"));
+  // What the USER typed is vaulted to a `-id` handle rather than erased to the bare sentinel, so the
+  // credential they deliberately supplied can still be used — by the shell, at execution time, and
+  // nowhere else (see secret-handle-integration.mjs). The property that matters here is unchanged
+  // and is the second half of this assertion: the raw value never reaches the model or the session.
+  check(
+    "user input secrets are removed before persistence",
+    /<vinci-secret-[0-9a-f]{8}>/.test(transformed?.text ?? "") && !transformed.text.includes("vinci_live_"),
+  );
   const authorization = guard.redactSecrets("Authorization: Bearer abcdefghijklmnopqrstuvwxyz");
   check("authorization tokens are fully removed", authorization.includes("<vinci-secret>") && !authorization.includes("abcdefghijkl"));
   const npmToken = guard.redactSecrets("artifact=npm_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123");

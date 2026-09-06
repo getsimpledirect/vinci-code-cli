@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `ExtensionContext.pendingMessageCount()`, so an extension mirroring the steering/follow-up queue can reconcile against the session's own count instead of correlating events by message text.
 - Added Vinci drag, clipboard-path, and `@path` image attachments through the managed Vinci Vision route.
 - Added fail-closed Vinci credential redaction, sensitive-read controls, sandbox enforcement, and one-command shell network grants.
 - Added Vinci runtime evidence state for dirty-worktree grounding, sticky direct-check results, truthful completion receipts, and visible queued user messages.
@@ -20,6 +21,8 @@
 
 ### Fixed
 
+- Fixed Vinci erasing a credential the user typed themselves, which made the model send the literal `<vinci-secret>` placeholder to a real endpoint or into a real environment variable. Text the user types now mints a session-scoped handle that the bash channel resolves at execution time; `write` and `edit` still refuse every placeholder, and a secret Vinci obtained by reading a file remains unresolvable.
+- Fixed the queued-message widget counting messages that had already been delivered. It matched deliveries by message text, which no longer matches once an `input` handler redacts a secret or strips an attached image path, or once the session expands a slash command or prompt template; aborting or restoring the queue to the editor left it stale as well. It now reconciles against `ExtensionContext.pendingMessageCount()`.
 - Fixed Vinci advisor calls to reject literal shell substitutions and explicitly mark requests with missing review context as unreviewed.
 - Fixed Vinci completion verification to require focused behavioral tests and post-change diff inspection for routing, auth, retry, fallback, provider-stream, billing, and credential changes.
 - Fixed Vinci provider streams to tolerate one-minute idle gaps and distinguish provider silence from local connection failures in retries and completion receipts.

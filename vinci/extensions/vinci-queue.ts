@@ -48,6 +48,22 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  // The text we record at `input` is NOT the text that ends up on the wire: later `input` handlers
+  // transform it (vinci-guard redacts secrets and strips attached image paths), and the session then
+  // expands skill commands and prompt templates. So an exact text match is a best case, not a
+  // contract — matching on it alone pinned delivered messages in the widget forever. The session is
+  // the authority on what is still queued, so reconcile against its count: it already retires a
+  // message before this event reaches us, and it also drops the whole queue when the user aborts or
+  // pulls the queue back into the editor, neither of which produces a message_start at all.
+  const reconcile = (ctx: ExtensionContext) => {
+    // Steering drains ahead of follow-ups, so the oldest steering entry is the one that left first.
+    while (queued.length > ctx.pendingMessageCount()) {
+      const oldest = queued.findIndex((message) => message.behavior === "steer");
+      queued.splice(oldest === -1 ? 0 : oldest, 1);
+    }
+    render(ctx);
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     queued.length = 0;
     render(ctx);
@@ -61,10 +77,18 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("message_start", async (event, ctx) => {
     if (event.message.role !== "user" || queued.length === 0) return;
-    const text = messageText(event.message.content);
-    const index = queued.findIndex((message) => message.text === text);
-    if (index === -1) return;
-    queued.splice(index, 1);
-    render(ctx);
+    // The count decides HOW MANY entries to retire; the text only decides WHICH one, so that the
+    // preview keeps naming a message that is genuinely still waiting. A user message the session
+    // never queued (an extension injecting one mid-run) therefore cannot retire anything.
+    const delivered = messageText(event.message.content);
+    if (queued.length > ctx.pendingMessageCount()) {
+      const exact = queued.findIndex((message) => message.text === delivered);
+      if (exact !== -1) queued.splice(exact, 1);
+    }
+    reconcile(ctx);
   });
+
+  pi.on("turn_end", async (_event, ctx) => reconcile(ctx));
+
+  pi.on("agent_end", async (_event, ctx) => reconcile(ctx));
 }
