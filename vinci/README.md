@@ -245,7 +245,15 @@ results. `vinci-guard` transforms prompt text at the `input` boundary, masks too
 read and shell-tool output alike — at the hook its own comment calls the "persistence/model
 boundary", and redacts the provider request as a last line of defence. Measured on 0.0.49: a
 synthetic key typed into the prompt, one read via the `read` tool, and one printed by the `bash`
-tool were each absent from the stored session, with `<vinci-secret>` in their place.
+tool were each absent from the stored session, with a placeholder in their place.
+
+Since 0.0.53 the two cases carry *different* placeholders, because they are different objects. A
+secret Vinci obtained by **reading** something becomes a bare `<vinci-secret>` that nothing can
+turn back into a value. A secret **you typed** becomes a session-scoped handle,
+`<vinci-secret-a1b2c3d4>`, that the shell — and only the shell — substitutes the real value for at
+the moment a command runs, so a credential you deliberately supply still works. The model never
+sees either value, and the handle rather than the value is what reaches the transcript. See
+[`docs/secrets.md`](docs/secrets.md).
 
 > 🔴 **Not every local persistence path crosses those hooks.** Output from the `!` shell shortcut
 > is recorded directly in the session JSONL, and large `bash` outputs can spill unmasked to
