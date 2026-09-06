@@ -28,9 +28,16 @@ concurrency:
 
 jobs:
   build-and-verify:
-    # Org-only: needs the AWS OIDC trust that exists in getsimpledirect/vinci-code alone.
+    # Org-only: needs the AWS OIDC trust that exists in this repository alone.
     # Public and forked copies are structurally inert rather than failing noisily.
-    if: github.repository == 'getsimpledirect/vinci-code'
+    #
+    # This name must track the repository as it is ACTUALLY named. It said
+    # `getsimpledirect/vinci-code` from before the rename to `-cli`, so it stopped matching the
+    # canonical repo and the fork-safety guard silently disarmed the real release: the 0.0.51 tag
+    # ran, skipped both jobs, and reported success while publishing nothing. GitHub Releases still
+    # showed 0.0.50 as latest. A skip is indistinguishable from a pass at a glance, which is what
+    # let it go unnoticed for a whole version.
+    if: github.repository == 'getsimpledirect/vinci-code-cli'
     runs-on: ubuntu-latest
     permissions:
       contents: read
