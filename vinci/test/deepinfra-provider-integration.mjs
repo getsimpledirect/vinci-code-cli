@@ -11,6 +11,14 @@ const provider = await loader.import(resolve(here, "../extensions/vinci-provider
 
 function registrations(qualification) {
   const prior = process.env.VINCI_DEEPINFRA_QUALIFICATION;
+  // The telus-qwen lane registers on CREDENTIAL PRESENCE rather than an opt-in flag (see
+  // vinci/test/telus-qwen-provider-integration.mjs for why), so it appears here on any machine that
+  // exports those vars -- which is every worker box. Clear them: this file's subject is DeepInfra's
+  // flag gate, and it should not go red because an unrelated, correctly-configured lane is present.
+  const priorTelusKey = process.env.TELUS_QWEN_API_KEY;
+  const priorTelusUrl = process.env.TELUS_QWEN_BASE_URL;
+  delete process.env.TELUS_QWEN_API_KEY;
+  delete process.env.TELUS_QWEN_BASE_URL;
   if (qualification) process.env.VINCI_DEEPINFRA_QUALIFICATION = "1";
   else delete process.env.VINCI_DEEPINFRA_QUALIFICATION;
   const seen = [];
@@ -24,6 +32,10 @@ function registrations(qualification) {
   } finally {
     if (prior === undefined) delete process.env.VINCI_DEEPINFRA_QUALIFICATION;
     else process.env.VINCI_DEEPINFRA_QUALIFICATION = prior;
+    if (priorTelusKey === undefined) delete process.env.TELUS_QWEN_API_KEY;
+    else process.env.TELUS_QWEN_API_KEY = priorTelusKey;
+    if (priorTelusUrl === undefined) delete process.env.TELUS_QWEN_BASE_URL;
+    else process.env.TELUS_QWEN_BASE_URL = priorTelusUrl;
   }
   return seen;
 }

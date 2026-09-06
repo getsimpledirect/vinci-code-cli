@@ -436,6 +436,25 @@ case "${VINCI_PROVIDER}" in
     }
     export VINCI_DEEPINFRA_QUALIFICATION=1
     ;;
+  telus-qwen)
+    # Self-hosted OpenAI-compatible vLLM deployment (worker fleet inference). Pinned to the single
+    # model the endpoint serves: GET /v1/models returns exactly one id, so any other value is a
+    # request the server rejects later and more confusingly.
+    [ "${VINCI_MODEL}" = "Qwen/Qwen3.8-27B" ] || {
+      echo "✗ The Telus Qwen lane is pinned to Qwen/Qwen3.8-27B" >&2
+      exit 2
+    }
+    [ -n "${TELUS_QWEN_API_KEY:-}" ] || {
+      echo "✗ TELUS_QWEN_API_KEY is required for the Telus Qwen lane" >&2
+      exit 2
+    }
+    # No default host: the deployment URL is per-environment, and a silent default would send a
+    # task's prompts wherever that stale hostname now resolves.
+    [ -n "${TELUS_QWEN_BASE_URL:-}" ] || {
+      echo "✗ TELUS_QWEN_BASE_URL is required for the Telus Qwen lane" >&2
+      exit 2
+    }
+    ;;
   *)
     # Offline process-level regressions inject a faux provider without reopening public CLI flags.
     [ "${VINCI_INTERNAL_PROVIDER_TEST:-0}" = "1" ] || {

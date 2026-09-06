@@ -18,6 +18,7 @@ import { VINCI_BILLING_URL, VINCI_GATEWAY_BASE_URL, VINCI_PLATFORM_BASE_URL } fr
 const BASE_URL = VINCI_GATEWAY_BASE_URL;
 const PLATFORM_URL = VINCI_PLATFORM_BASE_URL;
 const DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai";
+const TELUS_QWEN_MODEL_ID = "Qwen/Qwen3.8-27B";
 const FORT_MODEL_ID = "zai-org/GLM-5.2";
 const FAR_FUTURE = 4102444800000; // 2100 — the minted key doesn't expire, so never auto-refresh.
 const VINCI_TERMINAL_BUDGET_ERROR =
@@ -353,6 +354,77 @@ export default function (pi: ExtensionAPI) {
       max_tokens: typeof currentMaxTokens === "number" ? Math.min(currentMaxTokens, maxTokens) : maxTokens,
     };
   });
+
+  // Telus AI PaaS — an OpenAI-compatible vLLM deployment on hardware we already rent, used by the
+  // worker fleet so a task's inference does not depend on a metered third-party key. Registered on
+  // CREDENTIAL PRESENCE, not on a separate opt-in flag, because the worker spawns the launcher with
+  // `--provider telus-qwen` as a CLI arg and never sets VINCI_PROVIDER (see vinci/worker/run.mjs) —
+  // a flag-gated registration would be absent in exactly the process that needs it. The clean room
+  // forwards both vars for this provider and nothing else (vinci/worker/cleanroom.mjs).
+  //
+  // Every field below is MEASURED against the live server (GET /v1/models + probe requests), not
+  // inferred from the model card; see vinci/test/telus-qwen-provider-integration.mjs for the values
+  // and what each probe returned.
+  if (process.env.TELUS_QWEN_API_KEY && process.env.TELUS_QWEN_BASE_URL) {
+    pi.registerProvider("telus-qwen", {
+      name: "Telus Qwen3.8 27B (vLLM)",
+      // No hardcoded host: the deployment URL is per-environment and a rented hostname does not
+      // belong in the client. The launcher refuses the lane when this is unset.
+      baseUrl: process.env.TELUS_QWEN_BASE_URL,
+      apiKey: "$TELUS_QWEN_API_KEY",
+      api: "openai-completions",
+      models: [
+        {
+          id: TELUS_QWEN_MODEL_ID,
+          name: "Telus Qwen3.8 27B",
+          reasoning: true,
+          // MEASURED accepted set is exactly { low, medium } -- and getting here took two passes,
+          // so the reasoning is recorded rather than the conclusion alone. The server validates
+          // reasoning_effort TWICE and the two layers disagree: a pydantic Literal accepts
+          // none|low|medium|high, and the reasoning parser behind it accepts xhigh|medium|low. Only
+          // low and medium clear both. Worse, the parser's own 400 text advertises "xhigh
+          // (default)" -- a value the pydantic layer rejects outright, so the error message names
+          // an input that can never succeed. Trusting that message over the probe result is exactly
+          // what shipped a `high -> "xhigh"` map that passed every offline test and then 400'd on
+          // the first real request.
+          //
+          // bin/vinci passes `--thinking high` on EVERY launch, so the high row is the one that
+          // runs in production; it maps to "medium", the highest value this server actually takes.
+          // `off: null` omits the field entirely, which is accepted (200).
+          thinkingLevelMap: {
+            off: null,
+            minimal: "low",
+            low: "low",
+            medium: "medium",
+            high: "medium",
+            xhigh: "medium",
+          },
+          input: ["text"],
+          // max_model_len reported by GET /v1/models. Not 128k, and not the Qwen3 card's figure —
+          // this deployment is served with a 32k window and a longer request is refused.
+          contextWindow: 32_768,
+          // The model spends output tokens on `reasoning` BEFORE any content, so a tight cap
+          // returns content:null with finish_reason "length". Kept well clear of that floor.
+          maxTokens: 8_192,
+          // Zero because the tokens are not separately billed to us; the hardware is rented either
+          // way. NOTE the consequence for the worker: a task's `budget_usd` limit is derived from
+          // reported cost, so on this provider it never trips and `max_runtime_s` is the ONLY
+          // binding limit. Worker envelopes on this lane must set one they can live with.
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          compat: {
+            supportsStore: false,
+            // role "developer" is a 400 ("Unexpected message role") on this server.
+            supportsDeveloperRole: false,
+            supportsReasoningEffort: true,
+            maxTokensField: "max_tokens",
+            supportsStrictMode: true,
+            supportsLongCacheRetention: false,
+            thinkingFormat: "openai" as const,
+          },
+        },
+      ],
+    });
+  }
 
   // Normalize managed-gateway terminal errors into actionable CLI states. Budget failures never
   // route around the account ledger: the durable Pi session is the checkpoint and resume target.
