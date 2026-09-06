@@ -1,7 +1,7 @@
 {
   "productName": "Vinci Code",
   "command": "vinci",
-  "version": "0.0.52",
+  "version": "0.0.53",
   "provider": "vinci",
   "defaultModel": "auto",
   "defaultModelName": "Vinci",
