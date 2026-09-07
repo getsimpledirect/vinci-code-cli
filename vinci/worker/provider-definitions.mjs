@@ -79,26 +79,29 @@ function projectInput(value, label) {
   return [...value];
 }
 
+function validateBaseUrl(value, label) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`provider definitions: ${label} must be an absolute URL`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error(`provider definitions: ${label} may not carry credentials, query parameters, or fragments`);
+  }
+}
+
 function safeBaseUrl(value, environment, label) {
   const variable = environment.baseUrlEnv;
   const reference = value === `$${variable}` || value === `\${${variable}}`;
   const configured = process.env[variable];
   if (!configured) throw new Error(`provider definitions: ${variable} is required`);
-  if (!reference) {
-    let parsed;
-    try {
-      parsed = new URL(value);
-    } catch {
-      throw new Error(`provider definitions: ${label} must be ${variable} or an absolute URL`);
-    }
-    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
-      throw new Error(`provider definitions: ${label} may not carry credentials, query parameters, or fragments`);
-    }
-    if (value !== configured) {
-      throw new Error(`provider definitions: ${label} does not match ${variable}`);
-    }
+  validateBaseUrl(configured, variable);
+  if (!reference) validateBaseUrl(value, label);
+  if (!reference && value !== configured) {
+    throw new Error(`provider definitions: ${label} does not match ${variable}`);
   }
-  return `$${variable}`;
+  return configured;
 }
 
 function projectCompat(value, label) {
@@ -192,12 +195,18 @@ export function seedProviderDefinitions(agentDir, provider, model) {
   const home = process.env.HOME;
   if (!home) return { seeded: false, reason: "home_missing" };
   const sourcePath = join(home, ".pi", "agent", "models.json");
-  let parsed;
+  let contents;
   try {
-    parsed = JSON.parse(readFileSync(sourcePath, "utf8"));
+    contents = readFileSync(sourcePath, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") return { seeded: false, reason: "definitions_missing" };
-    throw new Error(`provider definitions: cannot read ${sourcePath}: ${error?.message ?? error}`);
+    throw new Error(`provider definitions: cannot read ${sourcePath} (${error?.code ?? "read_error"})`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(contents);
+  } catch {
+    throw new Error(`provider definitions: malformed JSON in ${sourcePath}`);
   }
   const providers = record(parsed, "models.json").providers;
   const providerTable = record(providers, "models.json.providers");
