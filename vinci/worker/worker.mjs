@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { replayPending } from "./outbox.mjs";
+import { seedProviderDefinitions } from "./provider-definitions.mjs";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, noCommitOutcome, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
@@ -1288,7 +1289,10 @@ async function processHandoff(
     const providerAgentDir = cleanRoom
       ? undefined
       : join(stateDir, "provider-slots", taskId, String(attempt.attempt), envelopeToUse.provider);
-    if (providerAgentDir) mkdirSync(providerAgentDir, { recursive: true, mode: 0o700 });
+    if (providerAgentDir) {
+      mkdirSync(providerAgentDir, { recursive: true, mode: 0o700 });
+      seedProviderDefinitions(providerAgentDir, envelopeToUse.provider, envelopeToUse.model);
+    }
     lifecycle.transition("RUNNING");
     const run = await runVinci({ envelope: envelopeToUse,
       stateDir,

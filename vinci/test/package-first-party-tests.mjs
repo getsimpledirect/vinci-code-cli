@@ -223,11 +223,14 @@ try {
 	// economics.test.mjs, so an exclusion that over-matched on the name would drop it.
 	check(
 		"worker runtime still ships",
-		shipped.has("vinci/worker/worker.mjs") && shipped.has("vinci/worker/run.mjs") && shipped.has("vinci/worker/economics.mjs"),
+		shipped.has("vinci/worker/worker.mjs") &&
+			shipped.has("vinci/worker/run.mjs") &&
+			shipped.has("vinci/worker/economics.mjs") &&
+			shipped.has("vinci/worker/provider-definitions.mjs"),
 	);
 	check(
-		"every other vinci/worker member survived (21 runtime paths)",
-		[...shipped].filter((m) => m.startsWith("vinci/worker/")).length === 21,
+		"every other vinci/worker member survived (22 runtime paths)",
+		[...shipped].filter((m) => m.startsWith("vinci/worker/")).length === 22,
 	);
 
 	// Closure check over the WHOLE archive, not just the paths this test planted or named. The checks
