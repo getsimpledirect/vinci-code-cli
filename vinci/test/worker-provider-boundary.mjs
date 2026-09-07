@@ -9,12 +9,13 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { childEnv, PROVIDER_CREDENTIAL_ENV, PROVIDER_KEY_ENV, providerScopedEnv } from "../worker/cleanroom.mjs";
+import { seedProviderDefinitions } from "../worker/provider-definitions.mjs";
 import { parseAllowedProviders, providerAllowed } from "../worker/task.mjs";
 import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
 
@@ -138,6 +139,184 @@ test("the clean-room path still gets the full clean room, not merely scoping", (
   assert.equal(env.HOME, "/tmp/h", "clean room still rewrites HOME");
   assert.equal(env.VINCI_API_KEY, "vinci");
   assert.equal(env.OPENROUTER_API_KEY, undefined);
+});
+
+test("provider definitions seed only the selected model and approved environment references", async () => {
+  const fixture = new WorkerTestFixture("provider-definitions-helper");
+  const priorHome = process.env.HOME;
+  const priorBaseUrl = process.env.VLLM_BASE_URL;
+  try {
+    const home = join(fixture.tempDir, "definition-home");
+    const slot = join(fixture.tempDir, "definition-slot");
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    mkdirSync(slot, { recursive: true });
+    process.env.HOME = home;
+    process.env.VLLM_BASE_URL = "https://vllm.example.invalid/v1";
+    writeFileSync(join(home, ".pi", "agent", "models.json"), JSON.stringify({
+      providers: {
+        vllm: {
+          baseUrl: "https://vllm.example.invalid/v1",
+          apiKey: "$VLLM_API_KEY",
+          api: "openai-completions",
+          models: [
+            { id: "Qwen/Qwen3.8-27B", reasoning: true, contextWindow: 32768, maxTokens: 4096 },
+            { id: "Qwen/Not-Selected", reasoning: false },
+          ],
+        },
+        unrelated: {
+          baseUrl: "https://unrelated.example.invalid/v1",
+          apiKey: "SYNTHETIC_LITERAL_NOT_A_SECRET",
+          headers: { Authorization: "Bearer SYNTHETIC_HEADER_NOT_A_SECRET" },
+          models: [{ id: "unrelated" }],
+        },
+      },
+    }));
+    const outcome = seedProviderDefinitions(slot, "vllm", "Qwen/Qwen3.8-27B");
+    assert.deepEqual(outcome, { seeded: true, reason: "selected_provider_only" });
+    const seeded = JSON.parse(readFileSync(join(slot, "models.json"), "utf8"));
+    assert.deepEqual(Object.keys(seeded.providers), ["vllm"]);
+    assert.equal(seeded.providers.vllm.apiKey, "$VLLM_API_KEY");
+    assert.equal(seeded.providers.vllm.baseUrl, "$VLLM_BASE_URL");
+    assert.deepEqual(seeded.providers.vllm.models.map(({ id }) => id), ["Qwen/Qwen3.8-27B"]);
+    assert.doesNotMatch(JSON.stringify(seeded), /SYNTHETIC_|Not-Selected|unrelated/);
+  } finally {
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorBaseUrl === undefined) delete process.env.VLLM_BASE_URL;
+    else process.env.VLLM_BASE_URL = priorBaseUrl;
+    await fixture.cleanup();
+  }
+});
+
+test("selected-provider literal, command, and header credentials fail closed", async () => {
+  const fixture = new WorkerTestFixture("provider-definitions-unsafe");
+  const priorHome = process.env.HOME;
+  const priorBaseUrl = process.env.VLLM_BASE_URL;
+  try {
+    const home = join(fixture.tempDir, "definition-home");
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    process.env.HOME = home;
+    process.env.VLLM_BASE_URL = "https://vllm.example.invalid/v1";
+    const source = join(home, ".pi", "agent", "models.json");
+    const selected = (extra) => ({ providers: { vllm: {
+      baseUrl: "$VLLM_BASE_URL",
+      apiKey: "$VLLM_API_KEY",
+      api: "openai-completions",
+      models: [{ id: "Qwen/Qwen3.8-27B" }],
+      ...extra,
+    } } });
+    for (const [name, config, reason] of [
+      ["literal", selected({ apiKey: "SYNTHETIC_LITERAL_NOT_A_SECRET" }), /apiKey must be an exact/],
+      ["command", selected({ apiKey: "!printf SYNTHETIC_COMMAND_NOT_EXECUTED" }), /apiKey must be an exact/],
+      ["provider-header", selected({ headers: { Authorization: "$VLLM_API_KEY" } }), /headers are not safe/],
+      ["model-header", selected({ models: [{ id: "Qwen/Qwen3.8-27B", headers: { Authorization: "$VLLM_API_KEY" } }] }), /headers are not safe/],
+      ["model-override-header", selected({ modelOverrides: { "Qwen/Qwen3.8-27B": { headers: { Authorization: "$VLLM_API_KEY" } } } }), /headers are not safe/],
+      ["url-userinfo", selected({ baseUrl: "https://synthetic-user:synthetic-pass@vllm.example.invalid/v1" }), /may not carry credentials/],
+      ["url-query", selected({ baseUrl: "https://vllm.example.invalid/v1?key=SYNTHETIC_NOT_A_SECRET" }), /may not carry credentials/],
+      ["url-mismatch", selected({ baseUrl: "https://other.example.invalid/v1" }), /does not match VLLM_BASE_URL/],
+      ["unknown-field", selected({ credentialNote: "SYNTHETIC_NOT_A_SECRET" }), /unsupported provider vllm field/],
+    ]) {
+      const slot = join(fixture.tempDir, `slot-${name}`);
+      mkdirSync(slot);
+      writeFileSync(source, JSON.stringify(config));
+      assert.throws(() => seedProviderDefinitions(slot, "vllm", "Qwen/Qwen3.8-27B"), reason);
+      assert.equal(existsSync(join(slot, "models.json")), false, `${name} must not leave a child-visible file`);
+    }
+  } finally {
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorBaseUrl === undefined) delete process.env.VLLM_BASE_URL;
+    else process.env.VLLM_BASE_URL = priorBaseUrl;
+    await fixture.cleanup();
+  }
+});
+
+test("missing optional definitions stay distinct from malformed definitions", async () => {
+  const fixture = new WorkerTestFixture("provider-definitions-missing");
+  const priorHome = process.env.HOME;
+  const priorBaseUrl = process.env.VLLM_BASE_URL;
+  try {
+    const home = join(fixture.tempDir, "definition-home");
+    const slot = join(fixture.tempDir, "definition-slot");
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    mkdirSync(slot);
+    process.env.HOME = home;
+    process.env.VLLM_BASE_URL = "https://vllm.example.invalid/v1";
+    assert.deepEqual(
+      seedProviderDefinitions(slot, "vllm", "Qwen/Qwen3.8-27B"),
+      { seeded: false, reason: "definitions_missing" },
+    );
+    writeFileSync(join(home, ".pi", "agent", "models.json"), JSON.stringify({ providers: { unrelated: {} } }));
+    assert.deepEqual(
+      seedProviderDefinitions(slot, "vllm", "Qwen/Qwen3.8-27B"),
+      { seeded: false, reason: "provider_missing" },
+    );
+    writeFileSync(join(home, ".pi", "agent", "models.json"), "{not-json");
+    assert.throws(
+      () => seedProviderDefinitions(slot, "vllm", "Qwen/Qwen3.8-27B"),
+      /cannot read .*models\.json/,
+    );
+    assert.equal(existsSync(join(slot, "models.json")), false);
+  } finally {
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorBaseUrl === undefined) delete process.env.VLLM_BASE_URL;
+    else process.env.VLLM_BASE_URL = priorBaseUrl;
+    await fixture.cleanup();
+  }
+});
+
+test("the actual worker seam gives a vllm child only its selected safe definition", async () => {
+  const fixture = new WorkerTestFixture("provider-definitions-seam");
+  try {
+    fixture.createRepo("test", "repo");
+    fixture.linkTools(TOOLS);
+    const home = join(fixture.tempDir, "home");
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    writeFileSync(join(home, ".pi", "agent", "models.json"), JSON.stringify({ providers: {
+      vllm: {
+        baseUrl: "https://vllm.example.invalid/v1",
+        apiKey: "$VLLM_API_KEY",
+        api: "openai-completions",
+        models: [{ id: "Qwen/Qwen3.8-27B", reasoning: true }],
+      },
+      unrelated: {
+        baseUrl: "https://unrelated.example.invalid/v1",
+        apiKey: "SYNTHETIC_LITERAL_NOT_A_SECRET",
+        models: [{ id: "unrelated" }],
+      },
+    } }));
+    await fixture.startBus([{
+      message_id: "provider-definitions-seam-1",
+      to_agent: "worker:w1",
+      kind: "handoff",
+      subject: "selected provider definition",
+      body: "repo: test/repo\nevidence: none\nprovider: vllm\nmodel: Qwen/Qwen3.8-27B\n\nTask",
+      ts: "2026-09-07T00:00:00Z",
+      posted_by: "scheduler",
+    }]);
+    const child = spawn(
+      "node",
+      [join(ROOT, "vinci/worker/worker.mjs"), "start", "--id", "w1", "--server", fixture.busUrl(), "--once", "--state-dir", fixture.tempDir],
+      { env: fixture.getEnv({
+        HOME: home,
+        VLLM_API_KEY: "SYNTHETIC_SELECTED_NOT_A_SECRET",
+        VLLM_BASE_URL: "https://vllm.example.invalid/v1",
+        VINCI_WORKER_ALLOWED_PROVIDERS: "vllm",
+      }), stdio: "pipe" },
+    );
+    assert.equal(await new Promise((resolveClose) => child.once("close", resolveClose)), 0);
+    const slot = join(fixture.tempDir, "provider-slots", "provider-definitions-seam-1", "1", "vllm");
+    const seeded = JSON.parse(readFileSync(join(slot, "models.json"), "utf8"));
+    assert.deepEqual(Object.keys(seeded.providers), ["vllm"]);
+    assert.equal(seeded.providers.vllm.apiKey, "$VLLM_API_KEY");
+    assert.equal(seeded.providers.vllm.baseUrl, "$VLLM_BASE_URL");
+    assert.doesNotMatch(JSON.stringify(seeded), /SYNTHETIC_|unrelated/);
+    const calls = fixture.getVinciCalls();
+    assert.equal(calls.length, 1, "positive control: the configured selected provider remains reachable");
+  } finally {
+    await fixture.cleanup();
+  }
 });
 
 test("provider allowlist defaults to OpenRouter and rejects malformed widening", () => {

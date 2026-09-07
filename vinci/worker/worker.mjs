@@ -11,35 +11,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { replayPending } from "./outbox.mjs";
-
-// The isolated provider slot exists to stop a child resolving CREDENTIALS from the daemon's
-// shared auth.json. Provider DEFINITIONS are a different thing: models.json names base URLs,
-// model ids and compat flags, and carries no secret -- its apiKey field is an env reference
-// that only resolves from the environment the child was already given.
-//
-// Isolating the slot hid the definitions too. Measured on the worker fleet 2026-09-06: a
-// self-hosted provider the daemon knew about was reported by the child as
-// `Unknown provider "vllm"` -- the allowlist admitted it, providerScopedEnv passed its
-// credential through, and it still could not run because nothing told the child the provider
-// existed. Three correct layers, one missing fact.
-//
-// So: seed the slot with definitions, never with auth.json. A box with no models.json gets
-// built-in providers exactly as before.
-function seedProviderDefinitions(agentDir) {
-  const home = process.env.HOME;
-  if (!home) return;
-  const source = join(home, ".pi", "agent", "models.json");
-  try {
-    writeFileSync(join(agentDir, "models.json"), readFileSync(source), { mode: 0o600 });
-  } catch (error) {
-    // Absent is the normal case on a box with no custom providers. Anything else is worth a log
-    // line but is never fatal: a task that needs the definition then fails at provider
-    // resolution with a clear message, which beats a half-seeded slot.
-    if (error?.code !== "ENOENT") {
-      console.error(`vinci worker: could not seed provider definitions from ${source}: ${error?.message ?? error}`);
-    }
-  }
-}
+import { seedProviderDefinitions } from "./provider-definitions.mjs";
 
 import { BusClient, isLedgerRef } from "./bus.mjs";
 import { command, finalState, noCommitOutcome, prepareRepository, publish, readHead, runVinci } from "./run.mjs";
@@ -1319,7 +1291,7 @@ async function processHandoff(
       : join(stateDir, "provider-slots", taskId, String(attempt.attempt), envelopeToUse.provider);
     if (providerAgentDir) {
       mkdirSync(providerAgentDir, { recursive: true, mode: 0o700 });
-      seedProviderDefinitions(providerAgentDir);
+      seedProviderDefinitions(providerAgentDir, envelopeToUse.provider, envelopeToUse.model);
     }
     lifecycle.transition("RUNNING");
     const run = await runVinci({ envelope: envelopeToUse,
