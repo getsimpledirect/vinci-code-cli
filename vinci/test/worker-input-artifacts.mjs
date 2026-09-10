@@ -3,7 +3,7 @@
 // a guard that fires on everything is visible as one.
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -165,7 +165,7 @@ await refuses("pointer_invalid", () => resolveInputArtifact(artifact(), opts({ l
 
 {
   await refuses(
-    "download_truncated",
+    "download_length_mismatch",
     () => resolveInputArtifact(artifact(), opts({ download: async () => BYTES.slice(0, 5) })),
     "a short read",
   );
@@ -412,3 +412,92 @@ await refuses(
 }
 
 console.log("worker-input-artifacts: trust-boundary controls passed");
+
+// --- symlink attack on the staging path (CRITICAL, found in review) --------
+
+// Pre-place a symlink where the resolver will stage, pointing at a file
+// OUTSIDE destDir. Before the fix: writeFileSync and chmodSync follow the
+// link, so the victim was overwritten with the artifact bytes and forced to
+// 0o400; renameSync does NOT follow, so the published "materialized" file
+// became a symlink out of the sandbox; and the digest re-read followed it
+// and matched, so the whole chain reported success.
+{
+  const root = mkdtempSync(join(tmpdir(), `symlink-${randomUUID()}-`));
+  const destDir = join(root, "inputs");
+  mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  const victim = join(root, "victim.txt");
+  writeFileSync(victim, "ORIGINAL", { mode: 0o644 });
+  // The deterministic name the resolver used before the fix.
+  symlinkSync(victim, join(destDir, `${DIGEST}.input.partial`));
+
+  const chain = await resolveInputArtifact(artifact(), opts({ destDir }));
+
+  assert.equal(readFileSync(victim, "utf8"), "ORIGINAL", "a file outside destDir must not be written through a symlink");
+  assert.equal(statSync(victim).mode & 0o777, 0o644, "a file outside destDir must not be permission-clobbered");
+  assert.equal(lstatSync(chain.materialized_path).isSymbolicLink(), false, "the published artifact must be a real file, not a link out of the sandbox");
+  assert.equal(lstatSync(chain.materialized_path).isFile(), true);
+  assert.equal(readFileSync(chain.materialized_path, "utf8"), "accepted findings context packet v1");
+}
+
+// The staging name is unpredictable, so it cannot be pre-created at all.
+{
+  const destDir = dest();
+  await resolveInputArtifact(artifact(), opts({ destDir }));
+  const names = readdirSync(destDir);
+  assert.deepEqual(names, [`${DIGEST}.input`], "no residue, and the published name is digest-derived");
+}
+{
+  // Two resolutions of the same artifact into one directory do not collide
+  // on the staging path -- which a fixed `.partial` name would.
+  const destDir = dest();
+  await resolveInputArtifact(artifact(), opts({ destDir }));
+  await resolveInputArtifact(artifact(), opts({ destDir }));
+  assert.deepEqual(readdirSync(destDir), [`${DIGEST}.input`]);
+}
+
+// Exclusive create: anything already sitting at the staging path is a
+// refusal, never something written through. The staging name is random, so
+// this is exercised by driving the write at a path that already exists --
+// the property is `flag: "wx"`, not the name.
+{
+  const destDir = dest();
+  mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  const squatted = join(destDir, "squatted.partial");
+  writeFileSync(squatted, "squatter");
+  assert.throws(
+    () => writeFileSync(squatted, BYTES, { mode: 0o400, flag: "wx" }),
+    (error) => error.code === "EEXIST",
+    "exclusive create must refuse an occupied path rather than write through it",
+  );
+  // ...and the squatter is untouched, which is the point.
+  assert.equal(readFileSync(squatted, "utf8"), "squatter");
+}
+
+// --- wrong-typed input is the module's own refusal, not a TypeError --------
+
+for (const bad of [{}, "hello", 42, true]) {
+  await refuses("invalid_input_artifact", () => resolveInputArtifacts(bad, opts()), `inputArtifacts of ${JSON.stringify(bad)}`);
+}
+assert.deepEqual(await resolveInputArtifacts(null, opts()), [], "null is still 'no declared inputs'");
+
+// --- unanchored allowlist prefixes are refused -----------------------------
+
+// `s3://vgc-artifacts` without the delimiter admits
+// `s3://vgc-artifacts@evil.example/x`, which passes startsWith while a
+// WHATWG parser reads host evil.example. Demonstrated in review.
+await refuses(
+  "unanchored_uri_prefix",
+  () => resolveInputArtifact(artifact(), { ...opts(), allowedUriPrefixes: ["s3://vgc-artifacts"] }),
+  "an unanchored prefix",
+);
+await refuses(
+  "unanchored_uri_prefix",
+  () => resolveInputArtifact(artifact(), {
+    ...opts(),
+    allowedUriPrefixes: ["s3://vgc-artifacts"],
+    lookup: async () => pointer({ uri: "s3://vgc-artifacts@evil.example/x" }),
+  }),
+  "the userinfo-confusion URI its absence would have admitted",
+);
+
+console.log("worker-input-artifacts: ambient-capability controls passed");

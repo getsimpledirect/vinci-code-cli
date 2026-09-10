@@ -37,8 +37,8 @@
 // Modelled on the one existing precedent in the fleet, `vgc artifacts pull`:
 // resolve id -> looked-up uri -> fetch -> verify sha256 AFTER download.
 
-import { createHash } from "node:crypto";
-import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { isIdentifier } from "./contracts/digest.mjs";
@@ -48,6 +48,14 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // A context packet is prose and JSON. This ceiling is not a policy about
 // artifacts in general -- it is the bound on what this consumer will pull
 // into a prompt, and a larger input is a refusal rather than a slow fetch.
+//
+// HONESTY-DEPENDENT. The pre-fetch check reads the pointer's DECLARED size,
+// so a lying or compromised authority can under-declare and the adapter will
+// still buffer whatever the object really is before this module sees a byte.
+// `maxBytes` reaches `download` as ADVISORY: enforcing it during transfer is
+// the adapter's job and this module cannot verify that it did. What is
+// enforced here is that the delivered length equals the declared one, which
+// bounds what can be MATERIALIZED, not what can be transferred.
 export const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
 
 export class InputArtifactError extends Error {
@@ -147,7 +155,21 @@ export function validatePointer(pointer, artifact, allowedUriPrefixes) {
       "the caller must declare which storage namespace its downloader is qualified to fetch from; there is no permissive default",
     );
   }
-  if (!allowedUriPrefixes.some((prefix) => typeof prefix === "string" && prefix && pointer.uri.startsWith(prefix))) {
+  // ANCHORED PREFIXES ONLY. `s3://vgc-artifacts` without the trailing
+  // delimiter admits `s3://vgc-artifacts@evil.example/x`, which passes
+  // startsWith while a WHATWG parser reads host `evil.example` and userinfo
+  // `vgc-artifacts`. Demonstrated in review. Requiring the delimiter is a
+  // structural rule on configuration, not a URI parser, and the module
+  // previously placed no requirement on these entries at all.
+  for (const prefix of allowedUriPrefixes) {
+    if (typeof prefix !== "string" || !prefix.endsWith("/")) {
+      refuse(
+        "unanchored_uri_prefix",
+        `allowedUriPrefixes entry ${JSON.stringify(prefix)} must end with "/"; an unanchored prefix admits userinfo and host confusion`,
+      );
+    }
+  }
+  if (!allowedUriPrefixes.some((prefix) => pointer.uri.startsWith(prefix))) {
     refuse(
       "uri_outside_namespace",
       `the pointer for ${artifact.id} names ${pointer.uri}, which is outside the qualified storage namespace [${allowedUriPrefixes.join(", ")}]`,
@@ -201,7 +223,7 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
   // that stop early hash to something else and would be caught below, but
   // naming the actual failure beats reporting a digest mismatch for it.
   if (bytes.byteLength !== pointer.bytes) {
-    refuse("download_truncated", `${artifact.id} downloaded ${bytes.byteLength} bytes, the ledger recorded ${pointer.bytes}`);
+    refuse("download_length_mismatch", `${artifact.id} downloaded ${bytes.byteLength} bytes, the ledger recorded ${pointer.bytes}`);
   }
   chain.downloaded_digest = sha256OfBytes(bytes);
   if (chain.downloaded_digest !== artifact.digest) {
@@ -215,7 +237,16 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
   // both are strings someone else chose, and a filename is a place. The
   // digest is the only name here that the bytes themselves prove.
   const finalPath = join(destDir, `${artifact.digest}.input`);
-  const tempPath = `${finalPath}.partial`;
+  // UNPREDICTABLE temp name. A deterministic one (`${digest}.input.partial`)
+  // is a name an attacker can pre-create -- and a symlink there is followed
+  // by both writeFileSync and chmodSync, so the artifact bytes land on the
+  // link's TARGET and force it to 0o400, while renameSync (which does not
+  // follow) then publishes the link itself as the "materialized" file. The
+  // digest re-read follows the link and matches, so the whole chain reports
+  // success while an arbitrary file outside destDir has been overwritten and
+  // permission-locked, and `materialized_path` points out of the sandbox.
+  // Reproduced before this fix; see the symlink controls in the test file.
+  const tempPath = `${finalPath}.${randomUUID()}.partial`;
   // The destination is private BEFORE anything is written into it, so the
   // partial file is never reachable by another user even briefly.
   mkdirSync(destDir, { recursive: true, mode: 0o700 });
@@ -228,7 +259,17 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
   // was the load-bearing part and nothing was checking it. Every narrowing
   // now happens on the TEMP path, and the rename publishes something that is
   // already read-only.
-  writeFileSync(tempPath, bytes, { mode: 0o400 });
+  // `wx` is exclusive-create: it fails with EEXIST on anything already at
+  // this path, symlink included, instead of following it. Unpredictable name
+  // AND exclusive create -- either alone is weaker than it looks.
+  try {
+    writeFileSync(tempPath, bytes, { mode: 0o400, flag: "wx" });
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      refuse("staging_path_occupied", `${tempPath} already exists; refusing to write through whatever is there`);
+    }
+    throw error;
+  }
   const handle = openSync(tempPath, "r");
   try {
     fsyncSync(handle);
@@ -267,6 +308,13 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
   if (chain.materialized_digest !== artifact.digest) {
     refuse("materialization_mismatch", `${artifact.id} materialized as ${chain.materialized_digest.slice(0, 12)}…, not ${artifact.digest.slice(0, 12)}…`);
   }
+  // The published path must be a REGULAR FILE we created, not a link to
+  // somewhere else. Belt and braces behind the two guards above, and the
+  // one check that would have caught the symlink defect on its own.
+  const published = lstatSync(finalPath);
+  if (!published.isFile()) {
+    refuse("published_path_not_a_regular_file", `${finalPath} is not a regular file after publication`);
+  }
   chain.materialized_path = finalPath;
   return chain;
 }
@@ -301,6 +349,11 @@ export async function resolveInputArtifacts(inputArtifacts, { lookup, download, 
   // it. Callers only reach it by calling the lower-level function directly,
   // which production does not do.
   const options = { lookup, download, destDir, allowedUriPrefixes, maxBytes };
+  if (inputArtifacts !== undefined && inputArtifacts !== null && !Array.isArray(inputArtifacts)) {
+    // Everything else in this module refuses through InputArtifactError; a
+    // bare TypeError escapes a caller that catches the documented contract.
+    refuse("invalid_input_artifact", `inputArtifacts is a list, got ${typeof inputArtifacts}`);
+  }
   const declared = (inputArtifacts ?? []).map(validateInputArtifact);
   const seen = new Set();
   for (const artifact of declared) {
