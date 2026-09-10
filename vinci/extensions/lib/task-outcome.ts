@@ -79,6 +79,13 @@ export type VinciTaskUsage = {
   estimatedCostUsd: number;
   providers: string[];
   models: string[];
+  // Same three-way split as the accumulator: `models` stays the collapsed observed-or-resolved
+  // field other consumers read, while these carry the two facts separately. Kept in lockstep with
+  // VinciAccumulatedUsage -- receipt-integration asserts the two rollups are deep-equal, and a
+  // divergence here is a real inconsistency, not a stale expectation.
+  observedModels: string[];
+  resolvedModels: string[];
+  observedModelCalls: number;
 };
 
 export type VinciTaskOutcome = {
@@ -285,6 +292,9 @@ function userFacingFailure(error: string): string {
 function summarizeAssistantUsage(messages: readonly unknown[]): VinciTaskUsage {
   const providers = new Set<string>();
   const models = new Set<string>();
+  const observedModels = new Set<string>();
+  const resolvedModels = new Set<string>();
+  let observedModelCalls = 0;
   // Assistant-stream and supplemental costs both accumulate as integer micro-USD internally.
   let estimatedCostMicroUsd = 0;
   const usage: VinciTaskUsage = {
@@ -297,6 +307,9 @@ function summarizeAssistantUsage(messages: readonly unknown[]): VinciTaskUsage {
     estimatedCostUsd: 0,
     providers: [],
     models: [],
+    observedModels: [],
+    resolvedModels: [],
+    observedModelCalls: 0,
   };
   for (const message of assistantMessages(messages)) {
     usage.modelCalls++;
@@ -307,16 +320,25 @@ function summarizeAssistantUsage(messages: readonly unknown[]): VinciTaskUsage {
     usage.reasoningTokens += finite(message.usage?.reasoning);
     estimatedCostMicroUsd += usdToMicroUsd(finite(message.usage?.cost?.total));
     if (typeof message.provider === "string" && message.provider) providers.add(message.provider);
-    const model = typeof message.responseModel === "string" && message.responseModel
-      ? message.responseModel
-      : typeof message.model === "string"
-        ? message.model
-        : "";
+    // Machine-observed served id: only ever what the provider reported on the wire.
+    const observed =
+      typeof message.responseModel === "string" && message.responseModel ? message.responseModel : "";
+    // Resolver's choice: recorded unconditionally, and never used to stand in for `observed`.
+    const resolved = typeof message.model === "string" && message.model ? message.model : "";
+    if (observed) {
+      observedModels.add(observed);
+      observedModelCalls += 1;
+    }
+    if (resolved) resolvedModels.add(resolved);
+    const model = observed || resolved;
     if (model) models.add(model);
   }
   usage.estimatedCostUsd = microUsdToUsd(estimatedCostMicroUsd);
   usage.providers = [...providers].sort();
   usage.models = [...models].sort();
+  usage.observedModels = [...observedModels].sort();
+  usage.resolvedModels = [...resolvedModels].sort();
+  usage.observedModelCalls = observedModelCalls;
   return usage;
 }
 
