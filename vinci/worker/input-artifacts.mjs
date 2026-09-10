@@ -94,7 +94,7 @@ export function validateInputArtifact(entry, index) {
 // The pointer shape vinci-gpu-control's artifacts ledger already emits:
 // {artifact_id, job_id, uri, bytes, sha256, created_at}. Only the four fields
 // this consumer needs are read, and the rest are ignored rather than trusted.
-export function validatePointer(pointer, artifact) {
+export function validatePointer(pointer, artifact, allowedUriPrefixes) {
   // An authority may answer with a list. Nothing establishes that artifact
   // ids form a globally unique namespace -- the investigation behind this
   // module found no registry semantics at all -- so more than one match is
@@ -134,6 +134,25 @@ export function validatePointer(pointer, artifact) {
       `the artifact ledger says ${artifact.id} is ${pointer.sha256.slice(0, 12)}… but the execution contract expects ${artifact.digest.slice(0, 12)}…; these are different claims from different authorities and neither one settles the other`,
     );
   }
+  // AN AUTHORITY THAT CAN SELECT AN OBJECT DOES NOT THEREBY GAIN ARBITRARY
+  // NETWORK-FETCH AUTHORITY. The pointer decides where this worker will go,
+  // so the caller must declare the storage namespace its downloader is
+  // qualified for, and a pointer outside it is refused however well-formed.
+  // No default: an omitted allowlist is a refusal, because a permissive
+  // default would make the trust boundary invisible at the call site --
+  // which is the one place it has to be visible.
+  if (!Array.isArray(allowedUriPrefixes) || allowedUriPrefixes.length === 0) {
+    refuse(
+      "no_uri_allowlist",
+      "the caller must declare which storage namespace its downloader is qualified to fetch from; there is no permissive default",
+    );
+  }
+  if (!allowedUriPrefixes.some((prefix) => typeof prefix === "string" && prefix && pointer.uri.startsWith(prefix))) {
+    refuse(
+      "uri_outside_namespace",
+      `the pointer for ${artifact.id} names ${pointer.uri}, which is outside the qualified storage namespace [${allowedUriPrefixes.join(", ")}]`,
+    );
+  }
   return { uri: pointer.uri, bytes: pointer.bytes, sha256: pointer.sha256 };
 }
 
@@ -153,7 +172,7 @@ export function validatePointer(pointer, artifact) {
  * `input delivery observation` consumes. Every stage is reported, including
  * the ones that did not happen.
  */
-export async function resolveInputArtifact(artifact, { lookup, download, destDir, maxBytes = DEFAULT_MAX_BYTES, readBack = readFileSync }) {
+export async function resolveInputArtifact(artifact, { lookup, download, destDir, allowedUriPrefixes, maxBytes = DEFAULT_MAX_BYTES, readBack = readFileSync }) {
   const chain = {
     artifact_id: artifact.id,
     requested_input_digest: artifact.digest,
@@ -167,7 +186,7 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
   // would require artifact ids to be globally unique, which nothing
   // establishes; the digest lets the authority disambiguate rather than
   // guess, and lets it refuse rather than return the wrong subject.
-  const pointer = validatePointer(await lookup(artifact.id, artifact.digest), artifact);
+  const pointer = validatePointer(await lookup(artifact.id, artifact.digest), artifact, allowedUriPrefixes);
   chain.resolved_storage_object = pointer.uri;
 
   if (pointer.bytes > maxBytes) {
@@ -253,13 +272,27 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
 }
 
 /**
- * Resolve every declared input artifact, or refuse the task.
+ * Resolve every declared input artifact, or refuse.
  *
- * All-or-nothing on purpose: a worker that ran with three of its four named
- * inputs would produce a result nobody could interpret, and the contract
- * digest covers the whole list.
+ * EXECUTION-ATOMIC, NOT MATERIALIZATION-ATOMIC. The distinction matters and
+ * the first version of this comment got it wrong by calling the whole thing
+ * "all-or-nothing".
+ *
+ * What holds: no worker spawn occurs unless EVERY declared input resolved,
+ * downloaded, verified and materialized. A refusal here propagates, and a
+ * task that ran with three of its four named inputs would produce a result
+ * nobody could interpret.
+ *
+ * What does NOT hold: this loop publishes each artifact as it goes, so a
+ * refusal on artifact N leaves artifacts 1..N-1 already materialized. That
+ * residue is verified, immutable and unreferenced -- it is cleanup debris,
+ * not partial execution -- but it is residue, and calling this a transaction
+ * would be a claim the code does not implement. Staging the whole set before
+ * publishing any of it is possible and is deliberately not done: it buys
+ * nothing while the execution-atomic property is enforced at the call site,
+ * which is where the eventual wiring must test it.
  */
-export async function resolveInputArtifacts(inputArtifacts, { lookup, download, destDir, maxBytes = DEFAULT_MAX_BYTES }) {
+export async function resolveInputArtifacts(inputArtifacts, { lookup, download, destDir, allowedUriPrefixes, maxBytes = DEFAULT_MAX_BYTES }) {
   // THE PRODUCTION ENTRY POINT ENUMERATES WHAT IT FORWARDS. `readBack` is a
   // test seam and must stay one: forwarding an options object wholesale
   // would let a caller supply the very function that decides what the
@@ -267,7 +300,7 @@ export async function resolveInputArtifacts(inputArtifacts, { lookup, download, 
   // implementation, so it is not in this signature and cannot pass through
   // it. Callers only reach it by calling the lower-level function directly,
   // which production does not do.
-  const options = { lookup, download, destDir, maxBytes };
+  const options = { lookup, download, destDir, allowedUriPrefixes, maxBytes };
   const declared = (inputArtifacts ?? []).map(validateInputArtifact);
   const seen = new Set();
   for (const artifact of declared) {

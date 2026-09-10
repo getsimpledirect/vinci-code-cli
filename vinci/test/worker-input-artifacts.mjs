@@ -43,10 +43,13 @@ const pointer = (over = {}) => ({
   ...over,
 });
 
+const NAMESPACE = ["s3://vgc-artifacts/"];
+
 const opts = (over = {}) => ({
   lookup: async () => pointer(),
   download: async () => BYTES,
   destDir: dest(),
+  allowedUriPrefixes: NAMESPACE,
   ...over,
 });
 
@@ -244,7 +247,7 @@ await refuses(
 
 // --- the pointer validator in isolation ------------------------------------
 
-assert.deepEqual(validatePointer(pointer(), artifact()), { uri: URI, bytes: BYTES.byteLength, sha256: DIGEST });
+assert.deepEqual(validatePointer(pointer(), artifact(), NAMESPACE), { uri: URI, bytes: BYTES.byteLength, sha256: DIGEST });
 
 console.log("worker-input-artifacts: all controls passed");
 
@@ -336,3 +339,76 @@ for (const [answer, why] of [
 }
 
 console.log("worker-input-artifacts: review corrections passed");
+
+// --- the download trust boundary -------------------------------------------
+
+// An authority that can SELECT an object does not thereby gain arbitrary
+// network-fetch authority. The pointer decides where this worker goes.
+{
+  // positive control: inside the qualified namespace, it resolves.
+  assert.ok(await resolveInputArtifact(artifact(), opts()));
+
+  for (const [uri, why] of [
+    ["s3://someone-elses-bucket/obj.tgz", "another bucket"],
+    ["https://evil.example/obj.tgz", "an http endpoint"],
+    ["file:///etc/passwd", "a local file url"],
+    ["http://169.254.169.254/latest/meta-data/", "a link-local metadata address"],
+    ["s3://vgc-artifacts-evil/obj.tgz", "a prefix-adjacent bucket name"],
+    // The namespace must be a PREFIX, not a substring. Every case above
+    // fails a substring test too, so none of them could tell `startsWith`
+    // from `includes` -- a mutation to `includes` survived until these.
+    ["https://evil.example/redirect?to=s3://vgc-artifacts/obj.tgz", "the namespace as a query parameter"],
+    ["s3://attacker-bucket/s3://vgc-artifacts/obj.tgz", "the namespace buried in a key"],
+  ]) {
+    await refuses(
+      "uri_outside_namespace",
+      () => resolveInputArtifact(artifact(), opts({ lookup: async () => pointer({ uri }) })),
+      why,
+    );
+  }
+}
+
+// No allowlist is a refusal, not a pass. A permissive default would make the
+// trust boundary invisible at the call site, which is the one place it has
+// to be visible.
+for (const missing of [undefined, [], null, "s3://vgc-artifacts/"]) {
+  await refuses(
+    "no_uri_allowlist",
+    () => resolveInputArtifact(artifact(), { ...opts(), allowedUriPrefixes: missing }),
+    `an allowlist of ${JSON.stringify(missing)}`,
+  );
+}
+
+// The namespace reaches the primitive through the PRODUCTION entry point too,
+// so wiring cannot accidentally drop it and get a permissive fetch.
+await refuses(
+  "uri_outside_namespace",
+  () => resolveInputArtifacts([artifact()], { ...opts(), lookup: async () => pointer({ uri: "s3://elsewhere/x" }) }),
+  "an out-of-namespace pointer through the production entry point",
+);
+
+// --- execution-atomic, NOT materialization-atomic ---------------------------
+
+// The honest property, asserted rather than described: a refusal on the
+// second artifact leaves the first one materialized. That residue is
+// verified and immutable, but it exists -- calling this a transaction would
+// be a claim the code does not implement.
+{
+  const destDir = dest();
+  const first = artifact();
+  const second = artifact({ id: "second-input", digest: OTHER_DIGEST });
+  await refuses(
+    "identity_disagreement",
+    () => resolveInputArtifacts([first, second], {
+      ...opts(),
+      destDir,
+      lookup: async (id) => (id === first.id ? pointer() : pointer({ artifact_id: "second-input", sha256: DIGEST })),
+    }),
+    "the second of two inputs disagreeing",
+  );
+  // The FIRST artifact is on disk. This is residue, not rollback.
+  assert.equal(statSync(join(destDir, `${DIGEST}.input`)).mode & 0o777, 0o400,
+    "the earlier artifact stays materialized: execution-atomic, not materialization-atomic");
+}
+
+console.log("worker-input-artifacts: trust-boundary controls passed");
