@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   DEFAULT_MAX_BYTES,
@@ -27,7 +27,11 @@ const OTHER = new TextEncoder().encode("accepted findings context packet v2");
 const OTHER_DIGEST = createHash("sha256").update(OTHER).digest("hex");
 const URI = "s3://vgc-artifacts/ctx/9f2.tgz";
 
-const dest = () => mkdtempSync(join(tmpdir(), `input-artifacts-${randomUUID()}-`));
+// A destDir the resolver must CREATE. mkdtempSync already makes 0o700
+// directories, so handing one straight to the resolver meant the
+// directory-privacy assertion could never discriminate -- the fixture was
+// doing the thing under test.
+const dest = () => join(mkdtempSync(join(tmpdir(), `input-artifacts-${randomUUID()}-`)), "inputs");
 const artifact = (over = {}) => ({ id: "accepted-findings-context", digest: DIGEST, ...over });
 const pointer = (over = {}) => ({
   artifact_id: "accepted-findings-context",
@@ -243,3 +247,92 @@ await refuses(
 assert.deepEqual(validatePointer(pointer(), artifact()), { uri: URI, bytes: BYTES.byteLength, sha256: DIGEST });
 
 console.log("worker-input-artifacts: all controls passed");
+
+// --- corrections from review ------------------------------------------------
+
+// PERMISSION BEFORE PUBLICATION. Concluding that the write mode was useless
+// because the final mode was chmod-ed was the wrong lesson: the ordering was
+// load-bearing and nothing tested it. The final pathname must never exist
+// writable, even briefly, so every narrowing happens on the temp path and the
+// rename publishes something already read-only.
+{
+  const seen = [];
+  const chain = await resolveInputArtifact(artifact(), opts({
+    // Observe the mode of the file at the moment it is read back, i.e. after
+    // staging and before/at publication.
+    readBack: (path) => {
+      seen.push({ path, mode: statSync(path).mode & 0o777 });
+      return BYTES;
+    },
+  }));
+  // The staged file is already 0o400 when its identity is verified, BEFORE
+  // it ever acquires the final name.
+  const staged = seen.find((s) => s.path.endsWith(".partial"));
+  assert.ok(staged, "identity must be verified while the file is still unpublished");
+  assert.equal(staged.mode, 0o400, "the temp file must be read-only before it is published");
+  // And the published file is read-only too.
+  assert.equal(statSync(chain.materialized_path).mode & 0o777, 0o400);
+  // The containing directory is private BEFORE anything is written into it,
+  // so the partial file is never reachable by another user even briefly.
+  assert.equal(statSync(dirname(chain.materialized_path)).mode & 0o777, 0o700);
+}
+
+// A staged file whose bytes do not hash correctly never acquires the final
+// name at all -- it is refused while still unpublished.
+{
+  const destDir = dest();
+  let readCount = 0;
+  await refuses(
+    "materialization_mismatch",
+    () => resolveInputArtifact(artifact(), opts({
+      destDir,
+      readBack: (path) => { readCount += 1; return path.endsWith(".partial") ? OTHER : BYTES; },
+    })),
+    "a staged file that does not hash correctly",
+  );
+  assert.equal(readCount, 1, "the refusal must happen at staging, before publication");
+  assert.throws(() => statSync(join(destDir, `${DIGEST}.input`)), "the final name must not exist");
+}
+
+// --- id + digest, and ambiguity fails closed --------------------------------
+
+// The resolver is asked for BOTH. Sending only the id would require artifact
+// ids to be globally unique, which nothing establishes.
+{
+  const asked = [];
+  await resolveInputArtifact(artifact(), opts({
+    lookup: async (id, digest) => { asked.push([id, digest]); return pointer(); },
+  }));
+  assert.deepEqual(asked, [["accepted-findings-context", DIGEST]]);
+}
+
+// More than one match is unresolvable, not a choice. Picking the newest is
+// how the wrong artifact arrives with every digest check passing.
+for (const [answer, why] of [
+  [[pointer(), pointer({ uri: "s3://other/obj.tgz" })], "two matching pointers"],
+  [[], "an empty pointer list"],
+]) {
+  await refuses("ambiguous_pointer", () => resolveInputArtifact(artifact(), opts({ lookup: async () => answer })), why);
+}
+// positive control: a single-element list resolves exactly like a bare object.
+{
+  const chain = await resolveInputArtifact(artifact(), opts({ lookup: async () => [pointer()] }));
+  assert.equal(chain.materialized_digest, DIGEST);
+}
+
+// --- the read-back seam is not caller-controlled in production --------------
+
+// resolveInputArtifacts is the production entry point. A caller must not be
+// able to supply the function that decides what the worker believes it
+// materialized, so the seam does not pass through it.
+{
+  let injected = false;
+  const chains = await resolveInputArtifacts([artifact()], {
+    ...opts(),
+    readBack: () => { injected = true; return OTHER; },
+  });
+  assert.equal(injected, false, "readBack must not be forwardable through the production entry point");
+  assert.equal(chains[0].materialized_digest, DIGEST);
+}
+
+console.log("worker-input-artifacts: review corrections passed");

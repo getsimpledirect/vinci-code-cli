@@ -38,7 +38,7 @@
 // resolve id -> looked-up uri -> fetch -> verify sha256 AFTER download.
 
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { isIdentifier } from "./contracts/digest.mjs";
@@ -95,6 +95,20 @@ export function validateInputArtifact(entry, index) {
 // {artifact_id, job_id, uri, bytes, sha256, created_at}. Only the four fields
 // this consumer needs are read, and the rest are ignored rather than trusted.
 export function validatePointer(pointer, artifact) {
+  // An authority may answer with a list. Nothing establishes that artifact
+  // ids form a globally unique namespace -- the investigation behind this
+  // module found no registry semantics at all -- so more than one match is
+  // a refusal, never a pick-the-newest. Choosing by recency is how the
+  // wrong artifact arrives with every digest check passing.
+  if (Array.isArray(pointer)) {
+    if (pointer.length !== 1) {
+      refuse(
+        "ambiguous_pointer",
+        `the authority returned ${pointer.length} pointer records for ${artifact.id}; artifact ids are not known to be globally unique, so this is unresolvable rather than a choice`,
+      );
+    }
+    pointer = pointer[0];
+  }
   if (pointer === null || typeof pointer !== "object") {
     refuse("pointer_invalid", `no pointer record for artifact ${artifact.id}`);
   }
@@ -149,7 +163,11 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
     materialized_path: null,
   };
 
-  const pointer = validatePointer(await lookup(artifact.id), artifact);
+  // The resolver is asked for id AND expected digest. Sending only the id
+  // would require artifact ids to be globally unique, which nothing
+  // establishes; the digest lets the authority disambiguate rather than
+  // guess, and lets it refuse rather than return the wrong subject.
+  const pointer = validatePointer(await lookup(artifact.id, artifact.digest), artifact);
   chain.resolved_storage_object = pointer.uri;
 
   if (pointer.bytes > maxBytes) {
@@ -179,27 +197,53 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
   // digest is the only name here that the bytes themselves prove.
   const finalPath = join(destDir, `${artifact.digest}.input`);
   const tempPath = `${finalPath}.partial`;
-  mkdirSync(destDir, { recursive: true });
-  // Written 0o600 and narrowed to 0o400 after the rename. Setting 0o400 at
-  // write time as well looked like defence in depth and was not: the chmod
-  // below decides the final mode, so a mutation of the write mode changed
-  // nothing observable. One mechanism that a test can see beats two where
-  // only one is load-bearing.
-  writeFileSync(tempPath, bytes, { mode: 0o600 });
-  // Rename after the bytes are down, so a crash mid-write cannot leave a
-  // half-file sitting at the name a later run would treat as cached.
+  // The destination is private BEFORE anything is written into it, so the
+  // partial file is never reachable by another user even briefly.
+  mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  chmodSync(destDir, 0o700);
+
+  // PERMISSION BEFORE PUBLICATION. An earlier version wrote, renamed, then
+  // chmod-ed -- which leaves an interval where the FINAL pathname exists
+  // and is still writable. Tests do not normally observe that interleaving,
+  // which is exactly why a mutation of the write mode survived: the ordering
+  // was the load-bearing part and nothing was checking it. Every narrowing
+  // now happens on the TEMP path, and the rename publishes something that is
+  // already read-only.
+  writeFileSync(tempPath, bytes, { mode: 0o400 });
+  const handle = openSync(tempPath, "r");
+  try {
+    fsyncSync(handle);
+  } finally {
+    closeSync(handle);
+  }
+  chmodSync(tempPath, 0o400);
+  // Verify identity while it is still unpublished: a temp file that does not
+  // hash correctly must never acquire the final name at all.
+  const stagedDigest = sha256OfBytes(readBack(tempPath));
+  if (stagedDigest !== artifact.digest) {
+    refuse("materialization_mismatch", `${artifact.id} staged as ${stagedDigest.slice(0, 12)}…, not ${artifact.digest.slice(0, 12)}…`);
+  }
   renameSync(tempPath, finalPath);
-  chmodSync(finalPath, 0o400);
+  const dirHandle = openSync(destDir, "r");
+  try {
+    fsyncSync(dirHandle);
+  } catch {
+    // Directory fsync is not portable everywhere; the rename is still
+    // atomic, so this is durability hardening rather than a correctness
+    // step, and failing it must not fail the delivery.
+  } finally {
+    closeSync(dirHandle);
+  }
 
   // Re-read from disk rather than re-hashing the buffer we already have.
   // Hashing the in-memory copy would prove the download and call it the
   // materialization -- the two are only the same claim if nothing went
   // wrong between them, which is the thing being checked.
-  // `readBack` is injectable ONLY so this property is testable. Hashing the
-  // buffer we already have would prove the download and label it the
-  // materialization; they are the same claim only if nothing went wrong in
-  // between, which is the thing being checked. A mutation that hashes
-  // `bytes` here survived every test until this seam existed.
+  // Re-read the PUBLISHED path. Hashing the buffer we already have would
+  // prove the download and label it the materialization; they are the same
+  // claim only if nothing went wrong in between, which is the thing being
+  // checked. A mutation that hashes `bytes` here survived every test until
+  // this seam existed.
   chain.materialized_digest = sha256OfBytes(readBack(finalPath));
   if (chain.materialized_digest !== artifact.digest) {
     refuse("materialization_mismatch", `${artifact.id} materialized as ${chain.materialized_digest.slice(0, 12)}…, not ${artifact.digest.slice(0, 12)}…`);
@@ -215,7 +259,15 @@ export async function resolveInputArtifact(artifact, { lookup, download, destDir
  * inputs would produce a result nobody could interpret, and the contract
  * digest covers the whole list.
  */
-export async function resolveInputArtifacts(inputArtifacts, options) {
+export async function resolveInputArtifacts(inputArtifacts, { lookup, download, destDir, maxBytes = DEFAULT_MAX_BYTES }) {
+  // THE PRODUCTION ENTRY POINT ENUMERATES WHAT IT FORWARDS. `readBack` is a
+  // test seam and must stay one: forwarding an options object wholesale
+  // would let a caller supply the very function that decides what the
+  // worker believes it materialized. Trusted code picks that
+  // implementation, so it is not in this signature and cannot pass through
+  // it. Callers only reach it by calling the lower-level function directly,
+  // which production does not do.
+  const options = { lookup, download, destDir, maxBytes };
   const declared = (inputArtifacts ?? []).map(validateInputArtifact);
   const seen = new Set();
   for (const artifact of declared) {
