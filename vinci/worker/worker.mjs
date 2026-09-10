@@ -9,6 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { replayPending } from "./outbox.mjs";
 import { seedProviderDefinitions } from "./provider-definitions.mjs";
@@ -546,6 +547,11 @@ async function emitEconomics({
         observation: "unavailable",
         resolved_model: null,
         resolved_models: [],
+        requested_provider: null,
+        requested_model: null,
+        used_generation_id: null,
+        used_generation_ids: [],
+        observed_generation_ids: [],
         observed_provider: null,
         observed_model: null,
         observed_models: [],
@@ -575,6 +581,26 @@ async function emitEconomics({
     if (typeof lease?.fencing_generation === "number") degraded.fencing_generation = lease.fencing_generation;
     return { summary: degraded, sha256: economicsSha256(canonicalJson(degraded)) };
   }
+}
+
+// A generation id is only printable as a whitespace-delimited field when it contains no
+// whitespace, NUL or `=`. Anything else is emitted as a digest so the body stays parseable while
+// the reference remains checkable against result.json, which carries the id verbatim.
+const FIELD_SAFE_ID = /^[A-Za-z0-9._:@+-]+$/;
+function generationIdFields(gi) {
+  const ids = Array.isArray(gi.used_generation_ids) ? gi.used_generation_ids : [];
+  if (ids.length === 0) return [];
+  const single = ids.length === 1 ? ids[0] : null;
+  if (single) {
+    return FIELD_SAFE_ID.test(single)
+      ? [`used_generation_id=${single}`]
+      : [`used_generation_id_sha256=${createHash("sha256").update(single).digest("hex").slice(0, 12)}`];
+  }
+  // More than one generation: never print a single id that would stand for all of them.
+  return [
+    `used_generation_count=${ids.length}`,
+    `used_generation_ids_sha256=${createHash("sha256").update(ids.join("\u0000")).digest("hex").slice(0, 12)}`,
+  ];
 }
 
 function terminalPostBody(details) {
@@ -629,6 +655,30 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
         policy.blocked > 0 ? `policy_blocked_sites=${policy.sites.blocked.join(",")}` : undefined,
       ]
     : [];
+  // The identity distinction, carried as FIELDS on the terminal post so a downstream reader gets
+  // it without opening the bundle. Never collapsed: `observation=unavailable` and an observed
+  // match are different facts, and `used_model` is emitted ONLY from a machine observation, so a
+  // reader can never mistake the requested string for what served the call. Same rule as W2's
+  // three profile outcomes directly above -- do not fold these into one field.
+  const gi = state.generation_identity;
+  const identityDetails = gi
+    ? [
+        `observation=${gi.observation}`,
+        gi.requested_model ? `requested_model=${gi.requested_model}` : undefined,
+        gi.resolved_model ? `resolved_model=${gi.resolved_model}` : undefined,
+        // `unknown`, never the requested or resolved string: an unobservable identity must not be
+        // reported as a served one.
+        `used_model=${gi.observed_model ?? "unknown"}`,
+        // The body is whitespace-delimited fields. A generation id is provider-shaped
+        // (`provider\0responseId`) and can contain whitespace or NUL, which would truncate the
+        // field and silently corrupt every token after it. Print it only when it is field-safe,
+        // otherwise print a digest -- lineage stays referenceable against the bundle, which
+        // carries the id verbatim, and the body stays parseable.
+        ...generationIdFields(gi),
+        // null means "not measured"; only an actual comparison prints true/false.
+        gi.matches_requested === null ? undefined : `identity_matches_requested=${gi.matches_requested}`,
+      ]
+    : [];
   const details = [
     `state=${state.state}`,
     `exit_code=${state.exit_code}`,
@@ -637,6 +687,7 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
     ...policyDetails,
+    ...identityDetails,
     contractTag(state),
     ...economicsDetails,
     ...evidenceDetails,
@@ -1476,6 +1527,13 @@ async function processHandoff(
     const economicsSha = economicsSha256(economicsCanonical);
     extraFiles["economics-summary.json"] = economicsCanonical;
     resultJson.economics_sha256 = economicsSha;
+    // Downstream consumers of the evidence bundle read result.json, not the economics summary.
+    // Carry the identity interface across that boundary rather than making them join two files.
+    resultJson.generation_identity = economicsSummary.generation_identity ?? null;
+    // The task record is the extension seam (task.mjs record() merges caller keys while forcing
+    // `state` unchanged, exactly as the six contract fields are spliced). postFinal reads the
+    // snapshot, so this is what puts the distinction on the terminal bus post.
+    lifecycle.record({ generation_identity: economicsSummary.generation_identity ?? null });
     // Local copy beside the attempt: a box without VINCI_EVIDENCE_URI_PREFIX uploads nothing, and
     // the runs that actually spent must not be the only ones that leave no file behind.
     try {

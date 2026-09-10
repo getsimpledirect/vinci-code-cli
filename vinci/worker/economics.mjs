@@ -70,6 +70,11 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
   const observedModels = new Set();
   const resolvedModels = new Set();
   const seenResponseIds = new Set();
+  // Lineage: the actual generation events this attempt consumed. A model STRING cannot identify
+  // what ran -- two different generations can carry the same string, and a relabelled fallback
+  // carries a string that was never served. The response id names the event itself.
+  const usedGenerationIds = new Set();
+  const observedGenerationIds = new Set();
   let totalCalls = 0;
   let observedCalls = 0;
 
@@ -81,6 +86,8 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
       seenResponseIds.add(entry.responseId);
     }
     if (typeof entry.model_calls === "number" && entry.model_calls > 0) totalCalls += entry.model_calls;
+    const generationId = str(entry.responseId);
+    if (generationId) usedGenerationIds.add(generationId);
     // Prefer the full arrays; a single entry may carry more than one of either. `observed_model`
     // / `resolved_model` remain as the singular convenience fields and are only consulted when the
     // arrays are absent (legacy entries written before this shape existed).
@@ -94,6 +101,7 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
     else { const observed = str(entry.observed_model); if (observed) observedHere.push(observed); }
     if (observedHere.length > 0) {
       for (const m of observedHere) observedModels.add(m);
+      if (generationId) observedGenerationIds.add(generationId);
       const n = typeof entry.observed_model_calls === "number" ? entry.observed_model_calls : 0;
       observedCalls += n > 0 ? n : observedHere.length;
     }
@@ -112,8 +120,23 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
   if (observation === "observed" && requestedModel !== null) matchesRequested = observedModel === requestedModel;
   else if (observation === "conflict") matchesRequested = false;
 
+  const usedIds = [...usedGenerationIds].sort();
+  const observedIds = [...observedGenerationIds].sort();
   return {
     observation,
+    // Carried here as well as in `route.initial_*` so a consumer reads ONE object and gets the
+    // whole chain; a consumer that has to join two places to tell requested from served is a
+    // consumer that will eventually print the wrong one.
+    requested_provider: requestedProvider,
+    requested_model: requestedModel,
+    // What was actually consumed. `used_generation_id` is filled only when the attempt consumed
+    // exactly one generation; otherwise the caller must read the list rather than be handed a
+    // single id that silently stands for several.
+    used_generation_id: usedIds.length === 1 ? usedIds[0] : null,
+    used_generation_ids: usedIds,
+    // The subset whose served identity was machine-observed. `used_model` is the served model of
+    // record: it is `observed_model` or nothing, never the requested or resolved string.
+    observed_generation_ids: observedIds,
     // The middle term. Present whenever any call ran, and deliberately NOT compared against
     // `observed_model` to produce a verdict here -- a consumer that wants drift reads all three.
     resolved_model: resolvedSorted.length === 1 ? resolvedSorted[0] : null,
@@ -384,6 +407,11 @@ export function buildEconomicsSummary(input = {}) {
         observed_models: [],
         resolved_model: null,
         resolved_models: [],
+        requested_provider: null,
+        requested_model: null,
+        used_generation_id: null,
+        used_generation_ids: [],
+        observed_generation_ids: [],
         observation_source: null,
         model_calls: 0,
         observed_model_calls: 0,

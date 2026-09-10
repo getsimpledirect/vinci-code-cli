@@ -16,8 +16,9 @@
 // one, so an implementation that echoes the request back cannot pass.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { spawn, execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
@@ -28,10 +29,11 @@ const TOOLS = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "worker-
 const REQUESTED_MODEL = "requested/model-A";
 const RESOLVED_MODEL = "resolved/model-B";
 const OBSERVED_MODEL = "observed/model-C";
+const FALLBACK_MODEL = "fallback/provider-default-D";
 
 // A session the fixture `vinci` binary appends: one outcome plus one usage entry whose observed id
 // is neither the requested id nor the resolved id.
-function sessionFixture({ observed }) {
+function sessionFixture({ observed, resolved = RESOLVED_MODEL }) {
   const usageBlock = (models, observedModels) => ({
     modelCalls: 1,
     inputTokens: 10,
@@ -43,10 +45,10 @@ function sessionFixture({ observed }) {
     providers: ["openrouter"],
     models,
     observedModels,
-    resolvedModels: [RESOLVED_MODEL],
+    resolvedModels: [resolved],
     observedModelCalls: observedModels.length > 0 ? 1 : 0,
   });
-  const collapsed = [observed ?? RESOLVED_MODEL];
+  const collapsed = [observed ?? resolved];
   const observedModels = observed ? [observed] : [];
   const outcome = {
     type: "custom",
@@ -74,13 +76,32 @@ function sessionFixture({ observed }) {
   return [JSON.stringify(outcome), JSON.stringify(usage)].join("\n") + "\n";
 }
 
-async function runWorker({ observed, taskId, name, workerId }) {
+function uploadedResultJson(fixture) {
+  const awsCalls = join(fixture.tempDir, "aws-calls.txt");
+  if (!existsSync(awsCalls)) return null;
+  const calls = readFileSync(awsCalls, "utf8")
+    .split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line));
+  if (calls.length === 0) return null;
+  const tarPath = calls[0].argv[3];
+  const out = mkdtempSync(join(tmpdir(), "gi-bundle-"));
+  try {
+    const tar = spawnSync("tar", ["xzf", tarPath, "-C", out], { encoding: "utf8" });
+    if (tar.status !== 0) return null;
+    return JSON.parse(readFileSync(join(out, "result.json"), "utf8"));
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+}
+
+async function runWorker({ observed, resolved, taskId, name, workerId, evidence }) {
   const fixture = new WorkerTestFixture(name);
   try {
     fixture.createRepo("test", "repo");
     fixture.linkTools(TOOLS);
     const sessionPath = join(fixture.tempDir, `session-${taskId}.jsonl`);
-    writeFileSync(sessionPath, sessionFixture({ observed }));
+    writeFileSync(sessionPath, sessionFixture({ observed, resolved }));
 
     await fixture.startBus([
       {
@@ -89,7 +110,7 @@ async function runWorker({ observed, taskId, name, workerId }) {
         to_agent: `worker:${workerId}`,
         subject: "generation identity",
         // The REQUESTED pair enters the system here and nowhere else.
-        body: `repo: test/repo\nprovider: openrouter\nmodel: ${REQUESTED_MODEL}\nevidence: none\nbudget_usd: 20\nref: job_gi${taskId}\n\nDo the task`,
+        body: `repo: test/repo\nprovider: openrouter\nmodel: ${REQUESTED_MODEL}\nevidence: ${evidence ?? "none"}\nbudget_usd: 20\nref: job_gi${taskId}\n\nDo the task`,
         ts: "2026-09-10T10:00:00Z",
         posted_by: "scheduler",
       },
@@ -109,7 +130,15 @@ async function runWorker({ observed, taskId, name, workerId }) {
         fixture.tempDir,
       ],
       {
-        env: fixture.getEnv({ FAKE_VINCI_USAGE: "1", FAKE_VINCI_SESSION_FIXTURE: sessionPath }),
+        env: fixture.getEnv({
+          FAKE_VINCI_USAGE: "1",
+          FAKE_VINCI_SESSION_FIXTURE: sessionPath,
+          // Without a prefix uploadEvidence returns before building a bundle, so result.json --
+          // the artifact the downstream consumer reads -- would never exist.
+          VINCI_EVIDENCE_URI_PREFIX: "s3://bucket/vinci-evidence/",
+          // The fake `aws` only records when told where to.
+          FAKE_AWS_RECORD: join(fixture.tempDir, "aws-calls.txt"),
+        }),
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -128,7 +157,13 @@ async function runWorker({ observed, taskId, name, workerId }) {
       `no economics summary anywhere under ${fixture.tempDir}\n${stderr.slice(-1500)}`);
     const file = found[0];
     const raw = readFileSync(file, "utf8");
-    return { summary: JSON.parse(raw), raw, posts: fixture.getPostedMessages() };
+    const taskFile = join(fixture.tempDir, "tasks", `${taskId}.json`);
+    const task = existsSync(taskFile) ? JSON.parse(readFileSync(taskFile, "utf8")) : null;
+    // The fake `aws` records `s3 cp --no-progress <bundle.tgz> <uri>`. Read result.json back out of
+    // the tarball the worker ACTUALLY handed the uploader -- that is the artifact a downstream
+    // consumer of the evidence bundle receives, not a local copy we arranged for the test.
+    const result = uploadedResultJson(fixture);
+    return { summary: JSON.parse(raw), raw, task, result, posts: fixture.getPostedMessages() };
   } finally {
     fixture.cleanup?.();
   }
@@ -217,6 +252,133 @@ await check("an unobserved run stays unknown on the artifact", async () => {
     Array.isArray(summary.usage) && summary.usage.length > 0,
     "no usage rows: this would be a vacuous pass, since a run with no calls trivially observes nothing",
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+// DOWNSTREAM CONSUMER. Producing the field is not the deliverable -- something has to READ it and
+// carry the distinction into what it emits. Two real downstream surfaces do:
+//   * the terminal bus post, which a scheduler/human reads without opening the bundle
+//   * result.json inside the evidence bundle
+// Both must show `used_model` as a machine observation or as `unknown`, and must never print the
+// requested or resolved string in that slot.
+// ---------------------------------------------------------------------------------------------
+await check("a downstream consumer preserves the distinction in emitted evidence", async () => {
+  const { result, posts } = await runWorker({
+    observed: OBSERVED_MODEL,
+    taskId: "93",
+    name: "gen-identity-downstream",
+    workerId: "w4",
+  });
+
+  // Consumer 1: the evidence bundle's result.json.
+  assert.ok(result, "no result.json in the evidence bundle");
+  const ri = result.generation_identity;
+  assert.ok(ri, "result.json does not carry the identity interface -- the consumer dropped the field");
+  assert.equal(ri.requested_model, REQUESTED_MODEL, "requested lost crossing into result.json");
+  assert.equal(ri.resolved_model, RESOLVED_MODEL, "resolved lost crossing into result.json");
+  assert.equal(ri.observed_model, OBSERVED_MODEL, "observed lost crossing into result.json");
+  assert.equal(new Set([ri.requested_model, ri.resolved_model, ri.observed_model]).size, 3,
+    "the consumer collapsed the three identities");
+
+  // Lineage: bound to the generation event, not to a model string.
+  assert.ok(ri.used_generation_id || ri.used_generation_ids?.length > 0,
+    "no generation id: the lineage references only a model string");
+  assert.deepEqual(ri.observed_generation_ids, [ri.used_generation_id],
+    "the observed identity is not bound to the generation event it came from");
+
+  // Consumer 2: the terminal bus post, read as fields.
+  const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
+  assert.ok(terminal, "no terminal post carries used_model= -- the distinction never reached the bus");
+  const fields = Object.fromEntries(
+    terminal.body.split(/\s+/).filter((t) => t.includes("=")).map((t) => {
+      const i = t.indexOf("=");
+      return [t.slice(0, i), t.slice(i + 1)];
+    }),
+  );
+  assert.equal(fields.used_model, OBSERVED_MODEL, "the post reports a used_model that was not observed");
+  assert.equal(fields.observation, "observed");
+  assert.equal(fields.requested_model, REQUESTED_MODEL);
+  assert.equal(fields.identity_matches_requested, "false");
+  // A real generation id is `provider\0responseId` and is not field-safe, so the post carries a
+  // digest of it rather than truncating the body. The binding must still be checkable: the digest
+  // has to be the digest OF the id the bundle carries verbatim.
+  const safe = /^[A-Za-z0-9._:@+-]+$/.test(ri.used_generation_id);
+  if (safe) {
+    assert.equal(fields.used_generation_id, ri.used_generation_id,
+      "the post's lineage id disagrees with the bundle's");
+  } else {
+    const expected = createHash("sha256").update(ri.used_generation_id).digest("hex").slice(0, 12);
+    assert.equal(fields.used_generation_id_sha256, expected,
+      "the post's lineage digest does not bind to the generation id in the bundle");
+    assert.equal(fields.used_generation_id, undefined,
+      "an unsafe generation id was printed raw and truncated the field list");
+    // And the truncation this guards against did not happen: fields after it survived.
+    assert.equal(fields.observation, "observed", "the field list was corrupted by the id");
+  }
+});
+
+await check("a downstream consumer reports unknown, not the requested model", async () => {
+  const { result, posts } = await runWorker({
+    observed: null,
+    taskId: "94",
+    name: "gen-identity-downstream-unknown",
+    workerId: "w5",
+  });
+
+  const ri = result?.generation_identity;
+  assert.ok(ri, "result.json does not carry the identity interface");
+  // Control precondition: both wrong answers are present in the very object the consumer reads.
+  assert.equal(ri.requested_model, REQUESTED_MODEL, "precondition: requested present and copyable");
+  assert.equal(ri.resolved_model, RESOLVED_MODEL, "precondition: resolved present and copyable");
+  assert.equal(ri.observed_model, null, "the consumer back-filled an unobservable identity");
+
+  const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
+  assert.ok(terminal, "no terminal post carries used_model=");
+  const fields = Object.fromEntries(
+    terminal.body.split(/\s+/).filter((t) => t.includes("=")).map((t) => {
+      const i = t.indexOf("=");
+      return [t.slice(0, i), t.slice(i + 1)];
+    }),
+  );
+  assert.equal(fields.used_model, "unknown", `the post printed used_model=${fields.used_model} for an unobserved run`);
+  assert.notEqual(fields.used_model, REQUESTED_MODEL, "the requested string was printed as the served model");
+  assert.notEqual(fields.used_model, RESOLVED_MODEL, "the resolved string was printed as the served model");
+  assert.equal(fields.observation, "unavailable");
+  // Not measured, so nothing is claimed either way.
+  assert.equal(fields.identity_matches_requested, undefined,
+    "an unmeasured comparison was printed as a match verdict");
+});
+
+// ---------------------------------------------------------------------------------------------
+// FALLBACK. `buildFallbackModel` returns the provider default's ENTIRE configuration with only
+// `id`/`name` overwritten by the requested string -- a different model wearing the right name. The
+// interface must show the fallback for what it is and must never relabel it as the requested model.
+// ---------------------------------------------------------------------------------------------
+await check("a fallback is not relabelled as the requested model", async () => {
+  // The fallback case as it reaches this layer: the resolver produced a DIFFERENT model
+  // (FALLBACK_MODEL) while the caller asked for REQUESTED_MODEL, and the provider confirmed the
+  // fallback on the wire.
+  const { summary, result, posts } = await runWorker({
+    observed: FALLBACK_MODEL,
+    resolved: FALLBACK_MODEL,
+    taskId: "95",
+    name: "gen-identity-fallback",
+    workerId: "w3",
+  });
+
+  const gi = summary.generation_identity;
+  assert.equal(gi.requested_model, REQUESTED_MODEL, "the request was lost");
+  assert.equal(gi.observed_model, FALLBACK_MODEL, "the fallback was not reported as what served the call");
+  assert.notEqual(gi.observed_model, REQUESTED_MODEL, "the fallback was relabelled as the requested model");
+  assert.equal(gi.matches_requested, false, "a fallback must not read as a match for the request");
+
+  assert.equal(result.generation_identity.observed_model, FALLBACK_MODEL);
+  const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
+  assert.ok(terminal);
+  assert.ok(terminal.body.includes(`used_model=${FALLBACK_MODEL}`),
+    "the terminal post did not name the fallback as the served model");
+  assert.ok(terminal.body.includes("identity_matches_requested=false"),
+    "a fallback was posted as matching the request");
 });
 
 console.log(results.join("\n"));
