@@ -163,7 +163,10 @@ export function addVinciAccumulatedUsage(
   target.resolvedModels = [
     ...new Set([...(target.resolvedModels ?? []), ...(addition.resolvedModels ?? []).filter(Boolean)]),
   ].sort();
-  target.observedModelCalls += finite(addition.observedModelCalls);
+  // `finite(target...)` rather than `+=`: this adder is also called with objects assembled
+  // elsewhere (combinedTaskUsage in task-outcome.ts) which may predate these fields. `undefined += n`
+  // is NaN, and NaN then travels as a plausible-looking number instead of failing.
+  target.observedModelCalls = finite(target.observedModelCalls) + finite(addition.observedModelCalls);
   return target;
 }
 

@@ -13,10 +13,20 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createJiti } from "jiti/static";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const here = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(here, "..", "..");
+// Same loader the other extension tests use, so these cases execute the REAL TypeScript module
+// rather than a re-implementation of it.
+const loader = createJiti(import.meta.url, {
+  alias: { "@earendil-works/pi-agent-core": resolve(here, "../../packages/agent/src/index.ts") },
+  moduleCache: false,
+  tryNative: false,
+});
+const taskOutcome = await loader.import(resolve(here, "../extensions/lib/task-outcome.ts"), { default: false });
 const { readSessionState } = await import(join(ROOT, "vinci/worker/session-read.mjs"));
 const { buildEconomicsSummary } = await import(join(ROOT, "vinci/worker/economics.mjs"));
 
@@ -209,6 +219,97 @@ check("conflicting observations within one attempt report conflict", () => {
   assert.equal(gi.observed_model, null, "a conflict must not resolve to one of the conflicting values");
   assert.deepEqual(gi.observed_models, ["model-C", "model-D"]);
   assert.equal(gi.matches_requested, false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// CASE 6 -- the SECOND consumer. `task-outcome.ts` rolls the same messages up independently for the
+// receipt, and had its own copy of the `responseModel ?? message.model` collapse. A mutation that
+// back-filled observed from resolved HERE survived every case above, so this control exists because
+// the mutation battery found the gap, not because the shape looked untested.
+// ---------------------------------------------------------------------------------------------
+const assistantMessage = ({ model, responseModel, responseId }) => ({
+  role: "assistant",
+  provider: "openrouter",
+  model,
+  ...(responseModel ? { responseModel } : {}),
+  responseId,
+  stopReason: "stop",
+  timestamp: 1,
+  usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: { total: 0.001 } },
+});
+
+check("task-outcome rollup keeps observed and resolved separate", () => {
+  const drifted = taskOutcome.summarizeVinciTaskUsage([
+    assistantMessage({ model: "model-B", responseModel: "model-C", responseId: "d1" }),
+  ]);
+  assert.deepEqual(drifted.observedModels, ["model-C"], "observed id lost in the receipt rollup");
+  assert.deepEqual(drifted.resolvedModels, ["model-B"], "resolved id lost in the receipt rollup");
+  assert.equal(drifted.observedModelCalls, 1);
+});
+
+check("task-outcome rollup does not back-fill an unobserved id", () => {
+  const silent = taskOutcome.summarizeVinciTaskUsage([
+    assistantMessage({ model: "model-B", responseModel: null, responseId: "s1" }),
+  ]);
+  // Control precondition: the wrong answer is present and copyable in the same rollup.
+  assert.deepEqual(silent.resolvedModels, ["model-B"], "precondition: resolved must be present");
+  assert.deepEqual(silent.models, ["model-B"], "precondition: the collapsed field still shows model-B");
+
+  assert.deepEqual(silent.observedModels, [], "unobserved id was back-filled in the receipt rollup");
+  assert.equal(silent.observedModelCalls, 0, "an unobserved call was counted as observed");
+});
+
+check("task-outcome and accumulator agree on a NaN-free count", () => {
+  // The adder is called with objects assembled elsewhere; `undefined += n` silently yields NaN.
+  const combined = taskOutcome.summarizeVinciTaskUsage(
+    [assistantMessage({ model: "model-B", responseModel: "model-C", responseId: "n1" })],
+    "task-nan-check",
+  );
+  assert.equal(Number.isFinite(combined.observedModelCalls), true, "observedModelCalls is not finite (NaN)");
+  assert.equal(Number.isFinite(combined.modelCalls), true);
+});
+
+// ---------------------------------------------------------------------------------------------
+// CASE 7 -- the adder's legacy-object guard. `addVinciAccumulatedUsage` is called with objects
+// assembled by other modules; one of them predated these fields, and `undefined += n` yields NaN,
+// which then travels as a plausible-looking number rather than failing.
+//
+// This control exists because a mutation restoring the `+=` form survived every other case: the
+// reachable NaN had already been closed by giving VinciTaskUsage the field, leaving the guard
+// itself unfalsifiable. Rather than keep an untested guard, exercise the exact shape it defends.
+// ---------------------------------------------------------------------------------------------
+const usageAccumulator = await loader.import(
+  resolve(here, "../extensions/lib/usage-accumulator.ts"),
+  { default: false },
+);
+
+check("adder tolerates a legacy target with no observed fields", () => {
+  // A target shaped the way callers built it before these fields existed.
+  const legacyTarget = {
+    modelCalls: 1,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    estimatedCostUsd: 0,
+    providers: [],
+    models: [],
+  };
+  const addition = {
+    ...usageAccumulator.emptyVinciAccumulatedUsage(),
+    modelCalls: 1,
+    observedModels: ["model-C"],
+    observedModelCalls: 1,
+  };
+  const merged = usageAccumulator.addVinciAccumulatedUsage(legacyTarget, addition);
+  assert.equal(
+    Number.isFinite(merged.observedModelCalls),
+    true,
+    `observedModelCalls is ${merged.observedModelCalls} -- a legacy target produced a non-finite count`,
+  );
+  assert.equal(merged.observedModelCalls, 1);
+  assert.deepEqual(merged.observedModels, ["model-C"]);
 });
 
 console.log(results.join("\n"));
