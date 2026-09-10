@@ -129,11 +129,26 @@ function usageEntryToRecord(entry) {
   const modelCalls = numberOrZero(usage.modelCalls);
   const providers = Array.isArray(usage.providers) ? usage.providers.filter((p) => typeof p === "string" && p) : [];
   const models = Array.isArray(usage.models) ? usage.models.filter((m) => typeof m === "string" && m) : [];
+  // Machine-observed served identity, carried separately from `models` because `models` falls back
+  // to the REQUESTED id when the provider reported nothing. Absent/legacy entries yield [], which
+  // reads as "unknown", never as agreement.
+  const observedModels = Array.isArray(usage.observedModels)
+    ? usage.observedModels.filter((m) => typeof m === "string" && m)
+    : [];
+  const observedModelCalls = numberOrZero(usage.observedModelCalls);
+  const resolvedModels = Array.isArray(usage.resolvedModels)
+    ? usage.resolvedModels.filter((m) => typeof m === "string" && m)
+    : [];
   const costUsd = numberOrZero(usage.estimatedCostUsd);
   const responseId = typeof entry?.data?.responseKey === "string" && entry.data.responseKey ? entry.data.responseKey : null;
   return {
     provider: providers[0] ?? null,
     model: models[0] ?? null,
+    // null means the provider did not report a served model for this call. It must never be
+    // back-filled from `model` above -- that is the substitution this field exists to prevent.
+    observed_model: observedModels[0] ?? null,
+    resolved_model: resolvedModels[0] ?? null,
+    observed_model_calls: observedModelCalls,
     model_calls: modelCalls,
     input_tokens: numberOrZero(usage.inputTokens),
     cached_read_tokens: numberOrZero(usage.cachedTokens),

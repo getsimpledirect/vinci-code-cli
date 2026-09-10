@@ -483,6 +483,11 @@ async function emitEconomics({
       task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt || attempt },
       workOrderId: contractFields?.work_order_id ?? envelopeToUse?.ref ?? null,
       attemptLabel: `${taskId}/${attempt.attempt || attempt}`,
+      // The REQUESTED pair, straight off the envelope the daemon spawned `vinci -p` with. Requested
+      // only -- what actually served the call is observed separately and must never be back-filled
+      // from these two.
+      requestedProvider: envelopeToUse?.provider ?? null,
+      requestedModel: envelopeToUse?.model ?? null,
       lease: lease || null,
       sessionState: session,
       sessionId,
@@ -1420,6 +1425,8 @@ async function processHandoff(
       // A governed handoff has no envelope.ref; its id is the contract's work_order_id.
       workOrderId: contractFields?.work_order_id ?? envelopeToUse.ref ?? null,
       attemptLabel: `${taskId}/${attempt.attempt}`,
+      requestedProvider: envelopeToUse?.provider ?? null,
+      requestedModel: envelopeToUse?.model ?? null,
       lease: lease || null,
       sessionState: session,
       usageEntries: session.usageEntries || [],

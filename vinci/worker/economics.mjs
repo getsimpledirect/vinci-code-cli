@@ -50,6 +50,77 @@ function str(value) {
   return typeof value === "string" && value.length <= 512 ? value : null;
 }
 
+// Machine-observed generation identity for this attempt.
+//
+// The contract, and the reason this is not a boolean: a run whose served model is UNKNOWN must stay
+// distinguishable from one where the served model was observed to equal what we asked for. Three
+// distinct states, never two:
+//
+//   observation: "unavailable"  no call reported a served id -> `observed_model` is null and
+//                               `matches_requested` is null. NOT evidence of agreement.
+//   observation: "observed"     >=1 call reported a served id and all reports agree.
+//   observation: "conflict"     calls reported DIFFERENT served ids within one attempt.
+//
+// `observed_model` is only ever a value the provider itself put on the wire. It is never derived
+// from the requested or resolved id -- that substitution is the defect this exists to make visible
+// (`buildFallbackModel` returns another model's entire configuration relabelled with the requested
+// id, so every identity keyed on `model.id` reports the request back as though it were an
+// observation).
+function observeGeneration(entries, requestedProvider, requestedModel) {
+  const observedModels = new Set();
+  const resolvedModels = new Set();
+  const seenResponseIds = new Set();
+  let totalCalls = 0;
+  let observedCalls = 0;
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    // Same dedup rule as the cost rollup: one provider response counted once.
+    if (typeof entry.responseId === "string" && entry.responseId) {
+      if (seenResponseIds.has(entry.responseId)) continue;
+      seenResponseIds.add(entry.responseId);
+    }
+    if (typeof entry.model_calls === "number" && entry.model_calls > 0) totalCalls += entry.model_calls;
+    const resolved = str(entry.resolved_model);
+    if (resolved) resolvedModels.add(resolved);
+    const observed = str(entry.observed_model);
+    if (observed) {
+      observedModels.add(observed);
+      const n = typeof entry.observed_model_calls === "number" ? entry.observed_model_calls : 0;
+      observedCalls += n > 0 ? n : 1;
+    }
+  }
+
+  const sorted = [...observedModels].sort();
+  const resolvedSorted = [...resolvedModels].sort();
+  let observation = "unavailable";
+  if (sorted.length === 1) observation = "observed";
+  else if (sorted.length > 1) observation = "conflict";
+
+  const observedModel = sorted.length === 1 ? sorted[0] : null;
+  // null, not false: with no observation there is nothing to compare, and reporting `false` here
+  // would assert a mismatch we never measured.
+  let matchesRequested = null;
+  if (observation === "observed" && requestedModel !== null) matchesRequested = observedModel === requestedModel;
+  else if (observation === "conflict") matchesRequested = false;
+
+  return {
+    observation,
+    // The middle term. Present whenever any call ran, and deliberately NOT compared against
+    // `observed_model` to produce a verdict here -- a consumer that wants drift reads all three.
+    resolved_model: resolvedSorted.length === 1 ? resolvedSorted[0] : null,
+    resolved_models: resolvedSorted,
+    observed_provider: observation === "unavailable" ? null : requestedProvider,
+    observed_model: observedModel,
+    observed_models: sorted,
+    observation_source: observation === "unavailable" ? null : "response-stream",
+    model_calls: totalCalls,
+    observed_model_calls: observedCalls,
+    unobserved_model_calls: Math.max(0, totalCalls - observedCalls),
+    matches_requested: matchesRequested,
+  };
+}
+
 function rollupUsage(entries, flags) {
   const rollup = new Map();
   // One provider response is one response regardless of which (provider, model) row it lands in.
@@ -254,7 +325,18 @@ export function buildEconomicsSummary(input = {}) {
     summary.finished_at = finishedAt;
     if (work !== null) summary.work = work;
     if (usage.length > 0) summary.usage = usage;
-    summary.route = { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] };
+    // Milestone 2: the REQUESTED pair. `usage[].provider/model` stays the (collapsed) observed-or-
+    // requested pair it already was; these two slots were in the schema and null on every path, so
+    // requested-vs-observed was not computable from this artifact at all.
+    const requestedProvider = str(input.requestedProvider);
+    const requestedModel = str(input.requestedModel);
+    summary.route = {
+      policy_id: "none",
+      initial_provider: requestedProvider,
+      initial_model: requestedModel,
+      escalations: [],
+    };
+    summary.generation_identity = observeGeneration(usageArray, requestedProvider, requestedModel);
     summary.assets_consumed = [];
     summary.compactions = 0;
     summary.human_interventions = [];
@@ -285,6 +367,21 @@ export function buildEconomicsSummary(input = {}) {
       started_at: null,
       finished_at: null,
       route: { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] },
+      // The builder threw. Nothing here was observed, and the field is emitted rather than omitted
+      // so a consumer never has to infer meaning from its absence.
+      generation_identity: {
+        observation: "unavailable",
+        observed_provider: null,
+        observed_model: null,
+        observed_models: [],
+        resolved_model: null,
+        resolved_models: [],
+        observation_source: null,
+        model_calls: 0,
+        observed_model_calls: 0,
+        unobserved_model_calls: 0,
+        matches_requested: null,
+      },
       assets_consumed: [],
       compactions: 0,
       human_interventions: [],
