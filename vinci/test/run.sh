@@ -304,6 +304,21 @@ if [ "${containment_broker_test_count}" -eq 0 ]; then
   exit 1
 fi
 run_group containment-broker node --test "${ROOT}"/vinci/containment-broker/test/*.test.mjs
+
+# Worker unit tests (vinci/worker/test/*.test.mjs). Registered because they were NOT: the
+# economics emitter's tests shipped in PR #49, passed locally, and were never executed by any
+# CI job — an inert guard, the exact shape the byok note above records. Zero matches is a
+# failure, not a pass, so deleting the directory cannot read as green.
+worker_unit_test_count=0
+for worker_unit_test in "${ROOT}"/vinci/worker/test/*.test.mjs; do
+  [ -e "${worker_unit_test}" ] || continue
+  worker_unit_test_count=$((worker_unit_test_count + 1))
+done
+if [ "${worker_unit_test_count}" -eq 0 ]; then
+  echo "run.sh: no worker unit tests found under vinci/worker/test/*.test.mjs" >&2
+  exit 1
+fi
+run_group worker-unit node --test "${ROOT}"/vinci/worker/test/*.test.mjs
 # Print-mode liveness: every prompt gets a fresh idle watchdog, all session activity resets it,
 # tool execution suspends it, invalid timeout configuration falls back safely, and cleanup cancels it.
 run_group print-mode-liveness node --experimental-strip-types --input-type=module --eval '
