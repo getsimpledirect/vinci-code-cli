@@ -146,8 +146,14 @@ function usageEntryToRecord(entry) {
     model: models[0] ?? null,
     // null means the provider did not report a served model for this call. It must never be
     // back-filled from `model` above -- that is the substitution this field exists to prevent.
-    observed_model: observedModels[0] ?? null,
-    resolved_model: resolvedModels[0] ?? null,
+    // The FULL sets, not [0]. One persisted entry can aggregate sub-calls served by different
+    // models (crew/helper rollups go through the same recordVinciTaskUsage path), and collapsing
+    // to the first silently credits every call in the entry to one identity and reports a
+    // confident "observed" for what is actually a disagreement.
+    observed_model: observedModels.length === 1 ? observedModels[0] : null,
+    observed_models: observedModels,
+    resolved_model: resolvedModels.length === 1 ? resolvedModels[0] : null,
+    resolved_models: resolvedModels,
     observed_model_calls: observedModelCalls,
     model_calls: modelCalls,
     input_tokens: numberOrZero(usage.inputTokens),

@@ -312,6 +312,58 @@ check("adder tolerates a legacy target with no observed fields", () => {
   assert.deepEqual(merged.observedModels, ["model-C"]);
 });
 
+// ---------------------------------------------------------------------------------------------
+// CASE 8 (F3) -- ONE persisted entry carrying TWO distinct observed ids. Crew/helper rollups go
+// through the same recordVinciTaskUsage path and legitimately produce this. Taking [0] reported a
+// confident `observed` for what is actually a disagreement, and credited both calls to one id.
+// Found by an independent reviewer against unmutated code, not by a mutation.
+// ---------------------------------------------------------------------------------------------
+check("two observed ids inside ONE entry is a conflict, not a silent pick-first", () => {
+  const entry = usageEntry({ responseKey: "agg1", provider: "openrouter", resolved: "model-B", observed: "model-C" });
+  // Exactly the aggregate shape: one entry, two sub-calls, two different served ids.
+  entry.data.usage.observedModels = ["model-C", "model-D"];
+  entry.data.usage.observedModelCalls = 2;
+  entry.data.usage.modelCalls = 2;
+  const summary = summaryFor([entry], { requestedProvider: "openrouter", requestedModel: "model-A" });
+  const gi = summary.generation_identity;
+  assert.equal(gi.observation, "conflict", `two served ids in one entry reported as ${gi.observation}`);
+  assert.equal(gi.observed_model, null, "a conflict resolved to one of the conflicting values");
+  assert.deepEqual(gi.observed_models, ["model-C", "model-D"], "the second observed id was dropped");
+});
+
+// ---------------------------------------------------------------------------------------------
+// CASE 9 (F2) -- the WIRE BOUNDARY itself. Every case above hand-builds the already-split
+// observedModels/resolvedModels fields, so none of them reaches `usageFromResponse`, which is the
+// function that actually performs the split. A mutation reverting it to `responseModel || model`
+// survived the whole suite. Drive the real function with a real response object instead.
+// ---------------------------------------------------------------------------------------------
+check("the wire boundary splits observed from resolved (usageFromResponse)", () => {
+  const drift = usageAccumulator.vinciUsageFromResponse({
+    provider: "openrouter",
+    model: "model-B",
+    responseModel: "model-C",
+    responseId: "w1",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: { total: 0.001 } },
+  });
+  assert.deepEqual(drift.observedModels, ["model-C"], "wire boundary lost the observed id");
+  assert.deepEqual(drift.resolvedModels, ["model-B"], "wire boundary lost the resolved id");
+  assert.equal(drift.observedModelCalls, 1);
+
+  const silent = usageAccumulator.vinciUsageFromResponse({
+    provider: "openrouter",
+    model: "model-B",
+    // no responseModel: the provider reported nothing
+    responseId: "w2",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: { total: 0.001 } },
+  });
+  // Control precondition: the wrong answer is present and copyable at this exact boundary.
+  assert.deepEqual(silent.resolvedModels, ["model-B"], "precondition: resolved present at the boundary");
+  assert.deepEqual(silent.models, ["model-B"], "precondition: the collapsed field still shows model-B");
+
+  assert.deepEqual(silent.observedModels, [], "wire boundary back-filled observed from resolved");
+  assert.equal(silent.observedModelCalls, 0, "an unobserved call was counted as observed at the boundary");
+});
+
 console.log(results.join("\n"));
 if (process.exitCode === 1) {
   console.error("worker-generation-identity: FAILURES above");

@@ -180,6 +180,16 @@ export function vinciResponseKey(response: ModelResponseLike): string | undefine
   return responseKey(response);
 }
 
+/**
+ * The wire boundary, exported for tests. This is where a provider response is split into what the
+ * provider actually reported (`observedModels`) and what the resolver chose (`resolvedModels`); a
+ * regression here re-fuses the two and is invisible to every test that starts from the already-split
+ * persisted shape.
+ */
+export function vinciUsageFromResponse(response: ModelResponseLike): VinciAccumulatedUsage {
+  return usageFromResponse(response);
+}
+
 function usageFromResponse(response: ModelResponseLike): VinciAccumulatedUsage {
   const provider = typeof response.provider === "string" && response.provider ? [response.provider] : [];
   // The ONLY machine observation of served identity available on this path. Upstream sets

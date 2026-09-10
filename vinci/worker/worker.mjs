@@ -539,6 +539,22 @@ async function emitEconomics({
       work_order_id: contractFields?.work_order_id ?? envelopeToUse?.ref ?? null,
       attempt_label: `${taskId}/${attempt?.attempt ?? attempt ?? 0}`,
       route: { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] },
+      // Emitted, not omitted. This is the outer crash path -- if the builder or the canonicaliser
+      // throws, the artifact still carries the field, so a consumer never has to read meaning into
+      // its absence. Nothing was observed here, and that is exactly what it says.
+      generation_identity: {
+        observation: "unavailable",
+        resolved_model: null,
+        resolved_models: [],
+        observed_provider: null,
+        observed_model: null,
+        observed_models: [],
+        observation_source: null,
+        model_calls: 0,
+        observed_model_calls: 0,
+        unobserved_model_calls: 0,
+        matches_requested: null,
+      },
       assets_consumed: [],
       compactions: 0,
       human_interventions: [],

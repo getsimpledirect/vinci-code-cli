@@ -81,13 +81,21 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
       seenResponseIds.add(entry.responseId);
     }
     if (typeof entry.model_calls === "number" && entry.model_calls > 0) totalCalls += entry.model_calls;
-    const resolved = str(entry.resolved_model);
-    if (resolved) resolvedModels.add(resolved);
-    const observed = str(entry.observed_model);
-    if (observed) {
-      observedModels.add(observed);
+    // Prefer the full arrays; a single entry may carry more than one of either. `observed_model`
+    // / `resolved_model` remain as the singular convenience fields and are only consulted when the
+    // arrays are absent (legacy entries written before this shape existed).
+    const resolvedList = Array.isArray(entry.resolved_models) ? entry.resolved_models : [];
+    if (resolvedList.length > 0) for (const m of resolvedList) { if (str(m)) resolvedModels.add(m); }
+    else { const resolved = str(entry.resolved_model); if (resolved) resolvedModels.add(resolved); }
+
+    const observedList = Array.isArray(entry.observed_models) ? entry.observed_models : [];
+    const observedHere = [];
+    if (observedList.length > 0) { for (const m of observedList) { if (str(m)) observedHere.push(m); } }
+    else { const observed = str(entry.observed_model); if (observed) observedHere.push(observed); }
+    if (observedHere.length > 0) {
+      for (const m of observedHere) observedModels.add(m);
       const n = typeof entry.observed_model_calls === "number" ? entry.observed_model_calls : 0;
-      observedCalls += n > 0 ? n : 1;
+      observedCalls += n > 0 ? n : observedHere.length;
     }
   }
 
