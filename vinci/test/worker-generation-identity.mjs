@@ -394,11 +394,18 @@ check("two generations in one attempt are both carried, never collapsed to one",
 });
 
 // ---------------------------------------------------------------------------------------------
-// CASE 11 (F2) -- each arm of the `generationOccurred` disjunction, exercised ALONE.
+// CASE 11 (F2) -- Economics-level fixtures that isolate the two partial-usage shapes independently.
 //
 // The gate is `(model_calls > 0) || (used_generation_ids.length > 0)`. A review deleted each arm
 // independently and the suite stayed green both times, because every fixture produced the two
-// together. These two cases separate them, so a silent break in either arm is visible.
+// together. These two cases separate them at the economics level, so a silent break in either arm
+// is visible downstream.
+//
+// Note: this test file proves behavior at the fixture level (the two partial-usage shapes are
+// distinguishable) and at the economics level (buildEconomicsSummary handles them correctly). The
+// `generationOccurred` branch itself lives in worker.mjs and is not directly exercised here — the
+// fixture exercises the implications of it at the economics layer and downstream consumers make
+// the resulting behavior observable. This case is not a direct unit test of the gate.
 // ---------------------------------------------------------------------------------------------
 check("a generation id with no counted calls still counts as a generation", () => {
   // A partial/malformed usage record: the response key survived, the call count did not.
