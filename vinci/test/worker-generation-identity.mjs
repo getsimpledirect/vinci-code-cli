@@ -36,7 +36,7 @@ const SESSION_ID = "sess-gen-identity";
 // `models` is the COLLAPSED field that already existed (observed-or-resolved), while
 // `observedModels` carries only what the provider reported and `resolvedModels` only what the
 // resolver chose.
-function usageEntry({ responseKey, provider, resolved, observed }) {
+function usageEntry({ responseKey, provider, resolved, observed, modelCalls = 1 }) {
   const models = observed ? [observed] : resolved ? [resolved] : [];
   return {
     type: "custom",
@@ -44,7 +44,7 @@ function usageEntry({ responseKey, provider, resolved, observed }) {
     data: {
       responseKey,
       usage: {
-        modelCalls: 1,
+        modelCalls,
         inputTokens: 10,
         outputTokens: 5,
         cachedTokens: 0,
@@ -362,6 +362,71 @@ check("the wire boundary splits observed from resolved (usageFromResponse)", () 
 
   assert.deepEqual(silent.observedModels, [], "wire boundary back-filled observed from resolved");
   assert.equal(silent.observedModelCalls, 0, "an unobserved call was counted as observed at the boundary");
+});
+
+// ---------------------------------------------------------------------------------------------
+// CASE 10 (F3) -- MORE THAN ONE generation in one attempt. An independent review found this branch
+// had zero coverage: the whole `ids.length > 1` arm could be deleted and every test stayed green,
+// because every fixture drove exactly one responseKey. That arm exists so a multi-generation
+// attempt is never summarised by a single id standing for all of them -- the case the lineage was
+// built for -- so it is the last place that should be dark.
+// ---------------------------------------------------------------------------------------------
+check("two generations in one attempt are both carried, never collapsed to one", () => {
+  const summary = summaryFor(
+    [
+      usageEntry({ responseKey: "openrouter resp-1", provider: "openrouter", resolved: "model-B", observed: "model-C" }),
+      usageEntry({ responseKey: "openrouter resp-2", provider: "openrouter", resolved: "model-B", observed: "model-C" }),
+    ],
+    { requestedProvider: "openrouter", requestedModel: "model-A" },
+  );
+  const gi = summary.generation_identity;
+  assert.equal(gi.used_generation_ids.length, 2, "a second generation was dropped");
+  assert.deepEqual(gi.used_generation_ids, ["openrouter resp-1", "openrouter resp-2"]);
+  // 🔴 The load-bearing assertion: with more than one generation, the singular field must be null.
+  // A non-null value here is one id silently standing for both.
+  assert.equal(gi.used_generation_id, null,
+    `used_generation_id is ${JSON.stringify(gi.used_generation_id)} for a 2-generation attempt -- ` +
+      "one id is standing in for both");
+  assert.equal(gi.observed_generation_ids.length, 2, "an observation lost its generation binding");
+  // Both generations agreed on the served model, so this is still a clean observation, not a conflict.
+  assert.equal(gi.observation, "observed");
+  assert.equal(gi.observed_model, "model-C");
+});
+
+// ---------------------------------------------------------------------------------------------
+// CASE 11 (F2) -- each arm of the `generationOccurred` disjunction, exercised ALONE.
+//
+// The gate is `(model_calls > 0) || (used_generation_ids.length > 0)`. A review deleted each arm
+// independently and the suite stayed green both times, because every fixture produced the two
+// together. These two cases separate them, so a silent break in either arm is visible.
+// ---------------------------------------------------------------------------------------------
+check("a generation id with no counted calls still counts as a generation", () => {
+  // A partial/malformed usage record: the response key survived, the call count did not.
+  const summary = summaryFor(
+    [usageEntry({ responseKey: "openrouter resp-9", provider: "openrouter", resolved: "model-B", observed: null, modelCalls: 0 })],
+    { requestedProvider: "openrouter", requestedModel: "model-A" },
+  );
+  const gi = summary.generation_identity;
+  assert.equal(gi.model_calls, 0, "precondition: this fixture must have NO counted calls");
+  assert.deepEqual(gi.used_generation_ids, ["openrouter resp-9"],
+    "precondition: but it DOES carry a generation id -- otherwise this arm is not isolated");
+  // A generation happened; the count is simply missing. Identity must still be reportable.
+  assert.equal(gi.used_generation_id, "openrouter resp-9");
+});
+
+check("counted calls with no generation id still count as a generation", () => {
+  // The mirror: the call was counted but carried no response key to name it.
+  const summary = summaryFor(
+    [usageEntry({ responseKey: undefined, provider: "openrouter", resolved: "model-B", observed: null })],
+    { requestedProvider: "openrouter", requestedModel: "model-A" },
+  );
+  const gi = summary.generation_identity;
+  assert.equal(gi.model_calls, 1, "precondition: this fixture must have a counted call");
+  assert.deepEqual(gi.used_generation_ids, [],
+    "precondition: and NO generation id -- otherwise this arm is not isolated");
+  // Spend happened with no id to bind it to: that is unknown identity, not absence of a generation.
+  assert.equal(gi.used_generation_id, null);
+  assert.equal(gi.observation, "unavailable");
 });
 
 console.log(results.join("\n"));

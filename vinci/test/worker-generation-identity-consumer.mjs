@@ -36,9 +36,17 @@ const RUNTIME_PROVIDER = "runtime-gateway-Z";
 
 // A session the fixture `vinci` binary appends: one outcome plus one usage entry whose observed id
 // is neither the requested id nor the resolved id.
-function sessionFixture({ observed, resolved = RESOLVED_MODEL, runtimeProvider = RUNTIME_PROVIDER }) {
+function sessionFixture({
+  observed,
+  resolved = RESOLVED_MODEL,
+  runtimeProvider = RUNTIME_PROVIDER,
+  // These two exist so each arm of worker.mjs's `generationOccurred` disjunction can be driven
+  // ALONE. With both always set together, deleting either arm changed nothing observable.
+  modelCalls = 1,
+  responseKey = "openrouter resp-1",
+}) {
   const usageBlock = (models, observedModels) => ({
-    modelCalls: 1,
+    modelCalls,
     inputTokens: 10,
     outputTokens: 5,
     cachedTokens: 0,
@@ -68,15 +76,18 @@ function sessionFixture({ observed, resolved = RESOLVED_MODEL, runtimeProvider =
       recordedAt: "2026-09-10T00:00:00Z",
     },
   };
-  const usage = {
+  // `responseKey` may be a single key, null (no key at all), or an ARRAY -- an array produces one
+  // usage entry per key, which is how a multi-generation attempt is driven.
+  const keys = Array.isArray(responseKey) ? responseKey : [responseKey];
+  const usageEntries = keys.map((key) => ({
     type: "custom",
     customType: "vinci-task-usage",
     data: {
-      responseKey: "openrouter resp-1",
+      ...(key ? { responseKey: key } : {}),
       usage: usageBlock(collapsed, observedModels),
     },
-  };
-  return [JSON.stringify(outcome), JSON.stringify(usage)].join("\n") + "\n";
+  }));
+  return [JSON.stringify(outcome), ...usageEntries.map((e) => JSON.stringify(e))].join("\n") + "\n";
 }
 
 // Read BOTH result.json and session.jsonl out of the one tarball the worker handed the uploader.
@@ -135,13 +146,24 @@ function uploadedResultJson(fixture) {
   }
 }
 
-async function runWorker({ observed, resolved, runtimeProvider, taskId, name, workerId, evidence, env = {} }) {
+async function runWorker({
+  observed,
+  resolved,
+  runtimeProvider,
+  modelCalls,
+  responseKey,
+  taskId,
+  name,
+  workerId,
+  evidence,
+  env = {},
+}) {
   const fixture = new WorkerTestFixture(name);
   try {
     fixture.createRepo("test", "repo");
     fixture.linkTools(TOOLS);
     const sessionPath = join(fixture.tempDir, `session-${taskId}.jsonl`);
-    writeFileSync(sessionPath, sessionFixture({ observed, resolved, runtimeProvider }));
+    writeFileSync(sessionPath, sessionFixture({ observed, resolved, runtimeProvider, modelCalls, responseKey }));
 
     await fixture.startBus([
       {
@@ -636,11 +658,21 @@ for (const [label, extraEnv, evidence] of [
 }
 
 // ---------------------------------------------------------------------------------------------
-// PRE-RUN REFUSAL. No generation happened, so no identity may be asserted -- not even
-// `observation=unavailable`, which would be a claim about evidence for a generation that never
-// occurred. The gate is "did a generation actually happen", not "is the task terminal".
+// PRE-RUN REFUSAL, via the BLOCKER post path.
+//
+// 🔴 READ THE NAME CAREFULLY: this case does NOT exercise the `generationOccurred` gate, and it
+// cannot fail if that gate is removed. A deadline refusal terminates through `blockerPostBody` /
+// `terminalPostBody`, which structurally never carry identity fields at all -- so these assertions
+// hold whether or not the gate exists. An independent review flagged exactly this, and it is
+// correct.
+//
+// It is kept, and relabelled, rather than deleted: it pins a real and different property -- that
+// the blocker path stays free of identity fields as that path evolves -- which nothing else covers.
+// The gate itself is proven by "a postFinal terminal with no generation asserts no identity"
+// below, which drives a branch-lease refusal through `postFinal` and DOES fail when the gate is
+// removed. Do not read this case as the discriminating one.
 // ---------------------------------------------------------------------------------------------
-await check("a pre-run refusal does not invent a generation identity", async () => {
+await check("the blocker post path carries no identity fields (does NOT test the gate)", async () => {
   const fixture = new WorkerTestFixture("gen-identity-prerun");
   try {
     fixture.createRepo("test", "repo");
@@ -755,6 +787,94 @@ await check("a postFinal terminal with no generation asserts no identity", async
   } finally {
     await fixture.cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// EACH ARM OF THE `generationOccurred` GATE, ALONE (worker.mjs).
+//
+// The gate is `(model_calls > 0) || (used_generation_ids.length > 0)`. An independent review
+// deleted each arm on its own and the whole suite stayed green, because every fixture produced the
+// two together -- so neither arm was ever load-bearing in a test. These two cases drive exactly one
+// arm each. Both describe real partial-usage records: a response key whose call count was lost, and
+// a counted call that carried no key to name it. In both, spend happened, so identity must be
+// reported rather than suppressed.
+// ---------------------------------------------------------------------------------------------
+await check("a generation id with zero counted calls still reports identity", async () => {
+  const { summary, posts } = await runWorker({
+    observed: OBSERVED_MODEL,
+    modelCalls: 0,
+    taskId: "208",
+    name: "gen-identity-arm-ids-only",
+    workerId: "w6",
+  });
+  const gi = summary.generation_identity;
+  // Preconditions isolate the arm: no counted calls, but a generation id IS present.
+  assert.equal(gi.model_calls, 0, "precondition: this case must have NO counted calls");
+  assert.ok((gi.used_generation_ids?.length ?? 0) > 0,
+    "precondition: it must still carry a generation id, else the arm is not isolated");
+
+  const terminal = posts.find((m) => typeof m.body === "string" && /state=/.test(m.body));
+  assert.ok(terminal, "no terminal post");
+  assert.ok(terminal.body.includes("used_model="),
+    "identity was suppressed for a run that produced a generation id -- the used_generation_ids arm " +
+      "of the gate is not doing its job");
+});
+
+await check("counted calls with no generation id still report identity", async () => {
+  const { summary, posts } = await runWorker({
+    observed: OBSERVED_MODEL,
+    responseKey: null,
+    taskId: "209",
+    name: "gen-identity-arm-calls-only",
+    workerId: "w7",
+  });
+  const gi = summary.generation_identity;
+  // The mirror precondition: calls counted, but nothing to name them by.
+  assert.ok((gi.model_calls ?? 0) > 0, "precondition: this case must have counted calls");
+  assert.deepEqual(gi.used_generation_ids, [],
+    "precondition: it must carry NO generation id, else the arm is not isolated");
+
+  const terminal = posts.find((m) => typeof m.body === "string" && /state=/.test(m.body));
+  assert.ok(terminal, "no terminal post");
+  assert.ok(terminal.body.includes("used_model="),
+    "identity was suppressed for a run that actually spent -- the model_calls arm of the gate is " +
+      "not doing its job");
+  // Spend with no id to bind it to is unknown lineage, and must be visible as such rather than omitted.
+  assert.ok(!terminal.body.includes("used_generation_id="),
+    "a generation id was asserted for a run that never recorded one");
+});
+
+// ---------------------------------------------------------------------------------------------
+// MULTI-GENERATION ON THE BUS POST. `generationIdFields`'s `ids.length > 1` branch had zero
+// coverage: an independent review deleted it entirely and every test stayed green, because no
+// fixture ever drove more than one generation. That branch exists so a multi-generation attempt is
+// never summarised by one id standing for all of them -- which is the exact case the lineage was
+// built for -- so it must not be the dark corner.
+// ---------------------------------------------------------------------------------------------
+await check("two generations reach the bus post as a count and a digest, not one id", async () => {
+  const { summary, posts } = await runWorker({
+    observed: OBSERVED_MODEL,
+    responseKey: ["openrouter resp-1", "openrouter resp-2"],
+    taskId: "210",
+    name: "gen-identity-multi-generation",
+    workerId: "w8",
+  });
+
+  // Precondition: two generations actually reached the summary, else the post assertions are vacuous.
+  const gi = summary.generation_identity;
+  assert.equal(gi.used_generation_ids.length, 2,
+    `precondition: expected 2 generations, got ${JSON.stringify(gi.used_generation_ids)}`);
+  assert.equal(gi.used_generation_id, null, "the singular field must stay null for a 2-generation attempt");
+
+  const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
+  assert.ok(terminal, "no terminal post carrying identity");
+  assert.ok(terminal.body.includes("used_generation_count=2"),
+    `the post did not report the generation COUNT: ${terminal.body.slice(0, 220)}`);
+  assert.ok(/used_generation_ids_sha256=[0-9a-f]{12}\b/.test(terminal.body),
+    "the post did not carry a digest binding the set of generations");
+  // 🔴 The substitution this branch exists to prevent: one id standing for several.
+  assert.ok(!terminal.body.includes("used_generation_id="),
+    "a single generation id was posted for an attempt that consumed two");
 });
 
 console.log(results.join("\n"));
