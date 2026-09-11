@@ -69,6 +69,11 @@ function str(value) {
 function observeGeneration(entries, requestedProvider, requestedModel) {
   const observedModels = new Set();
   const resolvedModels = new Set();
+  // The provider the RUNTIME actually used. Every adapter sets a response's `provider` from
+  // `model.provider` (packages/ai/src/api/*.ts) -- it is configuration carried alongside the call,
+  // and it is never read back off the wire. It is therefore routing/runtime state, NOT an
+  // observation, and it is named accordingly.
+  const runtimeProviders = new Set();
   const seenResponseIds = new Set();
   // Lineage: the actual generation events this attempt consumed. A model STRING cannot identify
   // what ran -- two different generations can carry the same string, and a relabelled fallback
@@ -86,6 +91,8 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
       seenResponseIds.add(entry.responseId);
     }
     if (typeof entry.model_calls === "number" && entry.model_calls > 0) totalCalls += entry.model_calls;
+    const runtimeProvider = str(entry.provider);
+    if (runtimeProvider) runtimeProviders.add(runtimeProvider);
     const generationId = str(entry.responseId);
     if (generationId) usedGenerationIds.add(generationId);
     // Prefer the full arrays; a single entry may carry more than one of either. `observed_model`
@@ -120,6 +127,7 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
   if (observation === "observed" && requestedModel !== null) matchesRequested = observedModel === requestedModel;
   else if (observation === "conflict") matchesRequested = false;
 
+  const runtimeSorted = [...runtimeProviders].sort();
   const usedIds = [...usedGenerationIds].sort();
   const observedIds = [...observedGenerationIds].sort();
   return {
@@ -129,6 +137,17 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
     // consumer that will eventually print the wrong one.
     requested_provider: requestedProvider,
     requested_model: requestedModel,
+    // 🔴 ALWAYS null on every current path, and that is the correct answer rather than an omission.
+    // No adapter reads a served provider off the wire, so there is no provider evidence at
+    // observation strength anywhere in this system. This field previously echoed
+    // `requestedProvider` whenever any MODEL was observed, which asserted provider provenance the
+    // data never had -- exactly the substitution the rest of this interface exists to prevent.
+    // It stays present, and null, so a consumer can see that provider is never observed.
+    observed_provider: null,
+    // Routing/runtime state, taken from the entries themselves. One value when the whole attempt
+    // ran on one provider, null when it did not -- never collapsed to a first element.
+    runtime_provider: runtimeSorted.length === 1 ? runtimeSorted[0] : null,
+    runtime_providers: runtimeSorted,
     // What was actually consumed. `used_generation_id` is filled only when the attempt consumed
     // exactly one generation; otherwise the caller must read the list rather than be handed a
     // single id that silently stands for several.
@@ -141,7 +160,6 @@ function observeGeneration(entries, requestedProvider, requestedModel) {
     // `observed_model` to produce a verdict here -- a consumer that wants drift reads all three.
     resolved_model: resolvedSorted.length === 1 ? resolvedSorted[0] : null,
     resolved_models: resolvedSorted,
-    observed_provider: observation === "unavailable" ? null : requestedProvider,
     observed_model: observedModel,
     observed_models: sorted,
     observation_source: observation === "unavailable" ? null : "response-stream",
@@ -402,13 +420,15 @@ export function buildEconomicsSummary(input = {}) {
       // so a consumer never has to infer meaning from its absence.
       generation_identity: {
         observation: "unavailable",
-        observed_provider: null,
         observed_model: null,
         observed_models: [],
         resolved_model: null,
         resolved_models: [],
         requested_provider: null,
         requested_model: null,
+        observed_provider: null,
+        runtime_provider: null,
+        runtime_providers: [],
         used_generation_id: null,
         used_generation_ids: [],
         observed_generation_ids: [],

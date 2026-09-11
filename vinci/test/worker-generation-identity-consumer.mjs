@@ -30,10 +30,13 @@ const REQUESTED_MODEL = "requested/model-A";
 const RESOLVED_MODEL = "resolved/model-B";
 const OBSERVED_MODEL = "observed/model-C";
 const FALLBACK_MODEL = "fallback/provider-default-D";
+// Deliberately NOT the requested provider ("openrouter"): if these matched, substituting one for
+// the other would be undetectable and the provider assertions would false-green.
+const RUNTIME_PROVIDER = "runtime-gateway-Z";
 
 // A session the fixture `vinci` binary appends: one outcome plus one usage entry whose observed id
 // is neither the requested id nor the resolved id.
-function sessionFixture({ observed, resolved = RESOLVED_MODEL }) {
+function sessionFixture({ observed, resolved = RESOLVED_MODEL, runtimeProvider = RUNTIME_PROVIDER }) {
   const usageBlock = (models, observedModels) => ({
     modelCalls: 1,
     inputTokens: 10,
@@ -42,7 +45,7 @@ function sessionFixture({ observed, resolved = RESOLVED_MODEL }) {
     cacheWriteTokens: 0,
     reasoningTokens: 0,
     estimatedCostUsd: 0.01,
-    providers: ["openrouter"],
+    providers: runtimeProvider ? [runtimeProvider] : [],
     models,
     observedModels,
     resolvedModels: [resolved],
@@ -132,13 +135,13 @@ function uploadedResultJson(fixture) {
   }
 }
 
-async function runWorker({ observed, resolved, taskId, name, workerId, evidence, env = {} }) {
+async function runWorker({ observed, resolved, runtimeProvider, taskId, name, workerId, evidence, env = {} }) {
   const fixture = new WorkerTestFixture(name);
   try {
     fixture.createRepo("test", "repo");
     fixture.linkTools(TOOLS);
     const sessionPath = join(fixture.tempDir, `session-${taskId}.jsonl`);
-    writeFileSync(sessionPath, sessionFixture({ observed, resolved }));
+    writeFileSync(sessionPath, sessionFixture({ observed, resolved, runtimeProvider }));
 
     await fixture.startBus([
       {
@@ -338,7 +341,14 @@ await check("a downstream consumer preserves the distinction in emitted evidence
 
   // Observation provenance survived downstream.
   assert.equal(ri.observation_source, "response-stream", "observation provenance lost crossing into the bundle");
-  assert.equal(ri.observed_provider, "openrouter", "observing provider lost crossing into the bundle");
+  // Provider is NEVER observed: no adapter reads a served provider off the wire. The field stays
+  // present and null so a consumer can see that, and what the runtime actually ran on is carried
+  // separately under its own name.
+  assert.equal(ri.observed_provider, null, "observed_provider claims provider provenance that does not exist");
+  assert.equal(ri.runtime_provider, RUNTIME_PROVIDER, "runtime provider lost crossing into the bundle");
+  assert.notEqual(ri.runtime_provider, ri.requested_provider,
+    "runtime provider was taken from the requested provider");
+  assert.equal(ri.requested_provider, "openrouter", "precondition: requested provider is present and copyable");
 
   // Consumer 2: the terminal bus post, read as fields.
   const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
@@ -354,7 +364,9 @@ await check("a downstream consumer preserves the distinction in emitted evidence
   assert.equal(fields.requested_model, REQUESTED_MODEL);
   assert.equal(fields.identity_matches_requested, "false");
   assert.equal(fields.observation_source, "response-stream", "observation provenance never reached the bus");
-  assert.equal(fields.observed_provider, "openrouter");
+  assert.equal(fields.observed_provider, undefined, "an unobservable provider was posted as observed");
+  assert.equal(fields.runtime_provider, RUNTIME_PROVIDER, "runtime provider never reached the bus");
+  assert.notEqual(fields.runtime_provider, fields.requested_model, "provider/model confusion on the post");
   // A real generation id is `provider\0responseId` and is not field-safe, so the post carries a
   // digest of it rather than truncating the body. The binding must still be checkable: the digest
   // has to be the digest OF the id the bundle carries verbatim.
@@ -622,6 +634,128 @@ for (const [label, extraEnv, evidence] of [
       "a diverged run was not posted as diverging");
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// PRE-RUN REFUSAL. No generation happened, so no identity may be asserted -- not even
+// `observation=unavailable`, which would be a claim about evidence for a generation that never
+// occurred. The gate is "did a generation actually happen", not "is the task terminal".
+// ---------------------------------------------------------------------------------------------
+await check("a pre-run refusal does not invent a generation identity", async () => {
+  const fixture = new WorkerTestFixture("gen-identity-prerun");
+  try {
+    fixture.createRepo("test", "repo");
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([
+      {
+        message_id: "205",
+        kind: "handoff",
+        to_agent: "worker:w7",
+        subject: "pre-run refusal",
+        // A deadline already in the past: refused before anything is spawned.
+        body: `repo: test/repo\nprovider: openrouter\nmodel: ${REQUESTED_MODEL}\ndeadline: 2020-01-01T00:00:00Z\n\nTask`,
+        ts: "2026-09-10T10:00:00Z",
+        posted_by: "scheduler",
+      },
+    ]);
+    const proc = spawn(
+      "node",
+      [join(ROOT, "vinci/worker/worker.mjs"), "start", "--id", "w7", "--server", fixture.busUrl(),
+       "--once", "--state-dir", fixture.tempDir],
+      { env: fixture.getEnv(), stdio: ["ignore", "pipe", "pipe"] },
+    );
+    await new Promise((r) => proc.on("close", r));
+    const posts = fixture.getPostedMessages();
+    // Reachability control: the task must actually have been claimed and refused, otherwise the
+    // absence assertions below are vacuous -- a worker that never saw the task trivially asserts
+    // nothing about it. Pre-run refusals post via blockerPostBody, not postFinal.
+    const about = posts.filter((m) => m.subject !== undefined && !/online/.test(String(m.subject)));
+    assert.ok(about.length > 0,
+      `the task was never claimed or refused, so this proves nothing. posts: ${posts.map((m) => m.subject).join(" | ")}`);
+
+    // Nothing ran, so nothing may be claimed about what served it -- on ANY post, not just one.
+    for (const m of about) {
+      const body = String(m.body ?? "");
+      assert.ok(!body.includes("used_model="),
+        `a pre-run refusal asserted a served model: ${body.slice(0, 180)}`);
+      assert.ok(!body.includes("observation="),
+        "a pre-run refusal asserted an observation status for a generation that never happened");
+      assert.ok(!body.includes("used_generation_id"),
+        "a pre-run refusal invented a generation identity");
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// PROVIDER PROVENANCE ABSENT. With no provider recorded anywhere in the session, neither the
+// observed nor the runtime provider may be conjured from the requested one.
+// ---------------------------------------------------------------------------------------------
+await check("absent provider provenance stays absent, not requested", async () => {
+  const { summary, posts } = await runWorker({
+    observed: OBSERVED_MODEL,
+    runtimeProvider: null,
+    taskId: "206",
+    name: "gen-identity-no-provider",
+    workerId: "w4",
+  });
+  const gi = summary.generation_identity;
+  // Control precondition: the requested provider is present and copyable.
+  assert.equal(gi.requested_provider, "openrouter", "precondition: requested provider present");
+  assert.equal(gi.observation, "observed", "precondition: a model WAS observed, so only provider is missing");
+
+  assert.equal(gi.observed_provider, null, "provider provenance was invented");
+  assert.equal(gi.runtime_provider, null, "runtime provider was back-filled from the request");
+  assert.deepEqual(gi.runtime_providers, [], "a provider appeared from nowhere");
+
+  const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
+  assert.ok(terminal, "no terminal post");
+  assert.ok(!terminal.body.includes("runtime_provider="),
+    "the post asserted a runtime provider that the session never recorded");
+});
+
+// ---------------------------------------------------------------------------------------------
+// A postFinal PATH WHERE NO GENERATION OCCURRED. Pre-run refusals never reach postFinal, so the
+// "did a generation happen" gate needs a path that does: a branch-lease refusal terminates through
+// postFinal before any session is spawned. It must not assert an observation status.
+// ---------------------------------------------------------------------------------------------
+await check("a postFinal terminal with no generation asserts no identity", async () => {
+  const fixture = new WorkerTestFixture("gen-identity-no-generation");
+  try {
+    fixture.createRepo("test", "repo");
+    fixture.linkTools(TOOLS);
+    await fixture.startBus([
+      {
+        message_id: "207",
+        kind: "handoff",
+        to_agent: "worker:w2",
+        subject: "no generation",
+        body: `repo: test/repo\nprovider: openrouter\nmodel: ${REQUESTED_MODEL}\nevidence: none\nbudget_usd: 20\nref: job_207\n\nTask`,
+        ts: "2026-09-10T10:00:00Z",
+        posted_by: "scheduler",
+      },
+    ]);
+    const proc = spawn(
+      "node",
+      [join(ROOT, "vinci/worker/worker.mjs"), "start", "--id", "w2", "--server", fixture.busUrl(),
+       "--once", "--state-dir", fixture.tempDir],
+      // Branch leases ON with no governor reachable: refused before anything is spawned.
+      { env: fixture.getEnv({ VINCI_BRANCH_LEASE: "1" }), stdio: ["ignore", "pipe", "pipe"] },
+    );
+    await new Promise((r) => proc.on("close", r));
+    const posts = fixture.getPostedMessages().filter((m) => !/online/.test(String(m.subject)));
+    assert.ok(posts.length > 0, "the task was never claimed, so this proves nothing");
+    for (const m of posts) {
+      const body = String(m.body ?? "");
+      assert.ok(!body.includes("observation="),
+        `a terminal with no generation asserted an observation status: ${body.slice(0, 180)}`);
+      assert.ok(!body.includes("used_model="),
+        "a terminal with no generation asserted a served model");
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
 
 console.log(results.join("\n"));
 if (process.exitCode === 1) console.error("worker-generation-identity-consumer: FAILURES above");
