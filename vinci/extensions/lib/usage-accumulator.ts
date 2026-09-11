@@ -13,6 +13,18 @@ export type VinciAccumulatedUsage = {
   estimatedCostUsd: number;
   providers: string[];
   models: string[];
+  // MACHINE-OBSERVED model identity only: the ids the provider itself reported on the wire
+  // (`responseModel`). NEVER populated from the requested/resolved id, so an empty array means
+  // "the provider did not tell us what served this call" and never "it served what we asked for".
+  // `models` above deliberately keeps its existing collapsed meaning; other consumers read it.
+  observedModels: string[];
+  // The id the in-process RESOLVER settled on (`message.model`), recorded unconditionally. This is
+  // what `buildFallbackModel` relabels, so resolved==requested proves nothing about what ran -- it
+  // is the middle term, and it is only meaningful next to `observedModels`.
+  resolvedModels: string[];
+  // Count of responses whose model identity was machine-observed. `modelCalls - observedModelCalls`
+  // is the number of calls whose served identity is unknown.
+  observedModelCalls: number;
 };
 
 export type VinciUsageCall = {
@@ -105,6 +117,9 @@ export function emptyVinciAccumulatedUsage(): VinciAccumulatedUsage {
     estimatedCostUsd: 0,
     providers: [],
     models: [],
+    observedModels: [],
+    resolvedModels: [],
+    observedModelCalls: 0,
   };
 }
 
@@ -119,6 +134,9 @@ function normalizedUsage(usage: Readonly<VinciAccumulatedUsage>): VinciAccumulat
     estimatedCostUsd: finite(usage.estimatedCostUsd),
     providers: [...new Set(usage.providers.filter(Boolean))].sort(),
     models: [...new Set(usage.models.filter(Boolean))].sort(),
+    observedModels: [...new Set((usage.observedModels ?? []).filter(Boolean))].sort(),
+    resolvedModels: [...new Set((usage.resolvedModels ?? []).filter(Boolean))].sort(),
+    observedModelCalls: finite(usage.observedModelCalls),
   };
 }
 
@@ -139,6 +157,16 @@ export function addVinciAccumulatedUsage(
   target.estimatedCostUsd = microUsdToUsd(targetMicroUsd + additionMicroUsd);
   target.providers = [...new Set([...target.providers, ...addition.providers.filter(Boolean)])].sort();
   target.models = [...new Set([...target.models, ...addition.models.filter(Boolean)])].sort();
+  target.observedModels = [
+    ...new Set([...(target.observedModels ?? []), ...(addition.observedModels ?? []).filter(Boolean)]),
+  ].sort();
+  target.resolvedModels = [
+    ...new Set([...(target.resolvedModels ?? []), ...(addition.resolvedModels ?? []).filter(Boolean)]),
+  ].sort();
+  // `finite(target...)` rather than `+=`: this adder is also called with objects assembled
+  // elsewhere (combinedTaskUsage in task-outcome.ts) which may predate these fields. `undefined += n`
+  // is NaN, and NaN then travels as a plausible-looking number instead of failing.
+  target.observedModelCalls = finite(target.observedModelCalls) + finite(addition.observedModelCalls);
   return target;
 }
 
@@ -152,14 +180,27 @@ export function vinciResponseKey(response: ModelResponseLike): string | undefine
   return responseKey(response);
 }
 
+/**
+ * The wire boundary, exported for tests. This is where a provider response is split into what the
+ * provider actually reported (`observedModels`) and what the resolver chose (`resolvedModels`); a
+ * regression here re-fuses the two and is invisible to every test that starts from the already-split
+ * persisted shape.
+ */
+export function vinciUsageFromResponse(response: ModelResponseLike): VinciAccumulatedUsage {
+  return usageFromResponse(response);
+}
+
 function usageFromResponse(response: ModelResponseLike): VinciAccumulatedUsage {
   const provider = typeof response.provider === "string" && response.provider ? [response.provider] : [];
-  const model =
-    typeof response.responseModel === "string" && response.responseModel
-      ? response.responseModel
-      : typeof response.model === "string" && response.model
-        ? response.model
-        : "";
+  // The ONLY machine observation of served identity available on this path. Upstream sets
+  // `responseModel` exclusively when the wire-reported id DIFFERS from the requested one
+  // (`packages/ai/src/api/openai-completions.ts:324`, guarded by `chunk.model !== model.id`), so its
+  // absence conflates "the provider agreed" with "the provider said nothing". We therefore record
+  // only what was actually observed and let the absence stay an absence.
+  const observed =
+    typeof response.responseModel === "string" && response.responseModel ? response.responseModel : "";
+  const resolved = typeof response.model === "string" && response.model ? response.model : "";
+  const model = observed || resolved;
   return {
     modelCalls: 1,
     inputTokens: finite(response.usage?.input),
@@ -170,6 +211,9 @@ function usageFromResponse(response: ModelResponseLike): VinciAccumulatedUsage {
     estimatedCostUsd: finite(response.usage?.cost?.total),
     providers: provider,
     models: model ? [model] : [],
+    observedModels: observed ? [observed] : [],
+    resolvedModels: resolved ? [resolved] : [],
+    observedModelCalls: observed ? 1 : 0,
   };
 }
 

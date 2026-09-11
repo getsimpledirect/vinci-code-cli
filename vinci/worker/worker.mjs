@@ -9,6 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { replayPending } from "./outbox.mjs";
 import { seedProviderDefinitions } from "./provider-definitions.mjs";
@@ -483,6 +484,11 @@ async function emitEconomics({
       task: { id: taskId, envelope: { ref: envelopeToUse.ref }, attempt: attempt.attempt || attempt },
       workOrderId: contractFields?.work_order_id ?? envelopeToUse?.ref ?? null,
       attemptLabel: `${taskId}/${attempt.attempt || attempt}`,
+      // The REQUESTED pair, straight off the envelope the daemon spawned `vinci -p` with. Requested
+      // only -- what actually served the call is observed separately and must never be back-filled
+      // from these two.
+      requestedProvider: envelopeToUse?.provider ?? null,
+      requestedModel: envelopeToUse?.model ?? null,
       lease: lease || null,
       sessionState: session,
       sessionId,
@@ -534,6 +540,29 @@ async function emitEconomics({
       work_order_id: contractFields?.work_order_id ?? envelopeToUse?.ref ?? null,
       attempt_label: `${taskId}/${attempt?.attempt ?? attempt ?? 0}`,
       route: { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] },
+      // Emitted, not omitted. This is the outer crash path -- if the builder or the canonicaliser
+      // throws, the artifact still carries the field, so a consumer never has to read meaning into
+      // its absence. Nothing was observed here, and that is exactly what it says.
+      generation_identity: {
+        observation: "unavailable",
+        resolved_model: null,
+        resolved_models: [],
+        requested_provider: null,
+        requested_model: null,
+        used_generation_id: null,
+        used_generation_ids: [],
+        observed_generation_ids: [],
+        observed_provider: null,
+        runtime_provider: null,
+        runtime_providers: [],
+        observed_model: null,
+        observed_models: [],
+        observation_source: null,
+        model_calls: 0,
+        observed_model_calls: 0,
+        unobserved_model_calls: 0,
+        matches_requested: null,
+      },
       assets_consumed: [],
       compactions: 0,
       human_interventions: [],
@@ -556,6 +585,26 @@ async function emitEconomics({
   }
 }
 
+// A generation id is only printable as a whitespace-delimited field when it contains no
+// whitespace, NUL or `=`. Anything else is emitted as a digest so the body stays parseable while
+// the reference remains checkable against result.json, which carries the id verbatim.
+const FIELD_SAFE_ID = /^[A-Za-z0-9._:@+-]+$/;
+function generationIdFields(gi) {
+  const ids = Array.isArray(gi.used_generation_ids) ? gi.used_generation_ids : [];
+  if (ids.length === 0) return [];
+  const single = ids.length === 1 ? ids[0] : null;
+  if (single) {
+    return FIELD_SAFE_ID.test(single)
+      ? [`used_generation_id=${single}`]
+      : [`used_generation_id_sha256=${createHash("sha256").update(single).digest("hex").slice(0, 12)}`];
+  }
+  // More than one generation: never print a single id that would stand for all of them.
+  return [
+    `used_generation_count=${ids.length}`,
+    `used_generation_ids_sha256=${createHash("sha256").update(ids.join("\u0000")).digest("hex").slice(0, 12)}`,
+  ];
+}
+
 function terminalPostBody(details) {
   return `${details} worker_build=${formatWorkerBuild(workerBuild)} vinci_binary=${formatVinciBinary(vinciBinary)}`;
 }
@@ -571,7 +620,13 @@ function blockerPostBody(record, details, fallback = null) {
   return terminalPostBody(tag ? `${tag} ${details}` : details);
 }
 
-async function postFinal(bus, message, envelope, state, evidence, economicsSha = null) {
+// `economics` is the emitEconomics result -- `{ summary, sha256 }` -- passed WHOLE and on purpose.
+// The digest and the identity are two projections of ONE summary, so the post cannot carry a SHA
+// from one summary and an identity from another. Identity is evidence about the execution, not
+// task state: it must not travel via the lifecycle, whose terminal state is correctly immutable
+// (`record()` throws once terminal, so every post-terminal path could never have used it anyway).
+async function postFinal(bus, message, envelope, state, evidence, economics = null) {
+  const economicsSha = typeof economics?.sha256 === "string" ? economics.sha256 : null;
   const subject = `task ${message.message_id} ${state.state.toLowerCase()}`;
   // uri/sha256 are advertised only when the bundle actually reached S3 (`uploaded === true`,
   // set by uploadEvidence solely after a successful `aws s3 cp`); a failed upload also carries
@@ -608,6 +663,44 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
         policy.blocked > 0 ? `policy_blocked_sites=${policy.sites.blocked.join(",")}` : undefined,
       ]
     : [];
+  // The identity distinction, carried as FIELDS on the terminal post so a downstream reader gets
+  // it without opening the bundle. Never collapsed: `observation=unavailable` and an observed
+  // match are different facts, and `used_model` is emitted ONLY from a machine observation, so a
+  // reader can never mistake the requested string for what served the call. Same rule as W2's
+  // three profile outcomes directly above -- do not fold these into one field.
+  const gi = economics?.summary?.generation_identity ?? null;
+  // Emit identity ONLY where a generation could actually have occurred. A pre-run refusal (bad
+  // bounds, past deadline, provider not allowed, branch-lease refusal) has no calls, and printing
+  // `observation=unavailable` there would assert an absence of evidence about a generation that
+  // never happened. A run that DID spend always prints, even when the served identity is unknown --
+  // that is the case most in need of the trail, not the one to hide.
+  const generationOccurred = (gi?.model_calls ?? 0) > 0 || (gi?.used_generation_ids?.length ?? 0) > 0;
+  const identityDetails = gi && generationOccurred
+    ? [
+        `observation=${gi.observation}`,
+        // Provenance of the observation itself: WHICH channel established identity. Without it a
+        // reader cannot tell a gateway-attested identity from one scraped off a response stream,
+        // and `unavailable` cannot be distinguished from "nobody looked".
+        gi.observation_source ? `observation_source=${gi.observation_source}` : undefined,
+        // `observed_provider` is never emitted: no adapter reads a served provider off the wire,
+        // so there is nothing to report at observation strength. What the runtime actually ran on
+        // is reported under its own name instead.
+        gi.runtime_provider ? `runtime_provider=${gi.runtime_provider}` : undefined,
+        gi.requested_model ? `requested_model=${gi.requested_model}` : undefined,
+        gi.resolved_model ? `resolved_model=${gi.resolved_model}` : undefined,
+        // `unknown`, never the requested or resolved string: an unobservable identity must not be
+        // reported as a served one.
+        `used_model=${gi.observed_model ?? "unknown"}`,
+        // The body is whitespace-delimited fields. A generation id is provider-shaped
+        // (`provider\0responseId`) and can contain whitespace or NUL, which would truncate the
+        // field and silently corrupt every token after it. Print it only when it is field-safe,
+        // otherwise print a digest -- lineage stays referenceable against the bundle, which
+        // carries the id verbatim, and the body stays parseable.
+        ...generationIdFields(gi),
+        // null means "not measured"; only an actual comparison prints true/false.
+        gi.matches_requested === null ? undefined : `identity_matches_requested=${gi.matches_requested}`,
+      ]
+    : [];
   const details = [
     `state=${state.state}`,
     `exit_code=${state.exit_code}`,
@@ -616,6 +709,7 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
     ...policyDetails,
+    ...identityDetails,
     contractTag(state),
     ...economicsDetails,
     ...evidenceDetails,
@@ -1256,7 +1350,7 @@ async function processHandoff(
         lifecycle.transition("BLOCKED", { outcome: { reason }, publish: "skipped", pr: null, fenced_out: reason });
         await releaseLease("BLOCKED");
         const econBranch = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
-        await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econBranch.sha256);
+        await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econBranch);
         return true;
       }
       branchLease = acquired.lease;
@@ -1276,7 +1370,7 @@ async function processHandoff(
       lifecycle.transition("BLOCKED", { outcome: { reason: authorityLost }, publish: "skipped", pr: null, fenced_out: authorityLost, lease: { ...lifecycle.snapshot().lease, ...lease } });
       await releaseLease("BLOCKED");
       const econLost = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse, lease, lifecycle, contractFields, sessionId: attempt?.sessionId ?? null });
-      await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econLost.sha256);
+      await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), null, econLost);
       return true;
     }
     // #18: probe the binary IMMEDIATELY before the spawn — after the Governor lease and the clone,
@@ -1420,6 +1514,8 @@ async function processHandoff(
       // A governed handoff has no envelope.ref; its id is the contract's work_order_id.
       workOrderId: contractFields?.work_order_id ?? envelopeToUse.ref ?? null,
       attemptLabel: `${taskId}/${attempt.attempt}`,
+      requestedProvider: envelopeToUse?.provider ?? null,
+      requestedModel: envelopeToUse?.model ?? null,
       lease: lease || null,
       sessionState: session,
       usageEntries: session.usageEntries || [],
@@ -1453,6 +1549,9 @@ async function processHandoff(
     const economicsSha = economicsSha256(economicsCanonical);
     extraFiles["economics-summary.json"] = economicsCanonical;
     resultJson.economics_sha256 = economicsSha;
+    // Downstream consumers of the evidence bundle read result.json, not the economics summary.
+    // Carry the identity interface across that boundary rather than making them join two files.
+    resultJson.generation_identity = economicsSummary.generation_identity ?? null;
     // Local copy beside the attempt: a box without VINCI_EVIDENCE_URI_PREFIX uploads nothing, and
     // the runs that actually spent must not be the only ones that leave no file behind.
     try {
@@ -1511,7 +1610,7 @@ async function processHandoff(
     // L4: release with the committed state's outcome, BEFORE the final post so the lease is not
     // held across a bus retry. A release failure is logged; the state above is already final.
     await releaseLease(state);
-    await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult, economicsSha);
+    await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult, { summary: economicsSummary, sha256: economicsSha });
   } catch (error) {
     // A terminal state is immutable: if the failure happened after it was committed (e.g. the
     // final bus post), surface the error to the daemon loop instead of rewriting the record.
@@ -1535,7 +1634,7 @@ async function processHandoff(
     await releaseLease("FAILED");
     // A session may already have run and spent here (exception after runVinci): read it.
     const econFailed = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
-    await postFinal(bus, message, envelope, lifecycle.snapshot(), null, econFailed.sha256);
+    await postFinal(bus, message, envelope, lifecycle.snapshot(), null, econFailed);
   }
   return true;
 }
