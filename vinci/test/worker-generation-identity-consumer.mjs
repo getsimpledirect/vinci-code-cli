@@ -76,6 +76,43 @@ function sessionFixture({ observed, resolved = RESOLVED_MODEL }) {
   return [JSON.stringify(outcome), JSON.stringify(usage)].join("\n") + "\n";
 }
 
+// Read BOTH result.json and session.jsonl out of the one tarball the worker handed the uploader.
+// They must agree: the generations the evidence claims were used are exactly the generations
+// present in the session that produced it. Reading them from the same bundle is the point -- a
+// claim checked against a different artifact than the one shipped proves nothing.
+function uploadedBundle(fixture) {
+  const awsCalls = join(fixture.tempDir, "aws-calls.txt");
+  if (!existsSync(awsCalls)) return { result: null, sessionKeys: null };
+  const calls = readFileSync(awsCalls, "utf8")
+    .split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line));
+  if (calls.length === 0) return { result: null, sessionKeys: null };
+  const out = mkdtempSync(join(tmpdir(), "gi-bundle-"));
+  try {
+    const tar = spawnSync("tar", ["xzf", calls[0].argv[3], "-C", out], { encoding: "utf8" });
+    if (tar.status !== 0) return { result: null, sessionKeys: null };
+    const result = JSON.parse(readFileSync(join(out, "result.json"), "utf8"));
+    // The immutable identities actually present in the consumed session.
+    const sessionPath = join(out, "session.jsonl");
+    const sessionKeys = existsSync(sessionPath)
+      ? readFileSync(sessionPath, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => {
+            try { return JSON.parse(line); } catch { return null; }
+          })
+          .filter((e) => e && e.type === "custom" && e.customType === "vinci-task-usage")
+          .map((e) => e?.data?.responseKey)
+          .filter((k) => typeof k === "string" && k)
+          .sort()
+      : null;
+    return { result, sessionKeys };
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+}
+
 function uploadedResultJson(fixture) {
   const awsCalls = join(fixture.tempDir, "aws-calls.txt");
   if (!existsSync(awsCalls)) return null;
@@ -162,8 +199,8 @@ async function runWorker({ observed, resolved, taskId, name, workerId, evidence 
     // The fake `aws` records `s3 cp --no-progress <bundle.tgz> <uri>`. Read result.json back out of
     // the tarball the worker ACTUALLY handed the uploader -- that is the artifact a downstream
     // consumer of the evidence bundle receives, not a local copy we arranged for the test.
-    const result = uploadedResultJson(fixture);
-    return { summary: JSON.parse(raw), raw, task, result, posts: fixture.getPostedMessages() };
+    const { result, sessionKeys } = uploadedBundle(fixture);
+    return { summary: JSON.parse(raw), raw, task, result, sessionKeys, posts: fixture.getPostedMessages() };
   } finally {
     fixture.cleanup?.();
   }
@@ -471,6 +508,39 @@ await check("a fully-agreeing run reports a match end to end, not unknown", asyn
   assert.ok(terminal.body.includes("identity_matches_requested=true"),
     "an observed agreement was not posted as a match");
   assert.ok(terminal.body.includes("observation=observed"));
+});
+
+// ---------------------------------------------------------------------------------------------
+// THE BINDING CONTROL. A copied model string is not evidence that a particular generation was
+// consumed. The consumer must be able to PROVE which generation it used, and this must fail if the
+// evidence claims a generation other than the one actually consumed.
+//
+// Both artifacts come out of the SAME shipped tarball: result.json's claim is checked against
+// session.jsonl's immutable response keys -- the generations that actually produced the run.
+// ---------------------------------------------------------------------------------------------
+await check("evidence claims exactly the generations the run actually consumed", async () => {
+  const { result, sessionKeys } = await runWorker({
+    observed: OBSERVED_MODEL,
+    taskId: "98",
+    name: "gen-identity-binding",
+    workerId: "w8",
+  });
+
+  assert.ok(Array.isArray(sessionKeys), "no session.jsonl in the bundle: the claim cannot be checked");
+  assert.ok(sessionKeys.length > 0,
+    "the consumed session carries no generation identities -- every claim below would be vacuous");
+
+  const claimed = [...(result.generation_identity.used_generation_ids ?? [])].sort();
+  assert.deepEqual(claimed, sessionKeys,
+    `evidence claims generations ${JSON.stringify(claimed)} but the session it shipped ` +
+      `actually contains ${JSON.stringify(sessionKeys)}`);
+
+  // And the observed identity is attributed to a generation that is really in that set, not to a
+  // free-floating id.
+  for (const id of result.generation_identity.observed_generation_ids ?? []) {
+    assert.ok(sessionKeys.includes(id),
+      `observed identity attributed to generation ${id}, which the consumed session does not contain`);
+  }
 });
 
 console.log(results.join("\n"));
