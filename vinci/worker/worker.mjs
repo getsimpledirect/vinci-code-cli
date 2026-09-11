@@ -664,6 +664,11 @@ async function postFinal(bus, message, envelope, state, evidence, economicsSha =
   const identityDetails = gi
     ? [
         `observation=${gi.observation}`,
+        // Provenance of the observation itself: WHICH channel established identity. Without it a
+        // reader cannot tell a gateway-attested identity from one scraped off a response stream,
+        // and `unavailable` cannot be distinguished from "nobody looked".
+        gi.observation_source ? `observation_source=${gi.observation_source}` : undefined,
+        gi.observed_provider ? `observed_provider=${gi.observed_provider}` : undefined,
         gi.requested_model ? `requested_model=${gi.requested_model}` : undefined,
         gi.resolved_model ? `resolved_model=${gi.resolved_model}` : undefined,
         // `unknown`, never the requested or resolved string: an unobservable identity must not be

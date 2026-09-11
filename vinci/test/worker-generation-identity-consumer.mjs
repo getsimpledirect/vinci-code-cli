@@ -280,11 +280,27 @@ await check("a downstream consumer preserves the distinction in emitted evidence
   assert.equal(new Set([ri.requested_model, ri.resolved_model, ri.observed_model]).size, 3,
     "the consumer collapsed the three identities");
 
-  // Lineage: bound to the generation event, not to a model string.
+  // STAGE 4, actually_used. The consumer must be able to say WHICH generation it used by an
+  // immutable event id, not by a copied model string. Assert the id exists, is not any of the
+  // three model strings, and is the id the observation itself came from.
   assert.ok(ri.used_generation_id || ri.used_generation_ids?.length > 0,
     "no generation id: the lineage references only a model string");
+  for (const modelString of [REQUESTED_MODEL, RESOLVED_MODEL, OBSERVED_MODEL]) {
+    assert.notEqual(ri.used_generation_id, modelString,
+      `used_generation_id is a model string (${modelString}), not an event identity`);
+  }
   assert.deepEqual(ri.observed_generation_ids, [ri.used_generation_id],
     "the observed identity is not bound to the generation event it came from");
+  // All FOUR stages distinct as observable values.
+  assert.equal(
+    new Set([ri.requested_model, ri.resolved_model, ri.observed_model, ri.used_generation_id]).size,
+    4,
+    "the four stages are not four distinct observable values",
+  );
+
+  // Observation provenance survived downstream.
+  assert.equal(ri.observation_source, "response-stream", "observation provenance lost crossing into the bundle");
+  assert.equal(ri.observed_provider, "openrouter", "observing provider lost crossing into the bundle");
 
   // Consumer 2: the terminal bus post, read as fields.
   const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
@@ -299,6 +315,8 @@ await check("a downstream consumer preserves the distinction in emitted evidence
   assert.equal(fields.observation, "observed");
   assert.equal(fields.requested_model, REQUESTED_MODEL);
   assert.equal(fields.identity_matches_requested, "false");
+  assert.equal(fields.observation_source, "response-stream", "observation provenance never reached the bus");
+  assert.equal(fields.observed_provider, "openrouter");
   // A real generation id is `provider\0responseId` and is not field-safe, so the post carries a
   // digest of it rather than truncating the body. The binding must still be checkable: the digest
   // has to be the digest OF the id the bundle carries verbatim.
@@ -379,6 +397,80 @@ await check("a fallback is not relabelled as the requested model", async () => {
     "the terminal post did not name the fallback as the served model");
   assert.ok(terminal.body.includes("identity_matches_requested=false"),
     "a fallback was posted as matching the request");
+});
+
+// ---------------------------------------------------------------------------------------------
+// The FAITHFUL fallback shape, and the one that matters most.
+//
+// `buildFallbackModel` returns `{...baseModel, id: modelId, name: modelId}` -- the provider
+// default's entire configuration (baseUrl, api, cost, contextWindow, maxTokens, reasoning, compat)
+// with only the NAME overwritten by what the caller asked for. So downstream, `message.model` is
+// the REQUESTED string: resolved == requested, and every identity keyed on `model.id` reports the
+// request back as though it were an observation. The wire report is the only thing that can
+// discriminate, and it must not be allowed to agree by default.
+// ---------------------------------------------------------------------------------------------
+await check("a relabelled fallback is exposed even though resolved == requested", async () => {
+  const { summary, result, posts } = await runWorker({
+    // The relabel: the resolver reports the REQUESTED id back, because that is what it wrote onto
+    // the object. Only the provider knows a different model actually served the call.
+    resolved: REQUESTED_MODEL,
+    observed: FALLBACK_MODEL,
+    taskId: "96",
+    name: "gen-identity-relabelled-fallback",
+    workerId: "w2",
+    evidence: "none",
+  });
+
+  const gi = summary.generation_identity;
+  // The trap: these two agreeing is exactly what the relabel manufactures, and it must NOT be
+  // read as confirmation that the request was honoured.
+  assert.equal(gi.requested_model, REQUESTED_MODEL);
+  assert.equal(gi.resolved_model, REQUESTED_MODEL, "precondition: the relabel makes resolved == requested");
+
+  assert.equal(gi.observed_model, FALLBACK_MODEL, "the served model was not exposed");
+  assert.notEqual(gi.observed_model, REQUESTED_MODEL, "the fallback was relabelled as the requested model");
+  assert.equal(gi.matches_requested, false,
+    "resolved == requested was taken as agreement while a different model actually served the call");
+
+  assert.equal(result.generation_identity.observed_model, FALLBACK_MODEL, "the bundle hid the fallback");
+  const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
+  assert.ok(terminal.body.includes(`used_model=${FALLBACK_MODEL}`),
+    "the terminal post named the requested model as the served one");
+  assert.ok(terminal.body.includes("identity_matches_requested=false"),
+    "a relabelled fallback was posted as matching the request");
+});
+
+// ---------------------------------------------------------------------------------------------
+// POSITIVE CONTROL at the consumer, A -> A -> A. Without this the strictness above is satisfiable
+// by a downstream that prints `unknown` unconditionally. The unit-level control proves the
+// aggregation can represent a match; this proves the match survives all the way to emitted
+// evidence.
+// ---------------------------------------------------------------------------------------------
+await check("a fully-agreeing run reports a match end to end, not unknown", async () => {
+  const { summary, result, posts } = await runWorker({
+    resolved: REQUESTED_MODEL,
+    observed: REQUESTED_MODEL,
+    taskId: "97",
+    name: "gen-identity-agreement",
+    workerId: "w1",
+  });
+
+  const gi = summary.generation_identity;
+  assert.equal(gi.observation, "observed", "an observed agreement read as unavailable");
+  assert.equal(gi.observed_model, REQUESTED_MODEL);
+  assert.equal(gi.matches_requested, true, "agreement was not reported as a match");
+  assert.equal(gi.observed_model_calls, 1);
+  assert.equal(gi.unobserved_model_calls, 0);
+  // Still bound to the event, even when every string agrees -- this is the case where a model
+  // string is least able to identify anything.
+  assert.ok(gi.used_generation_id, "no event identity on an agreeing run");
+
+  assert.equal(result.generation_identity.matches_requested, true, "the bundle lost the match");
+  const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("used_model="));
+  assert.ok(terminal.body.includes(`used_model=${REQUESTED_MODEL}`));
+  assert.ok(terminal.body.includes("identity_matches_requested=true"),
+    "an observed agreement was not posted as a match");
+  assert.ok(terminal.body.includes("observation=observed"));
 });
 
 console.log(results.join("\n"));
