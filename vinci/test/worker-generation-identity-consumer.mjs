@@ -132,7 +132,7 @@ function uploadedResultJson(fixture) {
   }
 }
 
-async function runWorker({ observed, resolved, taskId, name, workerId, evidence }) {
+async function runWorker({ observed, resolved, taskId, name, workerId, evidence, env = {} }) {
   const fixture = new WorkerTestFixture(name);
   try {
     fixture.createRepo("test", "repo");
@@ -175,6 +175,7 @@ async function runWorker({ observed, resolved, taskId, name, workerId, evidence 
           VINCI_EVIDENCE_URI_PREFIX: "s3://bucket/vinci-evidence/",
           // The fake `aws` only records when told where to.
           FAKE_AWS_RECORD: join(fixture.tempDir, "aws-calls.txt"),
+          ...env,
         }),
         stdio: ["ignore", "pipe", "pipe"],
       },
@@ -542,6 +543,85 @@ await check("evidence claims exactly the generations the run actually consumed",
       `observed identity attributed to generation ${id}, which the consumed session does not contain`);
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// NON-COMPLETED TERMINALS. Every case above drives the task to DONE/COMPLETED. A run that actually
+// ran, actually spent, and actually observed a divergent served model, but then terminates FAILED
+// (post-run git/network/evidence errors are routine) must not lose the identity on the way to the
+// bus -- that is precisely the run most in need of an accurate trail, and it is the one the
+// happy-path tests could never see.
+// ---------------------------------------------------------------------------------------------
+await check("a FAILED run that actually observed a divergence still reports it on the bus", async () => {
+  const { summary, posts } = await runWorker({
+    observed: OBSERVED_MODEL,
+    taskId: "99",
+    name: "gen-identity-failed-terminal",
+    workerId: "w6",
+    env: { FAKE_VINCI_EXIT: "1" },
+  });
+
+  // Precondition: the run really happened and the divergence really was computed. Without this the
+  // assertion below could pass vacuously on a task that never ran.
+  const gi = summary.generation_identity;
+  assert.equal(gi.observation, "observed", "precondition: the divergence must have been observed");
+  assert.equal(gi.observed_model, OBSERVED_MODEL, "precondition: the served model was identified");
+  assert.equal(gi.matches_requested, false, "precondition: this run diverged from the request");
+
+  const terminal = posts.find((m) => typeof m.body === "string" && m.body.includes("state=FAILED"));
+  assert.ok(terminal, "no FAILED terminal post");
+  assert.ok(
+    terminal.body.includes("used_model="),
+    "the FAILED terminal post carries no generation identity at all -- the divergence was computed " +
+      "and then dropped on the way to the bus, which is the one consumer an operator reads without " +
+      "opening the bundle",
+  );
+  assert.ok(terminal.body.includes(`used_model=${OBSERVED_MODEL}`),
+    "the FAILED post does not name the model that actually served the run");
+  assert.ok(terminal.body.includes("identity_matches_requested=false"),
+    "a diverged FAILED run was not posted as diverging");
+});
+
+// ---------------------------------------------------------------------------------------------
+// UNVERIFIED is where a run that SPENT and DIVERGED most often lands: the session ran, tokens were
+// paid for, a different model served the call, and then publication or evidence failed. It is a
+// different terminal path from COMPLETED and a different one again from the early aborts, and it
+// must not lose the identity. An independent review found this whole class; this is the
+// fixture-reachable member of it.
+// ---------------------------------------------------------------------------------------------
+for (const [label, extraEnv, evidence] of [
+  ["gh failure after the run", { FAKE_GH_EXIT: "1" }, "pr"],
+  ["no commit produced", { FAKE_VINCI_NO_COMMIT: "1" }, "pr"],
+]) {
+  await check(`an UNVERIFIED run (${label}) still reports the served model`, async () => {
+    const { summary, posts } = await runWorker({
+      observed: OBSERVED_MODEL,
+      taskId: label.startsWith("gh") ? "201" : "203",
+      name: `gen-identity-unverified-${label.startsWith("gh") ? "gh" : "nocommit"}`,
+      workerId: label.startsWith("gh") ? "w1" : "w3",
+      evidence,
+      env: extraEnv,
+    });
+
+    // Preconditions: the run really spent and really diverged, so the assertion cannot pass on a
+    // task that never reached a provider.
+    const gi = summary.generation_identity;
+    assert.equal(gi.observation, "observed", "precondition: the divergence must have been observed");
+    assert.equal(gi.matches_requested, false, "precondition: this run diverged from the request");
+    assert.ok(summary.usage?.length > 0, "precondition: the run must actually have spent");
+
+    const terminal = posts.find((m) => typeof m.body === "string" && /state=(UNVERIFIED|FAILED|BLOCKED)/.test(m.body));
+    assert.ok(terminal, "no non-COMPLETED terminal post");
+    assert.ok(
+      terminal.body.includes("used_model="),
+      `the ${(terminal.body.match(/state=(\w+)/) || [])[1]} terminal post carries no generation identity -- ` +
+        "the divergence was computed and then dropped before the bus",
+    );
+    assert.ok(terminal.body.includes(`used_model=${OBSERVED_MODEL}`),
+      "the terminal post does not name the model that actually served this run");
+    assert.ok(terminal.body.includes("identity_matches_requested=false"),
+      "a diverged run was not posted as diverging");
+  });
+}
 
 console.log(results.join("\n"));
 if (process.exitCode === 1) console.error("worker-generation-identity-consumer: FAILURES above");

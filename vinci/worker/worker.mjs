@@ -1536,8 +1536,17 @@ async function processHandoff(
     // Carry the identity interface across that boundary rather than making them join two files.
     resultJson.generation_identity = economicsSummary.generation_identity ?? null;
     // The task record is the extension seam (task.mjs record() merges caller keys while forcing
-    // `state` unchanged, exactly as the six contract fields are spliced). postFinal reads the
-    // snapshot, so this is what puts the distinction on the terminal bus post.
+    // `state` unchanged). postFinal reads the snapshot, so this is what puts the distinction on the
+    // terminal bus post. This path builds the summary directly and never calls emitEconomics.
+    //
+    // 🔴 KNOWN GAP, do not "fix" it by calling record() from emitEconomics: `record()` THROWS on a
+    // terminal state (task.mjs: `if (this.isTerminal()) throw`), and emitEconomics runs inside a
+    // try/catch, so such a call is swallowed and silently downgrades the whole summary to the
+    // degraded catch-path object. The 13 emitEconomics call sites transition to their terminal
+    // state BEFORE emitting economics, so none of them can carry identity through the lifecycle at
+    // all. Most are pre-session and have nothing to lose, but the outer-catch FAILED path can fire
+    // after a session has run and spent. Closing that needs the identity passed INTO postFinal as
+    // a parameter (the way economicsSha already is), not routed through the task record.
     lifecycle.record({ generation_identity: economicsSummary.generation_identity ?? null });
     // Local copy beside the attempt: a box without VINCI_EVIDENCE_URI_PREFIX uploads nothing, and
     // the runs that actually spent must not be the only ones that leave no file behind.
