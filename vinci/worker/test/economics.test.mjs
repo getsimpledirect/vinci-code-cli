@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { canonicalJson, buildEconomicsSummary, economicsSha256, ECONOMICS_SCHEMA } from "../economics.mjs";
 
 // ============================================================================
@@ -93,6 +94,63 @@ test("buildEconomicsSummary: never throws on malformed input", () => {
   const emptyResult = buildEconomicsSummary({});
   assert.ok(Array.isArray(emptyResult.incomplete), "incomplete should be array");
   assert.ok(emptyResult.incomplete.length > 0, "incomplete should list missing fields");
+});
+
+test("inner degraded summary remains Revision-1 compatible without inventing measurements", () => {
+  const malformedReceipt = {
+    get usage() {
+      throw new Error("controlled malformed receipt");
+    },
+  };
+  const summary = buildEconomicsSummary({
+    workOrderId: "bk_inner_degraded",
+    attemptLabel: "bk_inner_degraded/1",
+    receipt: malformedReceipt,
+  });
+
+  assert.equal(summary.work_order_id, "bk_inner_degraded");
+  assert.equal(summary.attempt_label, "bk_inner_degraded/1");
+  assert.deepEqual(summary.lineage, {
+    root_objective_id: null,
+    backlog_row_id: null,
+    parent_work_order_id: null,
+  });
+  assert.equal(summary.execution_world_ref, null);
+  assert.equal(summary.capacity_events, null);
+  assert.deepEqual(summary.decision_refs, []);
+  assert.equal(summary.measurement_cost, null);
+  assert.equal(summary.cost_reconstruction, "none");
+  assert.equal(summary.usage, undefined, "degraded output must not imply reconstructed usage");
+
+  const requiredCodes = [
+    "malformed_entries",
+    "lineage_unbound",
+    "execution_world_missing",
+    "capacity_unobserved",
+    "measurement_cost_unknown",
+  ];
+  for (const code of requiredCodes) assert.ok(summary.incomplete.includes(code), code);
+  assert.equal(new Set(summary.incomplete).size, summary.incomplete.length, "incomplete codes must be unique");
+
+  const requiredFields = [
+    "lineage",
+    "execution_world_ref",
+    "capacity_events",
+    "decision_refs",
+    "measurement_cost",
+  ];
+  for (const field of requiredFields) assert.ok(Object.hasOwn(summary, field), field);
+
+  const canonical = canonicalJson(summary);
+  assert.equal(
+    economicsSha256(canonical),
+    createHash("sha256").update(canonical, "utf8").digest("hex"),
+    "digest must bind the exact serialized degraded summary",
+  );
+
+  const unbound = buildEconomicsSummary({ receipt: malformedReceipt });
+  assert.equal(unbound.work_order_id, null, "a missing task binding must stay missing");
+  assert.ok(unbound.incomplete.includes("missing"));
 });
 
 // ============================================================================
