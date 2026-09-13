@@ -267,6 +267,7 @@ export class WorkerTestFixture {
     this.busMessages = [];
     this.evidencePosts = [];
     this.getRequests = [];
+    this.identityRequests = 0;
     // When set (e.g. 500), every /v1/evidence POST answers with that status instead of 200.
     this.evidencePostStatus = null;
     // When set to a RegExp, every /v1/messages POST whose subject matches answers 500 and is
@@ -387,8 +388,17 @@ process.exit(r.status ?? 1);
     this.postedMessages = [];
     this.rejectedPosts = [];
     this.getRequests = [];
+    this.identityRequests = 0;
     this.evidencePosts = [];
     this.contractRequests = [];
+    if (this.busPrincipal === null) {
+      const recipients = [...new Set(
+        handoffs
+          .map((handoff) => handoff.to_agent)
+          .filter((principal) => typeof principal === "string" && principal.startsWith("worker:")),
+      )];
+      this.busPrincipal = recipients.length === 1 ? recipients[0] : "worker:w1";
+    }
 
     const server = createServer((request, response) => {
       if (request.method === "GET" && request.url === "/v1/version") {
@@ -412,6 +422,17 @@ process.exit(r.status ?? 1);
         return;
       }
       const url = new URL(request.url, "http://fixture.invalid");
+      if (request.method === "GET" && url.pathname === "/v1/worker-principal") {
+        this.identityRequests += 1;
+        if (this.busPrincipalRole !== "worker") {
+          response.writeHead(403, { "content-type": "application/json" });
+          response.end(JSON.stringify({ detail: "worker credential required" }));
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ worker_principal: this.busPrincipal }));
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/v1/messages") {
         const limit = Number(url.searchParams.get("limit") ?? 100);
         const offset = Number(url.searchParams.get("offset") ?? 0);

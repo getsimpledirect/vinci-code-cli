@@ -61,6 +61,14 @@ class TerminalBusFixture {
     this.nextId = 1;
     this.authenticatedPrincipal = authenticatedPrincipal;
     this.principalRole = principalRole;
+    this.identityStatus = principalRole === "worker" ? 200 : 403;
+    this.identityPayload = { worker_principal: authenticatedPrincipal };
+    this.identityRaw = null;
+    this.identityDelayMs = 0;
+    this.identityRequests = 0;
+    this.identityRequestUrls = [];
+    this.messageGetRequests = 0;
+    this.afterMessageGet = null;
     this.dropAckSubject = null;
     this.droppedAck = false;
     this.breakSecondPage = false;
@@ -87,7 +95,19 @@ class TerminalBusFixture {
         response.end();
         return;
       }
+      if (request.method === "GET" && url.pathname === "/v1/worker-principal") {
+        this.identityRequests += 1;
+        this.identityRequestUrls.push(request.url);
+        const sendIdentity = () => {
+          response.writeHead(this.identityStatus, { "content-type": "application/json" });
+          response.end(this.identityRaw ?? JSON.stringify(this.identityPayload));
+        };
+        if (this.identityDelayMs > 0) setTimeout(sendIdentity, this.identityDelayMs);
+        else sendIdentity();
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/v1/messages") {
+        this.messageGetRequests += 1;
         const limit = Number(url.searchParams.get("limit") ?? 100);
         const offset = Number(url.searchParams.get("offset") ?? 0);
         const fromAgent = url.searchParams.get("from");
@@ -105,6 +125,7 @@ class TerminalBusFixture {
         }
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({ messages: page, total: filtered.length, limit, offset }));
+        this.afterMessageGet?.();
         return;
       }
       if (request.method === "POST" && url.pathname === "/v1/messages") {
@@ -167,12 +188,15 @@ function scratch(name) {
 }
 
 function recordTerminal(dir) {
-  return recordPending(TERMINAL, join(dir, "outbox"));
+  return recordPending({
+    ...TERMINAL,
+    configured_worker_principal: POSTED_BY,
+  }, join(dir, "outbox"));
 }
 
 async function authenticatedBus(fixture, dir, pageSize = 100) {
   const bus = new BusClient(fixture.url, "test-token", pageSize, join(dir, "outbox"), POSTED_BY);
-  await bus.establishAuthenticatedPostingPrincipal("status", `worker ${WORKER_ID} online`, "identity probe");
+  await bus.establishAuthenticatedPostingPrincipal();
   return bus;
 }
 
@@ -252,37 +276,154 @@ test("same from_agent with the wrong server-stamped posted_by does not reconcile
   assert.equal(listPending(join(dir, "outbox")).length, 0);
 });
 
-test("identity binding selects the exact acknowledged row and refuses missing stamped provenance", async (t) => {
-  const dir = scratch("identity-readback");
+test("identity binding comes from the body-free worker-only endpoint without a client identity hint", async (t) => {
+  const dir = scratch("identity-endpoint");
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const fixture = new TerminalBusFixture();
   await fixture.start();
   t.after(() => fixture.close());
   const bus = await authenticatedBus(fixture, dir, 1);
+
   assert.equal(bus.authenticatedPostingPrincipal, POSTED_BY);
+  assert.equal(fixture.identityRequests, 1);
+  assert.deepEqual(fixture.identityRequestUrls, ["/v1/worker-principal"]);
+  assert.equal(fixture.posts.length, 0, "identity resolution itself must be side-effect free");
+  assert.equal(fixture.messageGetRequests, 0);
+});
 
-  const refusedDir = scratch("identity-missing-stamp");
-  t.after(() => rmSync(refusedDir, { recursive: true, force: true }));
-  const malformed = new TerminalBusFixture();
-  malformed.identityReadbackTransform = (message) => {
-    delete message.posted_by;
-    return message;
+for (const refusal of [
+  { name: "missing bearer", token: "", status: 401 },
+  { name: "unknown bearer", token: "unknown-token", status: 401 },
+  { name: "ambiguous bearer", status: 403, payload: { detail: "credential maps to multiple principals" } },
+  { name: "malformed JSON", raw: "{not-json" },
+  { name: "missing worker_principal", payload: {} },
+  { name: "non-string worker_principal", payload: { worker_principal: 7 } },
+  { name: "invalid worker form", payload: { worker_principal: "admin:lane-b-worker" } },
+]) {
+  test(`${refusal.name} fails closed before reconciliation or terminal delivery`, async (t) => {
+    const dir = scratch(`identity-${refusal.name.replaceAll(" ", "-")}`);
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const fixture = new TerminalBusFixture();
+    if (refusal.status !== undefined) fixture.identityStatus = refusal.status;
+    if (refusal.payload !== undefined) fixture.identityPayload = refusal.payload;
+    if (refusal.raw !== undefined) fixture.identityRaw = refusal.raw;
+    await fixture.start();
+    t.after(() => fixture.close());
+    recordTerminal(dir);
+    const bus = new BusClient(
+      fixture.url,
+      refusal.token ?? "test-token",
+      100,
+      join(dir, "outbox"),
+      POSTED_BY,
+    );
+
+    await assert.rejects(() => bus.establishAuthenticatedPostingPrincipal());
+    assert.equal(bus.authenticatedPostingPrincipal, null);
+    const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+    assert.equal(summary.failed, 1);
+    assert.equal(listPending(join(dir, "outbox")).length, 1);
+    assert.equal(fixture.messageGetRequests, 0, "identity failure must precede terminal reconciliation");
+    assert.equal(terminalPostCount(fixture), 0);
+  });
+}
+
+test("identity timeout retains pending terminal evidence and performs no side effect", async (t) => {
+  const dir = scratch("identity-timeout");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture();
+  fixture.identityDelayMs = 200;
+  await fixture.start();
+  t.after(() => fixture.close());
+  recordTerminal(dir);
+  const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY, 20);
+
+  const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+  assert.equal(summary.failed, 1);
+  assert.equal(listPending(join(dir, "outbox")).length, 1);
+  assert.equal(fixture.messageGetRequests, 0);
+  assert.equal(terminalPostCount(fixture), 0);
+});
+
+test("network failure retains pending terminal evidence and performs no side effect", async (t) => {
+  const dir = scratch("identity-network");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture();
+  await fixture.start();
+  const url = fixture.url;
+  await fixture.close();
+  recordTerminal(dir);
+  const bus = new BusClient(url, "test-token", 100, join(dir, "outbox"), POSTED_BY, 100);
+
+  const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+  assert.equal(summary.failed, 1);
+  assert.equal(listPending(join(dir, "outbox")).length, 1);
+  assert.equal(terminalPostCount(fixture), 0);
+});
+
+test("a stale prior identity never authorizes a terminal POST after the server binding changes", async (t) => {
+  const dir = scratch("identity-stale-post");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture();
+  await fixture.start();
+  t.after(() => fixture.close());
+  const bus = await authenticatedBus(fixture, dir);
+  fixture.identityPayload = { worker_principal: "worker:other" };
+
+  await assert.rejects(
+    () => bus.postTerminal("status", TERMINAL.subject, TERMINAL.body, TERMINAL.options),
+    /worker:other.*--id requires worker:lane-b-worker/,
+  );
+
+  assert.equal(bus.authenticatedPostingPrincipal, null);
+  assert.equal(listPending(join(dir, "outbox")).length, 1, "terminal debt is recorded before identity lookup");
+  assert.equal(terminalPostCount(fixture), 0);
+});
+
+test("replay re-authenticates after cardinality-zero observation before it can POST", async (t) => {
+  const dir = scratch("identity-changes-during-replay");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture();
+  fixture.afterMessageGet = () => {
+    fixture.identityPayload = { worker_principal: "worker:other" };
   };
-  await malformed.start();
-  t.after(() => malformed.close());
-  const unbound = new BusClient(malformed.url, "test-token", 1, join(refusedDir, "outbox"), POSTED_BY);
+  await fixture.start();
+  t.after(() => fixture.close());
+  recordTerminal(dir);
+  const bus = await authenticatedBus(fixture, dir);
+
+  const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+  assert.equal(summary.failed, 1);
+  assert.equal(fixture.messageGetRequests, 1);
+  assert.equal(fixture.identityRequests, 3, "startup, pre-scan, and immediate pre-POST checks are distinct");
+  assert.equal(terminalPostCount(fixture), 0);
+  assert.equal(listPending(join(dir, "outbox")).length, 1);
+});
+
+test("IR control: a bearer for worker:other cannot commit or clear worker:lane-b-worker debt", async (t) => {
+  const dir = scratch("identity-ir-control");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture([], { authenticatedPrincipal: "worker:other" });
+  await fixture.start();
+  t.after(() => fixture.close());
+  const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
 
   await assert.rejects(
-    () => unbound.establishAuthenticatedPostingPrincipal("status", `worker ${WORKER_ID} online`, "identity probe"),
-    /malformed or filter-inconsistent/,
+    () => bus.postTerminal("status", TERMINAL.subject, TERMINAL.body, TERMINAL.options),
+    /worker:other.*--id requires worker:lane-b-worker/,
   );
-  assert.equal(unbound.authenticatedPostingPrincipal, null);
-  await assert.rejects(
-    () => unbound.postTerminal("status", TERMINAL.subject, TERMINAL.body, TERMINAL.options),
-    /authenticated worker posting-principal binding/,
-  );
-  assert.equal(listPending(join(refusedDir, "outbox")).length, 0);
-  assert.equal(terminalPostCount(malformed), 0);
+  assert.equal(terminalPostCount(fixture), 0, "mismatched bearer cannot create the first terminal effect");
+  assert.equal(listPending(join(dir, "outbox")).length, 1);
+
+  const fresh = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+  const summary = await replayPending(fresh, join(dir, "outbox"), { warn() {}, error() {} });
+  assert.equal(summary.failed, 1);
+  assert.equal(terminalPostCount(fixture), 0, "restart cannot duplicate a terminal that was never authorized");
+  assert.equal(listPending(join(dir, "outbox")).length, 1, "pending debt stays retained for operator repair");
 });
 
 test("two exact server-stamped rows are a retained duplicate condition with no third POST", async (t) => {
@@ -373,13 +514,12 @@ for (const mismatch of [
     assert.equal(terminalPostCount(fixture), 0, "identity refusal must occur before terminal replay");
     assert.equal(listPending(join(dir, "outbox")).length, 1, "identity refusal must retain terminal debt");
     if (mismatch.principalRole === "worker") {
-      assert.match(run.stderr(), /from_agent must match authenticated worker principal/);
-      assert.equal(fixture.posts.length, 0, "a wrong worker bearer must be rejected at POST");
+      assert.match(run.stderr(), /worker:other.*--id requires worker:lane-b-worker/);
     } else {
-      assert.match(run.stderr(), /bearer authenticates as .*--id requires worker:lane-b-worker/);
-      assert.equal(fixture.posts.length, 1, "non-worker bearer may author only the startup probe before refusal");
-      assert.equal(fixture.posts[0].posted_by, mismatch.authenticatedPrincipal);
+      assert.match(run.stderr(), /worker identity GET .* failed: 403/);
     }
+    assert.equal(fixture.posts.length, 0, "identity refusal must precede every worker publication");
+    assert.equal(fixture.messageGetRequests, 0);
   });
 }
 
@@ -414,5 +554,6 @@ test("installed worker survives commit-then-ACK-loss and process loss without a 
   assert.match(terminalRows[0].body, /economics_sha256=e[1]{63}/);
   assert.match(terminalRows[0].body, /evidence_sha256=a{64}/);
   assert.equal(listPending(join(dir, "outbox")).length, 0);
+  assert.equal(fixture.identityRequests, 5, "both processes re-resolve identity at each terminal boundary");
   assert.match(second.stderr(), /reconciled 1/);
 });

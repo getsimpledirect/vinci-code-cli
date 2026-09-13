@@ -1,4 +1,4 @@
-import { DEFAULT_OUTBOX_DIR, clearPending, recordPending } from "./outbox.mjs";
+import { DEFAULT_OUTBOX_DIR, bindPendingPrincipal, clearPending, recordPending } from "./outbox.mjs";
 
 const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -12,6 +12,7 @@ const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 // and therefore invisible to a consumer that keys attention on `outcome !== "COMPLETED"`.
 const TERMINAL_OUTCOMES = new Set(["COMPLETED", "FAILED", "BLOCKED", "REFUSED", "UNVERIFIED"]);
 const WORKER_PRINCIPAL = /^worker:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+const DEFAULT_IDENTITY_TIMEOUT_MS = 10_000;
 
 function sameStrings(left, right) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -66,7 +67,14 @@ export function normaliseMessage(message) {
 export class BusClient {
   #authenticatedPostingPrincipal;
 
-  constructor(serverUrl, token, pageSize = 100, outboxDir = null, expectedPostingPrincipal = null) {
+  constructor(
+    serverUrl,
+    token,
+    pageSize = 100,
+    outboxDir = null,
+    expectedPostingPrincipal = null,
+    identityTimeoutMs = DEFAULT_IDENTITY_TIMEOUT_MS,
+  ) {
     const url = new URL(serverUrl);
     if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("server must use http or https");
     if (url.username || url.password) throw new Error("server URL must not contain credentials");
@@ -80,10 +88,13 @@ export class BusClient {
     ) {
       throw new Error("expected posting principal must be a worker:<id> principal");
     }
-    // A configured expectation is not authenticated identity. The only method that assigns
-    // authenticatedPostingPrincipal is establishAuthenticatedPostingPrincipal(), after it reads
-    // the exact server-created startup row and checks its server-stamped `posted_by`.
+    if (!Number.isInteger(identityTimeoutMs) || identityTimeoutMs <= 0) {
+      throw new Error("worker identity timeout must be a positive integer");
+    }
+    // A configured expectation is not authenticated identity. Only the server's worker-only
+    // identity endpoint can assign authenticatedPostingPrincipal.
     this.expectedPostingPrincipal = expectedPostingPrincipal;
+    this.identityTimeoutMs = identityTimeoutMs;
     this.#authenticatedPostingPrincipal = null;
     // Where undelivered terminal records are parked. Settable because the
     // worker keeps its durable state under --state-dir, and a default that
@@ -150,129 +161,62 @@ export class BusClient {
       .sort((left, right) => left.ts.localeCompare(right.ts) || left.message_id.localeCompare(right.message_id));
   }
 
-  // Establish which principal the server authenticated for this bearer. The startup announcement
-  // already exists on every daemon start, so use it as the probe rather than creating a second
-  // identity protocol: the server returns its message id/timestamp, and the authenticated GET
-  // returns the durable row whose `posted_by` was stamped from the bearer credential.
-  //
-  // A successful POST is not enough: admin and collector credentials may author an arbitrary
-  // `from_agent`. Only the stamped row is authoritative, and no terminal publication or replay is
-  // allowed until that value is exactly the expected worker principal.
-  async establishAuthenticatedPostingPrincipal(kind, subject, body) {
+  // Resolve the bearer at the server's worker-only identity boundary. This is intentionally fresh
+  // on every call: startup, reconciliation, and terminal delivery cannot rely on a prior local
+  // observation after the credential or server-side mapping may have changed.
+  async establishAuthenticatedPostingPrincipal() {
     const expected = this.expectedPostingPrincipal;
+    this.#authenticatedPostingPrincipal = null;
     if (typeof expected !== "string") {
       throw new Error("worker principal authentication requires an expected worker:<id> principal");
     }
-    if (this.#authenticatedPostingPrincipal !== null) {
-      throw new Error("worker posting principal is already authenticated");
+    const url = `${this.serverUrl}/v1/worker-principal`;
+    let response;
+    try {
+      response = await fetch(url, {
+        headers: { authorization: `Bearer ${this.token}` },
+        signal: AbortSignal.timeout(this.identityTimeoutMs),
+      });
+    } catch (error) {
+      throw new Error(`worker identity GET ${url} failed: ${error.message}`);
     }
-
-    const receipt = await this.post(kind, subject, body);
-    if (
-      !receipt
-      || typeof receipt.message_id !== "string"
-      || !receipt.message_id
-      || typeof receipt.ts !== "string"
-      || Number.isNaN(Date.parse(receipt.ts))
-    ) {
-      throw new Error("worker identity probe POST returned no valid server message id/timestamp");
+    if (!response.ok) {
+      throw new Error(`worker identity GET ${url} failed: ${response.status} ${await response.text()}`);
     }
-
-    const rows = [];
-    const messageIds = new Set();
-    let expectedTotal = null;
-    let offset = 0;
-    while (true) {
-      const url = new URL(`${this.serverUrl}/v1/messages`);
-      url.searchParams.set("from", expected);
-      url.searchParams.set("kind", kind);
-      url.searchParams.set("since", receipt.ts);
-      url.searchParams.set("limit", String(this.pageSize));
-      url.searchParams.set("offset", String(offset));
-      const response = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
-      if (!response.ok) {
-        throw new Error(`worker identity probe GET ${url} failed: ${response.status} ${await response.text()}`);
-      }
-      let payload;
-      try {
-        payload = await response.json();
-      } catch (error) {
-        throw new Error(`worker identity probe GET ${url} returned invalid JSON: ${error.message}`);
-      }
-      if (
-        !payload
-        || !Array.isArray(payload.messages)
-        || !Number.isInteger(payload.total)
-        || payload.total < 0
-        || !Number.isInteger(payload.limit)
-        || payload.limit !== this.pageSize
-        || !Number.isInteger(payload.offset)
-        || payload.offset !== offset
-        || payload.messages.length > payload.limit
-      ) {
-        throw new Error("worker identity probe GET response has an invalid or incomplete pagination shape");
-      }
-      if (expectedTotal === null) expectedTotal = payload.total;
-      else if (payload.total !== expectedTotal) {
-        throw new Error(`worker identity probe GET total changed during pagination (${expectedTotal} -> ${payload.total})`);
-      }
-
-      for (const raw of payload.messages) {
-        const message = normaliseMessage(raw);
-        if (
-          message === null
-          || !Object.hasOwn(raw, "from_agent")
-          || !Object.hasOwn(raw, "posted_by")
-          || !Object.hasOwn(raw, "to_agent")
-          || !Object.hasOwn(raw, "subject")
-          || !Object.hasOwn(raw, "body")
-          || message.from_agent !== expected
-          || message.kind !== kind
-          || typeof raw.posted_by !== "string"
-        ) {
-          throw new Error("worker identity probe GET returned a malformed or filter-inconsistent message");
-        }
-        if (messageIds.has(message.message_id)) {
-          throw new Error(`worker identity probe GET repeated message ${message.message_id}; pagination is incomplete`);
-        }
-        messageIds.add(message.message_id);
-        rows.push(message);
-      }
-
-      offset += payload.messages.length;
-      if (offset === expectedTotal) break;
-      if (offset > expectedTotal || payload.messages.length === 0) {
-        throw new Error(`worker identity probe GET ended at ${offset} of ${expectedTotal} messages`);
-      }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      throw new Error(`worker identity GET ${url} returned invalid JSON: ${error.message}`);
     }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error("worker identity GET response must be an object containing worker_principal");
+    }
+    const principal = payload.worker_principal;
+    if (typeof principal !== "string") {
+      throw new Error("worker identity GET response must contain a string worker_principal");
+    }
+    if (!WORKER_PRINCIPAL.test(principal)) {
+      throw new Error(`worker identity GET returned invalid worker principal ${principal}`);
+    }
+    if (principal !== expected) {
+      throw new Error(`worker bearer authenticates as ${principal}, but --id requires ${expected}`);
+    }
+    this.#authenticatedPostingPrincipal = principal;
+    return principal;
+  }
 
-    if (rows.length !== expectedTotal) {
-      throw new Error(`worker identity probe GET returned ${rows.length} unique messages for total ${expectedTotal}`);
+  configuredPrincipalForEntry(entry) {
+    const configured = entry?.configured_worker_principal ?? entry?.expected_posted_by;
+    if (typeof configured !== "string" || !WORKER_PRINCIPAL.test(configured)) {
+      throw new Error("pending terminal record has no configured worker-principal binding");
     }
-
-    const matches = rows.filter((message) => message.message_id === receipt.message_id);
-    if (matches.length !== 1) {
-      throw new Error(`worker identity probe expected one exact server row, found ${matches.length}`);
-    }
-    const [match] = matches;
-    if (
-      match.ts !== receipt.ts
-      || match.to_agent !== null
-      || match.subject !== subject
-      || match.body !== body
-    ) {
-      throw new Error("worker identity probe server row does not match the acknowledged startup post");
-    }
-    if (match.posted_by !== expected) {
+    if (configured !== this.expectedPostingPrincipal) {
       throw new Error(
-        `worker bearer authenticates as ${match.posted_by || "<missing>"}, but --id requires ${expected}`,
+        `pending terminal record belongs to ${configured}, configured worker is ${this.expectedPostingPrincipal ?? "unbound"}`,
       );
     }
-    if (!WORKER_PRINCIPAL.test(match.posted_by)) {
-      throw new Error(`worker identity probe returned invalid authenticated principal ${match.posted_by}`);
-    }
-    this.#authenticatedPostingPrincipal = match.posted_by;
-    return match.posted_by;
+    return configured;
   }
 
   // Classify whether the exact terminal effect represented by an outbox entry is already visible
@@ -280,13 +224,11 @@ export class BusClient {
   // offset scan is not evidence of absence, so response-shape, total, offset and duplicate-id
   // inconsistencies are hard errors; replay retains the entry and posts nothing on any such error.
   async findTerminalDeliveries(entry) {
-    const expectedPostedBy = entry?.expected_posted_by;
-    if (typeof expectedPostedBy !== "string" || !WORKER_PRINCIPAL.test(expectedPostedBy)) {
-      throw new Error("pending terminal record has no authenticated posting-principal binding");
-    }
-    if (this.#authenticatedPostingPrincipal !== expectedPostedBy) {
+    this.configuredPrincipalForEntry(entry);
+    const expectedPostedBy = await this.establishAuthenticatedPostingPrincipal();
+    if (entry?.expected_posted_by !== undefined && entry.expected_posted_by !== expectedPostedBy) {
       throw new Error(
-        `pending terminal record belongs to ${expectedPostedBy}, authenticated worker is ${this.#authenticatedPostingPrincipal ?? "unbound"}`,
+        `pending terminal record was posted by ${entry.expected_posted_by}, authenticated worker is ${expectedPostedBy}`,
       );
     }
 
@@ -385,7 +327,7 @@ export class BusClient {
     }
     const url = `${this.serverUrl}/v1/messages`;
     const payload = { kind, subject, body };
-    const fromAgent = this.#authenticatedPostingPrincipal ?? this.expectedPostingPrincipal;
+    const fromAgent = this.#authenticatedPostingPrincipal;
     if (fromAgent !== null) payload.from_agent = fromAgent;
     if (options.outcome !== undefined) payload.outcome = options.outcome;
     if (options.refs !== undefined) payload.refs = options.refs;
@@ -400,6 +342,20 @@ export class BusClient {
     return text ? JSON.parse(text) : undefined;
   }
 
+  async deliverPendingTerminal(entry) {
+    this.configuredPrincipalForEntry(entry);
+    const principal = await this.establishAuthenticatedPostingPrincipal();
+    if (entry?.expected_posted_by !== undefined && entry.expected_posted_by !== principal) {
+      throw new Error(
+        `pending terminal record was posted by ${entry.expected_posted_by}, authenticated worker is ${principal}`,
+      );
+    }
+    if (entry?.expected_posted_by === undefined) {
+      bindPendingPrincipal(entry.id, principal, this.outboxDir);
+    }
+    return this.post(entry.kind, entry.subject, entry.body, entry.options ?? {});
+  }
+
   // The ONLY sanctioned way to announce that a task has ended. Requires the typed outcome, so a
   // terminal record cannot be posted without one by construction rather than by convention.
   async postTerminal(kind, subject, body, options = {}) {
@@ -408,8 +364,8 @@ export class BusClient {
         `a terminal record must carry a typed outcome (${[...TERMINAL_OUTCOMES].join(", ")}); got ${options.outcome}`,
       );
     }
-    if (typeof this.#authenticatedPostingPrincipal !== "string") {
-      throw new Error("terminal posts require an authenticated worker posting-principal binding");
+    if (typeof this.expectedPostingPrincipal !== "string") {
+      throw new Error("terminal posts require a configured worker-principal binding");
     }
     // RECORDED BEFORE THE ATTEMPT, cleared only after it succeeds or an exact
     // server-stamped delivery is reconciled. The worker transitions its
@@ -423,8 +379,10 @@ export class BusClient {
       subject,
       body,
       options,
-      expected_posted_by: this.#authenticatedPostingPrincipal,
+      configured_worker_principal: this.expectedPostingPrincipal,
     }, this.outboxDir);
+    const principal = await this.establishAuthenticatedPostingPrincipal();
+    bindPendingPrincipal(pendingId, principal, this.outboxDir);
     const result = await this.post(kind, subject, body, options);
     clearPending(pendingId, this.outboxDir);
     return result;

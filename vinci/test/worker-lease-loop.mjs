@@ -1176,6 +1176,7 @@ function declarationPosts(fixture, workerId) {
 
 // A daemon (no --once) so the interval can actually fire.
 function spawnDaemon(fixture, workerId, extraArgs, envOverrides = {}) {
+  fixture.busPrincipal = `worker:${workerId}`;
   const env = fixture.getEnv({ VINCI_GOVERNOR_TOKEN: 'gov-token', ...envOverrides });
   const proc = spawn('node', [WORKER, 'start', '--id', workerId, '--server', fixture.busUrl(), '--state-dir', fixture.tempDir, ...extraArgs], { env, stdio: 'pipe' });
   let stderr = '';
