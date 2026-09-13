@@ -89,6 +89,7 @@ class TerminalBusFixture {
     this.droppedAck = false;
     this.breakSecondPage = false;
     this.identityReadbackTransform = null;
+    this.terminalReadbackTransform = null;
     this.afterMessageGet = null;
     this.server = null;
     this.url = null;
@@ -139,6 +140,9 @@ class TerminalBusFixture {
         let page = this.breakSecondPage && offset > 0 ? [] : filtered.slice(offset, offset + limit);
         if (this.identityReadbackTransform !== null && fromAgent !== null && since !== null) {
           page = page.map((message) => this.identityReadbackTransform({ ...message }));
+        }
+        if (this.terminalReadbackTransform !== null && postedBy !== null && kind !== null) {
+          page = page.map((message) => this.terminalReadbackTransform({ ...message }));
         }
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({ messages: page, total: filtered.length, limit, offset }));
@@ -432,6 +436,53 @@ for (const variant of [
     assert.equal(terminalRequests.length, 1, "canonical reconciliation must not append a duplicate");
     assert.equal(fixture.posts.length, 1);
     assert.equal(listPending(join(dir, "outbox")).length, 0);
+  });
+}
+
+for (const malformedBody of [123, true, { unexpected: "object" }, ["unexpected array"]]) {
+  test(`malformed terminal reconciliation body ${JSON.stringify(malformedBody)} cannot erase pending evidence`, async (t) => {
+    const dir = scratch("malformed-body");
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const fixture = new TerminalBusFixture([
+      terminalRow("msg_different_body", { body: "DIFFERENT NONEMPTY BODY" }),
+    ]);
+    fixture.terminalReadbackTransform = (message) => ({ ...message, body: malformedBody });
+    await fixture.start();
+    t.after(() => fixture.close());
+    recordPending({ ...TERMINAL, body: " \n\u0085" }, join(dir, "outbox"));
+    const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+
+    const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+    assert.equal(summary.failed, 1);
+    assert.equal(summary.reconciled, 0);
+    assert.equal(summary.delivered, 0);
+    assert.equal(fixture.messagePostRequests.length, 0, "a malformed readback cannot authorize a POST or deletion");
+    assert.equal(fixture.messages.length, 1);
+    assert.equal(fixture.messages[0].body, "DIFFERENT NONEMPTY BODY");
+    assert.equal(listPending(join(dir, "outbox")).length, 1);
+  });
+}
+
+for (const malformedSubject of [123, true, { unexpected: "object" }, ["unexpected array"]]) {
+  test(`malformed terminal reconciliation subject ${JSON.stringify(malformedSubject)} fails closed`, async (t) => {
+    const dir = scratch("malformed-subject");
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const fixture = new TerminalBusFixture([terminalRow("msg_exact_with_malformed_readback")]);
+    fixture.terminalReadbackTransform = (message) => ({ ...message, subject: malformedSubject });
+    await fixture.start();
+    t.after(() => fixture.close());
+    recordTerminal(dir);
+    const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+
+    const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+    assert.equal(summary.failed, 1);
+    assert.equal(summary.reconciled, 0);
+    assert.equal(summary.delivered, 0);
+    assert.equal(fixture.messagePostRequests.length, 0, "malformed readback must not downgrade to publication");
+    assert.equal(fixture.messages.length, 1);
+    assert.equal(listPending(join(dir, "outbox")).length, 1);
   });
 }
 

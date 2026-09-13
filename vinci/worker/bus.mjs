@@ -373,16 +373,24 @@ export class BusClient {
       }
 
       for (const raw of payload.messages) {
-        const message = normaliseMessage(raw);
         if (
-          message === null
+          !raw
+          || typeof raw !== "object"
           || !Object.hasOwn(raw, "posted_by")
           || !Object.hasOwn(raw, "to_agent")
           || !Object.hasOwn(raw, "subject")
           || !Object.hasOwn(raw, "body")
+          || typeof raw.subject !== "string"
+          || (raw.body !== null && typeof raw.body !== "string")
           || !Object.hasOwn(raw, "outcome")
           || !Object.hasOwn(raw, "in_reply_to")
           || !Object.hasOwn(raw, "refs")
+        ) {
+          throw new Error("terminal reconciliation GET returned a malformed or filter-inconsistent message");
+        }
+        const message = normaliseMessage(raw);
+        if (
+          message === null
           || message.posted_by !== expectedPostedBy
           || message.kind !== canonicalEntry.kind
           || typeof message.subject !== "string"
