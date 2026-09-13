@@ -287,6 +287,10 @@ export class WorkerTestFixture {
     this.versionRequests = 0;
     this.busServer = null;
     this.busPort = 0;
+    // Tests that attack credential/--id binding may set these before startBus. Ordinary worker
+    // fixtures model the correctly provisioned worker token by stamping the supplied worker name.
+    this.busPrincipal = null;
+    this.busPrincipalRole = "worker";
     mkdirSync(this.reposDir, { recursive: true });
   }
 
@@ -412,7 +416,15 @@ process.exit(r.status ?? 1);
         const limit = Number(url.searchParams.get("limit") ?? 100);
         const offset = Number(url.searchParams.get("offset") ?? 0);
         this.getRequests.push({ limit, offset });
+        const fromAgent = url.searchParams.get("from");
+        const kind = url.searchParams.get("kind");
+        const since = url.searchParams.get("since");
+        const postedBy = url.searchParams.get("posted_by");
         const messages = this.busMessages
+          .filter((message) => fromAgent === null || message.from_agent === fromAgent)
+          .filter((message) => kind === null || message.kind === kind)
+          .filter((message) => since === null || message.ts >= since)
+          .filter((message) => postedBy === null || message.posted_by === postedBy)
           .slice()
           .sort((left, right) => left.ts.localeCompare(right.ts) || left.message_id.localeCompare(right.message_id));
         response.writeHead(200, { "content-type": "application/json" });
@@ -427,6 +439,17 @@ process.exit(r.status ?? 1);
         });
         request.on("end", () => {
           const message = JSON.parse(body);
+          const authenticatedPrincipal = this.busPrincipal ?? message.from_agent;
+          if (
+            this.busPrincipalRole === "worker"
+            && message.from_agent !== undefined
+            && message.from_agent !== authenticatedPrincipal
+          ) {
+            this.rejectedPosts.push(message);
+            response.writeHead(400, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: "from_agent must match authenticated worker principal" }));
+            return;
+          }
           const invalidRefs = (message.refs ?? []).filter((ref) => !LEDGER_REF.test(ref));
           if (invalidRefs.length > 0) {
             this.rejectedPosts.push(message);
@@ -440,9 +463,25 @@ process.exit(r.status ?? 1);
             response.end(JSON.stringify({ error: "fixture: post refused" }));
             return;
           }
+          const record = {
+            message_id: `msg_fixture_${this.postedMessages.length + 1}`,
+            ts: new Date().toISOString(),
+            from_agent: this.busPrincipalRole === "worker" ? authenticatedPrincipal : message.from_agent,
+            posted_by: authenticatedPrincipal,
+            to_agent: message.to_agent ?? null,
+            kind: message.kind,
+            subject: message.subject ?? "",
+            body: message.body ?? "",
+            outcome: message.outcome ?? null,
+            in_reply_to: message.in_reply_to ?? null,
+            refs: message.refs ?? [],
+          };
+          // Preserve the existing fixture contract: assertions over postedMessages inspect the
+          // client payload. busMessages models the server's durable, authenticated representation.
           this.postedMessages.push(message);
+          this.busMessages.push(record);
           response.writeHead(200, { "content-type": "application/json" });
-          response.end(JSON.stringify({ ok: true }));
+          response.end(JSON.stringify({ message_id: record.message_id, ts: record.ts }));
         });
         return;
       }

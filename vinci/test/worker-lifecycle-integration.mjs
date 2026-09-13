@@ -29,6 +29,16 @@ function envelope(overrides = {}) {
 async function fakeBus(body) {
   const posts = [];
   const onlinePosts = [];
+  const messages = [{
+    message_id: "1",
+    to_agent: "worker:t1",
+    kind: "handoff",
+    subject: "lifecycle task",
+    body,
+    ts: "2026-08-26T10:00:00Z",
+    posted_by: "scheduler",
+  }];
+  let nextMessage = 2;
   const server = createServer((request, response) => {
     // W0.5: GET /v1/version is unauthenticated by contract; this bus does not serve it, so the
     // daemon records `server_build={error}` and still starts.
@@ -39,20 +49,22 @@ async function fakeBus(body) {
     }
     assert.equal(request.headers.authorization, "Bearer test-token");
     if (request.method === "GET" && request.url?.startsWith("/v1/messages")) {
+      const url = new URL(request.url, "http://fixture.invalid");
+      const fromAgent = url.searchParams.get("from");
+      const kind = url.searchParams.get("kind");
+      const since = url.searchParams.get("since");
+      const limit = Number(url.searchParams.get("limit") ?? 100);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      const filtered = messages.filter((message) =>
+        (fromAgent === null || message.from_agent === fromAgent)
+        && (kind === null || message.kind === kind)
+        && (since === null || message.ts >= since));
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify({
-        messages: [{
-          message_id: "1",
-          to_agent: "worker:t1",
-          kind: "handoff",
-          subject: "lifecycle task",
-          body,
-          ts: "2026-08-26T10:00:00Z",
-          posted_by: "scheduler",
-        }],
-        total: 1,
-        limit: 100,
-        offset: 0,
+        messages: filtered.slice(offset, offset + limit),
+        total: filtered.length,
+        limit,
+        offset,
       }));
       return;
     }
@@ -64,12 +76,26 @@ async function fakeBus(body) {
       });
       request.on("end", () => {
         const post = JSON.parse(raw);
+        const row = {
+          message_id: String(nextMessage++),
+          ts: new Date().toISOString(),
+          from_agent: "worker:t1",
+          posted_by: "worker:t1",
+          to_agent: null,
+          kind: post.kind,
+          subject: post.subject ?? "",
+          body: post.body ?? "",
+          outcome: post.outcome ?? null,
+          in_reply_to: post.in_reply_to ?? null,
+          refs: post.refs ?? [],
+        };
+        messages.push(row);
         // The per-start `worker <id> online` status (W0.5) is not a task post; keep the
         // per-task kind sequences below exact by recording it separately.
         if (/ online$/.test(post.subject)) onlinePosts.push(post);
         else posts.push(post);
         response.setHeader("content-type", "application/json");
-        response.end("{}");
+        response.end(JSON.stringify({ message_id: row.message_id, ts: row.ts }));
       });
       return;
     }

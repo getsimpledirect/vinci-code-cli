@@ -55,13 +55,16 @@ function terminalRow(id, overrides = {}) {
 }
 
 class TerminalBusFixture {
-  constructor(messages = []) {
+  constructor(messages = [], { authenticatedPrincipal = POSTED_BY, principalRole = "worker" } = {}) {
     this.messages = messages.slice();
     this.posts = [];
     this.nextId = 1;
+    this.authenticatedPrincipal = authenticatedPrincipal;
+    this.principalRole = principalRole;
     this.dropAckSubject = null;
     this.droppedAck = false;
     this.breakSecondPage = false;
+    this.identityReadbackTransform = null;
     this.server = null;
     this.url = null;
     this.terminalCommitted = null;
@@ -87,12 +90,19 @@ class TerminalBusFixture {
       if (request.method === "GET" && url.pathname === "/v1/messages") {
         const limit = Number(url.searchParams.get("limit") ?? 100);
         const offset = Number(url.searchParams.get("offset") ?? 0);
+        const fromAgent = url.searchParams.get("from");
         const postedBy = url.searchParams.get("posted_by");
         const kind = url.searchParams.get("kind");
+        const since = url.searchParams.get("since");
         const filtered = this.messages.filter((message) =>
-          (postedBy === null || message.posted_by === postedBy)
-          && (kind === null || message.kind === kind));
-        const page = this.breakSecondPage && offset > 0 ? [] : filtered.slice(offset, offset + limit);
+          (fromAgent === null || message.from_agent === fromAgent)
+          && (postedBy === null || message.posted_by === postedBy)
+          && (kind === null || message.kind === kind)
+          && (since === null || message.ts >= since));
+        let page = this.breakSecondPage && offset > 0 ? [] : filtered.slice(offset, offset + limit);
+        if (this.identityReadbackTransform !== null && fromAgent !== null && since !== null) {
+          page = page.map((message) => this.identityReadbackTransform({ ...message }));
+        }
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({ messages: page, total: filtered.length, limit, offset }));
         return;
@@ -103,11 +113,20 @@ class TerminalBusFixture {
         request.on("data", (chunk) => { raw += chunk; });
         request.on("end", () => {
           const payload = JSON.parse(raw);
+          if (
+            this.principalRole === "worker"
+            && payload.from_agent !== undefined
+            && payload.from_agent !== this.authenticatedPrincipal
+          ) {
+            response.writeHead(400, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: "from_agent must match authenticated worker principal" }));
+            return;
+          }
           const row = {
             message_id: `msg_server_${this.nextId++}`,
             ts: new Date().toISOString(),
-            from_agent: POSTED_BY,
-            posted_by: POSTED_BY,
+            from_agent: this.principalRole === "worker" ? this.authenticatedPrincipal : payload.from_agent,
+            posted_by: this.authenticatedPrincipal,
             to_agent: payload.to_agent ?? null,
             kind: payload.kind,
             subject: payload.subject ?? "",
@@ -125,7 +144,7 @@ class TerminalBusFixture {
             return;
           }
           response.writeHead(201, { "content-type": "application/json" });
-          response.end(JSON.stringify({ message_id: row.message_id }));
+          response.end(JSON.stringify({ message_id: row.message_id, ts: row.ts }));
         });
         return;
       }
@@ -149,6 +168,16 @@ function scratch(name) {
 
 function recordTerminal(dir) {
   return recordPending(TERMINAL, join(dir, "outbox"));
+}
+
+async function authenticatedBus(fixture, dir, pageSize = 100) {
+  const bus = new BusClient(fixture.url, "test-token", pageSize, join(dir, "outbox"), POSTED_BY);
+  await bus.establishAuthenticatedPostingPrincipal("status", `worker ${WORKER_ID} online`, "identity probe");
+  return bus;
+}
+
+function terminalPostCount(fixture) {
+  return fixture.posts.filter((row) => row.subject === TERMINAL.subject).length;
 }
 
 function runWorker(launcher, serverUrl, stateDir, { once = true } = {}) {
@@ -214,13 +243,46 @@ test("same from_agent with the wrong server-stamped posted_by does not reconcile
   t.after(() => fixture.close());
   recordTerminal(dir);
 
-  const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+  const bus = await authenticatedBus(fixture, dir);
   const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
 
   assert.equal(summary.reconciled, 0);
   assert.equal(summary.delivered, 1, "wrong authenticated provenance is cardinality zero");
-  assert.equal(fixture.posts.filter((row) => row.subject === TERMINAL.subject).length, 1);
+  assert.equal(terminalPostCount(fixture), 1);
   assert.equal(listPending(join(dir, "outbox")).length, 0);
+});
+
+test("identity binding selects the exact acknowledged row and refuses missing stamped provenance", async (t) => {
+  const dir = scratch("identity-readback");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture();
+  await fixture.start();
+  t.after(() => fixture.close());
+  const bus = await authenticatedBus(fixture, dir, 1);
+  assert.equal(bus.authenticatedPostingPrincipal, POSTED_BY);
+
+  const refusedDir = scratch("identity-missing-stamp");
+  t.after(() => rmSync(refusedDir, { recursive: true, force: true }));
+  const malformed = new TerminalBusFixture();
+  malformed.identityReadbackTransform = (message) => {
+    delete message.posted_by;
+    return message;
+  };
+  await malformed.start();
+  t.after(() => malformed.close());
+  const unbound = new BusClient(malformed.url, "test-token", 1, join(refusedDir, "outbox"), POSTED_BY);
+
+  await assert.rejects(
+    () => unbound.establishAuthenticatedPostingPrincipal("status", `worker ${WORKER_ID} online`, "identity probe"),
+    /malformed or filter-inconsistent/,
+  );
+  assert.equal(unbound.authenticatedPostingPrincipal, null);
+  await assert.rejects(
+    () => unbound.postTerminal("status", TERMINAL.subject, TERMINAL.body, TERMINAL.options),
+    /authenticated worker posting-principal binding/,
+  );
+  assert.equal(listPending(join(refusedDir, "outbox")).length, 0);
+  assert.equal(terminalPostCount(malformed), 0);
 });
 
 test("two exact server-stamped rows are a retained duplicate condition with no third POST", async (t) => {
@@ -234,13 +296,13 @@ test("two exact server-stamped rows are a retained duplicate condition with no t
   t.after(() => fixture.close());
   recordTerminal(dir);
 
-  const bus = new BusClient(fixture.url, "test-token", 1, join(dir, "outbox"), POSTED_BY);
+  const bus = await authenticatedBus(fixture, dir, 1);
   const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
 
   assert.equal(summary.duplicate, 1);
   assert.equal(summary.conditions[0].type, DUPLICATE_DELIVERY);
   assert.equal(summary.conditions[0].exact_match_count, 2);
-  assert.equal(fixture.posts.length, 0, "duplicate detection must not append a third row");
+  assert.equal(terminalPostCount(fixture), 0, "duplicate detection must not append a third row");
   assert.equal(listPending(join(dir, "outbox"))[0].entry.delivery_condition.type, DUPLICATE_DELIVERY);
 });
 
@@ -260,12 +322,12 @@ test("a near match and a later exact match are distinguished across complete pag
   t.after(() => fixture.close());
   recordTerminal(dir);
 
-  const bus = new BusClient(fixture.url, "test-token", 1, join(dir, "outbox"), POSTED_BY);
+  const bus = await authenticatedBus(fixture, dir, 1);
   const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
 
   assert.equal(summary.reconciled, 1);
   assert.equal(summary.delivered, 0);
-  assert.equal(fixture.posts.length, 0);
+  assert.equal(terminalPostCount(fixture), 0);
   assert.equal(listPending(join(dir, "outbox")).length, 0);
 });
 
@@ -281,13 +343,45 @@ test("premature pagination is incomplete observation: retain pending and POST ze
   t.after(() => fixture.close());
   recordTerminal(dir);
 
-  const bus = new BusClient(fixture.url, "test-token", 1, join(dir, "outbox"), POSTED_BY);
+  const bus = await authenticatedBus(fixture, dir, 1);
   const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
 
   assert.equal(summary.failed, 1);
-  assert.equal(fixture.posts.length, 0);
+  assert.equal(terminalPostCount(fixture), 0);
   assert.equal(listPending(join(dir, "outbox")).length, 1);
 });
+
+for (const mismatch of [
+  { name: "wrong worker", authenticatedPrincipal: "worker:other", principalRole: "worker" },
+  { name: "admin", authenticatedPrincipal: "george", principalRole: "admin" },
+  { name: "collector", authenticatedPrincipal: "collector:ci", principalRole: "collector" },
+]) {
+  test(`${mismatch.name} bearer is refused before terminal replay`, async (t) => {
+    const dir = scratch(`identity-${mismatch.principalRole}`);
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    mkdirSync(join(dir, "home"), { recursive: true });
+    recordTerminal(dir);
+    const fixture = new TerminalBusFixture([], mismatch);
+    await fixture.start();
+    t.after(() => fixture.close());
+    const launcher = resolve(process.env.VINCI_TEST_WORKER_LAUNCHER ?? join(ROOT, "vinci/bin/vinci"));
+
+    const run = runWorker(launcher, fixture.url, dir);
+    const exit = await waitForExit(run.child);
+
+    assert.equal(exit.code, 1, run.stderr());
+    assert.equal(terminalPostCount(fixture), 0, "identity refusal must occur before terminal replay");
+    assert.equal(listPending(join(dir, "outbox")).length, 1, "identity refusal must retain terminal debt");
+    if (mismatch.principalRole === "worker") {
+      assert.match(run.stderr(), /from_agent must match authenticated worker principal/);
+      assert.equal(fixture.posts.length, 0, "a wrong worker bearer must be rejected at POST");
+    } else {
+      assert.match(run.stderr(), /bearer authenticates as .*--id requires worker:lane-b-worker/);
+      assert.equal(fixture.posts.length, 1, "non-worker bearer may author only the startup probe before refusal");
+      assert.equal(fixture.posts[0].posted_by, mismatch.authenticatedPrincipal);
+    }
+  });
+}
 
 test("installed worker survives commit-then-ACK-loss and process loss without a duplicate", async (t) => {
   const dir = scratch("installed-restart");

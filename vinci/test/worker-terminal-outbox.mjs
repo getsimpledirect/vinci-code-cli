@@ -20,6 +20,7 @@ import {
   DEFAULT_OUTBOX_DIR,
   DUPLICATE_DELIVERY,
   listPending,
+  recordPending,
   replayPending,
 } from "../worker/outbox.mjs";
 
@@ -32,27 +33,32 @@ function unreachableBus(dir) {
   return new BusClient("http://127.0.0.1:9/nope", "t", 100, dir, "worker:test");
 }
 
-test("a terminal post that FAILS leaves a durable record", async () => {
+function recordTerminal(dir, subject, outcome, inReplyTo = null) {
+  return recordPending({
+    kind: "status",
+    subject,
+    body: "body",
+    options: { outcome, ...(inReplyTo === null ? {} : { inReplyTo }) },
+    expected_posted_by: "worker:test",
+  }, dir);
+}
+
+test("a terminal post without authenticated server provenance writes nothing", async () => {
   const dir = join(scratch(), "outbox");
   const bus = unreachableBus(dir);
   await assert.rejects(
     () => bus.postTerminal("status", "task X failed", "body", { outcome: "FAILED" }),
+    /authenticated worker posting-principal binding/,
   );
-  const pending = listPending(dir);
-  assert.equal(pending.length, 1, "the undelivered terminal must be on disk");
-  assert.equal(pending[0].entry.options.outcome, "FAILED");
-  assert.equal(pending[0].entry.subject, "task X failed");
-  assert.equal(pending[0].entry.kind, "status");
-  assert.equal(pending[0].entry.expected_posted_by, "worker:test");
+  assert.equal(listPending(dir).length, 0, "a client-configured worker id is not authenticated provenance");
 });
 
-test("a terminal post that SUCCEEDS leaves nothing behind", async () => {
+test("a pending terminal record carries the authenticated principal binding", () => {
   const dir = join(scratch(), "outbox");
-  const bus = unreachableBus(dir);
-  // Replace the transport, keeping postTerminal's own logic under test.
-  bus.post = async () => ({ ok: true });
-  await bus.postTerminal("status", "task Y done", "body", { outcome: "COMPLETED" });
-  assert.equal(listPending(dir).length, 0, "a delivered record must not linger");
+  recordTerminal(dir, "task Y done", "COMPLETED");
+  const [pending] = listPending(dir);
+  assert.equal(pending.entry.expected_posted_by, "worker:test");
+  assert.equal(pending.entry.options.outcome, "COMPLETED");
 });
 
 test("an invalid outcome is refused BEFORE anything is written", async () => {
@@ -69,9 +75,8 @@ test("an invalid outcome is refused BEFORE anything is written", async () => {
 
 test("replay delivers what was undelivered, then clears it", async () => {
   const dir = join(scratch(), "outbox");
-  const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "s1", "b", { outcome: "BLOCKED" }));
-  await assert.rejects(() => bus.postTerminal("status", "s2", "b", { outcome: "UNVERIFIED" }));
+  recordTerminal(dir, "s1", "BLOCKED");
+  recordTerminal(dir, "s2", "UNVERIFIED");
   assert.equal(listPending(dir).length, 2);
 
   const delivered = [];
@@ -89,8 +94,7 @@ test("replay delivers what was undelivered, then clears it", async () => {
 
 test("replay that STILL fails keeps the record rather than dropping it", async () => {
   const dir = join(scratch(), "outbox");
-  const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "s", "b", { outcome: "FAILED" }));
+  recordTerminal(dir, "s", "FAILED");
 
   const stillBroken = {
     findTerminalDeliveries: async () => [],
@@ -107,8 +111,7 @@ test("a corrupt record is reported, never silently dropped", async () => {
   // A record we cannot read is still evidence that something terminal went
   // unannounced. Deleting it would destroy the only trace.
   const dir = join(scratch(), "outbox");
-  const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "s", "b", { outcome: "FAILED" }));
+  recordTerminal(dir, "s", "FAILED");
   const [name] = readdirSync(dir);
   writeFileSync(join(dir, name), "{ this is not json");
 
@@ -130,7 +133,7 @@ test("the bus records into ITS OWN directory, not the process cwd", async () => 
   // replayed from another is an inert fix that looks like a working one.
   const dir = join(scratch(), "outbox");
   const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "s", "b", { outcome: "FAILED" }));
+  recordTerminal(bus.outboxDir, "s", "FAILED");
   assert.equal(bus.outboxDir, dir);
   assert.equal(listPending(dir).length, 1);
   assert.notEqual(dir, DEFAULT_OUTBOX_DIR);
@@ -138,11 +141,7 @@ test("the bus records into ITS OWN directory, not the process cwd", async () => 
 
 test("one exact committed row reconciles ACK loss without a second POST", async () => {
   const dir = join(scratch(), "outbox");
-  const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "task exact done", "body", {
-    outcome: "COMPLETED",
-    inReplyTo: "msg_exact",
-  }));
+  recordTerminal(dir, "task exact done", "COMPLETED", "msg_exact");
 
   let posts = 0;
   const summary = await replayPending({
@@ -159,11 +158,7 @@ test("one exact committed row reconciles ACK loss without a second POST", async 
 
 test("two exact committed rows preserve a typed duplicate condition and post no third row", async () => {
   const dir = join(scratch(), "outbox");
-  const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "task duplicate done", "body", {
-    outcome: "COMPLETED",
-    inReplyTo: "msg_duplicate",
-  }));
+  recordTerminal(dir, "task duplicate done", "COMPLETED", "msg_duplicate");
 
   let posts = 0;
   const errors = [];
@@ -186,11 +181,7 @@ test("two exact committed rows preserve a typed duplicate condition and post no 
 
 test("reconciliation failure retains the entry and posts nothing", async () => {
   const dir = join(scratch(), "outbox");
-  const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "task uncertain", "body", {
-    outcome: "FAILED",
-    inReplyTo: "msg_uncertain",
-  }));
+  recordTerminal(dir, "task uncertain", "FAILED", "msg_uncertain");
 
   let posts = 0;
   const summary = await replayPending({
@@ -206,10 +197,7 @@ test("reconciliation failure retains the entry and posts nothing", async () => {
 test("a legacy pending record without authenticated provenance is retained, never adopted", async () => {
   const dir = join(scratch(), "outbox");
   const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "legacy", "body", {
-    outcome: "FAILED",
-    inReplyTo: "msg_legacy",
-  }));
+  recordTerminal(dir, "legacy", "FAILED", "msg_legacy");
   const [pending] = listPending(dir);
   delete pending.entry.expected_posted_by;
   writeFileSync(pending.path, JSON.stringify(pending.entry));
@@ -225,10 +213,7 @@ test("a legacy pending record without authenticated provenance is retained, neve
 test("a pending record bound to another worker principal is retained", async () => {
   const dir = join(scratch(), "outbox");
   const bus = unreachableBus(dir);
-  await assert.rejects(() => bus.postTerminal("status", "other worker", "body", {
-    outcome: "FAILED",
-    inReplyTo: "msg_other",
-  }));
+  recordTerminal(dir, "other worker", "FAILED", "msg_other");
   const [pending] = listPending(dir);
   pending.entry.expected_posted_by = "worker:somebody-else";
   writeFileSync(pending.path, JSON.stringify(pending.entry));
