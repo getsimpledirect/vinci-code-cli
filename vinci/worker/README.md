@@ -540,6 +540,31 @@ configured nothing changes (no downgrade), so soak boxes may run without it.
 - If `terminal=true`: skip (already done)
 - If `terminal=false` (`PENDING`/`RUNNING`): increment `attempt`, keep same `session_id`, resume
 
+### Terminal outbox reconciliation
+
+The lifecycle transition and the terminal bus POST are not atomic. Before every terminal POST,
+the worker writes the exact payload plus the expected authenticated worker principal to
+`<state-dir>/outbox/`. It removes that record only after the POST is acknowledged. On startup,
+after taking the state-directory daemon lock and before polling new work, the worker settles each
+pending record against `GET /v1/messages`:
+
+- The lookup is filtered and rechecked against the server-stamped `posted_by=worker:<id>`.
+  `from_agent` is never accepted as authenticated provenance.
+- Kind, subject, body, outcome, `in_reply_to`, refs, and broadcast recipient must all match exactly.
+  The contract/economics/evidence fields in the body therefore remain bound to the same handoff and
+  artifact set; the economics digest binds the attempt label in `economics-summary.json`.
+- Zero exact matches proves the effect is unobserved, so the worker POSTs once and clears only after
+  the acknowledgement. One exact match is the commit-then-ACK-loss case and clears without POSTing.
+- More than one exact match is `duplicate_terminal_delivery`: the worker POSTs no additional row,
+  retains the outbox entry, persists the typed condition and matching message ids, and reports it.
+- A failed, malformed, changing, repeated, or prematurely-ended pagination scan is not proof of
+  absence. The worker retains the entry and POSTs nothing.
+
+Records written by a pre-reconciliation worker do not carry `expected_posted_by`. They are retained
+and reported as unbound rather than replayed under an identity the original record did not prove.
+This is process-loss safety for one state directory under its daemon lock, not server-wide atomic
+idempotency for copied outboxes or independently running workers.
+
 ## Credentials
 
 - `VINCI_BUS_TOKEN`: Bearer auth to bus (/v1/messages)
@@ -566,6 +591,7 @@ No new npm dependencies introduced; uses only node:* and global APIs.
 ```
 <state-dir>/
   cursor.json                    # High-water mark per worker
+  outbox/*.json                  # pending terminal effects and retained duplicate conditions
   tasks/
     <id>.json                    # Lifecycle record
   sessions/<id>/                 # vinci JSONL read for outcomes and usage (outside every tree)
