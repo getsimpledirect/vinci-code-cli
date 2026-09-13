@@ -51,6 +51,14 @@ export function clearPending(id, dir = DEFAULT_OUTBOX_DIR) {
   if (existsSync(path)) rmSync(path);
 }
 
+export function bindPendingPrincipal(id, principal, dir = DEFAULT_OUTBOX_DIR) {
+  const path = join(dir, `${id}.json`);
+  const entry = JSON.parse(readFileSync(path, "utf8"));
+  const temporary = `${path}.tmp-${process.pid}`;
+  writeFileSync(temporary, JSON.stringify({ ...entry, expected_posted_by: principal }));
+  renameSync(temporary, path);
+}
+
 function preserveDeliveryCondition(path, entry, condition) {
   const temporary = `${path}.tmp-${process.pid}`;
   writeFileSync(temporary, JSON.stringify({ ...entry, delivery_condition: condition }));
@@ -97,7 +105,7 @@ export async function replayPending(bus, dir = DEFAULT_OUTBOX_DIR, log = console
     }
     summary.attempted += 1;
     try {
-      if (typeof bus.findTerminalDeliveries !== "function") {
+      if (typeof bus.findTerminalDeliveries !== "function" || typeof bus.deliverPendingTerminal !== "function") {
         throw new Error("bus does not support interruption-safe terminal reconciliation");
       }
       const matches = await bus.findTerminalDeliveries(entry);
@@ -125,7 +133,7 @@ export async function replayPending(bus, dir = DEFAULT_OUTBOX_DIR, log = console
         );
         continue;
       }
-      await bus.post(entry.kind, entry.subject, entry.body, entry.options ?? {});
+      await bus.deliverPendingTerminal(entry);
       rmSync(path);
       summary.delivered += 1;
       log.warn(`worker outbox: delivered previously unobserved terminal record ${entry.id} (${entry.options?.outcome})`);

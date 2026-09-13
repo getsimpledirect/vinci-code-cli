@@ -1699,12 +1699,11 @@ async function main() {
     serverBuild = await fetchServerBuild(options.server);
     // #18: and the version of the `vinci` binary this daemon will spawn (never fatal either).
     vinciBinary = vinciBinaryVersion();
-    // The configured --id is only an expectation. Round-trip this existing startup row and accept
-    // identity solely from the server-stamped `posted_by` before replaying a terminal debt or
-    // publishing any new terminal. A wrong worker token is rejected by the server's from_agent
-    // check; an admin/collector token may author that name, but its stamped principal still differs
-    // and is refused by the readback.
-    await bus.establishAuthenticatedPostingPrincipal(
+    // The configured --id is only an expectation. Resolve the bearer at the server's worker-only
+    // identity boundary before any publication or terminal reconciliation; no declared or locally
+    // persisted identity is accepted as a fallback.
+    await bus.establishAuthenticatedPostingPrincipal();
+    await bus.post(
       "status",
       `worker ${options.id} online`,
       `worker_build=${formatWorkerBuild(workerBuild)} worker_version=${version} server_build=${formatServerBuild(serverBuild)} vinci_binary=${formatVinciBinary(vinciBinary)} branch_lease=${process.env.VINCI_BRANCH_LEASE === "1" ? "on" : "off"} allowed_providers=${[...options.allowedProviders].sort().join(",")}`,

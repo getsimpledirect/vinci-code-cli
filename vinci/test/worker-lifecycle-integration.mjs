@@ -48,6 +48,11 @@ async function fakeBus(body) {
       return;
     }
     assert.equal(request.headers.authorization, "Bearer test-token");
+    if (request.method === "GET" && request.url === "/v1/worker-principal") {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ worker_principal: "worker:t1" }));
+      return;
+    }
     if (request.method === "GET" && request.url?.startsWith("/v1/messages")) {
       const url = new URL(request.url, "http://fixture.invalid");
       const fromAgent = url.searchParams.get("from");

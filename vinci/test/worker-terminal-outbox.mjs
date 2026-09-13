@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { BusClient } from "../worker/bus.mjs";
+import { BusClient, WorkerIdentityRefusal } from "../worker/bus.mjs";
 import {
   DEFAULT_OUTBOX_DIR,
   DUPLICATE_DELIVERY,
@@ -39,18 +39,34 @@ function recordTerminal(dir, subject, outcome, inReplyTo = null) {
     subject,
     body: "body",
     options: { outcome, ...(inReplyTo === null ? {} : { inReplyTo }) },
+    configured_worker_principal: "worker:test",
     expected_posted_by: "worker:test",
   }, dir);
 }
 
-test("a terminal post without authenticated server provenance writes nothing", async () => {
+test("a terminal identity outage preserves the terminal evidence before refusing", async () => {
   const dir = join(scratch(), "outbox");
   const bus = unreachableBus(dir);
   await assert.rejects(
     () => bus.postTerminal("status", "task X failed", "body", { outcome: "FAILED" }),
-    /authenticated worker posting-principal binding/,
+    (error) => error instanceof WorkerIdentityRefusal
+      && error.refused === true
+      && error.code === "worker_identity_unavailable",
   );
-  assert.equal(listPending(dir).length, 0, "a client-configured worker id is not authenticated provenance");
+  const [pending] = listPending(dir);
+  assert.equal(pending.entry.configured_worker_principal, "worker:test");
+  assert.equal(pending.entry.expected_posted_by, undefined, "an unavailable server cannot be a principal source");
+});
+
+test("a terminal post with no configured worker identity writes nothing", async () => {
+  const dir = join(scratch(), "outbox");
+  const bus = new BusClient("http://127.0.0.1:9/nope", "t", 100, dir);
+  await assert.rejects(
+    () => bus.postTerminal("status", "task X failed", "body", { outcome: "FAILED" }),
+    (error) => error instanceof WorkerIdentityRefusal
+      && error.code === "worker_identity_unconfigured",
+  );
+  assert.equal(listPending(dir).length, 0);
 });
 
 test("a pending terminal record carries the authenticated principal binding", () => {
@@ -82,7 +98,7 @@ test("replay delivers what was undelivered, then clears it", async () => {
   const delivered = [];
   const good = {
     findTerminalDeliveries: async () => [],
-    post: async (k, s, b, o) => { delivered.push([s, o.outcome]); },
+    deliverPendingTerminal: async (entry) => { delivered.push([entry.subject, entry.options.outcome]); },
   };
   const summary = await replayPending(good, dir, { warn() {}, error() {} });
 
@@ -98,7 +114,7 @@ test("replay that STILL fails keeps the record rather than dropping it", async (
 
   const stillBroken = {
     findTerminalDeliveries: async () => [],
-    post: async () => { throw new Error("bus down"); },
+    deliverPendingTerminal: async () => { throw new Error("bus down"); },
   };
   const summary = await replayPending(stillBroken, dir, { warn() {}, error() {} });
 
@@ -117,7 +133,7 @@ test("a corrupt record is reported, never silently dropped", async () => {
 
   const errors = [];
   const summary = await replayPending(
-    { findTerminalDeliveries: async () => [], post: async () => {} },
+    { findTerminalDeliveries: async () => [], deliverPendingTerminal: async () => {} },
     dir,
     { warn() {}, error: (m) => errors.push(m) },
   );
@@ -146,7 +162,7 @@ test("one exact committed row reconciles ACK loss without a second POST", async 
   let posts = 0;
   const summary = await replayPending({
     findTerminalDeliveries: async () => ["msg_terminal_1"],
-    post: async () => { posts += 1; },
+    deliverPendingTerminal: async () => { posts += 1; },
   }, dir, { warn() {}, error() {} });
 
   assert.equal(summary.reconciled, 1);
@@ -164,7 +180,7 @@ test("two exact committed rows preserve a typed duplicate condition and post no 
   const errors = [];
   const summary = await replayPending({
     findTerminalDeliveries: async () => ["msg_terminal_1", "msg_terminal_2"],
-    post: async () => { posts += 1; },
+    deliverPendingTerminal: async () => { posts += 1; },
   }, dir, { warn() {}, error: (message) => errors.push(message) });
 
   assert.equal(summary.duplicate, 1);
@@ -186,7 +202,7 @@ test("reconciliation failure retains the entry and posts nothing", async () => {
   let posts = 0;
   const summary = await replayPending({
     findTerminalDeliveries: async () => { throw new Error("pagination incomplete"); },
-    post: async () => { posts += 1; },
+    deliverPendingTerminal: async () => { posts += 1; },
   }, dir, { warn() {}, error() {} });
 
   assert.equal(summary.failed, 1);
@@ -199,6 +215,7 @@ test("a legacy pending record without authenticated provenance is retained, neve
   const bus = unreachableBus(dir);
   recordTerminal(dir, "legacy", "FAILED", "msg_legacy");
   const [pending] = listPending(dir);
+  delete pending.entry.configured_worker_principal;
   delete pending.entry.expected_posted_by;
   writeFileSync(pending.path, JSON.stringify(pending.entry));
 
@@ -215,6 +232,7 @@ test("a pending record bound to another worker principal is retained", async () 
   const bus = unreachableBus(dir);
   recordTerminal(dir, "other worker", "FAILED", "msg_other");
   const [pending] = listPending(dir);
+  pending.entry.configured_worker_principal = "worker:somebody-else";
   pending.entry.expected_posted_by = "worker:somebody-else";
   writeFileSync(pending.path, JSON.stringify(pending.entry));
 

@@ -285,6 +285,7 @@ export class WorkerTestFixture {
     // When > 0, /v1/version answers only after this many ms (to exercise the daemon's timeout).
     this.versionDelayMs = 0;
     this.versionRequests = 0;
+    this.identityRequests = 0;
     this.busServer = null;
     this.busPort = 0;
     // Tests that attack credential/--id binding may set these before startBus. Ordinary worker
@@ -389,6 +390,16 @@ process.exit(r.status ?? 1);
     this.getRequests = [];
     this.evidencePosts = [];
     this.contractRequests = [];
+    // One bearer represents one worker. Most fixtures carry a handoff addressed to that worker;
+    // empty-bus startup cases use w1 unless the test sets busPrincipal explicitly.
+    if (this.busPrincipal === null) {
+      const addressed = [...new Set(
+        handoffs
+          .map((message) => message.to_agent)
+          .filter((principal) => typeof principal === "string" && principal.startsWith("worker:")),
+      )];
+      this.busPrincipal = addressed.length === 1 ? addressed[0] : "worker:w1";
+    }
 
     const server = createServer((request, response) => {
       if (request.method === "GET" && request.url === "/v1/version") {
@@ -412,6 +423,17 @@ process.exit(r.status ?? 1);
         return;
       }
       const url = new URL(request.url, "http://fixture.invalid");
+      if (request.method === "GET" && url.pathname === "/v1/worker-principal") {
+        this.identityRequests += 1;
+        if (this.busPrincipalRole !== "worker") {
+          response.writeHead(403, { "content-type": "application/json" });
+          response.end(JSON.stringify({ detail: "worker bearer required for authenticated worker identity" }));
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ worker_principal: this.busPrincipal }));
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/v1/messages") {
         const limit = Number(url.searchParams.get("limit") ?? 100);
         const offset = Number(url.searchParams.get("offset") ?? 0);
