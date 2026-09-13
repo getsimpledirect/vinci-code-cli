@@ -12,6 +12,9 @@ const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 // and therefore invisible to a consumer that keys attention on `outcome !== "COMPLETED"`.
 const TERMINAL_OUTCOMES = new Set(["COMPLETED", "FAILED", "BLOCKED", "REFUSED", "UNVERIFIED"]);
 const WORKER_PRINCIPAL = /^worker:[A-Za-z0-9][A-Za-z0-9._-]{0,56}$/;
+const SERVER_STRIP_EDGE = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
+const SERVER_MAX_SUBJECT_CODE_POINTS = 200;
+const SERVER_MAX_BODY_CODE_POINTS = 8_000;
 const DEFAULT_IDENTITY_TIMEOUT_MS = 10_000;
 
 export class WorkerIdentityRefusal extends Error {
@@ -25,6 +28,32 @@ export class WorkerIdentityRefusal extends Error {
 
 function sameStrings(left, right) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function serverStrip(value) {
+  return value.replace(SERVER_STRIP_EDGE, "");
+}
+
+function canonicalTerminalEntry(entry) {
+  if (typeof entry?.subject !== "string") {
+    throw new Error("terminal subject must be a non-empty string");
+  }
+  const subject = serverStrip(entry.subject);
+  if (subject.length === 0) throw new Error("terminal subject must be a non-empty string");
+  if ([...subject].length > SERVER_MAX_SUBJECT_CODE_POINTS) {
+    throw new Error(`terminal subject must be <= ${SERVER_MAX_SUBJECT_CODE_POINTS} characters`);
+  }
+  if (entry.body !== null && entry.body !== undefined && typeof entry.body !== "string") {
+    throw new Error("terminal body must be a string");
+  }
+  if (typeof entry.body === "string" && entry.body.length > 0 && [...entry.body].length > SERVER_MAX_BODY_CODE_POINTS) {
+    throw new Error(`terminal body must be <= ${SERVER_MAX_BODY_CODE_POINTS} characters before canonical storage`);
+  }
+  return {
+    ...entry,
+    subject,
+    body: typeof entry.body === "string" ? serverStrip(entry.body) : "",
+  };
 }
 
 function isExactTerminalDelivery(message, entry, expectedPostedBy) {
@@ -304,6 +333,7 @@ export class BusClient {
   // inconsistencies are hard errors; replay retains the entry and posts nothing on any such error.
   async findTerminalDeliveries(entry) {
     const expectedPostedBy = this.#configuredPrincipalForEntry(entry);
+    const canonicalEntry = canonicalTerminalEntry(entry);
     const { token } = await this.#requireAuthenticatedPostingPrincipal();
 
     const messages = [];
@@ -313,7 +343,7 @@ export class BusClient {
     while (true) {
       const url = new URL(`${this.serverUrl}/v1/messages`);
       url.searchParams.set("posted_by", expectedPostedBy);
-      url.searchParams.set("kind", entry.kind);
+      url.searchParams.set("kind", canonicalEntry.kind);
       url.searchParams.set("limit", String(this.pageSize));
       url.searchParams.set("offset", String(offset));
       const response = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
@@ -354,7 +384,7 @@ export class BusClient {
           || !Object.hasOwn(raw, "in_reply_to")
           || !Object.hasOwn(raw, "refs")
           || message.posted_by !== expectedPostedBy
-          || message.kind !== entry.kind
+          || message.kind !== canonicalEntry.kind
           || typeof message.subject !== "string"
           || typeof message.body !== "string"
           || !Array.isArray(message.refs)
@@ -382,7 +412,7 @@ export class BusClient {
       throw new Error(`terminal reconciliation GET returned ${messages.length} unique messages for total ${expectedTotal}`);
     }
     return messages
-      .filter((message) => isExactTerminalDelivery(message, entry, expectedPostedBy))
+      .filter((message) => isExactTerminalDelivery(message, canonicalEntry, expectedPostedBy))
       .map((message) => message.message_id);
   }
 
@@ -446,8 +476,16 @@ export class BusClient {
         `a pending terminal record must carry a typed outcome (${[...TERMINAL_OUTCOMES].join(", ")}); got ${entry?.options?.outcome}`,
       );
     }
+    const canonicalEntry = canonicalTerminalEntry(entry);
     const { principal, token } = await this.#requireAuthenticatedPostingPrincipal();
-    return this.#post(entry.kind, entry.subject, entry.body, entry.options ?? {}, token, principal);
+    return this.#post(
+      canonicalEntry.kind,
+      canonicalEntry.subject,
+      canonicalEntry.body,
+      canonicalEntry.options ?? {},
+      token,
+      principal,
+    );
   }
 
   // The ONLY sanctioned way to announce that a task has ended. Requires the typed outcome, so a
@@ -479,8 +517,16 @@ export class BusClient {
       configured_worker_principal: this.#expectedPostingPrincipal,
     };
     const pendingId = recordPending(entry, this.outboxDir);
+    const canonicalEntry = canonicalTerminalEntry(entry);
     const { principal, token } = await this.#requireAuthenticatedPostingPrincipal();
-    const result = await this.#post(kind, subject, body, options, token, principal);
+    const result = await this.#post(
+      canonicalEntry.kind,
+      canonicalEntry.subject,
+      canonicalEntry.body,
+      canonicalEntry.options,
+      token,
+      principal,
+    );
     clearPending(pendingId, this.outboxDir);
     return result;
   }

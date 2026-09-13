@@ -22,6 +22,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const WORKER_ID = "lane-b-worker";
 const POSTED_BY = `worker:${WORKER_ID}`;
 const EXPECTED_WORKER_HEADER = "x-vgc-expected-worker-principal";
+const SERVER_STRIP_EDGE = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
 const TERMINAL = Object.freeze({
   kind: "status",
   subject: "task msg_lane_b completed",
@@ -54,6 +55,10 @@ function terminalRow(id, overrides = {}) {
     refs: TERMINAL.options.refs,
     ...overrides,
   };
+}
+
+function serverStrip(value) {
+  return value.replace(SERVER_STRIP_EDGE, "");
 }
 
 class TerminalBusFixture {
@@ -181,6 +186,28 @@ class TerminalBusFixture {
             response.end(JSON.stringify({ detail: "authenticated POST principal does not satisfy expected worker" }));
             return;
           }
+          if (typeof payload.subject !== "string" || serverStrip(payload.subject).length === 0) {
+            response.writeHead(422, { "content-type": "application/json" });
+            response.end(JSON.stringify({ detail: "subject must be a non-empty string" }));
+            return;
+          }
+          const storedSubject = serverStrip(payload.subject);
+          if ([...storedSubject].length > 200) {
+            response.writeHead(422, { "content-type": "application/json" });
+            response.end(JSON.stringify({ detail: "subject must be <= 200 characters" }));
+            return;
+          }
+          if (payload.body !== null && payload.body !== undefined && typeof payload.body !== "string") {
+            response.writeHead(422, { "content-type": "application/json" });
+            response.end(JSON.stringify({ detail: "body must be a string" }));
+            return;
+          }
+          if (typeof payload.body === "string" && payload.body.length > 0 && [...payload.body].length > 8_000) {
+            response.writeHead(422, { "content-type": "application/json" });
+            response.end(JSON.stringify({ detail: "body must be <= 8000 characters" }));
+            return;
+          }
+          const storedBody = typeof payload.body === "string" ? serverStrip(payload.body) || null : null;
           const row = {
             message_id: `msg_server_${this.nextId++}`,
             ts: new Date().toISOString(),
@@ -189,8 +216,8 @@ class TerminalBusFixture {
             posted_role: this.postPrincipalRole === "worker" ? "worker" : null,
             to_agent: payload.to_agent ?? null,
             kind: payload.kind,
-            subject: payload.subject ?? "",
-            body: payload.body ?? "",
+            subject: storedSubject,
+            body: storedBody,
             outcome: payload.outcome ?? null,
             in_reply_to: payload.in_reply_to ?? null,
             refs: payload.refs ?? [],
@@ -369,6 +396,66 @@ test("TOCTOU identity discovery cannot authorize a differently authenticated ter
   assert.equal(fixture.posts.length, 0, "the server-style guard refuses before row insertion");
   assert.equal(fixture.messages.length, 0);
   assert.equal(listPending(join(dir, "outbox")).length, 1, "refusal retains terminal evidence");
+});
+
+for (const variant of [
+  { name: "body with trailing newline", subject: TERMINAL.subject, body: `${TERMINAL.body}\n`, storedBody: TERMINAL.body },
+  { name: "subject with surrounding server whitespace", subject: `\u0085 ${TERMINAL.subject} \u001c`, body: TERMINAL.body, storedBody: TERMINAL.body },
+  { name: "whitespace-only body stored as null", subject: TERMINAL.subject, body: " \n\u0085", storedBody: null },
+]) {
+  test(`ACK loss reconciles the canonical server row for ${variant.name}`, async (t) => {
+    const dir = scratch(`canonical-${variant.name.replaceAll(" ", "-")}`);
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const fixture = new TerminalBusFixture();
+    fixture.dropAckSubject = serverStrip(variant.subject);
+    await fixture.start();
+    t.after(() => fixture.close());
+    const beforeCrash = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+
+    await assert.rejects(
+      () => beforeCrash.postTerminal("status", variant.subject, variant.body, TERMINAL.options),
+      /fetch failed/,
+    );
+    assert.equal(fixture.posts.length, 1, "the first bound POST committed before its ACK was lost");
+    assert.equal(fixture.posts[0].subject, TERMINAL.subject);
+    assert.equal(fixture.posts[0].body, variant.storedBody);
+    assert.equal(fixture.posts[0].posted_by, POSTED_BY);
+    assert.equal(listPending(join(dir, "outbox")).length, 1);
+
+    const restarted = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+    const summary = await replayPending(restarted, join(dir, "outbox"), { warn() {}, error() {} });
+    const terminalRequests = fixture.messagePostRequests.filter(({ payload }) =>
+      serverStrip(payload.subject) === TERMINAL.subject);
+
+    assert.equal(summary.reconciled, 1);
+    assert.equal(summary.delivered, 0);
+    assert.equal(terminalRequests.length, 1, "canonical reconciliation must not append a duplicate");
+    assert.equal(fixture.posts.length, 1);
+    assert.equal(listPending(join(dir, "outbox")).length, 0);
+  });
+}
+
+test("terminal canonicalization preserves server length and empty-subject refusals", async (t) => {
+  const dir = scratch("canonical-validation");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture();
+  await fixture.start();
+  t.after(() => fixture.close());
+  const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+
+  await assert.rejects(
+    () => bus.postTerminal("status", TERMINAL.subject, " ".repeat(8_001), TERMINAL.options),
+    /body must be <= 8000 characters before canonical storage/,
+  );
+  await assert.rejects(
+    () => bus.postTerminal("status", " \n\u0085", TERMINAL.body, TERMINAL.options),
+    /subject must be a non-empty string/,
+  );
+
+  assert.equal(fixture.identityRequests, 0);
+  assert.equal(fixture.messagePostRequests.length, 0);
+  assert.equal(fixture.posts.length, 0);
+  assert.equal(listPending(join(dir, "outbox")).length, 2, "both refused terminal records remain durable");
 });
 
 test("bearer and configured identity are immutable after a successful lookup", async (t) => {
