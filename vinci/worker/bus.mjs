@@ -26,6 +26,16 @@ export class WorkerIdentityRefusal extends Error {
   }
 }
 
+export class WorkerTerminalAuthorityConflict extends Error {
+  constructor(messageIds) {
+    super(`terminal reconciliation found exact semantic rows without worker authority (${messageIds.join(", ")})`);
+    this.name = "WorkerTerminalAuthorityConflict";
+    this.code = "terminal_delivery_authority_conflict";
+    this.conflict = true;
+    this.messageIds = messageIds;
+  }
+}
+
 function sameStrings(left, right) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
@@ -56,11 +66,10 @@ function canonicalTerminalEntry(entry) {
   };
 }
 
-function isExactTerminalDelivery(message, entry, expectedPostedBy) {
+function isExactTerminalSemantics(message, entry) {
   const options = entry.options ?? {};
   const expectedRefs = options.refs ?? [];
-  return message.posted_by === expectedPostedBy
-    && message.to_agent === null
+  return message.to_agent === null
     && message.kind === entry.kind
     && message.subject === entry.subject
     && message.body === entry.body
@@ -337,6 +346,7 @@ export class BusClient {
     const { token } = await this.#requireAuthenticatedPostingPrincipal();
 
     const messages = [];
+    const rawAuthorityByMessageId = new Map();
     const messageIds = new Set();
     let expectedTotal = null;
     let offset = 0;
@@ -391,7 +401,7 @@ export class BusClient {
         const message = normaliseMessage(raw);
         if (
           message === null
-          || message.posted_by !== expectedPostedBy
+          || raw.posted_by !== expectedPostedBy
           || message.kind !== canonicalEntry.kind
           || typeof message.subject !== "string"
           || typeof message.body !== "string"
@@ -407,6 +417,11 @@ export class BusClient {
         }
         messageIds.add(message.message_id);
         messages.push(message);
+        rawAuthorityByMessageId.set(message.message_id, {
+          hasPostedRole: Object.hasOwn(raw, "posted_role"),
+          postedBy: raw.posted_by,
+          postedRole: raw.posted_role,
+        });
       }
 
       offset += payload.messages.length;
@@ -419,8 +434,20 @@ export class BusClient {
     if (messages.length !== expectedTotal) {
       throw new Error(`terminal reconciliation GET returned ${messages.length} unique messages for total ${expectedTotal}`);
     }
-    return messages
-      .filter((message) => isExactTerminalDelivery(message, canonicalEntry, expectedPostedBy))
+    const semanticMatches = messages.filter((message) => isExactTerminalSemantics(message, canonicalEntry));
+    const authorityConflicts = semanticMatches.filter((message) => {
+      const authority = rawAuthorityByMessageId.get(message.message_id);
+      return authority.postedBy === expectedPostedBy
+        && (!authority.hasPostedRole || authority.postedRole !== "worker");
+    });
+    if (authorityConflicts.length > 0) {
+      throw new WorkerTerminalAuthorityConflict(authorityConflicts.map((message) => message.message_id));
+    }
+    return semanticMatches
+      .filter((message) => {
+        const authority = rawAuthorityByMessageId.get(message.message_id);
+        return authority.postedBy === expectedPostedBy && authority.postedRole === "worker";
+      })
       .map((message) => message.message_id);
   }
 

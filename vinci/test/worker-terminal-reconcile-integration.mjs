@@ -10,7 +10,11 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { BusClient, WorkerIdentityRefusal } from "../worker/bus.mjs";
+import {
+  BusClient,
+  WorkerIdentityRefusal,
+  WorkerTerminalAuthorityConflict,
+} from "../worker/bus.mjs";
 import {
   DUPLICATE_DELIVERY,
   listPending,
@@ -46,6 +50,7 @@ function terminalRow(id, overrides = {}) {
     ts: "2026-09-13T12:00:00.000Z",
     from_agent: POSTED_BY,
     posted_by: POSTED_BY,
+    posted_role: "worker",
     to_agent: null,
     kind: TERMINAL.kind,
     subject: TERMINAL.subject,
@@ -324,12 +329,11 @@ async function withTimeout(promise, message, timeoutMs = 15_000) {
   }
 }
 
-test("same from_agent with the wrong server-stamped posted_by does not reconcile", async (t) => {
+test("different raw posted_by with worker role is filter-inconsistent and cannot publish or reconcile", async (t) => {
   const dir = scratch("provenance");
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const fixture = new TerminalBusFixture([
-    terminalRow("msg_forged", { from_agent: POSTED_BY, posted_by: "worker:other" }),
-  ]);
+  const fixture = new TerminalBusFixture([terminalRow("msg_filter_inconsistent")]);
+  fixture.terminalReadbackTransform = (message) => ({ ...message, posted_by: "worker:other" });
   await fixture.start();
   t.after(() => fixture.close());
   recordTerminal(dir);
@@ -337,10 +341,11 @@ test("same from_agent with the wrong server-stamped posted_by does not reconcile
   const bus = await authenticatedBus(fixture, dir);
   const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
 
+  assert.equal(summary.failed, 1);
   assert.equal(summary.reconciled, 0);
-  assert.equal(summary.delivered, 1, "wrong authenticated provenance is cardinality zero");
-  assert.equal(terminalPostCount(fixture), 1);
-  assert.equal(listPending(join(dir, "outbox")).length, 0);
+  assert.equal(summary.delivered, 0, "a filter-inconsistent row is not evidence of absence");
+  assert.equal(fixture.messagePostRequests.length, 0);
+  assert.equal(listPending(join(dir, "outbox")).length, 1);
 });
 
 test("identity binding comes from the worker-only server endpoint without a publication probe", async (t) => {
@@ -424,6 +429,7 @@ for (const variant of [
     assert.equal(fixture.posts[0].subject, TERMINAL.subject);
     assert.equal(fixture.posts[0].body, variant.storedBody);
     assert.equal(fixture.posts[0].posted_by, POSTED_BY);
+    assert.equal(fixture.posts[0].posted_role, "worker");
     assert.equal(listPending(join(dir, "outbox")).length, 1);
 
     const restarted = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
@@ -438,6 +444,89 @@ for (const variant of [
     assert.equal(listPending(join(dir, "outbox")).length, 0);
   });
 }
+
+test("one exact worker-authoritative row reconciles and clears pending without POST", async (t) => {
+  const dir = scratch("worker-authority-positive");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture([terminalRow("msg_worker_authoritative")]);
+  await fixture.start();
+  t.after(() => fixture.close());
+  recordTerminal(dir);
+  const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+
+  const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+  assert.equal(summary.reconciled, 1);
+  assert.equal(summary.failed, 0);
+  assert.equal(fixture.messagePostRequests.length, 0);
+  assert.equal(listPending(join(dir, "outbox")).length, 0);
+});
+
+for (const role of [
+  { name: "admin", value: "admin" },
+  { name: "agent", value: "agent" },
+  { name: "collector", value: "collector" },
+  { name: "missing", omit: true },
+  { name: "null", value: null },
+  { name: "malformed number", value: 123 },
+  { name: "malformed boolean", value: true },
+  { name: "malformed object", value: { role: "worker" } },
+  { name: "malformed array", value: ["worker"] },
+]) {
+  test(`exact semantic row with ${role.name} posted_role is a typed authority conflict`, async (t) => {
+    const dir = scratch(`role-conflict-${role.name.replaceAll(" ", "-")}`);
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const fixture = new TerminalBusFixture([terminalRow("msg_role_conflict")]);
+    fixture.terminalReadbackTransform = (message) => {
+      const transformed = { ...message };
+      if (role.omit) delete transformed.posted_role;
+      else transformed.posted_role = role.value;
+      return transformed;
+    };
+    await fixture.start();
+    t.after(() => fixture.close());
+    recordTerminal(dir);
+    const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+
+    await assert.rejects(
+      () => bus.findTerminalDeliveries(TERMINAL),
+      (error) => error instanceof WorkerTerminalAuthorityConflict
+        && error.code === "terminal_delivery_authority_conflict"
+        && error.conflict === true
+        && error.messageIds.length === 1
+        && error.messageIds[0] === "msg_role_conflict",
+    );
+    const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+    assert.equal(summary.failed, 1);
+    assert.equal(summary.reconciled, 0);
+    assert.equal(summary.delivered, 0, "an authority conflict is not ordinary cardinality zero");
+    assert.equal(fixture.messagePostRequests.length, 0);
+    assert.equal(fixture.messages.length, 1);
+    assert.equal(listPending(join(dir, "outbox")).length, 1);
+  });
+}
+
+test("no semantic row publishes exactly once with the bound worker precondition", async (t) => {
+  const dir = scratch("authority-no-row");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = new TerminalBusFixture();
+  await fixture.start();
+  t.after(() => fixture.close());
+  recordTerminal(dir);
+  const bus = new BusClient(fixture.url, "test-token", 100, join(dir, "outbox"), POSTED_BY);
+
+  const summary = await replayPending(bus, join(dir, "outbox"), { warn() {}, error() {} });
+
+  assert.equal(summary.delivered, 1);
+  assert.equal(summary.reconciled, 0);
+  assert.equal(summary.failed, 0);
+  assert.equal(fixture.messagePostRequests.length, 1);
+  assert.deepEqual(fixture.messagePostRequests[0].expectedHeaders, [POSTED_BY]);
+  assert.equal(fixture.posts[0].posted_by, POSTED_BY);
+  assert.equal(fixture.posts[0].posted_role, "worker");
+  assert.equal(listPending(join(dir, "outbox")).length, 0);
+});
 
 for (const malformedBody of [123, true, { unexpected: "object" }, ["unexpected array"]]) {
   test(`malformed terminal reconciliation body ${JSON.stringify(malformedBody)} cannot erase pending evidence`, async (t) => {
@@ -889,6 +978,7 @@ test("installed worker survives commit-then-ACK-loss and process loss without a 
   assert.equal(terminalRequests[0].payload.from_agent, undefined);
   assert.equal(terminalRequests[0].payload.posted_by, undefined);
   assert.equal(terminalRows[0].posted_by, POSTED_BY);
+  assert.equal(terminalRows[0].posted_role, "worker");
   assert.equal(terminalRows[0].in_reply_to, TERMINAL.options.inReplyTo);
   assert.deepEqual(terminalRows[0].refs, TERMINAL.options.refs);
   assert.match(terminalRows[0].body, /contract=wo_lane_b@01234567/);
