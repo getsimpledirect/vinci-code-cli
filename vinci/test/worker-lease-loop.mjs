@@ -523,6 +523,7 @@ await test('release failure is logged and never changes the state', async () => 
     assert.equal(governor.releases.length, 1);
     const final = fixture.getPostedMessages().find((p) => p.subject === 'task 112 completed');
     assert(final, 'final post still happens');
+    assert.match(final.body, /(?:^| )attempt=112\/1(?: |$)/, 'terminal binds the exact lifecycle attempt');
   } finally {
     await governor.close();
     await fixture.cleanup();

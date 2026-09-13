@@ -16,7 +16,12 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { BusClient } from "../worker/bus.mjs";
-import { DEFAULT_OUTBOX_DIR, listPending, replayPending } from "../worker/outbox.mjs";
+import {
+  DEFAULT_OUTBOX_DIR,
+  DUPLICATE_DELIVERY,
+  listPending,
+  replayPending,
+} from "../worker/outbox.mjs";
 
 function scratch() {
   return mkdtempSync(join(tmpdir(), "vinci-outbox-"));
@@ -24,7 +29,7 @@ function scratch() {
 
 // A bus that cannot reach anything: 127.0.0.1:9 is the discard port.
 function unreachableBus(dir) {
-  return new BusClient("http://127.0.0.1:9/nope", "t", 100, dir);
+  return new BusClient("http://127.0.0.1:9/nope", "t", 100, dir, "worker:test");
 }
 
 test("a terminal post that FAILS leaves a durable record", async () => {
@@ -38,6 +43,7 @@ test("a terminal post that FAILS leaves a durable record", async () => {
   assert.equal(pending[0].entry.options.outcome, "FAILED");
   assert.equal(pending[0].entry.subject, "task X failed");
   assert.equal(pending[0].entry.kind, "status");
+  assert.equal(pending[0].entry.expected_posted_by, "worker:test");
 });
 
 test("a terminal post that SUCCEEDS leaves nothing behind", async () => {
@@ -69,7 +75,10 @@ test("replay delivers what was undelivered, then clears it", async () => {
   assert.equal(listPending(dir).length, 2);
 
   const delivered = [];
-  const good = { post: async (k, s, b, o) => { delivered.push([s, o.outcome]); } };
+  const good = {
+    findTerminalDeliveries: async () => [],
+    post: async (k, s, b, o) => { delivered.push([s, o.outcome]); },
+  };
   const summary = await replayPending(good, dir, { warn() {}, error() {} });
 
   assert.equal(summary.delivered, 2);
@@ -83,7 +92,10 @@ test("replay that STILL fails keeps the record rather than dropping it", async (
   const bus = unreachableBus(dir);
   await assert.rejects(() => bus.postTerminal("status", "s", "b", { outcome: "FAILED" }));
 
-  const stillBroken = { post: async () => { throw new Error("bus down"); } };
+  const stillBroken = {
+    findTerminalDeliveries: async () => [],
+    post: async () => { throw new Error("bus down"); },
+  };
   const summary = await replayPending(stillBroken, dir, { warn() {}, error() {} });
 
   assert.equal(summary.failed, 1);
@@ -102,7 +114,9 @@ test("a corrupt record is reported, never silently dropped", async () => {
 
   const errors = [];
   const summary = await replayPending(
-    { post: async () => {} }, dir, { warn() {}, error: (m) => errors.push(m) },
+    { findTerminalDeliveries: async () => [], post: async () => {} },
+    dir,
+    { warn() {}, error: (m) => errors.push(m) },
   );
   assert.equal(summary.corrupt, 1);
   assert.equal(summary.delivered, 0);
@@ -120,4 +134,107 @@ test("the bus records into ITS OWN directory, not the process cwd", async () => 
   assert.equal(bus.outboxDir, dir);
   assert.equal(listPending(dir).length, 1);
   assert.notEqual(dir, DEFAULT_OUTBOX_DIR);
+});
+
+test("one exact committed row reconciles ACK loss without a second POST", async () => {
+  const dir = join(scratch(), "outbox");
+  const bus = unreachableBus(dir);
+  await assert.rejects(() => bus.postTerminal("status", "task exact done", "body", {
+    outcome: "COMPLETED",
+    inReplyTo: "msg_exact",
+  }));
+
+  let posts = 0;
+  const summary = await replayPending({
+    findTerminalDeliveries: async () => ["msg_terminal_1"],
+    post: async () => { posts += 1; },
+  }, dir, { warn() {}, error() {} });
+
+  assert.equal(summary.reconciled, 1);
+  assert.equal(summary.delivered, 0);
+  assert.equal(summary.duplicate, 0);
+  assert.equal(posts, 0, "an observed exact terminal effect must not be posted again");
+  assert.equal(listPending(dir).length, 0);
+});
+
+test("two exact committed rows preserve a typed duplicate condition and post no third row", async () => {
+  const dir = join(scratch(), "outbox");
+  const bus = unreachableBus(dir);
+  await assert.rejects(() => bus.postTerminal("status", "task duplicate done", "body", {
+    outcome: "COMPLETED",
+    inReplyTo: "msg_duplicate",
+  }));
+
+  let posts = 0;
+  const errors = [];
+  const summary = await replayPending({
+    findTerminalDeliveries: async () => ["msg_terminal_1", "msg_terminal_2"],
+    post: async () => { posts += 1; },
+  }, dir, { warn() {}, error: (message) => errors.push(message) });
+
+  assert.equal(summary.duplicate, 1);
+  assert.equal(summary.reconciled, 0);
+  assert.equal(summary.delivered, 0);
+  assert.equal(posts, 0, "an existing duplicate must never grow to three rows");
+  assert.equal(summary.conditions[0].type, DUPLICATE_DELIVERY);
+  assert.equal(summary.conditions[0].exact_match_count, 2);
+  assert.match(errors.join("\n"), /DUPLICATE_DELIVERY/);
+  const [pending] = listPending(dir);
+  assert.equal(pending.entry.delivery_condition.type, DUPLICATE_DELIVERY);
+  assert.deepEqual(pending.entry.delivery_condition.message_ids, ["msg_terminal_1", "msg_terminal_2"]);
+});
+
+test("reconciliation failure retains the entry and posts nothing", async () => {
+  const dir = join(scratch(), "outbox");
+  const bus = unreachableBus(dir);
+  await assert.rejects(() => bus.postTerminal("status", "task uncertain", "body", {
+    outcome: "FAILED",
+    inReplyTo: "msg_uncertain",
+  }));
+
+  let posts = 0;
+  const summary = await replayPending({
+    findTerminalDeliveries: async () => { throw new Error("pagination incomplete"); },
+    post: async () => { posts += 1; },
+  }, dir, { warn() {}, error() {} });
+
+  assert.equal(summary.failed, 1);
+  assert.equal(posts, 0, "an incomplete observation is not proof of absence");
+  assert.equal(listPending(dir).length, 1);
+});
+
+test("a legacy pending record without authenticated provenance is retained, never adopted", async () => {
+  const dir = join(scratch(), "outbox");
+  const bus = unreachableBus(dir);
+  await assert.rejects(() => bus.postTerminal("status", "legacy", "body", {
+    outcome: "FAILED",
+    inReplyTo: "msg_legacy",
+  }));
+  const [pending] = listPending(dir);
+  delete pending.entry.expected_posted_by;
+  writeFileSync(pending.path, JSON.stringify(pending.entry));
+
+  let posts = 0;
+  const summary = await replayPending(bus, dir, { warn() {}, error() {} });
+
+  assert.equal(summary.failed, 1);
+  assert.equal(posts, 0);
+  assert.equal(listPending(dir).length, 1);
+});
+
+test("a pending record bound to another worker principal is retained", async () => {
+  const dir = join(scratch(), "outbox");
+  const bus = unreachableBus(dir);
+  await assert.rejects(() => bus.postTerminal("status", "other worker", "body", {
+    outcome: "FAILED",
+    inReplyTo: "msg_other",
+  }));
+  const [pending] = listPending(dir);
+  pending.entry.expected_posted_by = "worker:somebody-else";
+  writeFileSync(pending.path, JSON.stringify(pending.entry));
+
+  const summary = await replayPending(bus, dir, { warn() {}, error() {} });
+
+  assert.equal(summary.failed, 1);
+  assert.equal(listPending(dir).length, 1);
 });

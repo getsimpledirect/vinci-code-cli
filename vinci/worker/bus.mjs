@@ -11,6 +11,25 @@ const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 // case, so leaving it untyped left the most COMMON non-success terminal with a null outcome
 // and therefore invisible to a consumer that keys attention on `outcome !== "COMPLETED"`.
 const TERMINAL_OUTCOMES = new Set(["COMPLETED", "FAILED", "BLOCKED", "REFUSED", "UNVERIFIED"]);
+const WORKER_PRINCIPAL = /^worker:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+
+function sameStrings(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function isExactTerminalDelivery(message, entry, expectedPostedBy) {
+  const options = entry.options ?? {};
+  const expectedRefs = options.refs ?? [];
+  return message.posted_by === expectedPostedBy
+    && message.to_agent === null
+    && message.kind === entry.kind
+    && message.subject === entry.subject
+    && message.body === entry.body
+    && (message.outcome ?? null) === (options.outcome ?? null)
+    && (message.in_reply_to ?? null) === (options.inReplyTo ?? null)
+    && Array.isArray(message.refs)
+    && sameStrings(message.refs, expectedRefs);
+}
 
 export function isLedgerRef(value) {
   return typeof value === "string" && LEDGER_REF.test(value);
@@ -45,7 +64,7 @@ export function normaliseMessage(message) {
 }
 
 export class BusClient {
-  constructor(serverUrl, token, pageSize = 100, outboxDir = null) {
+  constructor(serverUrl, token, pageSize = 100, outboxDir = null, postingPrincipal = null) {
     const url = new URL(serverUrl);
     if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("server must use http or https");
     if (url.username || url.password) throw new Error("server URL must not contain credentials");
@@ -53,6 +72,15 @@ export class BusClient {
     this.serverUrl = url.href.replace(/\/$/, "");
     this.token = token;
     this.pageSize = pageSize;
+    if (postingPrincipal !== null && (typeof postingPrincipal !== "string" || !WORKER_PRINCIPAL.test(postingPrincipal))) {
+      throw new Error("posting principal must be a worker:<id> principal");
+    }
+    // Expected value of the server-stamped `posted_by` field for this token. This is deliberately
+    // NOT `from_agent`: that field is client-facing identity, while `posted_by` is the authenticated
+    // provenance the server observed. Production constructs the client from --id at the same point
+    // it selects the worker token; pending terminal entries persist the value so another worker id
+    // cannot adopt them silently after a restart.
+    this.postingPrincipal = postingPrincipal;
     // Where undelivered terminal records are parked. Settable because the
     // worker keeps its durable state under --state-dir, and a default that
     // wrote to the process cwd would park records somewhere the replay at
@@ -114,6 +142,101 @@ export class BusClient {
       .sort((left, right) => left.ts.localeCompare(right.ts) || left.message_id.localeCompare(right.message_id));
   }
 
+  // Classify whether the exact terminal effect represented by an outbox entry is already visible
+  // on the bus. Every page is read before the caller is allowed to POST. A partial or shifting
+  // offset scan is not evidence of absence, so response-shape, total, offset and duplicate-id
+  // inconsistencies are hard errors; replay retains the entry and posts nothing on any such error.
+  async findTerminalDeliveries(entry) {
+    const expectedPostedBy = entry?.expected_posted_by;
+    if (typeof expectedPostedBy !== "string" || !WORKER_PRINCIPAL.test(expectedPostedBy)) {
+      throw new Error("pending terminal record has no authenticated posting-principal binding");
+    }
+    if (this.postingPrincipal !== expectedPostedBy) {
+      throw new Error(
+        `pending terminal record belongs to ${expectedPostedBy}, current worker is ${this.postingPrincipal ?? "unbound"}`,
+      );
+    }
+
+    const messages = [];
+    const messageIds = new Set();
+    let expectedTotal = null;
+    let offset = 0;
+    while (true) {
+      const url = new URL(`${this.serverUrl}/v1/messages`);
+      url.searchParams.set("posted_by", expectedPostedBy);
+      url.searchParams.set("kind", entry.kind);
+      url.searchParams.set("limit", String(this.pageSize));
+      url.searchParams.set("offset", String(offset));
+      const response = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
+      if (!response.ok) throw new Error(`terminal reconciliation GET ${url} failed: ${response.status} ${await response.text()}`);
+      let payload;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        throw new Error(`terminal reconciliation GET ${url} returned invalid JSON: ${error.message}`);
+      }
+      if (
+        !payload
+        || !Array.isArray(payload.messages)
+        || !Number.isInteger(payload.total)
+        || payload.total < 0
+        || !Number.isInteger(payload.limit)
+        || payload.limit !== this.pageSize
+        || !Number.isInteger(payload.offset)
+        || payload.offset !== offset
+        || payload.messages.length > payload.limit
+      ) {
+        throw new Error("terminal reconciliation GET response has an invalid or incomplete pagination shape");
+      }
+      if (expectedTotal === null) expectedTotal = payload.total;
+      else if (payload.total !== expectedTotal) {
+        throw new Error(`terminal reconciliation GET total changed during pagination (${expectedTotal} -> ${payload.total})`);
+      }
+
+      for (const raw of payload.messages) {
+        const message = normaliseMessage(raw);
+        if (
+          message === null
+          || !Object.hasOwn(raw, "posted_by")
+          || !Object.hasOwn(raw, "to_agent")
+          || !Object.hasOwn(raw, "subject")
+          || !Object.hasOwn(raw, "body")
+          || !Object.hasOwn(raw, "outcome")
+          || !Object.hasOwn(raw, "in_reply_to")
+          || !Object.hasOwn(raw, "refs")
+          || message.posted_by !== expectedPostedBy
+          || message.kind !== entry.kind
+          || typeof message.subject !== "string"
+          || typeof message.body !== "string"
+          || !Array.isArray(message.refs)
+          || message.refs.some((ref) => typeof ref !== "string")
+          || (message.outcome !== null && message.outcome !== undefined && typeof message.outcome !== "string")
+          || (message.in_reply_to !== null && message.in_reply_to !== undefined && typeof message.in_reply_to !== "string")
+        ) {
+          throw new Error("terminal reconciliation GET returned a malformed or filter-inconsistent message");
+        }
+        if (messageIds.has(message.message_id)) {
+          throw new Error(`terminal reconciliation GET repeated message ${message.message_id}; pagination is incomplete`);
+        }
+        messageIds.add(message.message_id);
+        messages.push(message);
+      }
+
+      offset += payload.messages.length;
+      if (offset === expectedTotal) break;
+      if (offset > expectedTotal || payload.messages.length === 0) {
+        throw new Error(`terminal reconciliation GET ended at ${offset} of ${expectedTotal} messages`);
+      }
+    }
+
+    if (messages.length !== expectedTotal) {
+      throw new Error(`terminal reconciliation GET returned ${messages.length} unique messages for total ${expectedTotal}`);
+    }
+    return messages
+      .filter((message) => isExactTerminalDelivery(message, entry, expectedPostedBy))
+      .map((message) => message.message_id);
+  }
+
   async post(kind, subject, body, options = {}) {
     if (kind !== "status" && kind !== "finding" && kind !== "blocker") {
       throw new Error(`worker cannot post message kind ${kind}`);
@@ -150,14 +273,23 @@ export class BusClient {
         `a terminal record must carry a typed outcome (${[...TERMINAL_OUTCOMES].join(", ")}); got ${options.outcome}`,
       );
     }
-    // RECORDED BEFORE THE ATTEMPT, cleared only after it succeeds, so anything
-    // left on disk is by definition undelivered. The worker transitions its
+    if (typeof this.postingPrincipal !== "string") {
+      throw new Error("terminal posts require an authenticated worker posting-principal binding");
+    }
+    // RECORDED BEFORE THE ATTEMPT, cleared only after it succeeds or an exact
+    // server-stamped delivery is reconciled. The worker transitions its
     // lifecycle to terminal and THEN announces it, and those two steps are not
     // atomic: without this, a transient bus failure left the task terminal and
     // unannounced, and a restart skipped it precisely because it was already
     // terminal. A typed terminal outcome exists so a failure is VISIBLE without
     // being an open decision -- undelivered, it is neither.
-    const pendingId = recordPending({ kind, subject, body, options }, this.outboxDir);
+    const pendingId = recordPending({
+      kind,
+      subject,
+      body,
+      options,
+      expected_posted_by: this.postingPrincipal,
+    }, this.outboxDir);
     const result = await this.post(kind, subject, body, options);
     clearPending(pendingId, this.outboxDir);
     return result;
