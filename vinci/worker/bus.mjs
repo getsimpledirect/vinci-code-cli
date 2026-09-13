@@ -1,4 +1,4 @@
-import { DEFAULT_OUTBOX_DIR, bindPendingPrincipal, clearPending, recordPending } from "./outbox.mjs";
+import { DEFAULT_OUTBOX_DIR, clearPending, recordPending } from "./outbox.mjs";
 
 const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -11,7 +11,7 @@ const LEDGER_REF = /^(?:job|exp|bk)_[A-Za-z0-9][A-Za-z0-9._-]*$/;
 // case, so leaving it untyped left the most COMMON non-success terminal with a null outcome
 // and therefore invisible to a consumer that keys attention on `outcome !== "COMPLETED"`.
 const TERMINAL_OUTCOMES = new Set(["COMPLETED", "FAILED", "BLOCKED", "REFUSED", "UNVERIFIED"]);
-const WORKER_PRINCIPAL = /^worker:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+const WORKER_PRINCIPAL = /^worker:[A-Za-z0-9][A-Za-z0-9._-]{0,56}$/;
 const DEFAULT_IDENTITY_TIMEOUT_MS = 10_000;
 
 export class WorkerIdentityRefusal extends Error {
@@ -276,7 +276,7 @@ export class BusClient {
   }
 
   #configuredPrincipalForEntry(entry) {
-    const configured = entry?.configured_worker_principal ?? entry?.expected_posted_by;
+    const configured = entry?.configured_worker_principal;
     if (typeof configured !== "string" || !WORKER_PRINCIPAL.test(configured)) {
       throw new WorkerIdentityRefusal(
         "worker_identity_outbox_unbound",
@@ -303,8 +303,8 @@ export class BusClient {
   // offset scan is not evidence of absence, so response-shape, total, offset and duplicate-id
   // inconsistencies are hard errors; replay retains the entry and posts nothing on any such error.
   async findTerminalDeliveries(entry) {
-    this.#configuredPrincipalForEntry(entry);
-    const { principal: expectedPostedBy, token } = await this.#requireAuthenticatedPostingPrincipal();
+    const expectedPostedBy = this.#configuredPrincipalForEntry(entry);
+    const { token } = await this.#requireAuthenticatedPostingPrincipal();
 
     const messages = [];
     const messageIds = new Set();
@@ -401,16 +401,36 @@ export class BusClient {
     }
     const url = `${this.serverUrl}/v1/messages`;
     const payload = { kind, subject, body };
-    if (postingPrincipal !== null) payload.from_agent = postingPrincipal;
+    if (postingPrincipal !== null && this.#expectedPostingPrincipal === null) {
+      payload.from_agent = postingPrincipal;
+    }
     if (options.outcome !== undefined) payload.outcome = options.outcome;
     if (options.refs !== undefined) payload.refs = options.refs;
     if (options.inReplyTo !== undefined) payload.in_reply_to = options.inReplyTo;
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    if (this.#expectedPostingPrincipal !== null) {
+      // This is an opt-in, same-request server precondition. Its value comes only from the
+      // configured worker binding: neither from_agent nor any prior identity discovery is
+      // authorization for the POST that follows.
+      headers["X-VGC-Expected-Worker-Principal"] = this.#expectedPostingPrincipal;
+    }
     const response = await fetch(url, {
       method: "POST",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      headers,
       body: JSON.stringify(payload),
     });
-    if (!response.ok) throw new Error(`bus POST ${url} failed: ${response.status} ${await response.text()}`);
+    if (!response.ok) {
+      const detail = await response.text();
+      if (this.#expectedPostingPrincipal !== null && [401, 403, 412, 422].includes(response.status)) {
+        const code = response.status === 412
+          ? "worker_publication_precondition_refused"
+          : response.status === 422
+            ? "worker_publication_precondition_malformed"
+            : "worker_publication_forbidden";
+        throw new WorkerIdentityRefusal(code, `bound worker bus POST ${url} failed: ${response.status} ${detail}`);
+      }
+      throw new Error(`bus POST ${url} failed: ${response.status} ${detail}`);
+    }
     const text = await response.text();
     return text ? JSON.parse(text) : undefined;
   }
@@ -460,7 +480,6 @@ export class BusClient {
     };
     const pendingId = recordPending(entry, this.outboxDir);
     const { principal, token } = await this.#requireAuthenticatedPostingPrincipal();
-    bindPendingPrincipal(pendingId, principal, this.outboxDir);
     const result = await this.#post(kind, subject, body, options, token, principal);
     clearPending(pendingId, this.outboxDir);
     return result;
