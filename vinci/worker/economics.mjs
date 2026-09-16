@@ -50,6 +50,126 @@ function str(value) {
   return typeof value === "string" && value.length <= 512 ? value : null;
 }
 
+// Machine-observed generation identity for this attempt.
+//
+// The contract, and the reason this is not a boolean: a run whose served model is UNKNOWN must stay
+// distinguishable from one where the served model was observed to equal what we asked for. Three
+// distinct states, never two:
+//
+//   observation: "unavailable"  no call reported a served id -> `observed_model` is null and
+//                               `matches_requested` is null. NOT evidence of agreement.
+//   observation: "observed"     >=1 call reported a served id and all reports agree.
+//   observation: "conflict"     calls reported DIFFERENT served ids within one attempt.
+//
+// `observed_model` is only ever a value the provider itself put on the wire. It is never derived
+// from the requested or resolved id -- that substitution is the defect this exists to make visible
+// (`buildFallbackModel` returns another model's entire configuration relabelled with the requested
+// id, so every identity keyed on `model.id` reports the request back as though it were an
+// observation).
+function observeGeneration(entries, requestedProvider, requestedModel) {
+  const observedModels = new Set();
+  const resolvedModels = new Set();
+  // The provider the RUNTIME actually used. Every adapter sets a response's `provider` from
+  // `model.provider` (packages/ai/src/api/*.ts) -- it is configuration carried alongside the call,
+  // and it is never read back off the wire. It is therefore routing/runtime state, NOT an
+  // observation, and it is named accordingly.
+  const runtimeProviders = new Set();
+  const seenResponseIds = new Set();
+  // Lineage: the actual generation events this attempt consumed. A model STRING cannot identify
+  // what ran -- two different generations can carry the same string, and a relabelled fallback
+  // carries a string that was never served. The response id names the event itself.
+  const usedGenerationIds = new Set();
+  const observedGenerationIds = new Set();
+  let totalCalls = 0;
+  let observedCalls = 0;
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    // Same dedup rule as the cost rollup: one provider response counted once.
+    if (typeof entry.responseId === "string" && entry.responseId) {
+      if (seenResponseIds.has(entry.responseId)) continue;
+      seenResponseIds.add(entry.responseId);
+    }
+    if (typeof entry.model_calls === "number" && entry.model_calls > 0) totalCalls += entry.model_calls;
+    const runtimeProvider = str(entry.provider);
+    if (runtimeProvider) runtimeProviders.add(runtimeProvider);
+    const generationId = str(entry.responseId);
+    if (generationId) usedGenerationIds.add(generationId);
+    // Prefer the full arrays; a single entry may carry more than one of either. `observed_model`
+    // / `resolved_model` remain as the singular convenience fields and are only consulted when the
+    // arrays are absent (legacy entries written before this shape existed).
+    const resolvedList = Array.isArray(entry.resolved_models) ? entry.resolved_models : [];
+    if (resolvedList.length > 0) for (const m of resolvedList) { if (str(m)) resolvedModels.add(m); }
+    else { const resolved = str(entry.resolved_model); if (resolved) resolvedModels.add(resolved); }
+
+    const observedList = Array.isArray(entry.observed_models) ? entry.observed_models : [];
+    const observedHere = [];
+    if (observedList.length > 0) { for (const m of observedList) { if (str(m)) observedHere.push(m); } }
+    else { const observed = str(entry.observed_model); if (observed) observedHere.push(observed); }
+    if (observedHere.length > 0) {
+      for (const m of observedHere) observedModels.add(m);
+      if (generationId) observedGenerationIds.add(generationId);
+      const n = typeof entry.observed_model_calls === "number" ? entry.observed_model_calls : 0;
+      observedCalls += n > 0 ? n : observedHere.length;
+    }
+  }
+
+  const sorted = [...observedModels].sort();
+  const resolvedSorted = [...resolvedModels].sort();
+  let observation = "unavailable";
+  if (sorted.length === 1) observation = "observed";
+  else if (sorted.length > 1) observation = "conflict";
+
+  const observedModel = sorted.length === 1 ? sorted[0] : null;
+  // null, not false: with no observation there is nothing to compare, and reporting `false` here
+  // would assert a mismatch we never measured.
+  let matchesRequested = null;
+  if (observation === "observed" && requestedModel !== null) matchesRequested = observedModel === requestedModel;
+  else if (observation === "conflict") matchesRequested = false;
+
+  const runtimeSorted = [...runtimeProviders].sort();
+  const usedIds = [...usedGenerationIds].sort();
+  const observedIds = [...observedGenerationIds].sort();
+  return {
+    observation,
+    // Carried here as well as in `route.initial_*` so a consumer reads ONE object and gets the
+    // whole chain; a consumer that has to join two places to tell requested from served is a
+    // consumer that will eventually print the wrong one.
+    requested_provider: requestedProvider,
+    requested_model: requestedModel,
+    // 🔴 ALWAYS null on every current path, and that is the correct answer rather than an omission.
+    // No adapter reads a served provider off the wire, so there is no provider evidence at
+    // observation strength anywhere in this system. This field previously echoed
+    // `requestedProvider` whenever any MODEL was observed, which asserted provider provenance the
+    // data never had -- exactly the substitution the rest of this interface exists to prevent.
+    // It stays present, and null, so a consumer can see that provider is never observed.
+    observed_provider: null,
+    // Routing/runtime state, taken from the entries themselves. One value when the whole attempt
+    // ran on one provider, null when it did not -- never collapsed to a first element.
+    runtime_provider: runtimeSorted.length === 1 ? runtimeSorted[0] : null,
+    runtime_providers: runtimeSorted,
+    // What was actually consumed. `used_generation_id` is filled only when the attempt consumed
+    // exactly one generation; otherwise the caller must read the list rather than be handed a
+    // single id that silently stands for several.
+    used_generation_id: usedIds.length === 1 ? usedIds[0] : null,
+    used_generation_ids: usedIds,
+    // The subset whose served identity was machine-observed. `used_model` is the served model of
+    // record: it is `observed_model` or nothing, never the requested or resolved string.
+    observed_generation_ids: observedIds,
+    // The middle term. Present whenever any call ran, and deliberately NOT compared against
+    // `observed_model` to produce a verdict here -- a consumer that wants drift reads all three.
+    resolved_model: resolvedSorted.length === 1 ? resolvedSorted[0] : null,
+    resolved_models: resolvedSorted,
+    observed_model: observedModel,
+    observed_models: sorted,
+    observation_source: observation === "unavailable" ? null : "response-stream",
+    model_calls: totalCalls,
+    observed_model_calls: observedCalls,
+    unobserved_model_calls: Math.max(0, totalCalls - observedCalls),
+    matches_requested: matchesRequested,
+  };
+}
+
 function rollupUsage(entries, flags) {
   const rollup = new Map();
   // One provider response is one response regardless of which (provider, model) row it lands in.
@@ -254,7 +374,18 @@ export function buildEconomicsSummary(input = {}) {
     summary.finished_at = finishedAt;
     if (work !== null) summary.work = work;
     if (usage.length > 0) summary.usage = usage;
-    summary.route = { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] };
+    // Milestone 2: the REQUESTED pair. `usage[].provider/model` stays the (collapsed) observed-or-
+    // requested pair it already was; these two slots were in the schema and null on every path, so
+    // requested-vs-observed was not computable from this artifact at all.
+    const requestedProvider = str(input.requestedProvider);
+    const requestedModel = str(input.requestedModel);
+    summary.route = {
+      policy_id: "none",
+      initial_provider: requestedProvider,
+      initial_model: requestedModel,
+      escalations: [],
+    };
+    summary.generation_identity = observeGeneration(usageArray, requestedProvider, requestedModel);
     summary.assets_consumed = [];
     summary.compactions = 0;
     summary.human_interventions = [];
@@ -285,6 +416,28 @@ export function buildEconomicsSummary(input = {}) {
       started_at: null,
       finished_at: null,
       route: { policy_id: "none", initial_provider: null, initial_model: null, escalations: [] },
+      // The builder threw. Nothing here was observed, and the field is emitted rather than omitted
+      // so a consumer never has to infer meaning from its absence.
+      generation_identity: {
+        observation: "unavailable",
+        observed_model: null,
+        observed_models: [],
+        resolved_model: null,
+        resolved_models: [],
+        requested_provider: null,
+        requested_model: null,
+        observed_provider: null,
+        runtime_provider: null,
+        runtime_providers: [],
+        used_generation_id: null,
+        used_generation_ids: [],
+        observed_generation_ids: [],
+        observation_source: null,
+        model_calls: 0,
+        observed_model_calls: 0,
+        unobserved_model_calls: 0,
+        matches_requested: null,
+      },
       assets_consumed: [],
       compactions: 0,
       human_interventions: [],

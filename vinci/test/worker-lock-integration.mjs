@@ -21,10 +21,16 @@ const fixture = new WorkerTestFixture("lock");
 try {
   fixture.createRepo("test", "repo");
   fixture.linkTools(TOOLS);
+  fixture.busPrincipal = "worker:locked";
   await fixture.startBus([]);
   const args = [join(ROOT, "vinci/worker/worker.mjs"), "start", "--id", "locked", "--server", fixture.busUrl(), "--state-dir", fixture.tempDir];
   const first = spawn("node", [...args, "--poll-seconds", "60"], { env: fixture.getEnv(), stdio: "pipe" });
-  await waitFor(() => existsSync(join(fixture.tempDir, "daemon.lock")) && fixture.getRequests.length === 1, "first daemon lock and poll");
+  await waitFor(
+    () => existsSync(join(fixture.tempDir, "daemon.lock"))
+      && fixture.identityRequests === 1
+      && fixture.getRequests.length === 1,
+    "first daemon identity lookup and poll",
+  );
   const getsBeforeSecond = fixture.getRequests.length;
   const second = spawn("node", [...args, "--once"], { env: fixture.getEnv(), stdio: ["ignore", "pipe", "pipe"] });
   let secondStderr = "";
