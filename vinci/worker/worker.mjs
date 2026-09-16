@@ -703,6 +703,11 @@ async function postFinal(bus, message, envelope, state, evidence, economics = nu
     : [];
   const details = [
     `state=${state.state}`,
+    // The terminal payload is the durable delivery identity reconciled after ACK loss. Carry the
+    // lifecycle's exact attempt label in that byte-exact payload so a terminal from another
+    // attempt of the same WorkOrder can never satisfy reconciliation merely because its subject,
+    // contract and outcome agree.
+    `attempt=${message.message_id}/${state.attempt}`,
     `exit_code=${state.exit_code}`,
     `cost_usd=${Number(state.cost_usd).toFixed(6)}`,
     state.limit_tripped ? `limit=${state.limit_tripped}` : undefined,
@@ -1681,13 +1686,23 @@ async function main() {
   process.once("SIGTERM", handleSignal);
   process.once("SIGINT", handleSignal);
   try {
-    const bus = new BusClient(options.server, options.token, 100, join(options.stateDir, "outbox"));
+    const bus = new BusClient(
+      options.server,
+      options.token,
+      100,
+      join(options.stateDir, "outbox"),
+      `worker:${options.id}`,
+    );
     // W0.5: record the server's build next to our own and announce both ONCE per daemon start,
     // before the first poll. A failed /v1/version fetch is recorded, never fatal: the bus
     // token check and the first poll already gate startup.
     serverBuild = await fetchServerBuild(options.server);
     // #18: and the version of the `vinci` binary this daemon will spawn (never fatal either).
     vinciBinary = vinciBinaryVersion();
+    // The configured --id is only an expectation. Resolve the bearer at the server's worker-only
+    // identity boundary before any publication or terminal reconciliation; no declared or locally
+    // persisted identity is accepted as a fallback.
+    await bus.establishAuthenticatedPostingPrincipal();
     await bus.post(
       "status",
       `worker ${options.id} online`,
@@ -1726,7 +1741,8 @@ async function main() {
     if (replayed.attempted || replayed.corrupt) {
       process.stderr.write(
         `vinci worker: terminal outbox -- attempted ${replayed.attempted}, `
-        + `delivered ${replayed.delivered}, failed ${replayed.failed}, `
+        + `delivered ${replayed.delivered}, reconciled ${replayed.reconciled}, `
+        + `duplicate ${replayed.duplicate}, failed ${replayed.failed}, `
         + `unreadable ${replayed.corrupt}\n`,
       );
     }

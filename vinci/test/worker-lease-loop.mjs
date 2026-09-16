@@ -523,6 +523,7 @@ await test('release failure is logged and never changes the state', async () => 
     assert.equal(governor.releases.length, 1);
     const final = fixture.getPostedMessages().find((p) => p.subject === 'task 112 completed');
     assert(final, 'final post still happens');
+    assert.match(final.body, /(?:^| )attempt=112\/1(?: |$)/, 'terminal binds the exact lifecycle attempt');
   } finally {
     await governor.close();
     await fixture.cleanup();
@@ -1175,6 +1176,7 @@ function declarationPosts(fixture, workerId) {
 
 // A daemon (no --once) so the interval can actually fire.
 function spawnDaemon(fixture, workerId, extraArgs, envOverrides = {}) {
+  fixture.busPrincipal = `worker:${workerId}`;
   const env = fixture.getEnv({ VINCI_GOVERNOR_TOKEN: 'gov-token', ...envOverrides });
   const proc = spawn('node', [WORKER, 'start', '--id', workerId, '--server', fixture.busUrl(), '--state-dir', fixture.tempDir, ...extraArgs], { env, stdio: 'pipe' });
   let stderr = '';
