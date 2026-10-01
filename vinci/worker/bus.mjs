@@ -170,6 +170,9 @@ export class BusClient {
     let offset = 0;
     while (true) {
       const url = new URL(`${this.serverUrl}/v1/messages`);
+      url.searchParams.set("kind", "handoff");
+      url.searchParams.set("to", `worker:${workerId}`);
+      if (typeof cursor?.ts === "string") url.searchParams.set("since", cursor.ts);
       url.searchParams.set("limit", String(this.pageSize));
       url.searchParams.set("offset", String(offset));
       const response = await fetch(url, { headers: { authorization: `Bearer ${this.#token}` } });
@@ -350,6 +353,7 @@ export class BusClient {
     const messageIds = new Set();
     let expectedTotal = null;
     let offset = 0;
+    // Intentionally full-range within its posted_by/kind filter to establish evidence of absence.
     while (true) {
       const url = new URL(`${this.serverUrl}/v1/messages`);
       url.searchParams.set("posted_by", expectedPostedBy);
