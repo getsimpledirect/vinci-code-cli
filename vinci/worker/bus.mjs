@@ -66,6 +66,9 @@ export class BusClient {
     let offset = 0;
     while (true) {
       const url = new URL(`${this.serverUrl}/v1/messages`);
+      url.searchParams.set("kind", "handoff");
+      url.searchParams.set("to", `worker:${workerId}`);
+      if (typeof cursor?.ts === "string") url.searchParams.set("since", cursor.ts);
       url.searchParams.set("limit", String(this.pageSize));
       url.searchParams.set("offset", String(offset));
       const response = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
