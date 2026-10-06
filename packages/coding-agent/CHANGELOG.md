@@ -21,6 +21,8 @@
 
 ### Fixed
 
+- Fixed Vinci accepting invalid or missing `--mode` values instead of rejecting them before provider startup.
+- Fixed Vinci's composer footer to reserve complete context metrics before fitting long project paths and ellipsize width-constrained project or model labels.
 - Fixed Vinci missing-credential guidance to use the selected provider's authentication route while preserving managed sign-in and plain Pi messages.
 - Fixed Vinci erasing a credential the user typed themselves, which made the model send the literal `<vinci-secret>` placeholder to a real endpoint or into a real environment variable. Text the user types now mints a session-scoped handle that the bash channel resolves at execution time; `write` and `edit` still refuse every placeholder, and a secret Vinci obtained by reading a file remains unresolvable.
 - Fixed the queued-message widget counting messages that had already been delivered. It matched deliveries by message text, which no longer matches once an `input` handler redacts a secret or strips an attached image path, or once the session expands a slash command or prompt template; aborting or restoring the queue to the editor left it stale as well. It now reconciles against `ExtensionContext.pendingMessageCount()`.
