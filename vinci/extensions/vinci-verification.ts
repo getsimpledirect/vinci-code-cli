@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { vinciBlockedStatusLine } from "./lib/blocked-status.ts";
 import {
   clearVinciAutomationStop,
   clearVinciConfirmationGate,
@@ -1697,16 +1698,47 @@ export function verificationOutputFailed(output: string): boolean {
 const HARNESS_CRASH =
   /\b(?:serverAddress|supertest|jest worker|worker (?:terminated|exited|crashed)|ERR_(?:REQUIRE_ESM|MODULE_NOT_FOUND|UNKNOWN_FILE_EXTENSION|UNSUPPORTED_[A-Z_]+)|unsupported (?:node|engine|module)|(?:version|node|engine|module|runner|harness|framework|dependency)[^\n]{0,24}\bincompatib(?:le|ility)\b|\bincompatib(?:le|ility)\b[^\n]{0,24}(?:version|node|engine|module|runner|harness|framework|dependency)|(?:before ?all|before ?each|setup) hook|test (?:runner|harness|framework)[^\n]{0,40}\b(?:crash|broke|broken|incompatible|fails? to (?:start|run|load)))\b/i;
 
-export function isHonestVerificationBlocker(text: string): boolean {
+const SANDBOX_CONTEXT = /\b(?:sandbox|bubblewrap|bwrap|network.namespace|NETLINK_ROUTE)\b/i;
+const SANDBOX_STARTUP_REASON =
+  /\b(?:cannot start|could not start|can['’]t start|couldn['’]t start|unable to start|failed to (?:start|create)|fails while creating|denied|not permitted|network.namespace|network socket|EPERM|EACCES)\b/i;
+// Match startup diagnostics, not arbitrary EPERM failures from code running inside the sandbox.
+const SANDBOX_STARTUP_OUTPUT =
+  /^(?:bwrap|bubblewrap):[^\n]{0,180}\b(?:creat(?:e|ing)|unshare|setup|setting up)[^\n]{0,80}\b(?:namespace|network|socket)\b[^\n]{0,80}\b(?:Operation not permitted|Permission denied|EPERM|EACCES)$/i;
+
+function sandboxStartupFailure(output: string): string {
+  const lines = output.trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  // A diagnostic example mixed with file-read errors or test output is not startup evidence.
+  // This is a diagnostic heuristic, not authenticated proof of which process wrote stderr.
+  if (
+    lines.length === 0 || lines.length > 2 || !SANDBOX_STARTUP_OUTPUT.test(lines[0]) ||
+    (lines.length === 2 && !/^Command exited with code [1-9]\d*$/.test(lines[1]))
+  ) return "";
+  return lines[0];
+}
+
+function hasVerificationSuccessClaim(text: string): boolean {
+  // The success-claim heuristic also matches "not verified" and "no tests passed". Those
+  // explicit negatives are honest blocked receipts, not assertions that verification succeeded.
+  const claimText = text.replace(
+    /\b(?:no tests? (?:passed|ran)|(?:(?:not|never)(?: (?:yet|fully|independently))?|(?:have|has|did)(?: not|n['’]t)) verified)\b/gi,
+    "",
+  );
+  return FALSE_SUCCESS.test(text) || isClaimingSuccessfulBehavioralTest(claimText);
+}
+
+export function isHonestVerificationBlocker(text: string, observedSandboxFailure = ""): boolean {
   const clean = text.trim();
+  const sandboxStartup = SANDBOX_CONTEXT.test(clean) && SANDBOX_STARTUP_REASON.test(clean);
   return (
     // A "Blocked:" LINE anywhere (m flag) — the recovery instruction says "write a line starting with
     // Blocked:", and an honest model naturally explains first; anchoring on the whole message rejected
     // exactly the honest reports this gate exists to accept (sweep P2-2). Em-dash accepted alongside
     // the colon because the guard's own block reasons use "Blocked (…) —" and models quote them.
-    /^(?:Blocked|Verification blocked)\s*(?::|—|\()\s*\S/im.test(clean) &&
-    (EXTERNAL_BLOCKER.test(clean) || HARNESS_CRASH.test(clean) || CONFIRMATION_GATE.test(clean)) &&
-    !FALSE_SUCCESS.test(clean)
+    vinciBlockedStatusLine(clean) !== undefined &&
+    (sandboxStartup
+      ? Boolean(sandboxStartupFailure(observedSandboxFailure))
+      : EXTERNAL_BLOCKER.test(clean) || HARNESS_CRASH.test(clean) || CONFIRMATION_GATE.test(clean)) &&
+    !hasVerificationSuccessClaim(clean)
   );
 }
 
@@ -2042,6 +2074,7 @@ export function isClaimingSuccessfulBehavioralTest(message: string): boolean {
 export function groundedCompletionReceipt(text: string): string {
   const state = getVinciVerificationState();
   if (state.variant !== "normal") return text;
+  if (vinciBlockedStatusLine(text) && !hasVerificationSuccessClaim(text)) return text;
   const currentVerification =
     state.status !== "failed" &&
     state.mutationRevision > 0 &&
@@ -2061,7 +2094,7 @@ export function groundedCompletionReceipt(text: string): string {
     const warning = `Done — please check it: ${reason}`;
     // Do not append an unverified warning beneath a success claim. That produces two mutually
     // exclusive receipts in one answer and leaves the earlier "tests passed" language standing.
-    if (isClaimingSuccessfulBehavioralTest(text)) return warning;
+    if (hasVerificationSuccessClaim(text)) return warning;
     if (/test suite couldn.t be run|done — please check it/i.test(text)) return text;
     return `${text.trim()}\n\n${warning}`;
   }
@@ -2069,7 +2102,7 @@ export function groundedCompletionReceipt(text: string): string {
   // A WAITING:/Blocked: close is a PARTIAL: the latest mutation may be verified, but the model is
   // saying the TASK isn't done (e.g. "fix X and wire up Stripe" → X verified, WAITING on the key).
   // Appending "Completed: the requested code change is implemented" would contradict it (sweep CP4).
-  if (/^\s*(?:WAITING|BLOCKED|Verification blocked)\s*[:—]/i.test(text)) return text;
+  if (/^\s*WAITING\s*[:—]/i.test(text)) return text;
   // When factcheck disclaimed a current/version fact this turn, a bare "Verification passed" reads as
   // validating that FACT — it isn't; it's about the CODE. Scope both receipt lines so the two subjects
   // can't blur together (round-2 outward-capability audit).
@@ -2112,6 +2145,8 @@ function persistedVerificationState(ctx?: ExtensionContext): VinciVerificationSt
 
 export default function (pi: ExtensionAPI) {
   let continueAfterTurn = false;
+  let sandboxStartupOutput = "";
+  let sandboxStartupRevision = -1;
   let turnMutationBaseline: WorkingTreeMutationBaseline | null = null;
   let deviationCheckedThisTurn = false;
   let mutatingBashThisTurn = false;
@@ -2141,6 +2176,7 @@ export default function (pi: ExtensionAPI) {
   const captureTurnMutationBaseline = async (cwd: string) => {
     deviationCheckedThisTurn = false;
     mutatingBashThisTurn = false;
+    sandboxStartupOutput = "";
     adHocHarnessRevision = -1;
     const mutationRevision = getVinciVerificationState().mutationRevision;
     turnMutationBaseline = {
@@ -2290,6 +2326,7 @@ export default function (pi: ExtensionAPI) {
     mutatingBashThisTurn = false;
     adHocHarnessRevision = -1;
     continueAfterTurn = false;
+    sandboxStartupOutput = "";
     clearVinciConfirmationGate();
     clearVinciFactDisclaimer();
     queuedUserInputs.length = 0;
@@ -2397,6 +2434,8 @@ export default function (pi: ExtensionAPI) {
         timeout: 20 * 60 * 1000,
       });
       const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+      sandboxStartupOutput = result.code !== 0 ? sandboxStartupFailure(output) : "";
+      sandboxStartupRevision = getVinciVerificationState().mutationRevision;
       const outputFailed = verificationOutputFailed(output);
       const checkClass = classifyVerificationCommand(command) ?? vinciVerificationCheckClass(state);
       const commandKey = normalizedVerificationCommand(command);
@@ -2532,6 +2571,10 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName !== "bash") return;
 
     const command = String(event.input.command ?? "").trim();
+    // The bash tool's raw output is its first block; later blocks may be guard-added guidance.
+    // Keep read-only commands eligible: the same startup failure also prevents inspecting a diff.
+    sandboxStartupOutput = event.isError ? sandboxStartupFailure(textContent(event.content.slice(0, 1))) : "";
+    sandboxStartupRevision = getVinciVerificationState().mutationRevision;
     if (!event.isError && isAdHocHarnessCommand(command)) adHocHarnessRevision = getVinciVerificationState().mutationRevision;
     if (!event.isError && isDiffEvidenceCommand(command, output)) {
       recordVinciDiffInspection();
@@ -2825,6 +2868,17 @@ export default function (pi: ExtensionAPI) {
       );
       return { message: annotated ?? blocked };
     }
+    const text = textContent(event.message.content);
+    if (
+      state.variant === "normal" &&
+      (state.status === "stale" || state.status === "failed" || hasIncompleteVinciBehavioralAttempt(state)) &&
+      isHonestVerificationBlocker(text, sandboxStartupRevision === state.mutationRevision ? sandboxStartupOutput : "")
+    ) {
+      continueAfterTurn = false;
+      setVinciContinuationPending(false);
+      requestVinciAutomationStop(text, "verification");
+      return undefined;
+    }
     if (state.variant === "normal" && state.status === "passed") {
       const text = textContent(event.message.content);
       const receipt = groundedCompletionReceipt(text);
@@ -2921,12 +2975,6 @@ export default function (pi: ExtensionAPI) {
       if (annotated) return { message: annotated };
       return note === text ? undefined : { message: rewritten };
     }
-    const text = textContent(event.message.content);
-    if (isHonestVerificationBlocker(text)) {
-      requestVinciAutomationStop(text, "verification");
-      return undefined;
-    }
-
     const stop = getVinciAutomationStop();
     if (stop.stopped) {
       continueAfterTurn = false;
