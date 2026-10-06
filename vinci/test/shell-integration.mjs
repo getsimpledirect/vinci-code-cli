@@ -3,6 +3,9 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
+import { TUI, visibleWidth } from "@earendil-works/pi-tui";
+import xterm from "@xterm/headless";
 import { createJiti } from "jiti/static";
 
 const source = fileURLToPath(new URL("../extensions/vinci-shell.ts", import.meta.url));
@@ -299,4 +302,106 @@ try {
 
 await emit("session_shutdown", {});
 
-console.log(`\nshell-integration: ${pass}/${pass} checks passed (semantic activity and pulse)`);
+// UX-03: render the real registered editor with deterministic status fixtures, without a provider,
+// auth, git subprocess, or copied layout logic. ANSI colors and Unicode consume terminal cells.
+const { getEditorTheme, initTheme, theme } = await loader.import(
+  fileURLToPath(new URL("../../packages/coding-agent/src/modes/interactive/theme/theme.ts", import.meta.url)),
+);
+const { VirtualTerminal } = await loader.import(
+  fileURLToPath(new URL("../../packages/tui/test/virtual-terminal.ts", import.meta.url)),
+);
+const { KeybindingsManager } = await loader.import(
+  fileURLToPath(new URL("../../packages/coding-agent/src/core/keybindings.ts", import.meta.url)),
+);
+initTheme("dark", false);
+const terminal = new VirtualTerminal(116, 41);
+const tui = new TUI(terminal);
+let editor;
+const footerContext = {
+  cwd: "/workspace/scratch/08d999a8bd37/vinci-cli-ui-qa-20261006/project",
+  model: { name: "Offline UI QA" },
+  getContextUsage: () => ({ percent: 20, tokens: 26_000 }),
+  ui: {
+    ...shellContext.ui,
+    theme,
+    setEditorComponent(factory) {
+      editor = factory(tui, getEditorTheme(), new KeybindingsManager());
+    },
+  },
+};
+await emit("session_start", {}, footerContext);
+
+function footerAt(width) {
+  const line = editor.render(width).at(-1);
+  assert.equal(visibleWidth(line), width, `footer must use exactly ${width} terminal cells`);
+  return stripVTControlCharacters(line);
+}
+
+for (const width of [80, 116, 80, 116]) {
+  const line = footerAt(width);
+  check(`footer keeps complete metrics after resize to ${width}`, /20% full · ↓ 26k ╯$/.test(line));
+  check(`footer keeps mode and model at ${width}`, line.includes("▶ AUTO  ·  Offline UI QA"));
+  if (width === 116) check("over-budget full path is visibly ellipsized", line.includes("…"));
+}
+
+for (const width of [80, 116]) {
+  const line = editor.render(width).at(-1);
+  const plain = stripVTControlCharacters(line);
+  const display = new xterm.Terminal({ cols: width, rows: 2, allowProposedApi: true });
+  await new Promise((resolve) => display.write(`${line}\x1b[2;1H${theme.fg("dim", "x")}`, resolve));
+  const expected = display.buffer.active.getLine(1).getCell(0);
+  for (const marker of ["20%", "26k", ...(width === 116 ? ["…"] : [])]) {
+    const column = visibleWidth(plain.slice(0, plain.indexOf(marker)));
+    const actual = display.buffer.active.getLine(0).getCell(column);
+    check(
+      `${marker} keeps its dim foreground after fitting to ${width}`,
+      actual.getFgColorMode() === expected.getFgColorMode() && actual.getFgColor() === expected.getFgColor(),
+    );
+  }
+  display.dispose();
+}
+
+for (const cwd of [
+  `/workspace/${"long-path/".repeat(30)}project`,
+  `/workspace/${"日本語/".repeat(30)}計画`,
+  `/workspace/\x1b[35m${"日本語/".repeat(30)}計画\x1b[0m`,
+]) {
+  footerContext.cwd = cwd;
+  for (const width of [80, 116]) {
+    const line = footerAt(width);
+    check(`long or Unicode project preserves metrics at ${width}`, /20% full · ↓ 26k ╯$/.test(line));
+    check(`long or Unicode project preserves model at ${width}`, line.includes("Offline UI QA"));
+    if (width === 116) check("truncated Unicode/ANSI path has an ellipsis", line.includes("…"));
+  }
+}
+
+footerContext.model.name = `\x1b[36m${"模型".repeat(60)}\x1b[0m`;
+for (const width of [70, 80, 116]) {
+  const line = footerAt(width);
+  check(`oversized ANSI/CJK model keeps complete metrics at ${width}`, /20% full · ↓ 26k ╯$/.test(line));
+  check(`oversized model remains visibly abbreviated at ${width}`, line.includes("模型") && line.includes("…"));
+}
+
+for (const width of [4, 5, 6, 8, 12, 20, 40, 69]) {
+  terminal.resize(width, 12);
+  const line = footerAt(width);
+  check(`short viewport has no partial numeric metric at ${width}`, !/full|↓|26/.test(line));
+  if (width >= 13) check(`short viewport retains complete mode at ${width}`, line.includes("▶ AUTO"));
+}
+
+footerContext.cwd = "/tmp/project";
+footerContext.model.name = "Offline UI QA";
+for (const [tokens, label] of [[150, "150"], [999, "999"], [1_500, "1.5k"], [26_000, "26k"], [2_600_000, "2.6M"]]) {
+  footerContext.getContextUsage = () => ({ percent: 20, tokens });
+  for (let width = 70; width <= 130; width++) {
+    assert.ok(footerAt(width).endsWith(`20% full · ↓ ${label} ╯`), `complete ${label} at ${width}`);
+  }
+  check(`numeric status ${label} stays atomic across 70–130 columns`, true);
+}
+footerContext.getContextUsage = () => ({ percent: 20, tokens: null });
+check("unknown tokens preserve the complete known percentage", /20% full ╯$/.test(footerAt(80)));
+footerContext.getContextUsage = () => ({ percent: null, tokens: null });
+check("unknown context renders no invented or partial metric", !/full|↓|null/.test(footerAt(116)));
+await emit("session_shutdown", {});
+
+console.log(`\nshell-integration: ${pass}/${pass} checks passed (semantic activity, pulse, and footer layout)`);

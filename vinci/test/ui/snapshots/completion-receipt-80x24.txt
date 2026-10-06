@@ -21,4 +21,4 @@
 │                                                                              │
 │›                                                                             │
 │                                                                              │
-╰ ▶ AUTO  ·  Vinci ─── <workspace>  ·  0% full · ↓ 15 ╯
+╰ ▶ AUTO  ·  Vinci ─── <workspace>…  ·  0% full · ↓ 150 ╯
