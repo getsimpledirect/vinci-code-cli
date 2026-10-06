@@ -224,6 +224,12 @@ test("reordered sandbox claims still require observed evidence", async () => {
 for (const negative of [
   "The change is in place but not verified.",
   "No tests passed because none could run.",
+  "No checks passed because none could run.",
+  "Zero tests passed because none could run.",
+  "No verification succeeded because the sandbox could not start.",
+  "0 tests passed because none could run.",
+  "No specs are passing because none could run.",
+  "Zero checks passed; no verification command succeeded.",
   "I have not verified the change.",
   "I haven't verified the change.",
 ]) {
@@ -232,9 +238,37 @@ for (const negative of [
     await shell(failures[0]);
     const message = assistant(`**Blocked:** the sandbox could not start shell commands. ${negative}`);
     assert.equal(await emit("message_end", { message }), undefined);
+    assert.equal(state.getVinciVerificationState().recoveryAttempts, 0);
+    assert.notEqual(state.getVinciVerificationState().status, "passed");
+    assert.equal(verification.groundedCompletionReceipt(message.content[0].text), message.content[0].text);
     await emit("turn_end");
     assert.equal(sent.length, 0);
     assert.equal(control.getVinciAutomationStop().stopped, true);
+    await emit("receipt:agent_end", { messages: [message] });
+    assert.equal(outcomes.at(-1).state, "BLOCKED");
+    assert.equal(exitHint, 3);
+  });
+}
+
+for (const claim of [
+  "Checks passed.",
+  "Tests passed.",
+  "Verification succeeded.",
+  "No checks passed, but tests passed.",
+  "Zero tests passed; verification succeeded.",
+  "No verification succeeded. All checks passed.",
+  "No checks passed because none could run. The implementation is complete.",
+]) {
+  test(`positive or mixed verification claims still require recovery: ${claim}`, async () => {
+    await start();
+    await shell(failures[0]);
+    const report = `**Blocked:** the sandbox could not start shell commands. ${claim}`;
+    assert.equal(verification.isHonestVerificationBlocker(report, failures[0]), false);
+    assert.ok((await emit("message_end", { message: assistant(report) }))?.message);
+    await emit("turn_end");
+    assert.equal(sent.length, 1);
+    assert.equal(control.getVinciAutomationStop().stopped, false);
+    assert.notEqual(state.getVinciVerificationState().status, "passed");
   });
 }
 

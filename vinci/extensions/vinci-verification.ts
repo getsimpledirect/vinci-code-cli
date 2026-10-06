@@ -1717,10 +1717,10 @@ function sandboxStartupFailure(output: string): string {
 }
 
 function hasVerificationSuccessClaim(text: string): boolean {
-  // The success-claim heuristic also matches "not verified" and "no tests passed". Those
-  // explicit negatives are honest blocked receipts, not assertions that verification succeeded.
+  // Strip only an explicitly negated verification phrase, not its whole sentence: a later
+  // positive claim ("no checks passed, but tests passed") must still reject the blocker.
   const claimText = text.replace(
-    /\b(?:no tests? (?:passed|ran)|(?:(?:not|never)(?: (?:yet|fully|independently))?|(?:have|has|did)(?: not|n['’]t)) verified)\b/gi,
+    /\b(?:(?:no|zero|0)\s+(?:test\s+suite|suite|tests?|specs?|checks?|verification(?:\s+command)?)(?:\s+(?:is|are))?\s+(?:pass(?:es|ed|ing)?|ran|green|succeeded|success)|(?:(?:not|never)(?: (?:yet|fully|independently))?|(?:have|has|did)(?: not|n['’]t)) verified)\b/gi,
     "",
   );
   return FALSE_SUCCESS.test(text) || isClaimingSuccessfulBehavioralTest(claimText);
