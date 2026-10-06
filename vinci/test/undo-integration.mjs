@@ -179,8 +179,51 @@ try {
     await turnStart(ctx);
     await toolCall(ctx, "bash", { command: "mv d.txt d2.txt" });
     const shellOnly = await runUndo(ctx);
-    check("a shell-only turn's undo admits it couldn't roll anything back", /Undo couldn't finish/.test(shellOnly.message) && /shell commands/.test(shellOnly.message));
+    check("a shell-only step explains its limitation without claiming shell execution", shellOnly.message === "No file backups in this step. Any changes made through shell commands have not been rolled back.");
+    check("a shell-only step remains a warning", shellOnly.level === "warning");
     check("a shell-only turn's undo never claims 'Nothing to change back'", !/Nothing to change back/.test(shellOnly.message));
+  }
+
+  // Attempted shell calls are recorded before execution. Never skip them to restore an older edit.
+  // These hooks do not execute either synthetic shell command.
+  {
+    const ws = workspace();
+    const ctx = makeCtx(ws);
+    const file = join(ws, "ordered.txt");
+    const root = join(ws, ".vinci", "undo");
+    writeFileSync(file, "original\n");
+    await turnStart(ctx);
+    await toolCall(ctx, "edit", { path: "ordered.txt", oldText: "original", newText: "edited" });
+    writeFileSync(file, "edited\n");
+    const editDir = latestTurnDir(ws);
+    await turnStart(ctx);
+    await toolCall(ctx, "bash", { command: "node --test first.test.mjs" });
+    const firstShellDir = latestTurnDir(ws);
+    await turnStart(ctx);
+    await toolCall(ctx, "bash", { command: "node --test second.test.mjs" });
+    const secondShellDir = latestTurnDir(ws);
+    const widgetsBefore = widgets.length;
+    const verificationBefore = verification.getVinciVerificationState();
+    const expected = "No file backups in this step. Any changes made through shell commands have not been rolled back. Say /undo again to step back to the previous recorded step.";
+
+    const first = await runUndo(ctx);
+    check("newest shell-only step gives an accurate conditional previous-step hint", first.message === expected && first.level === "warning");
+    check("first undo consumes only the newest shell checkpoint", !existsSync(secondShellDir) && existsSync(firstShellDir) && existsSync(editDir));
+    check("first shell-only undo leaves the older edit intact", readFileSync(file, "utf8") === "edited\n");
+    const second = await runUndo(ctx);
+    check("another shell-only step repeats the limitation, not a promised file restore", second.message === expected && second.level === "warning");
+    check("second undo consumes only the remaining shell checkpoint", !existsSync(firstShellDir) && existsSync(editDir));
+    check("second shell-only undo still leaves the file edit intact", readFileSync(file, "utf8") === "edited\n");
+    check("shell-only steps do not replace the receipt", widgets.length === widgetsBefore);
+    check("shell-only steps do not invalidate verification for files they did not restore", JSON.stringify(verification.getVinciVerificationState()) === JSON.stringify(verificationBefore));
+    const third = await runUndo(ctx);
+    check("the next undo restores the older tracked edit", readFileSync(file, "utf8") === "original\n" && /restored ordered\.txt/.test(third.message) && third.level === "info");
+    check("all recorded checkpoints are consumed in order", readdirSync(root).filter((name) => /^\d+$/.test(name)).length === 0);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const exhausted = await runUndo(ctx);
+      check(`exhausted undo ${attempt + 1} stays informational without a previous-step hint`, exhausted.message === "Nothing to undo — Vinci hasn't changed any files yet." && exhausted.level === "info");
+      check(`exhausted undo ${attempt + 1} leaves restored contents unchanged`, readFileSync(file, "utf8") === "original\n");
+    }
   }
 
   // ── 3. unrestorable file → named in the report, not silent ──────────────────────────────────
