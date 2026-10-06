@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -181,8 +181,63 @@ check(
   "a scratch repro file is redirected to inline diagnostics without prompting for an outside write",
   scratchWrite?.block === true && /inline diagnostic/i.test(scratchWrite.reason) && /outside writes require/i.test(scratchWrite.reason),
 );
-check("scratch detection covers common diagnostic names", scope.isProjectDiagnosticScratch("debug-parser.js"));
-check("scratch detection covers diagnostic directories", scope.isProjectDiagnosticScratch("_probe/sub/a.test.js"));
+check("scratch detection covers common diagnostic names", scope.isProjectDiagnosticScratch("debug-parser.js", cleanupDir));
+check("scratch detection covers diagnostic directories", scope.isProjectDiagnosticScratch("_probe/sub/a.test.js", cleanupDir));
+
+// Only project-relative names express diagnostic intent. An ancestor (or the project itself)
+// named scratch/debug/probe/repro must not turn ordinary source writes into diagnostic files.
+const ancestorDir = mkdtempSync(join(tmpdir(), "vinci-path-classification-"));
+try {
+  for (const ancestor of ["scratch", "debug", "probe", "repro"]) {
+    for (const projectName of ["project", ancestor]) {
+      const project = join(ancestorDir, ancestor, projectName);
+      mkdirSync(project, { recursive: true });
+      context.cwd = project;
+      for (const path of ["src/app.js", "./src/app.js", "src/../src/app.js", "debug/../src/app.js"]) {
+        check(`${ancestor}/${projectName}: relative ${path} is ordinary`, !scope.isProjectDiagnosticScratch(path, project));
+        check(`${ancestor}/${projectName}: absolute ${path} is ordinary`, !scope.isProjectDiagnosticScratch(join(project, path), project));
+      }
+      for (const path of ["debug-parser.js", "_probe/sub/a.test.js", "src/repro.mjs", "scratch/notes.txt", "src/../debug-parser.js"]) {
+        check(`${ancestor}/${projectName}: relative ${path} is diagnostic`, scope.isProjectDiagnosticScratch(path, project));
+        check(`${ancestor}/${projectName}: absolute ${path} is diagnostic`, scope.isProjectDiagnosticScratch(join(project, path), project));
+      }
+      // Pure lexical inputs only: never read, write, or dispatch tools at an outside-project path.
+      for (const path of ["../outside/scratch/notes.txt", join(project + "-sibling", "debug-parser.js"), join(project + "-sibling", "ordinary.js"), "../outside/debug/../ordinary.js"]) {
+        check(`${ancestor}/${projectName}: outside diagnostic classification stays conservative`, scope.isProjectDiagnosticScratch(path, project));
+      }
+      for (const path of ["..", "../ordinary.js"]) {
+        check(`${ancestor}/${projectName}: outside ordinary classification stays unchanged`, !scope.isProjectDiagnosticScratch(path, project));
+      }
+      for (const absolute of [false, true]) {
+        for (const handler of handlers.input ?? []) {
+          await handler({ type: "input", text: "Fix the checkout flow", source: "interactive" }, context);
+        }
+        const diagnosticPath = absolute ? join(project, "repro.mjs") : "repro.mjs";
+        const refused = await toolCall(diagnosticPath);
+        check(`${ancestor}/${projectName}: diagnostic writes still refuse (${absolute})`, refused?.block === true && /inline diagnostic/i.test(refused.reason));
+        for (let index = 1; index <= 8; index++) {
+          const path = `checkout-${index}.js`;
+          const result = await toolCall(absolute ? join(project, path) : path);
+          check(
+            `${ancestor}/${projectName}: volume write ${index} (${absolute})`,
+            index < 8 ? result === undefined : result?.block === true && /changed 8 files/.test(result.reason),
+          );
+        }
+        for (const handler of handlers.input ?? []) {
+          await handler({ type: "input", text: "Create repro.mjs to investigate checkout", source: "interactive" }, context);
+        }
+        check(`${ancestor}/${projectName}: explicit diagnostic approval remains (${absolute})`, await toolCall(diagnosticPath) === undefined);
+      }
+    }
+  }
+} finally {
+  context.cwd = cleanupDir;
+  rmSync(ancestorDir, { recursive: true, force: true });
+}
+for (const handler of handlers.input ?? []) {
+  await handler({ type: "input", text: "Fix the query parsing regression", source: "interactive" }, context);
+}
+await toolCall("test-regression.js");
 writeFileSync(join(cleanupDir, "test-regression.js"), "test\n");
 const selectionsBeforeCleanup = selections.length;
 check(

@@ -1,16 +1,16 @@
 /**
  * Vinci undo — a safety net for people who can't use git. Before Vinci's write/edit tools touch a
  * file, we snapshot that file's current contents to `<project>/.vinci/undo/<turn>/`. `/undo` then
- * restores the most recent turn's changes: modified files are put back, files Vinci newly created
+ * restores the most recent agent step's changes: modified files are put back, files Vinci newly created
  * are removed (and directories that became empty are cleared). This is deliberately FILE-BACKUP
  * based, not git plumbing — it can never touch or corrupt the project's real git state.
  *
- *   • automatic → each write/edit is backed up (grouped per user turn), capped to the last 10 turns
- *   • /undo     → revert the last turn's file changes, in plain language
+ *   • automatic → each write/edit is backed up (grouped per agent step), capped to the last 10 steps
+ *   • /undo     → revert the last agent step's file changes, in plain language
  *
  * Honesty rules (round-2 session-lifecycle audit P2-5/6/7): the /undo report never overclaims.
- * Shell-command mutations are invisible to the snapshotter, so a turn that ran a mutating bash
- * command carries that caveat into its report; files that could not be put back are named; a fully
+ * Shell-command mutations are invisible to the snapshotter, so a step with a potentially mutating
+ * bash call carries that caveat into its report; files that could not be put back are named; a fully
  * failed restore never reads as "Nothing to change back". After a successful restore the shared
  * verification state goes stale (the reverted tree needs a fresh check) and checkpoint recovery
  * records for the restored paths are dropped.
@@ -273,7 +273,7 @@ function removeEmptyParents(filePath: string, cwd: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
-  // New user turn → start a fresh (lazy) checkpoint.
+  // Each agent step (including subsequent model/tool cycles) starts a fresh lazy checkpoint.
   pi.on("turn_start", async () => {
     turnDir = null;
     backedUp = new Set<string>();
@@ -434,8 +434,16 @@ export default function (pi: ExtensionAPI) {
           `✓ Undone — ${parts.join("; ")}.${caveatText} Say /undo again to step back further.`,
           caveats.length ? "warning" : "info",
         );
+      } else if (m.entries.length === 0 && m.bashMutation) {
+        // The shell call was recorded before execution: it may have been blocked or failed.
+        // Consume this step normally, without silently skipping to an older file backup.
+        const stepBack = dirs.length > 1 ? " Say /undo again to step back to the previous recorded step." : "";
+        ctx.ui.notify(
+          `No file backups in this step. Any changes made through shell commands have not been rolled back.${stepBack}`,
+          "warning",
+        );
       } else if (caveats.length) {
-        // A fully failed (or shell-only) turn must never read as "nothing happened" (audit P2-5).
+        // A fully failed restore must never read as "nothing happened" (audit P2-5).
         ctx.ui.notify(`Undo couldn't finish — ${caveats.join("; ")}.`, "warning");
       } else {
         ctx.ui.notify("Nothing to change back.", "info");
