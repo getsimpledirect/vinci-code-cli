@@ -37,23 +37,21 @@ export async function listModels(
 		console.error(chalk.yellow(`Warning: errors loading models.json:\n${loadError}`));
 	}
 
-	// [vinci] The managed product exposes model classes, not Pi's provider catalog.
-	const availableModels = modelRegistry.getAvailable();
+	// [vinci] Catalog discovery must work before login; executable selection still uses getAvailable().
+	const vinciCode = process.env.VINCI_CODE === "1";
+	const catalogModels = vinciCode ? modelRegistry.getAll() : modelRegistry.getAvailable();
 	const showOtherProviders =
-		process.env.VINCI_CODE === "1" &&
-		(settingsManager ?? SettingsManager.create(process.cwd())).getShowOtherProviders();
+		vinciCode && (settingsManager ?? SettingsManager.create(process.cwd())).getShowOtherProviders();
 	const models =
-		process.env.VINCI_CODE === "1" && !showOtherProviders
-			? availableModels.filter((model) => model.provider === "vinci")
-			: availableModels;
+		vinciCode && !showOtherProviders ? catalogModels.filter((model) => model.provider === "vinci") : catalogModels;
 
 	if (models.length === 0) {
-		console.log(formatNoModelsAvailableMessage());
+		console.log(vinciCode ? "No models in the visible catalog." : formatNoModelsAvailableMessage());
 		return;
 	}
 
 	// Apply fuzzy filter if search pattern provided
-	let filteredModels: Model<Api>[] = models;
+	let filteredModels: Model<Api>[] = [...models];
 	if (searchPattern) {
 		filteredModels = fuzzyFilter(models, searchPattern, (m) => `${m.provider} ${m.id}`);
 	}
@@ -82,6 +80,8 @@ export async function listModels(
 		maxOut: formatTokenCount(m.maxTokens),
 		thinking: m.reasoning ? "yes" : "no",
 		images: m.input.includes("image") ? "yes" : "no",
+		// Presence only: does not validate credentials, refresh tokens, or check account access.
+		auth: vinciCode ? (modelRegistry.hasConfiguredAuth(m) ? "configured" : "unconfigured") : "",
 	}));
 
 	const headers = {
@@ -110,6 +110,7 @@ export async function listModels(
 		headers.maxOut.padEnd(widths.maxOut),
 		headers.thinking.padEnd(widths.thinking),
 		headers.images.padEnd(widths.images),
+		...(vinciCode ? ["auth"] : []),
 	].join("  ");
 	console.log(headerLine);
 
@@ -122,6 +123,7 @@ export async function listModels(
 			row.maxOut.padEnd(widths.maxOut),
 			row.thinking.padEnd(widths.thinking),
 			row.images.padEnd(widths.images),
+			...(vinciCode ? [row.auth] : []),
 		].join("  ");
 		console.log(line);
 	}
