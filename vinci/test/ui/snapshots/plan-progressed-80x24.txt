@@ -20,4 +20,4 @@
 │                                                                              │
 │›                                                                             │
 │                                                                              │
-╰ ◇ PLAN  ·  Vinci ─── <workspace>  ·  0% full · ↓ 15 ╯
+╰ ◇ PLAN  ·  Vinci ─── <workspace>…  ·  0% full · ↓ 150 ╯

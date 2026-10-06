@@ -148,8 +148,8 @@ function formatTokens(count: number): string {
 function formatContext(ctx: ExtensionContext): string {
   const usage = ctx.getContextUsage();
   if (!usage || usage.percent === null) return "";
-  // "% full" leads (the primary at-a-glance signal); the raw token count trails so it degrades
-  // gracefully — on a narrow border the token add-on truncates first, keeping "% full" intact.
+  // Keep the percentage and token count together; footer allocation treats metrics as atomic so
+  // a clipped suffix can never turn a value such as 26k into a misleading 2.
   const percent = `${Math.round(usage.percent)}% full`;
   return usage.tokens === null || usage.tokens === undefined ? percent : `${percent} · ↓ ${formatTokens(usage.tokens)}`;
 }
@@ -288,11 +288,28 @@ export default function (pi: ExtensionAPI) {
           : state.mode === "plan"
             ? theme.fg("warning", theme.bold(" ◇ Plan with Vinci "))
             : theme.fg("accent", theme.bold(" ✹ Ask Vinci "));
-        const context = formatContext(ctx);
+        // Reserve the corners and minimum border gap first, then fit complete status fields before
+        // the project. Widening to a full cwd must never steal cells from numeric context metrics.
+        const footerBudget = Math.max(0, width - 2 - 3);
+        let bottomLeft = truncateToWidth(` ${modeLabel} `, footerBudget, "…");
+        let context = width >= 70 ? formatContext(ctx) : "";
+        if (context && visibleWidth(bottomLeft) + visibleWidth(context) + 2 > footerBudget) context = "";
+        const contextWidth = context ? visibleWidth(context) + 2 : 0;
+        const separator = "  ·  ";
+        const modelWidth = footerBudget - visibleWidth(bottomLeft) - contextWidth - visibleWidth(separator);
+        if (modelWidth > 0) {
+          const model = truncateToWidth(theme.fg("muted", formatModel(ctx)), modelWidth, theme.fg("muted", "…"));
+          bottomLeft = ` ${modeLabel}${theme.fg("dim", separator)}${model} `;
+        }
         const project = `${formatProject(ctx.cwd, width)}${branch ? ` (${branch})` : ""}`;
-        const bottomLeft = ` ${modeLabel}${theme.fg("dim", "  ·  ")}${theme.fg("muted", formatModel(ctx))} `;
-        const bottomRightParts = width >= 70 ? [project, context].filter(Boolean) : [project];
-        const bottomRight = theme.fg("dim", ` ${bottomRightParts.join("  ·  ")} `);
+        const projectWidth = footerBudget - visibleWidth(bottomLeft) - contextWidth - (context ? visibleWidth(separator) : 2);
+        // Truncation resets ANSI styling before its ellipsis. Style each segment independently so
+        // shortening the path cannot change the following metrics' foreground color.
+        const fittedProject = projectWidth > 0
+          ? truncateToWidth(theme.fg("dim", project), projectWidth, theme.fg("dim", "…"))
+          : "";
+        const bottomRightParts = [fittedProject, context ? theme.fg("dim", context) : ""].filter(Boolean);
+        const bottomRight = bottomRightParts.length ? ` ${bottomRightParts.join(theme.fg("dim", separator))} ` : "";
         const edgeColor = state.working
           ? (text: string) => theme.fg("accent", text)
           : state.mode === "plan"
