@@ -2184,7 +2184,7 @@ export class InteractiveMode {
 	private showExtensionSelector(
 		title: string,
 		options: string[],
-		opts?: ExtensionUIDialogOptions,
+		opts?: ExtensionUIDialogOptions & { vinciReviewContext?: boolean },
 	): Promise<string | undefined> {
 		return new Promise((resolve) => {
 			if (opts?.signal?.aborted) {
@@ -2211,7 +2211,23 @@ export class InteractiveMode {
 					this.hideExtensionSelector();
 					resolve(undefined);
 				},
-				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
+				{
+					tui: this.ui,
+					timeout: opts?.timeout,
+					onToggleToolsExpanded: () => this.toggleToolOutputExpansion(),
+					// [vinci] The TUI anchors the editor above these trailing components.
+					reviewContextDimensions: opts?.vinciReviewContext
+						? () => ({
+								width: this.ui.terminal.columns,
+								rows: Math.max(
+									0,
+									this.ui.terminal.rows -
+										this.widgetContainerBelow.render(this.ui.terminal.columns).length -
+										(this.customFooter ?? this.footer).render(this.ui.terminal.columns).length,
+								),
+							})
+						: undefined,
+				},
 			);
 
 			this.editorContainer.clear();
@@ -2241,7 +2257,11 @@ export class InteractiveMode {
 		message: string,
 		opts?: ExtensionUIDialogOptions,
 	): Promise<boolean> {
-		const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], opts);
+		// Context review is select-only: confirm's legacy ordering is not safe-first.
+		const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], {
+			signal: opts?.signal,
+			timeout: opts?.timeout,
+		});
 		return result === "Yes";
 	}
 

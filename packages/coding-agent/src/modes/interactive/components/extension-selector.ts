@@ -16,8 +16,11 @@ import { theme } from "../theme/theme.ts";
 import { CountdownTimer } from "./countdown-timer.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
+import { VinciContextReview } from "./vinci-context-review.ts";
 
 export interface ExtensionSelectorOptions {
+	/** [vinci] Dimensions available after accounting for widgets and the footer. */
+	reviewContextDimensions?: () => { width: number; rows: number };
 	tui?: TUI;
 	timeout?: number;
 	onToggleToolsExpanded?: () => void;
@@ -48,6 +51,7 @@ class VinciAccentComponent implements Component {
 }
 
 export class ExtensionSelectorComponent extends Container {
+	private review: VinciContextReview | undefined;
 	private options: string[];
 	private selectedIndex = 0;
 	private listContainer: Container;
@@ -72,6 +76,9 @@ export class ExtensionSelectorComponent extends Container {
 		this.onCancelCallback = onCancel;
 		this.onToggleToolsExpanded = opts?.onToggleToolsExpanded;
 		this.baseTitle = title;
+		if (process.env.VINCI_CODE === "1" && opts?.reviewContextDimensions) {
+			this.review = new VinciContextReview(title, options, opts.reviewContextDimensions, onSelect, onCancel);
+		}
 
 		const vinci = process.env.VINCI_CODE === "1";
 		const topBorder = new DynamicBorder(vinci ? (text) => theme.fg("accent", text) : undefined);
@@ -88,7 +95,10 @@ export class ExtensionSelectorComponent extends Container {
 			this.countdown = new CountdownTimer(
 				opts.timeout,
 				opts.tui,
-				(s) => this.titleText.setText(theme.fg("accent", theme.bold(`${this.baseTitle} (${s}s)`))),
+				(s) => {
+					this.titleText.setText(theme.fg("accent", theme.bold(`${this.baseTitle} (${s}s)`)));
+					this.review?.setCountdown(s);
+				},
 				() => this.onCancelCallback(),
 			);
 		}
@@ -133,10 +143,16 @@ export class ExtensionSelectorComponent extends Container {
 		}
 	}
 
+	render(width: number): string[] {
+		return this.review ? this.review.render(width) : super.render(width);
+	}
+
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
 		if (kb.matches(keyData, "app.tools.expand")) {
 			this.onToggleToolsExpanded?.();
+		} else if (this.review) {
+			this.review.handleInput(keyData);
 		} else if (kb.matches(keyData, "tui.select.up") || keyData === "k") {
 			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
 			this.updateList();

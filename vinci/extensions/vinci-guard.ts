@@ -119,7 +119,7 @@ async function confirmRisky(ctx: ExtensionContext, title: string, detail: string
   const YES = "Yes, run it";
   const ALWAYS = "Always allow this exact command in this project";
   const NO = "No, don't";
-  const choice = await ctx.ui.select(`${title}\n\n${detail}`, [NO, YES, ALWAYS]);
+  const choice = await ctx.ui.select(`${title}\n\n${detail}`, [NO, YES, ALWAYS], { vinciReviewContext: true });
   if (choice === ALWAYS) {
     addTrust(ctx.cwd, c);
     ctx.ui.notify("Got it — I won't ask about that exact command in this project again (/allowed to undo).", "info");
@@ -132,7 +132,7 @@ async function confirmRisky(ctx: ExtensionContext, title: string, detail: string
 async function confirmSafely(ctx: ExtensionContext, title: string, detail: string): Promise<boolean> {
   const YES = "Yes, allow it";
   const NO = "No, don't";
-  return (await ctx.ui.select(`${title}\n\n${detail}`, [NO, YES])) === YES;
+  return (await ctx.ui.select(`${title}\n\n${detail}`, [NO, YES], { vinciReviewContext: true })) === YES;
 }
 
 /** rm with BOTH a recursive and a force flag (any order, combined like -rf or separate). */
