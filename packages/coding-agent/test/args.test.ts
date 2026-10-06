@@ -1,7 +1,65 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { parseArgs, printHelp } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
+	describe("Vinci --mode validation", () => {
+		beforeEach(() => vi.stubEnv("VINCI_CODE", "1"));
+		afterEach(() => vi.unstubAllEnvs());
+
+		test.each(["text", "json", "rpc"])("accepts %s", (mode) => {
+			const result = parseArgs(["--mode", mode, "-p", "hello"]);
+			expect(result.mode).toBe(mode);
+			expect(result.diagnostics).toEqual([]);
+			expect(result.print).toBe(true);
+			expect(result.messages).toEqual(["hello"]);
+		});
+
+		test.each(["wrong", "JSON", " ", "json ", ""])("rejects value %j", (mode) => {
+			const result = parseArgs(["--mode", mode, "-p", "hello"]);
+			expect(result.mode).toBeUndefined();
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: expect.stringMatching(/--mode.*text, json, rpc/) },
+			]);
+			expect(result.print).toBe(true);
+			expect(result.messages).toEqual(["hello"]);
+		});
+
+		test("rejects a missing value", () => {
+			const result = parseArgs(["--mode"]);
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: expect.stringMatching(/--mode.*text, json, rpc/) },
+			]);
+			expect(result.unknownFlags.size).toBe(0);
+		});
+
+		test.each(["--print", "-p"])("does not consume following option %s", (option) => {
+			const result = parseArgs(["--mode", option, "hello"]);
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0].type).toBe("error");
+			expect(result.print).toBe(true);
+			expect(result.messages).toEqual(["hello"]);
+		});
+
+		test("does not consume a following attachment", () => {
+			const result = parseArgs(["--mode", "@prompt.md"]);
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.fileArgs).toEqual(["prompt.md"]);
+		});
+
+		test("a later valid mode cannot erase an invalid mode", () => {
+			const result = parseArgs(["--mode", "wrong", "--mode", "json"]);
+			expect(result.mode).toBe("json");
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0].type).toBe("error");
+		});
+
+		test("preserves plain Pi parsing", () => {
+			vi.stubEnv("VINCI_CODE", undefined);
+			expect(parseArgs(["--mode", "wrong"]).diagnostics).toEqual([]);
+			expect(parseArgs(["--mode"]).unknownFlags.get("mode")).toBe(true);
+		});
+	});
+
 	describe("--version flag", () => {
 		test("parses --version flag", () => {
 			const result = parseArgs(["--version"]);
