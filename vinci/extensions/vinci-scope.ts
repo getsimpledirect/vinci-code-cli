@@ -23,7 +23,7 @@
  * self-discipline are robust and latency-free today.)
  */
 import { existsSync } from "node:fs";
-import { basename, relative, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve } from "node:path";
 import { classifyCompletionResult, complete } from "@earendil-works/pi-ai/compat";
 import { type ExtensionAPI, type ExtensionContext, vinciMaskSecrets } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
@@ -205,8 +205,15 @@ function normalizedProjectPath(path: string, cwd: string): string {
   return normalized.startsWith("../") ? "" : normalized;
 }
 
-export function isProjectDiagnosticScratch(path: string): boolean {
-  return /(?:^|\/)_?(?:debug|probe|repro|scratch)(?:[-_.\/]|$)/i.test(path.replaceAll("\\", "/"));
+export function isProjectDiagnosticScratch(path: string, cwd: string): boolean {
+  const projectPath = relative(cwd, resolve(cwd, path));
+  const normalized = projectPath.replaceAll("\\", "/");
+  // Classify project names, not workspace ancestors. Outside targets keep the conservative
+  // raw-path behavior; this lexical intent check never grants filesystem authorization.
+  const candidate = normalized === ".." || normalized.startsWith("../") || isAbsolute(projectPath)
+    ? path.replaceAll("\\", "/")
+    : normalized;
+  return /(?:^|\/)_?(?:debug|probe|repro|scratch)(?:[-_.\/]|$)/i.test(candidate);
 }
 
 // Match the action at a command position (line start or after ; | & && ||), sudo-tolerant.
@@ -668,7 +675,7 @@ export default function (pi: ExtensionAPI) {
       const path = String(input.path ?? input.file_path ?? "");
       if (path) {
         const absolutePath = resolve(ctx.cwd, path);
-        if (!existsSync(absolutePath) && isProjectDiagnosticScratch(path) && !task.toLowerCase().includes(basename(path).toLowerCase())) {
+        if (!existsSync(absolutePath) && isProjectDiagnosticScratch(path, ctx.cwd) && !task.toLowerCase().includes(basename(path).toLowerCase())) {
           return {
             block: true,
             reason:

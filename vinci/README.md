@@ -87,7 +87,7 @@ Vinci Code has its **own** version, separate from the underlying Pi version. To 
 | `themes/vinci-{dark,light}.json` | Brand palette as Pi themes (all 51 tokens) |
 | `identity.json` | Canonical Vinci app/provider/model/theme/extension contract, enforced after upstream syncs |
 | `updater/` | Stable signed-manifest updater, public trust root, atomic version activation, and rollback launcher |
-| `extensions/vinci-provider.ts` | Managed Vinci gateway (`/api/v1`) + `/login vinci` device pairing. The product contract is the stable `forte` frontier class, initially GLM 5.2 on approved DeepInfra. The picker exposes only Forte; the direct DeepInfra lane is internal qualification only |
+| `extensions/vinci-provider.ts` | Managed Vinci gateway (`/api/v1`) + `/login` device pairing for Vinci. The product contract is the stable `forte` frontier class, initially GLM 5.2 on approved DeepInfra. The picker exposes only Forte; the direct DeepInfra lane is internal qualification only |
 | `extensions/vinci-shell.ts` | Vinci-owned framed composer and status shell — a spacious raised input surface with breathing room above it, one slow `· → • → ● → •` pulse, semantic phase copy, honest connection state, Auto/Plan, model, project/branch, and context orientation |
 | `extensions/vinci-character.ts` | Coding behavior — own the user's goal, explore freely, use a high permission bar, **narrate every step in plain language**, and finish the task |
 | `extensions/vinci-memory.ts` | Transparent project memory — `remember` tool + `/memory`, local `.vinci/memory.md` |
@@ -102,7 +102,7 @@ Vinci Code has its **own** version, separate from the underlying Pi version. To 
 | `extensions/vinci-guard.ts` | Safety hook — blocks catastrophic commands and shell-based file writes; confirms destructive actions, **database schema changes/resets**, wholesale file overwrites that lose content, **reaches-the-real-world** actions, system changes, committing secrets, and protected-path writes |
 | `extensions/vinci-scope.ts` | Scope guardian — pauses Auto mode on consequential out-of-scope drift with Go-ahead / Skip / Explain: deletes, dependency/config changes, a lenient **LLM "is this in scope?" judge**, and broad-refactor volume. Its `ask_user` tool is reserved for material, destructive, external, costly, or sensitive decisions—not routine exploration |
 | `extensions/vinci-loopbreak.ts` | **Loop defense** — the fixation ladder (nudge → stronger teammate → stop-and-report) over identical repeats incl. edits/writes/meta-tools, carrying across bare-"continue" turns; narration may reset the consecutive exploration streak but never the absolute per-turn action ceiling; invalid-call + truncated-write coaches; and a validated turn-stop (kill switch `VINCI_NO_TURNSTOP=1`) |
-| `extensions/vinci-undo.ts` | Safety net — per-turn file checkpoints + `/undo` (no git needed) |
+| `extensions/vinci-undo.ts` | Safety net — per-agent-step file checkpoints + `/undo` (no git needed) |
 | `extensions/vinci-checkpoint.ts` | Durable task recovery — the session UUID is the task ID; write/edit/bash calls receive started/completed checkpoints, interrupted file state is inspected on resume, and exact completed or unsafe side effects are never blindly replayed; `/task-info` shows the resume command |
 | `extensions/vinci-preview.ts` | **`/preview`** — opens what Vinci built: a static site in the browser, or starts the app's dev server + opens the local URL (so a non-programmer can actually *see* the result) |
 | `extensions/vinci-receipt.ts` | Durable task handoff — explicit `DONE`, `DONE-UNVERIFIED`, `WAITING`, or `BLOCKED`; changed files, verifier-owned evidence, `/undo`, active duration, and a session-local model-call/token/cache/cost meter. `/usage` shows the same record and points to the Vinci app for authoritative account credits |
@@ -166,8 +166,9 @@ Vinci Code has its **own** version, separate from the underlying Pi version. To 
   applying database migrations or other consequential actions.
 - **Project brain** — Pi natively reads a project-root `AGENTS.md` (or `CLAUDE.md`): put your
   architecture, conventions, and "never do X" there and Vinci reads it every session.
-- **Login without pasting a key** — `/login vinci` pairs in the browser. `/login` and `/model`
-  also offer every provider Pi supports, with Vinci's own classes listed first.
+- **Login without pasting a key** — `/login` opens Vinci browser pairing directly in the
+  managed-default view. With other providers enabled, choose an authentication method, then
+  a provider; choose "Use a subscription", then Vinci to pair in the browser.
 
 ## Run it
 
@@ -181,7 +182,8 @@ npm install && bash vinci/build.sh
 vinci/bin/vinci
 
 # 3. Connect (first run) — no API key to paste:
-#    /login vinci  → opens platform.getsimpledirect.com/device, authorize with one click.
+#    /login  → opens Vinci pairing directly in the managed-default view.
+#    With other providers enabled, choose "Use a subscription", then Vinci.
 
 # Resume an interrupted task using the ID from /task-info or the exit receipt:
 vinci resume <task-id>
@@ -190,7 +192,7 @@ vinci resume <task-id>
 vinci report-wrong <task-id> "optional note"
 ```
 
-The `/login vinci` device-pairing flow (RFC 8628) is in `extensions/vinci-provider.ts` —
+The Vinci device-pairing flow reached through `/login` (RFC 8628) is in `extensions/vinci-provider.ts` —
 it opens the browser, you authorize, and the CLI gets its own revocable key (managed in
 `~/.pi/agent/`). No key to copy. `VINCI_API_KEY` still works as a CI/fallback escape hatch.
 Backend: vinci-chat `device_pairings` (#91) + vinci-platform `/api/device/*` (#2) — **must
