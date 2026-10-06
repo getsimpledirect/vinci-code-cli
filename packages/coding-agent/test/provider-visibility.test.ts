@@ -31,7 +31,9 @@ function createRegistry(): ModelRegistry {
 	return {
 		refresh: () => {},
 		getError: () => undefined,
+		getAll: () => models,
 		getAvailable: () => models,
+		hasConfiguredAuth: () => true,
 		find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
 	} as unknown as ModelRegistry;
 }
