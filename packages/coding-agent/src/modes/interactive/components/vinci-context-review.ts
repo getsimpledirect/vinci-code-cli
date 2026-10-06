@@ -26,10 +26,11 @@ export class VinciContextReview implements Component {
 		onSelect: (option: string) => void,
 		onCancel: () => void,
 	) {
-		// Commands are data: show control bytes literally instead of letting them erase or move review text.
+		// [vinci] Escape only the display copy: terminals disagree about Unicode cell widths.
+		// Fixed-width UTF-16 escapes preserve controls, backslashes and lone surrogates unambiguously.
 		this.title = title.replace(
-			/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g,
-			(char) => `\\x${char.charCodeAt(0).toString(16).padStart(2, "0")}`,
+			/[^\x20-\x5b\x5d-\x7e]/g,
+			(char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
 		);
 		this.options = options;
 		this.dimensions = dimensions;
@@ -59,7 +60,11 @@ export class VinciContextReview implements Component {
 			return [];
 		}
 		const textLines = (text: string) => new Text(text, 0, 0).render(width);
-		const context = textLines(this.title);
+		const context = textLines("Display only: ASCII-escaped context");
+		// Every display character is one cell. Hard wrapping also preserves boundary spaces.
+		for (let offset = 0; offset < this.title.length; offset += width) {
+			context.push(this.title.slice(offset, offset + width));
+		}
 		const choices = this.options.flatMap((option, index) =>
 			textLines(index === this.selected ? theme.fg("accent", `→ ${option}`) : `  ${option}`),
 		);

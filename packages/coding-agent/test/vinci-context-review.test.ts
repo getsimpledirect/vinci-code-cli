@@ -54,7 +54,7 @@ describe("Vinci approval context review", () => {
 		const f = fixture(title, 80, 22);
 		const screen = f.paint().join("\n");
 		expect(screen).toContain("echo disposable");
-		expect(screen).toContain("delete a folder");
+		expect(f.paint().join("")).toContain("delete a folder");
 		expect(screen).toContain(`→ ${NO}`);
 		expect(screen).toContain(ALWAYS);
 		f.review.handleInput("\r");
@@ -86,7 +86,7 @@ describe("Vinci approval context review", () => {
 	});
 
 	it("cannot skip unseen pages with queued page keys", () => {
-		const f = fixture();
+		const f = fixture(`${title}\n${"review context ".repeat(50)}`);
 		f.paint();
 		for (let i = 0; i < 100; i++) f.review.handleInput(down);
 		expect(f.paint().join("\n")).toContain("Review 2/");
@@ -139,15 +139,22 @@ describe("Vinci approval context review", () => {
 		expect(f.selected).toEqual([NO]);
 	});
 
-	it("paginates long unbroken Unicode commands without truncation and quotes control bytes", () => {
+	it("paginates escaped Unicode commands without truncation and quotes control bytes", () => {
 		const command = `echo ${"漢🙂".repeat(500)} END\x1b[2J\r\x07`;
 		const f = fixture(command);
 		const pages = finishReview(f);
 		expect(pages.length).toBeGreaterThan(10);
-		const combined = pages.flat().join("\n");
-		expect((combined.match(/漢/g) ?? []).length).toBe(500);
-		expect((combined.match(/🙂/g) ?? []).length).toBe(500);
-		expect(combined).toContain("END\\x1b[2J\\x0d\\x07");
+		const combined = pages
+			.flatMap((lines) =>
+				lines.slice(
+					0,
+					lines.findIndex((line) => line.startsWith("Review ")),
+				),
+			)
+			.join("");
+		expect((combined.match(/\\u6f22/g) ?? []).length).toBe(500);
+		expect((combined.match(/\\ud83d\\ude42/g) ?? []).length).toBe(500);
+		expect(combined).toContain("END\\u001b[2J\\u000d\\u0007");
 		expect(pages.flat().every((line) => visibleWidth(line) <= 40)).toBe(true);
 	});
 
@@ -313,7 +320,7 @@ describe("production selector in an xterm viewport", () => {
 		expect(terminal.getViewport().join("\n")).toContain("Editor restored");
 		expect(selected).toEqual([]);
 	});
-	it("preserves all Unicode command graphemes across actual xterm pages", async () => {
+	it("preserves ASCII-escaped Unicode commands across actual xterm pages", async () => {
 		process.env.VINCI_CODE = "1";
 		initTheme("dark");
 		const terminal = new VirtualTerminal(40, 12);
@@ -347,8 +354,13 @@ describe("production selector in an xterm viewport", () => {
 			terminal.sendInput(down);
 		}
 		const rendered = context.join("");
-		for (const grapheme of ["漢", "👩‍💻", "🇨🇦", "❤️"]) {
-			expect(rendered.split(grapheme).length - 1).toBe(120);
+		for (const escaped of [
+			"\\u6f22",
+			"\\ud83d\\udc69\\u200d\\ud83d\\udcbb",
+			"\\ud83c\\udde8\\ud83c\\udde6",
+			"\\u2764\\ufe0f",
+		]) {
+			expect(rendered.split(escaped).length - 1).toBe(120);
 		}
 		expect(rendered).toContain("END_COMMAND");
 	});
