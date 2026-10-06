@@ -150,7 +150,7 @@ Nothing to configure. Install it, run it, pick a provider:
 ./vinci/bin/vinci
 
 /login      # pick Anthropic, OpenAI, Google, Groq, … or Vinci
-/model      # pick a model — foreign ones show their exact id and a provider badge
+/model      # pick a model from providers with configured authentication
 ```
 
 `/login` asks how you want to authenticate before it asks who with. "Use an API key" lists every
@@ -161,6 +161,12 @@ add a key. A Vinci account is one of the options, never a prerequisite.
 
 Providers are visible before you configure anything — on a fresh checkout `--list-models` already
 lists other providers' models next to Vinci's own classes, which simply sort first:
+
+The `auth` column marks each model `configured` or `unconfigured`. This is a local credential
+presence check, not a login, token-validity, or account-access check. Listing the catalog does
+not contact providers. Use `--list-models <search>` to filter it; use `/login` to configure a
+provider before selecting its model with `/model`. The interactive picker only lists models
+with configured authentication.
 
 <img src="vinci/assets/demo-byok.gif" alt="On a fresh checkout with nothing configured, vinci --list-models already shows Anthropic, DeepSeek and Google models alongside Vinci's own classes, which sort first" width="900" />
 
