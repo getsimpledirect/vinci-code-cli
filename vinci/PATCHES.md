@@ -30,7 +30,7 @@ only patch core when there's no hook.)
 | `agent/src/agent-loop.ts` | Canonicalize tool-name synonyms (`editor`→`edit`); repair double-encoded arguments before validation; mark Vinci-blocked results for private display handling | 20,23 |
 | `ai/src/api/openai-completions.ts` | Mark failed/blocked tool results with an explicit `ERROR —` prefix on the wire | 15 |
 | `coding-agent/package.json` | `piConfig.name: "vinci"` — window title / `APP_NAME` (JSON, so no inline tag) | 9 |
-| `coding-agent/src/cli/args.ts` | Hide provider/model/BYOK controls from Vinci help while preserving the full upstream Pi surface | 4 |
+| `coding-agent/src/cli/args.ts` | Hide provider/model/BYOK controls from Vinci help; reject malformed output modes before runtime startup | 4,26 |
 | `coding-agent/src/cli/list-models.ts` | Restrict Vinci's non-interactive model listing to the managed provider | 4 |
 | `coding-agent/src/core/agent-session.ts` | Small-window compaction `keepRecentTokens`; auto-continue after threshold compaction AND after a length-cut reply; turn-end verification gate (Phase 2); default active tools incl. grep/find/ls | 7,8,10 |
 | `coding-agent/src/core/extensions/runner.ts` | Default the extension overlay-focus query to false outside interactive UI | — |
@@ -512,6 +512,20 @@ const credentialsTail =
     ? "You're connected. Vinci is also on the web and your phone — type /help for links."
     : `Credentials saved to ${getAuthPath()}`;
 ```
+
+## 26. Reject malformed output modes before inference
+
+`cli/args.ts` validates the documented `--mode <value>` form under `VINCI_CODE=1`. Invalid,
+empty, and missing values produce an error listing `text, json, rpc`; the existing diagnostics
+path exits 1 before loading extensions or starting a provider. A following flag or attachment
+is not consumed as the missing value, and a later valid mode does not clear an earlier error.
+Plain Pi retains its existing parser behavior. This is not a general flag-validation change:
+other flags, extension flags, and unsupported built-in equals syntax are unchanged.
+
+Regressions: `packages/coding-agent/test/args.test.ts` covers parsing;
+`packages/coding-agent/test/vinci-cli-mode.test.ts` launches the offline-built executable with
+an isolated HOME and local faux provider. It covers piped input, Linux TTY errors, zero extension
+or provider calls on malformed modes, valid text/JSON output, and an RPC state query.
 
 ---
 
