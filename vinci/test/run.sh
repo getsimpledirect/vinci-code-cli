@@ -772,6 +772,8 @@ run_group loopbreak-integration node "${ROOT}/vinci/test/loopbreak-integration.m
 # finalization git commands exempt from the reserve (never push/network).
 run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-harness-integration.mjs"
 run_group guard-integration node "${ROOT}/vinci/test/guard-integration.mjs"
+# Replay failed tool results offline; guidance must preserve raw errors without inventing their cause.
+run_group guard-error-guidance-integration node --test "${ROOT}/vinci/test/guard-error-guidance-integration.mjs"
 # Masked content (<vinci-secret>) can never match or overwrite raw file bytes.
 run_group mask-edit-integration node "${ROOT}/vinci/test/mask-edit-integration.mjs"
 run_group secret-handle-integration node "${ROOT}/vinci/test/secret-handle-integration.mjs"
