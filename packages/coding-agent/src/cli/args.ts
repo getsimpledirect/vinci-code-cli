@@ -75,6 +75,19 @@ export function parseArgs(args: string[]): Args {
 			result.help = true;
 		} else if (arg === "--version" || arg === "-v") {
 			result.version = true;
+		} else if (arg === "--mode" && process.env.VINCI_CODE === "1") {
+			// [vinci] Reject malformed modes before runtime startup; preserve following flags and attachments.
+			const mode = args[i + 1];
+			if (mode === "text" || mode === "json" || mode === "rpc") {
+				result.mode = mode;
+				i++;
+			} else {
+				result.diagnostics.push({
+					type: "error",
+					message: "Invalid or missing --mode value. Valid values: text, json, rpc",
+				});
+				if (mode !== undefined && !mode.startsWith("-") && !mode.startsWith("@")) i++;
+			}
 		} else if (arg === "--mode" && i + 1 < args.length) {
 			const mode = args[++i];
 			if (mode === "text" || mode === "json" || mode === "rpc") {
