@@ -724,6 +724,8 @@ run_group model-provenance-integration node "${ROOT}/vinci/test/model-provenance
 run_group workspace-integration node "${ROOT}/vinci/test/workspace-integration.mjs"
 # Failed/stale verification is sticky across edits and cannot be narrated away as success.
 run_group verification-state-integration node "${ROOT}/vinci/test/verification-state-integration.mjs"
+# Honest sandbox blockers preserve the model's report and do not enqueue futile recovery turns.
+run_group verification-blocked-report-integration node "${ROOT}/vinci/test/verification-blocked-report-integration.mjs"
 # The latch LIFECYCLE: every shape is driven fail -> exact rerun -> clear. Two rounds of #56/#66
 # shipped a latch that formed correctly and could never resolve, because every test asserted the
 # latch FORMS and none asserted it RESOLVES (VERIFICATION_LATCH_DESIGN.md, guarantee 8).
