@@ -1,3 +1,4 @@
+import { vinciBlockedStatusLine } from "./blocked-status.ts";
 import { formatDuration } from "./format-duration.ts";
 import { getVinciHardStop } from "./hard-stop.ts";
 import {
@@ -477,7 +478,8 @@ export function classifyVinciLocalTaskState(
         `The attempted check (${verification.behavioralAttemptCommand || verification.command}) ran without executing tests, so nothing was verified.`,
     };
   }
-  if (/^\s*BLOCKED:/i.test(text)) return { state: "BLOCKED", reason: text.split("\n")[0].slice(0, 240) };
+  const blockedStatus = vinciBlockedStatusLine(text);
+  if (blockedStatus) return { state: "BLOCKED", reason: blockedStatus.slice(0, 240) };
   if (/^\s*WAITING:/i.test(text)) return { state: "WAITING", reason: text.split("\n")[0].slice(0, 240) };
   // #10: verification being switched off never changes the STATE — it changes what we may say
   // about it. Two earlier attempts overrode the state and were both wrong: the first erased a

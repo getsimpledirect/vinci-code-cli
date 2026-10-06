@@ -9,4 +9,4 @@
 │                                                          │
 │›                                                         │
 │                                                          │
-╰ ▶ AUTO  ·  Vinci ─── <workspace> ╯
+╰ ▶ AUTO  ·  Vinci ─── <workspace>… ╯

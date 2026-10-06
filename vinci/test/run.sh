@@ -724,6 +724,8 @@ run_group model-provenance-integration node "${ROOT}/vinci/test/model-provenance
 run_group workspace-integration node "${ROOT}/vinci/test/workspace-integration.mjs"
 # Failed/stale verification is sticky across edits and cannot be narrated away as success.
 run_group verification-state-integration node "${ROOT}/vinci/test/verification-state-integration.mjs"
+# Honest sandbox blockers preserve the model's report and do not enqueue futile recovery turns.
+run_group verification-blocked-report-integration node "${ROOT}/vinci/test/verification-blocked-report-integration.mjs"
 # The latch LIFECYCLE: every shape is driven fail -> exact rerun -> clear. Two rounds of #56/#66
 # shipped a latch that formed correctly and could never resolve, because every test asserted the
 # latch FORMS and none asserted it RESOLVES (VERIFICATION_LATCH_DESIGN.md, guarantee 8).
@@ -770,6 +772,8 @@ run_group loopbreak-integration node "${ROOT}/vinci/test/loopbreak-integration.m
 # finalization git commands exempt from the reserve (never push/network).
 run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-harness-integration.mjs"
 run_group guard-integration node "${ROOT}/vinci/test/guard-integration.mjs"
+# Replay failed tool results offline; guidance must preserve raw errors without inventing their cause.
+run_group guard-error-guidance-integration node --test "${ROOT}/vinci/test/guard-error-guidance-integration.mjs"
 # Masked content (<vinci-secret>) can never match or overwrite raw file bytes.
 run_group mask-edit-integration node "${ROOT}/vinci/test/mask-edit-integration.mjs"
 run_group secret-handle-integration node "${ROOT}/vinci/test/secret-handle-integration.mjs"

@@ -1075,25 +1075,40 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Sandbox follow-up: when a bash command fails with a write-permission error while the sandbox is on,
-  // it most likely tried to write OUTSIDE the project and the OS sandbox blocked it. A raw "Operation
-  // not permitted" is baffling — so append a plain-language note (the model sees it too, so it explains
-  // rather than blindly retrying). Best-effort + advisory; only fires on an actual failure.
+  // Diagnostic-only guidance. Permission text does not prove a sandbox denial or an outside-project
+  // write. Keep raw evidence first and unchanged; verification consumers must not depend on this hint.
   pi.on("tool_result", async (event) => {
     if (event.toolName !== "bash" || !event.isError) return;
     if (process.env.VINCI_CODE !== "1" || process.env.VINCI_NO_SANDBOX === "1") return;
-    const text = (event.content ?? [])
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n");
-    if (!/operation not permitted|permission denied|not permitted|read-only file system/i.test(text)) return;
-    const note =
-      "\n\n[Vinci safety note: this likely failed because the command tried to write OUTSIDE your " +
-      "project folder — Vinci confines writes to your project so an automated command can't touch the " +
-      "rest of your machine. If it should write inside the project, fix the path. If it genuinely needs " +
-      "to write elsewhere and you trust it, tell the user they can re-run Vinci with the sandbox off " +
-      "(set VINCI_NO_SANDBOX=1). Do NOT blindly retry the same command.]";
-    return { content: [...event.content, { type: "text", text: note }], details: event.details, isError: event.isError };
+    // Bash puts its output/error in the first block; later blocks may be another extension's advice.
+    const raw = event.content[0];
+    if (raw?.type !== "text") return;
+    const lines = raw.text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const diagnostics = lines.filter((line) => !/^Command exited with code \d+$/.test(line));
+    const startup = /^(?:bwrap:\s*(?:(?:loopback:\s*)?Failed to create NETLINK_ROUTE socket:|Creating new namespace failed:|Can't create network socket:|No permissions to create new namespace\b)|sandbox-exec:\s*sandbox_apply:)/i;
+    let note: string;
+    if (diagnostics.length > 0 && diagnostics.every((line) => startup.test(line))) {
+      note =
+        "This output looks like an OS sandbox startup failure. If it came from the sandbox backend, " +
+        "the requested command may not have started; it is not evidence that the test itself failed. " +
+        "Ask the host/container administrator to check sandbox prerequisites, keeping the sandbox enabled.";
+    } else {
+      const permission = /^(?:Error:\s*)?(?:EACCES\b|EPERM\b|EROFS\b|operation not permitted\b|permission denied\b|read-only file system\b)|^(?:connect|listen|bind)\s+(?:EACCES|EPERM)\b|^(?:cat|touch|mkdir|cp|mv|rm|rmdir|bash|sh|zsh|dash):.*(?:permission denied|operation not permitted|read-only file system)/i;
+      const denied = diagnostics.filter((line) => permission.test(line));
+      if (denied.length === 0) return;
+      // A shell prefix alone is not filesystem evidence: connect, /dev/tcp, and kill can fail too.
+      const filesystem = /read-only file system|\b(?:EACCES|EPERM|EROFS)\b.*,\s*(?:open|mkdir|scandir|readdir|unlink|rename|rmdir|chmod|stat|lstat)\b|^(?:cat|touch|mkdir|cp|mv|rm|rmdir):/i;
+      note = denied.some((line) => filesystem.test(line))
+        ? "The output reports a filesystem access denial. Check the reported path, its permissions, and mount policy. " +
+          "This text alone does not establish that Vinci caused the denial or that the command wrote outside the project."
+        : "The output contains a permission-related error. This text alone does not establish whether it came from " +
+          "filesystem access, network/IPC, application code, or sandbox setup. Inspect the original diagnostic before choosing a remedy.";
+    }
+    return {
+      content: [...event.content, { type: "text", text: `\n\n[Vinci safety note: ${note} Do not blindly retry the same command.]` }],
+      details: event.details,
+      isError: event.isError,
+    };
   });
 
   // Persistence/model boundary: tool output is stored after this hook and later becomes provider
