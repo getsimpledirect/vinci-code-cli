@@ -36,7 +36,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/extensions/runner.ts` | Default the extension overlay-focus query to false outside interactive UI | — |
 | `coding-agent/src/core/extensions/types.ts` | Expose an optional overlay-focus query to extensions | — |
 | `coding-agent/src/core/vinci-grader.ts` | Shared grader core (verification system): untracked-aware diff, skeptical prompt, verdict parse, completion-claim detector — one check for core + `vinci-review`/`vinci-todo` | 8 |
-| `coding-agent/src/core/auth-guidance.ts` | Warm "not connected to Vinci" copy | 9 |
+| `coding-agent/src/core/auth-guidance.ts` | Warm managed sign-in copy; selected-provider credential guidance | 9 |
 | `coding-agent/src/core/keybindings.ts` | Free `shift+tab` for the Auto/Plan cycle | 11 |
 | `coding-agent/src/core/sdk.ts` | One-line call into `vinci-degroove.ts` — collapse identical failed-call loops in the model's context view | 19 |
 | `coding-agent/src/core/system-prompt.ts` | Drop the blanket "Be concise" guideline — the Vinci pack owns the voice (narration) | 16 |
@@ -274,9 +274,11 @@ Small, mostly env-gated edits so a non-programmer never sees raw "pi" or dev jar
   literal keeps *looking* right and only misbehaves once a user actually overrides the directory.
   Vinci-layer code must therefore call `getAgentDir()` (or read `ENV_AGENT_DIR`) from the package,
   never restate the name — see `vinci/test/agent-dir-env-integration.mjs`.
-- **`auth-guidance.ts`** → under `VINCI_CODE=1`, the "not signed in / no model" messages become one
-  warm line ("You're not connected to Vinci yet. Type /login…") — no provider IDs, "OAuth or API
-  key", or doc paths.
+- **`auth-guidance.ts`** → under `VINCI_CODE=1`, managed and no-model messages keep the warm
+  "You're not connected to Vinci yet. Type /login…" line. Missing credentials for an explicitly
+  selected Anthropic API, OpenAI API, or Codex subscription instead name that provider and its
+  supported setup route. Other providers get generic setup guidance without assuming an auth method.
+  Plain Pi copy is unchanged.
 - **`status-indicator.ts`** → the compaction spinner label reframes to "Tidying up our
   conversation…" (matches `vinci-compact.ts`) instead of "Context overflow detected, Auto-compacting"
   under `VINCI_CODE=1`.
