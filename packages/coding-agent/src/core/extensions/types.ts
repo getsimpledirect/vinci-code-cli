@@ -125,7 +125,12 @@ export type EditorFactory = (tui: TUI, theme: EditorTheme, keybindings: Keybindi
  */
 export interface ExtensionUIContext {
 	/** Show a selector and return the user's choice. */
-	select(title: string, options: string[], opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
+	select(
+		title: string,
+		options: string[],
+		/** [vinci] Context review requires the first option to be the safe decline choice. */
+		opts?: ExtensionUIDialogOptions & { vinciReviewContext?: boolean },
+	): Promise<string | undefined>;
 
 	/** Show a confirmation dialog. */
 	confirm(title: string, message: string, opts?: ExtensionUIDialogOptions): Promise<boolean>;
