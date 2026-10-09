@@ -12,15 +12,16 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import {
+  currentRemoteVerdict,
   getVinciVerificationState,
-  type RemoteAcceptanceVerdict,
+  type RemoteIssuedAcceptanceVerdict,
 } from "./lib/verification-state.ts";
+import { vinciVerificationDisabled } from "./lib/verification-control.ts";
 import { getVinciCrewStatus } from "./lib/crew-status.ts";
 import { VINCI_BILLING_URL } from "./vinci-links.ts";
 import {
   buildVinciTaskOutcome,
   classifyVinciLocalTaskState,
-  currentRemoteVerdict,
   formatVinciTaskDuration,
   formatVinciTaskUsage,
   getVinciTaskOutcome,
@@ -30,6 +31,7 @@ import {
   VINCI_FALSE_COMPLETION_ENTRY,
   VINCI_TASK_OUTCOME_ENTRY,
   isVinciFalseCompletionReport,
+  remoteVerdictTaskState,
   VINCI_ASK_HOLDING_REASON,
   vinciFinalMessageAsksUser,
   vinciToolTextReportsFailure,
@@ -67,33 +69,11 @@ function failedChange(content: readonly { type: string; text?: string }[]): bool
 }
 
 /**
- * Map a remote acceptance verdict status to a local task outcome state.
- * Per Wave 5 decision 4 (frozen).
- */
-function mapRemoteVerdictToState(status?: string): string | undefined {
-  if (!status) return undefined;
-  switch (status) {
-    case "VERIFIED_PASS": return "DONE";
-    case "CONDITIONAL": return "DONE_UNVERIFIED";
-    case "BLOCKED": return "BLOCKED";
-    case "FAILED": return "DONE_UNVERIFIED";
-    default: return undefined;
-  }
-}
-
-/**
- * Get Vinci-owned copy for FAILED verdicts (never blames user code).
- */
-function getFailedVerdictCopy(): string {
-  return "A verification step encountered an error. Please review the verification report for details.";
-}
-
-/**
  * Get the latest remote acceptance verdict from the verification state if it exists.
  */
-export function getLatestRemoteVerdict(): RemoteAcceptanceVerdict | undefined {
+export function getLatestRemoteVerdict(): RemoteIssuedAcceptanceVerdict | undefined {
   try {
-    return currentRemoteVerdict(getVinciVerificationState());
+    return vinciVerificationDisabled() ? undefined : currentRemoteVerdict(getVinciVerificationState());
   } catch {
     return undefined;
   }
@@ -103,7 +83,7 @@ export function getLatestRemoteVerdict(): RemoteAcceptanceVerdict | undefined {
  *  verdict overrides the local outcome; a staled one adds context only. */
 export function remoteVerdictDisplay(
   outcome: Readonly<Pick<VinciTaskOutcome, "state" | "reason" | "hardStop">>,
-  remoteVerdict?: { status?: string; staled?: boolean; summary?: string },
+  remoteVerdict?: Readonly<Pick<RemoteIssuedAcceptanceVerdict, "status" | "staled" | "summary">>,
 ): { state: string; reason: string } {
   let displayState: string = outcome.state;
   let displayReason = outcome.reason;
@@ -117,13 +97,10 @@ export function remoteVerdictDisplay(
     return { state: displayState, reason: displayReason };
   }
   if (remoteVerdict && !remoteVerdict.staled) {
-    const mappedState = mapRemoteVerdictToState(remoteVerdict.status);
+    const mappedState = remoteVerdictTaskState(remoteVerdict);
     if (mappedState) {
       displayState = mappedState;
-      // Vinci-owned copy for FAILED: never blames the user's code.
-      displayReason = remoteVerdict.status === "FAILED"
-        ? getFailedVerdictCopy()
-        : remoteVerdict.summary || outcome.reason;
+      displayReason = remoteVerdict.summary || outcome.reason;
     }
   } else if (remoteVerdict && remoteVerdict.staled) {
     displayReason = outcome.reason + "\nA verification from before your latest changes found: " + (remoteVerdict.summary || "");
@@ -142,7 +119,7 @@ function receiptWidget(outcome: Readonly<VinciTaskOutcome>, remoteVerdict?: any)
       // announcing a wall; "Done — please check it" is a warning, not an error — the work IS done.
       const title = displayState === "DONE"
         ? theme.fg("success", theme.bold("  ✓ Done"))
-        : displayState === "BLOCKED"
+        : displayState === "BLOCKED" // canonical-rendering: local state selects the receipt's plain-language title.
           ? theme.fg("error", theme.bold("  ! Stopped — needs you"))
           : displayState === "WAITING"
             ? theme.fg("warning", theme.bold("  ? Waiting for you"))
@@ -151,7 +128,7 @@ function receiptWidget(outcome: Readonly<VinciTaskOutcome>, remoteVerdict?: any)
       const names = files.slice(0, 3).join(", ") + (files.length > 3 ? ` +${files.length - 3} more` : "");
       const evidence = displayState === "DONE" && outcome.verificationStatus === "passed"
         ? theme.fg("success", `check: ${outcome.verificationCommand}`)
-        : displayState === "BLOCKED"
+        : displayState === "BLOCKED" // canonical-rendering: local state selects receipt detail color and copy.
           ? theme.fg("error", displayReason)
           : theme.fg("warning", displayReason);
       const detail = theme.fg("muted", "  ") +

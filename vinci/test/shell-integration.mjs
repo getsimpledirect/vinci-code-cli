@@ -1,5 +1,6 @@
 // The composer is Vinci's one animated surface. Keep its pulse and activity language semantic so a
 // non-technical user can tell whether Vinci is thinking, inspecting, changing, or checking.
+import { parseLauncherExtensions } from "./launcher-extensions.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -42,9 +43,7 @@ check("failed work visibly adjusts approach", shell.vinciActivityAfterTool("edit
 
 const launcher = await readFile(launcherSource, "utf8");
 const identity = JSON.parse(await readFile(identitySource, "utf8"));
-const launcherExtensions = [...launcher.matchAll(/--extension "\$\{VINCI\}\/extensions\/([^"]+)"/g)].map(
-  (match) => match[1],
-);
+const launcherExtensions = parseLauncherExtensions(launcher);
 const launcherOrder = ["vinci-guard.ts", "vinci-loopbreak.ts", "vinci-shell.ts", "vinci-completion-receipt.ts"].map(
   (extension) => launcherExtensions.indexOf(extension),
 );

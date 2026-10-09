@@ -1,0 +1,359 @@
+name: Vinci Manifest Rollback
+
+# Re-points the LIVE beta update manifest at an ALREADY-PUBLISHED version without rebuilding or
+# re-uploading any artifact. Download the existing versioned archive from S3 → bind it to the
+# vinci-v<version> GitHub Release receipt (independent of mutable S3) → prove its extensions load →
+# fetch + verify the live manifest to derive the next sequence and capture its ETag → sign a new
+# manifest naming the old archive → verify the signed manifest locally → publish ONLY
+# manifest-beta.json with If-Match on the live ETag (compare-and-swap) → verify live → receipt.
+#
+# The updater installs whatever a manifest with sequence > lastSequence names (it does not compare
+# versions), so a higher-sequence manifest naming an older version downgrades every install on its
+# next check. That is the point of this workflow.
+#
+# SECURITY MODEL — same as vinci-release.yml:
+#   * Org-only (repository guard) and gated on the protected `vinci-release` environment.
+#   * The OIDC role is scoped to exactly the one secret and the release S3 prefix.
+#   * This workflow NEVER writes a versioned key. It uploads exactly one object: manifest-beta.json.
+#   * The S3 archive is trusted only after sha256(S3 archive) == the GitHub Release's .sha256 asset
+#     == signed.artifact.sha256 inside that release's signed manifest (signature verified against
+#     the repo trust root) and the size agrees. The S3 .sha256 sidecar alone is mutable and is not
+#     the authority.
+#   * Activation is compare-and-swap: put-object --if-match <ETag of the manifest we derived the
+#     sequence from>. A concurrent write fails closed (412); nothing retries automatically.
+#   * The version input is validated (shell `case` + Node regex) and only ever reaches shell quoted.
+#   * All `uses:` are pinned to full commit SHAs; the trailing comment is the human-readable version.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "X.Y.Z of an ALREADY-PUBLISHED artifact to point the live manifest at"
+        required: true
+        type: string
+      reason:
+        description: "Why the manifest is being rolled back (recorded in the run summary)"
+        required: true
+        type: string
+
+permissions: {}
+
+# GLOBAL, shared with vinci-release: a rollback and a release must never run concurrently or they
+# race the live sequence.
+concurrency:
+  group: vinci-release
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    # Publisher-only: the release role's OIDC trust names getsimpledirect/vinci-code-cli by immutable
+    # ids (measured 2026-10-09), so a rollback can only assume it there; the private repo would fail at
+    # "Assume". Exported byte-for-byte, this runs in the publisher and is inert in private and in forks.
+    if: github.repository == 'getsimpledirect/vinci-code-cli'
+    runs-on: ubuntu-latest
+    # Protected environment: the run pauses here until the maintainer approves it.
+    environment: vinci-release
+    permissions:
+      contents: read # checkout + reading the vinci-v* GitHub Release assets (the receipt)
+      id-token: write # OIDC federation to the narrowly-scoped AWS release role
+    env:
+      S3_BUCKET: vinci-assets
+      S3_PREFIX: vinci-code
+      MANIFEST_URL: https://vinci-assets.s3.ca-central-1.amazonaws.com/vinci-code/manifest-beta.json
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.19"
+
+      - name: Validate the requested version (never interpolated unquoted into shell)
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Coarse shell gate (same shape as vinci-release.yml), then the exact regex in Node. The
+          # input is read from the environment in both places; it is never expanded unquoted.
+          case "$INPUT_VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "version '$INPUT_VERSION' is not X.Y.Z"; exit 1 ;;
+          esac
+          node -e 'if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(process.env.INPUT_VERSION)) { console.error(`version ${JSON.stringify(process.env.INPUT_VERSION)} is not X.Y.Z`); process.exit(1); }'
+          printf 'version=%s\n' "$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Assume the release role (OIDC — no stored AWS credentials)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ vars.VINCI_RELEASE_ROLE_ARN }}
+          aws-region: ca-central-1
+
+      - name: Download the ALREADY-PUBLISHED archive from S3 (refuse if it does not exist)
+        id: s3
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release receipt
+          B="$S3_BUCKET"; P="$S3_PREFIX"
+          # This workflow never uploads an artifact: a missing versioned object is a hard refusal,
+          # not something to fix by publishing. head-object first so the failure names the cause,
+          # and its ETag / VersionId / ContentLength go into the receipt.
+          aws s3api head-object --bucket "$B" --key "$P/vinci-code-${VERSION}.tgz" > receipt/s3-archive-head.json \
+            || { echo "::error::s3://$B/$P/vinci-code-${VERSION}.tgz does not exist — nothing published to roll back to"; exit 1; }
+          aws s3api head-object --bucket "$B" --key "$P/vinci-code-${VERSION}.tgz.sha256" > receipt/s3-sha256-head.json \
+            || { echo "::error::s3://$B/$P/vinci-code-${VERSION}.tgz.sha256 does not exist"; exit 1; }
+          aws s3 cp "s3://$B/$P/vinci-code-${VERSION}.tgz" "release/vinci-code-${VERSION}.tgz"
+          aws s3 cp "s3://$B/$P/vinci-code-${VERSION}.tgz.sha256" "release/vinci-code-${VERSION}.tgz.sha256"
+          ETAG="$(node -p "JSON.parse(require('fs').readFileSync('receipt/s3-archive-head.json','utf8')).ETag ?? ''")"
+          VERSION_ID="$(node -p "JSON.parse(require('fs').readFileSync('receipt/s3-archive-head.json','utf8')).VersionId ?? 'null'")"
+          echo "S3 archive ETag=$ETAG VersionId=$VERSION_ID"
+          printf 'archive_etag=%s\n' "$ETAG" >> "$GITHUB_OUTPUT"
+          printf 'archive_version_id=%s\n' "$VERSION_ID" >> "$GITHUB_OUTPUT"
+
+      # The S3 .sha256 sidecar is a MUTABLE object under the same prefix, so it cannot vouch for the
+      # archive. The vinci-v<version> GitHub Release was written by the release run that produced
+      # the archive (vinci-release.yml uploads the .tgz, its .sha256 and the signed manifest-beta.json
+      # of that release) and is an independent historical receipt. Require agreement across all of:
+      # sha256(S3 archive), S3 .sha256, release .sha256, the release manifest's signed
+      # artifact.sha256 (signature verified against the repo trust root), and the size.
+      - name: Bind the S3 archive to the vinci-v<version> GitHub Release receipt
+        id: bind
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "vinci-v${VERSION}" -R "$GITHUB_REPOSITORY" -D receipt/release \
+            -p "vinci-code-${VERSION}.tgz.sha256" -p manifest-beta.json \
+            || { echo "::error::no vinci-v${VERSION} GitHub Release with its .sha256 + manifest-beta.json assets — cannot bind the S3 archive to an independent receipt"; exit 1; }
+          test -s "receipt/release/vinci-code-${VERSION}.tgz.sha256" || { echo "::error::release asset vinci-code-${VERSION}.tgz.sha256 missing"; exit 1; }
+          test -s receipt/release/manifest-beta.json || { echo "::error::release asset manifest-beta.json missing"; exit 1; }
+          node --input-type=module <<'EOF' | tee receipt/sha-comparison.txt
+          import { readFileSync, statSync } from "node:fs";
+          import { createHash, createPublicKey, verify } from "node:crypto";
+          const version = process.env.VERSION;
+          const archive = `release/vinci-code-${version}.tgz`;
+          const hexOf = (path) => {
+            const h = readFileSync(path, "utf8").trim().split(/\s+/)[0];
+            if (!/^[0-9a-f]{64}$/.test(h)) throw new Error(`${path} is not a sha256 line: ${JSON.stringify(h)}`);
+            return h;
+          };
+          const s3Sha = createHash("sha256").update(readFileSync(archive)).digest("hex");
+          const s3Size = statSync(archive).size;
+          const s3Sidecar = hexOf(`${archive}.sha256`);
+          const releaseSidecar = hexOf(`receipt/release/vinci-code-${version}.tgz.sha256`);
+          const rm = JSON.parse(readFileSync("receipt/release/manifest-beta.json", "utf8"));
+          const pk = createPublicKey(readFileSync("vinci/updater/public-key.pem"));
+          if (!verify(null, Buffer.from(JSON.stringify(rm.signed)), pk, Buffer.from(rm.signature, "base64")))
+            throw new Error(`release-asset manifest for vinci-v${version} does not verify against the repo trust root`);
+          if (rm.signed.version !== version) throw new Error(`release-asset manifest names v${rm.signed.version}, not v${version}`);
+          const head = JSON.parse(readFileSync("receipt/s3-archive-head.json", "utf8"));
+          const rows = [
+            ["sha256(S3 archive)", s3Sha],
+            ["S3 .sha256 sidecar", s3Sidecar],
+            ["release-asset .sha256", releaseSidecar],
+            ["release-asset manifest signed.artifact.sha256", rm.signed.artifact.sha256],
+          ];
+          for (const [name, value] of rows) console.log(`${name.padEnd(48)} ${value}`);
+          console.log(`${"S3 archive size".padEnd(48)} ${s3Size}`);
+          console.log(`${"S3 head-object ContentLength".padEnd(48)} ${head.ContentLength}`);
+          console.log(`${"release-asset manifest signed.artifact.size".padEnd(48)} ${rm.signed.artifact.size}`);
+          console.log(`${"S3 head-object ETag".padEnd(48)} ${head.ETag ?? ""}`);
+          console.log(`${"S3 head-object VersionId".padEnd(48)} ${head.VersionId ?? "null (bucket not versioned)"}`);
+          const bad = [];
+          for (let i = 1; i < rows.length; i++) if (rows[i][1] !== rows[0][1]) bad.push(`${rows[0][0]} != ${rows[i][0]}`);
+          if (s3Size !== rm.signed.artifact.size) bad.push("S3 archive size != release-asset manifest signed.artifact.size");
+          if (s3Size !== head.ContentLength) bad.push("S3 archive size != S3 head-object ContentLength");
+          if (bad.length) throw new Error(`target binding FAILED: ${bad.join("; ")}`);
+          console.log(`target bound: v${version} sha ${s3Sha.slice(0, 12)}… size ${s3Size} agrees with the vinci-v${version} release receipt (release seq ${rm.signed.sequence})`);
+          EOF
+
+      # Reproduces the 0.0.51 failure class (a bare package missing from the tarball's node_modules)
+      # on the ROLLBACK TARGET: rolling back to an artifact whose extensions cannot load helps nobody.
+      - name: Runtime import test — every shipped extension must load from the target archive
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash vinci/scripts/check-packaged-extensions-load.sh "release/vinci-code-${VERSION}.tgz" | tee receipt/extensions-load.txt
+
+      - name: Sign the PUBLISHED archive (no rebuild, no re-upload) with a live-derived sequence
+        id: sign
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          MINIMUM_VERSION: ${{ vars.VINCI_MINIMUM_VERSION || '0.0.09' }}
+        run: |
+          set -euo pipefail
+          # Key lives only in RUNNER_TEMP (ephemeral single-use VM) and is removed on exit.
+          KEY_FILE="$(mktemp "${RUNNER_TEMP}/vinci-key.XXXXXX")"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          aws secretsmanager get-secret-value \
+            --secret-id vinci/code/update-signing-key \
+            --query SecretBinary --output text | base64 -d > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          # Live sequence: fetch (keeping the response headers — the ETag of THIS body is the
+          # compare-and-swap token for publish), VERIFY signature against the repo trust root,
+          # validate as a safe integer with headroom for +1 — all inside Node. The value never
+          # enters shell arithmetic.
+          curl -fsS -D receipt/live-before.headers "$MANIFEST_URL" > live-before.json
+          cp live-before.json receipt/live-before.json
+          NEXT_SEQ="$(node --input-type=module <<'EOF'
+          import { readFileSync } from "node:fs";
+          import { createPublicKey, verify } from "node:crypto";
+          const m = JSON.parse(readFileSync("live-before.json", "utf8"));
+          const pk = createPublicKey(readFileSync("vinci/updater/public-key.pem"));
+          if (!verify(null, Buffer.from(JSON.stringify(m.signed)), pk, Buffer.from(m.signature, "base64")))
+            throw new Error("live manifest signature does not verify against the repo trust root");
+          const s = m.signed.sequence;
+          if (typeof s !== "number" || !Number.isInteger(s)) throw new Error(`live sequence is not an integer: ${JSON.stringify(s)}`);
+          if (!Number.isSafeInteger(s) || s < 1) throw new Error(`bad live sequence: ${s}`);
+          if (s >= Number.MAX_SAFE_INTEGER) throw new Error(`live sequence ${s} has no safe successor`);
+          const next = s + 1;
+          if (!Number.isSafeInteger(next) || next !== s + 1) throw new Error(`next sequence overflow from ${s}`);
+          process.stdout.write(String(next));
+          EOF
+          )"
+          echo "next sequence: $NEXT_SEQ"
+
+          # ETag of the exact body we derived the sequence from. Publish uses it as If-Match, so a
+          # manifest written by anyone else between now and then makes the PUT fail closed.
+          LIVE_ETAG="$(node -p "const h=require('fs').readFileSync('receipt/live-before.headers','utf8'); const m=h.match(/^etag:\s*(\S+)\s*$/im); if(!m) throw new Error('live manifest GET carried no ETag header'); m[1]")"
+          echo "live manifest ETag: $LIVE_ETAG"
+
+          # Nothing to roll back to if the live manifest already names the requested version.
+          PREV_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('live-before.json','utf8')).signed.version")"
+          PREV_SEQ="$(node -p "JSON.parse(require('fs').readFileSync('live-before.json','utf8')).signed.sequence")"
+          echo "live manifest: v$PREV_VERSION seq $PREV_SEQ"
+          if [ "$PREV_VERSION" = "$VERSION" ]; then
+            echo "::error::the live manifest already names v${VERSION} (seq ${PREV_SEQ}) — nothing to roll back to"
+            exit 1
+          fi
+          printf 'prev_version=%s\n' "$PREV_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'prev_sequence=%s\n' "$PREV_SEQ" >> "$GITHUB_OUTPUT"
+          printf 'next_sequence=%s\n' "$NEXT_SEQ" >> "$GITHUB_OUTPUT"
+          printf 'live_etag=%s\n' "$LIVE_ETAG" >> "$GITHUB_OUTPUT"
+
+          # Sign the DOWNLOADED artifact directly — create-update-manifest.mjs signs an existing
+          # --artifact, so nothing is rebuilt or re-tarred on this runner.
+          node vinci/scripts/create-update-manifest.mjs \
+            --artifact "release/vinci-code-${VERSION}.tgz" \
+            --artifact-url "https://${S3_BUCKET}.s3.ca-central-1.amazonaws.com/${S3_PREFIX}/vinci-code-${VERSION}.tgz" \
+            --version "$VERSION" \
+            --minimum-version "$MINIMUM_VERSION" \
+            --sequence "$NEXT_SEQ" \
+            --channel beta \
+            --mandatory false \
+            --private-key "$KEY_FILE" \
+            --public-key vinci/updater/public-key.pem \
+            --output release/manifest-beta.json
+          cp release/manifest-beta.json receipt/manifest-beta.signed.json
+
+      - name: Verify the SIGNED manifest against the downloaded archive BEFORE any upload
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          NEXT_SEQ: ${{ steps.sign.outputs.next_sequence }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF'
+          import { readFileSync } from "node:fs";
+          import { createPublicKey, verify, createHash } from "node:crypto";
+          const m = JSON.parse(readFileSync("release/manifest-beta.json", "utf8"));
+          const version = process.env.VERSION;
+          const pk = createPublicKey(readFileSync("vinci/updater/public-key.pem"));
+          if (!verify(null, Buffer.from(JSON.stringify(m.signed)), pk, Buffer.from(m.signature, "base64")))
+            throw new Error("freshly signed manifest does not verify against the repo trust root");
+          if (m.signed.version !== version) throw new Error(`manifest version ${m.signed.version} != ${version}`);
+          const local = createHash("sha256").update(readFileSync(`release/vinci-code-${version}.tgz`)).digest("hex");
+          if (local !== m.signed.artifact.sha256) throw new Error("manifest sha does not match the tested archive");
+          const expectedUrl = `https://${process.env.S3_BUCKET}.s3.ca-central-1.amazonaws.com/${process.env.S3_PREFIX}/vinci-code-${version}.tgz`;
+          if (m.signed.artifact.url !== expectedUrl) throw new Error(`manifest url ${m.signed.artifact.url} != ${expectedUrl}`);
+          if (String(m.signed.sequence) !== process.env.NEXT_SEQ) throw new Error(`manifest sequence ${m.signed.sequence} != ${process.env.NEXT_SEQ}`);
+          console.log(`signed manifest verified locally: v${version} seq ${m.signed.sequence}`);
+          EOF
+
+      # No versioned key is written here. The ONLY object this workflow ever uploads is the manifest,
+      # and only if the live object is still byte-for-byte the one we derived the sequence from.
+      - name: Publish the manifest — compare-and-swap on the live ETag (the single activation point)
+        env:
+          LIVE_ETAG: ${{ steps.sign.outputs.live_etag }}
+        run: |
+          set -euo pipefail
+          if aws s3api put-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/manifest-beta.json" \
+               --body release/manifest-beta.json --content-type application/json \
+               --if-match "$LIVE_ETAG" > receipt/put-manifest.json 2> receipt/put-manifest.err; then
+            cat receipt/put-manifest.json
+          else
+            cat receipt/put-manifest.err
+            echo "::error::conditional PUT of manifest-beta.json failed (If-Match $LIVE_ETAG). The live manifest changed under us — NOT retrying; nothing was activated by this run."
+            curl -fsSL -D receipt/live-divergent.headers "$MANIFEST_URL" > receipt/live-divergent.json || true
+            node -p "const m=JSON.parse(require('fs').readFileSync('receipt/live-divergent.json','utf8')); 'live manifest now: v'+m.signed.version+' seq '+m.signed.sequence" || true
+            grep -i '^etag:' receipt/live-divergent.headers || true
+            exit 1
+          fi
+
+      - name: Verify the LIVE manifest names the rollback version at the derived sequence
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          NEXT_SEQ: ${{ steps.sign.outputs.next_sequence }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -D receipt/live-after.headers "$MANIFEST_URL" > live-after.json
+          cp live-after.json receipt/live-after.json
+          aws s3api head-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/manifest-beta.json" > receipt/s3-manifest-head-after.json
+          node --input-type=module <<'EOF'
+          import { readFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          const local = createHash("sha256").update(readFileSync("release/manifest-beta.json")).digest("hex");
+          const live = createHash("sha256").update(readFileSync("live-after.json")).digest("hex");
+          if (local !== live) throw new Error("live manifest bytes differ from the manifest we signed");
+          const m = JSON.parse(readFileSync("live-after.json", "utf8"));
+          if (m.signed.version !== process.env.VERSION) throw new Error(`live version ${m.signed.version} != ${process.env.VERSION}`);
+          if (String(m.signed.sequence) !== process.env.NEXT_SEQ) throw new Error(`live sequence ${m.signed.sequence} != ${process.env.NEXT_SEQ}`);
+          console.log(`live manifest is byte-identical to the signed manifest: v${m.signed.version} seq ${m.signed.sequence}`);
+          EOF
+
+      - name: Run summary
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          NEXT_SEQ: ${{ steps.sign.outputs.next_sequence }}
+          PREV_VERSION: ${{ steps.sign.outputs.prev_version }}
+          PREV_SEQ: ${{ steps.sign.outputs.prev_sequence }}
+          LIVE_ETAG: ${{ steps.sign.outputs.live_etag }}
+          ARCHIVE_ETAG: ${{ steps.s3.outputs.archive_etag }}
+          ARCHIVE_VERSION_ID: ${{ steps.s3.outputs.archive_version_id }}
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Vinci beta manifest rolled back"
+            echo
+            echo "| | version | sequence |"
+            echo "|---|---|---|"
+            echo "| before | $PREV_VERSION | $PREV_SEQ |"
+            echo "| after | $VERSION | $NEXT_SEQ |"
+            echo
+            echo "- **Dispatched by:** $ACTOR"
+            echo "- **Reason:** $REASON"
+            echo "- **Artifact:** \`s3://${S3_BUCKET}/${S3_PREFIX}/vinci-code-${VERSION}.tgz\` (pre-existing; not modified) — ETag \`${ARCHIVE_ETAG}\`, VersionId \`${ARCHIVE_VERSION_ID}\`"
+            echo "- **Bound to:** GitHub Release \`vinci-v${VERSION}\` (.sha256 asset + signed manifest asset agree with the S3 bytes)"
+            echo "- **Replaced manifest ETag (If-Match):** \`${LIVE_ETAG}\`"
+            echo "- **Only object written:** \`s3://${S3_BUCKET}/${S3_PREFIX}/manifest-beta.json\`"
+            echo
+            echo "### Target binding"
+            echo '```'
+            cat receipt/sha-comparison.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Durable receipt, uploaded even when a step above failed so a refused rollback is auditable.
+      - name: Upload the rollback receipt
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: vinci-rollback-receipt-${{ steps.meta.outputs.version || 'invalid' }}-${{ github.run_id }}
+          path: receipt/
+          if-no-files-found: warn
+          retention-days: 90

@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  packages: read
   contents: read
 
 jobs:
@@ -23,6 +24,8 @@ jobs:
 
       - name: Install dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-audit --no-fund
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Audit production vulnerabilities
         run: npm audit --omit=dev --audit-level=moderate

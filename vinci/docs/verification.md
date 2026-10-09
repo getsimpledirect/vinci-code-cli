@@ -143,6 +143,40 @@ Phase 3a retrieval-plus-attribution gate instead of blocking an otherwise ground
 shows the warning and the session retains the unavailable verdict. Sealed live calibration is still
 required for multi-claim coverage, false positives, latency, and cost.
 
+`@getsimpledirect/vinci-contracts` is the single source of attempt/verdict semantics on the production
+verification path — at COMPILE and TEST time. `vinci/extensions/lib/canonical-verdicts.ts` authors the
+verdict/attempt arrays locally, imports only TYPES from the package, and is pinned to it two ways:
+type-level completeness assertions in the file itself (a contract member missing locally fails
+typecheck) and `vinci/test/canonical-verdicts-contract.mjs`, which deep-equals the local arrays and
+membership wrappers against the package's runtime exports. It exposes the only local membership
+wrappers used by verification-state parsing, recording, and current verdict selection. The package has
+no separate layer-0 attempt validator, so Code's accepted attempt set is the FAILED/CANCELLED
+`VerificationOutcome` reasons in `RUN_STATES` order.
+
+No runtime file may import a VALUE from the package, and "the bundler inlines it" is not a defence.
+0.0.51 shipped `canonical-verdicts.ts` importing `RUN_STATES` and `VERDICT_STATUSES` at runtime and
+failed on every launch with `ERR_MODULE_NOT_FOUND`, behind a green harness and a green release
+pipeline. The esbuild bundles under `vinci/dist/extensions` were clean, exactly as this section used
+to promise — but that is not the only path to the file. `packages/coding-agent/src/core/vinci-grader.ts`
+imports `vinci/extensions/lib/verification-contract.ts` directly, so the coding-agent tsgo build emits
+plain, un-bundled `vinci/extensions/lib/{verification-contract,canonical-verdicts}.js` beside the
+sources (gitignored in `vinci/extensions/lib/.gitignore`), `package.sh` ships `vinci/extensions`
+whole, and the core's `dist/core/vinci-grader.js` loads those copies with the bare import intact. The
+private package is excluded from the tarball, and the harness runs from the repo where it is
+installed, so nothing that ran from the repo could see the failure.
+
+Distribution is therefore local values plus build-time inlining, guarded at three layers. The public
+tarball remains installable without GitHub Packages access and excludes `node_modules/@getsimpledirect`.
+`vinci/scripts/check-no-contracts-at-runtime.sh` fails the build on a private runtime dependency in
+ANY manifest (root included) and on any non-type import of the scope in the BUILT output — both
+`vinci/dist/extensions` and the in-place emits under `vinci/extensions` — or in a packaged tarball.
+`node vinci/test/packaged-vocabulary.mjs` builds and checks the packaged vocabulary directly, and
+`node vinci/test/packaged-launch-check.mjs <tree>` runs the real launcher in print mode against a
+local faux gateway, which is the only check that loads what users load; the aggregate harness runs
+both in the `PACKAGED` group after `packaged-build`, and the release workflow runs the launch check
+against the unpacked artifact. W0-G3 needs nothing further from outside this repository once these
+source and packaged mutation gates pass.
+
 ## Build Phases
 
 - **Phase 1 (done):** flaw #1 (untracked) + flaw #2 (tool-grounded grader prompt) + flaw #3
