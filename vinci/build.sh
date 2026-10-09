@@ -19,4 +19,7 @@ echo "Building Vinci (no external model fetch)…"
 ( cd "$ROOT/packages/agent" && npm run build )
 ( cd "$ROOT/packages/coding-agent" && npm run build )           # includes copy-assets
 ( cd "$ROOT/packages/orchestrator" && npm run build )
+rm -rf "$ROOT/vinci/dist/extensions"
+npx tsgo -p "$ROOT/vinci/tsconfig.extensions-build.json"
+node "$ROOT/vinci/scripts/build-extensions.mjs"
 echo "✓ Vinci built — packages/coding-agent/dist/cli.js is ready. Relaunch: vinci/bin/vinci"

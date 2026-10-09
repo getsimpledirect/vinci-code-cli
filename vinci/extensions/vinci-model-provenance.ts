@@ -12,6 +12,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ResolutionEvidence } from "@getsimpledirect/vinci-model-classes";
 import { createHash } from "node:crypto";
 
 const ENTRY_TYPE = "vinci-model-provenance";
@@ -40,8 +41,6 @@ interface ClientCapabilities {
   reasoning: boolean;
   inputs: string[];
 }
-
-type ResolutionEvidence = "gateway-header" | "response-stream" | "requested-model";
 
 interface ResolvedRoute {
   model: string;

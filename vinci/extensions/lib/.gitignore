@@ -1,0 +1,6 @@
+# tsgo emits dependencies of the coding-agent grader beside the Vinci-owned contract.
+# These files are runtime build artifacts; the bundled extension copies live under dist/extensions.
+canonical-verdicts.js
+canonical-verdicts.js.map
+canonical-verdicts.d.ts
+canonical-verdicts.d.ts.map

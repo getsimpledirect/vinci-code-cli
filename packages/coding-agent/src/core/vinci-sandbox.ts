@@ -4,14 +4,24 @@
  * Vinci runs an autonomous 4B for non-programmers. The permission guards (vinci-guard/scope) are one
  * layer, but they depend on the USER noticing a confirm — and Claude Code's own data shows users
  * approve ~93% of prompts. So we add an INDEPENDENT layer that doesn't depend on attention: run every
- * bash command inside an OS sandbox that confines FILESYSTEM WRITES to the workspace, so a runaway
- * command physically cannot `rm -rf ~/Documents`, overwrite `~/.ssh/authorized_keys`, or scribble on
- * `/etc` — regardless of whether a guard caught it.
+ * bash command inside an OS sandbox that confines FILESYSTEM WRITES, so a runaway command physically
+ * cannot overwrite `~/.ssh/authorized_keys` or scribble on `/etc` — regardless of whether a guard
+ * caught it.
  *
- * Scope of the policy (deliberately not paranoid, so it doesn't break real work):
- *  - WRITES allowed: the project (cwd), its workspace PARENT (so sibling projects the user edits still
- *    work — e.g. run Vinci in vinci-code, edit ../French-learning-tool), temp dirs, and package caches
- *    (~/.npm, ~/.cache, …). Everything else on disk is read-only.
+ * WHAT THIS LAYER DOES NOT DO: it does not protect your home directory. `$HOME` is a writable root,
+ * so a runaway command CAN `rm -rf ~/Documents`. That is a deliberate trade — confining writes to the
+ * launch cwd meant Vinci could not produce files where a non-programmer keeps them, and Claude Code
+ * and Codex both make the same call. What survives a writable `$HOME` is a CREDENTIAL floor, applied
+ * LAST so it wins over the `$HOME` root; `/` is never a root.
+ *
+ * The authorities are the constants below, not this comment — read them rather than trusting a prose
+ * list that can go stale (this paragraph replaced one that had):
+ *  - `vinciWritableRoots()` — everywhere writes are allowed.
+ *  - `LOCKED_HOME_SECRETS` — fully locked, no read and no write.
+ *  - `TOOL_CONFIG_DIRS` — deliberately writable so gcloud/aws/kubectl/docker still function.
+ *  - `TOOL_CONFIG_PROTECTED_WRITES` — readable (the CLI needs it) but never writable.
+ * `vinci/test/sandbox-integration.mjs` exercises each of these against the real OS sandbox; if you
+ * change a constant, that suite is what tells you whether the sentence above is still true.
  *  - Credential reads and NETWORK are denied unless the guard signs one exact invocation.
  *  - In-workspace destruction (rm -rf inside the project) is NOT this layer's job — that's the guard +
  *    /undo + git. This layer stops ESCAPE from the workspace.

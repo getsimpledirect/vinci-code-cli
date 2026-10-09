@@ -1,3 +1,4 @@
+import { parseLauncherExtensions } from "./launcher-extensions.mjs";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -57,10 +58,14 @@ for (const theme of identity.themes) {
   assert.ok(existsSync(join(vinci, "themes", theme)), `Required Vinci theme is missing: ${theme}`);
 }
 
-const launcherExtensions = Array.from(
-  launcher.matchAll(/--extension "\$\{VINCI\}\/extensions\/([^"]+)"/g),
-  (match) => match[1],
+// The launcher runs BUILT extensions when present (dist/, canonical values inlined — the tarball has
+// no registry access at runtime) and falls back to sources in dev. The identity pin is unchanged in
+// strength: every extension is still enumerated literally and compared by name to identity.json.
+assert.ok(
+  launcher.includes('VINCI_EXTENSIONS="${VINCI}/dist/extensions"'),
+  "The launcher must prefer built extensions (dist) over sources",
 );
+const launcherExtensions = parseLauncherExtensions(launcher);
 assert.deepEqual(launcherExtensions, identity.extensions, "The launcher extension set drifted from vinci/identity.json");
 for (const extension of identity.extensions) {
   assert.ok(existsSync(join(vinci, "extensions", extension)), `Required Vinci extension is missing: ${extension}`);

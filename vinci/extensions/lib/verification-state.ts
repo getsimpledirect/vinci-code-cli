@@ -2,6 +2,17 @@
 
 import { isAbsolute } from "node:path";
 
+import { isAttemptStatus, isVerdictStatus } from "./canonical-verdicts.ts";
+
+export {
+  ACCEPTED_WIRE_STATUSES,
+  ATTEMPT_STATUSES,
+  VERDICT_STATUSES,
+  isAcceptedWireStatus,
+  isAttemptStatus,
+  isVerdictStatus,
+} from "./canonical-verdicts.ts";
+
 import {
   parseSharedVinciVerificationState,
   remoteAcceptanceVerdictKey,
@@ -11,6 +22,9 @@ import {
   VINCI_VERIFICATION_SCHEMA_VERSION,
   type SharedVinciNormalVerificationState,
   type RemoteAcceptanceVerdict,
+  type RemoteIssuedAcceptanceVerdict,
+  type RemoteVerificationAttempt,
+  type RemoteVerificationResult,
   type SharedVinciTerminalUnverifiableState,
   type SharedVinciVerificationClass,
   type SharedVinciVerificationState,
@@ -29,9 +43,11 @@ export type VinciNormalVerificationState = SharedVinciNormalVerificationState;
 export type VinciTerminalUnverifiableState = SharedVinciTerminalUnverifiableState;
 export type VinciVerificationState = SharedVinciVerificationState;
 export type { RemoteAcceptanceVerdict };
+export type { RemoteIssuedAcceptanceVerdict };
+export type { RemoteVerificationAttempt, RemoteVerificationResult };
 
 export type RemoteAcceptanceVerdictInput = Omit<
-  RemoteAcceptanceVerdict,
+  RemoteVerificationResult,
   "schemaVersion" | "recordedAtIso" | "staled"
 >;
 
@@ -81,9 +97,13 @@ function freezeState<T extends VinciVerificationState>(state: T): T {
         ),
       )
     : undefined;
+  const remoteVerificationAttempts = state.remoteVerificationAttempts
+    ? Object.freeze(state.remoteVerificationAttempts.map((attempt) => Object.freeze({ ...attempt })))
+    : undefined;
   return Object.freeze({
     ...state,
     ...(remoteAcceptanceVerdicts ? { remoteAcceptanceVerdicts } : {}),
+    ...(remoteVerificationAttempts ? { remoteVerificationAttempts } : {}),
   }) as T;
 }
 
@@ -223,6 +243,12 @@ function normalState(): VinciNormalVerificationState | undefined {
   return state.variant === "normal" ? state : undefined;
 }
 
+function isRemoteVerificationAttempt(
+  result: RemoteVerificationResult,
+): result is Extract<RemoteVerificationResult, { status: "FAILED" | "CANCELLED" }> {
+  return isAttemptStatus(result.status);
+}
+
 export function vinciVerificationCommand(
   state: Readonly<VinciVerificationState> = currentState(),
 ): string {
@@ -249,10 +275,23 @@ export function vinciVerificationMutationRevision(
 
 export function applyRemoteVerdict(
   state: VinciVerificationState,
-  verdict: RemoteAcceptanceVerdict,
+  verdict: RemoteVerificationResult,
 ): VinciVerificationState {
-  // D10 CANCELLED is deliberately a no-op: it does not erase or supersede the prior record.
-  if (verdict.status === "CANCELLED") return state;
+  if (isRemoteVerificationAttempt(verdict)) {
+    const attempt: RemoteVerificationAttempt = {
+      jobId: verdict.jobId,
+      snapshotDigest: verdict.snapshotDigest,
+      outcome: verdict.status,
+      summary: verdict.summary,
+      ...(verdict.reportUrl !== undefined ? { reportUrl: verdict.reportUrl } : {}),
+      ...(verdict.eventCursor !== undefined ? { eventCursor: verdict.eventCursor } : {}),
+      recordedAtIso: verdict.recordedAtIso,
+    };
+    return freezeState({
+      ...state,
+      remoteVerificationAttempts: [...(state.remoteVerificationAttempts ?? []), attempt],
+    });
+  }
   const key = remoteAcceptanceVerdictKey(verdict);
   return freezeState({
     ...state,
@@ -263,27 +302,49 @@ export function applyRemoteVerdict(
   });
 }
 
-/** Builds, validates, and records a remote verdict in the live verification store. */
+/** Builds, validates, and records a remote verification result in the live store. */
 export function recordRemoteAcceptanceVerdict(verdict: RemoteAcceptanceVerdictInput): boolean {
-  const completeVerdict: RemoteAcceptanceVerdict = {
+  const completeVerdict: RemoteVerificationResult = {
     ...verdict,
     schemaVersion: VINCI_VERIFICATION_SCHEMA_VERSION,
     recordedAtIso: new Date().toISOString(),
     staled: false,
   };
-  const key = remoteAcceptanceVerdictKey(completeVerdict);
   const state = currentState();
-  const parsedState = parseSharedVinciVerificationState({
-    ...state,
-    remoteAcceptanceVerdicts: {
-      ...state.remoteAcceptanceVerdicts,
-      [key]: completeVerdict,
-    },
-  });
-  const parsedVerdict = parsedState?.remoteAcceptanceVerdicts?.[key];
-  if (!parsedVerdict) return false;
-  setState(applyRemoteVerdict(state, parsedVerdict));
+  const parsedState = parseSharedVinciVerificationState(applyRemoteVerdict(state, completeVerdict));
+  if (!parsedState) return false;
+  if (isAttemptStatus(completeVerdict.status)) {
+    const parsedAttempt = parsedState.remoteVerificationAttempts?.at(-1);
+    if (
+      !parsedAttempt ||
+      parsedAttempt.outcome !== completeVerdict.status ||
+      parsedAttempt.jobId !== completeVerdict.jobId ||
+      parsedAttempt.snapshotDigest !== completeVerdict.snapshotDigest
+    ) {
+      return false;
+    }
+  } else {
+    const key = remoteAcceptanceVerdictKey(completeVerdict);
+    if (!parsedState.remoteAcceptanceVerdicts?.[key]) return false;
+  }
+  setState(parsedState);
   return true;
+}
+
+export function currentRemoteVerdict(
+  state: Readonly<VinciVerificationState>,
+): RemoteIssuedAcceptanceVerdict | undefined {
+  // The store invariant says this record holds only issued verdicts. Filter on
+  // status anyway: hand-built or corrupt state must skip a stray attempt, not
+  // surface it as the current verdict.
+  return Object.values(state.remoteAcceptanceVerdicts ?? {})
+    .filter((verdict) => !verdict.staled && isVerdictStatus(verdict.status))
+    .sort(
+      (left, right) =>
+        right.recordedAtIso.localeCompare(left.recordedAtIso) ||
+        (right.eventCursor ?? "").localeCompare(left.eventCursor ?? "") ||
+        right.jobId.localeCompare(left.jobId),
+    )[0];
 }
 
 function staleRemoteAcceptanceVerdicts(
@@ -453,6 +514,8 @@ export function recordVinciTerminalUnverifiable(): void {
     command,
     commandKey,
     checkClass: state.behavioralAttemptCommand ? "behavioral" : state.checkClass,
+    ...(state.remoteAcceptanceVerdicts ? { remoteAcceptanceVerdicts: state.remoteAcceptanceVerdicts } : {}),
+    ...(state.remoteVerificationAttempts ? { remoteVerificationAttempts: state.remoteVerificationAttempts } : {}),
   });
 }
 
@@ -556,6 +619,8 @@ export function recordVinciVerification(
       checkClass === "behavioral" ? mutationRevision : -1;
     setState({
       ...initialState(),
+      ...(current.remoteAcceptanceVerdicts ? { remoteAcceptanceVerdicts: current.remoteAcceptanceVerdicts } : {}),
+      ...(current.remoteVerificationAttempts ? { remoteVerificationAttempts: current.remoteVerificationAttempts } : {}),
       status: "passed",
       command: cleanCommand,
       commandKey: cleanCommandKey,
