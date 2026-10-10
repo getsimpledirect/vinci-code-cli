@@ -38,11 +38,14 @@ function storedVerdict(state) {
   return records[0];
 }
 
+// Only the three statuses that ARE verdicts appear here. FAILED was in this
+// table mapping to DONE_UNVERIFIED, which pinned the defect: it made a crashed
+// verifier report on the WORK. It is asserted below as a no-op instead, beside
+// CANCELLED, which always behaved that way.
 const table = [
   ["VERIFIED_PASS", "DONE"],
   ["CONDITIONAL", "DONE_UNVERIFIED"],
   ["BLOCKED", "BLOCKED"],
-  ["FAILED", "DONE_UNVERIFIED"],
 ];
 
 for (const [remoteStatus, taskState] of table) {
@@ -61,15 +64,43 @@ for (const localStatus of ["passed", "failed"]) {
 const conflictingBlock = verification.applyRemoteVerdict(localState("passed"), remoteVerdict("BLOCKED"));
 assert.equal(outcome.classifyVinciTaskState([], ["src/change.ts"], conflictingBlock).state, "BLOCKED");
 
-// FAILED is Vinci-owned and cannot turn the service summary into user blame.
+// FAILED is attempt history, not a verdict on the work, and cannot surface service blame.
+//
+// The state is now DONE rather than DONE_UNVERIFIED, and that is the point of the
+// change rather than a side effect: the local latch says passed, the verification
+// job crashed, and a crashed job is not an assessment of the work. CANCELLED has
+// always behaved exactly this way on a locally-passed run — measured, not assumed
+// — so this makes the two halves of one rule agree instead of introducing new
+// semantics.
+//
+// The blame property below is unchanged and is the part that must not regress:
+// a failed verification still cannot present the service's own summary as the
+// user's fault.
 const failed = verification.applyRemoteVerdict(
   localState("passed"),
   remoteVerdict("FAILED", { summary: "The user supplied a bad change." }),
 );
 const failedOutcome = outcome.classifyVinciTaskState([], ["src/change.ts"], failed);
-assert.equal(failedOutcome.state, "DONE_UNVERIFIED");
-assert.match(failedOutcome.reason, /^Vinci /);
+assert.equal(failedOutcome.state, "DONE");
+assert.equal(verification.currentRemoteVerdict(failed), undefined);
+assert.deepEqual(failed.remoteVerificationAttempts?.map(({ outcome }) => outcome), ["FAILED"]);
+// And it matches CANCELLED, which is the sibling case that already worked.
+const cancelledOnPassed = verification.applyRemoteVerdict(localState("passed"), remoteVerdict("CANCELLED"));
+assert.equal(
+  outcome.classifyVinciTaskState([], ["src/change.ts"], cancelledOnPassed).state,
+  failedOutcome.state,
+);
+// The safety property, stated directly rather than via the "Vinci " prefix.
+//
+// That prefix was a proxy for "the reason came from the service, not the user".
+// Now that a failed job falls back to the local latch, the reason is the LOCAL
+// one — so the prefix no longer applies, and asserting it would be testing the
+// wording rather than the property. What must never happen is the crashed
+// verifier's summary surfacing as an assessment of the user's work, and that is
+// asserted here on its own terms. It holds more strongly than before: the
+// summary does not appear at all.
 assert.doesNotMatch(failedOutcome.reason, /user supplied/i);
+assert.doesNotMatch(failedOutcome.reason, /bad change/i);
 
 // Mutation preserves the verdict record, stales it, and resumes local-latch classification.
 const accepted = verification.applyRemoteVerdict(localState("passed"), remoteVerdict("VERIFIED_PASS"));
@@ -97,14 +128,64 @@ assert.equal("remoteAcceptanceVerdicts" in oldState, false);
 const oldRoundTrip = verification.parseVinciVerificationState(JSON.parse(JSON.stringify(oldState)));
 assert.deepEqual(oldRoundTrip, oldState);
 
-// CANCELLED is a no-op: it cannot erase or replace the prior verdict.
+// CANCELLED is retained as attempt history and cannot erase or replace the prior verdict.
 const prior = verification.applyRemoteVerdict(oldState, remoteVerdict("CONDITIONAL"));
 const cancelled = verification.applyRemoteVerdict(
   prior,
   remoteVerdict("CANCELLED", { jobId: "acceptance-job-2", snapshotDigest: "sha256:snapshot-2" }),
 );
-assert.strictEqual(cancelled, prior);
+assert.equal(verification.currentRemoteVerdict(cancelled)?.status, "CONDITIONAL");
+assert.deepEqual(cancelled.remoteVerificationAttempts?.map(({ outcome }) => outcome), ["CANCELLED"]);
 assert.equal(outcome.remoteVerdictTaskState(remoteVerdict("CANCELLED")), undefined);
+assert.equal(outcome.remoteVerdictTaskState(remoteVerdict("FAILED")), undefined);
+
+// A FAILED VERIFIER IS NOT A VERDICT ON THE WORK.
+//
+// This used to map to DONE_UNVERIFIED, which is a statement about the submitted
+// snapshot. FAILED reports that the verification JOB did not finish; it says
+// nothing about the work, so the run is no more and no less done than it already
+// was. Turning an absent assessment into a weak negative one is the shape FR-6.4
+// exists to prevent.
+//
+// CANCELLED already behaved this way, so the two halves of one rule disagreed
+// inside a single switch. The canonical vocabulary in vinci-contracts calls both
+// `kind: "not-issued"`, and terminalStateOfVerification() returns undefined for
+// each — this aligns Code with that ahead of the package migration.
+assert.equal(outcome.remoteVerdictTaskState(remoteVerdict("FAILED")), undefined);
+
+// THE SECOND ASYMMETRY, NOW CLOSED.
+//
+// #228 pinned the then-current behaviour here: CANCELLED was a strict no-op on
+// the stored record, while FAILED REPLACED the stored verdict, so a crashed
+// verifier overwrote a CONDITIONAL that was genuinely issued. It was recorded so
+// that changing it would be deliberate and visible. This is that change.
+//
+// Attempts and verdicts are now separate records. FAILED and CANCELLED both
+// append to remoteVerificationAttempts and neither touches
+// remoteAcceptanceVerdicts — an issued verdict survives any number of
+// unsuccessful attempts, and the attempts remain as history rather than being
+// dropped. Asserted on the record itself, both directions.
+const priorForFailed = verification.applyRemoteVerdict(oldState, remoteVerdict("CONDITIONAL"));
+const afterFailed = verification.applyRemoteVerdict(
+  priorForFailed,
+  remoteVerdict("FAILED", { jobId: "acceptance-job-3", snapshotDigest: "sha256:snapshot-3" }),
+);
+assert.deepEqual(afterFailed.remoteAcceptanceVerdicts, priorForFailed.remoteAcceptanceVerdicts);
+assert.equal(verification.currentRemoteVerdict(afterFailed)?.status, "CONDITIONAL");
+assert.deepEqual(afterFailed.remoteVerificationAttempts?.map(({ outcome }) => outcome), ["FAILED"]);
+const afterCancelled = verification.applyRemoteVerdict(afterFailed, remoteVerdict("CANCELLED"));
+assert.deepEqual(afterCancelled.remoteAcceptanceVerdicts, priorForFailed.remoteAcceptanceVerdicts);
+assert.equal(verification.currentRemoteVerdict(afterCancelled)?.status, "CONDITIONAL");
+assert.deepEqual(
+  afterCancelled.remoteVerificationAttempts?.map(({ outcome }) => outcome),
+  ["FAILED", "CANCELLED"],
+);
+
+// The three that ARE verdicts still map as before — this change narrows what
+// counts as an assessment, it does not weaken the assessments themselves.
+assert.equal(outcome.remoteVerdictTaskState(remoteVerdict("VERIFIED_PASS")), "DONE");
+assert.equal(outcome.remoteVerdictTaskState(remoteVerdict("BLOCKED")), "BLOCKED");
+assert.equal(outcome.remoteVerdictTaskState(remoteVerdict("CONDITIONAL")), "DONE_UNVERIFIED");
 
 // Recording and staling are display-only: local latch/job identity remain intact; no job is created.
 assert.equal(prior.status, oldState.status);

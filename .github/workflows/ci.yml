@@ -10,6 +10,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   build-check-test:
     # PR #1 (`vinci` -> `main`) is the permanently-open fork-layer PR; it is never going to merge, so
@@ -27,6 +31,8 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: '@getsimpledirect'
 
       - name: Install system dependencies
         run: |
@@ -36,6 +42,8 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
         run: npm run build

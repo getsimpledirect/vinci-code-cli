@@ -13,6 +13,12 @@ set -euo pipefail
 SELF="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
 ROOT="$(cd "${SELF}/../.." && pwd)"
 VINCI="${ROOT}/vinci"
+VINCI_EXTENSIONS="${VINCI}/dist/extensions"
+VINCI_EXTENSION_SUFFIX="js"
+if [ ! -d "${VINCI_EXTENSIONS}" ]; then
+  VINCI_EXTENSIONS="${VINCI}/extensions"
+  VINCI_EXTENSION_SUFFIX="ts"
+fi
 
 # ── Self-heal the bootstrap updater ─────────────────────────────────────────────────────────────
 # The install shim runs $VINCI_HOME/updater/update.mjs — the BOOTSTRAP copy — for every command,
@@ -345,6 +351,12 @@ if [ "${VINCI_PROFILE_UNCLEAN:-0}" -ne 0 ]; then
   exit 78
 fi
 
+# Runtime is an authenticated task-service client, independent of Pi sessions and inference.
+if [ "${1:-}" = "runtime" ]; then
+  shift
+  exec node "${VINCI}/scripts/runtime.mjs" "$@"
+fi
+
 PI_LOCAL="${ROOT}/packages/coding-agent/dist/cli.js"
 PI_SOURCE="${ROOT}/packages/coding-agent/src/cli.ts"
 PI_TSX="${ROOT}/node_modules/.bin/tsx"
@@ -483,45 +495,45 @@ set +e
 "${PI[@]}" \
   --theme "${VINCI}/themes/vinci-dark.json" \
   --theme "${VINCI}/themes/vinci-light.json" \
-  --extension "${VINCI}/extensions/vinci-provider.ts" \
-  --extension "${VINCI}/extensions/vinci-model-provenance.ts" \
-  --extension "${VINCI}/extensions/vinci-priority.ts" \
-  --extension "${VINCI}/extensions/vinci-queue.ts" \
-  --extension "${VINCI}/extensions/vinci-workspace.ts" \
-  --extension "${VINCI}/extensions/vinci-verification.ts" \
-  --extension "${VINCI}/extensions/vinci-accept.ts" \
-  --extension "${VINCI}/extensions/vinci-checkpoint.ts" \
-  --extension "${VINCI}/extensions/vinci-character.ts" \
-  --extension "${VINCI}/extensions/vinci-factcheck.ts" \
-  --extension "${VINCI}/extensions/vinci-plan.ts" \
-  --extension "${VINCI}/extensions/vinci-memory.ts" \
-  --extension "${VINCI}/extensions/vinci-header.ts" \
-  --extension "${VINCI}/extensions/vinci-council.ts" \
-  --extension "${VINCI}/extensions/vinci-advisor.ts" \
-  --extension "${VINCI}/extensions/vinci-orchestrate.ts" \
-  --extension "${VINCI}/extensions/vinci-crew.ts" \
-  --extension "${VINCI}/extensions/vinci-feedback.ts" \
-  --extension "${VINCI}/extensions/vinci-issue.ts" \
-  --extension "${VINCI}/extensions/vinci-todo.ts" \
-  --extension "${VINCI}/extensions/vinci-review.ts" \
-  --extension "${VINCI}/extensions/vinci-outcome.ts" \
-  --extension "${VINCI}/extensions/vinci-receipt.ts" \
-  --extension "${VINCI}/extensions/vinci-guard.ts" \
-  --extension "${VINCI}/extensions/vinci-scope.ts" \
-  --extension "${VINCI}/extensions/vinci-loopbreak.ts" \
-  --extension "${VINCI}/extensions/vinci-shell.ts" \
-  --extension "${VINCI}/extensions/vinci-undo.ts" \
-  --extension "${VINCI}/extensions/vinci-search.ts" \
-  --extension "${VINCI}/extensions/vinci-autoname.ts" \
-  --extension "${VINCI}/extensions/vinci-preview.ts" \
-  --extension "${VINCI}/extensions/vinci-render.ts" \
-  --extension "${VINCI}/extensions/vinci-compact.ts" \
-  --extension "${VINCI}/extensions/vinci-toolload.ts" \
-  --extension "${VINCI}/extensions/vinci-cachewatch.ts" \
-  --extension "${VINCI}/extensions/vinci-support.ts" \
-  --extension "${VINCI}/extensions/vinci-help.ts" \
-  --extension "${VINCI}/extensions/vinci-copy.ts" \
-  --extension "${VINCI}/extensions/vinci-completion-receipt.ts" \
+  --extension "${VINCI_EXTENSIONS}/vinci-provider.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-model-provenance.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-priority.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-queue.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-workspace.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-verification.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-accept.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-checkpoint.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-character.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-factcheck.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-plan.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-memory.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-header.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-council.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-advisor.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-orchestrate.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-crew.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-feedback.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-issue.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-todo.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-review.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-outcome.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-receipt.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-guard.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-scope.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-loopbreak.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-shell.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-undo.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-search.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-autoname.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-preview.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-render.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-compact.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-toolload.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-cachewatch.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-support.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-help.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-copy.${VINCI_EXTENSION_SUFFIX}" \
+  --extension "${VINCI_EXTENSIONS}/vinci-completion-receipt.${VINCI_EXTENSION_SUFFIX}" \
   --thinking high \
   --provider "${VINCI_PROVIDER}" \
   --model "${VINCI_MODEL}" \

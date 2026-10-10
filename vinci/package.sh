@@ -16,6 +16,8 @@ EXCLUDES="$(mktemp "${TMPDIR:-/tmp}/vinci-package-excludes.XXXXXX")"
 trap 'rm -f "${EXCLUDES}"' EXIT
 mkdir -p "${OUT}"
 
+bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh"
+
 echo "── Building (network-free) ─────────────────────────"
 bash "${ROOT}/vinci/build.sh" >/dev/null
 echo "  ✓ built"
@@ -33,6 +35,7 @@ tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude='node_modules/typescript' \
   --exclude='node_modules/@typescript' \
   --exclude='node_modules/@biomejs' \
+  --exclude='node_modules/@getsimpledirect' \
   --exclude='node_modules/@types' \
   --exclude='node_modules/esbuild' \
   --exclude='node_modules/@esbuild' \
@@ -47,9 +50,11 @@ tar -czf "${TGZ}" -C "${ROOT}" \
   packages/coding-agent/dist packages/coding-agent/package.json \
   packages/orchestrator/dist packages/orchestrator/package.json \
   packages/tui/dist packages/tui/package.json \
-  vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater vinci/worker \
-  vinci/scripts/report-wrong.mjs vinci/identity.json vinci/NOTICE \
+  vinci/bin vinci/extensions vinci/dist vinci/themes vinci/assets vinci/updater vinci/worker \
+  vinci/scripts/report-wrong.mjs vinci/scripts/runtime.mjs vinci/scripts/runtime.d.mts vinci/identity.json vinci/NOTICE \
   package.json node_modules
+
+bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh" "${TGZ}"
 
 cp "${TGZ}" "${CURRENT_TGZ}"
 # Record the checksum against the BASENAME so `shasum -c` works from the release dir on any machine

@@ -1,3 +1,4 @@
+import { parseLauncherExtensions } from "./launcher-extensions.mjs";
 import assert from "node:assert/strict";
 import { accessSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { constants } from "node:fs";
@@ -11,9 +12,8 @@ const launcher = join(root, "vinci/bin/vinci");
 const launcherSource = readFileSync(launcher, "utf8");
 const identity = JSON.parse(readFileSync(join(root, "vinci/identity.json"), "utf8"));
 
-assert.match(
-  launcherSource,
-  /--extension "\$\{VINCI\}\/extensions\/vinci-accept\.ts"/,
+assert.ok(
+  parseLauncherExtensions(launcherSource).includes("vinci-accept.ts"),
   "launcher must register vinci-accept",
 );
 assert(identity.extensions.includes("vinci-accept.ts"), "identity must register vinci-accept");

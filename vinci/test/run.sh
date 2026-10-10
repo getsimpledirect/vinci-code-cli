@@ -244,7 +244,12 @@ run_cli_supervised() (
 )
 
 echo "── UNIT ──────────────────────────────────────────────"
+run_group canonical-sweep node "${ROOT}/vinci/test/canonical-sweep.mjs"
+# The contracts runtime guard is byte-conservative over everything shipped: template/require.resolve/
+# export-star/concatenated/commented references, extensionless launchers, node_modules, lockfiles.
+run_group contracts-runtime-guard node "${ROOT}/vinci/test/contracts-runtime-guard.mjs"
 run_group identity-contract node "${ROOT}/vinci/test/identity-contract.mjs"
+run_group runtime-cli node "${ROOT}/vinci/test/runtime-integration.mjs"
 run_group deepinfra-provider-integration node "${ROOT}/vinci/test/deepinfra-provider-integration.mjs"
 # BYOK: the launcher's provider-flag matrix, and proof that a BYOK session keeps every VINCI_CODE
 # guard. Both existed and passed for a while WITHOUT being listed here, so the aggregate gate was
@@ -275,6 +280,10 @@ run_group billing-codes-integration node "${ROOT}/vinci/test/billing-codes-integ
 run_group 402-classification-integration node "${ROOT}/vinci/test/402-classification-integration.mjs"
 run_group 402-escalation-no-downgrade node "${ROOT}/vinci/test/402-escalation-no-downgrade.mjs"
 run_group no-downgrade-integration node "${ROOT}/vinci/test/no-downgrade-integration.mjs"
+# Public tests exercise local values; package drift is checked only when private packages exist.
+run_group canonical-verdicts-contract node "${ROOT}/vinci/test/canonical-verdicts-contract.mjs"
+run_group private-contracts-drift node "${ROOT}/vinci/test/private-contracts-drift.mjs"
+run_group contract-vocabulary node "${ROOT}/vinci/test/contract-vocabulary.mjs"
 run_group units node "${ROOT}/vinci/test/units.mjs"
 # Worker daemon: every vinci/test/worker-*.mjs runs, discovered by glob so a new file cannot be
 # silently omitted (a hand-maintained list here once registered 3 of 13 while the other 10 were
@@ -772,6 +781,7 @@ run_group loopbreak-integration node "${ROOT}/vinci/test/loopbreak-integration.m
 # finalization git commands exempt from the reserve (never push/network).
 run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-harness-integration.mjs"
 run_group guard-integration node "${ROOT}/vinci/test/guard-integration.mjs"
+run_group input-images node "${ROOT}/vinci/test/input-images.test.mjs"
 # Replay failed tool results offline; guidance must preserve raw errors without inventing their cause.
 run_group guard-error-guidance-integration node --test "${ROOT}/vinci/test/guard-error-guidance-integration.mjs"
 # Masked content (<vinci-secret>) can never match or overwrite raw file bytes.
@@ -830,6 +840,34 @@ fi
 run_group crew-integration node "${ROOT}/vinci/test/crew-integration.mjs"
 # Integration: per-result context budget — read/grep/find keep tool output bounded (real modules).
 run_group resultbudget-integration node "${ROOT}/vinci/test/resultbudget-integration.mjs"
+
+echo
+echo "── PACKAGED (built verification vocabulary) ──────────"
+run_group packaged-build bash "${ROOT}/vinci/build.sh"
+run_group packaged-vocabulary env VINCI_PACKAGED_VOCABULARY_REUSE_BUILD=1 node "${ROOT}/vinci/test/packaged-vocabulary.mjs"
+# package.sh can require release signing credentials. Keep release packaging out of this local group;
+# the runtime guard directly verifies the dependency and private-scope exclusion contract.
+run_group packaged-runtime-contract-guard bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh"
+# The CLI must LAUNCH, not just answer --version: the real launcher in print mode against a local faux
+# gateway, which loads Pi, every extension, the agent session and the core grader with no network and
+# no credentials. First from the repo build (cheap, always), then from a freshly packaged and unpacked
+# tarball — the only tree in which a private-scope import is unresolvable. 0.0.51 died on every launch
+# behind a green harness because nothing here ran the code users run from the tree users get.
+run_group packaged-launch-repo node "${ROOT}/vinci/test/packaged-launch-check.mjs" "${ROOT}"
+packaged_dir="$(mktemp -d "${TMPDIR:-/tmp}/vinci-packaged-test.XXXXXX")"
+if run_group packaged-tarball bash "${ROOT}/vinci/package.sh" "${packaged_dir}"; then
+  packaged_tgz="$(ls "${packaged_dir}"/vinci-code-*.tgz 2>/dev/null | head -1)"
+  mkdir -p "${packaged_dir}/unpacked"
+  if [ -n "${packaged_tgz}" ] && tar -xzf "${packaged_tgz}" -C "${packaged_dir}/unpacked"; then
+    run_group packaged-artifact-imports node "${ROOT}/vinci/test/packaged-artifact-check.mjs" "${packaged_dir}/unpacked"
+    run_group packaged-launch-artifact node "${ROOT}/vinci/test/packaged-launch-check.mjs" "${packaged_dir}/unpacked"
+    run_group runtime-cli-packaged node "${ROOT}/vinci/test/runtime-integration.mjs" "${packaged_dir}/unpacked"
+  else
+    echo "  ✗ packaged-unpack: no tarball produced in ${packaged_dir}"
+    fails=$((fails + 1))
+  fi
+fi
+rm -rf "${packaged_dir}"
 
 echo
 echo "── UI (headless xterm + faux model) ──────────────────"

@@ -143,6 +143,52 @@ Phase 3a retrieval-plus-attribution gate instead of blocking an otherwise ground
 shows the warning and the session retains the unavailable verdict. Sealed live calibration is still
 required for multi-claim coverage, false positives, latency, and cost.
 
+`@getsimpledirect/vinci-contracts` is the single source of attempt/verdict semantics on the production
+verification path — pinned by PRIVATE-ONLY drift checks. `vinci/extensions/lib/canonical-verdicts.ts`
+authors the verdict/attempt arrays and types locally. The exported public tree has no private package
+dependency, including during typechecking. `vinci/test/canonical-verdicts-contract.mjs` checks local
+values and membership behavior; `vinci/test/private-contracts-drift.mjs` deep-equals those arrays and
+membership wrappers against the private package's runtime exports. The separate
+`vinci/test/tsconfig.private-contracts-drift.json` typechecks exact equality of the local run, verdict,
+attempt, verification-outcome, and model-resolution-evidence types with the two private 0.2.0 packages.
+No public tsconfig includes that pin. The local module exposes the only membership
+wrappers used by verification-state parsing, recording, and current verdict selection. The package has
+no separate layer-0 attempt validator, so Code's accepted attempt set is the FAILED/CANCELLED
+`VerificationOutcome` reasons in `RUN_STATES` order.
+
+The `private-contracts-drift` job in `vinci-tests.yml` runs only in the private development repository,
+installs both private packages without saving manifest or lockfile changes, and requires runtime
+drift checks plus the private tsgo pin. The normal harness runs the runtime drift check too: without
+the private packages it prints one SKIP line and exits successfully. Setting
+`VINCI_REQUIRE_PRIVATE_CONTRACTS=1` makes missing packages fail, so private CI cannot silently skip.
+`vinci/extensions/vinci-model-provenance.ts` copies the `ResolutionEvidence` literal union from
+vinci-model-classes 0.2.0 (`src/provenance.ts:22–27`, `dist/provenance.d.ts:16–17`); the private checks
+compare both its union type and its literal values with the package.
+
+No runtime file may import a VALUE from the package, and "the bundler inlines it" is not a defence.
+0.0.51 shipped `canonical-verdicts.ts` importing `RUN_STATES` and `VERDICT_STATUSES` at runtime and
+failed on every launch with `ERR_MODULE_NOT_FOUND`, behind a green harness and a green release
+pipeline. The esbuild bundles under `vinci/dist/extensions` were clean, exactly as this section used
+to promise — but that is not the only path to the file. `packages/coding-agent/src/core/vinci-grader.ts`
+imports `vinci/extensions/lib/verification-contract.ts` directly, so the coding-agent tsgo build emits
+plain, un-bundled `vinci/extensions/lib/{verification-contract,canonical-verdicts}.js` beside the
+sources (gitignored in `vinci/extensions/lib/.gitignore`), `package.sh` ships `vinci/extensions`
+whole, and the core's `dist/core/vinci-grader.js` loads those copies with the bare import intact. The
+private package was excluded from the tarball while the repository harness had it installed, so
+those repository tests could not see the failure.
+
+Distribution is therefore local types and values plus build-time inlining, guarded at three layers. The public
+tarball remains installable without GitHub Packages access and excludes `node_modules/@getsimpledirect`.
+`vinci/scripts/check-no-contracts-at-runtime.sh` fails the build on a private runtime dependency in
+ANY manifest (root included) and on any non-type import of the scope in the BUILT output — both
+`vinci/dist/extensions` and the in-place emits under `vinci/extensions` — or in a packaged tarball.
+`node vinci/test/packaged-vocabulary.mjs` builds and checks the packaged vocabulary directly, and
+`node vinci/test/packaged-launch-check.mjs <tree>` runs the real launcher in print mode against a
+local faux gateway, which is the only check that loads what users load; the aggregate harness runs
+both in the `PACKAGED` group after `packaged-build`, and the release workflow runs the launch check
+against the unpacked artifact. W0-G3 needs nothing further from outside this repository once these
+source and packaged mutation gates pass.
+
 ## Build Phases
 
 - **Phase 1 (done):** flaw #1 (untracked) + flaw #2 (tool-grounded grader prompt) + flaw #3
