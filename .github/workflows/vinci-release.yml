@@ -27,9 +27,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Releases publish from the public getsimpledirect/vinci-code-cli only (George, 2026-10-09). This
+  # file is exported to public byte-for-byte, so the tag trigger must stay; in the private repo the
+  # jobs below skip on the repository guard, and a skip reads like a pass. Fail loudly here instead.
+  refuse-private-release:
+    if: github.repository == 'getsimpledirect/vinci-code'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Releases publish from vinci-code-cli only
+        run: |
+          echo "::error::Vinci releases are published from getsimpledirect/vinci-code-cli only. Export this change to public and tag vinci-v<version> there; nothing was published from the private repository."
+          exit 1
+
   build-and-verify:
-    # Org-only: needs the AWS OIDC trust that exists in this repository alone.
-    # Public and forked copies are structurally inert rather than failing noisily.
+    # Publisher-only: runs in getsimpledirect/vinci-code-cli, the one publisher (its release-role OIDC
+    # assumption succeeded for vinci-v0.0.54). The private repo fails loudly via refuse-private-release
+    # above; forks are inert.
     #
     # This name must track the repository as it is ACTUALLY named. It said
     # `getsimpledirect/vinci-code` from before the rename to `-cli`, so it stopped matching the
@@ -41,6 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: read
     outputs:
       version: ${{ steps.meta.outputs.version }}
     steps:
@@ -81,6 +96,8 @@ jobs:
           printf 'version=%s\n' "$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install, build, and package the UNSIGNED payload
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           npm ci
@@ -102,6 +119,10 @@ jobs:
           mkdir -p /tmp/vinci-artifact-check
           tar -xzf "release/vinci-code-${{ steps.meta.outputs.version }}.tgz" -C /tmp/vinci-artifact-check
           node vinci/test/packaged-artifact-check.mjs /tmp/vinci-artifact-check
+          # The tarball must not LOAD the private contracts scope anywhere (0.0.51 did, from an
+          # un-bundled vinci/extensions/lib/*.js the core grader imports). package.sh already ran
+          # this; run it again here so the release step that ships the file is the one that fails.
+          bash vinci/scripts/check-no-contracts-at-runtime.sh "release/vinci-code-${{ steps.meta.outputs.version }}.tgz"
           # Belt and braces: the packaged CLI must answer --version without an extension-load error.
           out="$(/tmp/vinci-artifact-check/vinci/bin/vinci --version 2>&1)" || true
           printf '%s\n' "${out}"
@@ -109,6 +130,12 @@ jobs:
             *"Failed to load extension"*|*"Cannot find module"*)
               echo "::error::The packaged CLI cannot load its extensions."; exit 1 ;;
           esac
+          # `--version` is answered by the launcher itself, before Pi or any extension loads, so the
+          # check above proved nothing about loading: 0.0.51 passed it and then died on every real
+          # launch. This runs the packaged launcher in PRINT MODE against a local faux gateway — Pi,
+          # every extension, the agent session and the core grader all load, no network, no
+          # credentials — and requires the reply. Fails on the 0.0.51 tarball; passes on a fixed one.
+          node vinci/test/packaged-launch-check.mjs /tmp/vinci-artifact-check
 
       - name: Carry the TESTED payload to publish (publish signs this, never a rebuild)
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3

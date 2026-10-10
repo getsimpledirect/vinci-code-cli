@@ -14,15 +14,21 @@ import {
   vinciResponseKey,
 } from "./usage-accumulator.ts";
 import {
+  currentRemoteVerdict,
   hasIncompleteVinciBehavioralAttempt,
   hasVinciZeroCollectionAttempt,
   vinciCheckWarrantedPath,
   vinciVerificationCommand,
   vinciIncompleteBehavioralAttemptSummary,
-  type RemoteAcceptanceVerdict,
+  type RemoteIssuedAcceptanceVerdict,
   type VinciVerificationState,
 } from "./verification-state.ts";
 import { vinciVerificationDisabled } from "./verification-control.ts";
+import {
+  isAttemptStatus,
+  isVerdictStatus,
+  type VerdictStatus,
+} from "./canonical-verdicts.ts";
 
 export const VINCI_TASK_OUTCOME_ENTRY = "vinci-task-outcome";
 export const VINCI_FALSE_COMPLETION_ENTRY = "vinci-false-completion-report";
@@ -52,22 +58,50 @@ export const VINCI_ASK_HOLDING_REASON = "The final reply asks for your go-ahead 
 
 /**
  * D10 (wave5.md, locked decisions 4-5):
- * VERIFIED_PASS -> DONE; BLOCKED -> BLOCKED; CONDITIONAL/FAILED -> DONE_UNVERIFIED;
- * CANCELLED -> no change. Staled/absent records also leave the local latch authoritative.
+ * VERIFIED_PASS -> DONE; BLOCKED -> BLOCKED; CONDITIONAL -> DONE_UNVERIFIED.
+ * FAILED/CANCELLED are not issued verdicts, so they never reach this selector or override
+ * the local latch. Staled/absent records also leave the local latch authoritative.
+ *
+ * FAILED IS NOT A VERDICT, and used to be treated as one here. It mapped to
+ * DONE_UNVERIFIED — a statement about the WORK — when what it reports is that the
+ * verification JOB did not finish. A verifier that crashed says nothing about the
+ * submitted snapshot: the run is no more and no less done than it already was.
+ * Reading it as DONE_UNVERIFIED turns an absent assessment into a weak negative
+ * one, which is the shape FR-6.4 exists to prevent — nothing may present as
+ * assessed unless an assessment was issued.
+ *
+ * The canonical predicates own the verdict/attempt boundary. The table below
+ * only translates a canonically-issued verdict into Vinci's existing receipt
+ * state and default explanation.
  */
-export function remoteVerdictTaskState(record: RemoteAcceptanceVerdict | undefined): VinciTaskState | undefined {
-  if (!record || record.staled) return undefined;
-  switch (record.status) {
-    case "VERIFIED_PASS":
-      return "DONE";
-    case "BLOCKED":
-      return "BLOCKED";
-    case "CONDITIONAL":
-    case "FAILED":
-      return "DONE_UNVERIFIED";
-    case "CANCELLED":
-      return undefined;
+const REMOTE_VERDICT_OUTCOME_BY_STATUS = {
+  VERIFIED_PASS: {
+    state: "DONE",
+    reason: "Remote acceptance verification passed.",
+  },
+  BLOCKED: {
+    state: "BLOCKED",
+    reason: "Remote acceptance verification found a blocker.",
+  },
+  CONDITIONAL: {
+    state: "DONE_UNVERIFIED",
+    reason: "Remote acceptance verification completed conditionally.",
+  },
+} as const satisfies Readonly<Record<VerdictStatus, { state: VinciTaskState; reason: string }>>;
+
+function remoteVerdictOutcomeMapping(
+  record: Readonly<{ status: unknown; staled: boolean }> | undefined,
+): (typeof REMOTE_VERDICT_OUTCOME_BY_STATUS)[VerdictStatus] | undefined {
+  if (!record || record.staled || isAttemptStatus(record.status) || !isVerdictStatus(record.status)) {
+    return undefined;
   }
+  return REMOTE_VERDICT_OUTCOME_BY_STATUS[record.status];
+}
+
+export function remoteVerdictTaskState(
+  record: Readonly<{ status: unknown; staled: boolean }> | undefined,
+): VinciTaskState | undefined {
+  return remoteVerdictOutcomeMapping(record)?.state;
 }
 
 export type VinciTaskUsage = {
@@ -375,38 +409,12 @@ export function summarizeVinciTaskUsage(
   return combinedTaskUsage(streamUsage, getVinciTaskUsageSnapshot(taskId, assistantResponseKeys(messages)));
 }
 
-export function currentRemoteVerdict(
-  verification: Readonly<VinciVerificationState>,
-): RemoteAcceptanceVerdict | undefined {
-  if (vinciVerificationDisabled()) return undefined;
-  return Object.values(verification.remoteAcceptanceVerdicts ?? {})
-    .filter((verdict) => remoteVerdictTaskState(verdict) !== undefined)
-    .sort(
-      (left, right) =>
-        right.recordedAtIso.localeCompare(left.recordedAtIso) ||
-        (right.eventCursor ?? "").localeCompare(left.eventCursor ?? "") ||
-        right.jobId.localeCompare(left.jobId),
-    )[0];
-}
-
-function remoteVerdictOutcome(record: RemoteAcceptanceVerdict): { state: VinciTaskState; reason: string } {
-  const state = remoteVerdictTaskState(record);
-  if (!state) throw new Error("A non-current remote verdict cannot determine task state.");
-  if (record.status === "FAILED") {
-    return {
-      state,
-      reason: "Vinci could not complete remote acceptance verification. The work is done, but remains unverified.",
-    };
-  }
+function remoteVerdictOutcome(record: RemoteIssuedAcceptanceVerdict): { state: VinciTaskState; reason: string } {
+  const mapped = remoteVerdictOutcomeMapping(record);
+  if (!mapped) throw new Error("A non-current remote verdict cannot determine task state.");
   return {
-    state,
-    reason:
-      record.summary ||
-      (record.status === "VERIFIED_PASS"
-        ? "Remote acceptance verification passed."
-        : record.status === "BLOCKED"
-          ? "Remote acceptance verification found a blocker."
-          : "Remote acceptance verification completed conditionally."),
+    state: mapped.state,
+    reason: record.summary || mapped.reason,
   };
 }
 
@@ -574,7 +582,7 @@ export function classifyVinciTaskState(
   changedFiles: readonly string[],
   verification: Readonly<VinciVerificationState>,
 ): { state: VinciTaskState; reason: string } {
-  const remoteVerdict = currentRemoteVerdict(verification);
+  const remoteVerdict = vinciVerificationDisabled() ? undefined : currentRemoteVerdict(verification);
   if (remoteVerdict) return remoteVerdictOutcome(remoteVerdict);
   return classifyVinciLocalTaskState(messages, changedFiles, verification);
 }

@@ -26,9 +26,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Fails loudly when a `v[0-9]*` tag or dispatch reaches the PRIVATE repo: this upstream builder
+  # stages a GitHub Release with `contents: write`, and Vinci never ships from here (vinci-code-cli
+  # publishes via vinci-release.yml). Mirrors `refuse-private-release` in vinci-release.yml.
+  refuse-private-binaries:
+    if: github.repository == 'getsimpledirect/vinci-code'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Refuse to build or stage a GitHub Release in the private repository
+        run: |
+          echo "::error::Build Binaries is upstream Pi's release path and does not run in getsimpledirect/vinci-code. Nothing was built or staged. Vinci releases are tagged vinci-v<version> in getsimpledirect/vinci-code-cli."
+          exit 1
+
   # Keep the public GitHub Release publication last. Binary assets are staged in
   # a draft release first; cleanup removes the draft if later publishing fails.
   build:
+    # Upstream only, like publish-npm below. In any Vinci repo the npm publish is skipped, so the draft
+    # release staged here was always deleted again by cleanup; skipping keeps contents:write jobs from
+    # running at all. Every downstream job needs this one and skips with it.
+    if: github.repository == 'badlogic/pi-mono'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -230,6 +247,8 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
         run: npm run build

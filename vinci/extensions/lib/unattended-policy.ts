@@ -61,6 +61,8 @@
  * can read them back out of the JSONL and put the three counts in the terminal post.
  */
 
+import { isVerdictStatus } from "./canonical-verdicts.ts";
+
 /** Session-transcript custom entry type. The worker's session-read.mjs anchors on this string. */
 export const VINCI_UNATTENDED_POLICY_ENTRY = "vinci-unattended-policy";
 
@@ -169,7 +171,7 @@ export function summarizeUnattendedDecisions(
 ): UnattendedSummary {
   const summary: UnattendedSummary = { blocked: 0, escalated: 0, proceeded: 0 };
   for (const decision of decisions) {
-    if (decision.outcome === "BLOCKED") summary.blocked += 1;
+    if (isVerdictStatus(decision.outcome)) summary.blocked += 1;
     else if (decision.outcome === "ESCALATED") summary.escalated += 1;
     else if (decision.outcome === "PROCEEDED") summary.proceeded += 1;
   }

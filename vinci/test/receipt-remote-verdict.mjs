@@ -13,78 +13,101 @@ const stateModule = await loader.import(resolve(here, "../extensions/lib/verific
 const receiptCwd = mkdtempSync(resolve(tmpdir(), "vinci-receipt-remote-verdict-"));
 writeFileSync(resolve(receiptCwd, "file.ts"), "export const value = 1;\n");
 
-// Test 1: applyRemoteVerdict stores VERIFIED_PASS verdict
-{
-  const currentState = stateModule.getVinciVerificationState();
-  const verdict = {
-    status: "VERIFIED_PASS",
-    summary: "All checks passed",
-    snapshotDigest: "abc123",
-    jobId: "job-123",
-  };
-  const nextState = stateModule.applyRemoteVerdict(currentState, verdict);
-  assert(nextState.remoteAcceptanceVerdicts !== undefined, "remote verdicts should exist");
-  const verdictKeys = Object.keys(nextState.remoteAcceptanceVerdicts);
-  assert(verdictKeys.length > 0, "verdict should be stored");
-  console.log("ok (1) VERIFIED_PASS verdict recorded");
+const remoteResult = (status, overrides = {}) => ({
+  schemaVersion: 1,
+  status,
+  summary: `Remote verification returned ${status}`,
+  snapshotDigest: "digest-1",
+  jobId: "job-1",
+  recordedAtIso: "2026-08-02T10:00:00.000Z",
+  staled: false,
+  ...overrides,
+});
+
+function freshState() {
+  stateModule.resetVinciVerificationState();
+  return stateModule.getVinciVerificationState();
 }
 
-// Test 2: applyRemoteVerdict handles CONDITIONAL verdict
+// A failed attempt for the same snapshot and job never displaces an issued conditional verdict.
 {
-  const currentState = stateModule.getVinciVerificationState();
-  const verdict = {
-    status: "CONDITIONAL",
-    summary: "Some conditions not met",
-    snapshotDigest: "def456",
-    jobId: "job-124",
-  };
-  const nextState = stateModule.applyRemoteVerdict(currentState, verdict);
-  assert(nextState.remoteAcceptanceVerdicts !== undefined, "remote verdicts should exist");
-  console.log("ok (2) CONDITIONAL verdict recorded");
+  const conditional = stateModule.applyRemoteVerdict(freshState(), remoteResult("CONDITIONAL"));
+  const afterFailed = stateModule.applyRemoteVerdict(
+    conditional,
+    remoteResult("FAILED", { recordedAtIso: "2026-08-02T11:00:00.000Z" }),
+  );
+  assert.equal(
+    stateModule.currentRemoteVerdict(afterFailed)?.status,
+    "CONDITIONAL",
+    "FAILED attempt must not overwrite the issued CONDITIONAL verdict",
+  );
+  assert.deepEqual(afterFailed.remoteVerificationAttempts?.map(({ outcome }) => outcome), ["FAILED"]);
+  assert.deepEqual(Object.values(afterFailed.remoteAcceptanceVerdicts ?? {}).map(({ status }) => status), ["CONDITIONAL"]);
+  console.log("ok (1) CONDITIONAL survives FAILED for the same snapshot and job");
 }
 
-// Test 3: remoteAcceptanceVerdictKey generates consistent keys
+// A cancelled attempt is retained as history without displacing a verified pass.
 {
-  const verdict1 = {
-    status: "VERIFIED_PASS",
-    summary: "pass",
-    snapshotDigest: "digest1",
+  const passed = stateModule.applyRemoteVerdict(freshState(), remoteResult("VERIFIED_PASS"));
+  const afterCancelled = stateModule.applyRemoteVerdict(
+    passed,
+    remoteResult("CANCELLED", { recordedAtIso: "2026-08-02T11:00:00.000Z" }),
+  );
+  assert.equal(stateModule.currentRemoteVerdict(afterCancelled)?.status, "VERIFIED_PASS");
+  assert.deepEqual(afterCancelled.remoteVerificationAttempts?.map(({ outcome }) => outcome), ["CANCELLED"]);
+  console.log("ok (2) VERIFIED_PASS survives CANCELLED for the same snapshot and job");
+}
+
+// An attempt can precede the first issued verdict without becoming one itself.
+{
+  const failed = stateModule.applyRemoteVerdict(freshState(), remoteResult("FAILED"));
+  assert.equal(stateModule.currentRemoteVerdict(failed), undefined);
+  const conditional = stateModule.applyRemoteVerdict(
+    failed,
+    remoteResult("CONDITIONAL", { recordedAtIso: "2026-08-02T11:00:00.000Z" }),
+  );
+  assert.equal(stateModule.currentRemoteVerdict(conditional)?.status, "CONDITIONAL");
+  assert.deepEqual(conditional.remoteVerificationAttempts?.map(({ outcome }) => outcome), ["FAILED"]);
+  console.log("ok (3) FAILED history survives the first issued CONDITIONAL verdict");
+}
+
+// Mutations stale issued verdicts but leave attempt history byte-for-byte unchanged.
+{
+  const issued = stateModule.applyRemoteVerdict(freshState(), remoteResult("BLOCKED"));
+  const withAttempt = stateModule.applyRemoteVerdict(
+    issued,
+    remoteResult("FAILED", { jobId: "job-2", recordedAtIso: "2026-08-02T11:00:00.000Z" }),
+  );
+  const attemptsBefore = JSON.parse(JSON.stringify(withAttempt.remoteVerificationAttempts));
+  stateModule.restoreVinciVerificationState(withAttempt);
+  stateModule.recordVinciMutation();
+  const staled = stateModule.getVinciVerificationState();
+  assert.equal(stateModule.currentRemoteVerdict(staled), undefined);
+  assert(Object.values(staled.remoteAcceptanceVerdicts ?? {}).every(({ staled }) => staled));
+  assert.deepEqual(staled.remoteVerificationAttempts, attemptsBefore);
+  console.log("ok (4) staling leaves remote verification attempts untouched");
+}
+
+// Schema-v1 state written before the split migrates failed pseudo-verdicts into attempt history.
+{
+  const oldState = JSON.parse(JSON.stringify(freshState()));
+  const legacyFailed = remoteResult("FAILED", { reportUrl: "https://example.invalid/job-1" });
+  oldState.remoteAcceptanceVerdicts = {
+    [JSON.stringify([legacyFailed.snapshotDigest, legacyFailed.jobId])]: legacyFailed,
+  };
+  const parsed = stateModule.parseVinciVerificationState(oldState);
+  assert(parsed, "legacy state containing FAILED should parse");
+  assert.equal(stateModule.currentRemoteVerdict(parsed), undefined);
+  assert.deepEqual(parsed.remoteVerificationAttempts, [{
     jobId: "job-1",
-  };
-  const verdict2 = {
-    status: "VERIFIED_PASS",
-    summary: "pass",
-    snapshotDigest: "digest1",
-    jobId: "job-1",
-  };
-  
-  const state1 = stateModule.applyRemoteVerdict(stateModule.getVinciVerificationState(), verdict1);
-  const state2 = stateModule.applyRemoteVerdict(state1, verdict2);
-  
-  // Same verdict should overwrite (same key), not add a duplicate
-  const keys1 = Object.keys(state1.remoteAcceptanceVerdicts || {});
-  const keys2 = Object.keys(state2.remoteAcceptanceVerdicts || {});
-  assert.equal(keys1.length, keys2.length, "same verdict should overwrite, not duplicate");
-  console.log("ok (3) verdictKey consistency verified");
-}
-
-// Test 4: CANCELLED verdict is skipped
-{
-  const currentState = stateModule.getVinciVerificationState();
-  const countBefore = Object.keys(currentState.remoteAcceptanceVerdicts || {}).length;
-  
-  const cancelledVerdict = {
-    status: "CANCELLED",
-    summary: "job cancelled",
-    snapshotDigest: "can123",
-    jobId: "job-125",
-  };
-  const nextState = stateModule.applyRemoteVerdict(currentState, cancelledVerdict);
-  const countAfter = Object.keys(nextState.remoteAcceptanceVerdicts || {}).length;
-  
-  // CANCELLED should not be recorded per Wave 5 decision
-  assert.equal(countAfter, countBefore, "CANCELLED verdict should not be stored");
-  console.log("ok (4) CANCELLED verdict skipped per design");
+    snapshotDigest: "digest-1",
+    outcome: "FAILED",
+    summary: "Remote verification returned FAILED",
+    reportUrl: "https://example.invalid/job-1",
+    recordedAtIso: "2026-08-02T10:00:00.000Z",
+  }]);
+  assert.deepEqual(parsed.remoteAcceptanceVerdicts, {});
+  console.log("ok (5) legacy FAILED pseudo-verdict migrates into attempt history");
 }
 
 // Clean up
@@ -132,13 +155,6 @@ const localOutcome = { state: "DONE", reason: "All local checks passed" };
   const d = display(localOutcome, { status: "CONDITIONAL", staled: false, summary: "Could not fully verify" });
   assert.equal(d.state, "DONE_UNVERIFIED", "remote CONDITIONAL beats local DONE");
   console.log("ok (display) CONDITIONAL overrides local -> DONE_UNVERIFIED");
-}
-{
-  const d = display(localOutcome, { status: "FAILED", staled: false, summary: "runner exploded: user code is broken" });
-  assert.equal(d.state, "DONE_UNVERIFIED");
-  assert(!d.reason.includes("user code"), "FAILED copy is Vinci-owned, never blames user code");
-  assert(!d.reason.includes("exploded"), "raw failure detail never surfaces in the receipt");
-  console.log("ok (display) FAILED shows Vinci-owned copy");
 }
 {
   const d = display({ state: "BLOCKED", reason: "Local gate open" }, { status: "VERIFIED_PASS", staled: true, summary: "All criteria verified" });

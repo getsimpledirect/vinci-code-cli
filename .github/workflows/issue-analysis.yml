@@ -42,6 +42,7 @@ on:
     types: [created]
 
 permissions:
+  packages: read
   contents: read
   issues: write
 
@@ -312,6 +313,8 @@ jobs:
       - name: Install dependencies
         working-directory: ${{ steps.workdir.outputs.name }}
         run: npm ci --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
         working-directory: ${{ steps.workdir.outputs.name }}

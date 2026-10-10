@@ -49,7 +49,7 @@ on:
   # Runs on every pull request, INCLUDING those targeting main: the `main` ruleset
   # requires this workflow's jobs as status checks, and a check that never runs on
   # PRs to main made every such PR unmergeable without an admin bypass (found on
-  # PR #3, 2026-08-27). The push trigger stays main-only.
+  # PR #3, 2026-08-27). The push trigger stays on the default branch only.
   pull_request:
     # Spelling `types` at all REPLACES the default [opened, synchronize,
     # reopened] rather than adding to it, so all three are repeated here.
@@ -58,7 +58,37 @@ on:
     # and so fires no `synchronize`, which without this line would let a PR
     # go draft -> ready -> merged having only ever run the Node 24 leg.
     types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+  packages: read
+
 jobs:
+  private-contracts-drift:
+    if: github.repository == 'getsimpledirect/vinci-code'
+    runs-on: ubuntu-latest
+    env:
+      PRIVATE_CONTRACTS_REGISTRY: https://npm.pkg.github.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          registry-url: ${{ env.PRIVATE_CONTRACTS_REGISTRY }}
+          scope: '@getsimpledirect'
+      - name: Install public dependencies
+        run: npm ci --ignore-scripts
+      - name: Build workspace for the private type pin
+        run: bash vinci/build.sh
+      - name: Install private contracts for drift checks only
+        run: npm install --no-save --package-lock=false --ignore-scripts @getsimpledirect/vinci-contracts@0.2.0 @getsimpledirect/vinci-model-classes@0.2.0
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require private runtime and type equality
+        run: |
+          VINCI_REQUIRE_PRIVATE_CONTRACTS=1 node vinci/test/private-contracts-drift.mjs
+          npx tsgo -p vinci/test/tsconfig.private-contracts-drift.json
+
   # biome + tsgo + the pinned-deps/shrinkwrap/install-lock checks. `ci.yml` runs these
   # only for `branches: [main]`, so nothing gated them on a vinci-targeted PR: a
   # contributor without the local pre-commit hook could land a type error or a lint
@@ -74,6 +104,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # `check` now type-checks vinci/extensions, which imports @earendil-works/* by package name.
       # Those resolve through each package's dist, so without a build every import fails TS2307 and
       # every imported type degrades to an implicit any — hundreds of cascade errors. ci.yml already
@@ -82,14 +114,14 @@ jobs:
         run: bash vinci/build.sh
       - name: Package unsigned artifact
         run: bash vinci/package.sh
-      # Keep the unpack procedure aligned with vinci-release.yml lines 91-93.
+      # Keep the unpack procedure aligned with vinci-release.yml's "Verify the PACKAGED artifact loads" step.
       - name: Unpack packaged artifact
         run: |
           set -euo pipefail
           rm -rf /tmp/vinci-artifact-check
           mkdir -p /tmp/vinci-artifact-check
           tar -xzf release/vinci-code-*.tgz -C /tmp/vinci-artifact-check
-      # Match vinci-release.yml line 94 exactly so PRs validate the release artifact itself.
+      # Match that same release step exactly so PRs validate the release artifact itself.
       - name: Verify packaged artifact imports
         run: node vinci/test/packaged-artifact-check.mjs /tmp/vinci-artifact-check
       # Stronger than vinci-release.yml's belt-and-braces string match: the packaged CLI
@@ -125,6 +157,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build
         run: npm run build
       - name: Run upstream test suite
@@ -140,6 +174,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build Vinci runtime
         run: bash vinci/build.sh
       - name: Run sandbox integration
@@ -182,6 +218,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build Vinci runtime without external catalog refresh
         run: bash vinci/build.sh
       # Run all 47+ harness lanes so CI cannot drift from the local suite.

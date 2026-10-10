@@ -368,7 +368,7 @@ try {
       true,
     );
     const withVerdict = verificationState.getVinciVerificationState();
-    const remote = taskOutcome.currentRemoteVerdict(withVerdict);
+    const remote = verificationState.currentRemoteVerdict(withVerdict); // private tree: currentRemoteVerdict lives in lib/verification-state.ts
     assert.ok(remote && remote.status === "VERIFIED_PASS" && !remote.staled, "a current VERIFIED_PASS remote verdict is recorded");
     hardStop.clearVinciHardStop("task-outcome");
     const remoteClean = taskOutcome.buildVinciTaskOutcome({ taskId: "task-outcome", messages: claimsDone, changedFiles: ["src/a.ts"], verification: withVerdict });
