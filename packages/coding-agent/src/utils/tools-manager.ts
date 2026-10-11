@@ -1,14 +1,23 @@
 import chalk from "chalk";
 import { type SpawnSyncReturns, spawnSync } from "child_process";
-import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
+import { createHash } from "crypto";
+import {
+	chmodSync,
+	createReadStream,
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+} from "fs";
 import { arch, platform } from "os";
 import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
-import { APP_NAME, getBinDir } from "../config.ts";
+import { getBinDir } from "../config.ts";
 
 const TOOLS_DIR = getBinDir();
-const NETWORK_TIMEOUT_MS = 10_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 
 function isOfflineModeEnabled(): boolean {
@@ -29,12 +38,29 @@ export function shouldBootstrapTools(env: NodeJS.ProcessEnv = process.env): bool
 	);
 }
 
+interface PinnedAsset {
+	version: string;
+	sha256: string;
+}
+
 interface ToolConfig {
 	name: string;
 	repo: string; // GitHub repo (e.g., "sharkdp/fd")
 	binaryName: string; // Name of the binary inside the archive
 	systemBinaryNames?: string[]; // Alternative system command names to try before downloading
 	tagPrefix: string; // Prefix for tags (e.g., "v" for v1.0.0, "" for 1.0.0)
+	// Exact-release pins per platform/arch. The bootstrap used to resolve "latest" at run time and
+	// chmod+execute whatever arrived — a takeover of the release channel, or a tampered download,
+	// executed arbitrary bytes with no version pin and no content check. Every supported platform
+	// now pins the exact release asset and its SHA-256; the digest is verified after download and
+	// BEFORE any extraction or chmod, and a platform without a pin is refused outright (fail closed).
+	//
+	// BUMP PATH: pick the target release; for EVERY key below download that asset and record
+	// `shasum -a 256` (the GitHub release API's asset `digest` field carries the same value); update
+	// version and digest together for every entry — either one alone fails closed at runtime, by
+	// design. The 2026-10-11 pins were taken from the fd 10.5.0 / ripgrep 15.2.0 release assets and
+	// the darwin/arm64 pair re-verified by downloading the bytes and hashing them locally.
+	pins: Record<string, PinnedAsset>;
 	getAssetName: (version: string, plat: string, architecture: string) => string | null;
 }
 
@@ -45,6 +71,32 @@ const TOOLS: Record<string, ToolConfig> = {
 		binaryName: "fd",
 		systemBinaryNames: ["fd", "fdfind"],
 		tagPrefix: "v",
+		pins: {
+			"darwin/arm64": {
+				version: "10.5.0",
+				sha256: "b67e1836c468e42e411984b56e52fa7abec08c2bd22c867398e7cc134aac5e12",
+			},
+			"darwin/x64": {
+				version: "10.5.0",
+				sha256: "7e31028c62c6955877735d0406807aa484c2a5e6f86235a59e26c29c301da590",
+			},
+			"linux/arm64": {
+				version: "10.5.0",
+				sha256: "c0ee43802e3313a317c5af2f4eabd6ba13eeedd595af9775f05e18a13ac4f52c",
+			},
+			"linux/x64": {
+				version: "10.5.0",
+				sha256: "a1259cd129636efbc3fef123525c1b49e88fe5088c012630983c310e52fdfa95",
+			},
+			"win32/arm64": {
+				version: "10.5.0",
+				sha256: "a2bcddcfd259b05357a77bbc6cd671fdb30f63fd266a0e748305890a8c5ceaa6",
+			},
+			"win32/x64": {
+				version: "10.5.0",
+				sha256: "a227701b8551c35a9931d9f6da75503cf86d88e182d71fb849a70864c5d57cd7",
+			},
+		},
 		getAssetName: (version, plat, architecture) => {
 			if (plat === "darwin") {
 				const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
@@ -64,6 +116,32 @@ const TOOLS: Record<string, ToolConfig> = {
 		repo: "BurntSushi/ripgrep",
 		binaryName: "rg",
 		tagPrefix: "",
+		pins: {
+			"darwin/arm64": {
+				version: "15.2.0",
+				sha256: "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4",
+			},
+			"darwin/x64": {
+				version: "15.2.0",
+				sha256: "af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1",
+			},
+			"linux/arm64": {
+				version: "15.2.0",
+				sha256: "a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d",
+			},
+			"linux/x64": {
+				version: "15.2.0",
+				sha256: "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c",
+			},
+			"win32/arm64": {
+				version: "15.2.0",
+				sha256: "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f",
+			},
+			"win32/x64": {
+				version: "15.2.0",
+				sha256: "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
+			},
+		},
 		getAssetName: (version, plat, architecture) => {
 			if (plat === "darwin") {
 				const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
@@ -81,6 +159,54 @@ const TOOLS: Record<string, ToolConfig> = {
 		},
 	},
 };
+
+export interface ResolvedPinnedAsset {
+	version: string;
+	assetName: string;
+	digest: string;
+}
+
+// Explicit per-tool override for an operator who must run a different release than the pin (e.g.
+// holding a tool back while an upstream regression is investigated). The DIGEST CHECK STAYS
+// MANDATORY: an override that does not carry BOTH a version and this asset's digest is REFUSED,
+// not silently ignored — falling back to the default pin would install a release the operator
+// never asked for, and skipping the digest would reintroduce "download and hope".
+// Format: VINCI_TOOL_PIN_FD=10.5.0:<64-hex sha256 of the exact asset for THIS platform>.
+/** The pinned release asset for a platform, or null when no pin exists — the caller must REFUSE
+ *  (never fall back to "latest", which is the unpinned, unverified download this exists to end).
+ *  Exported so the integrity decision is directly testable. */
+export function resolvePinnedAsset(
+	tool: "fd" | "rg",
+	plat: string = platform(),
+	architecture: string = arch(),
+): ResolvedPinnedAsset | null {
+	const config = TOOLS[tool];
+	if (!config) return null;
+	const overrideEnv = process.env[`VINCI_TOOL_PIN_${tool.toUpperCase()}`];
+	let pin: PinnedAsset | undefined;
+	if (overrideEnv !== undefined) {
+		const separator = overrideEnv.indexOf(":");
+		const version = separator === -1 ? "" : overrideEnv.slice(0, separator);
+		const sha256 = separator === -1 ? "" : overrideEnv.slice(separator + 1);
+		if (/^\d+\.\d+\.\d+$/.test(version) && /^[0-9a-f]{64}$/i.test(sha256)) {
+			pin = { version, sha256: sha256.toLowerCase() };
+		}
+	} else {
+		pin = config.pins[`${plat}/${architecture}`];
+	}
+	if (!pin) return null;
+	const assetName = config.getAssetName(pin.version, plat, architecture);
+	if (!assetName) return null;
+	return { version: pin.version, assetName, digest: pin.sha256 };
+}
+
+/** SHA-256 of a file on disk, streamed (release archives are a few MB, not a problem, but never
+ *  buffer what a digest can stream). */
+async function sha256File(path: string): Promise<string> {
+	const digest = createHash("sha256");
+	await pipeline(createReadStream(path), digest);
+	return digest.digest("hex");
+}
 
 // Check if a command exists in PATH by trying to run it
 function commandExists(cmd: string): boolean {
@@ -113,21 +239,6 @@ export function getToolPath(tool: "fd" | "rg"): string | null {
 	}
 
 	return null;
-}
-
-// Fetch latest release version from GitHub
-async function getLatestVersion(repo: string): Promise<string> {
-	const response = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
-		headers: { "User-Agent": `${APP_NAME}-coding-agent` },
-		signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
-	});
-
-	if (!response.ok) {
-		throw new Error(`GitHub API error: ${response.status}`);
-	}
-
-	const data = (await response.json()) as { tag_name: string };
-	return data.tag_name.replace(/^v/, "");
 }
 
 // Download a file from URL
@@ -249,36 +360,47 @@ function extractZipArchive(archivePath: string, extractDir: string, assetName: s
 	throw new Error(`Failed to extract ${assetName}: ${failures.join("; ")}`);
 }
 
-// Download and install a tool
-async function downloadTool(tool: "fd" | "rg"): Promise<string> {
+// Download and install a tool from its PINNED release (see ToolConfig.pins for the bump path).
+// Exported so the integrity decision is directly testable.
+export async function downloadTool(tool: "fd" | "rg"): Promise<string> {
 	const config = TOOLS[tool];
 	if (!config) throw new Error(`Unknown tool: ${tool}`);
 
 	const plat = platform();
 	const architecture = arch();
 
-	// Get latest version
-	let version = await getLatestVersion(config.repo);
-	if (tool === "fd" && plat === "darwin" && architecture === "x64") {
-		version = "10.3.0";
+	// The pin decides the version and the expected digest. No pin → refuse: an unpinned download
+	// is exactly the "latest and hope" this exists to end (an unsupported platform has no asset
+	// name either, so both failures close here, before any fetch).
+	const pin = resolvePinnedAsset(tool, plat, architecture);
+	if (!pin) {
+		throw new Error(
+			`No pinned ${config.name} release for ${plat}/${architecture} — refusing to download an unpinned, unverified binary`,
+		);
 	}
 
-	// Get asset name for this platform
-	const assetName = config.getAssetName(version, plat, architecture);
-	if (!assetName) {
-		throw new Error(`Unsupported platform: ${plat}/${architecture}`);
-	}
+	const assetName = pin.assetName;
 
 	// Create tools directory
 	mkdirSync(TOOLS_DIR, { recursive: true });
 
-	const downloadUrl = `https://github.com/${config.repo}/releases/download/${config.tagPrefix}${version}/${assetName}`;
+	const downloadUrl = `https://github.com/${config.repo}/releases/download/${config.tagPrefix}${pin.version}/${assetName}`;
 	const archivePath = join(TOOLS_DIR, assetName);
 	const binaryExt = plat === "win32" ? ".exe" : "";
 	const binaryPath = join(TOOLS_DIR, config.binaryName + binaryExt);
 
 	// Download
 	await downloadFile(downloadUrl, archivePath);
+
+	// INTEGRITY GATE: verify the archive against the pin's SHA-256 BEFORE anything extracts it or
+	// chmods the result — a tampered or substituted download must never become an executable.
+	const actualDigest = await sha256File(archivePath);
+	if (actualDigest !== pin.digest) {
+		rmSync(archivePath, { force: true });
+		throw new Error(
+			`${config.name} ${pin.version} failed its integrity check: expected sha256 ${pin.digest}, got ${actualDigest}. The download was discarded; nothing was extracted or executed`,
+		);
+	}
 
 	// Extract into a unique temp directory. fd and rg downloads can run concurrently
 	// during startup, so sharing a fixed directory causes races.

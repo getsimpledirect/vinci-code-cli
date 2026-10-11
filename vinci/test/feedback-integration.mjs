@@ -27,6 +27,15 @@ feedbackExtension({
 assert.equal(typeof command?.handler, "function");
 
 const plantedSecret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+// New provider shapes (audit 2026-10-11), planted so /feedback must mask them before anything
+// leaves the machine. TESTONLY-marked and split-concatenated so no contiguous key shape is
+// ever committed.
+const newShapeSecrets = [
+  "r8_" + "TESTONLY" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9s",
+  "pypi-" + "TESTONLY" + "AgEIcHlwaS5vcmc" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9s",
+  "ya29." + "TESTONLY" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV5wX6",
+  "tgp_v1_" + "TESTONLY" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV5",
+];
 const transcriptOnly = "TRANSCRIPT-ONLY-PRIVACY-GUARD";
 
 function messageEntry(id, role, content) {
@@ -42,7 +51,7 @@ function messageEntry(id, role, content) {
 function makeContext({ description, confirm = true, email = "", notifications = [], confirmations = [] }) {
   const branch = [
     { type: "custom", id: "ignored", parentId: null, timestamp: "2026-07-20T11:59:00.000Z" },
-    messageEntry("user", "user", `${transcriptOnly} api_key=${plantedSecret}`),
+    messageEntry("user", "user", `${transcriptOnly} api_key=${plantedSecret} together_key=${newShapeSecrets[3]}`),
     messageEntry("assistant", "assistant", [{ type: "text", text: "assistant reply" }]),
   ];
   return {
@@ -104,7 +113,7 @@ try {
   await command.handler(
     "",
     makeContext({
-      description: `The agent exposed api_key=${plantedSecret} and claimed success.`,
+      description: `The agent exposed api_key=${plantedSecret}, replicate=${newShapeSecrets[0]}, pypi=${newShapeSecrets[1]} and google=${newShapeSecrets[2]} before claiming success.`,
       email: "person@example.com",
       confirmations,
     }),
@@ -117,6 +126,9 @@ try {
   assert.equal(sent[0].body.replyTo, "person@example.com");
   assert.doesNotMatch(sent[0].body.message, new RegExp(plantedSecret));
   assert.doesNotMatch(sent[0].body.message, new RegExp(transcriptOnly));
+  for (const shape of newShapeSecrets) {
+    assert.ok(!sent[0].body.message.includes(shape), `feedback egress leaked the new token shape ${shape.slice(0, 10)}…`);
+  }
   assert.equal(confirmations[0].title, "check this before sending");
   assert.match(confirmations[0].message, /This is exactly what will be sent:/);
   assert.match(confirmations[0].message, /transcript stays on your machine at /);
@@ -129,6 +141,9 @@ try {
   assert.ok(firstReport);
   const localReport = readFileSync(firstReport, "utf8");
   assert.doesNotMatch(localReport, new RegExp(plantedSecret));
+  for (const shape of newShapeSecrets) {
+    assert.ok(!localReport.includes(shape), `the local report leaked the new token shape ${shape.slice(0, 10)}…`);
+  }
   assert.match(localReport, new RegExp(transcriptOnly));
 
   await command.handler("", makeContext({ description: "x".repeat(8_000) }));
