@@ -1059,11 +1059,15 @@ try {
   mkdirSync(grantedDirectory);
   mkdirSync(otherDirectory);
   nextSelection = ["Yes, allow it", "Yes, allow it"];
-  check("outside-project approval grants the selected directory", await toolCall("write", { path: join(grantedDirectory, "one.txt"), content: "ordinary" }) === undefined);
+  check("outside-project approval grants the selected directory", await toolCall("write", { path: join(grantedDirectory, "one.txt"), content: "ordinary" }) === undefined && toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(grantedDirectory, "one.txt")));
   const scopedPromptCount = selections.length;
   nextSelection = "Yes, allow it";
   check("another file in that approved directory needs no repeated scope prompt", await toolCall("write", { path: join(grantedDirectory, "two.txt"), content: "ordinary" }) === undefined && selections.slice(scopedPromptCount).every((entry) => /sensitive change/i.test(entry.title)));
-  check("a different outside directory still requires approval", (await toolCall("write", { path: join(otherDirectory, "one.txt"), content: "ordinary" }))?.block === true);
+  // A normal path needs no extra sensitive prompt, so it may leave the preceding Yes unconsumed.
+  nextSelection = "No, don't";
+  const otherWrite = await toolCall("write", { path: join(otherDirectory, "one.txt"), content: "ordinary" });
+  check("a different outside directory still requires approval", otherWrite?.block === true && /declined changes outside/.test(otherWrite.reason));
+  check("declining another directory creates no write grant", !toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(otherDirectory, "one.txt")));
   for (const handler of handlers.session_start) await handler({}, ctx);
   check("starting a new session clears directory permission", (await toolCall("write", { path: join(grantedDirectory, "three.txt"), content: "ordinary" }))?.block === true);
   nextSelection = "Yes, allow it";
