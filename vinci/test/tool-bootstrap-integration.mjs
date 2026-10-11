@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,7 +47,7 @@ const binDir = join(agentRoot, "bin");
 
 // A REAL tar.gz nested like a real fd release: fd-v9.9.9-aarch64-apple-darwin/fd.
 function buildArchive(payload) {
-	const staging = mkdtempSync(join(tmpdir(), "vinci-archive-"));
+	const staging = mkdtempSync(join(agentRoot, "archive-"));
 	const nested = join(staging, "fd-v9.9.9-aarch64-apple-darwin");
 	execFileSync("mkdir", ["-p", nested]);
 	writeFileSync(join(nested, "fd"), payload);
@@ -96,9 +96,16 @@ try {
 	const thisPin = tools.resolvePinnedAsset("fd");
 	assert.ok(thisPin, "the override pin must resolve for this platform");
 	const expectedUrl = `https://github.com/sharkdp/fd/releases/download/v${thisPin.version}/${thisPin.assetName}`;
+	mkdirSync(binDir, { recursive: true });
+	const untouched = join(agentRoot, "inert-neighbor");
+	writeFileSync(untouched, "keep these fixture bytes");
+	symlinkSync(untouched, join(binDir, thisPin.assetName));
+	let privateStageObserved = false;
 	const fetchedUrls = [];
 	globalThis.fetch = async (url) => {
 		fetchedUrls.push(String(url));
+		const stages = readdirSync(binDir).filter((name) => name.startsWith("download_fd_"));
+		privateStageObserved = stages.length === 1 && (statSync(join(binDir, stages[0])).mode & 0o777) === 0o700;
 		return new Response(cleanArchive, { status: 200 });
 	};
 	const binaryPath = join(binDir, "fd");
@@ -115,6 +122,8 @@ try {
 		"digest match: the installed binary is the archive's own payload",
 		readFileSync(binaryPath, "utf8").includes("clean probe fd stub"),
 	);
+	check("private bootstrap staging ignores the old predictable archive link", readFileSync(untouched, "utf8") === "keep these fixture bytes");
+	check("bootstrap staging is unique, private and cleaned after a successful install", privateStageObserved && !readdirSync(binDir).some((name) => name.startsWith("download_fd_")));
 	rmSync(binDir, { recursive: true, force: true });
 
 	// Digest mismatch → refuses with a clear error; nothing extracted, chmodded, or executed.
@@ -136,7 +145,12 @@ try {
 			/integrity check/i.test(String(mismatchError.message ?? mismatchError)) &&
 			!existsSync(join(binDir, "fd")),
 	);
+	check("digest mismatch cleans private staging", !readdirSync(binDir).some((name) => name.startsWith("download_fd_")));
 	rmSync(binDir, { recursive: true, force: true });
+	process.env.VINCI_TOOL_PIN_FD = `9.9.9:${cleanSha}`;
+	globalThis.fetch = async () => { throw new Error("inert interrupted download"); };
+	await assert.rejects(tools.downloadTool("fd"), /inert interrupted download/);
+	check("an interrupted download cleans staging before returning its error", !readdirSync(binDir).some((name) => name.startsWith("download_fd_")));
 
 	// Missing digest (override without one) → fails closed BEFORE any download.
 	process.env.VINCI_TOOL_PIN_FD = "9.9.9";

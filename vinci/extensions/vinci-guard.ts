@@ -16,6 +16,12 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
+  vinciGrantWriteDirectory,
+  vinciGrantWriteFile,
+  vinciResetSandboxPermissions,
+  vinciSandboxWriteGranted,
+  vinciSensitiveNoWrite,
+  vinciWritableRoots,
 } from "@earendil-works/pi-coding-agent";
 import { recordVinciConfirmationGate, sendVinciControl } from "./lib/control.ts";
 import { recordFinalizationRefusal } from "./lib/hard-stop.ts";
@@ -41,10 +47,6 @@ import {
 import { planCommandMutates } from "./vinci-plan.ts";
 
 export { redactSecrets, redactSecretsDeep } from "./lib/secrets.ts";
-
-// Set once the user OKs Vinci working outside the project folder this session (so we don't re-ask
-// on every edit). Reads outside are always fine; this only gates writes/edits.
-let outsideWritesAllowed = false;
 
 // The placeholders redactSecrets() puts in everything the model sees (see lib/secrets.ts). They
 // never exist in real files, so their presence in edit/write input means the model is working from
@@ -903,6 +905,8 @@ const OUTWARD: Array<[RegExp, string]> = [
 ];
 // Changes your whole computer, not just this project. Confirm — "this isn't just your project".
 const SYSTEM: Array<[RegExp, string]> = [
+  // HOME may be configured outside /Users/<name> or /home/<name> (including fresh test fixtures).
+  [new RegExp(`${homedir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/\\.(?:bashrc|bash_profile|bash_login|bash_logout|zshrc|zshenv|zprofile|zlogin|zlogout|profile|gitconfig|inputrc)\\b`, "i"), "change your system or startup settings"],
   [/\b(npm|pnpm)\s+(i|install|add)\b[^\n]*\s(-g|--global)\b|\byarn\s+global\s+add\b/i, "install software globally on your computer"],
   [/\b(brew|apt|apt-get|gem|cargo|pipx|port)\s+install\b/i, "install system software"],
   // `deno install` with -g/--global writes an executable onto PATH — a system-class change that the
@@ -1445,6 +1449,14 @@ function signSecurityCommand(command: string, cwd: string, scopes: string[]): st
   return `# vinci-security-grant:${grantId}:${normalized}:${signature}\n${command}`;
 }
 
+function toolConfigScopes(command: string): string[] {
+  const scopes = new Set<string>();
+  for (const match of shellRiskText(command).matchAll(/\b(gcloud|gsutil|bq|aws|kubectl|helm|docker)\b/g)) {
+    scopes.add(["gcloud", "gsutil", "bq"].includes(match[1]) ? "gcloud" : ["kubectl", "helm"].includes(match[1]) ? "kube" : match[1]);
+  }
+  return [...scopes];
+}
+
 export function userAskedForSensitiveRead(request: string): boolean {
   return (
     /\b(?:secret|credential|private key|api key|access token|auth token)s?\b/i.test(request) ||
@@ -1525,6 +1537,8 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(
         [
           `Sandbox: ${sandboxBackend()}`,
+          `Writable directories: ${vinciWritableRoots(ctx.cwd).join(", ")}`,
+          "Additional scope: /allow-directory <path> or /allow-file <path>; /deny-writes clears session grants",
           "Shell network: denied unless one exact command is approved",
           "Credential reads: denied unless one exact read is approved",
           "Provider/session secrets: redacted",
@@ -1535,7 +1549,44 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  for (const [name, file] of [["allow-directory", false], ["allow-file", true]] as const) {
+    pi.registerCommand(name, {
+      description: file ? "Authorize one deliberate file edit for this session" : "Authorize one additional writable directory for this session",
+      handler: async (args: string, ctx: ExtensionContext) => {
+        const path = structuredWritePath(args.trim(), ctx.cwd);
+        const target = path === null ? null : consumerWritePath(path, ctx.cwd);
+        if (!target || !args.trim()) {
+          ctx.ui.notify(`The path could not be resolved. Use /${name} with an absolute or project-relative path.`, "warning");
+          return;
+        }
+        if (!ctx.hasUI) {
+          headlessGate(pi, "additional-write-scope", "keep-blocking", "grant additional filesystem write authority", "Use an interactive confirmation or explicit launch configuration for deliberate additional scope.");
+          return;
+        }
+        if (!(await confirmSafely(ctx, "Vinci — grant write scope?", `Allow ${file ? "this exact file" : "this directory and its descendants"} for this session?\n\n  ${target}\n\n${file ? "A file grant can authorize a protected startup or credential file. Other files remain protected." : "Startup and credential files remain independently protected. Granting HOME is broad authority over your personal files."}`))) {
+          ctx.ui.notify("Additional write scope was declined; no grant was created. Choose an approved project path to continue.", "info");
+          sendVinciControl(pi, "vinci-write-scope-declined", "Additional filesystem write scope was declined. Use an already approved project path; do not retry equivalent grants.");
+          return;
+        }
+        try {
+          const granted = file ? vinciGrantWriteFile(ctx.cwd, target) : vinciGrantWriteDirectory(ctx.cwd, target);
+          ctx.ui.notify(`Write scope granted for "${granted}" in this session.`, "info");
+        } catch (error) {
+          ctx.ui.notify(String(error instanceof Error ? error.message : error), "warning");
+        }
+      },
+    });
+  }
+  pi.registerCommand("deny-writes", {
+    description: "Clear additional session write grants",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      vinciResetSandboxPermissions();
+      ctx.ui.notify("Additional session write grants cleared. Launch-configured grants and already running commands remain unchanged.", "info");
+    },
+  });
+
   pi.on("session_start", (_event, ctx) => {
+    vinciResetSandboxPermissions();
     buildNetworkApprovedForSession = false; // a new session re-asks before builds reach the internet
     resetSecretVault(); // credentials the user supplied are scoped to one session and never outlive it
     const status = sandboxBackend();
@@ -1543,6 +1594,9 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Security warning: VINCI_NO_SANDBOX=1 allows shell filesystem and network access.", "warning");
     } else if (status.startsWith("unavailable")) {
       ctx.ui.notify("Bash is disabled because Vinci could not find an enforceable OS sandbox.", "warning");
+    }
+    if (consumerWritePath(ctx.cwd, ctx.cwd) === consumerWritePath(homedir(), ctx.cwd)) {
+      ctx.ui.notify("HOME is read-only by default. Choose a project directory, or use /allow-directory with an explicit path for deliberate write scope.", "info");
     }
   });
 
@@ -1702,7 +1756,7 @@ export default function (pi: ExtensionAPI) {
       const interpreterOutsideWrite = interpreterTargets.some((target) => {
         if (target === "" || projectRoot === null) return true;
         const abs = consumerWritePath(target, ctx.cwd);
-        return abs === null || abs !== projectRoot && !abs.startsWith(projectRoot + sep);
+        return abs === null || !vinciSandboxWriteGranted(ctx.cwd, abs);
       });
       if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
         if (ctx.hasUI) ctx.ui.notify("Vinci tried to write a file through the shell — switching to the safer file editor.", "info");
@@ -1925,7 +1979,7 @@ export default function (pi: ExtensionAPI) {
             const ok = await confirmSafely(
               ctx,
               "Vinci — allow this network command once?",
-              `This command can connect to an external service or transfer data:\n\n  ${displayCommand}${effect}\n\nAllow this exact invocation once?`,
+              `This command can connect to an external service or transfer data:\n\n  ${displayCommand}${effect}${toolConfigScopes(cmd).length ? `\n\nIt may also update operational ${toolConfigScopes(cmd).join(", ")} configuration and caches for this invocation. Credential and startup files remain protected.` : ""}\n\nAllow this exact invocation once?`,
             );
             if (!ok) return { block: true, reason: "Blocked — the user declined THIS network command. Don't retry it or run an equivalent that goes online. This applies to this one command only — a different network action the user asks for (e.g. `git push`) is NOT blocked; attempt it and it will prompt for approval. Do what they asked locally, or ask them." };
             securityScopes.push("network");
@@ -1934,6 +1988,9 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (securityScopes.length > 0) {
+        // A cloud CLI may update operational context/cache files. This scope is included in the
+        // exact invocation approval, while its credential/configuration files remain protected.
+        if (securityScopes.includes("network")) securityScopes.push(...toolConfigScopes(cmd));
         (event.input as { command: string }).command = signSecurityCommand(cmd, ctx.cwd, securityScopes);
       }
 
@@ -2237,7 +2294,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      if (!outsideWritesAllowed && abs !== projectRoot && !abs.startsWith(projectRoot + sep)) {
+      if (!vinciSandboxWriteGranted(ctx.cwd, abs)) {
         // A from-scratch build often makes the model invent a generic placeholder path
         // (/home/user/project/index.html) instead of the grounded cwd (observed live 2026-07-15,
         // reproducibly, on empty-project web builds). That is a hallucinated path, not a deliberate
@@ -2281,22 +2338,23 @@ export default function (pi: ExtensionAPI) {
         // the attempt's teardown — the definition of an unreviewable change on a shared box.
         if (!ctx.hasUI)
           return headlessGate(pi, "outside-project-write", "keep-blocking", `change a file outside the project folder (${abs})`);
-        // Confirm ONCE per session (not per edit) — a deliberate opt-in to work outside the project,
-        // without nagging on every change.
+        const directory = dirname(abs);
         const ok = await confirmSafely(
           ctx,
           "Vinci — work outside this project?",
-          `Vinci wants to change a file OUTSIDE this project folder:\n\n  ${abs}\n\nIt's working in ${ctx.cwd}. Allow Vinci to make changes outside this project for the rest of this session?`,
+          `Vinci wants to change:\n\n  ${abs}\n\nAllow writes in this directory and its descendants for this session?\n\n  ${directory}\n\nIt's working in ${ctx.cwd}. Other directories will still ask. Startup and credential files remain protected; granting HOME includes your personal files.`,
         );
         if (!ok) {
           ctx.ui.notify("Change blocked.", "info");
           return { block: true, reason: "Blocked — you declined changes outside the project folder." };
         }
-        outsideWritesAllowed = true;
+        vinciGrantWriteDirectory(ctx.cwd, directory);
       }
 
       const resolvedPolicyPath = abs === projectRoot || abs.startsWith(projectRoot + sep) ? relative(projectRoot, abs) : abs;
-      const hit = SENSITIVE_PATHS.find(([re]) => re.test(path) || re.test(resolvedPolicyPath));
+      const independentlyProtected = vinciSensitiveNoWrite(ctx.cwd).some((root) => abs === root || abs.startsWith(root + sep));
+      const hit = SENSITIVE_PATHS.find(([re]) => re.test(path) || re.test(resolvedPolicyPath)) ??
+        (independentlyProtected ? [/./, "a protected startup or credential file"] as [RegExp, string] : undefined);
       if (hit) {
         // [W2 bucket: KEEP-BLOCKING] SENSITIVE_PATHS is .env, .git/ internals, private keys and
         // certificates, SSH keys, node_modules, lockfiles, and credentials dirs. Hand-writing any of
@@ -2314,6 +2372,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Change blocked.", "info");
           return { block: true, reason: "Blocked — you declined the sensitive change." };
         }
+        if (independentlyProtected) vinciGrantWriteFile(ctx.cwd, abs);
       }
       return undefined;
     }

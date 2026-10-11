@@ -7,6 +7,7 @@ import {
 	createWriteStream,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	renameSync,
 	rmSync,
@@ -16,6 +17,7 @@ import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { getBinDir } from "../config.ts";
+import { vinciSandboxChildEnv } from "../core/vinci-sandbox.ts";
 
 const TOOLS_DIR = getBinDir();
 const DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -211,7 +213,7 @@ async function sha256File(path: string): Promise<string> {
 // Check if a command exists in PATH by trying to run it
 function commandExists(cmd: string): boolean {
 	try {
-		const result = spawnSync(cmd, ["--version"], { stdio: "pipe" });
+		const result = spawnSync(cmd, ["--version"], { env: vinciSandboxChildEnv(process.env), stdio: "pipe" });
 		// Check for ENOENT error (command not found)
 		return result.error === undefined || result.error === null;
 	} catch {
@@ -297,7 +299,7 @@ function formatSpawnFailure(result: SpawnSyncReturns<Buffer>): string {
 }
 
 function runExtractionCommand(command: string, args: string[]): string | null {
-	const result = spawnSync(command, args, { stdio: "pipe" });
+	const result = spawnSync(command, args, { env: vinciSandboxChildEnv(process.env), stdio: "pipe" });
 	if (!result.error && result.status === 0) {
 		return null;
 	}
@@ -385,32 +387,26 @@ export async function downloadTool(tool: "fd" | "rg"): Promise<string> {
 	mkdirSync(TOOLS_DIR, { recursive: true });
 
 	const downloadUrl = `https://github.com/${config.repo}/releases/download/${config.tagPrefix}${pin.version}/${assetName}`;
-	const archivePath = join(TOOLS_DIR, assetName);
 	const binaryExt = plat === "win32" ? ".exe" : "";
 	const binaryPath = join(TOOLS_DIR, config.binaryName + binaryExt);
-
-	// Download
-	await downloadFile(downloadUrl, archivePath);
-
-	// INTEGRITY GATE: verify the archive against the pin's SHA-256 BEFORE anything extracts it or
-	// chmods the result — a tampered or substituted download must never become an executable.
-	const actualDigest = await sha256File(archivePath);
-	if (actualDigest !== pin.digest) {
-		rmSync(archivePath, { force: true });
-		throw new Error(
-			`${config.name} ${pin.version} failed its integrity check: expected sha256 ${pin.digest}, got ${actualDigest}. The download was discarded; nothing was extracted or executed`,
-		);
-	}
-
-	// Extract into a unique temp directory. fd and rg downloads can run concurrently
-	// during startup, so sharing a fixed directory causes races.
-	const extractDir = join(
-		TOOLS_DIR,
-		`extract_tmp_${config.binaryName}_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-	);
-	mkdirSync(extractDir, { recursive: true });
+	// Keep both the download and extraction in a private, unique directory. A predictable archive
+	// path can follow a preexisting symlink before its bytes are verified, and concurrent downloads
+	// must not substitute each other's already-verified archive.
+	const stagingDir = mkdtempSync(join(TOOLS_DIR, `download_${config.binaryName}_`));
+	const archivePath = join(stagingDir, assetName);
+	const extractDir = join(stagingDir, "extract");
 
 	try {
+		await downloadFile(downloadUrl, archivePath);
+		// Verify before extraction/chmod. A failed or incomplete fetch is cleaned up by the same
+		// finally path as an integrity refusal; no unverified archive survives for a later install.
+		const actualDigest = await sha256File(archivePath);
+		if (actualDigest !== pin.digest) {
+			throw new Error(
+				`${config.name} ${pin.version} failed its integrity check: expected sha256 ${pin.digest}, got ${actualDigest}. The download was discarded; nothing was extracted or executed. Retry only with the expected release asset.`,
+			);
+		}
+		mkdirSync(extractDir);
 		if (assetName.endsWith(".tar.gz")) {
 			extractTarGzArchive(archivePath, extractDir, assetName);
 		} else if (assetName.endsWith(".zip")) {
@@ -442,8 +438,7 @@ export async function downloadTool(tool: "fd" | "rg"): Promise<string> {
 		}
 	} finally {
 		// Cleanup
-		rmSync(archivePath, { force: true });
-		rmSync(extractDir, { recursive: true, force: true });
+		rmSync(stagingDir, { recursive: true, force: true });
 	}
 
 	return binaryPath;

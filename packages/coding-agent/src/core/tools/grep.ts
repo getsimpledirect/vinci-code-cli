@@ -9,6 +9,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts"
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import { vinciSandboxChildEnv } from "../vinci-sandbox.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -219,7 +220,10 @@ export function createGrepToolDefinition(
 						if (glob) args.push("--glob", glob);
 						args.push("--", pattern, searchPath);
 
-						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const child = spawn(rgPath, args, {
+							env: vinciSandboxChildEnv(process.env),
+							stdio: ["ignore", "pipe", "pipe"],
+						});
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						let matchCount = 0;

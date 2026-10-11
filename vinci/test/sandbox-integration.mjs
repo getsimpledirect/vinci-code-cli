@@ -1,174 +1,133 @@
-// Integration check: the REAL vinci-sandbox against a REAL OS sandbox. Confines bash filesystem
-// writes to the workspace (cwd + parent) so a runaway command can't escape to damage the machine.
-// macOS uses the built-in sandbox-exec. Linux runs the same contract when bubblewrap is installed;
-// the disposable EC2 lane installs it specifically so this path can no longer remain best-effort.
-import assert from "node:assert";
-import { execSync } from "node:child_process";
+// Real local-tool entrypoints with a fresh, credential-free environment and one owned fixture tree.
+// Backend qualification is a positive command: a sandbox startup failure must not count as a denial.
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, platform } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
 
-const here = dirname(fileURLToPath(import.meta.url));
-
-const sandboxExecutable = platform() === "darwin"
-  ? "/usr/bin/sandbox-exec"
-  : platform() === "linux"
-    ? ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"].find((path) => existsSync(path))
-    : undefined;
-
-if (!sandboxExecutable || !existsSync(sandboxExecutable)) {
-  console.log("sandbox-integration: skipped (sandbox-exec or bubblewrap is not available)");
+const script = fileURLToPath(import.meta.url);
+const here = dirname(script);
+if (!process.env.VINCI_SANDBOX_TEST_ROOT) {
+  const root = mkdtempSync(join(here, ".sandbox-integration-"));
+  for (const path of ["home", "temp", "project", "sibling", "other"]) mkdirSync(join(root, path));
+  try {
+    execFileSync(process.execPath, [script], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: join(root, "home"), TMPDIR: join(root, "temp"), VINCI_SANDBOX_TEST_ROOT: root },
+      timeout: 90_000, stdio: "inherit",
+    });
+  } finally {
+    execFileSync("/usr/bin/find", [root, "-mindepth", "1", "-delete"], { timeout: 10_000 });
+    rmdirSync(root);
+  }
   process.exit(0);
 }
-
+const root = realpathSync(process.env.VINCI_SANDBOX_TEST_ROOT);
+const home = join(root, "home");
+const cwd = join(root, "project");
+const sibling = join(root, "sibling");
+const other = join(root, "other");
+const backend = process.platform === "darwin" ? "/usr/bin/sandbox-exec" : ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"].find(existsSync);
+if (!backend || !existsSync(backend)) throw new Error("Sandbox runtime verification unavailable. Install a supported backend before counting this test as verified.");
 process.env.VINCI_CODE = "1";
-delete process.env.VINCI_NO_SANDBOX;
-const sbx = await import(resolve(here, "../../packages/coding-agent/src/core/vinci-sandbox.ts"));
-
-// Temp workspace under $HOME: <root>/workspace/proj is cwd, parent=<root>/workspace (a sibling
-// project lives there), <root>/outside is beyond the workspace and must be unwritable.
-const root = `${homedir()}/.vinci-sbx-it`;
-const cwd = `${root}/workspace/proj`;
-rmSync(root, { recursive: true, force: true });
-for (const d of [`${root}/workspace/proj`, `${root}/workspace/sibling`, `${root}/outside`]) mkdirSync(d, { recursive: true });
-const canonicalRoot = realpathSync(root);
-const canonicalWorkspace = realpathSync(`${root}/workspace`);
-const canonicalCwd = realpathSync(cwd);
-const fakeSecret = `${homedir()}/.vinci-sbx-it-fakekey`;
-// Probe inside a genuinely locked credential store. Nothing is created while the sandbox holds; the
-// finally block removes it either way so a regression can never leave a stray file in ~/.ssh.
-const sshProbe = `${homedir()}/.ssh/.vinci-sbx-it-probe`;
-
+process.env.VINCI_SECURITY_NONCE = "inert-test-signing-material";
+const sbx = await import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"));
+const tools = await import(resolve(here, "../../packages/coding-agent/dist/index.js"));
 let pass = 0;
-const check = (name, cond) => { assert.ok(cond, name); console.log(`  ✓ ${name}`); pass++; };
-const runs = (cmd) => {
-  try { execSync(sbx.vinciSandboxWrap(cmd, cwd), { cwd, stdio: "pipe" }); return true; } catch { return false; }
-};
+const check = (name, condition) => { assert.ok(condition, name); console.log(`  ✓ ${name}`); pass++; };
+const bash = (command, options) => tools.createBashToolDefinition(cwd, options).execute("sandbox-fixture", { command, timeout: 5 });
+const text = (result) => result.content.filter((entry) => entry.type === "text").map((entry) => entry.text).join("\n");
+const write = tools.createWriteToolDefinition(cwd);
+const edit = tools.createEditToolDefinition(cwd);
+const sq = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 let grantIndex = 0;
 const grant = (command, scopes) => {
-  const grantId = (++grantIndex).toString(16).padStart(32, "0");
+  const id = (++grantIndex).toString(16).padStart(32, "0");
   const normalized = [...scopes].sort().join(",");
-  const signature = createHmac("sha256", process.env.VINCI_SECURITY_NONCE)
-    .update(`${cwd}\0${grantId}\0${normalized}\0${command}`)
-    .digest("hex");
-  return `# vinci-security-grant:${grantId}:${normalized}:${signature}\n${command}`;
+  const signature = createHmac("sha256", process.env.VINCI_SECURITY_NONCE).update(`${cwd}\0${id}\0${normalized}\0${command}`).digest("hex");
+  return `# vinci-security-grant:${id}:${normalized}:${signature}\n${command}`;
 };
 
-try {
-  // Writable roots include the project and its workspace parent, not the grandparent.
-  const roots = sbx.vinciWritableRoots(cwd);
-  check("writable roots include the project (cwd)", roots.includes(canonicalCwd));
-  check("writable roots include the workspace parent (siblings work)", roots.includes(canonicalWorkspace));
-  // Writes are intentionally NOT confined to the project: Vinci works anywhere the user keeps files
-  // (Desktop, Documents, a sibling folder), matching Claude Code and Codex. Confining to the launch
-  // cwd meant files could land where nothing could ever be built. "/" is still never a root.
-  check("$HOME is a writable root (Vinci can work anywhere you keep files)", roots.includes(realpathSync(homedir())));
-  check("the filesystem root is NEVER writable", !roots.includes("/"));
-
-  // Enforcement against the platform's real OS sandbox.
-  check("write INSIDE the project is allowed", runs(`echo hi > ${cwd}/inside.txt`));
-  check("write to a SIBLING project (workspace parent) is allowed", runs(`echo hi > ${root}/workspace/sibling/s.txt`));
-  check("write OUTSIDE the project but under $HOME is ALLOWED", runs(`echo hi > ${root}/outside/ok.txt`));
-  check("write to a system path outside $HOME is BLOCKED", !runs(`echo leak > /etc/vinci-sbx-it-leak`));
-  // The protection that actually matters now that $HOME is writable: credential stores stay locked.
-  // (~/.ssh is re-denied LAST, so it wins over the writable $HOME root.) Nothing is created if the
-  // sandbox holds; the probe path is cleaned up in the finally block regardless.
-  check("write into ~/.ssh is BLOCKED even though $HOME is writable", !runs(`echo leak > ${sshProbe}`));
-  check("reading ~/.ssh is BLOCKED even though $HOME is writable", !runs(`cat ${homedir()}/.ssh/. > /dev/null`));
-  check("reading a system file is allowed", runs(`cat /etc/hosts > /dev/null`));
-  // A project's own .env must be READABLE so its commands (dotenv, vite, next…) can load config; the
-  // model still never sees raw values (the model-channel redaction masks them in tool output).
-  writeFileSync(`${cwd}/.env`, "API_KEY=some-real-value\n");
-  check("a project .env IS readable so dotenv / project commands work", runs(`cat ${cwd}/.env > /dev/null`));
-  // But a pure credential-token STORE (.npmrc) stays unreadable — a runaway command can't slurp a token.
-  writeFileSync(`${cwd}/.npmrc`, "//registry.npmjs.org/:_authToken=should-not-be-readable\n");
-  check("a project credential-token store (.npmrc) is still BLOCKED", !runs(`cat ${cwd}/.npmrc > /dev/null`));
-  process.env.VINCI_SECURITY_NONCE = "sandbox-integration-nonce";
-  const readGrant = grant(`cat ${cwd}/.npmrc > /dev/null`, ["read"]);
-  check("a signed one-command read grant exposes only that invocation", runs(readGrant));
-  check("the same signed read grant cannot be replayed", !runs(readGrant));
-  check("altering a signed read command invalidates its grant", !runs(`${grant(`cat ${cwd}/.npmrc > /dev/null`, ["read"])} && cat ${cwd}/.npmrc`));
-  const wrappedOffline = sbx.vinciSandboxWrap("printf local", cwd);
-  check(
-    "ordinary shell commands have external network disabled",
-    platform() === "darwin" ? wrappedOffline.includes("deny network") : wrappedOffline.includes("--unshare-net"),
-  );
-  const wrappedOnline = sbx.vinciSandboxWrap(grant("printf network-approved", ["network"]), cwd);
-  check("a signed one-command network grant removes the network deny", !wrappedOnline.includes(platform() === "darwin" ? "deny network" : "--unshare-net"));
-  check("a normal pipe/cd command still works", runs(`cd ${cwd} && echo one two three | wc -w > out.txt`));
-
-  // Local IPC must work (tsx's ESM loader, vitest workers, dev tools all open a local unix socket) while
-  // the internet stays blocked. A blanket network deny broke every such tool (EPERM on listen).
-  const sock = `${cwd}/ipc.sock`;
-  const sockCmd = `node -e 'const net=require("node:net");const s=net.createServer(c=>c.end()).listen(${JSON.stringify(sock)},()=>{s.close();process.exit(0)});s.on("error",()=>process.exit(1))'`;
-  check("a LOCAL unix-domain socket bind is allowed (tsx / vitest IPC works)", runs(sockCmd));
-  check(
-    "the seatbelt profile still denies remote network while allowing local IPC",
-    platform() !== "darwin" ||
-      (wrappedOffline.includes("deny network") && wrappedOffline.includes("local unix-socket")),
-  );
-
-  // review finding (HIGH): launching from $HOME (a non-programmer's default cwd) must NOT make the whole
-  // home tree writable — ~/.ssh, ~/.aws etc. stay read-only even then. Exercised against a FAKE $HOME so
-  // we never touch the real one.
-  check("'/' is never added as a writable root", !sbx.vinciWritableRoots("/").includes("/"));
-  {
-    const origHome = process.env.HOME;
-    const fakeHome = `${root}/fakehome`;
-    mkdirSync(`${fakeHome}/.ssh`, { recursive: true });
-    process.env.HOME = fakeHome;
-    try {
-      check("$HOME-as-cwd: home IS writable (real work isn't broken)", sbx.vinciWritableRoots(fakeHome).includes(realpathSync(fakeHome)));
-      check("$HOME-as-cwd: ~/.ssh is on the re-deny list", sbx.vinciSensitiveNoWrite(fakeHome).some((p) => p.endsWith("/.ssh")));
-      const runsIn = (cmd, wd) => { try { execSync(sbx.vinciSandboxWrap(cmd, wd), { cwd: wd, stdio: "pipe" }); return true; } catch { return false; } };
-      check("$HOME-as-cwd: a normal write in home is allowed", runsIn(`echo hi > ${fakeHome}/note.txt`, fakeHome));
-      check("$HOME-as-cwd: writing ~/.ssh/authorized_keys is STILL BLOCKED", !runsIn(`echo pwned >> ${fakeHome}/.ssh/authorized_keys`, fakeHome));
-    } finally {
-      if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
-    }
-  }
-
-  // Tool-config dirs (gcloud/aws/kube/docker) must be READABLE + WRITABLE so the CLI can run — locking
-  // them bricked the tool and forced a manual handoff (the customer's gcloud dead-end). Verified against
-  // a FAKE $HOME so the real ~/.config/gcloud is never touched.
-  {
-    const origHome = process.env.HOME;
-    const fakeHome = `${root}/toolhome`;
-    const proj = `${fakeHome}/proj`;
-    mkdirSync(`${fakeHome}/.config/gcloud`, { recursive: true });
-    mkdirSync(`${fakeHome}/.aws`, { recursive: true });
-    mkdirSync(`${fakeHome}/.ssh`, { recursive: true });
-    mkdirSync(proj, { recursive: true });
-    writeFileSync(`${fakeHome}/.aws/credentials`, "[default]\naws_secret_access_key=nope\n");
-    writeFileSync(`${fakeHome}/.ssh/id_rsa`, "PRIVATE\n");
-    process.env.HOME = fakeHome;
-    try {
-      const roots2 = sbx.vinciWritableRoots(proj);
-      check("tool dir ~/.config/gcloud is a writable root (gcloud can run)", roots2.includes(realpathSync(`${fakeHome}/.config/gcloud`)));
-      check("~/.aws/credentials stays on the re-deny list (integrity)", sbx.vinciSensitiveNoWrite(proj).some((p) => p.endsWith("/.aws/credentials")));
-      check("a whole tool dir is NOT blanket write-denied", !sbx.vinciSensitiveNoWrite(proj).some((p) => p.endsWith("/.config/gcloud")));
-      check("~/.config/gcloud is NOT read-denied (auth needs it)", !sbx.vinciSensitiveNoRead(proj).some((p) => p.endsWith("/.config/gcloud")));
-      check("~/.ssh IS still read-denied", sbx.vinciSensitiveNoRead(proj).some((p) => p.endsWith("/.ssh")));
-      const runsIn = (cmd, wd) => { try { execSync(sbx.vinciSandboxWrap(cmd, wd), { cwd: wd, stdio: "pipe" }); return true; } catch { return false; } };
-      check("writing inside ~/.config/gcloud is ALLOWED (the fix)", runsIn(`echo cfg > ${fakeHome}/.config/gcloud/active_config`, proj));
-      check("writing a NEW file in ~/.aws is allowed (cli caches work)", runsIn(`echo x > ${fakeHome}/.aws/cli-cache.json`, proj));
-      check("overwriting ~/.aws/credentials is STILL BLOCKED", !runsIn(`echo pwned > ${fakeHome}/.aws/credentials`, proj));
-      check("reading a private key in ~/.ssh is STILL BLOCKED", !runsIn(`cat ${fakeHome}/.ssh/id_rsa > /dev/null`, proj));
-    } finally {
-      if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
-    }
-  }
-
-  // Opt-out: VINCI_NO_SANDBOX=1 returns the command unwrapped (fail open).
-  process.env.VINCI_NO_SANDBOX = "1";
-  check("VINCI_NO_SANDBOX=1 disables the wrap", sbx.vinciSandboxWrap("echo x", cwd) === "echo x");
-  delete process.env.VINCI_NO_SANDBOX;
-  check("re-enabled: wrap is applied again", sbx.vinciSandboxWrap("echo x", cwd).includes(sandboxExecutable));
-} finally {
-  rmSync(root, { recursive: true, force: true });
-  rmSync(fakeSecret, { force: true });
+check("native backend starts an ordinary real bash tool command", text(await bash("printf sandbox-ready")) === "sandbox-ready");
+const roots = sbx.vinciWritableRoots(cwd);
+check("default roots contain the project without HOME, siblings, shared temp or Volumes", roots.includes(cwd) && !roots.includes(home) && !roots.includes(dirname(cwd)) && !roots.includes(process.env.TMPDIR) && !roots.includes("/Volumes"));
+check("HOME, Volumes, shared-temp and filesystem-root cwd need explicit scope", !sbx.vinciWritableRoots(home).includes(home) && !sbx.vinciWritableRoots("/").includes("/") && !sbx.vinciWritableRoots("/Volumes").includes("/Volumes") && !sbx.vinciWritableRoots(process.env.TMPDIR).includes(process.env.TMPDIR));
+await write.execute("local-write", { path: "nested/file.txt", content: "before\n" });
+await edit.execute("local-edit", { path: "nested/file.txt", edits: [{ oldText: "before", newText: "after" }] });
+check("real structured write/edit creates parents and preserves actual content", readFileSync(join(cwd, "nested/file.txt"), "utf8") === "after\n");
+for (const target of [join(sibling, "not-approved"), join(other, "not-approved")]) {
+  await assert.rejects(write.execute("outside-denied", { path: target, content: "inert" }), /scoped sandbox/);
+  check("unapproved structured sibling writes leave no bytes", !existsSync(target));
 }
-
-console.log(`\nsandbox-integration: ${pass}/${pass} checks passed (real ${platform() === "darwin" ? "sandbox-exec" : "bubblewrap"} write-confinement)`);
+sbx.vinciGrantWriteDirectory(cwd, sibling);
+await write.execute("approved-sibling", { path: join(sibling, "approved"), content: "approved bytes" });
+check("an explicit directory grant preserves cross-project structured writes", readFileSync(join(sibling, "approved"), "utf8") === "approved bytes");
+await assert.rejects(write.execute("other-still-denied", { path: join(other, "still-denied"), content: "inert" }), /scoped sandbox/);
+check("one directory grant does not grant another directory", !existsSync(join(other, "still-denied")));
+symlinkSync(other, join(cwd, "outside-link"));
+await assert.rejects(write.execute("symlink-denied", { path: "outside-link/link-file", content: "inert" }), /scoped sandbox/);
+check("native structured writes resolve a symlink at the real consumer", !existsSync(join(other, "link-file")));
+const startup = join(home, ".zshenv");
+writeFileSync(startup, "# inert startup fixture\n");
+sbx.vinciGrantWriteDirectory(cwd, home);
+if (process.platform === "darwin") {
+  await assert.rejects(write.execute("protected-startup", { path: startup, content: "inert replacement" }), /scoped sandbox/);
+  check("a broad explicit HOME grant leaves startup bytes protected", readFileSync(startup, "utf8") === "# inert startup fixture\n");
+  sbx.vinciGrantWriteFile(cwd, startup);
+  await write.execute("explicit-startup", { path: startup, content: "# deliberate fixture edit\n" });
+  check("an explicit exact-file grant preserves deliberate protected-file edits", readFileSync(startup, "utf8") === "# deliberate fixture edit\n");
+} else {
+  assert.throws(() => sbx.vinciSandboxWrap("printf local", cwd), /absent sensitive path/);
+  check("Linux fails closed for broad scope with absent protected paths", true);
+}
+sbx.vinciResetSandboxPermissions();
+await assert.rejects(write.execute("grant-reset", { path: join(sibling, "after-reset"), content: "inert" }), /scoped sandbox/);
+check("session reset revokes additional directory grants", !existsSync(join(sibling, "after-reset")));
+process.env.VINCI_SANDBOX_WRITE_ROOTS = JSON.stringify([sibling]);
+await write.execute("configured-root", { path: join(sibling, "configured"), content: "configured scope" });
+check("explicit launch configuration preserves directory workflow", readFileSync(join(sibling, "configured"), "utf8") === "configured scope");
+delete process.env.VINCI_SANDBOX_WRITE_ROOTS;
+const envResult = await bash(`node -e 'process.stdout.write(String(["VINCI_SECURITY_NONCE","VINCI_SANDBOX_WRITE_ROOTS","BASH_ENV","ENV","LD_PRELOAD"].every(k=>process.env[k]===undefined)&&process.env.USER_AUTHORIZED_API_KEY==="inert-credential-delivery"))'`, {
+  spawnHook: (context) => ({ ...context, env: { ...context.env, VINCI_SECURITY_NONCE: "inert-hook-value", VINCI_SANDBOX_WRITE_ROOTS: JSON.stringify([other]), BASH_ENV: join(home, "inert-hook"), ENV: join(home, "inert-hook"), LD_PRELOAD: "inert-hook", USER_AUTHORIZED_API_KEY: "inert-credential-delivery" } }),
+});
+check("the final real child strips controls while preserving trusted-hook credential delivery", text(envResult) === "true");
+if (existsSync("/bin/zsh")) check("a configured custom shell runs inside the native wrapper", text(await bash('printf "%s" "$0"', { shellPath: "/bin/zsh" })) === "/bin/zsh");
+check("ordinary pipes and local project reads still work", text(await bash("printf 'one two' | wc -w")).trim() === "2");
+mkdirSync(join(home, ".ssh"));
+writeFileSync(join(home, ".ssh", "fixture"), "inert credential fixture");
+const protectedProject = join(home, ".ssh", "fixture-project");
+mkdirSync(protectedProject);
+await assert.rejects(tools.createWriteToolDefinition(protectedProject).execute("protected-project", { path: "fixture", content: "inert" }));
+check("a workspace inside a protected store does not remove its independent protection", !existsSync(join(protectedProject, "fixture")) && sbx.vinciSensitiveNoWrite(protectedProject).includes(join(home, ".ssh")));
+const readCommand = `cat ${sq(join(home, ".ssh", "fixture"))} > /dev/null`;
+await assert.rejects(bash(readCommand));
+check("default locked-store read is denied", true);
+const approvedRead = grant(readCommand, ["read"]);
+await bash(approvedRead);
+check("an exact signed read grant still works with sanitized child env", true);
+await assert.rejects(bash(approvedRead));
+check("a consumed exact read grant cannot be replayed", true);
+const previousSessionGrant = grant(readCommand, ["read"]);
+sbx.vinciResetSandboxPermissions();
+await assert.rejects(bash(previousSessionGrant));
+check("resetting permissions invalidates previous-session signing material", true);
+sbx.vinciGrantWriteFile(cwd, join(home, ".ssh", "fixture"));
+await write.execute("deliberate-locked-file", { path: join(home, ".ssh", "fixture"), content: "deliberate fixture bytes" });
+check("the fixed structured writer preserves an exact locked-file edit", readFileSync(join(home, ".ssh", "fixture"), "utf8") === "deliberate fixture bytes");
+await assert.rejects(bash(readCommand));
+check("the fixed writer does not grant later arbitrary shell reads", true);
+sbx.vinciResetSandboxPermissions();
+const offline = sbx.vinciSandboxWrap("printf local", cwd);
+const online = sbx.vinciSandboxWrap(grant("printf local", ["network"]), cwd);
+const deny = process.platform === "darwin" ? "deny network" : "--unshare-net";
+check("signed one-command network scope survives child env sanitization", offline.includes(deny) && !online.includes(deny));
+check("a signed network invocation starts through the real sanitized Bash consumer", text(await bash(grant("printf network-scope-ready", ["network"]))) === "network-scope-ready");
+const cloud = join(home, ".config", "gcloud");
+mkdirSync(cloud, { recursive: true });
+for (const name of ["application_default_credentials.json", "credentials.db"]) writeFileSync(join(cloud, name), "inert configuration fixture");
+const cloudCommand = `printf 'operational fixture' > ${sq(join(cloud, "active_config"))}`;
+await assert.rejects(bash(cloudCommand));
+await bash(grant(cloudCommand, ["gcloud", "network"]));
+check("a signed cloud configuration scope preserves operational writes without a default root", readFileSync(join(cloud, "active_config"), "utf8") === "operational fixture" && !sbx.vinciWritableRoots(cwd).includes(cloud));
+console.log(`sandbox-integration: ${pass}/${pass} checks passed on ${process.platform}; Linux runtime evidence requires a Linux run.`);

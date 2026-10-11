@@ -335,6 +335,14 @@ export {
 } from "./core/vinci-grader.ts";
 // [vinci] display-only secret masking, exported so the vinci-render extension can mask expanded tool output.
 export { vinciMaskEnabled, vinciMaskSecrets } from "./core/vinci-mask-secrets.ts";
+export {
+	vinciGrantWriteDirectory,
+	vinciGrantWriteFile,
+	vinciResetSandboxPermissions,
+	vinciSandboxWriteGranted,
+	vinciSensitiveNoWrite,
+	vinciWritableRoots,
+} from "./core/vinci-sandbox.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 // Run modes for programmatic SDK usage

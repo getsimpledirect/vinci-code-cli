@@ -184,6 +184,12 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Build Vinci runtime without external catalog refresh
         run: bash vinci/build.sh
+      - name: Install Linux sandbox backend (Node 24)
+        if: matrix.node == '24'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y bubblewrap
+      - name: Qualify real Linux scoped sandbox (Node 24)
+        if: matrix.node == '24'
+        run: node vinci/test/sandbox-integration.mjs
       # Run all 47+ harness lanes so CI cannot drift from the local suite.
       # Node 22 (floor): SMOKE skipped (offline), type-stripping integrations skipped (Node 23+ only).
       # Node 24 (LTS): SMOKE skipped (offline), all type-stripping lanes execute (mask, sandbox, search,
