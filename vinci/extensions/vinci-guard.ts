@@ -11,6 +11,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   type ExtensionAPI,
   type ExtensionContext,
@@ -684,6 +685,25 @@ export function interpreterWriteTargets(command: string, depth = 0): string[] {
 /** Compatibility seam for existing extensions; safety decisions consume ALL targets below. */
 export function interpreterWriteTarget(command: string): string | null {
   return interpreterWriteTargets(command)[0] ?? null;
+}
+
+/** Match the core write/edit resolveToCwd input normalization before resolving symlink ancestors.
+ * Actual-tool regressions cover these forms so the gate follows the consumer, not a raw spelling. */
+function structuredWritePath(path: string, cwd: string): string | null {
+  const normalize = (input: string, toolInput: boolean): string => {
+    let normalized = toolInput ? input.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ") : input;
+    if (toolInput && normalized.startsWith("@")) normalized = normalized.slice(1);
+    if (normalized === "~") return homedir();
+    if (normalized.startsWith("~/") || process.platform === "win32" && normalized.startsWith("~\\")) {
+      return join(homedir(), normalized.slice(2));
+    }
+    return /^file:\/\//.test(normalized) ? fileURLToPath(normalized) : normalized;
+  };
+  try {
+    return resolve(normalize(cwd, false), normalize(path, true));
+  } catch {
+    return null;
+  }
 }
 
 /** Resolve existing symlink ancestors exactly as file creation does. Missing descendants can be
@@ -2172,8 +2192,8 @@ export default function (pi: ExtensionAPI) {
         return { block: true, reason: "Vinci blocked a false-green test command that performs no real verification." };
       }
 
-      const lexicalPath = resolve(ctx.cwd, path);
-      const abs = PLACEHOLDER_WRITE_PATH.test(lexicalPath) ? lexicalPath : consumerWritePath(path, ctx.cwd);
+      const lexicalPath = structuredWritePath(path, ctx.cwd);
+      const abs = lexicalPath === null ? null : PLACEHOLDER_WRITE_PATH.test(lexicalPath) ? lexicalPath : consumerWritePath(lexicalPath, ctx.cwd);
       const projectRoot = consumerWritePath(ctx.cwd, ctx.cwd);
       if (abs === null || projectRoot === null) {
         sendVinciControl(pi, "vinci-unresolved-write-block", "The file target could not be resolved through its existing filesystem ancestors. Inspect its parent directory and symlinks, then use a resolvable project path; do not bypass this refusal with a shell writer.");

@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createJiti } from "jiti/static";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -20,6 +20,7 @@ const loader = createJiti(import.meta.url, {
 const guard = await loader.import(resolve(here, "../extensions/vinci-guard.ts"), { default: false });
 const imageInput = await loader.import(resolve(here, "../extensions/lib/images.ts"), { default: false });
 const plan = await loader.import(resolve(here, "../extensions/vinci-plan.ts"), { default: false });
+const toolDefinitions = await loader.import(resolve(here, "../../packages/coding-agent/dist/index.js"), { default: false });
 
 const handlers = {};
 const controls = [];
@@ -167,6 +168,55 @@ try {
       assert.equal(result?.block, true, `a symlinked ${toolName} must request outside-project permission`);
     }
   }
+
+  // The actual structured tools normalize path input before filesystem access. Probe their real
+  // execute entrypoints so a raw-path gate cannot mistake @, file URLs, Unicode spaces or .. for
+  // harmless project-local names. HOME points only at this disposable fixture during the probe.
+  symlinkSync(workspace, join(adversarialProject, "space link"));
+  const structuredFailures = [];
+  const originalHome = process.env.HOME;
+  process.env.HOME = workspace;
+  try {
+    for (const toolName of ["write", "edit"]) {
+      const definition = toolName === "write"
+        ? toolDefinitions.createWriteToolDefinition(adversarialProject)
+        : toolDefinitions.createEditToolDefinition(adversarialProject);
+      for (const [label, inputPath, target] of [
+        ["at prefix", `@../${toolName}-at`, join(workspace, `${toolName}-at`)],
+        ["file URL", pathToFileURL(join(workspace, `${toolName}-url`)).href, join(workspace, `${toolName}-url`)],
+        ["Unicode space", `space\u00a0link/${toolName}-space`, join(workspace, `${toolName}-space`)],
+        ["home expansion", `~/${toolName}-home`, join(workspace, `${toolName}-home`)],
+      ]) {
+        if (toolName === "edit") writeFileSync(target, "old");
+        const input = toolName === "write"
+          ? { path: inputPath, content: "outside" }
+          : { path: inputPath, edits: [{ oldText: "old", newText: "outside" }] };
+        await definition.execute("guard-path-probe", input);
+        assert.equal(readFileSync(target, "utf8"), "outside", `${toolName} ${label}: actual tool effect missing`);
+        for (const handler of handlers.tool_call ?? []) {
+          const result = await handler({ toolName, input }, adversarialCtx);
+          if (result?.block !== true) structuredFailures.push(`${toolName} ${label}: guard allowed the actual outside target`);
+        }
+      }
+      const localPath = `escape/../${toolName}-normalized-local`;
+      const localTarget = join(adversarialProject, `${toolName}-normalized-local`);
+      if (toolName === "edit") writeFileSync(localTarget, "old");
+      const input = toolName === "write"
+        ? { path: localPath, content: "local" }
+        : { path: localPath, edits: [{ oldText: "old", newText: "local" }] };
+      await definition.execute("guard-path-positive-control", input);
+      assert.equal(readFileSync(localTarget, "utf8"), "local");
+      for (const handler of handlers.tool_call ?? []) {
+        const result = await handler({ toolName, input }, adversarialCtx);
+        if (result !== undefined) structuredFailures.push(`${toolName}: guard refused the normalized local positive control`);
+      }
+    }
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  }
+  assert.deepEqual(structuredFailures, [], `Structured consumer regressions failed:\n${structuredFailures.join("\n")}`);
+  check("real structured write/edit paths and guard resolution agree", true);
 
   const imagePath = join(workspace, "dragged screenshot.png");
   writeFileSync(
