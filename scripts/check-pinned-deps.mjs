@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { checkForgeBackport, forgeSourcePath } from "./check-forge-backport.mjs";
 
 const dependencySections = ["dependencies", "devDependencies", "optionalDependencies"];
 const exactVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
@@ -52,10 +53,21 @@ function getVersionSpecifier(specifier) {
 
 const failures = [];
 
+try {
+	checkForgeBackport();
+} catch (error) {
+	failures.push(`${error.message} Restore the reviewed Forge source package before retrying.`);
+}
+
 collectPackageJsonFiles(".");
 
 for (const file of packageJsonFiles.sort()) {
 	const packageJson = JSON.parse(readFileSync(file, "utf8"));
+	if (file === "package.json" || file === "packages/coding-agent/examples/extensions/gondolin/package.json") {
+		const expected = file === "package.json" ? `file:./${forgeSourcePath}` : "file:./vendor/node-forge";
+		const dependencies = file === "package.json" ? packageJson.devDependencies : packageJson.dependencies;
+		if (packageJson.overrides?.["node-forge"] !== "$node-forge" || dependencies?.["node-forge"] !== expected) failures.push(`${file}: the reviewed Forge dependency/override is missing; restore "${expected}" and its "$node-forge" reference before installing dependencies.`);
+	}
 
 	for (const section of dependencySections) {
 		const dependencies = packageJson[section];
@@ -75,9 +87,22 @@ for (const file of lockJsonFiles.sort()) {
 		failures.push(`${file}: the package graph is missing; regenerate the lockfile before checking advisory versions.`);
 		continue;
 	}
+	let forgeEntries = 0;
 	for (const [path, entry] of Object.entries(lock.packages)) {
 		const names = new Set([path.split("node_modules/").at(-1), entry.name]);
 		for (const name of names) {
+			if (name === "node-forge" && path.includes("node_modules/")) {
+				forgeEntries++;
+				const expectedPath = resolve(forgeSourcePath);
+				const source = typeof entry.resolved === "string" ? resolve(dirname(file), entry.resolved.replace(/^file:/, "")) : undefined;
+				const metadata = lock.packages[entry.resolved];
+				const linked = entry.link === true && metadata?.version === "1.4.0" && metadata?.engines?.node === ">= 6.13.0";
+				const packed = entry.link !== true && entry.resolved?.startsWith("file:") && entry.version === "1.4.0" && entry.engines?.node === ">= 6.13.0";
+				if (source !== expectedPath || (!linked && !packed)) {
+					failures.push(`${file}: ${path} does not resolve to the reviewed Forge source; regenerate its lock with the local backport override.`);
+				}
+				continue;
+			}
 			if (!Object.hasOwn(securityVersions, name)) continue;
 			const versions = securityVersions[name];
 			const actual = /^(\d+)\.(\d+)\.(\d+)$/.exec(entry.version ?? "")?.slice(1).map(Number);
@@ -91,6 +116,9 @@ for (const file of lockJsonFiles.sort()) {
 				failures.push(`${file}: ${path} has affected version "${entry.version}"; update to ${minimum} or newer in the reviewed major.`);
 			}
 		}
+	}
+	if ((file === "package-lock.json" || file === "packages/coding-agent/examples/extensions/gondolin/package-lock.json") && forgeEntries !== 1) {
+		failures.push(`${file}: the Gondolin graph must include exactly one reviewed Forge backport; regenerate and review the local override resolution.`);
 	}
 }
 
