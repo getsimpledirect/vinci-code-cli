@@ -21,6 +21,13 @@
 
 ### Fixed
 
+- Fixed Vinci guard classification gaps that let a destructive delete run with no confirmation when it was delivered through another tool's arguments: `find -delete`, `find -exec rm`, `xargs rm` (including `xargs sh -c '…rm…'`), and `shred` now land in the same confirm tiers `rm -rf` uses, with a root-targeted `find ~ … -delete` hard-blocked like `rm -rf ~`.
+- Fixed interpreter one-liners (`python3 -c "open(…,'w')"`, `node -e "fs.writeFile…"`, `ruby -e "File.open(…,'w')"` writing out of the project with no gate: an out-of-project or unresolvable write target is now blocked like `tee`/`echo` shell writes, while a literal in-project target keeps the ordinary in-project write behavior.
+- Fixed the system-settings confirm missing always-sourced or persistence rc files: `.zshenv`, `.zlogin`, `.bash_login`, `.gitconfig`, and `.inputrc` now join `.bashrc`/`.zshrc`/`.profile` in the startup-settings classification.
+- Fixed secret masking missing four high-confidence token shapes — Replicate `r8_…`, PyPI upload `pypi-…`, Google OAuth `ya29.…`, and Together `tgp_v1_…` — on both the display and model channels, including the `/feedback` transcript egress.
+- Fixed the pre-commit secret scanner silently dropping every single-backslash-escaped pattern from its derived detection set (the eyJ JWT, SendGrid, Firebase, and sentry-DSN shapes, and the new `ya29.` shape): the escape-pair parser matched two backslashes where the shapes carry one.
+- Fixed the fd/ripgrep first-run bootstrap fetching the "latest" release with no pin and no content check: each platform now pins the exact release asset with a SHA-256 digest verified before extraction or chmod, and a platform without a pin (or a digest that does not match) refuses the install.
+- Fixed the sandbox module header overstating its own invariant: the documented writable roots now match the enforced set (the project, `$HOME`, `/Volumes`, temp dirs, package caches, and CLI tool-config dirs, with credential stores re-denied last-match-wins).
 - Fixed Vinci accepting invalid or missing `--mode` values instead of rejecting them before provider startup.
 - Fixed Vinci's composer footer to reserve complete context metrics before fitting long project paths and ellipsize width-constrained project or model labels.
 - Fixed Vinci missing-credential guidance to use the selected provider's authentication route while preserving managed sign-in and plain Pi messages.
