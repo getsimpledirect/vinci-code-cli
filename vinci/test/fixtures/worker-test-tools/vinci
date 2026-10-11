@@ -2,9 +2,10 @@
 // Fake vinci for worker tests - records invocation and simulates behavior
 import { appendFileSync, existsSync, fstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
 
-const recordFile = process.env.FAKE_VINCI_RECORD || '/tmp/fake-vinci-invocations.txt';
+const recordFile = process.env.FAKE_VINCI_RECORD || resolve(tmpdir(), 'fake-vinci-invocations.txt');
 
 // #18: the fake launcher's "install" is `$HOME/fake-vinci-version.json` (HOME is the only thing
 // the daemon's minimal probe env lets through besides PATH/TMPDIR/LANG):
@@ -79,6 +80,7 @@ const sessionId = process.argv.indexOf('--session-id') >= 0 ? process.argv[proce
 const invocation = {
   argv: process.argv.slice(2),
   timestamp: new Date().toISOString(),
+  pid: process.pid,
   version: executedVersion,
   updateDisabled: process.env.VINCI_UPDATE_DISABLED ?? null,
 };
@@ -95,6 +97,8 @@ if (sessionDir && sessionId) {
   const failExit = process.env.FAKE_VINCI_EXIT !== undefined ? parseInt(process.env.FAKE_VINCI_EXIT, 10) : 0;
   const writeUsage = process.env.FAKE_VINCI_USAGE === '1';
 
+  const startupDelayMs = Number(process.env.FAKE_VINCI_STARTUP_DELAY_MS) || 0;
+  if (startupDelayMs > 0) await new Promise((resolveStartup) => setTimeout(resolveStartup, startupDelayMs));
 
   // By default, make a real commit (fixture for a successful run).
   // Use FAKE_VINCI_NO_COMMIT=1 to simulate a run with no commits (e.g. for #28 tests).
@@ -187,10 +191,30 @@ if (sessionDir && sessionId) {
 
   // Sleep if requested
   if (sleepMs > 0) {
+    if (process.env.FAKE_VINCI_DESCENDANT_READY_FILE) {
+      const readyFile = process.env.FAKE_VINCI_DESCENDANT_READY_FILE;
+      const descendant = spawn(process.execPath, ['--input-type=module', '-e', `
+        import { appendFileSync, writeFileSync } from 'node:fs';
+        process.on('SIGTERM', () => appendFileSync(${JSON.stringify(recordFile)}, 'DESCENDANT_SIGTERM\\n'));
+        writeFileSync(${JSON.stringify(readyFile)}, String(process.pid));
+        setInterval(() => {}, 1000);
+      `], { stdio: 'ignore' });
+      descendant.unref();
+      const deadline = Date.now() + 5000;
+      while (!existsSync(readyFile) || Number(readFileSync(readyFile, 'utf8')) !== descendant.pid) {
+        if (Date.now() >= deadline) throw new Error('The fixture descendant did not become ready within 5000 ms; inspect the child process.');
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+    }
     process.on("SIGTERM", () => {
       appendFileSync(recordFile, "SIGTERM\n");
-      process.exit(143);
+      if (process.env.FAKE_VINCI_IGNORE_SIGTERM !== '1') process.exit(143);
     });
+    if (process.env.FAKE_VINCI_PULSE_FILE) {
+      let pulse = 0;
+      setInterval(() => writeFileSync(process.env.FAKE_VINCI_PULSE_FILE, String(++pulse)), 50);
+    }
+    if (process.env.FAKE_VINCI_READY_FILE) writeFileSync(process.env.FAKE_VINCI_READY_FILE, `${process.pid}\n`);
     await new Promise((resolveSleep) => setTimeout(resolveSleep, sleepMs));
   }
 
@@ -205,4 +229,5 @@ if (sessionDir && sessionId) {
   }
 }
 
+if (process.env.FAKE_VINCI_RUN_EXIT_MARKER) writeFileSync(process.env.FAKE_VINCI_RUN_EXIT_MARKER, String(process.pid));
 process.exit(0);

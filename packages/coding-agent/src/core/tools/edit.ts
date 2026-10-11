@@ -6,6 +6,7 @@ import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import { vinciSandboxEnabled, vinciSandboxWriteFile } from "../vinci-sandbox.ts";
 import {
 	applyEditsToNormalizedContent,
 	computeEditsDiff,
@@ -350,7 +351,11 @@ export function createEditToolDefinition(
 				throwIfAborted();
 
 				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
-				await ops.writeFile(absolutePath, finalContent);
+				if (!options?.operations && vinciSandboxEnabled()) {
+					await vinciSandboxWriteFile(absolutePath, finalContent, cwd, false, signal);
+				} else {
+					await ops.writeFile(absolutePath, finalContent);
+				}
 				throwIfAborted();
 
 				const diffResult = generateDiffString(baseContent, newContent);

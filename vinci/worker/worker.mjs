@@ -130,6 +130,73 @@ async function postCapabilityDeclaration(bus, options, { throwOnFailure = false 
 // (`abandoned`) before the process exits. Entries are added right after acquire and removed by
 // the task's own release; the set is empty whenever no governed task is in flight.
 const activeLeases = new Set();
+const activeRuns = new Set();
+let stopping = false;
+
+function taskGroupExists(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function stopActiveRuns(signal) {
+  for (const entry of activeLeases) entry.heartbeat?.stop();
+  const configuredGrace = Number(process.env.VINCI_WORKER_LEASE_KILL_GRACE_MS);
+  const graceMs = Number.isFinite(configuredGrace) && configuredGrace > 0 && configuredGrace <= 2_147_483_647
+    ? configuredGrace : 10_000;
+  const boundMs = graceMs + 5000;
+  const results = await Promise.all([...activeRuns].map(async (entry) => {
+    let escalation;
+    let closeBound;
+    try {
+      process.stderr.write(`vinci worker: ${signal}: stopping task ${entry.taskId} before releasing its leases\n`);
+      entry.abortController.abort(`daemon_${signal.toLowerCase()}`);
+      if (Number.isInteger(entry.child?.pid) && entry.child.pid > 0) {
+        const pid = entry.child.pid;
+        let signalError = null;
+        // The leader may already have closed, removing runVinci's abort listener.
+        try {
+          process.kill(-pid, "SIGTERM");
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+        // runVinci clears its timer on leader close; this timer remains until the whole group stops.
+        escalation = setTimeout(() => {
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch (error) {
+            if (error.code !== "ESRCH") signalError = error;
+          }
+        }, graceMs);
+        const deadline = Date.now() + boundMs;
+        while (taskGroupExists(pid)) {
+          if (signalError) throw signalError;
+          if (Date.now() >= deadline) throw new Error(`task process group ${pid} remains present after ${boundMs} ms`);
+          await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+        }
+      }
+      await Promise.race([
+        entry.completed,
+        new Promise((_, reject) => {
+          closeBound = setTimeout(() => reject(new Error("task process pipes did not close within 5000 ms")), 5000);
+        }),
+      ]);
+      activeRuns.delete(entry);
+      return true;
+    } catch (error) {
+      process.stderr.write(`vinci worker: ${signal}: task ${entry.taskId} shutdown failed (${error.message}); leases were not released, so stop the remaining task process group before restarting and let its leases expire at TTL.\n`);
+      return false;
+    } finally {
+      clearTimeout(escalation);
+      clearTimeout(closeBound);
+    }
+  }));
+  return results.every(Boolean);
+}
 
 // The same promise for §36 branch leases, raised in adversarial review of #43:
 // activeLeases holds only Governor work-leases, so a SIGTERM left a branch
@@ -155,8 +222,7 @@ async function releaseActiveBranchLeases(signal) {
   }
 }
 
-// Bounded shutdown of every active lease: stop the heartbeat, wait for a renew in flight, release
-// `abandoned`, then SIGTERM the child so nothing keeps working under a released lease. The whole
+// After task groups stop, stop the heartbeat, wait for a renew in flight, and release `abandoned`. The whole
 // thing is capped at LEASE_TIMEOUT_MS per lease (the release post itself has the same cap) so a
 // hung Governor cannot keep the daemon alive after a stop request.
 async function releaseActiveLeases(signal) {
@@ -176,7 +242,6 @@ async function releaseActiveLeases(signal) {
     const result = await Promise.race([release, deadline]);
     clearTimeout(bound);
     if (result?.timeout) process.stderr.write(`vinci worker: ${signal}: lease ${entry.lease.lease_id} release did not complete within ${LEASE_TIMEOUT_MS} ms\n`);
-    entry.abortController?.abort(`daemon_${signal.toLowerCase()}`);
   }
 }
 
@@ -847,6 +912,7 @@ async function processHandoff(
   workerId,
   { fence: injectedFence = null, cleanRoom = null, allowedProviders = parseAllowedProviders(), subjectOf = leaseSubject } = {},
 ) {
+  if (stopping) return false;
   // Known before the run: clean-room publication cannot safely hold a Governor or branch fence
   // because its cache publisher does not enforce either fence.
   const branchLeaseEnabled =
@@ -1083,6 +1149,7 @@ async function processHandoff(
   let fencedOutReason = null;
   const abortController = new AbortController();
   let leaseEntry = null;
+  let runEntry = null;
   // §36 branch lease. Declared HERE, above releaseLease, because releaseLease
   // runs on paths that precede acquisition (the clone-time BLOCKED exits) and a
   // `let` declared later would be in its temporal dead zone -- a ReferenceError
@@ -1109,20 +1176,27 @@ async function processHandoff(
   // not to enable it by surprise under everyone already running.
   const branchLeases = branchLeaseEnabled ? new BranchLeaseClient(bus.serverUrl, bus.token) : null;
   const releaseLease = async (state) => {
+    if (stopping) return;
     // The branch lease is released even when there is no work lease: the two are
     // independent, and an ungoverned worker still holds a branch.
     await releaseBranchLease();
-    if (!lease || !leaseClient) return;
-    if (leaseEntry) activeLeases.delete(leaseEntry);
+    if (stopping) return;
+    if (!lease || !leaseClient) {
+      if (runEntry) activeRuns.delete(runEntry);
+      return;
+    }
     // F5: stop the heartbeat AND wait for a renew already in flight, so the Governor never sees
     // a renew arrive after the release for the same generation.
     if (heartbeat) {
       heartbeat.stop();
       await heartbeat.settled();
     }
+    if (stopping) return;
+    if (leaseEntry) activeLeases.delete(leaseEntry);
     const held = lease;
     lease = null;
     await leaseClient.release(held, releaseOutcome(state, { authorityLost: Boolean(authorityLost || fencedOutReason) }));
+    if (runEntry && !stopping) activeRuns.delete(runEntry);
   };
   // Released on EVERY terminal, by riding the work-lease release, which already
   // covers the success path (933) and both failure paths (939, 943) as well as
@@ -1131,6 +1205,7 @@ async function processHandoff(
   // stall, not a leak -- and it must never be able to fail the attempt it is
   // cleaning up after, hence the swallow. It is recorded, not silent.
   const releaseBranchLease = async () => {
+    if (stopping) return;
     if (!branchLeases || !branchLease) return;
     const held = branchLease;
     branchLease = null;
@@ -1168,7 +1243,9 @@ async function processHandoff(
       return lease?.fencing_generation ?? null;
     },
     check: async ({ stage } = {}) => {
-      const verdict = !lease || !leaseClient
+      const verdict = stopping
+        ? { valid: false, reason: "daemon_stopping" }
+        : !lease || !leaseClient
         ? { valid: false, reason: "no lease held" }
         : authorityLost
           ? { valid: false, reason: authorityLost }
@@ -1177,6 +1254,7 @@ async function processHandoff(
       return verdict;
     },
   };
+  const shutdownFence = { check: async () => ({ valid: !stopping, reason: stopping ? "daemon_stopping" : "running" }) };
 
   try {
     // Stage 2: Governor lease (if configured). FAIL-CLOSED (W0.1): with a Governor URL set,
@@ -1316,6 +1394,7 @@ async function processHandoff(
           contractFields ? contractFields.execution_spec_digest : undefined,
         );
     if (repository.debrisReceipt) lifecycle.record({ debris_receipt: repository.debrisReceipt });
+    if (stopping) return false;
     lifecycle.record({
       ...(attempt.firstAttempt ? { base_commit: repository.baseCommit ?? null } : {}),
       ...(cleanRoom
@@ -1392,8 +1471,11 @@ async function processHandoff(
       mkdirSync(providerAgentDir, { recursive: true, mode: 0o700 });
       seedProviderDefinitions(providerAgentDir, envelopeToUse.provider, envelopeToUse.model);
     }
+    if (stopping) return false;
     lifecycle.transition("RUNNING");
-    const run = await runVinci({ envelope: envelopeToUse,
+    runEntry = lease || branchLease ? { taskId, abortController, child: null, completed: null } : null;
+    if (runEntry) activeRuns.add(runEntry);
+    const runPromise = runVinci({ envelope: envelopeToUse,
       stateDir,
       taskId, repoDir: repository.repoDir, sessionId: attempt.sessionId,
       // The provider boundary applies on BOTH paths now. It used to be `: undefined` here --
@@ -1401,8 +1483,12 @@ async function processHandoff(
       // clean-room mode, which is itself refused under a Governor.
       env: childEnv({ cleanRoom, provider: envelopeToUse.provider, homeDir: repository.homeDir, tmpDir: repository.tmpDir, agentDir: providerAgentDir }),
       envDelta: unattendedPolicy,
-      ...(lease ? { abortSignal: abortController.signal } : {}) });
+      ...(runEntry ? { abortSignal: abortController.signal, onSpawn: (child) => { runEntry.child = child; } } : {}) });
+    if (runEntry) runEntry.completed = runPromise;
+    const run = await runPromise;
+    if (stopping) return false;
     const head = await readHead(repository.repoDir);
+    if (stopping) return false;
     if (lease) lifecycle.record({ lease: { ...lifecycle.snapshot().lease, ...lease } });
     lifecycle.record({ ...run, head, outcome: run.outcome ?? null });
     // Loss of authority means no publication. Otherwise compute PR eligibility before opening a
@@ -1432,7 +1518,7 @@ async function processHandoff(
             ...repository,
             taskId,
             attempt: attempt.attempt,
-            fence: composeFences(lease ? fence : null, branchFence),
+            fence: composeFences(lease ? fence : null, branchFence, runEntry ? shutdownFence : null),
             prEligible,
             objective,
             outcome: prEligible ? "COMPLETED" : null,
@@ -1440,6 +1526,7 @@ async function processHandoff(
             baseRef: contractFields?.base_ref ?? envelopeToUse.base_ref,
             baseCommit: contractFields?.base_commit ?? lifecycle.snapshot().base_commit,
           });
+    if (stopping) return false;
     const { patch, artifacts, ...published } = publication;
     if (Array.isArray(artifacts)) published.artifacts = artifacts;
     const extraFiles = {};
@@ -1506,6 +1593,7 @@ async function processHandoff(
       "diff",
       contractFields?.base_commit ? `${contractFields.base_commit}...HEAD` : "origin/main...HEAD",
     ], { allowFailure: true });
+    if (stopping) return false;
     const gitDiff = gitDiffResult.status === 0 ? gitDiffResult.stdout : null;
     // The attempt is over and its diff is captured: seal the tree (evidence, read-only). Retention
     // runs AFTER the evidence upload below, because only an uploaded attempt is prunable (F6).
@@ -1577,10 +1665,11 @@ async function processHandoff(
       busUrl: bus.serverUrl,
       busToken: bus.token,
       ref: envelopeToUse.ref,
-      fence: lease ? fence : null,
+      fence: composeFences(lease ? fence : null, runEntry ? shutdownFence : null),
       economics: { summary: economicsSummary, sha256: economicsSha },
       extraFiles,
     });
+    if (stopping) return false;
 
     // Wave 1B L3 (F1): the evidence POST is the third fence. `valid: false` there is the same
     // loss of authority as at the push or the PR: the task is BLOCKED `fenced_out:<reason>`, the
@@ -1602,6 +1691,7 @@ async function processHandoff(
         markEvidenceUploaded({ stateDir, repo: envelopeToUse.repo, taskId, attempt: attempt.attempt, uri: evidenceResult.uri, sha256: evidenceResult.sha256 });
       }
       await pruneAttempts({ stateDir, repo: envelopeToUse.repo, taskId, keep: cleanRoom.keepAttempts, protect: attempt.attempt });
+      if (stopping) return false;
     }
     const state = evidenceFencedOut ? "BLOCKED" : evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
     lifecycle.transition(state, {
@@ -1615,12 +1705,15 @@ async function processHandoff(
     // L4: release with the committed state's outcome, BEFORE the final post so the lease is not
     // held across a bus retry. A release failure is logged; the state above is already final.
     await releaseLease(state);
+    if (stopping) return false;
     await postFinal(bus, message, envelopeToUse, lifecycle.snapshot(), evidenceResult, { summary: economicsSummary, sha256: economicsSha });
   } catch (error) {
+    if (stopping) return false;
     // A terminal state is immutable: if the failure happened after it was committed (e.g. the
     // final bus post), surface the error to the daemon loop instead of rewriting the record.
     if (lifecycle.isTerminal()) {
       await releaseLease(lifecycle.snapshot().state);
+      if (stopping) return false;
       throw error;
     }
     // B4: a base-checkout validation failure (missing origin base ref, or base_commit not
@@ -1628,7 +1721,9 @@ async function processHandoff(
     if (typeof error?.blockedReason === "string") {
       lifecycle.transition("BLOCKED", { outcome: { reason: error.message } });
       await releaseLease("BLOCKED");
+      if (stopping) return false;
       const econCheckout = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
+      if (stopping) return false;
       await bus.postTerminal("status", `task ${taskId} blocked`, blockerPostBody(lifecycle.snapshot(), `state=BLOCKED reason=${error.message}`), {
         inReplyTo: message.message_id,
         outcome: "BLOCKED",
@@ -1637,8 +1732,10 @@ async function processHandoff(
     }
     lifecycle.transition("FAILED", { outcome: { reason: error.message }, exit_code: 1 });
     await releaseLease("FAILED");
+    if (stopping) return false;
     // A session may already have run and spent here (exception after runVinci): read it.
     const econFailed = await emitEconomics({ taskId, attempt: lifecycle.snapshot().attempt ?? 0, stateDir, envelopeToUse: envelope, lease: lease ?? null, lifecycle, contractFields, sessionId: lifecycle.snapshot().session_id ?? null });
+    if (stopping) return false;
     await postFinal(bus, message, envelope, lifecycle.snapshot(), null, econFailed);
   }
   return true;
@@ -1666,21 +1763,30 @@ async function main() {
     process.stderr.write(`vinci worker: clean room on (disk floor ${options.diskFloorMb} MiB${options.diskFloorMb === 0 ? ", disabled" : ""}, keep ${options.keepAttempts} attempts)\n`);
   }
   const releaseLock = acquireDaemonLock(options.stateDir, options.id);
-  // F7: a stop request with a lease in flight releases it (`abandoned`, bounded by
-  // LEASE_TIMEOUT_MS) and SIGTERMs the child before the daemon exits; the task record stays
+  // F7: a stop request stops the task group before releasing its work/branch leases (`abandoned`,
+  // bounded by LEASE_TIMEOUT_MS). The task record stays
   // RUNNING and is resumed as the next attempt by the next daemon start. Without an active
   // lease this is the plain exit it always was.
-  let stopping = false;
   // D1 refresh timer (governed daemons only); cleared on exit.
   let declarationTimer = null;
   const handleSignal = (signal) => {
     if (stopping) return;
     stopping = true;
-    Promise.all([releaseActiveLeases(signal), releaseActiveBranchLeases(signal)])
-      .catch((error) => process.stderr.write(`vinci worker: ${signal}: lease release failed: ${error.message}\n`))
+    let exitCode = 0;
+    (async () => {
+      if (!(await stopActiveRuns(signal))) {
+        exitCode = 1;
+        return;
+      }
+      await Promise.all([releaseActiveLeases(signal), releaseActiveBranchLeases(signal)]);
+    })()
+      .catch((error) => {
+        exitCode = 1;
+        process.stderr.write(`vinci worker: ${signal}: shutdown failed (${error.message}); inspect remaining task groups and lease status before restarting.\n`);
+      })
       .finally(() => {
         releaseLock();
-        process.exit(0);
+        process.exit(exitCode);
       });
   };
   process.once("SIGTERM", handleSignal);
@@ -1767,18 +1873,23 @@ async function main() {
       let cursor = loadCursor(options.stateDir, options.id);
       const messages = await bus.poll(options.id, cursor);
       for (const message of messages) {
+        if (stopping) break;
         const cleanRoom = options.cleanRoom ? { diskFloorMb: options.diskFloorMb, keepAttempts: options.keepAttempts } : null;
-        if (!(await processHandoff(bus, options.stateDir, message, options.governor, options.id, { cleanRoom, allowedProviders: options.allowedProviders }))) continue;
+        const processed = await processHandoff(bus, options.stateDir, message, options.governor, options.id, { cleanRoom, allowedProviders: options.allowedProviders });
+        if (stopping) break;
+        if (!processed) continue;
         cursor = advanceCursor(cursor, message);
         saveCursor(options.stateDir, options.id, cursor);
       }
-      if (!options.once) await new Promise((resolveWait) => setTimeout(resolveWait, options.pollSeconds * 1000));
-    } while (!options.once);
+      if (!stopping && !options.once) await new Promise((resolveWait) => setTimeout(resolveWait, options.pollSeconds * 1000));
+    } while (!stopping && !options.once);
   } finally {
     if (declarationTimer) clearInterval(declarationTimer);
-    process.off("SIGTERM", handleSignal);
-    process.off("SIGINT", handleSignal);
-    releaseLock();
+    if (!stopping) {
+      process.off("SIGTERM", handleSignal);
+      process.off("SIGINT", handleSignal);
+      releaseLock();
+    }
   }
 }
 

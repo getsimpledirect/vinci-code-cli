@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const launcher = join(root, "vinci/bin/vinci");
 const providerExtension = join(root, "vinci/test/fixtures/checkpoint-faux-provider.ts");
 const pauseExtension = join(root, "vinci/test/fixtures/checkpoint-pause.ts");
+const children = new Set();
 
 function waitForExit(child, timeoutMs) {
   return new Promise((resolveExit, reject) => {
@@ -47,13 +48,17 @@ function startVinci(cwd, outputPath, args, env) {
     env: { ...process.env, ...env },
     stdio: ["ignore", outputFd, outputFd],
   });
-  child.once("exit", () => closeSync(outputFd));
+  children.add(child);
+  child.once("exit", () => { closeSync(outputFd); children.delete(child); });
   return child;
 }
 
 const temp = mkdtempSync(join(tmpdir(), "vinci-checkpoint-process-"));
 try {
   const home = join(temp, "home");
+  const project = join(temp, "project");
+  mkdirSync(home);
+  mkdirSync(project);
   const sessions = join(temp, "sessions");
   const marker = join(temp, "kill-window.marker");
   const firstLog = join(temp, "first.log");
@@ -70,7 +75,7 @@ try {
   };
 
   const first = startVinci(
-    temp,
+    project,
     firstLog,
     [
       "--session-dir",
@@ -90,7 +95,7 @@ try {
   );
   const firstExit = waitForExit(first, 15_000);
   await waitForFile(marker, first, 10_000, firstLog);
-  const target = join(temp, "interrupted.txt");
+  const target = join(project, "interrupted.txt");
   assert.equal(readFileSync(target, "utf8"), "written once before process death\n");
   const beforeResume = statSync(target, { bigint: true }).mtimeNs;
   first.kill("SIGKILL");
@@ -121,7 +126,7 @@ try {
   );
 
   const resume = startVinci(
-    temp,
+    project,
     resumeLog,
     [
       "resume",
@@ -162,6 +167,9 @@ try {
   );
   assert.match(readFileSync(resumeLog, "utf8"), /Resume completed without replaying the write/);
 } finally {
+  const running = [...children].filter((child) => child.exitCode === null && child.signalCode === null);
+  for (const child of running) child.kill("SIGKILL");
+  await Promise.all(running.map((child) => waitForExit(child, 2_000)));
   rmSync(temp, { recursive: true, force: true });
 }
 

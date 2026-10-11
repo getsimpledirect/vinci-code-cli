@@ -267,6 +267,26 @@ Shell network access and credential reads require approval for one exact invocat
 `/security` to inspect the active controls. `VINCI_NO_SANDBOX=1` is a developer bypass and weakens
 these guarantees.
 
+Local Bash, write and edit operations use an OS sandbox. Its default writable scope is the project,
+narrow build caches and private temporary space; HOME, sibling projects and `/Volumes` are not
+implicit grants. Cross-project edits ask for one specific directory. `/allow-directory <path>` grants
+that directory for the session; `/allow-file <path>` permits one deliberate file edit, including a
+protected startup or credential file. `/deny-writes` clears additional session grants, and a new
+session also clears them. Running commands retain the permissions they started with. Launchers can
+set `VINCI_SANDBOX_WRITE_ROOTS` or `VINCI_SANDBOX_WRITE_FILES` to JSON arrays of explicit absolute
+paths; these configured grants survive the session reset. The filesystem root cannot be granted.
+
+Directory grants leave startup and credential files independently protected. Cloud commands can
+receive operational configuration/cache writes as part of their exact invocation approval. On Linux,
+Bubblewrap refuses a broad directory grant if it contains an absent protected path, and an exact
+file grant requires an existing file. Choose a narrower directory or prepare that file yourself.
+Read-locked credential files also require a read grant for a Linux shell to access them. These limits
+are enforced rather than silently widening the scope. Custom shell startup runs inside the native
+wrapper; ambient shell hooks and grant-signing material are removed from local child environments.
+Trusted extensions and explicitly supplied custom operations remain privileged code. The shell
+classifier is a heuristic, and local IPC/loopback access can reach services that relay traffic; the
+network policy is not a complete exfiltration boundary.
+
 ## Test it
 
 ```bash

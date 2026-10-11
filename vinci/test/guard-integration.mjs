@@ -23,20 +23,24 @@ const plan = await loader.import(resolve(here, "../extensions/vinci-plan.ts"), {
 const toolDefinitions = await loader.import(resolve(here, "../../packages/coding-agent/dist/index.js"), { default: false });
 
 const handlers = {};
+const commands = {};
 const controls = [];
 const pi = {
   on(name, handler) {
     (handlers[name] ??= []).push(handler);
   },
-  registerCommand() {},
+  registerCommand(name, command) { commands[name] = command; },
   sendMessage(message, options) {
     controls.push({ message, options });
   },
 };
 guard.default(pi);
 
-const workspace = mkdtempSync(join(tmpdir(), "vinci-guard-it-"));
-const vinciHome = mkdtempSync(join(tmpdir(), "vinci-home-it-"));
+const runRoot = mkdtempSync(join(tmpdir(), "vinci-guard-it-"));
+const workspace = join(runRoot, "project");
+const vinciHome = join(runRoot, "vinci-home");
+mkdirSync(workspace);
+mkdirSync(vinciHome);
 const originalVinciHome = process.env.VINCI_HOME;
 const selections = [];
 const notifications = [];
@@ -690,7 +694,8 @@ try {
   // A DIRECT cloud deploy asks once (never silent), then runs with a signed one-command grant.
   nextSelection = "Yes, allow it";
   const directDeploy = { command: "gcloud run deploy app --region us-central1" };
-  check("a direct cloud deploy asks once, then runs with a signed grant", await toolCall("bash", directDeploy) === undefined && /^# vinci-security-grant:[a-f0-9]{32}:network:/.test(directDeploy.command));
+  check("a direct cloud deploy asks once, then runs with a signed configuration/network grant", await toolCall("bash", directDeploy) === undefined && /^# vinci-security-grant:[a-f0-9]{32}:gcloud,network:/.test(directDeploy.command));
+  check("the cloud approval names operational configuration/cache writes", /operational gcloud configuration and caches/.test(selections.at(-1).title));
   nextSelection = "No, don't";
   check("declining the cloud deploy blocks it", (await toolCall("bash", { command: "gcloud run deploy app" }))?.block === true);
 
@@ -1049,6 +1054,34 @@ try {
   const realOutside = await toolCall("write", { path: "/tmp/vinci-real-outside-xyz.txt", content: "x" });
   check("a real outside-project path still asks for confirmation", realOutside?.block === true && /outside the project|declined changes outside/i.test(realOutside.reason));
 
+  const grantedDirectory = join(runRoot, "approved-project");
+  const otherDirectory = join(runRoot, "other-project");
+  mkdirSync(grantedDirectory);
+  mkdirSync(otherDirectory);
+  nextSelection = ["Yes, allow it", "Yes, allow it"];
+  check("outside-project approval grants the selected directory", await toolCall("write", { path: join(grantedDirectory, "one.txt"), content: "ordinary" }) === undefined && toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(grantedDirectory, "one.txt")));
+  const scopedPromptCount = selections.length;
+  nextSelection = "Yes, allow it";
+  check("another file in that approved directory needs no repeated scope prompt", await toolCall("write", { path: join(grantedDirectory, "two.txt"), content: "ordinary" }) === undefined && selections.slice(scopedPromptCount).every((entry) => /sensitive change/i.test(entry.title)));
+  // A normal path needs no extra sensitive prompt, so it may leave the preceding Yes unconsumed.
+  nextSelection = "No, don't";
+  const otherWrite = await toolCall("write", { path: join(otherDirectory, "one.txt"), content: "ordinary" });
+  check("a different outside directory still requires approval", otherWrite?.block === true && /declined changes outside/.test(otherWrite.reason));
+  check("declining another directory creates no write grant", !toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(otherDirectory, "one.txt")));
+  for (const handler of handlers.session_start) await handler({}, ctx);
+  check("starting a new session clears directory permission", (await toolCall("write", { path: join(grantedDirectory, "three.txt"), content: "ordinary" }))?.block === true);
+  nextSelection = "Yes, allow it";
+  await commands["allow-directory"].handler(grantedDirectory, ctx);
+  check("the explicit directory command preserves cross-project workflow", toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(grantedDirectory, "four.txt")));
+  await commands["deny-writes"].handler("", ctx);
+  await commands["allow-directory"].handler(otherDirectory, ctx);
+  check("declining a directory command logs its refusal and creates no grant", notifications.some((entry) => /write scope was declined/.test(entry.message)) && !toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(otherDirectory, "declined.txt")));
+  check("the user can revoke added directory grants", !toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(grantedDirectory, "four.txt")));
+  nextSelection = "Yes, allow it";
+  await commands["allow-file"].handler(join(otherDirectory, "one.txt"), ctx);
+  check("an exact-file grant does not include adjacent files", toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(otherDirectory, "one.txt")) && !toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(otherDirectory, "two.txt")));
+  await commands["deny-writes"].handler("", ctx);
+
   // ── Headless (no-UI) blocks: EVERY confirmation-shaped block must record the gate ─────────────
   // (found live 2026-07-15: a bare "no UI to confirm" reason drove workaround attempts and a
   // misleading generic BLOCKED; only the CONSEQUENTIAL site was fixed at first — these pin the rest).
@@ -1063,6 +1096,10 @@ try {
     return undefined;
   }
   const gates = () => control.getVinciConfirmationGates();
+
+  control.clearVinciConfirmationGate();
+  await commands["allow-directory"].handler(otherDirectory, headlessCtx);
+  check("an unavailable write-scope confirmation records a gate and creates no grant", gates().length === 1 && !toolDefinitions.vinciSandboxWriteGranted(ctx.cwd, join(otherDirectory, "headless.txt")));
 
   const netPush = await headlessCall("bash", { command: "git push origin main" });
   check("headless git push blocks with the gate recorded", netPush?.block === true && gates().length === 1);
@@ -1160,8 +1197,7 @@ try {
 } finally {
   if (originalVinciHome === undefined) delete process.env.VINCI_HOME;
   else process.env.VINCI_HOME = originalVinciHome;
-  rmSync(workspace, { recursive: true, force: true });
-  rmSync(vinciHome, { recursive: true, force: true });
+  rmSync(runRoot, { recursive: true, force: true });
 }
 
 console.log(`\nguard-integration: ${pass}/${pass} checks passed (real command, credential, and checkpoint guards)`);

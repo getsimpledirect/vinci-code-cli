@@ -7,6 +7,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts"
 import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { vinciMaskEnabled, vinciMaskSecrets } from "../vinci-mask-secrets.ts";
+import { vinciSandboxEnabled, vinciSandboxWriteFile } from "../vinci-sandbox.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "./render-utils.ts";
@@ -218,12 +219,14 @@ export function createWriteToolDefinition(
 				};
 
 				throwIfAborted();
-				// Create parent directories if needed.
-				await ops.mkdir(dir);
-				throwIfAborted();
-
-				// Write the file contents.
-				await ops.writeFile(absolutePath, content);
+				if (!options?.operations && vinciSandboxEnabled()) {
+					await vinciSandboxWriteFile(absolutePath, content, cwd, true, signal);
+				} else {
+					// Custom operations are trusted extension code, including remote filesystems.
+					await ops.mkdir(dir);
+					throwIfAborted();
+					await ops.writeFile(absolutePath, content);
+				}
 				throwIfAborted();
 
 				return {

@@ -18,7 +18,7 @@ import {
 } from "../../utils/shell.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { vinciMaskEnabled, vinciMaskSecrets } from "../vinci-mask-secrets.ts";
-import { vinciSandboxWrap } from "../vinci-sandbox.ts";
+import { vinciSandboxChildEnv, vinciSandboxEnabled, vinciSandboxWrap } from "../vinci-sandbox.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -89,7 +89,13 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 			if (signal?.aborted) {
 				throw new Error("aborted");
 			}
-			const shellConfig = getShellConfig(options?.shellPath);
+			// The wrapper must start without ambient shell startup hooks. User command setup belongs
+			// inside commandPrefix/spawnHook, where the native policy applies before it executes.
+			const shellConfig = getShellConfig(vinciSandboxEnabled() ? undefined : options?.shellPath);
+			const shellArgs =
+				vinciSandboxEnabled() && /(?:^|\/)bash$/.test(shellConfig.shell)
+					? ["--noprofile", "--norc", "-p", ...shellConfig.args]
+					: shellConfig.args;
 			try {
 				await fsAccess(cwd, constants.F_OK);
 			} catch {
@@ -97,10 +103,10 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 			}
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
-			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
+			const child = spawn(shellConfig.shell, commandFromStdin ? shellArgs : [...shellArgs, command], {
 				cwd,
 				detached: process.platform !== "win32",
-				env: env ?? getShellEnv(),
+				env: vinciSandboxChildEnv(env ?? getShellEnv(), env === undefined),
 				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
 				windowsHide: true,
 			});
@@ -158,26 +164,23 @@ export interface BashSpawnContext {
 
 export type BashSpawnHook = (context: BashSpawnContext) => BashSpawnContext;
 
-function resolveSpawnContext(command: string, cwd: string, spawnHook?: BashSpawnHook): BashSpawnContext {
-	const shellEnv = { ...getShellEnv() };
-	if (process.env.VINCI_CODE === "1") {
-		for (const key of Object.keys(shellEnv)) {
-			if (
-				/(?:^|_)(?:API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_?KEY|ACCESS_?KEY|CLIENT_?SECRET|AUTH)(?:$|_)/i.test(
-					key,
-				) ||
-				key === "VINCI_SECURITY_NONCE"
-			) {
-				delete shellEnv[key];
-			}
-		}
-	}
+function resolveSpawnContext(
+	command: string,
+	cwd: string,
+	spawnHook?: BashSpawnHook,
+	shellPath?: string,
+): BashSpawnContext {
+	const shellEnv = vinciSandboxChildEnv(getShellEnv());
 	const baseContext: BashSpawnContext = { command, cwd, env: shellEnv };
 	const hooked = spawnHook ? spawnHook(baseContext) : baseContext;
 	// VINCI_CODE: confine the command's filesystem writes to the workspace via an OS sandbox — an
 	// enforcement layer independent of the attention-dependent permission guards. Applied AFTER any
-	// spawnHook (so command prefixes are inside the sandbox too). No-op when disabled/unavailable.
-	return { ...hooked, command: vinciSandboxWrap(hooked.command, hooked.cwd) };
+	// spawnHook (so command prefixes are inside the sandbox too). Missing backends fail closed.
+	// Grant validation reads the parent environment; no signing material reaches the local child.
+	const wrapped = vinciSandboxWrap(hooked.command, hooked.cwd, shellPath);
+	// Trusted extensions may deliberately deliver credentials through spawnHook. Preserve those,
+	// while always stripping startup hooks and grant controls even when a hook reintroduces them.
+	return { ...hooked, command: wrapped, env: vinciSandboxChildEnv(hooked.env, false) };
 }
 
 export interface BashToolOptions {
@@ -332,7 +335,12 @@ export function createBashToolDefinition(
 			_ctx?,
 		) {
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
-			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
+			const spawnContext = resolveSpawnContext(
+				resolvedCommand,
+				cwd,
+				spawnHook,
+				options?.operations ? undefined : options?.shellPath,
+			);
 			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
