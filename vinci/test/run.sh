@@ -254,6 +254,10 @@ run_group byok-guards-integration env VINCI_CODE=1 node "${ROOT}/vinci/test/byok
 # Public docs must not teach an obsolete opt-in, link a repo readers cannot open, or pin a version.
 # Each of those actually shipped during the open-sourcing work and was caught by eye, not by a gate.
 run_group docs-accuracy-integration node "${ROOT}/vinci/test/docs-accuracy-integration.mjs"
+# Pre-commit secret scanner: its pattern set is DERIVED from vinci-mask-secrets.ts TOKEN_PATTERNS,
+# so its coverage is pinned here per shape — the scanner itself only ever sees staged content, and
+# a pattern that never ran anywhere was exactly the inert-guard failure run.sh exists to prevent.
+run_group check-secrets-patterns node --test "${ROOT}/scripts/check-secrets.test.mjs"
 run_group install-guard-integration node "${ROOT}/vinci/test/install-guard-integration.mjs"
 run_group priority-integration node "${ROOT}/vinci/test/priority-integration.mjs"
 run_group update-integration node "${ROOT}/vinci/test/update-integration.mjs"

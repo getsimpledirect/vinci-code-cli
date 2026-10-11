@@ -50,8 +50,17 @@ export function loadTokenPatterns() {
 	// Parse each array entry (a single-line regex literal: /PATTERN/FLAGS,
 	// e.g. /sk-ant-[A-Za-z0-9_-]{20,}/g) per line so escaped characters and
 	// trailing commas cannot bleed into the flags of the next pattern. The body
-	// group allows any backslash escape (`\\/`, `\\.`, `\\d`, ...).
-	const literal = /^\/((?:\\\\.|[^\\\\/])*)\/([a-z]*),?$/;
+	// group allows any backslash escape (`\/`, `\.`, `\d`, ...): a backslash is
+	// consumed together with the character it escapes, so an escaped `/` never
+	// ends the body early and an escaped `.` is not left dangling.
+	//
+	// The escape pair used to require TWO backslashes (`\\\\.`), so every
+	// single-escape pattern in TOKEN_PATTERNS — the eyJ JWT, SendGrid `SG\.`,
+	// Firebase `1\/\/0`, sentry-DSN and (2026-10-11) `ya29\.` shapes — was
+	// silently DROPPED from the derived set and the scanner never saw it,
+	// while the comment above claimed the opposite. Found because the ya29.
+	// fixture refused to be caught; fixing the pair restores all of them.
+	const literal = /^\/((?:\\.|[^\\/])*)\/([a-z]*),?$/;
 	for (const rawLine of block[1].split("\n")) {
 		const trimmed = rawLine.trim();
 		if (trimmed.startsWith("];")) break;
