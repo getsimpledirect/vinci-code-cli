@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   type ExtensionAPI,
   type ExtensionContext,
@@ -188,8 +188,9 @@ function shellWords(segment: string): string[] {
   for (let i = 0; i < segment.length; i++) {
     const ch = segment[i];
     if (quote) {
-      if (quote !== "'" && ch === "\\" && i + 1 < segment.length) {
-        current += segment[++i];
+      if (quote !== "'" && ch === "\\" && i + 1 < segment.length && /[$`"\\\n]/.test(segment[i + 1])) {
+        const escaped = segment[++i];
+        if (escaped !== "\n") current += escaped;
       } else if (ch === quote) {
         quote = null;
       } else {
@@ -220,7 +221,8 @@ function shellWords(segment: string): string[] {
 function recursiveForceRmTargets(command: string): string[][] {
   const invocations: string[][] = [];
   for (const segment of shellSegments(command)) {
-    const words = shellWords(commandBody(segment));
+    const words = unwrapExecutableWords(shellWords(commandBody(segment)));
+    if (words === null) continue;
     if ((words[0]?.split("/").pop() ?? "").toLowerCase() !== "rm") continue;
 
     let recursive = false;
@@ -257,20 +259,74 @@ function recursiveForceRmTargets(command: string): string[][] {
 /** Executables that destroy data when run. rmdir is judged separately: POSIX rmdir removes empty
  *  directories only, so it joins only when spelled with a recursive flag. */
 const DESTRUCTIVE_EXEC_WORD = /^(?:rm|shred|mkfs[^/\s]*|mkswap|dd)$/i;
-/** A whole-word destructive command inside a `sh -c` payload script (word-bounded, so prose like
- *  "confirm" or a URL slug cannot fire it). */
-const DESTRUCTIVE_PAYLOAD_WORD = /(?:^|[\s;&|])(?:rm|rmdir|mkfs[^/\s]*|mkswap|dd|shred)(?=$|[\s;&|])/i;
 /** rmdir carrying a recursive flag — not a thing a benign invocation spells. */
 const RMDIR_RECURSIVE = /^-[^-]*r/i;
 
-/** A delivered command (a find -exec payload, an xargs trailing command) that destroys data —
- *  including one hidden behind `sh -c '…'`, judged conservatively on whole words in the script. */
-function deliveredCommandDestructive(words: string[]): boolean {
+/** Peel known execution wrappers using each wrapper's option grammar. Unknown options and excessive
+ * nesting remain opaque; callers may veto them, never treat them as a safe executable. */
+function unwrapExecutableWords(input: string[]): string[] | null {
+  let words = input;
+  for (let depth = 0; depth < 8; depth += 1) {
+    while (/^[A-Za-z_]\w*=/.test(words[0] ?? "")) words = words.slice(1);
+    const executable = words[0]?.split("/").pop();
+    if (executable !== "env" && executable !== "command" && executable !== "sudo") return words;
+    let index = 1;
+    while (index < words.length) {
+      const word = words[index];
+      if (word === "--") { index++; break; }
+      if (/^[A-Za-z_]\w*=/.test(word)) { index++; continue; }
+      if (!word.startsWith("-")) break;
+      // env's split-string option executes another argv grammar, not a literal executable word.
+      if (executable === "command" && /^-[vV]$/.test(word)) return []; // introspection does not execute
+      const valued = executable === "env"
+        ? /^(?:-u|--unset|-C|--chdir|-P)$/
+        : executable === "sudo"
+          ? /^(?:-u|--user|-g|--group|-h|--host|-p|--prompt|-r|--role|-t|--type|-C|--close-from|-T|--command-timeout|-R|--chroot|-D|--chdir)$/
+          : /$^/;
+      const plain = executable === "env"
+        ? /^(?:-[i0v]|--ignore-environment|--null|--debug|--help|--version)$/
+        : executable === "sudo"
+          ? /^(?:-[AbEHnPSbkK]|--askpass|--background|--preserve-env|--set-home|--non-interactive|--stdin|--reset-timestamp)$/
+          : /^-p$/;
+      const attached = executable === "env"
+        ? /^(?:-[uCP].+|--(?:unset|chdir)=.+)$/
+        : executable === "sudo"
+          ? /^(?:-[ughprtCTRD].+|--(?:user|group|host|prompt|role|type|close-from|command-timeout|chroot|chdir|preserve-env)=.+)$/
+          : /$^/;
+      if (valued.test(word)) {
+        if (words[index + 1] === undefined) return null;
+        index++;
+      } else if (!plain.test(word) && !attached.test(word)) return null;
+      index++;
+    }
+    words = words.slice(index);
+  }
+  return null;
+}
+
+/** Recognize direct deletes and recursively delivered find/xargs/shell payloads. */
+function deliveredCommandDestructive(input: string[], depth = 0): boolean {
+  if (depth >= 8) return true; // an opaque nested execution chain cannot authorize a safe delivery
+  const words = unwrapExecutableWords(input);
+  if (words === null) return true;
   const commandWord = (words[0]?.split("/").pop() ?? "").toLowerCase();
   if (commandWord === "rmdir") return RMDIR_RECURSIVE.test(words[1] ?? "");
   if (DESTRUCTIVE_EXEC_WORD.test(commandWord)) return true;
-  if (/^(?:sh|bash|zsh|dash)$/.test(commandWord) && words[1] === "-c" && words[2] !== undefined) {
-    return DESTRUCTIVE_PAYLOAD_WORD.test(words[2]);
+  if (/^(?:sh|bash|zsh|dash)$/.test(commandWord)) {
+    const flag = words.findIndex((word, index) => index > 0 && /^-[^-]*c/.test(word));
+    if (flag !== -1 && words[flag + 1] !== undefined) {
+      return shellSegments(words[flag + 1]).some((segment) =>
+        deliveredCommandDestructive(shellWords(commandBody(segment)), depth + 1),
+      );
+    }
+  }
+  if (commandWord === "find") {
+    const parsed = parseFindDestructive(words);
+    return !!parsed && (parsed.delete || parsed.execPayloads.some((payload) => deliveredCommandDestructive(payload, depth + 1)));
+  }
+  if (commandWord === "xargs") {
+    const trailing = xargsTrailingCommand(words);
+    return trailing !== null && deliveredCommandDestructive(trailing, depth + 1);
   }
   return false;
 }
@@ -279,7 +335,7 @@ function deliveredCommandDestructive(words: string[]): boolean {
  *  search root — the difference between `find . -name '~' -delete` (confirms) and a false
  *  catastrophic on a pattern that only LOOKS like a home target. */
 const FIND_FLAG_WITH_VALUE =
-  /^-(?:name|iname|path|ipath|lname|ilname|regex|iregex|type|xtype|fstype|perm|user|uid|group|gid|size|links|inum|maxdepth|mindepth|newer|newermt|newerat|newerct|mtime|atime|ctime|used|context|fprint|fprint0|fprintf|printf|print0|D|O)$/;
+  /^-(?:name|iname|path|ipath|lname|ilname|regex|iregex|type|xtype|fstype|perm|user|uid|group|gid|size|links|inum|maxdepth|mindepth|newer|newermt|newerat|newerct|mtime|atime|ctime|used|context|fprint|fprint0|fprintf|printf|D|O)$/;
 
 interface FindDestructive {
   delete: boolean;
@@ -298,6 +354,7 @@ function parseFindDestructive(words: string[]): FindDestructive | null {
   let payload: string[] | null = null;
   const roots: string[] = [];
   let expectValue = false;
+  let expression = false;
   for (let index = 1; index < words.length; index += 1) {
     const word = words[index];
     if (payload !== null) {
@@ -308,17 +365,26 @@ function parseFindDestructive(words: string[]): FindDestructive | null {
     if (expectValue) {
       expectValue = false;
     } else if (word === "-delete") {
+      expression = true;
       deleting = true;
-    } else if (word === "-exec" || word === "-execdir") {
+    } else if (/^-(?:exec|execdir|ok|okdir)$/.test(word)) {
+      expression = true;
       payload = [];
       execPayloads.push(payload);
     } else if (word === "--") {
-      roots.push(...words.slice(index + 1));
-      break;
+      continue; // separates find's invocation flags, not its expression grammar
+    } else if (!expression && word === "-f") {
+      if (words[index + 1] !== undefined) roots.push(words[++index]);
+    } else if (!expression && /^-[HLP]$/.test(word)) {
+      continue;
     } else if (word.startsWith("-")) {
+      expression = true;
       if (FIND_FLAG_WITH_VALUE.test(word)) expectValue = true;
-    } else {
+      if (word === "-fprintf") index += 1; // consumes both its file and format arguments
+    } else if (!expression && word !== "(" && word !== "!") {
       roots.push(word);
+    } else {
+      expression = true;
     }
   }
   return { delete: deleting, execPayloads, roots };
@@ -354,7 +420,8 @@ function xargsTrailingCommand(words: string[]): string[] | null {
 /** A destructive delete delivered through another tool's argv, with a description for the confirm
  *  dialog — or null when the segment is not one. Exported for the integration tests. */
 export function segmentDestructiveDelivery(segment: string): string | null {
-  const words = shellWords(commandBody(segment));
+  const words = unwrapExecutableWords(shellWords(commandBody(segment)));
+  if (words === null) return "opaque executable delivery (requires review)";
   const word = (words[0]?.split("/").pop() ?? "").toLowerCase();
   if (word === "find") {
     const parsed = parseFindDestructive(words);
@@ -390,7 +457,8 @@ export function destructiveDeliveryWhy(command: string): string | null {
 export function destructiveFindRootTargets(command: string): string[][] {
   const invocations: string[][] = [];
   for (const segment of shellSegments(command)) {
-    const parsed = parseFindDestructive(shellWords(commandBody(segment)));
+    const words = unwrapExecutableWords(shellWords(commandBody(segment)));
+    const parsed = words === null ? null : parseFindDestructive(words);
     if (!parsed) continue;
     if (!parsed.delete && !parsed.execPayloads.some((payload) => deliveredCommandDestructive(payload))) continue;
     invocations.push(parsed.roots);
@@ -439,64 +507,102 @@ export function isShellFileWrite(command: string): boolean {
  *  alone stay reads. */
 const WRITABLE_MODE = /[wax+]/;
 
-/** python: open(PATH, MODE) with a write-mode MODE — literal PATH, or a detected write with a
- *  dynamic target when the first argument is anything but a quoted literal. */
-function pythonWriteTarget(payload: string): string | null {
-  for (const match of payload.matchAll(
-    /\bopen\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))\s*,\s*(?:"([^"\n]*)"|'([^'\n]*)')/g,
-  )) {
-    if (WRITABLE_MODE.test(match[3] ?? match[4] ?? "")) return match[1] ?? match[2] ?? "";
-  }
-  return null;
-}
-
-/** node: fs.writeFile/appendFile/createWriteStream(PATH) (writes by definition), or open(PATH,
- *  MODE) with a write-mode MODE. console.log and friends are not write calls and never match. */
-function nodeWriteTarget(payload: string): string | null {
-  for (const match of payload.matchAll(
-    /\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))/g,
-  )) {
-    return match[1] ?? match[2] ?? "";
-  }
-  for (const match of payload.matchAll(
-    /\bopen(?:Sync)?\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))\s*,\s*(?:"([^"\n]*)"|'([^'\n]*)')/g,
-  )) {
-    if (WRITABLE_MODE.test(match[3] ?? match[4] ?? "")) return match[1] ?? match[2] ?? "";
-  }
-  return null;
-}
-
-/** ruby: File.write(PATH), or (File.)open(PATH, MODE) with a write-mode MODE. */
-function rubyWriteTarget(payload: string): string | null {
-  for (const match of payload.matchAll(
-    /\bFile\.write\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))/g,
-  )) {
-    return match[1] ?? match[2] ?? "";
-  }
-  for (const match of payload.matchAll(
-    /\b(?:File\.)?open\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))\s*,\s*(?:"([^"\n]*)"|'([^'\n]*)')/g,
-  )) {
-    if (WRITABLE_MODE.test(match[3] ?? match[4] ?? "")) return match[1] ?? match[2] ?? "";
-  }
-  return null;
-}
-
-/** perl: open(HANDLE, MODE, PATH) or two-arg open(HANDLE, ">PATH") — a leading > / +> mode writes. */
-function perlWriteTarget(payload: string): string | null {
-  for (const match of payload.matchAll(
-    /\bopen\(\s*[A-Za-z_]\w*\s*,\s*(?:"([^"\n]*)"|'([^'\n]*)')\s*(?:,\s*(?:"([^"\n]*)"|'([^'\n]*)'))?/g,
-  )) {
-    const arg = match[1] ?? match[2] ?? "";
-    if (match[3] !== undefined || match[4] !== undefined) {
-      if (/^[>+]|[wax]/.test(arg)) return match[3] ?? match[4] ?? "";
-    } else if (/^[>+]/.test(arg)) {
-      return arg.replace(/^[>+\s]+/, "");
-    }
-  }
-  return null;
-}
-
 type InterpreterKind = "python" | "node" | "ruby" | "perl";
+
+interface InlineToken {
+  value: string;
+  literal: boolean;
+}
+
+/** A bounded lexical scan, not a language evaluator. Quoted prose/comments cannot masquerade as a
+ * call; escapes, interpolation and compound arguments cannot masquerade as whole literal paths. */
+function inlineTokens(payload: string, kind: InterpreterKind): InlineToken[] {
+  const tokens: InlineToken[] = [];
+  for (let index = 0; index < payload.length;) {
+    const character = payload[index];
+    if (/\s/.test(character)) { index++; continue; }
+    if (kind !== "node" && character === "#" || kind === "node" && payload.slice(index, index + 2) === "//") {
+      const end = payload.indexOf("\n", index);
+      index = end === -1 ? payload.length : end + 1;
+      continue;
+    }
+    if (kind === "node" && payload.slice(index, index + 2) === "/*") {
+      const end = payload.indexOf("*/", index + 2);
+      index = end === -1 ? payload.length : end + 2;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      const quote = character;
+      let value = "";
+      let literal = quote !== "`";
+      index++;
+      while (index < payload.length && payload[index] !== quote) {
+        if (payload[index] === "\\") {
+          literal = false; // decoding varies by language and prefix; unknown fails closed
+          value += payload[index++];
+          if (index < payload.length) value += payload[index++];
+        } else value += payload[index++];
+      }
+      literal &&= index < payload.length && !/[$\n\r]/.test(value) && !value.includes("#{");
+      if (index < payload.length) index++;
+      tokens.push({ value, literal });
+      continue;
+    }
+    const word = /^[A-Za-z_$][\w$]*/.exec(payload.slice(index))?.[0];
+    tokens.push({ value: word ?? character, literal: false });
+    index += word?.length ?? 1;
+  }
+  return tokens;
+}
+
+/** Collect every recognized call's arguments at their actual nesting depth, rather than accepting a
+ * quoted prefix of an expression. This intentionally does not promise analysis of arbitrary code,
+ * aliases, computed method names, or scripts loaded from disk. */
+function inlineWriteTargets(payload: string, kind: InterpreterKind): string[] {
+  if (Buffer.byteLength(payload, "utf8") > 128 * 1024) return [""];
+  const tokens = inlineTokens(payload, kind);
+  const targets: string[] = [];
+  const literalArgument = (argument: InlineToken[] | undefined): string | null =>
+    argument?.length === 1 && argument[0].literal ? argument[0].value : null;
+  const changedCwd = tokens.some((token, index) => token.value === "chdir" && tokens[index + 1]?.value === "(");
+  let scanned = 0;
+  for (let index = 0; index < tokens.length; index++) {
+    const name = tokens[index];
+    if (name.literal || tokens[index + 1]?.value !== "(") continue;
+    const inherentWrite = kind === "node"
+      ? /^(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)$/.test(name.value)
+      : kind === "ruby" && /^(?:write|binwrite)$/.test(name.value) && tokens[index - 2]?.value === "File";
+    if (!inherentWrite && !/^open(?:Sync)?$/.test(name.value)) continue;
+    const args: InlineToken[][] = [[]];
+    let depth = 0;
+    let closed = false;
+    for (let at = index + 2; at < tokens.length; at++) {
+      if (++scanned > 128 * 1024) return [""]; // cap repeated traversal of adversarial nested calls
+      const token = tokens[at];
+      if (!token.literal && token.value === ")" && depth === 0) { closed = true; break; }
+      if (!token.literal && /^(?:\(|\[|\{)$/.test(token.value)) depth++;
+      if (!token.literal && /^(?:\)|\]|\})$/.test(token.value)) depth--;
+      if (!token.literal && token.value === "," && depth === 0) args.push([]);
+      else args[args.length - 1].push(token);
+    }
+    if (!closed) { targets.push(""); continue; }
+    let target: string | null = null;
+    if (inherentWrite) target = literalArgument(args[0]) ?? "";
+    else if (kind === "perl") {
+      const mode = literalArgument(args[1]);
+      if (mode === null || /^[>+]/.test(mode)) {
+        target = args.length >= 3 ? literalArgument(args[2]) ?? "" : mode?.replace(/^[>+\s]+/, "") ?? "";
+      }
+    } else {
+      const keywordMode = args.find((argument) => argument[0]?.value === "mode" && argument[1]?.value === "=");
+      const mode = literalArgument(keywordMode?.slice(2) ?? args[1]);
+      // An omitted mode is a read in Python/Ruby; an explicitly unknown mode may write.
+      if (mode === null ? args.length > 1 : WRITABLE_MODE.test(mode)) target = literalArgument(args[0]) ?? "";
+    }
+    if (target !== null) targets.push(changedCwd && !isAbsolute(target) ? "" : target);
+  }
+  return targets;
+}
 
 /** The inline payload of an interpreter one-liner segment — the word after -c (python) or
  *  -e/--eval (node/ruby/perl), or the heredoc body a `<< MARKER` introduces — or null when this
@@ -506,7 +612,8 @@ function interpreterInlinePayload(
   command: string,
 ): { kind: InterpreterKind; payload: string } | null {
   const body = commandBody(segment);
-  const words = shellWords(body);
+  const words = unwrapExecutableWords(shellWords(body));
+  if (words === null) return null;
   const word = (words[0]?.split("/").pop() ?? "").toLowerCase();
   const kind: InterpreterKind | null =
     /^python\d*(?:\.\d+)?$/.test(word) || /^pypy\d*$/.test(word)
@@ -520,23 +627,31 @@ function interpreterInlinePayload(
             : null;
   if (kind === null) return null;
   // The inline payload: the word after -c (python) or -e/--eval (node/ruby/perl).
-  for (const flag of kind === "python" ? ["-c"] : ["-e", "--eval"]) {
-    const flagIndex = words.indexOf(flag, 1);
-    if (flagIndex !== -1 && words[flagIndex + 1] !== undefined) {
-      return { kind, payload: words[flagIndex + 1] };
+  for (let index = 1; index < words.length; index++) {
+    const word = words[index];
+    if (word === "--") break;
+    const flag = kind === "python" ? /^-c(.*)$/ : kind === "node" ? /^(?:-e|--eval=|-p|--print=)(.*)$/ : /^-e(.*)$/;
+    if ((kind !== "python" && (word === "--eval" || kind === "node" && word === "--print")) || word === "-e" || word === "-c" || kind === "node" && word === "-p") {
+      if (words[index + 1] !== undefined) return { kind, payload: words[index + 1] };
+    } else {
+      const attached = flag.exec(word);
+      if (attached?.[1]) return { kind, payload: attached[1] };
     }
+    const valued = kind === "python" ? /^-[WX]$/ : kind === "node" ? /^(?:-r|--require|--import|--input-type)$/ : /^(?:-r|-I|-F)$/;
+    if (valued.test(word)) index++;
+    else if (!word.startsWith("-") || word === "-") break; // script files and their argv are not inline payloads
   }
   // Heredoc form (python -<<): the script sits in the lines after the marker, which
   // shellSegments splits into separate segments — so the payload is recovered from the original
   // command text, up to the marker line.
-  const marker = /<<\s*(?:'([A-Za-z_]\w*)'|([A-Za-z_]\w*))\s*$/.exec(body);
+  const marker = /<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))\s*$/.exec(body);
   if (marker) {
     const at = command.indexOf(segment);
     if (at !== -1) {
       const lines = command.slice(at + segment.length).split("\n");
       const script: string[] = [];
       for (const line of lines) {
-        if (line.trim() === marker[1] || line.trim() === marker[2]) break;
+        if (line.trim() === (marker[1] ?? marker[2] ?? marker[3])) break;
         script.push(line);
       }
       return { kind, payload: script.join("\n") };
@@ -545,22 +660,50 @@ function interpreterInlinePayload(
   return null;
 }
 
-/** The write target of an interpreter one-liner file write anywhere in a command: the extracted
- *  literal path, "" when a write idiom is present but the target is dynamic, or null when no
- *  write idiom is present. */
-export function interpreterWriteTarget(command: string): string | null {
+/** Every recognized inline write target, with "" for an unresolved target and [] when none was
+ * recognized. This is a conservative heuristic over known idioms, not a proof about arbitrary code. */
+export function interpreterWriteTargets(command: string, depth = 0): string[] {
+  if (depth >= 8) return [""];
+  const targets: string[] = [];
+  const changesCwd = shellSegments(command).some((segment) =>
+    /^(?:cd|pushd|popd)\b/.test(commandBody(segment)) || /\b(?:--chdir(?:=|\s)|env\s+-C\s)/.test(segment),
+  );
   for (const segment of shellSegments(command)) {
+    const words = unwrapExecutableWords(shellWords(commandBody(segment)));
+    if (words && /^(?:sh|bash|zsh|dash)$/.test(words[0]?.split("/").pop() ?? "")) {
+      const flag = words.findIndex((word, index) => index > 0 && /^-[^-]*c/.test(word));
+      if (flag !== -1 && words[flag + 1] !== undefined) targets.push(...interpreterWriteTargets(words[flag + 1], depth + 1));
+    }
     const inline = interpreterInlinePayload(segment, command);
     if (inline === null) continue;
-    const target =
-      inline.kind === "python"
-        ? pythonWriteTarget(inline.payload)
-        : inline.kind === "node"
-          ? nodeWriteTarget(inline.payload)
-          : inline.kind === "ruby"
-            ? rubyWriteTarget(inline.payload)
-            : perlWriteTarget(inline.payload);
-    if (target !== null) return target;
+    targets.push(...inlineWriteTargets(inline.payload, inline.kind));
+  }
+  return targets.map((target) => changesCwd && !isAbsolute(target) ? "" : target);
+}
+
+/** Compatibility seam for existing extensions; safety decisions consume ALL targets below. */
+export function interpreterWriteTarget(command: string): string | null {
+  return interpreterWriteTargets(command)[0] ?? null;
+}
+
+/** Resolve existing symlink ancestors exactly as file creation does. Missing descendants can be
+ * appended only after resolving their existing parent; a dangling link/unreadable ancestor refuses. */
+function consumerWritePath(path: string, cwd: string): string | null {
+  let candidate = isAbsolute(path) ? path : `${cwd}${sep}${path}`;
+  const missing: string[] = [];
+  for (let depth = 0; depth < 256; depth++) {
+    try {
+      lstatSync(candidate);
+      return resolve(realpathSync(candidate), ...missing.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      // lstat succeeds on dangling links, but realpath fails: never treat one as a missing component.
+      try { if (lstatSync(candidate).isSymbolicLink()) return null; } catch { /* missing component */ }
+      const parent = dirname(candidate);
+      if (parent === candidate) return null;
+      missing.push(basename(candidate));
+      candidate = parent;
+    }
   }
   return null;
 }
@@ -751,7 +894,7 @@ const SYSTEM: Array<[RegExp, string]> = [
   // actually sources, not just the classics: .zshenv is sourced by EVERY zsh invocation (login or
   // not — a .zshenv-only implant survives where a .zshrc one never fires), .zlogin/.bash_login sit
   // on the login path, .gitconfig persists via core.pager/alias, and .inputrc rides readline.
-  [/(~|\$HOME|\/Users\/[^/\s]+|\/home\/[^/\s]+)\/\.(bashrc|zshrc|zshenv|bash_profile|bash_login|zprofile|zlogin|profile|gitconfig|inputrc)\b|>\s*\/etc\/|\bcrontab\s+[^-]|\blaunchctl\s+(load|unload|bootstrap)\b|\bsystemctl\s+(enable|start|stop|disable)\b/i, "change your system or startup settings"],
+  [/(~|\$HOME|\$\{HOME\}|\/Users\/[^/\s]+|\/home\/[^/\s]+)\/\.(bashrc|zshrc|zshenv|bash_profile|bash_login|zprofile|zlogin|profile|gitconfig|inputrc)\b|>\s*\/etc\/|\bcrontab\s+[^-]|\blaunchctl\s+(load|unload|bootstrap)\b|\bsystemctl\s+(enable|start|stop|disable)\b/i, "change your system or startup settings"],
 ];
 const DATABASE: Array<[RegExp, string]> = [
   [/\bprisma\s+migrate\s+(dev|deploy|resolve)\b|\bprisma\s+db\s+push\b/i, "apply a Prisma schema change to the database"],
@@ -1534,13 +1677,13 @@ export default function (pi: ExtensionAPI) {
       // this block: a literal in-project target is the model's normal write route and behaves like
       // the write tool's own in-project case (no extra gate). A dynamic target expression is
       // unknown, and unknown fails closed — out-of-project — here.
-      const interpreterTarget = interpreterWriteTarget(cmd);
-      const interpreterOutsideWrite = (() => {
-        if (interpreterTarget === null) return false;
-        if (interpreterTarget === "") return true;
-        const abs = resolve(ctx.cwd, interpreterTarget);
-        return abs !== ctx.cwd && !abs.startsWith(ctx.cwd + sep);
-      })();
+      const interpreterTargets = interpreterWriteTargets(cmd);
+      const projectRoot = consumerWritePath(ctx.cwd, ctx.cwd);
+      const interpreterOutsideWrite = interpreterTargets.some((target) => {
+        if (target === "" || projectRoot === null) return true;
+        const abs = consumerWritePath(target, ctx.cwd);
+        return abs === null || abs !== projectRoot && !abs.startsWith(projectRoot + sep);
+      });
       if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
         if (ctx.hasUI) ctx.ui.notify("Vinci tried to write a file through the shell — switching to the safer file editor.", "info");
         sendVinciControl(
@@ -2029,7 +2172,13 @@ export default function (pi: ExtensionAPI) {
         return { block: true, reason: "Vinci blocked a false-green test command that performs no real verification." };
       }
 
-      const abs = resolve(ctx.cwd, path);
+      const lexicalPath = resolve(ctx.cwd, path);
+      const abs = PLACEHOLDER_WRITE_PATH.test(lexicalPath) ? lexicalPath : consumerWritePath(path, ctx.cwd);
+      const projectRoot = consumerWritePath(ctx.cwd, ctx.cwd);
+      if (abs === null || projectRoot === null) {
+        sendVinciControl(pi, "vinci-unresolved-write-block", "The file target could not be resolved through its existing filesystem ancestors. Inspect its parent directory and symlinks, then use a resolvable project path; do not bypass this refusal with a shell writer.");
+        return { block: true, reason: `Blocked — could not resolve the file target "${path}". Inspect its parent directory and symlinks before editing.` };
+      }
 
       // Wholesale overwrite: replacing an existing, non-trivial file with far LESS content is likely a
       // data-loss accident (a whole file → a stub). `write` replaces the file entirely; `edit` is
@@ -2068,7 +2217,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      if (!outsideWritesAllowed && abs !== ctx.cwd && !abs.startsWith(ctx.cwd + sep)) {
+      if (!outsideWritesAllowed && abs !== projectRoot && !abs.startsWith(projectRoot + sep)) {
         // A from-scratch build often makes the model invent a generic placeholder path
         // (/home/user/project/index.html) instead of the grounded cwd (observed live 2026-07-15,
         // reproducibly, on empty-project web builds). That is a hallucinated path, not a deliberate
@@ -2126,7 +2275,8 @@ export default function (pi: ExtensionAPI) {
         outsideWritesAllowed = true;
       }
 
-      const hit = SENSITIVE_PATHS.find(([re]) => re.test(path));
+      const resolvedPolicyPath = abs === projectRoot || abs.startsWith(projectRoot + sep) ? relative(projectRoot, abs) : abs;
+      const hit = SENSITIVE_PATHS.find(([re]) => re.test(path) || re.test(resolvedPolicyPath));
       if (hit) {
         // [W2 bucket: KEEP-BLOCKING] SENSITIVE_PATHS is .env, .git/ internals, private keys and
         // certificates, SSH keys, node_modules, lockfiles, and credentials dirs. Hand-writing any of

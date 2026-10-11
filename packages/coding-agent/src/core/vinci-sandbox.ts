@@ -9,17 +9,20 @@
  * or write into arbitrary system locations — regardless of whether a guard caught it.
  *
  * Scope of the policy (deliberately not paranoid, so it doesn't break real work). The WRITABLE roots
- * are exactly what vinciWritableRoots() returns — documented here to match the mechanism, because an
- * overstated invariant is its own defect (audit, 2026-10-11: this header used to claim writes were
+ * include what vinciWritableRoots() returns plus the backend's writable /dev. An overstated invariant
+ * is its own defect (audit, 2026-10-11: this header used to claim writes were
  * "confined to the workspace" while the roots deliberately include all of $HOME and /Volumes):
  *  - WRITES allowed: the project (cwd), the whole of $HOME (so source written anywhere a person
  *    keeps work still builds — npm install in ~/Desktop/Test Folder), /Volumes (external drives),
  *    the workspace PARENT when it is a strict subdirectory of $HOME, temp dirs, package caches
  *    (~/.npm, ~/.cache, …), and CLI tool-config dirs (~/.config/gcloud, ~/.aws, ~/.kube, ~/.docker).
- *  - Credential stores (~/.ssh, ~/.gnupg, ~/.netrc, ~/.npmrc, ~/.pypirc, ~/.aws/credentials) are
- *    RE-DENIED after the writable roots — seatbelt/bwrap are last-match-wins, so these stay
- *    read-only (and unreadable) even though $HOME is writable.
- *  - Credential reads and NETWORK are denied unless the guard signs one exact invocation.
+ *  - Static credential stores (~/.ssh, ~/.gnupg, ~/.netrc, ~/.npmrc, ~/.pypirc) are denied reads
+ *    unless an exact read is approved. Their writes are re-denied after the writable roots except
+ *    when the project itself is inside a protected store. ~/.aws/credentials is write-denied by
+ *    the same rule, but remains readable so the AWS CLI can authenticate. Existing stores are mounted
+ *    read-only or hidden on Linux; writes in hidden directories do not reach the host store.
+ *  - Reads from locked token stores and external NETWORK are denied unless the guard signs one exact
+ *    invocation. Project .env files and operational CLI credentials remain readable.
  *  - Destruction INSIDE a writable root (rm -rf ~/Documents) is NOT this layer's job — that is the
  *    guard's confirm tiers + /undo + git. This layer stops writes to places outside the root set.
  *
@@ -252,7 +255,8 @@ function bwrapWrap(
 /**
  * Wrap a shell command so its filesystem writes stay inside the writable-root set (see the module
  * header and vinciWritableRoots): the project, $HOME, /Volumes, temp dirs, package caches, and
- * tool-config dirs — with the credential stores re-denied last (last match wins).
+ * tool-config dirs, and the backend's writable /dev — with applicable credential stores re-denied
+ * last (later binds/rules win; see vinciSensitiveNoWrite's project-inside-store exception).
  *
  * Returns the command UNCHANGED only when the sandbox is switched OFF — either this is not Vinci
  * (VINCI_CODE unset) or the VINCI_NO_SANDBOX=1 developer bypass is set.

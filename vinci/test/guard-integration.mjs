@@ -2,7 +2,8 @@
 // quoted documentation is not executable risk, shell file writes use structured tools, database
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,6 +89,85 @@ function regressionCheck(name, condition) {
 }
 
 try {
+  // Use the registered tool_call hook and the same bytes executed by a real shell. All effects are
+  // confined to this test's disposable tree; a sibling directory models an outside-project target.
+  const adversarialProject = join(workspace, "guard-project");
+  mkdirSync(join(adversarialProject, "sub"), { recursive: true });
+  symlinkSync(workspace, join(adversarialProject, "escape"));
+  const adversarialSelections = [];
+  const localShellEnv = { PATH: process.env.PATH ?? "", HOME: workspace, TMPDIR: workspace };
+  const adversarialCtx = {
+    ...ctx,
+    cwd: adversarialProject,
+    ui: { ...ctx.ui, async select(title) { adversarialSelections.push(title); return "No, don't"; } },
+  };
+  const failures = [];
+  for (const [label, command, target, deleting] of [
+    ["later node write", `node -e "require('fs').writeFileSync('first','local');require('fs').writeFileSync('../later','outside')"`, "later"],
+    ["attached node eval", `node --eval="require('fs').writeFileSync('../attached','outside')"`, "attached"],
+    ["node print evaluates writes", `node -p "require('fs').writeFileSync('../print-write','outside')"`, "print-write"],
+    ["node long print evaluates writes", `node --print "require('fs').writeFileSync('../long-print-write','outside')"`, "long-print-write"],
+    ["attached python code", `python3 -c"open('../short','w').write('outside')"`, "short"],
+    ["python concatenated target", `python3 -c "open('sub'+'/../../py-concat','w').write('outside')"`, "py-concat"],
+    ["python dynamic call target", `python3 -c "import pathlib;open(pathlib.Path('../py-path'),'w').write('outside')"`, "py-path"],
+    ["python keyword mode", `python3 -c "open('../py-keyword',mode='w').write('outside')"`, "py-keyword"],
+    ["perl lexical handle", `perl -e 'open(my $fh, ">", "../perl-write"); print $fh "outside";'`, "perl-write"],
+    ["concatenated node target", `node -e "require('fs').writeFileSync('sub'+'/../../concat','outside')"`, "concat"],
+    ["escaped node target", `node -e "require('fs').writeFileSync('\\u002e\\u002e/escaped','outside')"`, "escaped"],
+    ["changed shell cwd", `cd ..; node -e "require('fs').writeFileSync('cwd-write','outside')"`, "cwd-write"],
+    ["symlinked parent", `node -e "require('fs').writeFileSync('escape/link-write','outside')"`, "link-write"],
+    ["env-wrapped interpreter", `env node -e "require('fs').writeFileSync('../env-write','outside')"`, "env-write"],
+    ["xargs env rm", `printf '%s\\n' victim | xargs env rm`, "victim", true],
+    ["find env rm", `find . -name victim -exec env rm {} \\;`, "victim", true],
+    ["find path-qualified shell rm", `find . -name victim -exec sh -c '/bin/rm "$1"' sh {} \\;`, "victim", true],
+    ["find option separator", `find -- . -name victim -delete`, "victim", true],
+    ["find print0 before delete", `find . -name victim -print0 -delete`, "victim", true],
+    ["xargs shell find delete", `printf x | xargs sh -c 'find . -name victim -delete'`, "victim", true],
+    ["find shell xargs delete", `find . -name victim -exec sh -c 'printf "%s\\n" "$1" | xargs rm' sh {} \\;`, "victim", true],
+    ["xargs env unset option", `printf '%s\\n' victim | xargs env -u NON_SECRET_GUARD_FIXTURE rm`, "victim", true],
+  ]) {
+    const targetPath = join(deleting ? adversarialProject : workspace, target);
+    if (deleting) writeFileSync(targetPath, "victim");
+    // Establish that this is an executable bypass vector, not malformed input. This process has no
+    // production credentials and writes only under the disposable test tree.
+    execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", command], { cwd: adversarialProject, timeout: 5000, env: localShellEnv });
+    assert.ok(deleting ? !existsSync(targetPath) : readFileSync(targetPath, "utf8") === "outside", `${label}: real effect missing`);
+    const selectionsBefore = adversarialSelections.length;
+    let result;
+    for (const handler of handlers.tool_call ?? []) {
+      result = await handler({ toolName: "bash", input: { command } }, adversarialCtx);
+      if (result !== undefined) break;
+    }
+    if (result?.block !== true) failures.push(`${label}: registered guard allowed the real effect`);
+    if (!deleting && adversarialSelections.length !== selectionsBefore) failures.push(`${label}: should use the shell-write refusal`);
+  }
+  assert.deepEqual(failures, [], `Guard adversarial regressions failed:\n${failures.join("\n")}`);
+  check("registered guard rejects executable write and destructive delivery bypasses", true);
+
+  for (const command of [
+    `node -e "require('fs').writeFileSync('first','local');require('fs').writeFileSync('second','local')"`,
+    `node --eval="console.log('writeFileSync( is documentation')"`,
+    `printf '%s\\n' first second | xargs env wc -c`,
+    `printf '%s\\n' first second | xargs env -i wc -c`,
+    `node --print="'open( is documentation'"`,
+    `find -- . -name first -exec env wc -c {} \\;`,
+  ]) {
+    for (const handler of handlers.tool_call ?? []) {
+      assert.equal(await handler({ toolName: "bash", input: { command } }, adversarialCtx), undefined, `benign control refused: ${command}`);
+    }
+    execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", command], { cwd: adversarialProject, timeout: 5000, env: localShellEnv });
+  }
+  check("actual-byte benign local writes and wrapped reads remain allowed", true);
+  assert.ok(guard.segmentDestructiveDelivery("xargs env --unknown-wrapper-option rm"), "an unknown wrapper option must fail closed");
+  assert.ok((await toolCall("bash", { command: "find -- ~ -name '*.log' -delete" }))?.block);
+
+  for (const toolName of ["write", "edit"]) {
+    for (const handler of handlers.tool_call ?? []) {
+      const result = await handler({ toolName, input: { path: "escape/structured", content: "outside", oldText: "old", newText: "new" } }, adversarialCtx);
+      assert.equal(result?.block, true, `a symlinked ${toolName} must request outside-project permission`);
+    }
+  }
+
   const imagePath = join(workspace, "dragged screenshot.png");
   writeFileSync(
     imagePath,
