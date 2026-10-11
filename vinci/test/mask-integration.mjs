@@ -120,6 +120,63 @@ for (const [name, text] of [
   pass++;
 }
 
+// 🔴 NEW PROVIDER SHAPES (audit 2026-10-11) — Replicate r8_, PyPI upload pypi-, Google OAuth ya29.,
+// Together tgp_v1_. Same rules as above: every shape masks on both channels bare in prose, longer-
+// than-canonical still masks (the fail-open regression class), and prefix-only/prose look-alikes
+// stay untouched. Tokens are TESTONLY-marked and split-concatenated so no contiguous key shape is
+// ever committed.
+{
+  const REPLICATE = "r8_" + "TESTONLY" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9s";
+  const PYPI = "pypi-" + "TESTONLY" + "AgEIcHlwaS5vcmc" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9s";
+  const GOOGLE = "ya29." + "TESTONLY" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV5wX6";
+  const TOGETHER = "tgp_v1_" + "TESTONLY" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV5";
+  for (const [name, tok] of [
+    ["Replicate r8_", REPLICATE],
+    ["PyPI upload pypi-", PYPI],
+    ["Google OAuth ya29.", GOOGLE],
+    ["Together tgp_v1_", TOGETHER],
+  ]) {
+    const bare = vinciMaskSecrets(`the key is ${tok} ok`);
+    assert.ok(!bare.includes(tok), `${name}: FAIL-OPEN — bare token passed through unmasked`);
+    assert.ok(bare.includes("‹redacted›"), `${name}: display redaction marker missing`);
+    const model = redactSecrets(`the key is ${tok} ok`);
+    assert.ok(!model.includes(tok), `${name}: model-channel body leaked`);
+    assert.ok(model.includes("<vinci-secret>"), `${name}: model-channel sentinel missing`);
+    console.log(`  ✓ new shape: ${name} masked on both channels, bare in prose`);
+    pass++;
+  }
+  // Off-canonical LENGTH variation: a re-tightened quantifier passes every canonical-length test
+  // and fails only these (the regression this whole block exists to catch).
+  for (const [name, token] of [
+    ["Replicate longer 60", "r8_" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV5wX6yZ7aB1cD2eF3gH4iJ5kL6m"],
+    ["Together longer 80", "tgp_v1_" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV5wX6yZ7aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV5wX6yZ7aB1cD"],
+    ["PyPI with URL-safe base64 chars", "pypi-" + "AgEIcHlwaS5vcmc" + "aB1_cD2-eF3_gH4-iJ5_kL6_mN7-oP8"],
+    ["Google ya29. longer 60", "ya29." + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV5wX6yZ7aB1cD2eF3gH4iJ5kL6mN7o"],
+  ]) {
+    const masked = vinciMaskSecrets(`KEY=${token}`);
+    assert.ok(!masked.includes(token), `${name}: FAIL-OPEN — longer key passed through unmasked`);
+    console.log(`  ✓ new shape variation: ${name} masked`);
+    pass++;
+  }
+  // The other direction: prefix-only and prose look-alikes must NOT be mangled. The pypi- guard is
+  // the load-bearing one: 'pypi-requirements' is a real word, not a token — the length threshold
+  // is the discriminator.
+  for (const [name, text] of [
+    ["pypi- prose word", "add the pypi-requirements extra to the test dependencies"],
+    ["pypi- hyphenated prose", "the pypi-package-manager-tooling flag is long but it is prose"],
+    ["r8_ below minimum", `KEY=r8_${"aB1cD2eF3"}`],
+    ["r8_ bare prefix in prose", "the r8_ prefix identifies Replicate tokens"],
+    ["ya29. bare prefix in prose", "the ya29. prefix identifies Google access tokens"],
+    ["tgp_v1_ below minimum", `KEY=tgp_v1_${"aB1cD2eF3"}`],
+    ["tgp_v1_ bare prefix in prose", "the tgp_v1_ prefix identifies Together tokens"],
+  ]) {
+    assert.equal(vinciMaskSecrets(text), text, `${name}: display masker mangled ordinary text`);
+    assert.equal(redactSecrets(text), text, `${name}: model redactor mangled ordinary text`);
+    console.log(`  ✓ new shape no false positive: ${name}`);
+    pass++;
+  }
+}
+
 // BYOK provider tokens with verified, provider-specific shapes must mask even without a secret-named
 // assignment. Near-miss documentation/code examples stay unchanged to guard against false positives.
 for (const [name, tok, nearMiss] of [
