@@ -91,6 +91,30 @@ function vinciRecordLines(fixture) {
   }
 }
 
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+async function waitForWorkerClose(worker) {
+  let timer;
+  try {
+    return await Promise.race([
+      worker.closed,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('The worker pipes did not close within 5000 ms; inspect the surviving task process group.')), 5000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function uploadedResultJson(fixture) {
   const calls = readFileSync(join(fixture.tempDir, 'aws-calls.txt'), 'utf8').split('\n').filter((l) => l.startsWith('{')).map((l) => JSON.parse(l));
   assert.equal(calls.length, 1, 'exactly one bundle upload');
@@ -755,40 +779,79 @@ await test('ttl_s < 1 is refused at acquire; a renew serving ttl_s < 1 keeps the
 
 // ---------------------------------------------------------------------------------------------
 // F7: SIGTERM with a lease in flight releases it (abandoned) and SIGTERMs the child before exit.
-await test('SIGTERM mid-run: heartbeat stops, lease released abandoned, child SIGTERMed, daemon exits 0', async () => {
-  const fixture = new WorkerTestFixture('lease-sigterm');
-  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1 });
-  await governor.start();
-  try {
-    fixture.createRepo('test', 'repo');
-    fixture.linkTools(TOOLS);
-    await fixture.startBus([handoff('118', 'w5', 'repo: test/repo\nevidence: pr\n\nTask')]);
-    const worker = spawnWorker(fixture, 'w5', ['--governor', governor.url], { FAKE_VINCI_SLEEP: '30000' });
-    await waitFor(() => fixture.getVinciCalls().length === 1, { label: 'the child spawn' });
-    await waitFor(() => governor.renews.length >= 1, { label: 'a renew' });
-    const renewsBefore = governor.renews.length;
-    const started = Date.now();
-    worker.proc.kill('SIGTERM');
-    const { code, stderr } = await worker.closed;
-    const elapsed = Date.now() - started;
-    assert.equal(code, 0, stderr);
-    assert(elapsed < 5000, `shutdown must be prompt, took ${elapsed}ms`);
-    assert.deepEqual(governor.releases, [{ lease_id: 'lease-1', fencing_generation: 100, outcome: 'abandoned' }]);
-    assert.match(stderr, /SIGTERM: releasing lease lease-1 \(task 118\) as abandoned/);
-    await new Promise((r) => setTimeout(r, 300));
-    assert(governor.renews.length <= renewsBefore + 1, 'the heartbeat stopped (at most one renew was in flight)');
-    const releaseAt = governor.events.indexOf('release');
-    assert.equal(governor.events.slice(releaseAt + 1).includes('renew:start'), false, `no renew after release (${governor.events.join(',')})`);
-    assert(vinciRecordLines(fixture).includes('SIGTERM'), 'the child must be SIGTERMed so nothing works under a released lease');
-    const snapshot = state(fixture, '118');
-    assert.equal(snapshot.state, 'RUNNING', 'the task record is left for the next daemon start to resume');
-    assert.equal(originHasBranch(join(fixture.reposDir, 'test', 'repo.git'), 'worker/118'), false, 'nothing published');
-    assert.equal(hasTerminalFailure(fixture.getPostedMessages()), false, 'no terminal failure record must be posted');
-  } finally {
-    await governor.close();
-    await fixture.cleanup();
-  }
-});
+for (const startupDelayMs of [0, 1200]) {
+  await test(`SIGTERM mid-run (${startupDelayMs}ms child startup): heartbeat stops, lease released abandoned, child SIGTERMed, daemon exits 0`, async () => {
+    const fixture = new WorkerTestFixture('lease-sigterm');
+    const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1 });
+    await governor.start();
+    let worker = null;
+    try {
+      fixture.createRepo('test', 'repo');
+      fixture.linkTools(TOOLS);
+      await fixture.startBus([handoff('118', 'w5', 'repo: test/repo\nevidence: pr\n\nTask')]);
+      const readyFile = join(fixture.tempDir, 'vinci-signal-ready');
+      worker = spawnWorker(fixture, 'w5', ['--governor', governor.url], {
+        FAKE_VINCI_SLEEP: '30000',
+        FAKE_VINCI_STARTUP_DELAY_MS: String(startupDelayMs),
+        FAKE_VINCI_READY_FILE: readyFile,
+      });
+      await waitFor(() => fixture.getVinciCalls().length === 1, { label: 'the child spawn' });
+      const childPid = fixture.getVinciCalls()[0].pid;
+      assert(Number.isInteger(childPid) && childPid > 0, 'the invocation must identify the actual task child');
+      // Invocation is recorded before synchronous Git work; it does not prove the handler is ready.
+      await waitFor(() => {
+        try {
+          return Number(readFileSync(readyFile, 'utf8').trim()) === childPid;
+        } catch (error) {
+          if (error.code === 'ENOENT') return false;
+          throw error;
+        }
+      }, { label: 'the child SIGTERM handler readiness for the actual task PID' });
+      assert.equal(processExists(childPid), true, 'the ready child must be alive before the stop request');
+      await waitFor(() => governor.renews.length >= 1, { label: 'a renew' });
+      const renewsBefore = governor.renews.length;
+      const started = Date.now();
+      worker.proc.kill('SIGTERM');
+      await waitFor(() => worker.proc.exitCode !== null, { timeoutMs: 5000, label: 'the signaled daemon to exit' });
+      await waitFor(() => !processExists(childPid), { timeoutMs: 5000, label: 'the SIGTERMed task child to exit' });
+      const { code, stderr } = await waitForWorkerClose(worker);
+      const elapsed = Date.now() - started;
+      assert.equal(code, 0, stderr);
+      assert(elapsed < 5000, `shutdown must be prompt, took ${elapsed}ms`);
+      assert.deepEqual(governor.releases, [{ lease_id: 'lease-1', fencing_generation: 100, outcome: 'abandoned' }]);
+      assert.match(stderr, /SIGTERM: releasing lease lease-1 \(task 118\) as abandoned/);
+      await new Promise((r) => setTimeout(r, 300));
+      assert(governor.renews.length <= renewsBefore + 1, 'the heartbeat stopped (at most one renew was in flight)');
+      const releaseAt = governor.events.indexOf('release');
+      assert.equal(governor.events.slice(releaseAt + 1).includes('renew:start'), false, `no renew after release (${governor.events.join(',')})`);
+      assert(vinciRecordLines(fixture).includes('SIGTERM'), 'the child must be SIGTERMed so nothing works under a released lease');
+      const snapshot = state(fixture, '118');
+      assert.equal(snapshot.state, 'RUNNING', 'the task record is left for the next daemon start to resume');
+      assert.equal(originHasBranch(join(fixture.reposDir, 'test', 'repo.git'), 'worker/118'), false, 'nothing published');
+      assert.equal(hasTerminalFailure(fixture.getPostedMessages()), false, 'no terminal failure record must be posted');
+    } finally {
+      const childPid = fixture.getVinciCalls()[0]?.pid;
+      let cleanupError = null;
+      if (Number.isInteger(childPid)) {
+        try {
+          process.kill(-childPid, 'SIGKILL');
+        } catch (error) {
+          if (error.code !== 'ESRCH') cleanupError = error;
+        }
+      }
+      try {
+        worker?.proc.kill('SIGKILL');
+        if (worker) await waitForWorkerClose(worker);
+      } catch (error) {
+        cleanupError ??= error;
+      } finally {
+        await governor.close();
+        await fixture.cleanup();
+      }
+      if (cleanupError) throw cleanupError;
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------------------------
 await test('--governor unset => no declaration, no digest, no lease fields, no fencing footer', async () => {

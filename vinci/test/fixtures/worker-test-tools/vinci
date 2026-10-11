@@ -3,8 +3,9 @@
 import { appendFileSync, existsSync, fstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { execSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 
-const recordFile = process.env.FAKE_VINCI_RECORD || '/tmp/fake-vinci-invocations.txt';
+const recordFile = process.env.FAKE_VINCI_RECORD || resolve(tmpdir(), 'fake-vinci-invocations.txt');
 
 // #18: the fake launcher's "install" is `$HOME/fake-vinci-version.json` (HOME is the only thing
 // the daemon's minimal probe env lets through besides PATH/TMPDIR/LANG):
@@ -79,6 +80,7 @@ const sessionId = process.argv.indexOf('--session-id') >= 0 ? process.argv[proce
 const invocation = {
   argv: process.argv.slice(2),
   timestamp: new Date().toISOString(),
+  pid: process.pid,
   version: executedVersion,
   updateDisabled: process.env.VINCI_UPDATE_DISABLED ?? null,
 };
@@ -95,6 +97,8 @@ if (sessionDir && sessionId) {
   const failExit = process.env.FAKE_VINCI_EXIT !== undefined ? parseInt(process.env.FAKE_VINCI_EXIT, 10) : 0;
   const writeUsage = process.env.FAKE_VINCI_USAGE === '1';
 
+  const startupDelayMs = Number(process.env.FAKE_VINCI_STARTUP_DELAY_MS) || 0;
+  if (startupDelayMs > 0) await new Promise((resolveStartup) => setTimeout(resolveStartup, startupDelayMs));
 
   // By default, make a real commit (fixture for a successful run).
   // Use FAKE_VINCI_NO_COMMIT=1 to simulate a run with no commits (e.g. for #28 tests).
@@ -191,6 +195,7 @@ if (sessionDir && sessionId) {
       appendFileSync(recordFile, "SIGTERM\n");
       process.exit(143);
     });
+    if (process.env.FAKE_VINCI_READY_FILE) writeFileSync(process.env.FAKE_VINCI_READY_FILE, `${process.pid}\n`);
     await new Promise((resolveSleep) => setTimeout(resolveSleep, sleepMs));
   }
 
