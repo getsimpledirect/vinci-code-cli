@@ -245,6 +245,159 @@ function recursiveForceRmTargets(command: string): string[][] {
   return invocations;
 }
 
+// ── Destructive delivery through find / xargs / shred ─────────────────────────────────────────
+// recursiveForceRmTargets keys on argv[0] === "rm", so the same delete reached through another
+// tool's argv classified as nothing: `find ~ -type f -delete`, `ls ~ | xargs rm -rf`,
+// `find ~ -name '*' -exec rm -rf {} +` and a bare `shred` all ran with no confirm and no gate
+// (audit, 2026-10-11). The parsers below extend the SAME structured argv grammar — shellSegments/
+// shellWords, env/sudo peeling via commandBody, option-value skipping — never a loose regex over
+// raw text, and they feed the SAME tiers rm -rf already uses: a root-targeted delete hard-blocks,
+// everything else takes the dangerous-class confirm.
+
+/** Executables that destroy data when run. rmdir is judged separately: POSIX rmdir removes empty
+ *  directories only, so it joins only when spelled with a recursive flag. */
+const DESTRUCTIVE_EXEC_WORD = /^(?:rm|shred|mkfs[^/\s]*|mkswap|dd)$/i;
+/** A whole-word destructive command inside a `sh -c` payload script (word-bounded, so prose like
+ *  "confirm" or a URL slug cannot fire it). */
+const DESTRUCTIVE_PAYLOAD_WORD = /(?:^|[\s;&|])(?:rm|rmdir|mkfs[^/\s]*|mkswap|dd|shred)(?=$|[\s;&|])/i;
+/** rmdir carrying a recursive flag — not a thing a benign invocation spells. */
+const RMDIR_RECURSIVE = /^-[^-]*r/i;
+
+/** A delivered command (a find -exec payload, an xargs trailing command) that destroys data —
+ *  including one hidden behind `sh -c '…'`, judged conservatively on whole words in the script. */
+function deliveredCommandDestructive(words: string[]): boolean {
+  const commandWord = (words[0]?.split("/").pop() ?? "").toLowerCase();
+  if (commandWord === "rmdir") return RMDIR_RECURSIVE.test(words[1] ?? "");
+  if (DESTRUCTIVE_EXEC_WORD.test(commandWord)) return true;
+  if (/^(?:sh|bash|zsh|dash)$/.test(commandWord) && words[1] === "-c" && words[2] !== undefined) {
+    return DESTRUCTIVE_PAYLOAD_WORD.test(words[2]);
+  }
+  return false;
+}
+
+/** find flags whose value is a separate word, so a value (`-name '*.log'`) is never mistaken for a
+ *  search root — the difference between `find . -name '~' -delete` (confirms) and a false
+ *  catastrophic on a pattern that only LOOKS like a home target. */
+const FIND_FLAG_WITH_VALUE =
+  /^-(?:name|iname|path|ipath|lname|ilname|regex|iregex|type|xtype|fstype|perm|user|uid|group|gid|size|links|inum|maxdepth|mindepth|newer|newermt|newerat|newerct|mtime|atime|ctime|used|context|fprint|fprint0|fprintf|printf|print0|D|O)$/;
+
+interface FindDestructive {
+  delete: boolean;
+  execPayloads: string[][];
+  roots: string[];
+}
+
+/** Parse one find argv: search roots, `-delete`, and every `-exec`/`-execdir` payload (the words
+ *  between the flag and its `;`/`+` terminator — shellWords already stripped the quoting a real
+ *  shell needs around `\;`). An UNTERMINATED payload is still judged: its words are visible to
+ *  the scan, and ignoring them would be the fail-open direction. */
+function parseFindDestructive(words: string[]): FindDestructive | null {
+  if ((words[0]?.split("/").pop() ?? "").toLowerCase() !== "find") return null;
+  let deleting = false;
+  const execPayloads: string[][] = [];
+  let payload: string[] | null = null;
+  const roots: string[] = [];
+  let expectValue = false;
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index];
+    if (payload !== null) {
+      if (word !== ";" && word !== "+") payload.push(word);
+      else payload = null;
+      continue;
+    }
+    if (expectValue) {
+      expectValue = false;
+    } else if (word === "-delete") {
+      deleting = true;
+    } else if (word === "-exec" || word === "-execdir") {
+      payload = [];
+      execPayloads.push(payload);
+    } else if (word === "--") {
+      roots.push(...words.slice(index + 1));
+      break;
+    } else if (word.startsWith("-")) {
+      if (FIND_FLAG_WITH_VALUE.test(word)) expectValue = true;
+    } else {
+      roots.push(word);
+    }
+  }
+  return { delete: deleting, execPayloads, roots };
+}
+
+/** xargs options that consume the NEXT word as their value (attached forms like `-n2`, `-I{}`
+ *  and `--flag=v` carry the value inside the same word and need no skip). */
+const XARGS_FLAG_WITH_VALUE =
+  /^(?:-[EeIiJLlnPsSdaR]|--(?:arg-file|args-file|delimiter|eof|replace|max-lines|max-args|max-chars|max-procs|max-stride))$/;
+
+/** The trailing command an xargs argv delivers (its argv after xargs's own flags), or null when
+ *  xargs would run its default /bin/echo. The command's targets come over stdin and are invisible
+ *  to argv parsing — which is exactly why the delivered command itself is what gets judged. */
+function xargsTrailingCommand(words: string[]): string[] | null {
+  let index = 1;
+  for (; index < words.length; index += 1) {
+    const word = words[index];
+    if (word === "--") {
+      const afterSeparator = words.slice(index + 1);
+      return afterSeparator.length > 0 ? afterSeparator : null;
+    }
+    if (XARGS_FLAG_WITH_VALUE.test(word)) {
+      index += 1; // skip the flag's value word
+      continue;
+    }
+    if (word.startsWith("-") && word !== "-") continue; // xargs's own flag
+    break; // first non-flag word: the delivered command's argv[0]
+  }
+  const trailing = words.slice(index);
+  return trailing.length > 0 ? trailing : null;
+}
+
+/** A destructive delete delivered through another tool's argv, with a description for the confirm
+ *  dialog — or null when the segment is not one. Exported for the integration tests. */
+export function segmentDestructiveDelivery(segment: string): string | null {
+  const words = shellWords(commandBody(segment));
+  const word = (words[0]?.split("/").pop() ?? "").toLowerCase();
+  if (word === "find") {
+    const parsed = parseFindDestructive(words);
+    if (parsed?.delete) return "find -delete (deletes every match)";
+    if (parsed && parsed.execPayloads.some((payload) => deliveredCommandDestructive(payload))) {
+      return `find -exec ${parsed.execPayloads.find((payload) => deliveredCommandDestructive(payload))?.[0]} (runs it on every match)`;
+    }
+    return null;
+  }
+  if (word === "xargs") {
+    const trailing = xargsTrailingCommand(words);
+    if (trailing && deliveredCommandDestructive(trailing)) {
+      return `xargs ${trailing[0]} (runs it on everything piped in)`;
+    }
+    return null;
+  }
+  if (word === "shred") return "shred (irrecoverable file overwrite)";
+  return null;
+}
+
+/** The destructive-delivery description for the first matching segment of a command, or null. */
+export function destructiveDeliveryWhy(command: string): string | null {
+  for (const segment of shellSegments(command)) {
+    const why = segmentDestructiveDelivery(segment);
+    if (why !== null) return why;
+  }
+  return null;
+}
+
+/** Search roots of every find invocation whose own action destroys what it walks (-delete or a
+ *  destructive -exec payload) — the find sibling of recursiveForceRmTargets, feeding the same
+ *  ROOT_TARGET hard block as `rm -rf /` and `rm -rf ~`. */
+export function destructiveFindRootTargets(command: string): string[][] {
+  const invocations: string[][] = [];
+  for (const segment of shellSegments(command)) {
+    const parsed = parseFindDestructive(shellWords(commandBody(segment)));
+    if (!parsed) continue;
+    if (!parsed.delete && !parsed.execPayloads.some((payload) => deliveredCommandDestructive(payload))) continue;
+    invocations.push(parsed.roots);
+  }
+  return invocations;
+}
+
 const COMMAND_PREFIX = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*'))\s+)*(?:sudo\s+)?(?:command\s+)?/i;
 const FILE_REDIRECT = /(?<![0-9&>])>>?(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 
@@ -265,6 +418,151 @@ export function isShellFileWrite(command: string): boolean {
     if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i[A-Za-z]*\b)/i.test(body)) return true;
     return false;
   });
+}
+
+// ── Interpreter one-liner file writes ──────────────────────────────────────────────────────────
+// An interpreter one-liner is the shell channel's OTHER file writer: `python3 -c
+// "open('/Users/x/.zshenv','a').write('…')"` planted a persistence implant with no gate at all
+// (audit, 2026-10-11) — isShellFileWrite never saw it because argv[0] is python3, not a writer.
+// High-confidence idioms only, argv-parsed (the inline payload word after -c/-e/--eval, or a
+// heredoc body — never a script FILE, whose contents are not ours to judge):
+//   python -c / -<< : open(PATH, MODE) with a write-mode MODE
+//   node -e / --eval : writeFile/appendFile/createWriteStream(PATH) or open(PATH, 'w…')
+//   ruby -e          : File.write(PATH) or (File.)open(PATH, 'w…')
+//   perl -e          : open(HANDLE, '>', PATH) (perl -i is already handled above)
+// Returns the write TARGET: the extracted literal path, "" when the idiom is present but the target
+// expression is dynamic (unknown — callers must fail closed), or null when no write idiom is
+// present. A LITERAL in-project target behaves like a normal in-project write; everything else
+// takes the same shell-write block tee/echo take.
+
+/** A write-mode argument: any mode string containing w/a/x/+ (python/node/ruby) — 'r' and 'rb'
+ *  alone stay reads. */
+const WRITABLE_MODE = /[wax+]/;
+
+/** python: open(PATH, MODE) with a write-mode MODE — literal PATH, or a detected write with a
+ *  dynamic target when the first argument is anything but a quoted literal. */
+function pythonWriteTarget(payload: string): string | null {
+  for (const match of payload.matchAll(
+    /\bopen\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))\s*,\s*(?:"([^"\n]*)"|'([^'\n]*)')/g,
+  )) {
+    if (WRITABLE_MODE.test(match[3] ?? match[4] ?? "")) return match[1] ?? match[2] ?? "";
+  }
+  return null;
+}
+
+/** node: fs.writeFile/appendFile/createWriteStream(PATH) (writes by definition), or open(PATH,
+ *  MODE) with a write-mode MODE. console.log and friends are not write calls and never match. */
+function nodeWriteTarget(payload: string): string | null {
+  for (const match of payload.matchAll(
+    /\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))/g,
+  )) {
+    return match[1] ?? match[2] ?? "";
+  }
+  for (const match of payload.matchAll(
+    /\bopen(?:Sync)?\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))\s*,\s*(?:"([^"\n]*)"|'([^'\n]*)')/g,
+  )) {
+    if (WRITABLE_MODE.test(match[3] ?? match[4] ?? "")) return match[1] ?? match[2] ?? "";
+  }
+  return null;
+}
+
+/** ruby: File.write(PATH), or (File.)open(PATH, MODE) with a write-mode MODE. */
+function rubyWriteTarget(payload: string): string | null {
+  for (const match of payload.matchAll(
+    /\bFile\.write\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))/g,
+  )) {
+    return match[1] ?? match[2] ?? "";
+  }
+  for (const match of payload.matchAll(
+    /\b(?:File\.)?open\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|(?:(?!"|')[^,()\n]+))\s*,\s*(?:"([^"\n]*)"|'([^'\n]*)')/g,
+  )) {
+    if (WRITABLE_MODE.test(match[3] ?? match[4] ?? "")) return match[1] ?? match[2] ?? "";
+  }
+  return null;
+}
+
+/** perl: open(HANDLE, MODE, PATH) or two-arg open(HANDLE, ">PATH") — a leading > / +> mode writes. */
+function perlWriteTarget(payload: string): string | null {
+  for (const match of payload.matchAll(
+    /\bopen\(\s*[A-Za-z_]\w*\s*,\s*(?:"([^"\n]*)"|'([^'\n]*)')\s*(?:,\s*(?:"([^"\n]*)"|'([^'\n]*)'))?/g,
+  )) {
+    const arg = match[1] ?? match[2] ?? "";
+    if (match[3] !== undefined || match[4] !== undefined) {
+      if (/^[>+]|[wax]/.test(arg)) return match[3] ?? match[4] ?? "";
+    } else if (/^[>+]/.test(arg)) {
+      return arg.replace(/^[>+\s]+/, "");
+    }
+  }
+  return null;
+}
+
+type InterpreterKind = "python" | "node" | "ruby" | "perl";
+
+/** The inline payload of an interpreter one-liner segment — the word after -c (python) or
+ *  -e/--eval (node/ruby/perl), or the heredoc body a `<< MARKER` introduces — or null when this
+ *  segment is not an interpreter one-liner. */
+function interpreterInlinePayload(
+  segment: string,
+  command: string,
+): { kind: InterpreterKind; payload: string } | null {
+  const body = commandBody(segment);
+  const words = shellWords(body);
+  const word = (words[0]?.split("/").pop() ?? "").toLowerCase();
+  const kind: InterpreterKind | null =
+    /^python\d*(?:\.\d+)?$/.test(word) || /^pypy\d*$/.test(word)
+      ? "python"
+      : word === "node"
+        ? "node"
+        : word === "ruby"
+          ? "ruby"
+          : word === "perl"
+            ? "perl"
+            : null;
+  if (kind === null) return null;
+  // The inline payload: the word after -c (python) or -e/--eval (node/ruby/perl).
+  for (const flag of kind === "python" ? ["-c"] : ["-e", "--eval"]) {
+    const flagIndex = words.indexOf(flag, 1);
+    if (flagIndex !== -1 && words[flagIndex + 1] !== undefined) {
+      return { kind, payload: words[flagIndex + 1] };
+    }
+  }
+  // Heredoc form (python -<<): the script sits in the lines after the marker, which
+  // shellSegments splits into separate segments — so the payload is recovered from the original
+  // command text, up to the marker line.
+  const marker = /<<\s*(?:'([A-Za-z_]\w*)'|([A-Za-z_]\w*))\s*$/.exec(body);
+  if (marker) {
+    const at = command.indexOf(segment);
+    if (at !== -1) {
+      const lines = command.slice(at + segment.length).split("\n");
+      const script: string[] = [];
+      for (const line of lines) {
+        if (line.trim() === marker[1] || line.trim() === marker[2]) break;
+        script.push(line);
+      }
+      return { kind, payload: script.join("\n") };
+    }
+  }
+  return null;
+}
+
+/** The write target of an interpreter one-liner file write anywhere in a command: the extracted
+ *  literal path, "" when a write idiom is present but the target is dynamic, or null when no
+ *  write idiom is present. */
+export function interpreterWriteTarget(command: string): string | null {
+  for (const segment of shellSegments(command)) {
+    const inline = interpreterInlinePayload(segment, command);
+    if (inline === null) continue;
+    const target =
+      inline.kind === "python"
+        ? pythonWriteTarget(inline.payload)
+        : inline.kind === "node"
+          ? nodeWriteTarget(inline.payload)
+          : inline.kind === "ruby"
+            ? rubyWriteTarget(inline.payload)
+            : perlWriteTarget(inline.payload);
+    if (target !== null) return target;
+  }
+  return null;
 }
 
 /** Ignore literal echo/printf payloads when classifying risk; they are data, not executed commands. */
@@ -449,7 +747,11 @@ const SYSTEM: Array<[RegExp, string]> = [
   [/\bdeno\s+install\b[^\n]*\s(-g|--global)\b/i, "install a global command with deno"],
   [/\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/i, "run a script straight from the internet"],
   [/\bgit\s+config\s+--global\b|\bgit\s+remote\s+(add|set-url|remove|rm)\b/i, "change your git setup (where your code gets sent)"],
-  [/(~|\$HOME|\/Users\/[^/\s]+|\/home\/[^/\s]+)\/\.(bashrc|zshrc|bash_profile|zprofile|profile)\b|>\s*\/etc\/|\bcrontab\s+[^-]|\blaunchctl\s+(load|unload|bootstrap)\b|\bsystemctl\s+(enable|start|stop|disable)\b/i, "change your system or startup settings"],
+  // The rc-file alternation is the PERSISTENCE set, so it must carry every file a shell (or git)
+  // actually sources, not just the classics: .zshenv is sourced by EVERY zsh invocation (login or
+  // not — a .zshenv-only implant survives where a .zshrc one never fires), .zlogin/.bash_login sit
+  // on the login path, .gitconfig persists via core.pager/alias, and .inputrc rides readline.
+  [/(~|\$HOME|\/Users\/[^/\s]+|\/home\/[^/\s]+)\/\.(bashrc|zshrc|zshenv|bash_profile|bash_login|zprofile|zlogin|profile|gitconfig|inputrc)\b|>\s*\/etc\/|\bcrontab\s+[^-]|\blaunchctl\s+(load|unload|bootstrap)\b|\bsystemctl\s+(enable|start|stop|disable)\b/i, "change your system or startup settings"],
 ];
 const DATABASE: Array<[RegExp, string]> = [
   [/\bprisma\s+migrate\s+(dev|deploy|resolve)\b|\bprisma\s+db\s+push\b/i, "apply a Prisma schema change to the database"],
@@ -806,7 +1108,13 @@ function classifySegmentClasses(segment: string): GuardClass[] {
   const classes: GuardClass[] = [];
   const body = commandBody(segment);
   if (CATASTROPHIC.some(([pattern]) => pattern.test(body))) classes.push("catastrophic");
-  if (DANGEROUS.some(([pattern]) => pattern.test(body)) || isRecursiveForceRm(body)) classes.push("dangerous");
+  if (
+    DANGEROUS.some(([pattern]) => pattern.test(body)) ||
+    isRecursiveForceRm(body) ||
+    segmentDestructiveDelivery(segment) !== null
+  ) {
+    classes.push("dangerous");
+  }
   if (DATABASE.some(([pattern]) => pattern.test(body))) classes.push("database");
   if (OUTWARD.some(([pattern]) => pattern.test(body))) classes.push("outward");
   if (SYSTEM.some(([pattern]) => pattern.test(body))) classes.push("system");
@@ -1220,12 +1528,25 @@ export default function (pi: ExtensionAPI) {
       // Never let a shell-writing workaround bypass structured file safety. This also prevents
       // documentation such as `echo '... prisma migrate reset ...' >> SETUP.md` from being mistaken
       // for an attempt to reset the database: the unsafe write mechanism is rejected first.
-      if (isShellFileWrite(cmd)) {
+      //
+      // Interpreter one-liners are the shell channel's OTHER writer (python -c open(), node -e
+      // fs.writeFile, ruby -e File.write). Only their OUT-OF-PROJECT or unresolvable targets take
+      // this block: a literal in-project target is the model's normal write route and behaves like
+      // the write tool's own in-project case (no extra gate). A dynamic target expression is
+      // unknown, and unknown fails closed — out-of-project — here.
+      const interpreterTarget = interpreterWriteTarget(cmd);
+      const interpreterOutsideWrite = (() => {
+        if (interpreterTarget === null) return false;
+        if (interpreterTarget === "") return true;
+        const abs = resolve(ctx.cwd, interpreterTarget);
+        return abs !== ctx.cwd && !abs.startsWith(ctx.cwd + sep);
+      })();
+      if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
         if (ctx.hasUI) ctx.ui.notify("Vinci tried to write a file through the shell — switching to the safer file editor.", "info");
         sendVinciControl(
           pi,
           "vinci-shell-write-block",
-          "That shell command was blocked because it writes file content. Use write for a necessary project file or edit for a targeted project change, then re-read the file to verify it. For a one-off diagnostic, use an inline command or the repository's existing focused test instead of creating a scratch file inside or outside the project. Do not retry with echo, printf, tee, heredocs, sed -i, or perl -pi.",
+          "That shell command was blocked because it writes file content. Use write for a necessary project file or edit for a targeted project change, then re-read the file to verify it. For a one-off diagnostic, use an inline command or the repository's existing focused test instead of creating a scratch file inside or outside the project. Do not retry with echo, printf, tee, heredocs, sed -i, perl -pi, or interpreter one-liners (python -c open(), node -e fs.writeFile, ruby -e File.write).",
         );
         return { block: true, reason: "Vinci blocked a shell-based file write; use the structured write or edit tool instead." };
       }
@@ -1506,19 +1827,30 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // Catastrophic: fixed patterns + a recursive-force rm aimed at / or home. Only inspect rm's
-      // parsed operands so a home path used by an earlier cd does not create a false positive.
+      // Catastrophic: fixed patterns + a recursive-force rm aimed at / or home — plus the same
+      // delete delivered through find's own action (-delete, destructive -exec) on a root/home
+      // search root. Only inspected parsed operands so a home path used by an earlier cd does not
+      // create a false positive.
       const cata = CATASTROPHIC.find(([re]) => re.test(riskText));
       const rmRoot = recursiveForceRmTargets(riskText).some((targets) => targets.some((target) => ROOT_TARGET.test(target)));
-      if (cata || rmRoot) {
-        const why = cata ? cata[1] : "rm -rf on / or your home directory";
+      const findRoot = destructiveFindRootTargets(riskText).some((targets) =>
+        targets.some((target) => ROOT_TARGET.test(target)),
+      );
+      if (cata || rmRoot || findRoot) {
+        const why = cata ? cata[1] : rmRoot ? "rm -rf on / or your home directory" : "find -delete/-exec on / or your home directory";
         if (ctx.hasUI) ctx.ui.notify(`Vinci blocked a catastrophic command: ${why}.`, "error");
         return { block: true, reason: `Vinci refuses to run this — ${why}. It is never safe. If you truly mean it, run it yourself outside Vinci.` };
       }
 
-      // Dangerous: a recursive-force rm (non-root) or a listed pattern → confirm.
+      // Dangerous: a recursive-force rm (non-root), a delivered destructive command (find -delete,
+      // find -exec rm, xargs rm, shred), or a listed pattern → confirm.
       const danger = confirmedClasses.has("dangerous") ? undefined : DANGEROUS.find(([re]) => re.test(riskText));
-      const why = danger ? danger[1] : isRecursiveForceRm(riskText) ? "recursive force delete (rm -rf)" : null;
+      const deliveryWhy = destructiveDeliveryWhy(riskText);
+      const why = danger
+        ? danger[1]
+        : isRecursiveForceRm(riskText)
+          ? "recursive force delete (rm -rf)"
+          : deliveryWhy;
       if (why) {
         // [W2 bucket: KEEP-BLOCKING] Same class as the network-branch DANGEROUS check above, plus a
         // non-root `rm -rf`. Destroys the work in progress. A lease over paths is not authority to

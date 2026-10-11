@@ -394,6 +394,156 @@ try {
     );
   }
 
+  // ── Destructive delivery through find / xargs / shred ──────────────────────────────────────
+  // The rm classifier keys on argv[0] === "rm", so the same delete reached through another tool's
+  // argv classified as nothing: `find ~ -type f -delete`, `ls ~ | xargs rm -rf`,
+  // `find ~ -name '*' -exec rm -rf {} +` and `shred` all ran with no confirm and no gate. The new
+  // rules extend the SAME structured argv parsing and land in the SAME tiers rm -rf uses: a
+  // root-targeted delete hard-blocks, everything else keeps the dangerous-class confirm.
+  for (const command of [
+    "find ~ -type f -delete",
+    "find $HOME -type f -delete",
+    "find ~ -name '*' -exec rm -rf {} +",
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `root-targeted destructive delivery hard-blocks like rm -rf ~: ${command}`,
+      result?.block === true && /never safe/i.test(result.reason) && selections.length === selectionCount,
+    );
+  }
+
+  for (const command of [
+    "ls ~ | xargs rm -rf",
+    "find . -name '*.log' -exec rm {} \\;",
+    `find ${workspace} -name '*.log' -delete`,
+    "shred ./scratch.bin",
+    "ls | xargs shred",
+    "git ls-files | xargs rm",
+    "ls ~ | xargs sh -c 'rm -rf $0'",
+  ]) {
+    const selectionCount = selections.length;
+    nextSelection = "Yes, run it";
+    const result = await toolCall("bash", { command });
+    nextSelection = undefined;
+    check(
+      `non-root destructive delivery keeps the dangerous confirmation: ${command}`,
+      result === undefined && selections.length === selectionCount + 1 && /risky command/i.test(selections.at(-1)?.title ?? ""),
+    );
+  }
+
+  // The benign must-pass list: ordinary find/xargs searches and builds get NO new prompts (the
+  // build-tools session grant was approved above; `xargs sed -i` keeps its existing behavior).
+  for (const command of [
+    "find . -name '*.ts' -not -path '*/node_modules/*'",
+    "ls | xargs grep foo",
+    "find . -type f | xargs wc -l",
+    "git ls-files | xargs sed -i 's/a/b/'",
+    "python3 script.py",
+    'node -e "console.log(1)"',
+    "pip install requests",
+    "npm install",
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `benign find/xargs/build tooling stays unprompted: ${command}`,
+      result === undefined && selections.length === selectionCount,
+    );
+  }
+
+  // ── Interpreter one-liner file writes ───────────────────────────────────────────────────────
+  // python -c / node -e / ruby -e are the shell channel's other file writer: a .zshenv implant
+  // one-liner wrote persistence with no gate. Out-of-project targets take the same block tee/echo
+  // take; a literal in-project target behaves like a normal in-project write (no extra gate).
+  const userHome = homedir();
+  for (const [command, label] of [
+    [`python3 -c "open('${userHome}/.zshenv','a').write('export EVIL=1 #')"`, "python -c appending to ~/.zshenv"],
+    [`node -e "require('fs').writeFileSync('${userHome}/.zshrc','evil')"`, "node -e writing ~/.zshrc"],
+    [`ruby -e "File.open('${userHome}/.zprofile','a'){|f| f.write('x')}"`, "ruby -e writing ~/.zprofile"],
+    [`python3 - <<'EOF'\nopen('${userHome}/.zshenv','a').write('x')\nEOF`, "python heredoc appending to ~/.zshenv"],
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `an out-of-project interpreter write is blocked as a shell file write: ${label}`,
+      result?.block === true && /shell-based file write/i.test(result.reason) && selections.length === selectionCount,
+    );
+  }
+
+  for (const command of [
+    `python3 -c "open('out.txt','w').write('hi')"`,
+    `node -e "require('fs').writeFileSync('out.txt','hi')"`,
+    `node -e "console.log('open( was just a string')"`,
+    `python3 -c "print(open('notes.md').read())"`,
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `an in-project interpreter one-liner stays unprompted: ${command}`,
+      result === undefined && selections.length === selectionCount,
+    );
+  }
+
+  // ── Persistence-sensitive rc files ──────────────────────────────────────────────────────────
+  // .zshenv is sourced by EVERY zsh (login or not), .zlogin/.bash_login sit on the login path,
+  // .gitconfig persists via core.pager/alias, .inputrc rides readline: they join the SYSTEM
+  // alternation .bashrc/.zshrc already had. echo/tee into them stay the shell-write block (blocked
+  // before any dialog); the SYSTEM confirm covers the non-echo routes (cp/ln/cat).
+  for (const [command, label] of [
+    [`cp dotfiles/zshenv ${userHome}/.zshenv`, "cp into ~/.zshenv"],
+    [`cp dotfiles/gitconfig ${userHome}/.gitconfig`, "cp into ~/.gitconfig"],
+    [`ln -sf repo/inputrc ${userHome}/.inputrc`, "ln into ~/.inputrc"],
+    [`cat dotfiles/zlogin >> ${userHome}/.zlogin`, "cat >> ~/.zlogin"],
+  ]) {
+    const selectionCount = selections.length;
+    nextSelection = "No, don't";
+    const result = await toolCall("bash", { command });
+    nextSelection = undefined;
+    check(
+      `${label} confirms as a system change`,
+      result?.block === true &&
+        selections.length === selectionCount + 1 &&
+        /changes your computer/i.test(selections.at(-1)?.title ?? ""),
+    );
+  }
+
+  {
+    const selectionCount = selections.length;
+    nextSelection = "No, don't";
+    const result = await toolCall("bash", { command: `cp dotfiles/zshrc ${userHome}/.zshrc` });
+    nextSelection = undefined;
+    check(
+      "the pre-existing .zshrc alternation keeps its system confirm",
+      result?.block === true && selections.length === selectionCount + 1 && /changes your computer/i.test(selections.at(-1)?.title ?? ""),
+    );
+  }
+
+  for (const [command, label] of [
+    [`echo 'x' >> ${userHome}/.zshenv`, "echo into ~/.zshenv"],
+    [`tee ${userHome}/.gitconfig`, "tee ~/.gitconfig"],
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `${label} stays the shell-write block (blocked before any dialog)`,
+      result?.block === true && /shell-based file write/i.test(result.reason) && selections.length === selectionCount,
+    );
+  }
+
+  for (const [command, label] of [
+    ["cp dotfiles/zshenv ./zshenv", "a project-local zshenv copy"],
+    ["echo 'x' >> ./zshenv", "a project-local echo redirect"],
+  ]) {
+    const result = await toolCall("bash", { command });
+    check(
+      `${label} keeps its existing behavior (no SYSTEM confirm without a home prefix)`,
+      label.includes("echo")
+        ? result?.block === true && /shell-based file write/i.test(result.reason)
+        : result === undefined,
+    );
+  }
+
   // No SILENT auto-grant: two adversarial reviews showed a shell command can't be classified "safe to
   // network" (endpoint override, argv[0] impostor, command substitution). EVERY network command — direct
   // cloud, wrapped script, curl — takes the one-command prompt. isCloudDeployCommand only routes cloud
