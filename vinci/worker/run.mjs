@@ -1202,7 +1202,8 @@ export function applyEnvDelta(base, delta) {
 // rather than a tripped limit. Without a signal the function is unchanged.
 // `env` (clean-room mode, #24) and `envDelta` (unattended policy, W2) are orthogonal to it: all
 // three are optional and compose.
-export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, envDelta, abortSignal }) {
+// `onSpawn` is an optional trusted daemon observer, never a task-supplied setting.
+export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, envDelta, abortSignal, onSpawn }) {
   const sessionDir = join(stateDir, "sessions", taskId);
   const pollMs = Number(process.env.VINCI_WORKER_LIMIT_POLL_MS) || 15_000;
   const killGraceMs = Number(process.env.VINCI_WORKER_KILL_GRACE_MS) || 30_000;
@@ -1313,6 +1314,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
     };
     child.once("error", () => finish(1, null));
     child.once("close", finish);
+    onSpawn?.(child);
   });
 }
 

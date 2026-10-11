@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -94,6 +94,16 @@ function vinciRecordLines(fixture) {
 function processExists(pid) {
   try {
     process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+function processGroupExists(pid) {
+  try {
+    process.kill(-pid, 0);
     return true;
   } catch (error) {
     if (error.code === 'ESRCH') return false;
@@ -852,6 +862,231 @@ for (const startupDelayMs of [0, 1200]) {
     }
   });
 }
+
+for (const authority of ['work', 'both', 'branch']) {
+  for (const behavior of ['cooperative', 'ignore', 'descendant']) {
+    await test(`SIGTERM ${authority} authority with ${behavior} task: stop the group before release and preserve resume`, async () => {
+      const fixture = new WorkerTestFixture('lease-sigterm-authority');
+      const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1 });
+      const groupAtWorkRelease = [];
+      const groupAtBranchRelease = [];
+      const branchAcquires = [];
+      let worker = null;
+      let childPid = null;
+      await governor.start();
+      const handleGovernor = governor.handle.bind(governor);
+      governor.handle = (request, response) => {
+        if (request.url.endsWith('/release')) groupAtWorkRelease.push(processGroupExists(childPid));
+        return handleGovernor(request, response);
+      };
+      try {
+        fixture.createRepo('test', 'repo');
+        fixture.linkTools(TOOLS);
+        await fixture.startBus([
+          handoff('118', 'w5', 'repo: test/repo\nevidence: pr\n\nTask'),
+          handoff('119', 'w5', 'repo: test/repo\nevidence: pr\n\nNext task'),
+        ]);
+        const handleBus = fixture.busServer.listeners('request')[0];
+        fixture.busServer.removeListener('request', handleBus);
+        fixture.busServer.on('request', (request, response) => {
+          if (!request.url.startsWith('/v1/branch-leases')) return handleBus(request, response);
+          if (request.method === 'POST') branchAcquires.push(request.url);
+          if (request.method === 'DELETE') groupAtBranchRelease.push(processGroupExists(childPid));
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ ok: true, valid: true, lease: { repo: 'test/repo', branch: 'worker/118', fencing_generation: 200 } }));
+        });
+        const readyFile = join(fixture.tempDir, 'signal-ready');
+        const descendantReady = join(fixture.tempDir, 'descendant-ready');
+        const pulseFile = join(fixture.tempDir, 'task-pulse');
+        worker = spawnWorker(fixture, 'w5', authority === 'branch' ? [] : ['--governor', governor.url], {
+          VINCI_BRANCH_LEASE: authority === 'work' ? '0' : '1',
+          VINCI_WORKER_LEASE_KILL_GRACE_MS: '200',
+          FAKE_VINCI_SLEEP: '30000',
+          FAKE_VINCI_READY_FILE: readyFile,
+          FAKE_VINCI_IGNORE_SIGTERM: behavior === 'ignore' ? '1' : '0',
+          FAKE_VINCI_DESCENDANT_READY_FILE: behavior === 'descendant' ? descendantReady : '',
+          FAKE_VINCI_PULSE_FILE: pulseFile,
+        });
+        await waitFor(() => fixture.getVinciCalls().length === 1, { label: 'the actual task invocation' });
+        childPid = fixture.getVinciCalls()[0].pid;
+        assert(Number.isInteger(childPid) && childPid > 0);
+        await waitFor(() => {
+          try { return Number(readFileSync(readyFile, 'utf8')) === childPid; }
+          catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+        }, { label: 'the exact task PID signal readiness' });
+        await waitFor(() => {
+          try { return Number(readFileSync(pulseFile, 'utf8')) >= 2; }
+          catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+        }, { label: 'the ready task to execute two pulse callbacks' });
+        const descendantPid = behavior === 'descendant' ? Number(readFileSync(descendantReady, 'utf8')) : null;
+        assert.equal(processExists(childPid), true);
+        if (descendantPid) assert.equal(processExists(descendantPid), true);
+        worker.proc.kill('SIGTERM');
+        const { code, stderr } = await waitForWorkerClose(worker);
+        assert.equal(code, 0, stderr);
+        await waitFor(() => !processGroupExists(childPid), { timeoutMs: 5000, label: 'the owned task group to disappear' });
+        assert.equal(processExists(childPid), false);
+        if (descendantPid) {
+          assert.equal(processExists(descendantPid), false, 'leader close must not cancel escalation for an ignoring descendant');
+          assert(vinciRecordLines(fixture).includes('DESCENDANT_SIGTERM'), 'the actual descendant observed the group SIGTERM');
+        }
+        assert(vinciRecordLines(fixture).includes('SIGTERM'));
+        assert.deepEqual(groupAtWorkRelease, authority === 'branch' ? [] : [false], 'work release occurs only after native group absence');
+        assert.deepEqual(groupAtBranchRelease, authority === 'work' ? [] : [false], 'branch release occurs only after native group absence');
+        assert.equal(branchAcquires.length, authority === 'work' ? 0 : 1);
+        assert.equal(state(fixture, '118').state, 'RUNNING');
+        assert.equal(existsSync(join(fixture.tempDir, 'tasks', '119.json')), false, 'shutdown must not start the next queued task');
+        assert.equal(fixture.getVinciCalls().length, 1);
+        assert.deepEqual(JSON.parse(readFileSync(join(fixture.tempDir, 'cursor.json'), 'utf8')).w5, { ts: '2000-01-01T00:00:00.000Z', message_ids: [] });
+        assert.equal(originHasBranch(join(fixture.reposDir, 'test', 'repo.git'), 'worker/118'), false);
+        assert.equal(ghCalls(fixture).length, 0);
+        assert(fixture.getPostedMessages().some((message) => message.subject === 'task 118 claimed' && message.in_reply_to === '118'));
+        assert.equal(fixture.getPostedMessages().some((message) => message.in_reply_to === '118' && message.outcome !== undefined), false, 'shutdown must not post any terminal outcome');
+        const pulseAfter = readFileSync(pulseFile, 'utf8');
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+        assert.equal(readFileSync(pulseFile, 'utf8'), pulseAfter, 'the stopped task cannot execute another pulse');
+      } finally {
+        let cleanupError = null;
+        if (Number.isInteger(childPid)) {
+          try { process.kill(-childPid, 'SIGKILL'); }
+          catch (error) { if (error.code !== 'ESRCH') cleanupError = error; }
+        }
+        try {
+          worker?.proc.kill('SIGKILL');
+          if (worker) await waitForWorkerClose(worker);
+          if (Number.isInteger(childPid)) await waitFor(() => !processGroupExists(childPid), { timeoutMs: 5000, label: 'the cleanup task group to disappear' });
+        } catch (error) {
+          cleanupError ??= error;
+        } finally {
+          await governor.close();
+          await fixture.cleanup();
+        }
+        if (cleanupError) throw cleanupError;
+      }
+    });
+  }
+}
+
+await test('SIGTERM during post-run readHead: retain descendant tracking and refuse terminal publication', async () => {
+  const fixture = new WorkerTestFixture('lease-sigterm-post-run');
+  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1 });
+  const groupAtWorkRelease = [];
+  const groupAtBranchRelease = [];
+  let worker = null;
+  let childPid = null;
+  let gitPid = null;
+  await governor.start();
+  const handleGovernor = governor.handle.bind(governor);
+  governor.handle = (request, response) => {
+    if (request.url.endsWith('/release')) groupAtWorkRelease.push(processGroupExists(childPid));
+    return handleGovernor(request, response);
+  };
+  try {
+    fixture.createRepo('test', 'repo');
+    fixture.linkTools(TOOLS);
+    const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' });
+    assert.equal(realGit.status, 0, realGit.stderr);
+    const exitMarker = join(fixture.tempDir, 'run-exited');
+    const gitPaused = join(fixture.tempDir, 'git-paused');
+    const gitContinue = join(fixture.tempDir, 'git-continue');
+    const gitResolved = join(fixture.tempDir, 'git-resolved');
+    const gitWrapper = join(fixture.toolsDir, 'git');
+    // Forward real Git; pause only the worker's HEAD read after the actual task leader exits.
+    writeFileSync(gitWrapper, `#!/usr/bin/env node
+import { existsSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const args = process.argv.slice(2);
+const paused = existsSync(${JSON.stringify(exitMarker)}) && args.includes('rev-parse') && args.at(-1) === 'HEAD';
+if (paused) {
+  writeFileSync(${JSON.stringify(gitPaused)}, String(process.pid));
+  const deadline = Date.now() + 5000;
+  while (!existsSync(${JSON.stringify(gitContinue)})) {
+    if (Date.now() >= deadline) { console.error('The post-run Git fixture timed out; release its pause marker.'); process.exit(1); }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+const result = spawnSync(${JSON.stringify(realGit.stdout.trim())}, args, { encoding: 'utf8', timeout: 5000 });
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+if (paused && result.status === 0) writeFileSync(${JSON.stringify(gitResolved)}, String(process.pid));
+process.exit(result.status ?? 1);
+`);
+    chmodSync(gitWrapper, 0o755);
+    await fixture.startBus([handoff('118', 'w5', 'repo: test/repo\nevidence: pr\n\nTask')]);
+    const handleBus = fixture.busServer.listeners('request')[0];
+    fixture.busServer.removeListener('request', handleBus);
+    fixture.busServer.on('request', (request, response) => {
+      if (!request.url.startsWith('/v1/branch-leases')) return handleBus(request, response);
+      if (request.method === 'DELETE') groupAtBranchRelease.push(processGroupExists(childPid));
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ ok: true, valid: true, lease: { repo: 'test/repo', branch: 'worker/118', fencing_generation: 200 } }));
+    });
+    const descendantReady = join(fixture.tempDir, 'descendant-ready');
+    worker = spawnWorker(fixture, 'w5', ['--governor', governor.url], {
+      VINCI_BRANCH_LEASE: '1',
+      VINCI_WORKER_LEASE_KILL_GRACE_MS: '1000',
+      FAKE_VINCI_SLEEP: '1',
+      FAKE_VINCI_DESCENDANT_READY_FILE: descendantReady,
+      FAKE_VINCI_RUN_EXIT_MARKER: exitMarker,
+    });
+    try {
+      await waitFor(() => fixture.getVinciCalls().length === 1, { label: 'the actual post-run task invocation' });
+    } catch (error) {
+      throw new Error(`${error.message}; inspect the worker startup output: ${worker.stderr()}`);
+    }
+    childPid = fixture.getVinciCalls()[0].pid;
+    assert(Number.isInteger(childPid) && childPid > 0);
+    await waitFor(() => {
+      try { gitPid = Number(readFileSync(gitPaused, 'utf8')); return Number.isInteger(gitPid) && gitPid > 0; }
+      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    }, { label: 'the real post-run HEAD read to pause' });
+    assert.equal(Number(readFileSync(exitMarker, 'utf8')), childPid);
+    await waitFor(() => !processExists(childPid), { label: 'the actual task leader to exit before shutdown' });
+    const descendantPid = Number(readFileSync(descendantReady, 'utf8'));
+    assert(Number.isInteger(descendantPid) && descendantPid > 0);
+    assert.equal(processExists(descendantPid), true, 'the owned descendant remains after leader close');
+    assert.equal(processGroupExists(childPid), true);
+    worker.proc.kill('SIGTERM');
+    await waitFor(() => vinciRecordLines(fixture).includes('DESCENDANT_SIGTERM'), { label: 'the retained group to receive SIGTERM' });
+    assert.equal(processExists(descendantPid), true, 'the ignoring descendant keeps shutdown in flight');
+    writeFileSync(gitContinue, 'continue');
+    await waitFor(() => {
+      try { return Number(readFileSync(gitResolved, 'utf8')) === gitPid; }
+      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    }, { label: 'the actual HEAD read to succeed after the shutdown latch' });
+    const { code, stderr } = await waitForWorkerClose(worker);
+    assert.equal(code, 0, stderr);
+    assert.equal(processGroupExists(childPid), false);
+    assert.equal(processExists(descendantPid), false);
+    assert.deepEqual(groupAtWorkRelease, [false]);
+    assert.deepEqual(groupAtBranchRelease, [false]);
+    assert.deepEqual(governor.releases.map((release) => release.outcome), ['abandoned']);
+    assert.equal(state(fixture, '118').state, 'RUNNING');
+    assert.equal(originHasBranch(join(fixture.reposDir, 'test', 'repo.git'), 'worker/118'), false);
+    assert.equal(ghCalls(fixture).length, 0);
+    assert(fixture.getPostedMessages().some((message) => message.subject === 'task 118 claimed' && message.in_reply_to === '118'));
+    assert.equal(fixture.getPostedMessages().some((message) => message.in_reply_to === '118' && message.outcome !== undefined), false, 'a successful post-run await during shutdown must not publish any terminal outcome');
+    assert.deepEqual(JSON.parse(readFileSync(join(fixture.tempDir, 'cursor.json'), 'utf8')).w5, { ts: '2000-01-01T00:00:00.000Z', message_ids: [] });
+  } finally {
+    let cleanupError = null;
+    for (const [pid, group] of [[childPid, true], [gitPid, false]]) {
+      if (!Number.isInteger(pid)) continue;
+      try { process.kill(group ? -pid : pid, 'SIGKILL'); }
+      catch (error) { if (error.code !== 'ESRCH') cleanupError ??= error; }
+    }
+    try {
+      worker?.proc.kill('SIGKILL');
+      if (worker) await waitForWorkerClose(worker);
+      if (Number.isInteger(childPid)) await waitFor(() => !processGroupExists(childPid), { timeoutMs: 5000, label: 'the post-run cleanup group to disappear' });
+    } catch (error) {
+      cleanupError ??= error;
+    } finally {
+      await governor.close();
+      await fixture.cleanup();
+    }
+    if (cleanupError) throw cleanupError;
+  }
+});
 
 // ---------------------------------------------------------------------------------------------
 await test('--governor unset => no declaration, no digest, no lease fields, no fencing footer', async () => {
