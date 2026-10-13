@@ -26,9 +26,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  refuse-vinci-binaries:
+    if: github.repository == 'getsimpledirect/vinci-code' || github.repository == 'getsimpledirect/vinci-code-cli'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Use the signed Vinci product release workflow
+        run: |
+          echo "::error::Build Binaries is upstream Pi's release path. Tag the reviewed Vinci product commit as vinci-v<version> in getsimpledirect/vinci-code-cli instead."
+          exit 1
+
   # Keep the public GitHub Release publication last. Binary assets are staged in
   # a draft release first; cleanup removes the draft if later publishing fails.
   build:
+    # Match the existing upstream-only npm publisher; Vinci uses vinci-release.yml.
+    if: github.repository == 'badlogic/pi-mono'
     runs-on: ubuntu-latest
     permissions:
       contents: read

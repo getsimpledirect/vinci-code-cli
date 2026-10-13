@@ -194,6 +194,7 @@ jobs:
           aws-region: ca-central-1
 
       - name: Sign the TESTED archive (no rebuild) with a live-derived sequence
+        id: sign
         env:
           MINIMUM_VERSION: ${{ vars.VINCI_MINIMUM_VERSION || '0.0.09' }}
         run: |
@@ -207,9 +208,9 @@ jobs:
             --query SecretBinary --output text | base64 -d > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
 
-          # Live sequence: fetch, VERIFY signature against the repo trust root, validate as a safe
-          # integer — all inside Node. The value never enters shell arithmetic.
-          curl -fsSL "$MANIFEST_URL" > live-before.json
+          # Bind the next sequence to this exact live body and its ETag. Conditional activation
+          # below refuses a concurrent manifest change rather than overwriting it.
+          curl -fsSL --max-time 30 -D live-before.headers "$MANIFEST_URL" > live-before.json
           NEXT_SEQ="$(node --input-type=module <<'EOF'
           import { readFileSync } from "node:fs";
           import { createPublicKey, verify } from "node:crypto";
@@ -219,10 +220,13 @@ jobs:
             throw new Error("live manifest signature does not verify against the repo trust root");
           const s = m.signed.sequence;
           if (!Number.isSafeInteger(s) || s < 1) throw new Error(`bad live sequence: ${s}`);
+          if (s >= Number.MAX_SAFE_INTEGER) throw new Error("Live sequence has no safe successor. Resolve the sequence limit before publishing.");
           process.stdout.write(String(s + 1));
           EOF
           )"
           echo "next sequence: $NEXT_SEQ"
+          LIVE_ETAG="$(node -p "const h=require('fs').readFileSync('live-before.headers','utf8'); const blocks=h.trim().split(/\\r?\\n\\r?\\n/); const m=blocks.at(-1).match(/^etag:\\s*(\\S+)\\s*$/im); if(!m) throw new Error('Live manifest GET carried no ETag. Restore conditional manifest publishing before retrying.'); m[1]")"
+          printf 'live_etag=%s\n' "$LIVE_ETAG" >> "$GITHUB_OUTPUT"
 
           # Sign the DOWNLOADED artifact directly — create-update-manifest.mjs signs an existing
           # --artifact, so nothing is rebuilt or re-tarred on this runner.
@@ -284,8 +288,19 @@ jobs:
           console.log(`staged payload verified: sha ${staged.slice(0, 12)}…`);
           EOF
 
-      - name: Publish the manifest LAST — the single activation point
-        run: aws s3 cp release/manifest-beta.json "s3://${S3_BUCKET}/${S3_PREFIX}/"
+      - name: Publish the manifest LAST — compare-and-swap on the live ETag
+        env:
+          LIVE_ETAG: ${{ steps.sign.outputs.live_etag }}
+        run: |
+          set -euo pipefail
+          if aws s3api put-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/manifest-beta.json" \
+               --body release/manifest-beta.json --content-type application/json \
+               --if-match "$LIVE_ETAG"; then
+            echo "Signed release manifest activated against the observed live ETag."
+          else
+            echo "::error::Conditional manifest publication failed for ETag $LIVE_ETAG. Inspect the live manifest and prepare a new signed sequence before retrying."
+            exit 1
+          fi
 
       - name: Verify the LIVE manifest is byte-for-byte the one we signed
         run: |
@@ -306,9 +321,15 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          notes="vinci/release-notes/${VERSION}.md"
+          if [ -f "$notes" ]; then
+            note_args=(--notes-file "$notes")
+          else
+            note_args=(--generate-notes)
+          fi
           gh release create "$RELEASE_TAG" \
             --title "Vinci Code $VERSION" \
-            --generate-notes \
+            "${note_args[@]}" \
             "release/vinci-code-${VERSION}.tgz" \
             "release/vinci-code-${VERSION}.tgz.sha256" \
             release/manifest-beta.json
