@@ -276,6 +276,7 @@ run_group check-secrets-patterns node --test "${ROOT}/scripts/check-secrets.test
 run_group install-guard-integration node "${ROOT}/vinci/test/install-guard-integration.mjs"
 run_group priority-integration node "${ROOT}/vinci/test/priority-integration.mjs"
 run_group update-integration node "${ROOT}/vinci/test/update-integration.mjs"
+run_group release-manifest-cas node "${ROOT}/vinci/test/release-manifest-cas.mjs"
 # VINCI_ENV=dev: launcher resolution (dev URLs, isolated agent dir, updates off, explicit-env-wins,
 # unknown-value rejection), updater dev gate + doctor report, shared vinci-links origin, header badge.
 run_group dev-env-integration node "${ROOT}/vinci/test/dev-env-integration.mjs"
@@ -796,6 +797,7 @@ run_group crew-loopbreak-integration node --test "${ROOT}/vinci/test/crew-loopbr
 # finalization git commands exempt from the reserve (never push/network).
 run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-harness-integration.mjs"
 run_group guard-integration node "${ROOT}/vinci/test/guard-integration.mjs"
+run_group input-images node "${ROOT}/vinci/test/input-images.test.mjs"
 # Replay failed tool results offline; guidance must preserve raw errors without inventing their cause.
 run_group guard-error-guidance-integration node --test "${ROOT}/vinci/test/guard-error-guidance-integration.mjs"
 # Masked content (<vinci-secret>) can never match or overwrite raw file bytes.

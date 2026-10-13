@@ -47,6 +47,15 @@ export function extractImagePaths(text: string, cwd: string): Array<{ token: str
   return images;
 }
 
+function replaceImageToken(text: string, token: string, marker: string): string {
+  const index = text.indexOf(token);
+  if (index < 0) return text;
+  // Tidy horizontal gaps beside this token only. Never cross a newline or consume indentation.
+  const before = text.slice(0, index).replace(/(\S)[ \t]+$/, "$1 ");
+  const after = text.slice(index + token.length).replace(/^[ \t]+(?=\S)/, " ");
+  return `${before}${marker}${after}`;
+}
+
 export async function attachImagesFromText(
   text: string,
   cwd: string,
@@ -63,7 +72,7 @@ export async function attachImagesFromText(
     // image never reached the model.
     if (images.length >= MAX_IMAGES) {
       overflow += 1;
-      remaining = remaining.replace(item.token, "[Image not attached]");
+      remaining = replaceImageToken(remaining, item.token, "[Image not attached]");
       continue;
     }
     try {
@@ -80,7 +89,7 @@ export async function attachImagesFromText(
       // it, and this text is what the transcript renders. Stand a short marker in its place: the
       // user sees what they attached instead of a wall of /var/folders, and the model keeps the
       // position of each image within the sentence. Numbered from 1 to match how people say it.
-      remaining = remaining.replace(item.token, `[Image #${images.length}]`);
+      remaining = replaceImageToken(remaining, item.token, `[Image #${images.length}]`);
     } catch {
       errors.push(`${item.path} could not be read.`);
     }
@@ -92,15 +101,12 @@ export async function attachImagesFromText(
     );
   }
 
-  const collapsed = remaining.replace(/\s+/g, " ").trim();
   // A bare drop is now "[Image #1]" rather than empty, so the old fallback would never fire again.
   // Keep the marker (the user should see what they attached) and restore the instruction after it.
-  const markersOnly = images.length > 0 && collapsed.replace(/\[Image #\d+\]/g, "").trim() === "";
+  const markersOnly = images.length > 0 && remaining.replace(/\[Image #\d+\]/g, "").trim() === "";
 
   return {
-    text: markersOnly
-      ? `${collapsed} Inspect the attached image.`
-      : collapsed || (images.length ? "Inspect the attached image." : text),
+    text: markersOnly ? `${remaining.trim()} Inspect the attached image.` : remaining,
     images,
     errors,
   };

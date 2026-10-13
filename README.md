@@ -130,7 +130,7 @@ Extension-by-extension detail, the patch inventory and the branch model → **[`
 # From source — the path this repository supports (Node 22.19+)
 git clone https://github.com/getsimpledirect/vinci-code-cli
 cd vinci-code-cli
-npm install && bash vinci/build.sh
+npm ci --ignore-scripts && bash vinci/build.sh
 ./vinci/bin/vinci
 ```
 
@@ -227,13 +227,13 @@ Full extension list and behaviour → **[`vinci/README.md`](vinci/README.md)**
 
 ## Releases
 
-Releases are tagged `vinci-v*` and published on this repository.
-
-Signing happens in a private repository, because the AWS release role is deliberately not
-reachable from a public one. So a release is cut there and mirrored here: the tarball attached
-to a release is downloaded from the published URL and its checksum compared against the signed
-manifest before it is uploaded. Where the two could ever disagree, the manifest is the
-authority — it is what the installer actually verifies.
+This public repository's reviewed `main` is the canonical product source and its protected
+`vinci-v*` release workflow is the sole product publisher. The workflow builds and tests an
+unsigned archive, carries those exact bytes into the protected publish job, then signs and
+stages the immutable artifact before activating the signed manifest. It binds the tested archive
+to the selected source commit and version; the installer verifies the signature and archive hash.
+Private operations and signing-key custody remain private and do not make the private product
+repository a second publisher.
 
 | What you want | Where it is |
 |---|---|
@@ -242,8 +242,9 @@ authority — it is what the installer actually verifies.
 | The build itself | the installer above, which verifies a signed manifest and its sha256 |
 | Bug reports and questions | [`SUPPORT.md`](SUPPORT.md) |
 
-`main` here is the source for the current release. It is published as a fast-forward, so an
-open pull request against it stays open.
+Product changes land through the public review lineage. The retained private repository's legacy
+mirror/rebase workflow is a separate maintenance model; it is unsupported on public product
+`main` until adapted. See [`vinci/UPSTREAM.md`](vinci/UPSTREAM.md).
 
 ## Project status
 
@@ -264,7 +265,7 @@ as well as agents.
 
 ## License
 
-**MIT**, throughout — see [`LICENSE`](LICENSE).
+The source code is **MIT** — see [`LICENSE`](LICENSE).
 
 - Upstream Pi is © 2025 Mario Zechner, MIT. That notice is preserved verbatim.
 - Vinci's modifications are © 2026 Alpine Pacific Trading Inc., under the same MIT grant.
@@ -273,5 +274,6 @@ as well as agents.
   conveys **no** trademark rights. See [`TRADEMARKS.md`](TRADEMARKS.md) — if you fork and
   ship this, rename it.
 
-There is no separately-licensed or source-available tier in this repository. Everything here
-is MIT.
+Original brand artwork retains its recorded provenance; the code license and this README do not
+grant additional artwork or trademark rights. See [`vinci/BRAND.md`](vinci/BRAND.md) and
+[`vinci/NOTICE`](vinci/NOTICE).
