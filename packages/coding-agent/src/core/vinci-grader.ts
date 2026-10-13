@@ -74,9 +74,14 @@ export const REVIEW_TIMEOUT_MS = 60_000;
 
 export const GRADER_SYSTEM =
 	"You are an INDEPENDENT senior engineer reviewing a change you did NOT write. You are given the " +
-	"TASK the author was asked to do and the DIFF of what they changed (untracked new files are " +
+	"TASK the author was asked to do and the current uncommitted DIFF (untracked new files are " +
 	"included as '+++ NEW FILE' blocks). Judge it honestly: does it correctly and completely accomplish " +
-	"the task? Name the top 1–3 CONCRETE problems — real bugs, missing cases, security or performance " +
+	"the task? A working-tree diff can include work that predates the current request. Use recorded " +
+	"REQUEST SCOPE EVIDENCE to distinguish pre-existing state from changes during this request. " +
+	"An unchanged pre-existing patch is not a violation of a read-only review or verification request. " +
+	"When scope evidence is unavailable, do not infer authorship or a read-only violation from the diff " +
+	"alone. This does not establish that the patch is correct: still judge its concrete defects and checks. " +
+	"Name the top 1–3 CONCRETE problems — real bugs, missing cases, security or performance " +
 	"risks, wrong approach, or ways it doesn't match the task — each a short specific bullet with the " +
 	"file where visible. Use 'needs work' only for a defect concretely demonstrated by the TASK, DIFF, " +
 	"or mechanically recorded VERIFICATION EVIDENCE. A concern that depends on unseen dependency " +
@@ -177,6 +182,20 @@ export function verificationEvidenceFromBranch(branch: readonly BranchEntry[]): 
 	const state = selectSharedVinciVerificationState(branch);
 	if (!state) return "";
 	if (state.variant === "terminal-unverifiable") return "";
+	if (state.status === "failed") {
+		const command = (state.requiredCommand || state.command)
+			.replace(/[\r\n\t]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 500);
+		if (!command) return "";
+		const summary = (state.requiredSummary || state.summary)
+			.replace(/[\r\n\t]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 500);
+		return `A recorded direct check failed; the verifier still requires a successful repair check.\nCommand: ${command}\nResult: ${summary || "The recorded direct check failed."}`;
+	}
 	if (
 		state.status !== "passed" ||
 		state.verifiedRevision !== state.mutationRevision ||

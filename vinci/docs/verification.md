@@ -66,6 +66,10 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   The grader primitives are shared from core (`core/vinci-grader.ts`, re-exported), so both points and
   the explicit `review_changes` tool use one implementation. The tool is not a second automatic final
   check; core owns normal completion review, while `/review` and `review_changes` remain explicit.
+  The full visible workspace diff supplies context; it does not prove that the latest request
+  authored every change. Review attributes current-request work from observed session metadata and
+  receives the shared direct-verification evidence. A read-only turn must not be blamed for
+  pre-existing changes simply because they remain visible in Git.
 - **Runtime evidence state** — `vinci-verification.ts` records code mutations, concrete failed edits,
   and direct project checks independently of assistant prose. A failed check or unapplied edit remains
   `failed`, and a later successful edit becomes `stale`, until a direct post-edit check passes. Piped
@@ -142,6 +146,33 @@ material supplied to it. If the independent checker is unavailable, Vinci warns 
 Phase 3a retrieval-plus-attribution gate instead of blocking an otherwise grounded answer; the TUI
 shows the warning and the session retains the unavailable verdict. Sealed live calibration is still
 required for multi-claim coverage, false positives, latency, and cost.
+
+## Canonical verdicts and distribution
+
+`vinci/extensions/lib/canonical-verdicts.ts` owns the public attempt/verdict vocabulary, local
+types and membership checks. Verification parsing, recording and current-verdict selection use
+that authority. A failed or cancelled remote verification is an attempt, which does not replace
+an issued verdict; a pass, block or conditional result can issue a verdict. The compatible
+`task-outcome.currentRemoteVerdict` entry point delegates to the shared selection logic.
+
+`canonical-verdicts-contract.mjs` checks the local values and membership behavior. Optional
+`private-contracts-drift.mjs` and its separate type configuration compare those values and types
+against independently installed private packages. Public installation, runtime and typechecking
+do not depend on them. Missing comparison packages produce an explicit SKIP; selecting
+`VINCI_REQUIRE_PRIVATE_CONTRACTS=1` requires the comparison instead. These checks do not establish
+a hosted Work service or remote verification trust.
+
+Build output can contain both bundled extensions under `vinci/dist/extensions` and plain emitted
+helpers beside `vinci/extensions/lib` loaded by coding-agent core. Both paths need the same public
+dependency boundary. `check-no-contracts-at-runtime.sh` checks manifests, source imports, built
+files and the actual archive for private runtime dependencies/imports; the archive excludes the
+private package scope. Local values are distributed directly rather than fetched at launch.
+
+The offline harness also checks packaged vocabulary and launches the actual unpacked CLI against
+a local faux provider. The release workflow qualifies the exact tested archive before signing it.
+The local macOS source-data boundary uses paired consumer controls to expose fallback reads from
+the development checkout while keeping ancestor metadata available. These are packaged startup
+and dependency measurements; they do not qualify real-provider completion or deployed admission.
 
 ## Build Phases
 

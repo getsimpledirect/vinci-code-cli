@@ -631,11 +631,17 @@ function isZeroCollection(output: string, exitCode?: number, isPytest?: boolean)
 }
 const HAS_TEST_EXECUTION_COUNT =
   /\b(?:ran|running)\s+[1-9]\d*\s+tests?\b|\b[1-9]\d*\s+(?:(?:tests?|test files?)\s+)?(?:failed|failing|failures?|errors?|passed|passing)\b|(?:^|\n)\s*(?:not ok\s+\d+|---\s*(?:PASS|FAIL):)/i;
+// Node's spec reporter prints label-before-count summaries. A failed file bootstrap also prints
+// `fail 1`, so its top-level startup diagnostic cannot establish that named test bodies executed.
+const NODE_SPEC_EXECUTION_COUNT = /(?:^|\n)\s*(?:ℹ\s*)?(?:pass|fail)\s+[1-9]\d*\s*(?:\n|$)/;
+const NODE_STARTUP_DIAGNOSTIC =
+  /(?:^|\n)(?:node:internal\/[^\n]+:\d+|file:\/\/[^\n]+:\d+)\n[\s\S]*?\n(?:Error(?: \[ERR_[A-Z_]+\])?|SyntaxError|TypeError|ReferenceError):/;
 const STRUCTURED_EXECUTION_ERROR =
   /\b(?:Command (?:aborted|timed out)|Operation aborted)\b/i;
 
 function hasTestExecutionCount(output: string): boolean {
-  return HAS_REAL_PASS.test(output) || HAS_TEST_EXECUTION_COUNT.test(output);
+  return HAS_REAL_PASS.test(output) || HAS_TEST_EXECUTION_COUNT.test(output) ||
+    (NODE_SPEC_EXECUTION_COUNT.test(output) && !NODE_STARTUP_DIAGNOSTIC.test(output));
 }
 
 // Per-category so the reason (and every user-facing string derived from it) names what actually

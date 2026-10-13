@@ -16,7 +16,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 // [verification system] auto-run the independent grader when the plan is marked all-done — trust the
 // check, not the claim. See lib/grader.ts and vinci/docs/verification.md.
-import { gradeChanges } from "./lib/grader.ts";
+import { captureReviewRequest, gradeChanges } from "./lib/grader.ts";
 import { getVinciAutomationStop, sendVinciControl } from "./lib/control.ts";
 import { clearVinciHardStop, recordVinciHardStop, refuseFinalization, vinciTaskIdOf } from "./lib/hard-stop.ts";
 import { isVinciFinalizationCommand, isVinciUnattended } from "./lib/unattended.ts";
@@ -154,6 +154,7 @@ const TODO_PARAMS = Type.Object({
 
 export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) {
   installVinciUsageAccumulator(pi);
+  pi.on("agent_start", (event, ctx) => captureReviewRequest(ctx, event));
   pi.registerTool({
     name: "todo",
     label: "Plan",
