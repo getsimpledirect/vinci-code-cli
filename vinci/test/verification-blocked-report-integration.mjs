@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -380,6 +380,46 @@ const correctPredicate = "home && (p === home || p.startsWith(home + sep))";
 assert.equal(actualHeaderText.split(correctPredicate).length, 2, "mutate exactly the selected actual HOME predicate");
 writeFileSync(join(nestedProject, "vinci", "test", "header-path-boundary.mjs"), readFileSync(new URL("header-path-boundary.mjs", import.meta.url)));
 const nestedCommand = "node --test --test-reporter=spec vinci/test/header-path-boundary.mjs";
+const installedModules = fileURLToPath(new URL("../../node_modules/", import.meta.url));
+const nestedModules = join(nestedProject, "node_modules");
+const selectedDependencies = [
+  ["jiti", "jiti/static"],
+  ["@earendil-works/pi-coding-agent", "@earendil-works/pi-coding-agent"],
+  ["@earendil-works/pi-tui", "@earendil-works/pi-tui"],
+];
+const selectedEntries = {};
+for (const [name, specifier] of selectedDependencies) {
+  const local = join(nestedModules, name);
+  const selected = join(installedModules, name);
+  mkdirSync(dirname(local), { recursive: true });
+  symlinkSync(selected, local, "dir");
+  assert.equal(existsSync(join(local, "package.json")), true, `bind the nested fixture's selected ${name} dependency`);
+  assert.equal(realpathSync(local), realpathSync(selected));
+  selectedEntries[specifier] = realpathSync(fileURLToPath(import.meta.resolve(specifier)));
+}
+// Bind this source fixture explicitly; a TMPDIR inside the checkout must not hide missing links.
+const dependencyProbe = join(nestedProject, "resolve-dependencies.mjs");
+writeFileSync(dependencyProbe, `import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+for (const [specifier, selected] of Object.entries(JSON.parse(process.argv[2]))) {
+  assert.equal(realpathSync(fileURLToPath(import.meta.resolve(specifier))), selected);
+}
+`);
+const resolvedDependencies = spawnSync(process.execPath, [dependencyProbe, JSON.stringify(selectedEntries)], {
+  cwd: nestedProject, encoding: "utf8", timeout: 5000, maxBuffer: 256 * 1024,
+});
+assert.equal(resolvedDependencies.error, undefined, "run the actual Node dependency resolver within its bound");
+assert.equal(resolvedDependencies.status, 0, resolvedDependencies.stdout + resolvedDependencies.stderr);
+
+function runNamedHeaderCheck() {
+  // This is an external CLI consumer, not recursive test-runner discovery in the parent worker.
+  const childEnv = { ...process.env };
+  delete childEnv.NODE_TEST_CONTEXT;
+  return spawnSync(process.execPath, ["--test", "--test-reporter=spec", "vinci/test/header-path-boundary.mjs"], {
+    cwd: nestedProject, encoding: "utf8", timeout: 10_000, maxBuffer: 256 * 1024, env: childEnv,
+  });
+}
 
 async function nestedCheck(valid, edited = false, request = readOnlyRequest) {
   sent.length = 0;
@@ -394,12 +434,7 @@ async function nestedCheck(valid, edited = false, request = readOnlyRequest) {
     toolName: "edit", input: { path: "vinci/extensions/vinci-header.ts" }, isError: false,
     content: [{ type: "text", text: "Applied changes" }],
   });
-  // This is an external CLI consumer, not recursive test-runner discovery in the parent worker.
-  const childEnv = { ...process.env };
-  delete childEnv.NODE_TEST_CONTEXT;
-  const result = spawnSync(process.execPath, ["--test", "--test-reporter=spec", "vinci/test/header-path-boundary.mjs"], {
-    cwd: nestedProject, encoding: "utf8", timeout: 10_000, maxBuffer: 256 * 1024, env: childEnv,
-  });
+  const result = runNamedHeaderCheck();
   assert.equal(result.error, undefined, "the actual named verifier must start and exit within its bound");
   assert.equal(result.status, valid ? 0 : 1);
   const output = result.stdout + result.stderr;
@@ -432,6 +467,30 @@ test("read-only nested real spec failure preserves assessment and closes blocked
 });
 
 test("a passing read-only nested check stays passed through the same final hooks", async () => {
+  await nestedCheck(true);
+  const localJiti = join(nestedModules, "jiti");
+  const incompleteJiti = join(project, "incomplete-jiti");
+  mkdirSync(incompleteJiti);
+  writeFileSync(join(incompleteJiti, "package.json"), JSON.stringify({
+    name: "jiti", type: "module", exports: { "./static": "./missing-static.mjs" },
+  }));
+  unlinkSync(localJiti);
+  symlinkSync(incompleteJiti, localJiti, "dir");
+  try {
+    const refused = runNamedHeaderCheck();
+    assert.equal(refused.error, undefined, "the dependency-refusal control must exit within its bound");
+    assert.equal(refused.status, 1);
+    const output = refused.stdout + refused.stderr;
+    assert.match(output, /ERR_MODULE_NOT_FOUND/);
+    assert.match(output, /missing-static\.mjs/);
+    assert.match(output, /ℹ tests 1/);
+    assert.match(output, /ℹ pass 0/);
+    assert.doesNotMatch(output, /shortPath rejects an unrelated same-prefix sibling/);
+  } finally {
+    unlinkSync(localJiti);
+    symlinkSync(join(installedModules, "jiti"), localJiti, "dir");
+  }
+  assert.equal(realpathSync(localJiti), realpathSync(join(installedModules, "jiti")));
   await nestedCheck(true);
   const message = assistant("Completed: read-only assessment ships; all eight tests passed and no files changed.");
   assert.equal(await emit("message_end", { message }), undefined);
