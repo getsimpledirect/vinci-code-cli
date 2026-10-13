@@ -67,6 +67,7 @@ import {
 export { vinciVerificationDisabled };
 import { redactSecrets } from "./lib/secrets.ts";
 import { recordVinciTaskCall } from "./lib/usage-accumulator.ts";
+import { currentRequestForbidsEdits } from "./lib/grader.ts";
 import { bashLooksMutating } from "./vinci-undo.ts";
 
 // ── Deviation check v2: model-graded completion claims vs. actual diff ──────────────────────────
@@ -2056,6 +2057,10 @@ export function isClaimingSuccessfulBehavioralTest(message: string): boolean {
       .filter((index) => index !== -1);
     const end = followingBoundaries.length > 0 ? Math.min(...followingBoundaries) : prose.length;
     const assertion = prose.slice(start, end);
+    // A partial count ("7 pass, 1 fail") reports a failure, not that the suite passed. Only this
+    // bare numeric candidate is excused; an additional "all tests passed" assertion still fails.
+    if (/^\d+\s+(?:tests?\s+)?pass(?:ed|ing)?$/i.test(match[0]) &&
+      /\b[1-9]\d*\s+(?:fail(?:ed|ing)?|failures?)\b/i.test(assertion)) continue;
     if (
       assertion.includes("?") ||
       /^\s*(?:are|is|was|were|do|does|did|can|could|would|will|should|have|has|had|what|when|where|why|how)\b/i.test(
@@ -2914,6 +2919,15 @@ export default function (pi: ExtensionAPI) {
     const recoveryCommand = state.requiredCommand || state.command;
     const recoverySummary = state.summary;
     const recoveryAttempts = state.recoveryAttempts;
+    if (state.variant === "normal" && state.status === "failed" && currentRequestForbidsEdits(ctx)) {
+      continueAfterTurn = false;
+      setVinciContinuationPending(false);
+      requestVinciAutomationStop(recoverySummary, "verification");
+      const closure = blockedMessage("failed", recoveryCommand, recoverySummary, state.commandCwd, ctx.cwd, state.mutationRevision > 0);
+      const text = textContent(event.message.content);
+      const report = hasVerificationSuccessClaim(text) ? closure : `${text.trim()}\n\n${closure}`;
+      return { message: replaceAssistantText(event.message, report) };
+    }
     // Consequential steps were gated for the user's confirmation with no UI to ask (e.g. `prisma migrate
     // dev` in a non-interactive run). That's an honest blocker, not a verification failure — close with a
     // handoff naming the held steps, don't loop recovery into a misleading generic BLOCKED, and don't let
@@ -2954,8 +2968,11 @@ export default function (pi: ExtensionAPI) {
     // EDIT never applied — that is a real failure, not a static-project closure.
     const mutationApplied =
       state.variant === "normal" &&
+      state.mutationRevision > 0 &&
       (state.status === "stale" || (state.status === "failed" && Boolean(state.command)));
-    if (mutationApplied && state.variant === "normal" && ctx?.cwd && !projectHasVerifier(ctx.cwd)) {
+    const completedBehavioralCheck = state.variant === "normal" &&
+      Boolean(state.behavioralAttemptCommand) && state.behavioralAttemptCompleted;
+    if (mutationApplied && !completedBehavioralCheck && state.variant === "normal" && ctx?.cwd && !projectHasVerifier(ctx.cwd)) {
       continueAfterTurn = false;
       requestVinciAutomationStop("no automated check exists for this project", "verification");
       const text = textContent(event.message.content);

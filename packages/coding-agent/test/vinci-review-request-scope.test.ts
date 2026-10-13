@@ -3,7 +3,11 @@ import { existsSync, readFileSync, rmdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Context, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test } from "vitest";
-import { captureReviewRequest, gatherReviewEvidence } from "../../../vinci/extensions/lib/grader.ts";
+import {
+	captureReviewRequest,
+	currentRequestForbidsEdits,
+	gatherReviewEvidence,
+} from "../../../vinci/extensions/lib/grader.ts";
 import {
 	getVinciVerificationState,
 	resetVinciVerificationState,
@@ -15,6 +19,11 @@ import type { ExtensionAPI, ExtensionContext } from "../src/core/extensions/type
 import { createHarness, type Harness } from "./suite/harness.ts";
 
 const active: Harness[] = [];
+// Exact public source-task requests from the selected installed positive and negative controls.
+const installedPositiveRequest =
+	"Verify the already-existing path-boundary patch; this is a read-only verification request, and all four existing changed files predate this request. Do not edit, write, stage, commit, restore, or remove any project file. Inspect only vinci/extensions/vinci-header.ts, vinci/extensions/vinci-shell.ts, vinci/test/header-path-boundary.mjs, and vinci/test/shell-path-boundary.mjs as needed.\n\nRun the actual named Node regression files with `node --test vinci/test/header-path-boundary.mjs vinci/test/shell-path-boundary.mjs`, then `git diff --check -- vinci/extensions/vinci-header.ts vinci/extensions/vinci-shell.ts vinci/test/header-path-boundary.mjs vinci/test/shell-path-boundary.mjs`. Do not run npm, install dependencies, change guards or use any credential/account file. Report the actual passed/failed counts, whether the scoped diff check passed, and any concrete defect supported by the inspected code or checks. Complete the ordinary verification and independent review flow; distinguish the pre-existing patch from work during this request. Do not claim that you wrote or modified the patch in this request. If checks fail, report that faithfully without repairing it.";
+const installedNegativeRequest =
+	"Verify whether the existing header patch correctly abbreviates only HOME itself and its true descendants, while preserving unrelated same-prefix sibling paths. This is a read-only verification request: the current one-predicate patch was already present before this request, and you must not edit, write, stage, commit, restore, or remove any project file. Inspect only vinci/extensions/vinci-header.ts and vinci/test/header-path-boundary.mjs as needed.\n\nRun the real named regression with `node --test --test-reporter=spec vinci/test/header-path-boundary.mjs`, then `git diff --check -- vinci/extensions/vinci-header.ts vinci/test/header-path-boundary.mjs`. Do not run npm, install dependencies, change guards or use any credential/account file. If a behavioral check fails, report its exact name and counts and keep the verification assessment needs-work or blocked; do not declare the patch correct or the tests passing. Complete the ordinary independent review flow without repairing the patch. Distinguish this pre-existing patch from edits during this request.";
 afterEach(() => {
 	for (const harness of active.splice(0)) {
 		harness.session.dispose();
@@ -40,11 +49,11 @@ function text(context: Context): string {
 		.join("\n");
 }
 
-async function fixture(valid = true, observer?: (pi: ExtensionAPI) => void): Promise<Harness> {
+async function fixture(valid = true, observer?: (pi: ExtensionAPI) => void, allowEdits = false): Promise<Harness> {
 	resetVinciVerificationState();
 	const harness = await createHarness({
 		extensionFactories: [registerTodo, registerReview, registerVerification, ...(observer ? [observer] : [])],
-		initialActiveToolNames: ["bash", "todo", "review_changes"],
+		initialActiveToolNames: ["bash", "todo", "review_changes", ...(allowEdits ? ["edit"] : [])],
 		settings: { retry: { enabled: false }, compaction: { enabled: false } },
 	});
 	active.push(harness);
@@ -72,7 +81,8 @@ function reviewResponse(context: Context, requests: string[], failed = false) {
 	const grounded =
 		request.includes("REQUEST SCOPE EVIDENCE") &&
 		request.includes("already present at request start") &&
-		request.includes("node --test review.test.mjs");
+		request.includes("node --test") &&
+		request.includes("review.test.mjs");
 	const evidence = failed
 		? request.includes("recorded direct check failed")
 		: request.includes("Direct check passed after the latest mutation");
@@ -216,7 +226,7 @@ describe("actual Vinci reviewer request provenance", () => {
 			}),
 		]);
 		await harness.session.prompt(
-			"Assess the existing defective patch read-only using its named test. Report failures faithfully and do not repair files.",
+			"Repair the existing defective patch using its named test. Review the findings, then make the authorized repair.",
 		);
 		expect(requests).toHaveLength(1);
 		expect(requests[0]).toContain("already present at request start");
@@ -382,4 +392,96 @@ describe("actual Node runner outcomes through Vinci verification", () => {
 			expect(harness.getPendingResponseCount()).toBe(0);
 		}, 20_000);
 	}
+});
+
+describe("explicit read-only assessment through actual sessions", () => {
+	test("exact installed requests are recognized, quoted examples are not, and a new repair request clears the constraint", async () => {
+		const constraints: boolean[] = [];
+		const harness = await fixture(true, (pi) =>
+			pi.on("tool_call", (_event, ctx) => {
+				constraints.push(currentRequestForbidsEdits(ctx));
+			}),
+		);
+		const requests = [
+			installedPositiveRequest,
+			installedNegativeRequest,
+			`Explain this example:\n\`\`\`text\n${installedNegativeRequest}\n\`\`\``,
+			`Explain this quote: "${installedNegativeRequest.replaceAll('"', "")}"`,
+			`Explain this quote: '${installedNegativeRequest.replaceAll("'", "")}'`,
+			installedNegativeRequest,
+			"Now repair the selected defect and run the existing regression. You may edit project source.",
+		];
+		harness.setResponses(
+			requests.flatMap(() => [
+				fauxAssistantMessage(fauxToolCall("bash", { command: "pwd", timeout: 10 }), { stopReason: "toolUse" }),
+				fauxAssistantMessage("Observed the current request constraint."),
+			]),
+		);
+		for (const request of requests) await harness.session.prompt(request);
+		expect(constraints).toEqual([true, true, false, false, false, true, false]);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	}, 20_000);
+
+	test("failed automatic read-only review reports findings, keeps the assessment closed and refuses a repair attempt", async () => {
+		const harness = await fixture(false, undefined, true);
+		const requests: string[] = [];
+		const before = readFileSync(join(harness.tempDir, "value.mjs"));
+		const steps = [
+			{ title: "Run the named check", status: "doing" },
+			{ title: "Report assessment without editing", status: "todo" },
+		];
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("todo", { steps }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(
+				fauxToolCall("bash", { command: "node --test --test-reporter=spec review.test.mjs", timeout: 10 }),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(fauxToolCall("todo", { steps: steps.map((step) => ({ ...step, status: "done" })) }), {
+				stopReason: "toolUse",
+			}),
+			(context) => reviewResponse(context, requests, true),
+			fauxAssistantMessage(
+				fauxToolCall("edit", {
+					path: "value.mjs",
+					edits: [{ oldText: "export const value = 2;", newText: "export const value = 1;" }],
+				}),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Assessment: needs-work. The named check failed; no project file changed."),
+		]);
+		await harness.session.prompt(installedNegativeRequest);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).toContain("recorded direct check failed");
+		const controls = harness.session.messages.filter((message) => message.role === "custom");
+		expect(controls.some((message) => message.customType === "vinci-plan-review-report")).toBe(true);
+		expect(controls.some((message) => message.customType === "vinci-plan-review-paused")).toBe(true);
+		expect(controls.some((message) => message.customType === "vinci-plan-review")).toBe(false);
+		expect(controls.some((message) => message.customType === "vinci-verification-recovery")).toBe(false);
+		expect(
+			harness.session.messages.some(
+				(message) => message.role === "toolResult" && message.toolName === "edit" && message.isError,
+			),
+		).toBe(true);
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "toolResult" &&
+					message.toolName === "todo" &&
+					(message.details as { assessmentOnly?: boolean } | undefined)?.assessmentOnly,
+			),
+		).toBe(true);
+		const last = harness.session.messages.filter((message) => message.role === "assistant").at(-1);
+		expect(text({ messages: last ? [last] : [] } as Context)).toContain("Assessment: needs-work");
+		expect(text({ messages: last ? [last] : [] } as Context)).toContain("Blocked:");
+		expect(text({ messages: last ? [last] : [] } as Context)).not.toMatch(/I made the change|no automated test/);
+		const verificationState = getVinciVerificationState();
+		expect(verificationState.status).toBe("failed");
+		if (verificationState.variant === "normal") {
+			expect(verificationState.mutationRevision).toBe(0);
+			expect(verificationState.behavioralAttemptCompleted).toBe(true);
+			expect(verificationState.recoveryAttempts).toBe(0);
+		}
+		expect(readFileSync(join(harness.tempDir, "value.mjs"))).toEqual(before);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	}, 20_000);
 });

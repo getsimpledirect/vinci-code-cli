@@ -70,6 +70,12 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   authored every change. Review attributes current-request work from observed session metadata and
   receives the shared direct-verification evidence. A read-only turn must not be blamed for
   pre-existing changes simply because they remain visible in Git.
+  An explicit current-user read-only assessment constraint keeps the assessment plan closed on
+  `needs-work` or `risky`: report the independent findings without converting them into repair
+  instructions. This does not accept the patch or clear a failed verifier. The supported constraint
+  combines “This is a read-only verification/review/assessment request” with an explicit prohibition
+  on editing any project file; quoted examples, plan text and earlier requests cannot establish it.
+  A new user request authorizing repair restores the normal repair lane.
 - **Runtime evidence state** — `vinci-verification.ts` records code mutations, concrete failed edits,
   and direct project checks independently of assistant prose. A failed check or unapplied edit remains
   `failed`, and a later successful edit becomes `stale`, until a direct post-edit check passes. Piped
@@ -80,6 +86,9 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   untrusted. Tool-free success prose
   while state is failed/stale is replaced by a bounded recovery turn; after two unsuccessful
   recoveries Vinci emits a deterministic `Blocked:` receipt instead of inventing success.
+  A failed check in that read-only assessment closes with the failure and a `Blocked:` receipt,
+  without a repair follow-up. A completed direct behavioral check takes precedence over filesystem
+  guesses that a project has no verifier; the static-project unverified note requires an observed edit.
   `vinci-receipt.ts` renders and persists the terminal contract directly: verified code is `DONE`,
   changed code without a direct pass is `DONE-UNVERIFIED`, a named decision is `WAITING`, and a
   provider/check/runtime stop is `BLOCKED`. The same non-context task record carries model-call,

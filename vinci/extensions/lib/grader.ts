@@ -107,6 +107,25 @@ export function gatherTask(ctx: ExtensionContext): string {
 	return taskFromBranch(ctx.sessionManager.getBranch() as ReadonlyArray<{ type?: string; message?: { role?: string; content?: unknown } }>);
 }
 
+/** Explicit current-user constraint only; a plan, reviewer, quote or earlier request cannot set it. */
+export function currentRequestForbidsEdits(ctx: ExtensionContext): boolean {
+	const branch = ctx.sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type !== "message" || entry.message.role !== "user") continue;
+		const content = entry.message.content;
+		const text = typeof content === "string" ? content : content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+		const prose = text
+			.replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ")
+			.replace(/^\s*>.*$/gm, " ")
+			.replace(/`[^`\n]*(?:`|$)|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|“[^”]*”|‘[^’]*’/g, " ");
+		// These explicit declarations are supported, not a general natural-language intent classifier.
+		return /(?:^|[.!?;]\s+)This is a read-only (?:verification|review|assessment) request\s*[:,.]/i.test(prose) &&
+			/\b(?:do|must) not edit(?:, write, stage, commit, restore, or remove)? any project files?\b/i.test(prose);
+	}
+	return false;
+}
+
 /** One-call grade for the auto-run path: gather the real state, grade it, return text + verdict. */
 export async function gradeChanges(ctx: ExtensionContext, taskOverride?: string): Promise<{ text: string; verdict: Verdict } | null> {
 	if (vinciVerificationDisabled()) return null;
