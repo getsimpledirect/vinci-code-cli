@@ -41,7 +41,7 @@ node "${ROOT}/vinci/scripts/package-excludes.mjs" "${ROOT}" --runtime-staged > "
 # Tar straight from the repo root so paths extract as packages/… + vinci/ + node_modules (the launcher
 # resolves ROOT from its own location, so this layout runs as-is). Package only Vinci runtime assets;
 # tests, docs, infrastructure state, and release tooling must never enter the public archive.
-tar -czf "${TGZ}" -C "${ROOT}" \
+COPYFILE_DISABLE=1 tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude-from="${EXCLUDES}" \
   --exclude='node_modules/typescript' \
   --exclude='node_modules/@typescript' \
