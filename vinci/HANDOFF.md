@@ -2,7 +2,7 @@
 
 ## Repository roles
 
-Product source, tests, versions, issues, pull requests and releases belong in the public `getsimpledirect/vinci-code-cli` repository. The private `vinci-code` repository remains the private operations and historical reference home. Its README/AGENTS redirect merged through [private PR #261](https://github.com/getsimpledirect/vinci-code/pull/261) at `707672884925599887ad81905069ffef5712bf54` on 2026-10-13 UTC. The repository remains private and unarchived because its operations still need their existing home. Keep private history, operational payloads and credentials private.
+Product source, tests, versions, issues, pull requests and releases belong in the public `getsimpledirect/vinci-code-cli` repository. The private `vinci-code` repository remains the private operations and historical reference home. Its README/AGENTS redirect merged through private PR #261 at `707672884925599887ad81905069ffef5712bf54` on 2026-10-13 UTC. The repository remains private and unarchived because its operations still need their existing home. Keep private history, operational payloads and credentials private.
 
 The private product release and manifest rollback workflows were disabled and read back as `disabled_manually` on 2026-10-13 UTC. Other operations workflows retain enabled configuration; this measures configuration, not running workloads. Do not run upstream Pi npm publishers to release Vinci.
 
