@@ -70,6 +70,11 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   authored every change. Review attributes current-request work from observed session metadata and
   receives the shared direct-verification evidence. A read-only turn must not be blamed for
   pre-existing changes simply because they remain visible in Git.
+  A literal, explicitly scoped `git diff --check -- <paths>` can supply supplemental formatting
+  evidence, including an empty result, when the current request's paired local Bash result records
+  exit zero in the verifier's working directory after the latest mutation. Only the latest matching
+  attempt qualifies. This receipt never replaces a behavioral check or clears a failed verifier;
+  substituted commands, ambiguous results and earlier-request receipts remain unqualified.
   An explicit current-user read-only assessment constraint keeps the assessment plan closed on
   `needs-work` or `risky`: report the independent findings without converting them into repair
   instructions. This does not accept the patch or clear a failed verifier. The supported constraint

@@ -50,6 +50,12 @@ export type BashToolInput = Static<typeof bashSchema>;
 export interface BashToolDetails {
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
+	/** Observed completion only; no command text or child environment is retained here. */
+	execution?: {
+		exitCode: number | null;
+		cwd: string;
+		originalCommand: boolean;
+	};
 }
 
 /**
@@ -453,7 +459,19 @@ export function createBashToolDefinition(
 				if (exitCode !== 0 && exitCode !== null) {
 					throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
 				}
-				return { content: [{ type: "text", text: outputText }], details };
+				return {
+					content: [{ type: "text", text: outputText }],
+					details: {
+						...details,
+						execution: {
+							exitCode,
+							cwd: spawnContext.cwd,
+							// The native sandbox wraps this same command. Extension backends/setup may
+							// substitute what ran, so their result cannot attest to the paired tool call.
+							originalCommand: !options?.operations && !commandPrefix && !spawnHook && !options?.shellPath,
+						},
+					},
+				};
 			} finally {
 				clearUpdateTimer();
 			}

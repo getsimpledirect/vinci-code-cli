@@ -96,6 +96,82 @@ function reviewResponse(context: Context, requests: string[], failed = false) {
 }
 
 describe("actual Vinci reviewer request provenance", () => {
+	for (const valid of [true, false]) {
+		test(`explicit and automatic review both receive a scoped formatting receipt alongside a ${valid ? "passed" : "failed"} behavioral check`, async () => {
+			const harness = await fixture(valid);
+			const before = readFileSync(join(harness.tempDir, "value.mjs"));
+			const requests: string[] = [];
+			const steps = [
+				{ title: "Run the named check and scoped formatting check", status: "doing" },
+				{ title: "Report the independent assessment without editing", status: "todo" },
+			];
+			const reviewer = (context: Context) => {
+				const request = text(context);
+				if (
+					!request.includes("git diff --check -- value.mjs") ||
+					!request.includes("Supplemental current-request formatting checks (not behavioral test evidence)") ||
+					!request.includes("observed exit code 0")
+				) {
+					requests.push(request);
+					return fauxAssistantMessage(
+						"The scoped formatting result is missing from recorded evidence.\n## Verdict risky, because the requested check is unqualified.",
+					);
+				}
+				return reviewResponse(context, requests, !valid);
+			};
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("todo", { steps }), { stopReason: "toolUse" }),
+				fauxAssistantMessage(
+					fauxToolCall("bash", { command: "node --test --test-reporter=spec review.test.mjs", timeout: 10 }),
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage(fauxToolCall("bash", { command: "git diff --check -- value.mjs", timeout: 10 }), {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage(fauxToolCall("review_changes", {}), { stopReason: "toolUse" }),
+				reviewer,
+				fauxAssistantMessage(fauxToolCall("todo", { steps: steps.map((step) => ({ ...step, status: "done" })) }), {
+					stopReason: "toolUse",
+				}),
+				reviewer,
+				fauxAssistantMessage(
+					valid
+						? "The named test passed and the scoped formatting check passed; both independent reviews accepted the pre-existing patch."
+						: "Assessment: needs-work. The named test failed and the scoped formatting check passed; no project file changed.",
+				),
+			]);
+			await harness.session.prompt(
+				"This is a read-only verification request: do not edit any project file. Run the existing named verifier and git diff --check -- value.mjs, explicitly request an independent review, and complete the ordinary assessment plan. Report failures without repairs.",
+			);
+			expect(requests).toHaveLength(2);
+			for (const request of requests) {
+				expect(request).toContain("git diff --check -- value.mjs");
+				expect(request).toContain("observed exit code 0");
+				expect(request).toContain(valid ? "Direct check passed" : "recorded direct check failed");
+				if (!valid) expect(request).not.toContain("Direct check passed");
+			}
+			const todo = [...harness.session.messages]
+				.reverse()
+				.find((message) => message.role === "toolResult" && message.toolName === "todo");
+			if (todo?.role !== "toolResult") throw new Error("Inspect the actual final TODO review result.");
+			if (valid) {
+				expect(todo?.content).toEqual(
+					expect.arrayContaining([{ type: "text", text: expect.stringContaining("Independent review passed") }]),
+				);
+			} else {
+				expect((todo?.details as { verdict?: string } | undefined)?.verdict).toBe("needs-work");
+			}
+			expect(getVinciVerificationState()).toMatchObject({
+				variant: "normal",
+				status: valid ? "passed" : "failed",
+				mutationRevision: 0,
+				behavioralAttemptCompleted: true,
+			});
+			expect(readFileSync(join(harness.tempDir, "value.mjs"))).toEqual(before);
+			expect(harness.getPendingResponseCount()).toBe(0);
+		}, 20_000);
+	}
+
 	for (let trial = 1; trial <= 3; trial++) {
 		test(`automatic todo review keeps a pre-existing patch read-only and includes actual verifier evidence (${trial}/3)`, async () => {
 			const harness = await fixture();
