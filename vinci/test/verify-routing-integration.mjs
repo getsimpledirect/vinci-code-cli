@@ -5,17 +5,14 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { parseLauncherExtensions } from "./launcher-extensions.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const launcher = join(root, "vinci/bin/vinci");
 const launcherSource = readFileSync(launcher, "utf8");
 const identity = JSON.parse(readFileSync(join(root, "vinci/identity.json"), "utf8"));
 
-assert.match(
-  launcherSource,
-  /--extension "\$\{VINCI\}\/extensions\/vinci-accept\.ts"/,
-  "launcher must register vinci-accept",
-);
+assert(parseLauncherExtensions(launcherSource).includes("vinci-accept.ts"), "launcher must register vinci-accept");
 assert(identity.extensions.includes("vinci-accept.ts"), "identity must register vinci-accept");
 
 function findExecutable(name) {

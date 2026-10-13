@@ -14,6 +14,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 
+// vinci-model-classes 0.2.0, src/provenance.ts:22-27
+// (dist/provenance.d.ts:16-17). Pinned by private-contracts-drift.types.ts only.
+export type ResolutionEvidence = "gateway-header" | "response-stream" | "requested-model";
+
 const ENTRY_TYPE = "vinci-model-provenance";
 const SCHEMA_VERSION = 1;
 const AUTO_MODEL = "auto";
@@ -40,8 +44,6 @@ interface ClientCapabilities {
   reasoning: boolean;
   inputs: string[];
 }
-
-type ResolutionEvidence = "gateway-header" | "response-stream" | "requested-model";
 
 interface ResolvedRoute {
   model: string;

@@ -14,6 +14,12 @@
  */
 
 import { isAbsolute } from "node:path";
+// Types come through canonical-verdicts.ts, the ONE shipped file allowed to name the private
+// contracts scope. This file ships whole (vinci/extensions is in the tarball) and holds regex
+// literals with quote characters; the runtime guard's deliberately naive lexer would misread those
+// as unterminated strings the moment this file mentioned the scope at all.
+import type { RunState, VerdictStatus } from "./canonical-verdicts.ts";
+import { isAcceptedWireStatus, isAttemptStatus, isVerdictStatus } from "./canonical-verdicts.ts";
 
 export const VINCI_VERIFICATION_ENTRY = "vinci-verification-state";
 
@@ -37,19 +43,48 @@ export const VINCI_TERMINAL_UNVERIFIABLE_MESSAGE = VINCI_UNREPLAYABLE_VERIFICATI
 export type SharedVinciVerificationStatus = "none" | "stale" | "failed" | "passed";
 export type SharedVinciVerificationClass = "static" | "build" | "behavioral";
 
-export type RemoteAcceptanceVerdict = {
-	schemaVersion: 1;
+export type RemoteVerdictStatus = "VERIFIED_PASS" | "BLOCKED" | "CONDITIONAL";
+export type RemoteAttemptStatus = "FAILED" | "CANCELLED";
+
+type MutuallyAssignable<Left, Right> = [Left] extends [Right]
+	? [Right] extends [Left]
+		? true
+		: false
+	: false;
+type Assert<T extends true> = T;
+type RemoteVerdictStatusMatchesCanonical = Assert<MutuallyAssignable<RemoteVerdictStatus, VerdictStatus>>;
+type RemoteAttemptStatusIsCanonicalRunState = Assert<RemoteAttemptStatus extends RunState ? true : false>;
+
+type RemoteVerificationResultFields = {
 	jobId: string;
 	snapshotDigest: string;
-	status: "VERIFIED_PASS" | "BLOCKED" | "CONDITIONAL" | "FAILED" | "CANCELLED";
 	summary: string;
 	reportUrl?: string;
 	eventCursor?: string;
 	recordedAtIso: string;
+};
+
+export type RemoteIssuedAcceptanceVerdict = RemoteVerificationResultFields & {
+	schemaVersion: 1;
+	status: RemoteVerdictStatus;
 	staled: boolean;
 };
 
-export type RemoteAcceptanceVerdictRecord = Readonly<Record<string, RemoteAcceptanceVerdict>>;
+type RemoteVerificationAttemptResult = RemoteVerificationResultFields & {
+	schemaVersion: 1;
+	status: RemoteAttemptStatus;
+	staled: boolean;
+};
+
+export type RemoteAcceptanceVerdict = RemoteIssuedAcceptanceVerdict | RemoteVerificationAttemptResult;
+
+export type RemoteAcceptanceVerdictRecord = Readonly<Record<string, RemoteIssuedAcceptanceVerdict>>;
+
+export type RemoteVerificationAttempt = RemoteVerificationResultFields & {
+	outcome: RemoteAttemptStatus;
+};
+
+export type RemoteVerificationResult = RemoteAcceptanceVerdict;
 
 export function remoteAcceptanceVerdictKey(
 	verdict: Pick<RemoteAcceptanceVerdict, "snapshotDigest" | "jobId">,
@@ -87,6 +122,7 @@ export type SharedVinciNormalVerificationState = {
 	behavioralAttemptCommandKeyCanonical: boolean;
 	behavioralAttemptCompleted: boolean;
 	remoteAcceptanceVerdicts?: RemoteAcceptanceVerdictRecord;
+	remoteVerificationAttempts?: readonly RemoteVerificationAttempt[];
 };
 
 export type SharedVinciTerminalUnverifiableState = {
@@ -102,6 +138,7 @@ export type SharedVinciTerminalUnverifiableState = {
 	commandKey: string;
 	checkClass: SharedVinciVerificationClass;
 	remoteAcceptanceVerdicts?: RemoteAcceptanceVerdictRecord;
+	remoteVerificationAttempts?: readonly RemoteVerificationAttempt[];
 };
 
 export type SharedVinciVerificationState = SharedVinciNormalVerificationState | SharedVinciTerminalUnverifiableState;
@@ -133,6 +170,7 @@ const NORMAL_KEYS = new Set([
 	"behavioralAttemptCommandKeyCanonical",
 	"behavioralAttemptCompleted",
 	"remoteAcceptanceVerdicts",
+	"remoteVerificationAttempts",
 ]);
 const LEGACY_REQUIRED_KEYS = ["status", "command", "summary", "mutationRevision", "verifiedRevision"] as const;
 const LEGACY_OPTIONAL_KEYS = new Set([
@@ -167,7 +205,7 @@ function isVerificationClass(value: unknown): value is SharedVinciVerificationCl
 	return value === "static" || value === "build" || value === "behavioral";
 }
 
-const REMOTE_ACCEPTANCE_VERDICT_KEYS = new Set([
+const REMOTE_VERIFICATION_RESULT_KEYS = new Set([
 	"schemaVersion",
 	"jobId",
 	"snapshotDigest",
@@ -179,19 +217,15 @@ const REMOTE_ACCEPTANCE_VERDICT_KEYS = new Set([
 	"staled",
 ]);
 
-function parseRemoteAcceptanceVerdict(value: unknown): RemoteAcceptanceVerdict | undefined {
+function parseRemoteVerificationResult(value: unknown): RemoteVerificationResult | undefined {
 	const verdict = verificationRecord(value);
 	if (
 		!verdict ||
-		!hasOnlyKeys(verdict, REMOTE_ACCEPTANCE_VERDICT_KEYS) ||
+		!hasOnlyKeys(verdict, REMOTE_VERIFICATION_RESULT_KEYS) ||
 		verdict.schemaVersion !== 1 ||
 		typeof verdict.jobId !== "string" ||
 		typeof verdict.snapshotDigest !== "string" ||
-		(verdict.status !== "VERIFIED_PASS" &&
-			verdict.status !== "BLOCKED" &&
-			verdict.status !== "CONDITIONAL" &&
-			verdict.status !== "FAILED" &&
-			verdict.status !== "CANCELLED") ||
+		!isAcceptedWireStatus(verdict.status) ||
 		typeof verdict.summary !== "string" ||
 		(verdict.reportUrl !== undefined && typeof verdict.reportUrl !== "string") ||
 		(verdict.eventCursor !== undefined && typeof verdict.eventCursor !== "string") ||
@@ -213,16 +247,92 @@ function parseRemoteAcceptanceVerdict(value: unknown): RemoteAcceptanceVerdict |
 	};
 }
 
-function parseRemoteAcceptanceVerdictRecord(value: unknown): RemoteAcceptanceVerdictRecord | undefined {
-	const record = verificationRecord(value);
-	if (!record) return undefined;
-	const parsed: Record<string, RemoteAcceptanceVerdict> = {};
-	for (const [key, value] of Object.entries(record)) {
-		const verdict = parseRemoteAcceptanceVerdict(value);
-		if (!verdict || key !== remoteAcceptanceVerdictKey(verdict)) return undefined;
-		parsed[key] = verdict;
+const REMOTE_VERIFICATION_ATTEMPT_KEYS = new Set([
+	"jobId",
+	"snapshotDigest",
+	"outcome",
+	"summary",
+	"reportUrl",
+	"eventCursor",
+	"recordedAtIso",
+]);
+
+function remoteVerificationAttempt(result: RemoteVerificationResult): RemoteVerificationAttempt | undefined {
+	if (!isAttemptStatus(result.status)) return undefined;
+	return {
+		jobId: result.jobId,
+		snapshotDigest: result.snapshotDigest,
+		outcome: result.status,
+		summary: result.summary,
+		...(result.reportUrl !== undefined ? { reportUrl: result.reportUrl } : {}),
+		...(result.eventCursor !== undefined ? { eventCursor: result.eventCursor } : {}),
+		recordedAtIso: result.recordedAtIso,
+	};
+}
+
+function isRemoteAcceptanceVerdict(result: RemoteVerificationResult): result is RemoteIssuedAcceptanceVerdict {
+	return isVerdictStatus(result.status);
+}
+
+function parseRemoteVerificationAttempt(value: unknown): RemoteVerificationAttempt | undefined {
+	const attempt = verificationRecord(value);
+	if (
+		!attempt ||
+		!hasOnlyKeys(attempt, REMOTE_VERIFICATION_ATTEMPT_KEYS) ||
+		typeof attempt.jobId !== "string" ||
+		typeof attempt.snapshotDigest !== "string" ||
+		!isAttemptStatus(attempt.outcome) ||
+		typeof attempt.summary !== "string" ||
+		(attempt.reportUrl !== undefined && typeof attempt.reportUrl !== "string") ||
+		(attempt.eventCursor !== undefined && typeof attempt.eventCursor !== "string") ||
+		typeof attempt.recordedAtIso !== "string"
+	) {
+		return undefined;
+	}
+	return {
+		jobId: attempt.jobId,
+		snapshotDigest: attempt.snapshotDigest,
+		outcome: attempt.outcome,
+		summary: attempt.summary,
+		...(attempt.reportUrl !== undefined ? { reportUrl: attempt.reportUrl } : {}),
+		...(attempt.eventCursor !== undefined ? { eventCursor: attempt.eventCursor } : {}),
+		recordedAtIso: attempt.recordedAtIso,
+	};
+}
+
+function parseRemoteVerificationAttempts(value: unknown): readonly RemoteVerificationAttempt[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const parsed: RemoteVerificationAttempt[] = [];
+	for (const item of value) {
+		const attempt = parseRemoteVerificationAttempt(item);
+		if (!attempt) return undefined;
+		parsed.push(attempt);
 	}
 	return parsed;
+}
+
+type ParsedRemoteAcceptanceVerdictRecord = {
+	verdicts: RemoteAcceptanceVerdictRecord;
+	migratedAttempts: readonly RemoteVerificationAttempt[];
+};
+
+function parseRemoteAcceptanceVerdictRecord(value: unknown): ParsedRemoteAcceptanceVerdictRecord | undefined {
+	const record = verificationRecord(value);
+	if (!record) return undefined;
+	const parsed: Record<string, RemoteIssuedAcceptanceVerdict> = {};
+	const migratedAttempts: RemoteVerificationAttempt[] = [];
+	for (const [key, value] of Object.entries(record)) {
+		const result = parseRemoteVerificationResult(value);
+		if (!result || key !== remoteAcceptanceVerdictKey(result)) return undefined;
+		if (!isRemoteAcceptanceVerdict(result)) {
+			const attempt = remoteVerificationAttempt(result);
+			if (!attempt) return undefined;
+			migratedAttempts.push(attempt);
+		} else {
+			parsed[key] = result;
+		}
+	}
+	return { verdicts: parsed, migratedAttempts };
 }
 
 function normalizedNormalState(
@@ -231,9 +341,18 @@ function normalizedNormalState(
 ): SharedVinciNormalVerificationState | undefined {
 	const hasCommandCwd = Object.hasOwn(data, "commandCwd");
 	const hasRemoteAcceptanceVerdicts = Object.hasOwn(data, "remoteAcceptanceVerdicts");
-	const remoteAcceptanceVerdicts = hasRemoteAcceptanceVerdicts
+	const parsedRemoteAcceptanceVerdicts = hasRemoteAcceptanceVerdicts
 		? parseRemoteAcceptanceVerdictRecord(data.remoteAcceptanceVerdicts)
 		: undefined;
+	const remoteAcceptanceVerdicts = parsedRemoteAcceptanceVerdicts?.verdicts;
+	const hasRemoteVerificationAttempts = Object.hasOwn(data, "remoteVerificationAttempts");
+	const parsedRemoteVerificationAttempts = hasRemoteVerificationAttempts
+		? parseRemoteVerificationAttempts(data.remoteVerificationAttempts)
+		: undefined;
+	const remoteVerificationAttempts = [
+		...(parsedRemoteVerificationAttempts ?? []),
+		...(parsedRemoteAcceptanceVerdicts?.migratedAttempts ?? []),
+	];
 	if (
 		(data.status !== "none" && data.status !== "stale" && data.status !== "failed" && data.status !== "passed") ||
 		typeof data.command !== "string" ||
@@ -282,7 +401,8 @@ function normalizedNormalState(
 		(!legacy && typeof data.behavioralAttemptCommandKeyCanonical !== "boolean") ||
 		(!legacy && typeof data.behavioralAttemptCompleted !== "boolean") ||
 		(legacy && data.behavioralAttemptCompleted !== undefined && typeof data.behavioralAttemptCompleted !== "boolean") ||
-		(hasRemoteAcceptanceVerdicts && remoteAcceptanceVerdicts === undefined)
+		(hasRemoteAcceptanceVerdicts && parsedRemoteAcceptanceVerdicts === undefined) ||
+		(hasRemoteVerificationAttempts && parsedRemoteVerificationAttempts === undefined)
 	) {
 		return undefined;
 	}
@@ -359,7 +479,8 @@ function normalizedNormalState(
 			: (data.behavioralAttemptCommandKeyCanonical as boolean),
 		behavioralAttemptCompleted:
 			typeof data.behavioralAttemptCompleted === "boolean" ? data.behavioralAttemptCompleted : true,
-		...(remoteAcceptanceVerdicts ? { remoteAcceptanceVerdicts } : {}),
+		...(hasRemoteAcceptanceVerdicts ? { remoteAcceptanceVerdicts: remoteAcceptanceVerdicts ?? {} } : {}),
+		...(hasRemoteVerificationAttempts || remoteVerificationAttempts.length > 0 ? { remoteVerificationAttempts } : {}),
 	};
 
 	const commandPairValid = Boolean(state.command) === Boolean(state.commandKey);
@@ -472,11 +593,21 @@ export function parseSharedVinciVerificationState(value: unknown): SharedVinciVe
 			"commandKey",
 			"checkClass",
 			"remoteAcceptanceVerdicts",
+			"remoteVerificationAttempts",
 		]);
 		const hasRemoteAcceptanceVerdicts = Object.hasOwn(data, "remoteAcceptanceVerdicts");
-		const remoteAcceptanceVerdicts = hasRemoteAcceptanceVerdicts
+		const parsedRemoteAcceptanceVerdicts = hasRemoteAcceptanceVerdicts
 			? parseRemoteAcceptanceVerdictRecord(data.remoteAcceptanceVerdicts)
 			: undefined;
+		const remoteAcceptanceVerdicts = parsedRemoteAcceptanceVerdicts?.verdicts;
+		const hasRemoteVerificationAttempts = Object.hasOwn(data, "remoteVerificationAttempts");
+		const parsedRemoteVerificationAttempts = hasRemoteVerificationAttempts
+			? parseRemoteVerificationAttempts(data.remoteVerificationAttempts)
+			: undefined;
+		const remoteVerificationAttempts = [
+			...(parsedRemoteVerificationAttempts ?? []),
+			...(parsedRemoteAcceptanceVerdicts?.migratedAttempts ?? []),
+		];
 		const hasCommandFields = "command" in data || "commandKey" in data || "checkClass" in data;
 		const summary =
 			data.summary === VINCI_CORRUPTED_VERIFICATION_MESSAGE || data.summary === legacyCorruptedMessage
@@ -508,7 +639,8 @@ export function parseSharedVinciVerificationState(value: unknown): SharedVinciVe
 			data.status !== "failed" ||
 			!summary ||
 			!isRevision(data.mutationRevision, 0) ||
-			(hasRemoteAcceptanceVerdicts && remoteAcceptanceVerdicts === undefined) ||
+			(hasRemoteAcceptanceVerdicts && parsedRemoteAcceptanceVerdicts === undefined) ||
+			(hasRemoteVerificationAttempts && parsedRemoteVerificationAttempts === undefined) ||
 			!commandFieldsValid ||
 			!causeValid
 		) {
@@ -523,7 +655,8 @@ export function parseSharedVinciVerificationState(value: unknown): SharedVinciVe
 			command,
 			commandKey,
 			checkClass,
-			...(remoteAcceptanceVerdicts ? { remoteAcceptanceVerdicts } : {}),
+			...(hasRemoteAcceptanceVerdicts ? { remoteAcceptanceVerdicts: remoteAcceptanceVerdicts ?? {} } : {}),
+			...(hasRemoteVerificationAttempts || remoteVerificationAttempts.length > 0 ? { remoteVerificationAttempts } : {}),
 		};
 	}
 	return undefined;
