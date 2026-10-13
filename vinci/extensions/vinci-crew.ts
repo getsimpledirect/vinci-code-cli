@@ -18,6 +18,7 @@
  * Additive: pure extension, no core patch.
  */
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -185,7 +186,9 @@ interface Helper {
   startedAt?: number;
   finishedAt?: number;
   notifiedAt?: number;
+  deliveryId?: string;
   deliveredAt?: number;
+  deliveryPending?: boolean; // accepted by the runtime, but not yet present in its session journal
   dismissedAt?: number; // user cleared this row from the strip; /agents still lists it
 
   result?: AgentResult;
@@ -211,6 +214,7 @@ type PersistedHelper = Omit<
   | "activity"
   | "streaming"
   | "messagedDuringRun"
+  | "deliveryPending"
   | "viewerRepaint"
   | "unsubscribeLive"
   | "unsubscribeEvents"
@@ -467,6 +471,7 @@ function persistedHelper(h: Helper): PersistedHelper {
     activity: _activity,
     streaming: _streaming,
     messagedDuringRun: _messagedDuringRun,
+    deliveryPending: _deliveryPending,
     viewerRepaint: _viewerRepaint,
     unsubscribeLive: _unsubscribeLive,
     unsubscribeEvents: _unsubscribeEvents,
@@ -719,6 +724,7 @@ function restoreHelpers(pi: ExtensionAPI, ctx: ExtensionContext): void {
   for (const record of latest.values()) {
     const restored: Helper = { ...record };
     normalizeRestoredHonesty(restored);
+    const deliveryObserved = reconcileHelperDelivery(restored, ctx.sessionManager);
     if (restored.diffPath) {
       try {
         restored.diff = readFileSync(restored.diffPath, "utf8");
@@ -732,7 +738,7 @@ function restoreHelpers(pi: ExtensionAPI, ctx: ExtensionContext): void {
         }
       } catch {
         restored.status = "blocked";
-        finalizeHelper(pi, restored, "The agent patch artifact is missing; no changes were applied.");
+        finalizeHelper(pi, restored, "The agent patch artifact is missing; no changes were applied.", "nextTurn");
       }
     }
     if (restored.status === "queued" || restored.status === "working" || restored.status === "verifying" || restored.status === "reviewing") {
@@ -784,20 +790,42 @@ function restoreHelpers(pi: ExtensionAPI, ctx: ExtensionContext): void {
         : restored.diff?.trim()
           ? "The prior session interrupted this agent; its partial patch was preserved for review."
           : recoveryReason ?? "The prior session interrupted this agent before it produced a patch.",
+        "nextTurn",
       );
     }
     if (isTerminalStatus(restored.status)) restored.finishedAt ??= Date.now();
     helpers.push(restored);
+    if (deliveryObserved) persistHelper(pi, restored);
   }
   nextId = Math.max(0, ...helpers.map((helper) => helper.id)) + 1;
   for (const helper of helpers) {
     if (isTerminalStatus(helper.status) && helper.finishedAt && (!helper.notifiedAt || !helper.deliveredAt)) {
-      finalizeHelper(pi, helper);
+      finalizeHelper(pi, helper, undefined, "nextTurn");
     }
   }
   // Publishes that happened DURING the rebuild saw a partial roster (each helper is finalized
   // before it is pushed); one publish over the complete roster makes the store honest at rest.
   publishCrewStatus();
+}
+
+function reconcileHelperDelivery(h: Helper, sessionManager: ExtensionContext["sessionManager"]): boolean {
+  for (const entry of sessionManager.getBranch()) {
+    if (entry.type !== "custom_message" || entry.customType !== "vinci-crew-result") continue;
+    if (!entry.details || typeof entry.details !== "object" || Array.isArray(entry.details)) continue;
+    const details = entry.details as Partial<AgentResult> & { deliveryId?: unknown };
+    // Legacy sessions had no delivery identity. Their helper ids are unique within the selected
+    // branch, but also match name/task so unrelated or malformed messages cannot acknowledge work.
+    const matches = h.deliveryId
+      ? details.deliveryId === h.deliveryId
+      : details.agentId === h.id && details.name === h.name && details.task === h.task;
+    if (!matches) continue;
+    if (typeof details.deliveryId === "string") h.deliveryId ??= details.deliveryId;
+    const timestamp = Date.parse(entry.timestamp);
+    h.deliveredAt ??= Number.isFinite(timestamp) ? timestamp : Date.now();
+    h.deliveryPending = false;
+    return true;
+  }
+  return false;
 }
 
 export function verificationProof(entries: readonly unknown[]): VerificationProof | undefined {
@@ -2019,7 +2047,12 @@ function formatAgentResult(result: AgentResult): string {
   );
 }
 
-export function finalizeHelper(pi: ExtensionAPI, h: Helper, reason?: string): void {
+export function finalizeHelper(
+  pi: ExtensionAPI,
+  h: Helper,
+  reason?: string,
+  delivery: "automatic" | "nextTurn" = "automatic",
+): void {
   if (!isTerminalStatus(h.status)) return;
   h.reason ??= reason;
   h.finishedAt ??= Date.now();
@@ -2058,14 +2091,45 @@ export function finalizeHelper(pi: ExtensionAPI, h: Helper, reason?: string): vo
     }
   }
 
-  if (!h.deliveredAt) {
+  if (!h.deliveredAt && !h.deliveryPending) {
     try {
-      pi.sendMessage<AgentResult>(
-        { customType: "vinci-crew-result", content: formatAgentResult(h.result), display: false, details: h.result },
-        { triggerTurn: true, deliverAs: "followUp" },
+      // Record the attempt identity BEFORE dispatch. A crash after the custom message is appended
+      // but before this helper checkpoint is saved is reconciled from that journal on restore.
+      h.deliveryId ??= randomUUID();
+      persistHelper(pi, h);
+      let holdTurn = false;
+      let idle = false;
+      let sessionManager: ExtensionContext["sessionManager"] | undefined;
+      try {
+        sessionManager = uiRef?.sessionManager;
+        if (uiRef?.mode === "tui") {
+          holdTurn = uiRef.ui.getEditorText().length > 0 || (uiRef.ui.isOverlayActive?.() ?? false);
+          idle = uiRef.isIdle();
+        }
+      } catch {
+        // A stale TUI cannot establish that the user is idle, so do not start an unsolicited turn.
+        holdTurn = true;
+      }
+      h.deliveryPending = true;
+      pi.sendMessage<AgentResult & { deliveryId: string }>(
+        {
+          customType: "vinci-crew-result",
+          content: formatAgentResult(h.result),
+          display: false,
+          details: { ...h.result, deliveryId: h.deliveryId },
+        },
+        // An idle draft can receive a durable context message without starting a model turn.
+        // During streaming, nextTurn waits for the user's submission rather than racing their text.
+        // Restored results must share the first admitted user/initial prompt. A startup-triggered
+        // turn races the CLI's initial stdin prompt before session_start has finished binding.
+        {
+          triggerTurn: delivery === "automatic" && !holdTurn,
+          deliverAs: delivery === "nextTurn" || (holdTurn && !idle) ? "nextTurn" : "followUp",
+        },
       );
-      h.deliveredAt = Date.now();
+      if (sessionManager) reconcileHelperDelivery(h, sessionManager);
     } catch {
+      h.deliveryPending = false;
       /* out-of-turn delivery is best-effort and retried after restore */
     }
   }
@@ -2490,6 +2554,19 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("agent_start", async (_e, ctx) => {
     uiRef = ctx;
+  });
+  pi.on("message_end", (event, ctx) => {
+    if (event.message.role !== "custom" || event.message.customType !== "vinci-crew-result") return;
+    const details = event.message.details as { deliveryId?: unknown } | undefined;
+    const helper = helpers.find((h) => h.deliveryId && h.deliveryId === details?.deliveryId);
+    if (!helper) return;
+    const sessionManager = ctx.sessionManager;
+    // The runtime persists message_end AFTER extension handlers. Observe on the next event-loop
+    // turn; acknowledging inside this handler would recreate the queued-but-lost crash window.
+    setImmediate(() => {
+      if (!helpers.includes(helper)) return;
+      if (reconcileHelperDelivery(helper, sessionManager)) persistHelper(pi, helper);
+    });
   });
   // [#194] One-shot modes fire this after the last submitted turn, BEFORE deciding the exit code.
   // Helpers run for minutes after the main turn ends; without this wait the old flow exited 0 with

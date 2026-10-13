@@ -169,7 +169,7 @@ export function summarizeUnattendedDecisions(
 ): UnattendedSummary {
   const summary: UnattendedSummary = { blocked: 0, escalated: 0, proceeded: 0 };
   for (const decision of decisions) {
-    if (decision.outcome === "BLOCKED") summary.blocked += 1;
+    if (decision.outcome === "BLOCKED") summary.blocked += 1; // canonical-rendering: local unattended outcomes select their summary counters.
     else if (decision.outcome === "ESCALATED") summary.escalated += 1;
     else if (decision.outcome === "PROCEEDED") summary.proceeded += 1;
   }

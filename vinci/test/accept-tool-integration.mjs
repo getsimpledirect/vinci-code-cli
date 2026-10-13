@@ -5,15 +5,14 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createJiti } from "jiti/static";
+import { parseLauncherExtensions } from "./launcher-extensions.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
 const tmpDir = mkdtempSync(resolve(tmpdir(), "vinci-accept-tool-"));
 
 const launcherSource = readFileSync(resolve(root, "vinci/bin/vinci"), "utf8");
-const launcherExtensions = [...launcherSource.matchAll(/--extension "\$\{VINCI\}\/extensions\/([^"]+)"/g)].map(
-  (match) => match[1],
-);
+const launcherExtensions = parseLauncherExtensions(launcherSource);
 const identity = JSON.parse(readFileSync(resolve(root, "vinci/identity.json"), "utf8"));
 assert(launcherExtensions.includes("vinci-accept.ts"), "launcher must discover vinci-accept");
 assert(identity.extensions.includes("vinci-accept.ts"), "identity must register vinci-accept");

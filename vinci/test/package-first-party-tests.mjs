@@ -27,7 +27,7 @@
 // Usage:  node vinci/test/package-first-party-tests.mjs
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -127,8 +127,15 @@ function listArchive(outputDirectory) {
 }
 
 function build(script, outputDirectory) {
-	execFileSync("bash", [script, outputDirectory], { cwd: root, encoding: "utf8", stdio: "pipe" });
+	// These intentional runtime probes change the real producer inputs. Build their exact bytes,
+	// rather than reusing the clean source build and defeating its provenance guard.
+	execFileSync("bash", [script, outputDirectory], { cwd: root, encoding: "utf8", stdio: "pipe", timeout: 240000, env: { ...process.env, VINCI_PACKAGE_REUSE_BUILD: "0", VINCI_PACKAGE_REQUIRE_CLEAN_SOURCE: "0" } });
 	return listArchive(outputDirectory);
+}
+
+function removeOwnedDirectory(directory) {
+	execFileSync("find", [directory, "-mindepth", "1", "-delete"], { timeout: 10000 });
+	rmdirSync(directory);
 }
 
 const work = mkdtempSync(join(tmpdir(), "vinci-package-first-party-tests-"));
@@ -246,9 +253,9 @@ try {
 	// removed after any created child. Directories that already existed are never named here at all.
 	for (const file of plantedFiles) rmSync(file, { force: true });
 	for (const directory of [...createdDirectories].sort((a, b) => b.length - a.length)) {
-		rmSync(directory, { recursive: true, force: true });
+		removeOwnedDirectory(directory);
 	}
-	rmSync(work, { recursive: true, force: true });
+	removeOwnedDirectory(work);
 }
 
 // These run on BOTH paths. The previous version sat after try/finally with no catch, so any
@@ -275,7 +282,10 @@ check(
 // This test's own keeper is removed last, after it has done its work; the directory only if this
 // run created it.
 rmSync(keeper, { force: true });
-if (!keeperDirectoryPreexisted) rmSync(keeperDirectory, { recursive: true, force: true });
+if (!keeperDirectoryPreexisted) removeOwnedDirectory(keeperDirectory);
+
+// Restore generated outputs to the restored source before the later packaged gates run.
+execFileSync("bash", [join(root, "vinci/build.sh")], { cwd: root, encoding: "utf8", stdio: "pipe", timeout: 120000 });
 
 if (thrown !== undefined) throw thrown;
 

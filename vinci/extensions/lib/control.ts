@@ -1,8 +1,9 @@
 /** Send model-only guidance without putting implementation instructions in the visible transcript. */
+import { isAcceptedWireStatus } from "./canonical-verdicts.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   recordRemoteAcceptanceVerdict as recordVerificationRemoteAcceptanceVerdict,
-  type RemoteAcceptanceVerdict,
+  type RemoteVerificationResult,
 } from "./verification-state.ts";
 
 export type VinciAutomationStop = {
@@ -126,7 +127,7 @@ export function sendVinciControl(pi: ExtensionAPI, customType: string, content: 
   );
 }
 
-// Record a remote acceptance verdict into the verification store. Best-effort: failures never break the caller.
+// Record a remote verification result into the verification store. Best-effort: failures never break the caller.
 type RemoteAcceptanceVerdictInput = {
   status?: string;
   summary?: string;
@@ -138,14 +139,8 @@ type RemoteAcceptanceVerdictInput = {
 
 function isRemoteAcceptanceVerdictStatus(
   status: string | undefined,
-): status is RemoteAcceptanceVerdict["status"] {
-  return (
-    status === "VERIFIED_PASS" ||
-    status === "BLOCKED" ||
-    status === "CONDITIONAL" ||
-    status === "FAILED" ||
-    status === "CANCELLED"
-  );
+): status is RemoteVerificationResult["status"] {
+  return isAcceptedWireStatus(status);
 }
 
 export function recordRemoteAcceptanceVerdict(verdict: RemoteAcceptanceVerdictInput): boolean {

@@ -16,7 +16,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 // [verification system] auto-run the independent grader when the plan is marked all-done — trust the
 // check, not the claim. See lib/grader.ts and vinci/docs/verification.md.
-import { gradeChanges } from "./lib/grader.ts";
+import { captureReviewRequest, currentRequestForbidsEdits, gradeChanges } from "./lib/grader.ts";
 import { getVinciAutomationStop, sendVinciControl } from "./lib/control.ts";
 import { clearVinciHardStop, recordVinciHardStop, refuseFinalization, vinciTaskIdOf } from "./lib/hard-stop.ts";
 import { isVinciFinalizationCommand, isVinciUnattended } from "./lib/unattended.ts";
@@ -154,6 +154,7 @@ const TODO_PARAMS = Type.Object({
 
 export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) {
   installVinciUsageAccumulator(pi);
+  pi.on("agent_start", (event, ctx) => captureReviewRequest(ctx, event));
   pi.registerTool({
     name: "todo",
     label: "Plan",
@@ -258,6 +259,20 @@ export default function (pi: ExtensionAPI, gradePlan: GradePlan = gradeChanges) 
           graded = null;
         }
         if (graded && (graded.verdict === "needs-work" || graded.verdict === "risky")) {
+          if (currentRequestForbidsEdits(ctx)) {
+            // A completed assessment can report a defective patch; it does not authorize repair.
+            reviewPaused = true;
+            automaticContinues = MAX_AUTOMATIC_CONTINUES;
+            sendVinciControl(
+              pi,
+              "vinci-plan-review-report",
+              `Independent review found ${graded.verdict}. This request explicitly forbids project edits. Report the findings and the failed or uncertain checks without repairing files; the assessment plan remains complete, while the patch is not accepted:\n\n${graded.text}`,
+            );
+            return {
+              content: [{ type: "text", text: "Independent review found issues · report the read-only assessment without changes." }],
+              details: { tool: "todo", steps: next.length, reviewed: true, assessmentOnly: true, verdict: graded.verdict },
+            };
+          }
           // Reopen the last step — the task is NOT actually done — and hand the model the concrete
           // findings. One repair pass is useful; a second failed review is a structural loop, so pause
           // mutations and return control instead of reopening forever. Risky findings pause at once.

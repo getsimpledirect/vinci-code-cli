@@ -111,13 +111,13 @@ function processGroupExists(pid) {
   }
 }
 
-async function waitForWorkerClose(worker) {
+async function waitForWorkerClose(worker, timeoutMs = 5000) {
   let timer;
   try {
     return await Promise.race([
       worker.closed,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('The worker pipes did not close within 5000 ms; inspect the surviving task process group.')), 5000);
+        timer = setTimeout(() => reject(new Error(`The worker pipes did not close within ${timeoutMs} ms; inspect the surviving task process group.`)), timeoutMs);
       }),
     ]);
   } finally {
@@ -408,22 +408,77 @@ await test('renew 409 stale mid-run => child SIGTERMed, BLOCKED lease_lost, zero
 await test('renew unreachable (socket dropped) is retried once, then lease_lost:unreachable', async () => {
   const fixture = new WorkerTestFixture('lease-drop');
   const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1, renewOkCount: 3, renewFailure: 'drop' });
+  const readyFile = join(fixture.tempDir, 'vinci-signal-ready');
+  const exitMarker = join(fixture.tempDir, 'vinci-natural-exit');
+  const signalDeadlineMs = 2 * LEASE_TIMEOUT_MS + 5000;
+  const handle = governor.handle.bind(governor);
+  governor.handle = async (request, response) => {
+    if (request.url.endsWith('/renew')) {
+      try {
+        await waitFor(() => existsSync(readyFile), { timeoutMs: 5000, label: 'the lease-loss child SIGTERM handler readiness before renewal' });
+      } catch (error) {
+        console.error(`The lease-loss fixture refused renewal because ${error.message}; inspect the child startup and SIGTERM readiness.`);
+        request.socket.destroy();
+        return true;
+      }
+    }
+    return handle(request, response);
+  };
   await governor.start();
+  let worker = null;
+  let childPid = null;
   try {
     fixture.createRepo('test', 'repo');
     fixture.linkTools(TOOLS);
     await fixture.startBus([handoff('105', 'w5', 'repo: test/repo\nevidence: none\n\nTask')]);
-    const { code, stderr } = await runWorker(fixture, 'w5', ['--governor', governor.url], { FAKE_VINCI_SLEEP: '20000' });
+    worker = spawnWorker(fixture, 'w5', ['--governor', governor.url], {
+      FAKE_VINCI_WAIT_FOR_SIGTERM: '1',
+      FAKE_VINCI_SIGNAL_DEADLINE_MS: String(signalDeadlineMs),
+      FAKE_VINCI_READY_FILE: readyFile,
+      FAKE_VINCI_RUN_EXIT_MARKER: exitMarker,
+    });
+    await waitFor(() => existsSync(readyFile), { timeoutMs: 5000, label: 'the actual lease-loss child to become signal-ready' });
+    childPid = Number(readFileSync(readyFile, 'utf8').trim());
+    assert.equal(childPid, fixture.getVinciCalls()[0]?.pid, 'the ready handler belongs to the actual task child');
+    assert.equal(processExists(childPid), true, 'the task remains alive before the lease-loss stop');
+    const { code, stderr } = await waitForWorkerClose(worker, signalDeadlineMs + 5000);
     assert.equal(code, 0, stderr);
     const snapshot = state(fixture, '105');
     assert.equal(snapshot.state, 'BLOCKED');
     assert.equal(snapshot.outcome.reason, 'lease_lost:unreachable');
+    assert.equal(snapshot.publish, 'skipped');
+    assert.equal(snapshot.pr, null);
     assert.equal(governor.renews.length, 5, 'three granted, the dropped one, exactly one retry');
     assert(vinciRecordLines(fixture).includes('SIGTERM'));
+    assert.equal(snapshot.exit_code, 143, 'the child exits from the observed signal');
+    assert.equal(existsSync(exitMarker), false, 'a natural child exit cannot stand in for lease-loss cancellation');
+    assert.equal(processGroupExists(childPid), false, 'the actual task group is absent before cleanup');
+    assert.deepEqual(governor.releases.map((r) => r.outcome), ['abandoned']);
+    assert.equal(governor.checks.length, 0, 'loss of authority prevents entry into publication');
+    assert.equal(ghCalls(fixture).length, 0, 'no PR operation follows lease loss');
     assert.equal(originHasBranch(join(fixture.reposDir, 'test', 'repo.git'), 'worker/105'), false);
   } finally {
-    await governor.close();
-    await fixture.cleanup();
+    let cleanupError = null;
+    const taskPids = new Set([childPid, ...fixture.getVinciCalls().map((call) => call.pid)]);
+    for (const pid of taskPids) {
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      try { process.kill(-pid, 'SIGKILL'); }
+      catch (error) { if (error.code !== 'ESRCH') cleanupError ??= error; }
+    }
+    try {
+      worker?.proc.kill('SIGKILL');
+      if (worker) await waitForWorkerClose(worker);
+      for (const pid of taskPids) {
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        await waitFor(() => !processGroupExists(pid), { timeoutMs: 5000, label: 'the lease-loss fixture task group to disappear during cleanup' });
+      }
+    } catch (error) {
+      cleanupError ??= error;
+    } finally {
+      await governor.close();
+      await fixture.cleanup();
+    }
+    if (cleanupError) throw cleanupError;
   }
 });
 
@@ -801,7 +856,8 @@ for (const startupDelayMs of [0, 1200]) {
       await fixture.startBus([handoff('118', 'w5', 'repo: test/repo\nevidence: pr\n\nTask')]);
       const readyFile = join(fixture.tempDir, 'vinci-signal-ready');
       worker = spawnWorker(fixture, 'w5', ['--governor', governor.url], {
-        FAKE_VINCI_SLEEP: '30000',
+        FAKE_VINCI_WAIT_FOR_SIGTERM: '1',
+        FAKE_VINCI_SIGNAL_DEADLINE_MS: String(2 * LEASE_TIMEOUT_MS + 5000),
         FAKE_VINCI_STARTUP_DELAY_MS: String(startupDelayMs),
         FAKE_VINCI_READY_FILE: readyFile,
       });

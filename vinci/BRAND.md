@@ -44,9 +44,27 @@ error `#E07A6E`/`#B5483C`, warning `#D9B48A`/`#9A6B1E` (dark/light).
 
 ## Terminal header
 
-The `vinci-header.ts` extension draws the aperture mark + `vinci code` lockup in sage.
-It's an approximation of the 12-petal logomark at terminal scale — a starting point;
-refine the glyphs against `assets/logomark.svg`.
+The everyday `vinci-header.ts` header reserves a fixed compact slot for Vero beside the
+Vinci identity and context. Image-capable terminals use the original PNG artwork on a
+neutral cream surface with its aspect ratio preserved. The optional `VINCI_HERO_HEADER=1`
+view retains the maker's mark and uses rich idle Vero. The ordinary view uses pixel Vero.
+
+[`assets/vero/manifest.json`](assets/vero/manifest.json) retains the approved marketing
+source commit, archive and guide hashes, and the original PNG/SVG hashes. Reimport with
+`node vinci/scripts/import-vero-assets.mjs --source <Vero-folder> --approved-manifest <manifest.json>`.
+Use the marketing manifest at its recorded commit. Do not redraw, stretch, recolour,
+invert, add effects, or invent poses. A raster-to-cell or ASCII adaptation needs brand
+approval; the supplied terminal integration uses readable text when images are unavailable.
+
+Vero reflects activity, not proof: working means activity; review means checking or a
+human decision; blocked means an observed blocker; done means completed activity. The
+receipt carries the evidence. `DONE-UNVERIFIED`, `WAITING` and `BLOCKED` remain explicit.
+The poses do not certify verification, approval, safety or security.
+
+`VINCI_REDUCED_MOTION=1` keeps a static activity indicator. `NO_COLOR`, `TERM=dumb`,
+`VINCI_PLAIN=1` and `VINCI_SCREEN_READER=1` select the compact text header and disable
+decorative images and the pulse. Non-TUI output, transcripts, copied responses and exports
+do not contain this presentation artwork.
 
 ## Voice
 
@@ -56,7 +74,6 @@ authoritatively, in the server-side character layer (vinci-chat).
 
 ## Fonts
 
-The brand type is **Fraunces** (wordmark serif) / **Newsreader** (reading serif) /
-**Geist** + **Geist Mono** (UI/mono) — all open-source (Google Fonts). A terminal uses
-the user's own monospace font, so fonts don't apply to the TUI; they matter for the docs
-site, marketing, and any rendered output. Not bundled here.
+The supplied Vinci style guide specifies **Geist Sans** for UI, body and display copy,
+and **Geist Mono** for monospace copy. Use the original wordmark artwork. A terminal uses
+the user's own monospace font; these fonts are not bundled here.

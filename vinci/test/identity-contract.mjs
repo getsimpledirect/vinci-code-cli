@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseLauncherExtensions } from "./launcher-extensions.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const vinci = join(root, "vinci");
@@ -43,7 +44,10 @@ assert.ok(
 );
 assert.ok(header.includes(identity.tagline), "The Vinci tagline is missing from the header");
 assert.ok(header.includes(identity.defaultModelName), "The header fallback model no longer matches the identity contract");
-assert.ok(header.includes(`VINCI_VERSION = "${identity.version}"`), "The header version drifted from the identity contract");
+assert.match(header, /import \{[^}]*VINCI_VERSION[^}]*\} from "\.\/lib\/product-identity\.ts"/, "The header must read Vinci's authoritative product identity");
+const productIdentity = read("vinci/extensions/lib/product-identity.ts");
+assert.match(productIdentity, /readFileSync\(new URL\("identity\.json", VINCI_ROOT\)/, "The header identity must be loaded from vinci/identity.json");
+assert.doesNotMatch(header, /VINCI_VERSION\s*=\s*["']\d+\.\d+\.\d+["']/, "The header must not duplicate a product version constant");
 assert.match(updater, /verifySignature/, "The commercial updater must verify signed release manifests");
 assert.match(updater, /update\.lock/, "The commercial updater must serialize concurrent updates");
 assert.match(updaterShim, /before-launch/, "The stable launcher must update before starting a task");
@@ -57,10 +61,7 @@ for (const theme of identity.themes) {
   assert.ok(existsSync(join(vinci, "themes", theme)), `Required Vinci theme is missing: ${theme}`);
 }
 
-const launcherExtensions = Array.from(
-  launcher.matchAll(/--extension "\$\{VINCI\}\/extensions\/([^"]+)"/g),
-  (match) => match[1],
-);
+const launcherExtensions = parseLauncherExtensions(launcher);
 assert.deepEqual(launcherExtensions, identity.extensions, "The launcher extension set drifted from vinci/identity.json");
 for (const extension of identity.extensions) {
   assert.ok(existsSync(join(vinci, "extensions", extension)), `Required Vinci extension is missing: ${extension}`);

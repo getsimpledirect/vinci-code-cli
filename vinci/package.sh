@@ -13,26 +13,40 @@ VERSION="$(node -e 'const i=require(process.argv[1]); if(typeof i.version!=="str
 TGZ="${OUT}/vinci-code-${VERSION}.tgz"
 CURRENT_TGZ="${OUT}/vinci-code.tgz"
 EXCLUDES="$(mktemp "${TMPDIR:-/tmp}/vinci-package-excludes.XXXXXX")"
-trap 'rm -f "${EXCLUDES}"' EXIT
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/vinci-package-runtime.XXXXXX")"
+trap 'rm -f "${EXCLUDES}"; find "${STAGE}" -mindepth 1 -delete && rmdir "${STAGE}"' EXIT
 mkdir -p "${OUT}"
 
+bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh"
+
 echo "── Building (network-free) ─────────────────────────"
-bash "${ROOT}/vinci/build.sh" >/dev/null
+if [ "${VINCI_PACKAGE_REUSE_BUILD:-0}" = "1" ]; then
+  for built in packages/{agent,ai,coding-agent,orchestrator,tui}/dist/index.js vinci/dist/extensions/vinci-header.js; do
+    [ -f "${ROOT}/${built}" ] || { echo "Reusable build file \"${built}\" is absent. Run vinci/build.sh before reusing its payload." >&2; exit 1; }
+  done
+else
+  bash "${ROOT}/vinci/build.sh" >/dev/null
+fi
+node "${ROOT}/vinci/scripts/build-source-identity.mjs" check "${ROOT}" "${ROOT}/vinci/dist/source-identity.json"
 echo "  ✓ built"
 
 echo "── Packaging → ${TGZ} ─────────────────────────────"
 # A shared development checkout can contain unrelated top-level packages left by local experiments.
 # Exclude anything npm identifies as extraneous so the release follows the reviewed dependency graph.
-node "${ROOT}/vinci/scripts/package-excludes.mjs" "${ROOT}" > "${EXCLUDES}"
+# Reused development dependencies can be absolute symlinks into another checkout. Stage the exact
+# locked runtime closure as files and relative workspace links before creating an installed payload.
+node "${ROOT}/vinci/scripts/stage-runtime-dependencies.mjs" "${ROOT}" "${STAGE}"
+node "${ROOT}/vinci/scripts/package-excludes.mjs" "${ROOT}" --runtime-staged > "${EXCLUDES}"
 
 # Tar straight from the repo root so paths extract as packages/… + vinci/ + node_modules (the launcher
 # resolves ROOT from its own location, so this layout runs as-is). Package only Vinci runtime assets;
 # tests, docs, infrastructure state, and release tooling must never enter the public archive.
-tar -czf "${TGZ}" -C "${ROOT}" \
+COPYFILE_DISABLE=1 tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude-from="${EXCLUDES}" \
   --exclude='node_modules/typescript' \
   --exclude='node_modules/@typescript' \
   --exclude='node_modules/@biomejs' \
+  --exclude='node_modules/@getsimpledirect' \
   --exclude='node_modules/@types' \
   --exclude='node_modules/esbuild' \
   --exclude='node_modules/@esbuild' \
@@ -41,15 +55,29 @@ tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude='node_modules/.bin' \
   --exclude='*.map' \
   --exclude='*.ts.map' \
+  --exclude='*/graphify-out' \
   --exclude='vinci/worker/README.md' \
   packages/agent/dist packages/agent/package.json \
   packages/ai/dist packages/ai/package.json \
   packages/coding-agent/dist packages/coding-agent/package.json \
   packages/orchestrator/dist packages/orchestrator/package.json \
   packages/tui/dist packages/tui/package.json \
-  vinci/bin vinci/extensions vinci/themes vinci/assets vinci/updater vinci/worker \
-  vinci/scripts/report-wrong.mjs vinci/identity.json vinci/NOTICE \
-  package.json node_modules
+  vinci/bin vinci/extensions vinci/dist vinci/themes vinci/assets vinci/updater vinci/worker \
+  vinci/scripts/report-wrong.mjs vinci/scripts/runtime.mjs vinci/scripts/runtime.d.mts vinci/identity.json vinci/NOTICE \
+  package.json LICENSE \
+  -C "${STAGE}" node_modules packages
+
+node "${ROOT}/vinci/scripts/build-source-identity.mjs" check "${ROOT}" "${ROOT}/vinci/dist/source-identity.json"
+PACKAGE_FILES="$(tar -tvzf "${TGZ}" | awk 'substr($0, 1, 1) != "d" { count++ } END { print count + 0 }')"
+if [ "${PACKAGE_FILES}" -gt 10000 ]; then
+  echo "Vinci artifact has ${PACKAGE_FILES} file or link entries, exceeding the 10,000-entry churn ceiling. Report this estimate before unpacking the payload." >&2
+  exit 1
+fi
+echo "  packaged ${PACKAGE_FILES} file and link entries (directories excluded)"
+# Release staged dependency files before the artifact guard extracts the payload, keeping live
+# generated file counts within one bounded tree instead of retaining both copies simultaneously.
+find "${STAGE}" -mindepth 1 -delete
+bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh" "${TGZ}"
 
 cp "${TGZ}" "${CURRENT_TGZ}"
 # Record the checksum against the BASENAME so `shasum -c` works from the release dir on any machine

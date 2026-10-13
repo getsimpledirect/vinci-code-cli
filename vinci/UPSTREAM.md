@@ -1,22 +1,22 @@
 # Upstream tracking — pulling Pi maintenance updates
 
-Vinci Code is a **thin fork**: `main` mirrors upstream Pi (`badlogic/pi-mono`, ~weekly
-releases) and stays **pristine**; all Vinci work lives on the `vinci` branch. Almost everything
-is additive (the `vinci/` dir + new `vinci-*.ts` files), so syncing is almost always
-conflict-free; the only thing that can conflict is the small set of inline `[vinci]` core
-patches inventoried in [`PATCHES.md`](PATCHES.md).
+Vinci Code is a **thin fork** of upstream Pi (`badlogic/pi-mono`). The active public product
+source and release publisher is `getsimpledirect/vinci-code-cli/main`. Integrate Pi changes
+through a reviewed public branch, preserving the Vinci layer and current public security fixes.
+The inline `[vinci]` patch inventory lives in [`PATCHES.md`](PATCHES.md).
 
-## The golden rule: **`vinci` is the trunk; never merge it into `main`**
+The retained `sync-upstream.sh` implements the private repository's legacy mirror/rebase model,
+not public product maintenance. It changes local Git configuration, restores catalog files,
+pushes `main`, and rebases `vinci`. **Do not run it in the public product checkout** until that
+route is adapted and reviewed. The private operational history and unresolved work remain
+retained; this document does not claim consolidation or archival is complete.
 
-`main`'s one job is to be a clean mirror of upstream Pi so we can fast-forward it and rebase our
-layer on top. `vinci` is the product line — the released code, the branch the installer builds from
-(`package.sh`). **Do not merge `vinci` → `main`.** Doing so makes `main` carry the whole layer, which
-permanently breaks the ff-main / rebase-vinci flow (every future Pi change that touches a file we
-also patch would then conflict against a `main` full of vinci commits). If you want a stable release
-pointer, **tag a commit on `vinci`** with the `vinci-` prefix (`git tag vinci-X.Y.Z`) — its own
-namespace, so it never collides with Pi's ~300 `vX.Y.Z` tags that the mirror carries, and tags
-survive the force-push that a rebase requires. The only case to revisit this is heavy multi-person PR development *on the layer
-itself*, where a force-pushed trunk hurts; that's a deliberate model change, not a routine merge.
+## Legacy private branch model
+
+In the private checkout, `main` is the pristine Pi mirror and `vinci` carries the historical
+product layer. Merging private `vinci` into private `main` breaks that legacy maintenance flow.
+These roles do not describe public `main`. Current protected release tags use `vinci-vX.Y.Z`
+on reviewed public product commits; the installer consumes the signed manifest and archive.
 
 ## Remotes
 
@@ -28,7 +28,11 @@ upstream  → badlogic/pi-mono                 (the real Pi)
 If `upstream` is missing after a fresh clone:
 `git remote add upstream https://github.com/badlogic/pi-mono.git`
 
-## Routine sync
+## Legacy private sync
+
+The commands below document the retained private workflow only. They require a separately
+owned private checkout whose `origin` is that private repository, appropriate review, and
+explicit push authorization. They are not commands to run against the public remotes above.
 
 ```bash
 vinci/sync-upstream.sh            # → latest upstream/main
@@ -64,19 +68,19 @@ are NOT is Vinci's own identity, which comes from:
 
 - `vinci/identity.json` — the canonical app name, provider, default model, tagline, and required
   extension set, checked against runtime sources after every sync;
-- `vinci/extensions/vinci-provider.ts` — the runtime-registered Vinci models (piccolo / bozza / tela)
-  and their windows and prices; and
-- the `VINCI_CODE` `/model` filter (PATCHES.md §4) — the selector only ever shows `provider === "vinci"`,
-  no matter what the catalogs contain.
+- `vinci/extensions/vinci-provider.ts` — the runtime-registered managed Vinci classes and
+  automatic selection; and
+- the managed-view `/model` filter when `VINCI_SHOW_OTHER_PROVIDERS=0` (PATCHES.md §4).
+  The default BYOK view also exposes upstream provider catalogs.
 
 So a Pi sync can rewrite every catalog and **nothing about Vinci's models changes**. The rules that keep
 it that way:
 
-1. **Never edit or commit the catalogs on `vinci`.** They're upstream's; carrying local changes makes
-   every future rebase conflict on huge generated diffs.
-2. **Build with `vinci/build.sh`, not the stock `npm run build`** — the stock build re-fetches ~1000
+1. **Update catalog generators rather than generated catalog files.** Keep any necessary public
+   change narrow and reviewed; the private legacy rebase policy preserves upstream catalog bytes.
+2. **Build with `vinci/build.sh`, not the stock `npm run build`** — the stock build re-fetches
    external catalogs on every run and dirties the tree with drift.
-3. `sync-upstream.sh` enforces this automatically: it **restores** any uncommitted catalog drift before
+3. The legacy `sync-upstream.sh` **restores** any uncommitted catalog drift before
    syncing, **warns** if a vinci commit touches a catalog, and installs per-clone merge attributes
    (`.git/info/attributes`, `merge=ours`) so any catalog conflict during the rebase auto-resolves to
    upstream's version.
@@ -89,7 +93,8 @@ Pi's **model registry and config schema change per release**. After bumping, che
   `compat`, `thinkingFormat`), model `contextWindow` / `maxTokens`.
 - `bin/vinci` — the CLI flags (`--theme` / `--extension` / `--provider` / `--model`)
   and the header/theme extension APIs (`ctx.ui.setHeader`, the 51 theme tokens).
-- Pin a known-good tag in production rather than tracking `main` head.
+- Run the identity, security and exact packaged-launch checks against the reviewed public source.
+  Production installation follows its signed immutable artifact rather than moving source `main`.
 
 ## Why not a GitHub Action?
 

@@ -9,6 +9,7 @@ It is derived from:
   Copyright (c) 2025 Mario Zechner
   Licensed under the MIT License (see /LICENSE at the repo root).
 
-All upstream Pi source is used unmodified; SimpleDirect's additions live entirely under
-the `vinci/` directory. The MIT License and the copyright notice above are retained per
-the license terms. This NOTICE does not modify the license.
+Vinci's additive product layer lives under `vinci/`; documented, environment-gated core
+patches also modify upstream package sources (see vinci/PATCHES.md in the source repository).
+The upstream MIT License and copyright notice are retained in the distribution's root LICENSE.
+This NOTICE does not modify that license or grant rights to separately attributed brand assets.

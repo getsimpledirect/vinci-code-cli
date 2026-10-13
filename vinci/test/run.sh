@@ -58,8 +58,8 @@ fi
 # chosen because it happened to be the one that broke -- a check pinned to compat.js would pass
 # while a differently-broken build still failed.
 WORKSPACE_MAIN="${ROOT}/packages/ai/dist/index.js"
-if [ ! -f "${WORKSPACE_MAIN}" ]; then
-  echo "• internal workspace packages are not built — building (offline) before tests…" >&2
+if [ "${VINCI_TEST_REUSE_BUILD:-0}" != "1" ] || [ ! -f "${WORKSPACE_MAIN}" ]; then
+  echo "• building current workspace sources (offline) before tests…" >&2
   if ! bash "${ROOT}/vinci/build.sh" >&2; then
     echo "✗ workspace build failed; the suite would otherwise fail as a missing node_modules path" >&2
     exit 1
@@ -244,7 +244,22 @@ run_cli_supervised() (
 )
 
 echo "── UNIT ──────────────────────────────────────────────"
+run_group canonical-sweep node "${ROOT}/vinci/test/canonical-sweep.mjs"
+run_group contracts-runtime-guard node "${ROOT}/vinci/test/contracts-runtime-guard.mjs"
+run_group runtime-dependency-staging node "${ROOT}/vinci/test/runtime-dependency-staging.mjs"
+run_group build-source-identity node "${ROOT}/vinci/test/build-source-identity.mjs"
 run_group identity-contract node "${ROOT}/vinci/test/identity-contract.mjs"
+run_group runtime-cli node "${ROOT}/vinci/test/runtime-integration.mjs"
+if [ -n "${VINCI_RUNTIME_WORK_ROOT:-}" ] && [ -n "${VINCI_RUN_MODULE:-}" ] && [ -n "${VINCI_APPROVAL_MODULE:-}" ] && [ -n "${VINCI_RECEIPT_MODULE:-}" ] && [ -n "${VINCI_PI_FIXTURE:-}" ]; then
+  run_group runtime-work node "${ROOT}/vinci/test/runtime-work-integration.mjs"
+else
+  echo "  SKIP runtime-work: operator-selected Work root and all exact canonical fixture modules are required; actual Work service qualification remains unqualified."
+fi
+if [ -n "${VINCI_RUNTIME_CONFIG:-}" ] && [ -n "${VINCI_RUNTIME_SHARED_RUN:-}" ] && [ "${VINCI_RUNTIME_SHARED_FIXTURE:-}" = "local-synthetic-task" ]; then
+  run_group runtime-shared-task node "${ROOT}/vinci/test/runtime-shared-task-conformance.mjs"
+else
+  echo "  SKIP runtime-shared-task: an operator-selected private config and existing synthetic run are required; shared-store qualification remains unqualified."
+fi
 run_group deepinfra-provider-integration node "${ROOT}/vinci/test/deepinfra-provider-integration.mjs"
 # BYOK: the launcher's provider-flag matrix, and proof that a BYOK session keeps every VINCI_CODE
 # guard. Both existed and passed for a while WITHOUT being listed here, so the aggregate gate was
@@ -261,6 +276,7 @@ run_group check-secrets-patterns node --test "${ROOT}/scripts/check-secrets.test
 run_group install-guard-integration node "${ROOT}/vinci/test/install-guard-integration.mjs"
 run_group priority-integration node "${ROOT}/vinci/test/priority-integration.mjs"
 run_group update-integration node "${ROOT}/vinci/test/update-integration.mjs"
+run_group release-manifest-cas node "${ROOT}/vinci/test/release-manifest-cas.mjs"
 # VINCI_ENV=dev: launcher resolution (dev URLs, isolated agent dir, updates off, explicit-env-wins,
 # unknown-value rejection), updater dev gate + doctor report, shared vinci-links origin, header badge.
 run_group dev-env-integration node "${ROOT}/vinci/test/dev-env-integration.mjs"
@@ -279,6 +295,9 @@ run_group billing-codes-integration node "${ROOT}/vinci/test/billing-codes-integ
 run_group 402-classification-integration node "${ROOT}/vinci/test/402-classification-integration.mjs"
 run_group 402-escalation-no-downgrade node "${ROOT}/vinci/test/402-escalation-no-downgrade.mjs"
 run_group no-downgrade-integration node "${ROOT}/vinci/test/no-downgrade-integration.mjs"
+run_group canonical-verdicts-contract node "${ROOT}/vinci/test/canonical-verdicts-contract.mjs"
+run_group private-contracts-drift node "${ROOT}/vinci/test/private-contracts-drift.mjs"
+run_group contract-vocabulary node "${ROOT}/vinci/test/contract-vocabulary.mjs"
 run_group units node "${ROOT}/vinci/test/units.mjs"
 # Worker daemon: every vinci/test/worker-*.mjs runs, discovered by glob so a new file cannot be
 # silently omitted (a hand-maintained list here once registered 3 of 13 while the other 10 were
@@ -720,6 +739,7 @@ run_group print-mode-liveness node --experimental-strip-types --input-type=modul
 # Production loads every extension through an isolated jiti instance; prove their shared shell state
 # remains one store instead of leaving the composer stuck on "checking".
 run_group ui-state-integration node "${ROOT}/vinci/test/ui-state-integration.mjs"
+run_group vero-integration node "${ROOT}/vinci/test/vero-integration.mjs"
 # User messages submitted mid-run remain visibly queued until the agent receives them.
 run_group queue-integration node "${ROOT}/vinci/test/queue-integration.mjs"
 # Requested/resolved model identity and route pins survive session resume; route drift is visible.
@@ -772,10 +792,12 @@ run_group automation-stop-integration node "${ROOT}/vinci/test/automation-stop-i
 run_group todo-stall-integration node "${ROOT}/vinci/test/todo-stall-integration.mjs"
 # Structural loop/safety regressions use jiti so they run on the Node 22 CI floor too.
 run_group loopbreak-integration node "${ROOT}/vinci/test/loopbreak-integration.mjs"
+run_group crew-loopbreak-integration node --test "${ROOT}/vinci/test/crew-loopbreak-integration.mjs"
 # #5/#6: no harness contradictions in unattended (`vinci -p`) runs — latch wording, hard stop ⇒ BLOCKED,
 # finalization git commands exempt from the reserve (never push/network).
 run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-harness-integration.mjs"
 run_group guard-integration node "${ROOT}/vinci/test/guard-integration.mjs"
+run_group input-images node "${ROOT}/vinci/test/input-images.test.mjs"
 # Replay failed tool results offline; guidance must preserve raw errors without inventing their cause.
 run_group guard-error-guidance-integration node --test "${ROOT}/vinci/test/guard-error-guidance-integration.mjs"
 # Masked content (<vinci-secret>) can never match or overwrite raw file bytes.
@@ -788,6 +810,8 @@ run_group scope-integration node "${ROOT}/vinci/test/scope-integration.mjs"
 # Mid-run steering amends the scope task; it never shrinks it to just the adjustment.
 run_group scope-amendment-integration node "${ROOT}/vinci/test/scope-amendment-integration.mjs"
 run_group shell-integration node "${ROOT}/vinci/test/shell-integration.mjs"
+run_group header-path-boundary node --test "${ROOT}/vinci/test/header-path-boundary.mjs"
+run_group shell-path-boundary node --test "${ROOT}/vinci/test/shell-path-boundary.mjs"
 # Keep the SSRF production-import lane registered in this canonical harness; the adjacent pin test
 # fails if this exact group is later dropped or silently redirected.
 run_group search-ssrf-registration node "${ROOT}/vinci/test/search-ssrf-registration.mjs"
@@ -836,6 +860,35 @@ run_group crew-integration node "${ROOT}/vinci/test/crew-integration.mjs"
 run_group resultbudget-integration node "${ROOT}/vinci/test/resultbudget-integration.mjs"
 
 echo
+echo "── PACKAGED (exact archive, offline launcher) ────────"
+run_group packaged-vocabulary env VINCI_PACKAGED_VOCABULARY_REUSE_BUILD=1 node "${ROOT}/vinci/test/packaged-vocabulary.mjs"
+run_group packaged-runtime-contract-guard bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh"
+packaged_dir="$(mktemp -d "${TMPDIR:-/tmp}/vinci-packaged-test.XXXXXX")"
+packaged_tgz="${VINCI_TEST_PACKAGED_ARTIFACT:-}"
+if [ -z "${packaged_tgz}" ]; then
+  if run_group packaged-tarball env -u VINCI_UPDATE_SIGNING_KEY -u VINCI_UPDATE_SEQUENCE -u VINCI_PACKAGE_REQUIRE_SIGNING VINCI_PACKAGE_REUSE_BUILD=1 bash "${ROOT}/vinci/package.sh" "${packaged_dir}"; then
+    packaged_version="$(node -e 'process.stdout.write(require(process.argv[1]).version)' "${ROOT}/vinci/identity.json")"
+    packaged_tgz="${packaged_dir}/vinci-code-${packaged_version}.tgz"
+  fi
+fi
+mkdir -p "${packaged_dir}/unpacked"
+if [ -n "${packaged_tgz}" ] && [ -f "${packaged_tgz}" ] && tar -xzf "${packaged_tgz}" -C "${packaged_dir}/unpacked"; then
+  run_group packaged-artifact-imports node "${ROOT}/vinci/test/packaged-artifact-check.mjs" "${packaged_dir}/unpacked"
+  packaged_boundary=()
+  if [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/sandbox-exec ]; then
+    common_git="$(git -C "${ROOT}" rev-parse --git-common-dir)"
+    case "${common_git}" in /*) ;; *) common_git="${ROOT}/${common_git}" ;; esac
+    packaged_boundary=(--deny-source "${ROOT}" --deny-source "$(dirname "${common_git}")")
+  fi
+  run_group packaged-launch-artifact node "${ROOT}/vinci/test/packaged-launch-check.mjs" "${packaged_dir}/unpacked" "${packaged_boundary[@]}"
+  run_group runtime-cli-packaged node "${ROOT}/vinci/test/runtime-integration.mjs" "${packaged_dir}/unpacked"
+else
+  echo "  ✗ packaged-unpack: artifact \"${packaged_tgz:-<missing>}\" is unavailable. Rebuild the owned unsigned payload before retrying."
+  fails=$((fails + 1))
+fi
+find "${packaged_dir}" -mindepth 1 -delete && rmdir "${packaged_dir}"
+
+echo
 echo "── UI (headless xterm + faux model) ──────────────────"
 # The trailing path is a filter, not a file: vitest still globs the whole root, and background
 # Agents keep their git worktrees at .claude/worktrees/ INSIDE the repo. Those copies have no
@@ -847,10 +900,20 @@ run_group ui-scenarios node "${VITEST_CLI}" \
   --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
   "vinci/test/ui/scenarios.test.mjs"
 
+run_group ui-fixture-lifecycle node "${VITEST_CLI}" \
+  --root "${ROOT}" --run \
+  --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
+  "vinci/test/ui/harness.test.mjs"
+
 run_group ui-crew-view node "${VITEST_CLI}" \
   --root "${ROOT}" --run \
   --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
   "vinci/test/ui/crew-view.test.mjs"
+
+run_group ui-crew-delivery node "${VITEST_CLI}" \
+  --root "${ROOT}" --run \
+  --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
+  "vinci/test/ui/crew-delivery.test.mjs"
 
 echo
 echo "── VISUAL (rendered TUI header via PTY) ──────────────"
@@ -886,7 +949,7 @@ if command -v script >/dev/null 2>&1; then
     sed -n '1,12p' "${visual_dir}/capture.log" | sed 's/^/      /'
     fails=$((fails + 1))
   fi
-  rm -rf "${visual_dir}"
+  find "${visual_dir}" -mindepth 1 -delete && rmdir "${visual_dir}"
 else
   echo "  ⚠ skipped — 'script' (PTY) not available on this system"
 fi

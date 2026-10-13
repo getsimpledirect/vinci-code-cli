@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ENV_AGENT_DIR } from "../../../packages/coding-agent/src/config.ts";
 import { AgentSessionRuntime } from "../../../packages/coding-agent/src/core/agent-session-runtime.ts";
@@ -34,6 +34,7 @@ function normalizeScreen(lines, tempDir) {
 			.replace(/\/\S*\/pi-[^\s]*/g, "<workspace>")
 			.replace(/\bpi-harness-[\w.-]+/g, "<workspace>")
 			.replace(/^(\s*Vinci(?: Forte| Fortissimo)?\s+·\s+).+$/, "$1<repo>")
+			.replace(/^(\s*Vero (?:READY|WORKING|REVIEW|BLOCKED|WAITING|DONE(?:-UNVERIFIED)?)\s+·\s+Vinci(?: Forte| Fortissimo)?\s+·\s+).+$/, "$1<repo>")
 			.replace(/\b\d+(?:\.\d+)?s\b/g, "<time>")
 			.replace(/(^|\s)[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?= Working\.\.\.)/g, "$1•")
 			.replace(
@@ -63,11 +64,12 @@ async function withTimeout(promise, description, timeoutMs = DEFAULT_TIMEOUT_MS)
 }
 
 export class VinciUiHarness {
-	constructor(core, mode, terminal, previousAgentDir) {
+	constructor(core, mode, terminal, previousAgentDir, previousGitCeiling) {
 		this.core = core;
 		this.mode = mode;
 		this.terminal = terminal;
 		this.previousAgentDir = previousAgentDir;
+		this.previousGitCeiling = previousGitCeiling;
 	}
 
 	get session() {
@@ -124,6 +126,8 @@ export class VinciUiHarness {
 		} finally {
 			if (this.previousAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
 			else process.env[ENV_AGENT_DIR] = this.previousAgentDir;
+			if (this.previousGitCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+			else process.env.GIT_CEILING_DIRECTORIES = this.previousGitCeiling;
 		}
 	}
 }
@@ -172,6 +176,11 @@ export async function createVinciUiHarness(options = {}) {
 	// off the developer's real ~/.pi/agent (reading their auth.json, creating the hint marker there).
 	const previousAgentDir = process.env[ENV_AGENT_DIR];
 	process.env[ENV_AGENT_DIR] = core.tempDir;
+	// A fixture under the checkout must not inherit its Git branch or repository contents.
+	const previousGitCeiling = process.env.GIT_CEILING_DIRECTORIES;
+	process.env.GIT_CEILING_DIRECTORIES = [previousGitCeiling, realpathSync(dirname(core.tempDir))]
+		.filter(Boolean)
+		.join(delimiter);
 	// Pre-claim the one-time thinking hint so every scenario renders the steady-state UI the
 	// reviewed snapshots capture (a fresh agent dir would otherwise fire the hint on each boot).
 	writeFileSync(join(core.tempDir, ".vinci-thinking-hint-v1"), "");
@@ -203,10 +212,12 @@ export async function createVinciUiHarness(options = {}) {
 		core.cleanup();
 		if (previousAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
 		else process.env[ENV_AGENT_DIR] = previousAgentDir;
+		if (previousGitCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+		else process.env.GIT_CEILING_DIRECTORIES = previousGitCeiling;
 		throw error;
 	}
 
-	return new VinciUiHarness(core, mode, terminal, previousAgentDir);
+	return new VinciUiHarness(core, mode, terminal, previousAgentDir, previousGitCeiling);
 }
 
 export async function expectSnapshot(name, ui) {

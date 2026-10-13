@@ -13,6 +13,7 @@ import { accessSync, constants, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { isAcceptedWireStatus } from "./lib/canonical-verdicts.ts";
 import { recordRemoteAcceptanceVerdict } from "./lib/control.ts";
 
 const ACCEPT_SCHEMA = Type.Object({
@@ -136,8 +137,8 @@ function truncateCapture(data: Buffer | string): string {
 /**
  * Check if a verdict status is terminal and should be recorded.
  */
-function isTerminalVerdictStatus(status: string): boolean {
-  return ["VERIFIED_PASS", "BLOCKED", "CONDITIONAL", "FAILED", "CANCELLED"].includes(status);
+export function isTerminalVerdictStatus(status: unknown): boolean {
+  return isAcceptedWireStatus(status);
 }
 
 export default function (pi: ExtensionAPI) {

@@ -1,5 +1,5 @@
   *  v1nc1 code   ·   Made, not generated.   ·   v0.0.54
-  Vinci   ·   <repo>
+  Vero BLOCKED   ·   Vinci   ·   <repo>
   /login to connect   ·   /undo safety net   ·   Ctrl+T thinking   ·   /thinking
 
 
@@ -14,7 +14,7 @@
   1 model call · 100 in / 50 out · 0% cached · ~$0.0000 estimated · <time> active
   Billed by faux, not Vinci.
 
-╭ ✹ Ask Vinci ───────────────────────────────────────────────────────── /login ╮
+╭ ✹ Ask Vinci · BLOCKED: Resolve the blocker. ───────────────────────── /login ╮
 │                                                                              │
 │›                                                                             │
 │                                                                              │

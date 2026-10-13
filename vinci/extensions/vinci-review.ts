@@ -18,7 +18,7 @@ import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 // Shared grader core (untracked-aware diff + skeptical-of-unverified-claims prompt). See
 // lib/grader.ts and vinci/docs/verification.md.
-import { type CompleteOpts, gatherDiff, gatherTask, runReview } from "./lib/grader.ts";
+import { captureReviewRequest, type CompleteOpts, gatherDiff, gatherReviewEvidence, gatherTask, runReview } from "./lib/grader.ts";
 import {
   installVinciUsageAccumulator,
   recordVinciTaskCall,
@@ -30,6 +30,7 @@ const REVIEW_PARAMS = Type.Object({
 
 export default function (pi: ExtensionAPI) {
   installVinciUsageAccumulator(pi);
+  pi.on("agent_start", (event, ctx) => captureReviewRequest(ctx, event));
   // EXPLICIT — core already reviews settled completion claims; this is for requested/mid-task review.
   pi.registerTool({
     name: "review_changes",
@@ -49,7 +50,7 @@ export default function (pi: ExtensionAPI) {
       if (!ctx.model) return { content: [{ type: "text", text: "Review unavailable: no model." }], details };
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
       if (!auth.ok || !auth.apiKey) return { content: [{ type: "text", text: "Review unavailable: not signed in (/login vinci)." }], details };
-      const diff = gatherDiff(process.cwd());
+      const diff = gatherDiff(ctx.cwd);
       if (!diff) return { content: [{ type: "text", text: "No uncommitted changes to review." }], details };
       const task = params.task?.trim() || gatherTask(ctx);
       const taskId = ctx.sessionManager.getSessionId();
@@ -64,6 +65,7 @@ export default function (pi: ExtensionAPI) {
         },
         task,
         diff,
+        gatherReviewEvidence(ctx),
       );
       return { content: [{ type: "text", text: critique || "The reviewer returned nothing." }], details };
     },
@@ -78,7 +80,7 @@ export default function (pi: ExtensionAPI) {
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
       if (!auth.ok) return void ctx.ui.notify("error" in auth ? auth.error : "Not signed in — run /login vinci", "error");
       if (!auth.apiKey) return void ctx.ui.notify("Not connected to Vinci — type /login to connect.", "error");
-      const diff = gatherDiff(process.cwd());
+      const diff = gatherDiff(ctx.cwd);
       if (!diff) return void ctx.ui.notify("No uncommitted changes to review.", "info");
       const model = ctx.model;
       const taskId = ctx.sessionManager.getSessionId();
@@ -93,7 +95,7 @@ export default function (pi: ExtensionAPI) {
       const critique = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         const loader = new BorderedLoader(tui, theme, "Reviewing your changes…");
         loader.onAbort = () => done(null);
-        runReview(model, { ...opts, signal: loader.signal }, task, diff)
+        runReview(model, { ...opts, signal: loader.signal }, task, diff, gatherReviewEvidence(ctx))
           .then((s) => done(s || null))
           .catch(() => done("The review couldn't finish that one — mind trying again in a moment?"));
         return loader;

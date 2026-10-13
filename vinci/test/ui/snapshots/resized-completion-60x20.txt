@@ -1,5 +1,5 @@
   *  v1nc1 code   ·   Made, not generated.   ·   v0.0.54
-  Vinci   ·   <repo>
+  Vero DONE   ·   Vinci   ·   <repo>
   ● connected   ·   /undo safety net   ·   Ctrl+T thinking
 
 
@@ -11,7 +11,7 @@
  remains readable when the terminal becomes narrow.
 
 
-╭ ✹ Ask Vinci ──────────────────────────────── ● connected ╮
+╭ ✹ Ask Vinci · DONE: Read the receipt. ────── ● connected ╮
 │                                                          │
 │›                                                         │
 │                                                          │

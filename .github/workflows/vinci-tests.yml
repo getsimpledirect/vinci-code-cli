@@ -74,6 +74,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci --ignore-scripts
+      - name: Verify release manifest conditional activation
+        run: node vinci/test/release-manifest-cas.mjs
       # `check` now type-checks vinci/extensions, which imports @earendil-works/* by package name.
       # Those resolve through each package's dist, so without a build every import fails TS2307 and
       # every imported type degrades to an implicit any — hundreds of cascade errors. ci.yml already

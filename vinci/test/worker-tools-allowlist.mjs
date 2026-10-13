@@ -140,10 +140,11 @@ const DEFAULT_CSV = "read,grep,find,ls,bash,edit,write,web_search,web_fetch,web_
     const stateDir = join(root, "state");
     const argvFile = join(root, "argv.json");
     for (const directory of [binDir, repoDir, stateDir]) mkdirSync(directory, { recursive: true });
+    writeFileSync(join(binDir, "package.json"), '{"type":"commonjs"}\n');
 
     // Shebanged with this interpreter's absolute path, so the stub does not itself depend on what
     // PATH resolves — the only PATH lookup under test is the one `resolveBin` performs for
-    // "vinci". No extension ⇒ CommonJS, hence `require`.
+    // "vinci". Pin CommonJS so a TMPDIR inside this ESM repository does not change the stub.
     const stub = join(binDir, "vinci");
     writeFileSync(
       stub,

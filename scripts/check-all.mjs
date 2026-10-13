@@ -20,7 +20,18 @@ export const checks = [
 		name: "npm run check:secrets",
 		command: `npm${executableSuffix}`,
 		args: ["run", "check:secrets"],
-	},	{
+	},
+	{
+		name: "npm run check:canonical-verdicts",
+		command: `npm${executableSuffix}`,
+		args: ["run", "check:canonical-verdicts"],
+	},
+	{
+		name: "npm run check:no-contracts-runtime",
+		command: `npm${executableSuffix}`,
+		args: ["run", "check:no-contracts-runtime"],
+	},
+	{
 		name: "npm run check:ts-imports",
 		command: `npm${executableSuffix}`,
 		args: ["run", "check:ts-imports"],

@@ -2158,16 +2158,21 @@ try {
   check(
     "a second finalization does not notify or deliver twice",
     typeof steerFinalizationHelper.notifiedAt === "number" &&
-      typeof steerFinalizationHelper.deliveredAt === "number" &&
+      steerFinalizationHelper.deliveryPending === true &&
+      steerFinalizationHelper.deliveredAt === undefined &&
       crewNotifications.length === duplicateNotificationCount &&
       crewDeliveries.length === duplicateDeliveryCount,
   );
 
   const restored9 = crewEntries.filter((entry) => entry.customType === "vinci-crew-helper" && entry.data.id === 9).at(-1);
+  // This fake sendMessage only admits a message; it does not append a custom-message journal entry.
+  // The real runtime's durable acknowledgement and crash windows are covered in crew-delivery.test.mjs.
   check(
-    "a finalized but undelivered helper notifies and delivers once on restore",
+    "a finalized but undelivered helper notifies and queues once on restore",
     typeof restored9?.data.notifiedAt === "number" &&
-      typeof restored9?.data.deliveredAt === "number" &&
+      typeof restored9?.data.deliveryId === "string" &&
+      restored9?.data.deliveredAt === undefined &&
+      restored9?.data.deliveryPending === undefined &&
       crewNotifications.filter((notification) => notification.message.includes('Agent "restore-undelivered"')).length === 1 &&
       crewDeliveries.filter((delivery) => delivery.message?.details?.agentId === 9).length === 1,
   );

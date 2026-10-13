@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "sourceRepository": "getsimpledirect/simpledirect-2026-marketing-website",
+  "sourceCommit": "ee968ae96f32856ae25925779d2b44ffc5f2f7f8",
+  "sourceArchive": "Vero Project.zip",
+  "sourceArchiveSha256": "e44d2e52292ea878dafc43fc0b4460e994b33c4c7e0baba882e1a65f9158e0ab",
+  "brandGuideSha256": "afd26929d4ea6b33a1608df1c30033af2aa42828f2859297d2846813937ee230",
+  "treatment": "Original PNG and SVG bytes, with aspect ratio preserved; no redrawing, recolouring, effects or invented poses.",
+  "assets": [
+    {
+      "key": "pixel",
+      "file": "vero-pixel.png",
+      "svgFile": "vero-pixel.svg",
+      "source": "Character or Mascot/PNG/mark 2.png",
+      "sha256": "203d4a46dcfa07e8a67f4ea5e6e854922435078d72990cb0bcd2b1788e5bb45d",
+      "bytes": 34901,
+      "width": 2880,
+      "height": 2514,
+      "svgSource": "Character or Mascot/SVG/mark 2.svg",
+      "svgSha256": "9ed5c8172d83ba0ae19e77e8bb331122f808eef6d80b6306ef728bc25af80278"
+    },
+    {
+      "key": "rich",
+      "file": "vero-rich.png",
+      "svgFile": "vero-rich.svg",
+      "source": "Character or Mascot/PNG/mark idle.png",
+      "sha256": "42aa47bfc697ecbfc6e49beef5bad4b95a65a43f469586dcd70123c334494909",
+      "bytes": 80243,
+      "width": 1888,
+      "height": 2880,
+      "svgSource": "Character or Mascot/SVG/mark idle.svg",
+      "svgSha256": "d6c3c6cf3914b7622b4768ca90dd76c3bf92278618a6ce3d9777266c496a5893"
+    },
+    {
+      "key": "working",
+      "file": "vero-working.png",
+      "svgFile": "vero-working.svg",
+      "source": "Character or Mascot/PNG/mark working.png",
+      "sha256": "048b73e19b54e102c27395d5536e1e77718277e3f54a1210c6e75994ee6af367",
+      "bytes": 102731,
+      "width": 2618,
+      "height": 2880,
+      "svgSource": "Character or Mascot/SVG/mark working.svg",
+      "svgSha256": "2f0468d7ed7fa56c85b42d334345954aae264939b28996d3771c5d5699fadb5a"
+    },
+    {
+      "key": "review",
+      "file": "vero-review.png",
+      "svgFile": "vero-review.svg",
+      "source": "Character or Mascot/PNG/mark review.png",
+      "sha256": "054b6767dccd08b0315e7fb1690d180e40ee8c2b1894fe76deeb01feb4418380",
+      "bytes": 107135,
+      "width": 1900,
+      "height": 2880,
+      "svgSource": "Character or Mascot/SVG/mark review.svg",
+      "svgSha256": "9c30ebdcf57b248256482a0d3c5c4fa375b28a8cecf72df2a2f19184a2c533d2"
+    },
+    {
+      "key": "blocked",
+      "file": "vero-blocked.png",
+      "svgFile": "vero-blocked.svg",
+      "source": "Character or Mascot/PNG/mark blocked.png",
+      "sha256": "2a36cafe3f98e326cdf8c6e618a6ffe76b28c2232d23a1607adbef117ed15eaa",
+      "bytes": 67166,
+      "width": 2086,
+      "height": 2880,
+      "svgSource": "Character or Mascot/SVG/mark blocked.svg",
+      "svgSha256": "5efec2bba9bddb7071ebe0f6a6c7017b6b4a17f3e3dd44279df8c6463399776a"
+    },
+    {
+      "key": "done",
+      "file": "vero-done.png",
+      "svgFile": "vero-done.svg",
+      "source": "Character or Mascot/PNG/mark done.png",
+      "sha256": "3dfca890a56181570d752b13e9b7dc0990527f41b40fd47c74c9281da29ae85a",
+      "bytes": 102849,
+      "width": 2646,
+      "height": 2880,
+      "svgSource": "Character or Mascot/SVG/mark done.svg",
+      "svgSha256": "e31d33c132479ab672236df11bd88c60eaace384c01265f7de67d3cbf9515b02"
+    }
+  ]
+}

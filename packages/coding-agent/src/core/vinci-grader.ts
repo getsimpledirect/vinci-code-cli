@@ -74,9 +74,14 @@ export const REVIEW_TIMEOUT_MS = 60_000;
 
 export const GRADER_SYSTEM =
 	"You are an INDEPENDENT senior engineer reviewing a change you did NOT write. You are given the " +
-	"TASK the author was asked to do and the DIFF of what they changed (untracked new files are " +
+	"TASK the author was asked to do and the current uncommitted DIFF (untracked new files are " +
 	"included as '+++ NEW FILE' blocks). Judge it honestly: does it correctly and completely accomplish " +
-	"the task? Name the top 1–3 CONCRETE problems — real bugs, missing cases, security or performance " +
+	"the task? A working-tree diff can include work that predates the current request. Use recorded " +
+	"REQUEST SCOPE EVIDENCE to distinguish pre-existing state from changes during this request. " +
+	"An unchanged pre-existing patch is not a violation of a read-only review or verification request. " +
+	"When scope evidence is unavailable, do not infer authorship or a read-only violation from the diff " +
+	"alone. This does not establish that the patch is correct: still judge its concrete defects and checks. " +
+	"Name the top 1–3 CONCRETE problems — real bugs, missing cases, security or performance " +
 	"risks, wrong approach, or ways it doesn't match the task — each a short specific bullet with the " +
 	"file where visible. Use 'needs work' only for a defect concretely demonstrated by the TASK, DIFF, " +
 	"or mechanically recorded VERIFICATION EVIDENCE. A concern that depends on unseen dependency " +
@@ -169,14 +174,135 @@ type BranchEntry = {
 	type?: string;
 	customType?: string;
 	data?: unknown;
-	message?: { role?: string; content?: unknown };
+	message?: {
+		role?: string;
+		content?: unknown;
+		toolCallId?: string;
+		toolName?: string;
+		isError?: boolean;
+		details?: unknown;
+	};
 };
+
+/** Supplemental formatting receipts never replace the verifier's behavioral state. */
+function supplementalDiffChecksFromBranch(
+	branch: readonly BranchEntry[],
+	state: SharedVinciNormalVerificationState,
+): string {
+	if (!state.commandCwd || (state.behavioralAttemptCommand && !state.behavioralAttemptCompleted)) return "";
+	let requestStart = -1;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		if (branch[index].type === "message" && branch[index].message?.role === "user") {
+			requestStart = index;
+			break;
+		}
+	}
+	if (requestStart < 0 || branch.length - requestStart > 2000) return "";
+	const calls = new Map<string, { count: number; index: number; command: string; current: boolean }>();
+	const latestAttempts = new Map<string, { index: number; count: number }>();
+	const results = new Map<string, { count: number; index: number; message: NonNullable<BranchEntry["message"]> }>();
+	let snapshot: SharedVinciVerificationState | undefined;
+	let mutationBoundary = requestStart;
+	for (let index = requestStart + 1; index < branch.length; index++) {
+		const entry = branch[index];
+		if (entry.type === "custom" && entry.customType === VINCI_VERIFICATION_ENTRY) {
+			snapshot = parseSharedVinciVerificationState(entry.data);
+			if (!snapshot || snapshot.variant !== "normal" || snapshot.mutationRevision !== state.mutationRevision) {
+				mutationBoundary = index;
+			}
+		}
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message?.role === "assistant" && Array.isArray(message.content)) {
+			for (const value of message.content) {
+				if (!value || typeof value !== "object") continue;
+				const call = value as { type?: unknown; id?: unknown; name?: unknown; arguments?: { command?: unknown } };
+				if (call.type !== "toolCall") continue;
+				const command =
+					call.name === "bash" && typeof call.arguments?.command === "string" ? call.arguments.command : "";
+				const previousAttempt = latestAttempts.get(command);
+				latestAttempts.set(command, {
+					index,
+					count: previousAttempt?.index === index ? previousAttempt.count + 1 : 1,
+				});
+				if (typeof call.id !== "string" || !call.id) continue;
+				calls.set(call.id, {
+					count: (calls.get(call.id)?.count ?? 0) + 1,
+					index,
+					command,
+					current:
+						!!snapshot &&
+						snapshot.variant === "normal" &&
+						(snapshot.status === "passed" || snapshot.status === "failed") &&
+						snapshot.mutationRevision === state.mutationRevision &&
+						snapshot.commandCwd === state.commandCwd &&
+						(!snapshot.behavioralAttemptCommand || snapshot.behavioralAttemptCompleted),
+				});
+			}
+		} else if (message?.role === "toolResult" && typeof message.toolCallId === "string" && message.toolCallId) {
+			results.set(message.toolCallId, {
+				count: (results.get(message.toolCallId)?.count ?? 0) + 1,
+				index,
+				message,
+			});
+		}
+	}
+	const receipts = new Map<string, string>();
+	for (const [id, call] of calls) {
+		const result = results.get(id);
+		const latestAttempt = latestAttempts.get(call.command);
+		const details = result?.message.details as
+			| { execution?: { exitCode?: unknown; cwd?: unknown; originalCommand?: unknown } }
+			| undefined;
+		const execution = details?.execution;
+		// Deliberately literal and scoped: no shell expansion, pathspec magic, compound, or Git setup.
+		if (
+			call.count !== 1 ||
+			latestAttempt?.index !== call.index ||
+			latestAttempt.count !== 1 ||
+			!call.current ||
+			call.index <= mutationBoundary ||
+			!result ||
+			result.count !== 1 ||
+			result.index <= call.index ||
+			result.message.toolName !== "bash" ||
+			result.message.isError !== false ||
+			execution?.exitCode !== 0 ||
+			execution.originalCommand !== true ||
+			execution.cwd !== state.commandCwd ||
+			call.command.length > 1000 ||
+			/[\r\n]/.test(call.command) ||
+			!/^git[ \t]+diff[ \t]+--check[ \t]+--(?:[ \t]+[A-Za-z0-9_./-]+){1,40}[ \t]*$/.test(call.command)
+		)
+			continue;
+		receipts.set(
+			call.command,
+			`Command: ${call.command}\nResult: scoped Git diff check completed with observed exit code 0.`,
+		);
+	}
+	if (!receipts.size) return "";
+	return `\n\nSupplemental current-request formatting checks (not behavioral test evidence):\n${[...receipts.values()].slice(-4).join("\n")}`;
+}
 
 /** Latest verifier-owned state, formatted as evidence for the independent reviewer. */
 export function verificationEvidenceFromBranch(branch: readonly BranchEntry[]): string {
 	const state = selectSharedVinciVerificationState(branch);
 	if (!state) return "";
 	if (state.variant === "terminal-unverifiable") return "";
+	if (state.status === "failed") {
+		const command = (state.requiredCommand || state.command)
+			.replace(/[\r\n\t]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 500);
+		if (!command) return "";
+		const summary = (state.requiredSummary || state.summary)
+			.replace(/[\r\n\t]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 500);
+		return `A recorded direct check failed; the verifier still requires a successful repair check.\nCommand: ${command}\nResult: ${summary || "The recorded direct check failed."}${supplementalDiffChecksFromBranch(branch, state)}`;
+	}
 	if (
 		state.status !== "passed" ||
 		state.verifiedRevision !== state.mutationRevision ||
@@ -195,7 +321,7 @@ export function verificationEvidenceFromBranch(branch: readonly BranchEntry[]): 
 		.replace(/\s+/g, " ")
 		.trim()
 		.slice(0, 500);
-	return `Direct check passed after the latest mutation.\nCommand: ${command}\nResult: ${summary || "The direct check passed."}`;
+	return `Direct check passed after the latest mutation.\nCommand: ${command}\nResult: ${summary || "The direct check passed."}${supplementalDiffChecksFromBranch(branch, state)}`;
 }
 
 function branchMessageText(entry: BranchEntry): string {

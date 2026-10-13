@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import { createJiti } from "jiti/static";
 
@@ -18,7 +20,7 @@ const outcomes = [];
 let exitHint;
 const project = mkdtempSync(join(tmpdir(), "vinci-blocked-report-"));
 writeFileSync(join(project, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
-after(() => rmSync(project, { recursive: true, force: true }));
+after(() => { execFileSync("find", [project, "-mindepth", "1", "-delete"]); rmdirSync(project); });
 
 verification.default({
   on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
@@ -36,10 +38,11 @@ receipt.default({
   appendEntry(_type, entry) { outcomes.push(entry); },
   registerCommand() {},
 });
+let branch = [];
 const context = {
   cwd: project,
   hasPendingMessages: () => false,
-  sessionManager: { getBranch: () => [], getSessionId: () => "blocked-report-test" },
+  sessionManager: { getBranch: () => branch, getSessionId: () => "blocked-report-test" },
   declareHeadlessExitHint(hint) { exitHint = hint; },
 };
 async function emit(name, event = {}) {
@@ -63,6 +66,8 @@ async function shell(output, isError = true, command = "node --test sum.test.mjs
   });
 }
 async function start() {
+  context.cwd = project;
+  branch = [];
   sent.length = 0;
   outcomes.length = 0;
   exitHint = undefined;
@@ -357,4 +362,188 @@ test("a diagnostic mentioned only by appended guidance is not observed failure e
   assert.ok((await emit("message_end", { message: assistant(reports[0]) }))?.message);
   await emit("turn_end");
   assert.equal(sent.length, 1);
+});
+
+const readOnlyRequest = "This is a read-only verification request: you must not edit, write, stage, commit, restore, or remove any project file. Run the existing named check and report its result.";
+const nestedProject = join(project, "nested-check-project");
+const staticProject = join(project, "static-project");
+mkdirSync(join(nestedProject, "vinci", "extensions"), { recursive: true });
+mkdirSync(join(nestedProject, "vinci", "test"), { recursive: true });
+mkdirSync(staticProject);
+const actualHeader = fileURLToPath(new URL("../extensions/vinci-header.ts", import.meta.url));
+const headerCopy = join(nestedProject, "vinci", "extensions", "vinci-header.ts");
+const actualHeaderText = readFileSync(actualHeader, "utf8").replace(
+  /(from\s+["'])(\.\.?\/[^"']+)(["'])/g,
+  (_match, prefix, path, suffix) => `${prefix}${resolve(dirname(actualHeader), path)}${suffix}`,
+);
+const correctPredicate = "home && (p === home || p.startsWith(home + sep))";
+assert.equal(actualHeaderText.split(correctPredicate).length, 2, "mutate exactly the selected actual HOME predicate");
+writeFileSync(join(nestedProject, "vinci", "test", "header-path-boundary.mjs"), readFileSync(new URL("header-path-boundary.mjs", import.meta.url)));
+const nestedCommand = "node --test --test-reporter=spec vinci/test/header-path-boundary.mjs";
+const installedModules = fileURLToPath(new URL("../../node_modules/", import.meta.url));
+const nestedModules = join(nestedProject, "node_modules");
+const selectedDependencies = [
+  ["jiti", "jiti/static"],
+  ["@earendil-works/pi-coding-agent", "@earendil-works/pi-coding-agent"],
+  ["@earendil-works/pi-tui", "@earendil-works/pi-tui"],
+];
+const selectedEntries = {};
+for (const [name, specifier] of selectedDependencies) {
+  const local = join(nestedModules, name);
+  const selected = join(installedModules, name);
+  mkdirSync(dirname(local), { recursive: true });
+  symlinkSync(selected, local, "dir");
+  assert.equal(existsSync(join(local, "package.json")), true, `bind the nested fixture's selected ${name} dependency`);
+  assert.equal(realpathSync(local), realpathSync(selected));
+  selectedEntries[specifier] = realpathSync(fileURLToPath(import.meta.resolve(specifier)));
+}
+// Bind this source fixture explicitly; a TMPDIR inside the checkout must not hide missing links.
+const dependencyProbe = join(nestedProject, "resolve-dependencies.mjs");
+writeFileSync(dependencyProbe, `import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+for (const [specifier, selected] of Object.entries(JSON.parse(process.argv[2]))) {
+  assert.equal(realpathSync(fileURLToPath(import.meta.resolve(specifier))), selected);
+}
+`);
+const resolvedDependencies = spawnSync(process.execPath, [dependencyProbe, JSON.stringify(selectedEntries)], {
+  cwd: nestedProject, encoding: "utf8", timeout: 5000, maxBuffer: 256 * 1024,
+});
+assert.equal(resolvedDependencies.error, undefined, "run the actual Node dependency resolver within its bound");
+assert.equal(resolvedDependencies.status, 0, resolvedDependencies.stdout + resolvedDependencies.stderr);
+
+function runNamedHeaderCheck() {
+  // This is an external CLI consumer, not recursive test-runner discovery in the parent worker.
+  const childEnv = { ...process.env };
+  delete childEnv.NODE_TEST_CONTEXT;
+  return spawnSync(process.execPath, ["--test", "--test-reporter=spec", "vinci/test/header-path-boundary.mjs"], {
+    cwd: nestedProject, encoding: "utf8", timeout: 10_000, maxBuffer: 256 * 1024, env: childEnv,
+  });
+}
+
+async function nestedCheck(valid, edited = false, request = readOnlyRequest) {
+  sent.length = 0;
+  outcomes.length = 0;
+  exitHint = undefined;
+  context.cwd = nestedProject;
+  branch = [{ type: "message", message: { role: "user", content: request } }];
+  await emit("session_start");
+  await emit("input", { source: "interactive", text: request });
+  writeFileSync(headerCopy, valid ? actualHeaderText : actualHeaderText.replace(correctPredicate, "home && p.startsWith(home)"));
+  if (edited) await emit("tool_result", {
+    toolName: "edit", input: { path: "vinci/extensions/vinci-header.ts" }, isError: false,
+    content: [{ type: "text", text: "Applied changes" }],
+  });
+  const result = runNamedHeaderCheck();
+  assert.equal(result.error, undefined, "the actual named verifier must start and exit within its bound");
+  assert.equal(result.status, valid ? 0 : 1);
+  const output = result.stdout + result.stderr;
+  assert.match(output, /ℹ tests 8/);
+  assert.match(output, valid ? /ℹ pass 8/ : /ℹ pass 7/);
+  if (!valid) assert.match(output, /✖ shortPath rejects an unrelated same-prefix sibling/);
+  await shell(output, !valid, nestedCommand);
+}
+
+test("read-only nested real spec failure preserves assessment and closes blocked without a repair", async () => {
+  await nestedCheck(false);
+  const report = "Completed: read-only verification only; no files changed.\nAssessment: needs-work.\nCounts: 8 tests, 7 pass, 1 fail. The existing sibling check failed.";
+  const result = await emit("message_end", { message: assistant(report) });
+  const text = result?.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+  assert.match(text, /Assessment: needs-work/);
+  assert.match(text, /7 pass, 1 fail/);
+  assert.match(text, /Blocked:/);
+  assert.doesNotMatch(text, /I made the change|no automated test|run it yourself/);
+  const verificationState = state.getVinciVerificationState();
+  assert.equal(verificationState.variant, "normal");
+  assert.equal(verificationState.status, "failed");
+  assert.equal(verificationState.behavioralAttemptCompleted, true);
+  assert.equal(verificationState.mutationRevision, 0);
+  assert.equal(verificationState.recoveryAttempts, 0);
+  await emit("turn_end");
+  assert.equal(sent.length, 0, "the constrained assessment cannot queue a repair");
+  await emit("receipt:agent_end", { messages: [result.message] });
+  assert.equal(outcomes.at(-1).state, "BLOCKED");
+  assert.equal(exitHint, 3);
+});
+
+test("a passing read-only nested check stays passed through the same final hooks", async () => {
+  await nestedCheck(true);
+  const localJiti = join(nestedModules, "jiti");
+  const incompleteJiti = join(project, "incomplete-jiti");
+  mkdirSync(incompleteJiti);
+  writeFileSync(join(incompleteJiti, "package.json"), JSON.stringify({
+    name: "jiti", type: "module", exports: { "./static": "./missing-static.mjs" },
+  }));
+  unlinkSync(localJiti);
+  symlinkSync(incompleteJiti, localJiti, "dir");
+  try {
+    const refused = runNamedHeaderCheck();
+    assert.equal(refused.error, undefined, "the dependency-refusal control must exit within its bound");
+    assert.equal(refused.status, 1);
+    const output = refused.stdout + refused.stderr;
+    assert.match(output, /ERR_MODULE_NOT_FOUND/);
+    assert.match(output, /missing-static\.mjs/);
+    assert.match(output, /ℹ tests 1/);
+    assert.match(output, /ℹ pass 0/);
+    assert.doesNotMatch(output, /shortPath rejects an unrelated same-prefix sibling/);
+  } finally {
+    unlinkSync(localJiti);
+    symlinkSync(join(installedModules, "jiti"), localJiti, "dir");
+  }
+  assert.equal(realpathSync(localJiti), realpathSync(join(installedModules, "jiti")));
+  await nestedCheck(true);
+  const message = assistant("Completed: read-only assessment ships; all eight tests passed and no files changed.");
+  assert.equal(await emit("message_end", { message }), undefined);
+  assert.equal(state.getVinciVerificationState().status, "passed");
+  await emit("turn_end");
+  assert.equal(sent.length, 0);
+  await emit("receipt:agent_end", { messages: [message] });
+  assert.equal(outcomes.at(-1).state, "DONE");
+  assert.equal(exitHint, undefined);
+});
+
+test("a false passing claim over the constrained failed check is replaced", async () => {
+  await nestedCheck(false);
+  const result = await emit("message_end", { message: assistant("All tests passed. The implementation is correct.") });
+  const text = result.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+  assert.match(text, /Blocked:/);
+  assert.doesNotMatch(text, /All tests passed|implementation is correct|I made the change|no automated test/);
+  assert.equal(state.getVinciVerificationState().status, "failed");
+});
+
+test("truthful partial counts cannot shield an additional false all-tests-passed claim", async () => {
+  await nestedCheck(false);
+  const result = await emit("message_end", { message: assistant("Counts: 7 passed, 1 failed; All tests passed.") });
+  const text = result.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+  assert.match(text, /Blocked:/);
+  assert.doesNotMatch(text, /All tests passed/);
+  assert.equal(state.getVinciVerificationState().status, "failed");
+});
+
+test("a completed failed nested check cannot become a static-project hedge after an edit", async () => {
+  await nestedCheck(false, true, "Repair the HOME boundary defect and run its existing regression.");
+  const result = await emit("message_end", { message: assistant("Done.") });
+  const text = result.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+  assert.doesNotMatch(text, /no automated test|run it yourself/);
+  assert.equal(state.getVinciVerificationState().status, "failed");
+  assert.equal(state.getVinciVerificationState().behavioralAttemptCompleted, true);
+  await emit("turn_end");
+  assert.equal(sent.length, 1, "a repair-authorized failure retains normal recovery");
+});
+
+test("a genuine static edit without any attempted verifier keeps its honest manual-check note", async () => {
+  sent.length = 0;
+  context.cwd = staticProject;
+  branch = [{ type: "message", message: { role: "user", content: "Update this standalone page." } }];
+  await emit("session_start");
+  await emit("input", { source: "interactive", text: "Update this standalone page." });
+  writeFileSync(join(staticProject, "index.html"), "<p>Updated page</p>\n");
+  await emit("tool_result", { toolName: "write", input: { path: "index.html", content: "<p>Updated page</p>" }, isError: false, content: [{ type: "text", text: "Wrote index.html" }] });
+  const result = await emit("message_end", { message: assistant("Updated the page.") });
+  const text = result.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+  assert.match(text, /I made the change|no automated test|open it in your browser/);
+  assert.equal(state.getVinciVerificationState().mutationRevision, 1);
+  assert.equal(state.getVinciVerificationState().behavioralAttemptCommand, "");
+  await emit("turn_end");
+  assert.equal(sent.length, 0);
 });

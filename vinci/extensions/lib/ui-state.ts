@@ -19,6 +19,7 @@ export type VinciUiState = {
   workingLabel: string;
   workingSince: number | undefined;
   continuationPending: boolean;
+  blockingReason?: string;
 };
 
 type VinciUiStore = {
@@ -61,6 +62,7 @@ export function resetVinciUiState(): void {
     workingLabel: "Contemplating…",
     workingSince: undefined,
     continuationPending: false,
+    blockingReason: undefined,
   });
 }
 
@@ -74,6 +76,7 @@ export function resetShellUiState(): void {
     workingLabel: "Contemplating…",
     workingSince: undefined,
     continuationPending: false,
+    blockingReason: undefined,
   });
 }
 
@@ -108,6 +111,12 @@ export function setVinciWorking(working: boolean, label?: string): void {
 export function setVinciActivity(activity: VinciActivityState): void {
   if (store.state.activity === activity) return;
   publish({ ...store.state, activity });
+}
+
+export function setVinciBlocker(reason: string | undefined): void {
+  const blockingReason = reason?.replace(/[\r\n\t]+/g, " ").trim() || undefined;
+  if (store.state.blockingReason === blockingReason) return;
+  publish({ ...store.state, blockingReason });
 }
 
 export function setVinciWorkingLabel(label: string): void {

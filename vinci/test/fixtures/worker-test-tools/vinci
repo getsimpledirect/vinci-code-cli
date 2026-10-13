@@ -93,6 +93,8 @@ if (sessionDir && sessionId) {
 
   // Check for behavior flags
   const sleepMs = process.env.FAKE_VINCI_SLEEP ? parseInt(process.env.FAKE_VINCI_SLEEP, 10) : 0;
+  const waitForSigterm = process.env.FAKE_VINCI_WAIT_FOR_SIGTERM === '1';
+  const signalDeadlineMs = Number(process.env.FAKE_VINCI_SIGNAL_DEADLINE_MS);
   const outcome = process.env.FAKE_VINCI_OUTCOME || 'DONE';
   const failExit = process.env.FAKE_VINCI_EXIT !== undefined ? parseInt(process.env.FAKE_VINCI_EXIT, 10) : 0;
   const writeUsage = process.env.FAKE_VINCI_USAGE === '1';
@@ -189,8 +191,12 @@ if (sessionDir && sessionId) {
   }
   if (process.env.FAKE_VINCI_UNTRACKED_FILE) writeFileSync(resolve(process.env.FAKE_VINCI_UNTRACKED_FILE), 'untracked deliverable\n');
 
-  // Sleep if requested
-  if (sleepMs > 0) {
+  // A lease-loss fixture must stay alive until the daemon actually signals it.
+  // A fixed sleep can finish before two renewal timeout budgets have elapsed.
+  if (sleepMs > 0 || waitForSigterm) {
+    if (waitForSigterm && (!Number.isFinite(signalDeadlineMs) || signalDeadlineMs <= 0)) {
+      throw new Error('The fixture signal deadline must be finite and positive; set FAKE_VINCI_SIGNAL_DEADLINE_MS.');
+    }
     if (process.env.FAKE_VINCI_DESCENDANT_READY_FILE) {
       const readyFile = process.env.FAKE_VINCI_DESCENDANT_READY_FILE;
       const descendant = spawn(process.execPath, ['--input-type=module', '-e', `
@@ -215,7 +221,11 @@ if (sessionDir && sessionId) {
       setInterval(() => writeFileSync(process.env.FAKE_VINCI_PULSE_FILE, String(++pulse)), 50);
     }
     if (process.env.FAKE_VINCI_READY_FILE) writeFileSync(process.env.FAKE_VINCI_READY_FILE, `${process.pid}\n`);
-    await new Promise((resolveSleep) => setTimeout(resolveSleep, sleepMs));
+    if (waitForSigterm) {
+      await new Promise((_, reject) => setTimeout(() => reject(new Error(`The fixture task did not receive SIGTERM within ${signalDeadlineMs} ms; inspect the daemon stop and lease renewal paths.`)), signalDeadlineMs));
+    } else {
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, sleepMs));
+    }
   }
 
   if (process.env.FAKE_VINCI_USAGE_AT_EXIT === '1') {

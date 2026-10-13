@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { chmodSync, createWriteStream, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import xterm from "@xterm/headless";
+import { ENV_AGENT_DIR } from "../../../packages/coding-agent/dist/config.js";
 import { viewportSvg, viewportText } from "./terminal-render.mjs";
 
 const XtermTerminal = xterm.Terminal;
@@ -24,8 +25,11 @@ function readOption(name, fallback) {
 const outputDir = resolve(readOption("--output", join(ROOT, "vinci-test-artifacts", "terminal")));
 const columns = Number.parseInt(readOption("--columns", "80"), 10);
 const rows = Number.parseInt(readOption("--rows", "24"), 10);
+const resizeOption = readOption("--resize-to", "");
+const resizeColumns = resizeOption ? Number.parseInt(resizeOption, 10) : undefined;
 assert.ok(Number.isInteger(columns) && columns >= 40 && columns <= 240, "columns must be between 40 and 240");
 assert.ok(Number.isInteger(rows) && rows >= 16 && rows <= 80, "rows must be between 16 and 80");
+assert.ok(resizeColumns === undefined || (Number.isInteger(resizeColumns) && resizeColumns >= 40 && resizeColumns <= 240), "resize columns must be between 40 and 240");
 mkdirSync(outputDir, { recursive: true });
 
 const wait = (milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
@@ -127,20 +131,75 @@ async function capture() {
 	let writeQueue = Promise.resolve();
 	let child;
 	let childInput;
+	const resizeMarker = join(home, "resize-observation.json");
+	const resizeExtension = join(home, "capture-resize.mjs");
+	if (resizeColumns !== undefined) {
+		writeFileSync(resizeExtension, [
+			'import { execFileSync } from "node:child_process";',
+			'import { writeFileSync } from "node:fs";',
+			`const marker = ${JSON.stringify(resizeMarker)};`,
+			"export default function (pi) {",
+			'  pi.registerCommand("capture-resize", {',
+			'    description: "Resize this owned test PTY and record the actual CLI terminal dimensions",',
+			"    async handler() {",
+			"      let timer;",
+			"      let observe;",
+			"      const observed = new Promise((resolve, reject) => {",
+			"        observe = () => {",
+			"          clearTimeout(timer);",
+			"          writeFileSync(marker, JSON.stringify({ columns: process.stdout.columns, rows: process.stdout.rows }));",
+			"          resolve();",
+			"        };",
+			'        process.stdout.once("resize", observe);',
+			'        timer = setTimeout(() => reject(new Error("CLI received no native terminal resize event. Inspect the owned PTY before retrying.")), 5000);',
+			"      });",
+			"      try {",
+			`        execFileSync("stty", [process.platform === "darwin" ? "-f" : "-F", "/dev/tty", "cols", ${JSON.stringify(String(resizeColumns))}, "rows", ${JSON.stringify(String(rows))}], { timeout: 5000 });`,
+			"        await observed;",
+			"      } finally {",
+			"        clearTimeout(timer);",
+			'        process.stdout.off("resize", observe);',
+			"      }",
+			"    },",
+			"  });",
+			"}",
+		].join("\n"));
+	}
 
-	const command = `stty cols ${columns} rows ${rows}; exec bash ${shellQuote(join(ROOT, "vinci", "bin", "vinci"))}`;
+	const command = `stty cols ${columns} rows ${rows}; exec bash ${shellQuote(join(ROOT, "vinci", "bin", "vinci"))}${resizeColumns === undefined ? "" : ` --extension ${shellQuote(resizeExtension)}`}`;
 	const environment = {
 		...process.env,
 		COLUMNS: String(columns),
-		// No agent-dir override: HOME above already points at the throwaway home, and agentDir is that
-		// home's default location. The old `PI_CODING_AGENT_DIR` line was a stale no-op — the override
-		// name is derived from piConfig.name (now VINCI_CODING_AGENT_DIR), so it set nothing.
+		// Bind the derived agent-dir override to this fresh profile even when the invoking shell has
+		// an existing override. Changing HOME alone would otherwise leave that inherited path active.
+		[ENV_AGENT_DIR]: agentDir,
 		HOME: home,
 		LINES: String(rows),
 		PI_OFFLINE: "1",
 		TERM: "xterm-256color",
+		// This PTY/headless capture measures the text fallback. It cannot decode native image
+		// graphics, so an inherited terminal-family hint would make row measurements inadmissible.
+		TERM_PROGRAM: undefined,
+		TERMINAL_EMULATOR: undefined,
+		KITTY_WINDOW_ID: undefined,
+		GHOSTTY_RESOURCES_DIR: undefined,
+		WEZTERM_PANE: undefined,
+		WARP_SESSION_ID: undefined,
+		WARP_TERMINAL_SESSION_UUID: undefined,
+		ITERM_SESSION_ID: undefined,
+		TMUX: undefined,
+		WT_SESSION: undefined,
+		VINCI_SOURCE_CLI: "0",
+		VINCI_HOME: join(home, ".vinci-code"),
+		VINCI_NO_BOOTSTRAP_HEAL: "1",
 		VINCI_API_KEY: "visual-test",
-		VINCI_ASCII_WORDMARK: "1",
+		// This is the animation positive control. Plain/accessibility/reduced-motion negatives have
+		// separate registered-renderer coverage and must not disable the pulse this run measures.
+		VINCI_ASCII_WORDMARK: undefined,
+		VINCI_REDUCED_MOTION: undefined,
+		VINCI_PLAIN: undefined,
+		VINCI_SCREEN_READER: undefined,
+		NO_COLOR: undefined,
 		VINCI_BASE_URL: fake.baseUrl,
 		VINCI_NO_RESUME: "1",
 		VINCI_NO_SANDBOX: "1",
@@ -157,7 +216,7 @@ async function capture() {
 	};
 	const saveFrame = async (name) => {
 		await flush();
-		const label = `Vinci ${name} at ${columns}x${rows}`;
+		const label = `Vinci ${name} at ${terminal.cols}x${terminal.rows}`;
 		writeFileSync(join(outputDir, `${prefix}-${name}.txt`), `${viewportText(terminal)}\n`);
 		writeFileSync(join(outputDir, `${prefix}-${name}.svg`), viewportSvg(terminal, label));
 	};
@@ -181,7 +240,9 @@ async function capture() {
 			const pipeline = `cat ${shellQuote(inputFifo)} | /usr/bin/script -q /dev/null /bin/bash -c ${shellQuote(command)}`;
 			child = spawn("/bin/bash", ["-c", pipeline], { cwd: projectDir, env: environment, stdio: ["ignore", "pipe", "pipe"] });
 			childInput = createWriteStream(inputFifo);
-			await once(childInput, "open");
+			await Promise.race([once(childInput, "open"), wait(10_000).then(() => {
+				throw new Error("Native terminal input pipe did not open. Inspect the owned capture process before retrying.");
+			})]);
 		} else {
 			child = spawn(
 				"script",
@@ -219,7 +280,7 @@ async function capture() {
 			await wait(140);
 		}
 		assert.ok(seenPulses.size >= 2, `Expected at least two native pulse frames, saw ${[...seenPulses].join(", ")}`);
-		await waitForScreen(/Continuing the ta/, 8_000, "the automatic continuation handoff");
+		await waitForScreen(/Continuing the/, 8_000, "the automatic continuation handoff");
 		await saveFrame("continuing");
 
 		const completedScreen = await waitForScreen(/Ask Vinci/, 12_000, "the completed Vinci composer");
@@ -229,6 +290,22 @@ async function capture() {
 		assert.match(completedScreen, /lively/);
 		assert.doesNotMatch(completedScreen, ACTIVITY);
 		await saveFrame("complete");
+		if (resizeColumns !== undefined) {
+			const elapsed = Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
+			castEvents.push([Number(elapsed.toFixed(6)), "r", `${resizeColumns}x${rows}`]);
+			terminal.resize(resizeColumns, rows);
+			childInput.write("/capture-resize\r");
+			const deadline = Date.now() + 7_000;
+			while (!existsSync(resizeMarker) && Date.now() < deadline) await wait(50);
+			assert.ok(existsSync(resizeMarker), "The built CLI did not observe the native PTY resize. Inspect the resize command before retrying.");
+			const observation = JSON.parse(readFileSync(resizeMarker, "utf8"));
+			assert.equal(observation.columns, resizeColumns, "The CLI must observe the actual resized PTY columns");
+			assert.equal(observation.rows, rows, "The CLI must observe the actual resized PTY rows");
+			await waitForScreen(/Ask Vinci/, 5_000, "the resized Vinci composer");
+			await wait(100);
+			await saveFrame(`resized-${resizeColumns}`);
+			writeFileSync(join(outputDir, `${prefix}-resize-observation.json`), `${JSON.stringify(observation)}\n`);
+		}
 		await wait(250);
 		childInput.end("/quit\r");
 		const result = await Promise.race([
@@ -265,4 +342,4 @@ async function capture() {
 }
 
 await capture();
-console.log(`terminal capture: ${columns}x${rows} ANSI, cast, text, and SVG artifacts written to ${outputDir}`);
+console.log(`terminal capture: ${columns}x${rows}${resizeColumns === undefined ? "" : ` resized natively to ${resizeColumns}x${rows}`} ANSI, cast, text, and SVG artifacts written to ${outputDir}`);
