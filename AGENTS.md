@@ -145,17 +145,19 @@ repository, not here.
 
 ### Cutting a release
 
-The version lives in two constants and is rendered into fifteen snapshots. All of them must
-move together or CI fails:
+The product version is authoritative in `vinci/identity.json`; the header and packaged launcher
+read it. UI snapshots render that version and must be regenerated and reviewed:
 
 1. Branch `release/vinci-v<version>` off `main`.
-2. Bump `vinci/identity.json` **and** `vinci/extensions/vinci-header.ts` (`VINCI_VERSION`).
+2. Bump only the product version in `vinci/identity.json`; do not synchronize root or Pi package versions.
 3. Regenerate the UI snapshots, which print the version in the header:
    `UPDATE_VINCI_UI_SNAPSHOTS=1 node packages/coding-agent/node_modules/vitest/dist/cli.js --root . --run vinci/test/ui/scenarios.test.mjs`
-   The diff must be fifteen files, one line each. Anything else means something unrelated moved.
+   Review every changed frame and confirm the intended version and UI state; do not use a stale
+   snapshot count as evidence that nothing else changed.
 4. Add `vinci/release-notes/<version>.md`. The workflow looks for exactly that filename; a
    mismatched name is skipped with a warning, not an error.
-5. Merge, then annotate-tag the *merge commit* and push the tag.
+5. Run `npm run check`, the offline harness, and the exact packaged-launch gates. After explicit
+   release authorization, merge, annotate-tag the reviewed public commit, and push the tag.
 
 `build-and-verify` asserts the tag matches `vinci/identity.json`, so a tag pushed before the
 bump merges will fail.

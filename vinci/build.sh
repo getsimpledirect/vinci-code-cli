@@ -13,10 +13,19 @@
 # the stock `npm run build` once.)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SOURCE_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/vinci-build-source.XXXXXX")"
+trap 'rm -f "${SOURCE_SNAPSHOT}"' EXIT
+node "$ROOT/vinci/scripts/build-source-identity.mjs" snapshot "$ROOT" "$SOURCE_SNAPSHOT"
 echo "Building Vinci (no external model fetch)…"
 ( cd "$ROOT/packages/tui" && npm run build )
 ( cd "$ROOT/packages/ai" && npx tsgo -p tsconfig.build.json )   # tsgo only — skip generate-models/image-models
 ( cd "$ROOT/packages/agent" && npm run build )
 ( cd "$ROOT/packages/coding-agent" && npm run build )           # includes copy-assets
 ( cd "$ROOT/packages/orchestrator" && npm run build )
+if [ -d "$ROOT/vinci/dist/extensions" ]; then
+  find "$ROOT/vinci/dist/extensions" -mindepth 1 -delete
+fi
+npx tsgo -p "$ROOT/vinci/tsconfig.extensions-build.json"
+node "$ROOT/vinci/scripts/build-extensions.mjs"
+node "$ROOT/vinci/scripts/build-source-identity.mjs" verify "$ROOT" "$SOURCE_SNAPSHOT" "$ROOT/vinci/dist/source-identity.json"
 echo "✓ Vinci built — packages/coding-agent/dist/cli.js is ready. Relaunch: vinci/bin/vinci"

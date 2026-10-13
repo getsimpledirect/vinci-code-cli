@@ -8,16 +8,20 @@ if (!root) {
 	throw new Error("Usage: package-excludes.mjs <repository-root>");
 }
 
-const tree = JSON.parse(
-	execFileSync("npm", ["ls", "--omit=dev", "--json", "--depth=0"], {
-		cwd: root,
-		encoding: "utf8",
-	}),
-);
-
-for (const [name, dependency] of Object.entries(tree.dependencies ?? {})) {
-	if (dependency && typeof dependency === "object" && dependency.extraneous === true) {
-		process.stdout.write(`node_modules/${name}\n`);
+// A staged runtime closure contains only dependencies selected and validated against the lock by
+// stage-runtime-dependencies.mjs. npm ls cannot classify absolute development symlinks reliably;
+// keep its exclusion behavior for callers packaging their original node_modules directly.
+if (process.argv[3] !== "--runtime-staged") {
+	const tree = JSON.parse(
+		execFileSync("npm", ["ls", "--omit=dev", "--json", "--depth=0"], {
+			cwd: root,
+			encoding: "utf8",
+		}),
+	);
+	for (const [name, dependency] of Object.entries(tree.dependencies ?? {})) {
+		if (dependency && typeof dependency === "object" && dependency.extraneous === true) {
+			process.stdout.write(`node_modules/${name}\n`);
+		}
 	}
 }
 

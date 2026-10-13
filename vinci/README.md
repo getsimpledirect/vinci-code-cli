@@ -45,7 +45,7 @@ this line once said `0.0.20` through five shipped releases. `vinci --version` is
 **From source** (contributors, and anyone who would rather read what they run):
 
 ```sh
-npm install && bash vinci/build.sh
+npm ci --ignore-scripts && bash vinci/build.sh
 ./vinci/bin/vinci
 ```
 
@@ -58,27 +58,26 @@ account is required; sign in to Vinci if you want managed inference. See
 
 Vinci Code has its **own** version, separate from the underlying Pi version. To cut a release:
 
-1. **Bump the version** — `version` in [`identity.json`](identity.json) and `VINCI_VERSION` in
-   [`extensions/vinci-header.ts`](extensions/vinci-header.ts). The identity test requires equality.
-2. **Verify** — `bash vinci/test/run.sh` must be green.
-3. **Commit + tag** — tag with the **`vinci-` prefix** (its own namespace — a bare `vX.Y.Z`
-   collides with Pi's ~300 mirrored tags):
-   ```sh
-   git tag -a vinci-vX.Y.Z -m "Vinci Code X.Y.Z"
-   git push origin main && git push origin vinci-vX.Y.Z
-   gh release create vinci-vX.Y.Z --title "Vinci Code X.Y.Z" --notes "…"
-   ```
+1. **Bump the product version** in [`identity.json`](identity.json). The header and packaged
+   launcher read this authority; root and Pi package versions remain separate namespaces.
+2. **Regenerate and review the UI snapshots**, add the matching release note, and run
+   `npm run check` plus `VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh`. The packaged checks unpack
+   the exact archive and run its real launcher with a local faux provider outside the checkout.
+   These offline checks do not establish live-provider usefulness or production activation.
+3. **After review and explicit release authorization**, merge to public `main`, annotate that
+   reviewed commit with the protected `vinci-vX.Y.Z` tag, and push the tag. Tags are immutable.
 
-> **Signing happens elsewhere, on purpose.** Signed release artifacts are produced by a workflow
-> in Vinci's internal repository, which holds the only AWS OIDC trust permitted to read the
-> update-signing key. That path is deliberately NOT reproduced here: a second signing path is a
-> second thing to compromise. This repository publishes source and release notes; the signed
-> `.tgz` and manifest that `curl … /install` consumes are produced and verified internally, then
-> mirrored here with identical bytes and checksums. Release signing is documented in the internal
-> ops repository.
+[`../.github/workflows/vinci-release.yml`](../.github/workflows/vinci-release.yml) in
+`getsimpledirect/vinci-code-cli` is the sole release publisher. It checks tag/identity agreement,
+builds and packages, tests those bytes, and carries that same archive to the protected publish
+job. Publish signs it, writes the immutable artifact once, verifies the staged hash, activates
+the signed manifest last, and verifies its read-back before creating the GitHub release.
+Signing trust and key operations stay in the private operations home; they are not copied here.
 
-`main` is a protected, fast-forward-only mirror of upstream Pi — **never merge `vinci` → `main`**
-(see [Branch model & syncing](#branch-model--syncing-with-upstream-pi) below).
+[`../.github/workflows/vinci-rollback.yml`](../.github/workflows/vinci-rollback.yml) reuses an
+existing immutable archive after checking its signed historical release receipt. It activates
+a newly signed manifest with a higher sequence and ETag compare-and-swap. It never moves a tag
+or rewrites the archive. Dispatching either workflow requires its own authorization.
 
 ## Layout
 
@@ -112,7 +111,7 @@ Vinci Code has its **own** version, separate from the underlying Pi version. To 
 | `APPEND_SYSTEM.md` | Character pack (reinforcement; the gateway injects it server-side too) |
 | `assets/` · `BRAND.md` | Brandmark + wordmark + palette (SVG) · palette hex |
 | `bin/vinci` | Launcher — Pi + the brand layer + extensions via flags |
-| `sync-upstream.sh` · `UPSTREAM.md` | Pull Pi maintenance updates (ff main, rebase vinci) |
+| `sync-upstream.sh` · `UPSTREAM.md` | Preserved private mirror/rebase maintenance workflow; unsupported on public product `main` until adapted |
 | `PATCHES.md` | The inventoried env-gated core patches — login/model/UX, small-model truth-telling, private controls, auto-continue, de-groove, and tight box-less rendering |
 | `AUTH_PAIRING_PLAN.md` | The "Connect to Vinci" pairing design (shipped + deployed) |
 
@@ -170,13 +169,44 @@ Vinci Code has its **own** version, separate from the underlying Pi version. To 
   managed-default view. With other providers enabled, choose an authentication method, then
   a provider; choose "Use a subscription", then Vinci to pair in the browser.
 
+## Before your first task
+
+Choose the provider and authentication method in `/login` before starting work. Vinci browser
+pairing uses Vinci's managed account. With your own provider enabled, choose its supported login or
+API key explicitly and check which account will be charged.
+
+- **OpenAI:** the supported ChatGPT/Codex sign-in and an OpenAI API key are separate billing
+  choices. API-key usage is billed through the API Platform rather than your ChatGPT subscription;
+  a subscription does not promise access to every third-party client or model. See
+  [OpenAI authentication guidance](https://learn.chatgpt.com/docs/auth).
+- **Anthropic:** use a Claude Console API key or a supported cloud-provider route for third-party
+  tools. Do not assume a Claude subscription authorizes an arbitrary client. Anthropic also warns
+  that `ANTHROPIC_API_KEY` takes precedence over subscription login in Claude Code and incurs API
+  charges; check exported keys before choosing that route. See
+  [Anthropic third-party authentication guidance](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account)
+  and [Claude Code subscription/key precedence](https://support.claude.com/en/articles/11145838-use-claude-code-with-your-pro-or-max-plan).
+
+The task meter is a local estimate. Missing price or usage data means **unknown**, not zero; it is
+not an account balance, a capacity promise, or a per-task spending cap. The provider's billing
+surface, or Account → Usage for Vinci's managed service, remains authoritative.
+
+For an installed copy, run `vinci doctor` to inspect the selected environment; `vinci update` and
+`vinci rollback` use the signed update flow. Open a shell in the project you intend to change, then
+launch `vinci`. Start with a bounded request such as "Fix this failing test, run its focused check,
+and report the changed files." `/agents` opens helper status and reviewed changes.
+
+Press **Escape** to abort active work. Use `/task-info` to record the task ID, then
+`vinci resume <task-id>` to reopen an interrupted task. Ctrl+C clears the editor; pressing it twice
+quits. Read the final receipt: `DONE` requires the required verification, `DONE-UNVERIFIED` records
+unverified changes, `WAITING` names a needed decision, and `BLOCKED` gives the stopping reason.
+
 ## Run it
 
 ```bash
 # 1. Build once from the REPO ROOT. vinci/build.sh compiles tui→ai→agent→coding-agent WITHOUT
 #    re-fetching the ~1000 external model catalogs the stock `npm run build` pulls each time
 #    — so it's network-free, faster, and leaves no git drift.
-npm install && bash vinci/build.sh
+npm ci --ignore-scripts && bash vinci/build.sh
 
 # 2. Launch branded (clears the screen so the welcome opens at the top)
 vinci/bin/vinci
@@ -231,6 +261,25 @@ Vinci Code works with your own provider key or with Vinci's managed service. Whe
 own, the credential is stored on your machine by the underlying agent (`~/.pi/agent/auth.json`) and
 sent only to the provider you chose — never to Vinci. There is no in-app local-model runtime; users
 may run local-model tooling independently.
+
+### Local Work task client
+
+`vinci runtime --help` exposes an explicitly configured local Work task client. Its
+`VINCI_RUNTIME_CONFIG` must name an owned, mode-0600 JSON file containing the selected numeric
+loopback origin and separately authorized Work task credential. It discovers no credentials
+and does not borrow an inference key or a subscription login.
+
+It can create an admitted saved task, inspect authorized state and replay, answer questions,
+approve or correct an exact reviewed action, read receipts and selected artifacts, watch with
+a deadline, report bounded metadata, and request cancellation. Use `--spec <file>` or
+`--spec -` to keep task content and exact intent off the command line. Creation does not launch
+a worker, and cancellation does not prove termination. Transport uncertainty requires explicit
+reconciliation of the original command; mutations are never automatically retried.
+
+Task listing, worker launch or resume, hosted schedules, publication, merging, and deployment
+are outside this interface. The local fixture and faux-provider checks qualify this client
+boundary; they do not establish Runtime deployment, subscription entitlement, real inference,
+or a useful completed task. See [`docs/environment.md`](docs/environment.md).
 
 ## Privacy and security
 
@@ -295,9 +344,9 @@ bash vinci/test/run.sh
 
 - **UNIT** (`vinci/test/units.mjs`) — pure logic in the extensions/patches (grader parse, escalation
   ladder, undo round-trip, guard path patterns, memory). Fast, offline. Also runs in CI on every
-  push/PR to `vinci` (`.github/workflows/vinci-tests.yml`).
+  push/PR to public `main` (`.github/workflows/vinci-tests.yml`).
 - **UI** (`vinci/test/ui/`) — boots the real interactive mode with the faux model and xterm-backed
-  virtual terminal, sends real key sequences, resizes the terminal, and runs 30 critical journeys
+  virtual terminal, sends real key sequences, resizes the terminal, and runs deterministic journeys
   with reviewed plain-text viewport snapshots for visual cases. No login, network, tmux, or model cost.
 - **IDENTITY** (`vinci/identity.json`) — the canonical Vinci name/provider/model/extension contract.
   Both CI and `sync-upstream.sh` fail if an upstream rebase drops or replaces part of the product.
@@ -322,35 +371,27 @@ bash vinci/test/run.sh
   extension + core patch **loads**, auth/gateway works, the agent responds, and **tools fire** end
   to end. Needs a Vinci login; makes ~2 gateway calls; skipped (not failed) if not signed in.
 
-**Run `bash vinci/test/run.sh` before finishing/merging a change.** Manual release review is now
-limited to subjective aesthetics, animation feel, and terminal-specific image rendering.
+**Run `VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh` before finishing/merging a change.** Keep the
+offline controls separate from authorized real-provider usefulness, installed-client recovery,
+production release activation, and terminal-specific artwork review.
 
 ## Branch model & syncing with upstream Pi
 
-Vinci Code is a **thin fork** of Pi. The branch model is what keeps it easy to pull Pi's updates
-without disturbing the Vinci layer:
+The active product source is `getsimpledirect/vinci-code-cli/main`. Product changes and release
+tags belong to its reviewed public lineage. Preserve public security fixes when reconciling
+private patches; never merge private history or overwrite the public tree with an old export.
 
-- `main` — **pristine**, tracks upstream Pi (`badlogic/pi-mono`). Never commit Vinci work here; its
-  only job is to be a clean mirror we can fast-forward.
-- `vinci` — **the trunk** (the released code; the installer builds from it). This is where all Vinci
-  work lives, rebased on top of `main` on each sync.
-
-**Golden rule: `vinci` is the trunk — never merge `vinci` → `main`.** That would put the whole layer
-on `main` and permanently break the fast-forward-main / rebase-vinci flow. `main` is protected on
-GitHub (linear history, no force-push, no deletions) to enforce this. For a stable release pointer,
-tag a commit on `vinci` with the `vinci-` prefix (`git tag vinci-X.Y.Z`) — its own namespace, distinct
-from Pi's `vX.Y.Z` tags, and tags survive the rebase force-push.
+The retained private repository has a different legacy branch model:
+its `main` mirrors upstream Pi and `vinci` carries the private product layer. Its operational
+history and unresolved work remain private until their disposition is complete. This distinction
+does not claim that consolidation or archival has finished.
 
 ### How to sync (pull the latest Pi)
 
-```bash
-vinci/sync-upstream.sh            # → latest upstream/main
-vinci/sync-upstream.sh v0.81.0    # → a specific Pi release tag (recommended: pin releases)
-```
-
-It enables `git rerere`, fast-forwards `main` to Pi, rebases `vinci` on top, verifies the canonical
-identity contract, and prints a completeness check. Then:
-`bash vinci/test/run.sh && git push --force-with-lease origin vinci`.
+`vinci/sync-upstream.sh` is preserved for that legacy private mirror/rebase workflow. It can
+fast-forward and push `main`, then rebase `vinci`; it is **not a supported maintenance route for
+public product `main`** until adapted and reviewed. Public Pi updates need a narrow reviewed
+integration against the public product lineage and fresh identity, security, and packaged checks.
 
 **Why this stays conflict-free:** ~everything Vinci is *additive* (the `vinci/` dir + new
 `packages/**/vinci-*.ts` files) — additive files never conflict. The only conflict surface is a small
@@ -360,10 +401,10 @@ each resolution so you never redo it. Full details + the recovery steps: [`UPSTR
 
 ## Status
 
-The current working tree has the truthfulness, checkpoint/resume, outcome/meter, model-provenance,
-source-ownership, Crew reconciliation, and sealed-comparator slices. `npm run check` and the complete
-offline harness pass, including 365 units, 30 UI scenarios, real SIGKILL recovery, and native PTY
-rendering.
+The source contains truthfulness, checkpoint/resume, outcome/meter, model-provenance,
+source-ownership, Crew reconciliation, and sealed-comparator work. Qualification belongs to the
+dated check and harness outputs for the exact source and artifact under review, rather than a
+test count or blanket passing claim maintained in this README.
 
 The product target is **Vinci Forte**, initially GLM 5.2 on DeepInfra with confirmed ZDR approval.
 The CLI requests the stable `forte` class and records requested/resolved provenance and route drift.
@@ -371,7 +412,6 @@ The remaining serving work is signed resolution metadata, complete capability/co
 production qualification, and a checked-in promotion/rollback gate. Do not replace that with BYOK, an
 in-app local runtime, a per-task dollar cap, plan-based concurrency, or a paid priority lane.
 
-Current quality evidence is strong but not complete. All ten pinned scenarios and seven reverse
-patches pass inventory validation, but the five-repetition production campaign has not run. The
-tracked launch report remains `not-qualified` until all Vinci outcomes pass and the secondary Codex
-and Claude Code comparison evidence is aggregated.
+Offline fixtures and packaged startup do not establish useful real-model execution. The tracked
+launch report remains `not-qualified` until the required production outcomes and independent
+comparison evidence are qualified and recorded by their owners.

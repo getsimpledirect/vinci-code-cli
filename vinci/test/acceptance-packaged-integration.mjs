@@ -50,6 +50,12 @@ function shippedTypeScriptModule(packagedRoot, relativePath) {
   return candidate;
 }
 
+function shippedBuiltModule(packagedRoot, relativePath) {
+  const candidate = join(packagedRoot, `vinci/dist/${relativePath}.js`);
+  assert.equal(existsSync(candidate), true, `packaged built module is missing: vinci/dist/${relativePath}.js`);
+  return candidate;
+}
+
 function runLauncher(launcher, path, home, marker, args, overrides = {}) {
   const env = {
     ...process.env,
@@ -80,6 +86,7 @@ try {
   
   // Copy vinci layer (no tests, no docs)
   cpSync(join(root, "vinci/bin"), join(packagedRoot, "vinci/bin"), { recursive: true });
+  cpSync(join(root, "vinci/dist"), join(packagedRoot, "vinci/dist"), { recursive: true });
   cpSync(join(root, "vinci/extensions"), join(packagedRoot, "vinci/extensions"), { recursive: true });
   cpSync(join(root, "vinci/themes"), join(packagedRoot, "vinci/themes"), { recursive: true });
   cpSync(join(root, "vinci/assets"), join(packagedRoot, "vinci/assets"), { recursive: true });
@@ -157,11 +164,11 @@ try {
   assert.equal(existsSync(piMarker), false, "missing-vac route started the Pi agent");
   console.log("ok (b) packaged launcher gives guidance without vac and does not start Pi");
 
-  const acceptPath = shippedTypeScriptModule(packagedRoot, "vinci/extensions/vinci-accept");
-  const verificationStatePath = shippedTypeScriptModule(packagedRoot, "vinci/extensions/lib/verification-state");
-  const receiptPath = shippedTypeScriptModule(packagedRoot, "vinci/extensions/vinci-receipt");
+  const acceptPath = shippedBuiltModule(packagedRoot, "extensions/vinci-accept");
+  const verificationStatePath = shippedBuiltModule(packagedRoot, "extensions/lib/verification-state");
+  const receiptPath = shippedBuiltModule(packagedRoot, "extensions/vinci-receipt");
   assert.match(
-    readFileSync(verificationStatePath, "utf8"),
+    readFileSync(shippedTypeScriptModule(packagedRoot, "vinci/extensions/lib/verification-state"), "utf8"),
     /export\s+type\s*\{\s*RemoteAcceptanceVerdict\s*\}/,
     "packaged verification state does not export the RemoteAcceptanceVerdict type",
   );

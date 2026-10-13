@@ -27,9 +27,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  refuse-private-release:
+    if: github.repository == 'getsimpledirect/vinci-code'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Releases publish from vinci-code-cli only
+        run: |
+          echo "::error::Vinci releases publish from getsimpledirect/vinci-code-cli only. Reconcile the public source and tag its reviewed commit before retrying."
+          exit 1
+
   build-and-verify:
-    # Org-only: needs the AWS OIDC trust that exists in this repository alone.
-    # Public and forked copies are structurally inert rather than failing noisily.
+    # The public product repository is the sole publisher; private tags refuse above.
     #
     # This name must track the repository as it is ACTUALLY named. It said
     # `getsimpledirect/vinci-code` from before the rename to `-cli`, so it stopped matching the
@@ -43,6 +52,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.meta.outputs.version }}
+      source-sha: ${{ steps.meta.outputs.source-sha }}
     steps:
       - name: Refuse anything that is not a vinci-v* tag
         env:
@@ -74,21 +84,29 @@ jobs:
             *) echo "tag version '$TAG_VERSION' is not X.Y.Z"; exit 1 ;;
           esac
           IDENTITY_VERSION="$(node -p "require('./vinci/identity.json').version")"
-          HEADER_VERSION="$(node -p "(require('fs').readFileSync('vinci/extensions/vinci-header.ts','utf8').match(/VINCI_VERSION = \"([^\"]*)\"/)||[])[1]||''")"
-          echo "tag=$TAG_VERSION identity=$IDENTITY_VERSION header=$HEADER_VERSION"
+          echo "tag=$TAG_VERSION identity=$IDENTITY_VERSION"
           test "$TAG_VERSION" = "$IDENTITY_VERSION" || { echo "identity.json disagrees with the tag"; exit 1; }
-          test "$TAG_VERSION" = "$HEADER_VERSION" || { echo "vinci-header.ts disagrees with the tag"; exit 1; }
           printf 'version=%s\n' "$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          SOURCE_SHA="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA" || { echo "::error::Checkout differs from the release event commit. Check out that exact commit before retrying."; exit 1; }
+          printf 'source-sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Install, build, and package the UNSIGNED payload
+        env:
+          VINCI_PACKAGE_REQUIRE_CLEAN_SOURCE: "1"
+          VINCI_EXPECTED_SOURCE_SHA: ${{ steps.meta.outputs.source-sha }}
         run: |
           set -euo pipefail
-          npm ci
-          bash vinci/build.sh
+          npm ci --ignore-scripts
           bash vinci/package.sh
+          node vinci/test/identity-contract.mjs
 
       - name: Full offline harness (smoke needs gateway auth; CI proves load + UI + unit)
-        run: VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh
+        env:
+          VINCI_SKIP_SMOKE: "1"
+          VINCI_TEST_REUSE_BUILD: "1"
+          VINCI_TEST_PACKAGED_ARTIFACT: ${{ github.workspace }}/release/vinci-code-${{ steps.meta.outputs.version }}.tgz
+        run: bash vinci/test/run.sh
 
       # The harness above runs FROM THE REPO, where every source path resolves — so it structurally
       # cannot see a shipped extension importing a file the tarball does not contain. 0.0.31 shipped
@@ -96,19 +114,19 @@ jobs:
       # packaged) and died at startup with a green harness, two green CI legs and a green 50-run
       # campaign behind it. Verify the ARTIFACT, not the repo.
       - name: Verify the PACKAGED artifact loads (unpack the real tarball and resolve its imports)
+        env:
+          VINCI_PACKAGE_REQUIRE_CLEAN_SOURCE: "1"
+          VINCI_EXPECTED_SOURCE_SHA: ${{ steps.meta.outputs.source-sha }}
         run: |
           set -euo pipefail
-          rm -rf /tmp/vinci-artifact-check
-          mkdir -p /tmp/vinci-artifact-check
-          tar -xzf "release/vinci-code-${{ steps.meta.outputs.version }}.tgz" -C /tmp/vinci-artifact-check
-          node vinci/test/packaged-artifact-check.mjs /tmp/vinci-artifact-check
-          # Belt and braces: the packaged CLI must answer --version without an extension-load error.
-          out="$(/tmp/vinci-artifact-check/vinci/bin/vinci --version 2>&1)" || true
-          printf '%s\n' "${out}"
-          case "${out}" in
-            *"Failed to load extension"*|*"Cannot find module"*)
-              echo "::error::The packaged CLI cannot load its extensions."; exit 1 ;;
-          esac
+          artifact_check="$(mktemp -d "${RUNNER_TEMP}/vinci-artifact-check.XXXXXX")"
+          trap 'find "$artifact_check" -mindepth 1 -delete && rmdir "$artifact_check"' EXIT
+          tar -xzf "release/vinci-code-${{ steps.meta.outputs.version }}.tgz" -C "$artifact_check"
+          node vinci/test/packaged-artifact-check.mjs "$artifact_check"
+          bash vinci/scripts/check-no-contracts-at-runtime.sh "release/vinci-code-${{ steps.meta.outputs.version }}.tgz"
+          out="$("$artifact_check/vinci/bin/vinci" --version)"
+          test "$out" = "${{ steps.meta.outputs.version }}" || { echo "::error::Packaged identity differs from the reviewed tag. Rebuild that source commit before retrying."; exit 1; }
+          node vinci/test/packaged-launch-check.mjs "$artifact_check"
 
       - name: Carry the TESTED payload to publish (publish signs this, never a rebuild)
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
@@ -132,6 +150,7 @@ jobs:
       id-token: write # OIDC federation to the narrowly-scoped AWS release role
     env:
       VERSION: ${{ needs.build-and-verify.outputs.version }}
+      SOURCE_SHA: ${{ needs.build-and-verify.outputs.source-sha }}
       S3_BUCKET: vinci-assets
       S3_PREFIX: vinci-code
       MANIFEST_URL: https://vinci-assets.s3.ca-central-1.amazonaws.com/vinci-code/manifest-beta.json
@@ -148,6 +167,26 @@ jobs:
           name: vinci-release-payload
           path: release
 
+      - name: Bind the downloaded tested payload to the release event before signing
+        run: |
+          set -euo pipefail
+          ( cd release && sha256sum -c "vinci-code-${VERSION}.tgz.sha256" )
+          node --input-type=module <<'EOF'
+          import assert from "node:assert/strict";
+          import { execFileSync } from "node:child_process";
+          const eventCommit = execFileSync("git", ["rev-parse", `${process.env.GITHUB_SHA}^{commit}`], { encoding: "utf8", timeout: 10000 }).trim();
+          assert.equal(process.env.SOURCE_SHA, eventCommit, "Tested source differs from the release event. Rebuild the selected commit before signing.");
+          const archive = `release/vinci-code-${process.env.VERSION}.tgz`;
+          const source = JSON.parse(execFileSync("tar", ["-xOf", archive, "vinci/dist/source-identity.json"], { encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024 }));
+          const identity = JSON.parse(execFileSync("tar", ["-xOf", archive, "vinci/identity.json"], { encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024 }));
+          assert.equal(source.schemaVersion, 1, "Artifact provenance is absent. Rebuild the reviewed source before signing.");
+          assert.equal(source.sourceCommit, eventCommit, "Artifact source differs from the release event. Rebuild that exact commit before signing.");
+          assert.equal(source.dirty, false, "Artifact source was dirty. Commit and review the exact source before signing.");
+          assert.match(source.inputSha256, /^[0-9a-f]{64}$/, "Artifact source byte identity is invalid. Rebuild its reviewed inputs before signing.");
+          assert.equal(identity.version, process.env.VERSION, "Artifact version differs from the release tag. Rebuild the selected version before signing.");
+          console.log(`Tested archive is bound to clean source commit ${eventCommit} and version ${identity.version}.`);
+          EOF
+
       - name: Assume the release role (OIDC — no stored AWS credentials)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
@@ -159,6 +198,7 @@ jobs:
           MINIMUM_VERSION: ${{ vars.VINCI_MINIMUM_VERSION || '0.0.09' }}
         run: |
           set -euo pipefail
+          ( cd release && sha256sum -c "vinci-code-${VERSION}.tgz.sha256" )
           # Key lives only in RUNNER_TEMP (ephemeral single-use VM) and is removed on exit.
           KEY_FILE="$(mktemp "${RUNNER_TEMP}/vinci-key.XXXXXX")"
           trap 'rm -f "$KEY_FILE"' EXIT

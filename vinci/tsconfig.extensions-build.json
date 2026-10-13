@@ -1,0 +1,16 @@
+{
+	"extends": "../tsconfig.base.json",
+	"compilerOptions": {
+		"declaration": false,
+		"declarationMap": false,
+		"inlineSources": false,
+		"lib": ["es2023"],
+		"noEmit": false,
+		"outDir": "./dist/extensions",
+		"rootDir": "./extensions",
+		"sourceMap": false
+	},
+	"include": [
+		"extensions/**/*.ts"
+	]
+}

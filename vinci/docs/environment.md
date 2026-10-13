@@ -63,3 +63,58 @@ A dev *release* channel — signed dev artifacts, a `manifest-dev.json`, a secon
 root, pre-release version grammar — was deliberately left out. Today the channel enum in
 the updater is cosmetic and selection is by manifest URL only. If external testers ever
 need pre-release builds, that is the work package to open.
+
+## Local Work Task Client
+
+`vinci runtime` uses Work's existing task authority through an explicitly configured
+local listener. It does not launch a worker or introduce a hosted orchestration service.
+Task enumeration, worker launch/resume, hosted schedules, remote-host admission, merging
+and deployment are outside this interface. A successful fixture does not qualify those
+features, subscription entitlement, real inference, isolation or useful output.
+
+Set `VINCI_RUNTIME_CONFIG` to an absolute, owned private JSON file containing a loopback
+`origin` and exactly one `cookie` or `token`. Group/world access, symlinks, redirects and
+remote origins are refused. Obtain the profile from the existing Work owner; do not
+copy unrelated credentials or configure a production service by assumption. Running
+`vinci runtime --help` requires no profile and lists the supported commands.
+
+Create input is explicit saved text with a stable `commandId`; bounded text/Markdown
+attachments carry their SHA-256 digest. Inspect the current snapshot before answering a
+scope question or approving/correcting an action. Decisions bind the current question or
+approval, exact action digest and revision. The server retains final authority. After
+observed cancellation or a terminal snapshot, retained question/approval IDs cannot send
+new client decisions. `cancel` requests cancellation; it does not by itself prove that
+execution stopped. Observe the host acknowledgement or terminal event separately.
+
+`events` reads a bounded replay page; `watch` requires a timeout. Replay gaps, changed
+snapshots and malformed responses require resynchronization. A transport error after a
+mutation leaves its outcome unconfirmed. Inspect and reconcile that outcome before
+retrying; the client does not automatically replay a mutation.
+
+`receipt` validates the canonical Work receipt's task/scope/event bindings and covered
+content digest. This is integrity and binding validation, not an independent assessment
+or a signature trust claim. `export` retrieves an exact artifact version and checks its
+recorded digest. `report` emits content-free recorded counters, separates missing usage
+from recorded zero, and deduplicates canonical turn IDs. Its counters are not invoices:
+provider quota, account debit, managed credits and total incurred cost remain unknown.
+
+The local JavaScript facade is `vinci/scripts/runtime.mjs` with declarations in
+`runtime.d.mts`. `createRuntime(configPath)` exposes the same bounded operations and
+supports request deadlines and abort signals. It does not replace Work's approval,
+policy, receipt or worker services. Routine tests use an owned synthetic listener;
+Work/shared-task qualification requires separately selected fixtures and fresh positive
+controls around each negative.
+
+## Terminal Presentation
+
+Vero uses the original approved artwork from the provenance manifest in `assets/vero/`.
+The compact header and composer retain explicit task state and next action. The image
+slot has a fixed height as poses change, and the receipt remains the evidence for any
+completion or verification claim. Text output, transcripts, `/copy` and exports do not
+contain presentation artwork.
+
+Use `VINCI_REDUCED_MOTION=1` for a static indicator. `NO_COLOR`, `TERM=dumb`,
+`VINCI_PLAIN=1` and `VINCI_SCREEN_READER=1` disable decorative images and the pulse and
+select the plain compact header. `VINCI_ASCII_WORDMARK=1` retains its original font
+fallback and suppresses images; it does not imply reduced motion. For plain logs use
+the existing noninteractive text mode; JSON/JSONL remain machine output.
