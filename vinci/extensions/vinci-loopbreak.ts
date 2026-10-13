@@ -90,7 +90,8 @@ const TRACKED_PATH_LOOKUP_TIMEOUT_MS = 2_000;
 // Interaction / meta tools are NOT exploration: a `todo` update or a teammate ask must never trip the
 // explore detector — and the steers themselves prescribe `ask_user`/`advisor`, so blocking those tools
 // hands the model a contradiction it can't resolve (observed: a blocked `todo` rendered mid-spiral).
-const META_TOOLS = new Set(["ask_user", "todo", "present_plan", "advisor", "convene_council", "review_changes", "remember", "rerun_check", "spawn_helper", "orchestrate"]);
+const META_TOOLS = new Set(["ask_user", "todo", "present_plan", "advisor", "convene_council", "review_changes", "remember", "rerun_check", "spawn_helper", "continue_agent", "message_agent", "orchestrate"]);
+const MUTATION_TOOLS = new Set(["edit", "write", "use_agent_work"]);
 
 // Source navigation is how an agent locates exact edit regions. These calls may be numerous without
 // being wasteful: reading the same file at another offset or grepping another pattern is new
@@ -814,11 +815,19 @@ export default function (pi: ExtensionAPI) {
     // misses) still hits the consecutive-failure backstop after 4 in a row. Structured source
     // navigation is exempt: a missing path/range must not poison the later edit, while an identical
     // failed lookup is still caught by the result-aware fixation detector. Any success resets it.
+    // Crew can return an ordinary result after refusing a patch. Only its explicit applied flag
+    // moves mutation pacing forward; repeated refusals retain the same failed-action bounds.
+    const crewWorkApplied =
+      event.toolName !== "use_agent_work" ||
+      (event.details !== null &&
+        typeof event.details === "object" &&
+        (event.details as { applied?: unknown }).applied === true);
     const failed =
-      !isVerificationCall(event.toolName, event.input) &&
-      (!!event.isError ||
-        /could not find the exact text|no changes|validation failed|overlap|must match exactly|didn'?t match|required propert/i.test(result) ||
-        /page doesn'?t exist|couldn'?t (?:read|reach|resolve)|took too long to load|resolves to an internal/i.test(result));
+      !crewWorkApplied ||
+      (!isVerificationCall(event.toolName, event.input) &&
+        (!!event.isError ||
+          /could not find the exact text|no changes|validation failed|overlap|must match exactly|didn'?t match|required propert/i.test(result) ||
+          /page doesn'?t exist|couldn'?t (?:read|reach|resolve)|took too long to load|resolves to an internal/i.test(result)));
     errorStreak = failed && !READ_ONLY_TOOLS.has(event.toolName) ? errorStreak + 1 : 0;
     // [#6] A refused `git add -A` followed by a landed `git add file && git commit` is a finished
     // task, not a stopped one: a SUCCESSFUL finalization command resolves a refusal-class hard stop
@@ -840,9 +849,9 @@ export default function (pi: ExtensionAPI) {
     const prevSig = lastResultSig.get(key);
     if (prevSig !== undefined && prevSig !== sig) seen.delete(key); // repeat made progress → restart streak
     lastResultSig.set(key, sig);
-    if (failed && (event.toolName === "edit" || event.toolName === "write")) {
+    if (failed && MUTATION_TOOLS.has(event.toolName)) {
       failedMutationCalls.add(key);
-    } else if (!failed && (event.toolName === "edit" || event.toolName === "write")) {
+    } else if (!failed && MUTATION_TOOLS.has(event.toolName)) {
       trackedPathCache.delete(ctx.cwd);
       failedMutationCalls.clear();
       mutationSucceeded = true;
@@ -1065,8 +1074,7 @@ export default function (pi: ExtensionAPI) {
       !mutationSucceeded &&
       !ownershipSteerSent &&
       calls >= PRE_MUTATION_STEER &&
-      tool !== "edit" &&
-      tool !== "write" &&
+      !MUTATION_TOOLS.has(tool) &&
       !META_TOOLS.has(tool)
     ) {
       ownershipSteerSent = true;
@@ -1087,8 +1095,7 @@ export default function (pi: ExtensionAPI) {
       !mutationSucceeded &&
       ownershipSteerCall > 0 &&
       calls > ownershipSteerCall + PRE_MUTATION_GRACE_CALLS &&
-      tool !== "edit" &&
-      tool !== "write" &&
+      !MUTATION_TOOLS.has(tool) &&
       !META_TOOLS.has(tool) &&
       !GROUNDING_TOOLS.has(tool) &&
       !readOnlyNavigation &&
@@ -1119,8 +1126,7 @@ export default function (pi: ExtensionAPI) {
 
     if (
       mutationSucceeded &&
-      tool !== "edit" &&
-      tool !== "write" &&
+      !MUTATION_TOOLS.has(tool) &&
       !META_TOOLS.has(tool) &&
       !GROUNDING_TOOLS.has(tool) &&
       !readOnlyNavigation &&
@@ -1139,7 +1145,7 @@ export default function (pi: ExtensionAPI) {
     // (observed live: the gateway clamp truncated a `write`'s content mid-JSON, the model re-sent
     // the exact same truncated write again and again — silently rewriting the same incomplete
     // file, with nothing erroring). Keep the call's OWN count across the reset so the ladder fires.
-    if (tool === "edit" || tool === "write") {
+    if (MUTATION_TOOLS.has(tool)) {
       const key = callKey(tool, event.input);
       const n = (seen.get(key) ?? 0) + 1;
       seen.clear();
