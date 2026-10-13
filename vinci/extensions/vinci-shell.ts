@@ -5,7 +5,7 @@
  * chrome: a stateful composer border, honest connection state, mode/model/project orientation, and
  * the only continuous animation on screen while work is active.
  */
-import { basename } from "node:path";
+import { basename, isAbsolute, relative, sep } from "node:path";
 import {
   CustomEditor,
   type ExtensionAPI,
@@ -164,7 +164,10 @@ function formatModel(ctx: ExtensionContext): string {
 function formatProject(cwd: string, width: number): string {
   if (width < 100) return basename(cwd) || cwd;
   const home = process.env.HOME;
-  return home && cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
+  if (!home) return cwd;
+  const fromHome = relative(home, cwd);
+  if (fromHome === "") return "~";
+  return fromHome !== ".." && !fromHome.startsWith(`..${sep}`) && !isAbsolute(fromHome) ? `~/${fromHome}` : cwd;
 }
 
 function authFailed(errorMessage: string | undefined): boolean {

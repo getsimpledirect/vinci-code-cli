@@ -808,6 +808,8 @@ run_group scope-integration node "${ROOT}/vinci/test/scope-integration.mjs"
 # Mid-run steering amends the scope task; it never shrinks it to just the adjustment.
 run_group scope-amendment-integration node "${ROOT}/vinci/test/scope-amendment-integration.mjs"
 run_group shell-integration node "${ROOT}/vinci/test/shell-integration.mjs"
+run_group header-path-boundary node --test "${ROOT}/vinci/test/header-path-boundary.mjs"
+run_group shell-path-boundary node --test "${ROOT}/vinci/test/shell-path-boundary.mjs"
 # Keep the SSRF production-import lane registered in this canonical harness; the adjacent pin test
 # fails if this exact group is later dropped or silently redirected.
 run_group search-ssrf-registration node "${ROOT}/vinci/test/search-ssrf-registration.mjs"
@@ -895,6 +897,11 @@ run_group ui-scenarios node "${VITEST_CLI}" \
   --root "${ROOT}" --run \
   --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
   "vinci/test/ui/scenarios.test.mjs"
+
+run_group ui-fixture-lifecycle node "${VITEST_CLI}" \
+  --root "${ROOT}" --run \
+  --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
+  "vinci/test/ui/harness.test.mjs"
 
 run_group ui-crew-view node "${VITEST_CLI}" \
   --root "${ROOT}" --run \

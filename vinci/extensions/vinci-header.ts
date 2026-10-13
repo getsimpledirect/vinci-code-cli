@@ -8,7 +8,7 @@
 import { type ExtensionAPI, getAgentDir, type Theme } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, Image, type ImageTheme, truncateToWidth } from "@earendil-works/pi-tui";
 import { closeSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { getVinciUiState, setVinciConnection } from "./lib/ui-state.ts";
 import { VINCI_ROOT, VINCI_VERSION } from "./lib/product-identity.ts";
@@ -143,7 +143,7 @@ const LOGO_CELLS = 30; // width of the inline logo, in terminal cells
 
 export function shortPath(p: string, w: number): string {
   const home = process.env.HOME;
-  const s = home && p.startsWith(home) ? "~" + p.slice(home.length) : p;
+  const s = home && (p === home || p.startsWith(home + sep)) ? "~" + p.slice(home.length) : p;
   return s.length <= w ? s : "…" + s.slice(s.length - (w - 1));
 }
 
