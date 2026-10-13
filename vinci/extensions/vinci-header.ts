@@ -9,8 +9,11 @@ import { type ExtensionAPI, getAgentDir, type Theme } from "@earendil-works/pi-c
 import { getCapabilities, Image, type ImageTheme, truncateToWidth } from "@earendil-works/pi-tui";
 import { closeSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import { getVinciUiState, setVinciConnection } from "./lib/ui-state.ts";
+import { VINCI_ROOT, VINCI_VERSION } from "./lib/product-identity.ts";
+import { getVeroPresentation, vinciPlainPresentation, type VeroPose } from "./lib/vero-state.ts";
+import { createVeroImages, renderVeroHeader } from "./lib/vero-image.ts";
 import { VINCI_GATEWAY_BASE_URL, VINCI_PROD_GATEWAY_URL } from "./vinci-links.ts";
 
 // Both helpers below resolve the agent directory through the core's getAgentDir(). Restating it here
@@ -121,18 +124,17 @@ const RING = logomark();
 // the plain fallback for terminals that can't render the math block.
 const SERIF_WORDMARK = "\u{1D42F}\u{1D7CF}\u{1D427}\u{1D41C}\u{1D7CF}"; // 𝐯𝟏𝐧𝐜𝟏
 const PLAIN_WORDMARK = "v1nc1";
-const WORDMARK = process.env.VINCI_ASCII_WORDMARK === "1" ? PLAIN_WORDMARK : SERIF_WORDMARK;
+const WORDMARK = vinciPlainPresentation() || process.env.VINCI_ASCII_WORDMARK === "1" ? PLAIN_WORDMARK : SERIF_WORDMARK;
 
 // Vinci Code's OWN version — deliberately simple to start; bump it when we ship something worth
 // iterating on. (NOT the underlying Pi version, which is an internal detail.)
-const VINCI_VERSION = "0.0.54";
 
 // The REAL Vinci logo — the full lockup (maker's-mark + the actual serif "v1nc1" wordmark), cream on a
 // TRANSPARENT background (rendered from the official SVG), for terminals that draw images (Ghostty /
 // kitty / iTerm). Transparent = no square, blends on any theme. Loaded once; empty → braille fallback.
 let LOGO_B64 = "";
 try {
-  LOGO_B64 = readFileSync(fileURLToPath(new URL("../assets/vinci-logo-lockup.png", import.meta.url))).toString("base64");
+  LOGO_B64 = readFileSync(new URL("assets/vinci-logo-lockup.png", VINCI_ROOT)).toString("base64");
 } catch {
   /* asset missing → braille fallback */
 }
@@ -146,6 +148,10 @@ export function shortPath(p: string, w: number): string {
 }
 
 function colors(theme: Theme) {
+  if (vinciPlainPresentation()) {
+    const plain = (text: string) => text;
+    return { sage: plain, cream: plain, muted: plain, dim: plain, bold: plain };
+  }
   return {
     sage: (t: string) => theme.fg("accent", t),
     cream: (t: string) => theme.fg("mdHeading", t),
@@ -216,7 +222,21 @@ function infoLines(theme: Theme, modelName: string, cwd: string): string[] {
 }
 
 // Fallback header: the braille aperture mark beside the serif wordmark (no image support).
-function brailleHeader(theme: Theme, modelName: string, width: number, cwd: string): string[] {
+function heroVeroInfo(theme: Theme, modelName: string, width: number, cwd: string, images: Map<VeroPose, Image>): string[] {
+  const vero = getVeroPresentation();
+  const image = images.get(vero.pose === "pixel" ? "rich" : vero.pose);
+  const showImage = width >= 40 && !vinciPlainPresentation() && process.env.VINCI_ASCII_WORDMARK !== "1" && !!getCapabilities().images && !!image;
+  const lines = infoLines(theme, modelName, cwd);
+  lines[2] = PAD + colors(theme).muted(`Vero ${vero.label}: ${vero.nextAction}`);
+  return renderVeroHeader(["", ...lines.map((line) => truncateToWidth(line, showImage ? width - 8 : width, "")), ""], image, width).slice(1, -1);
+}
+
+function fitHeaderLine(line: string, width: number): string {
+  // Images and adjacent text are fitted before insertion; text truncation corrupts their payload.
+  return line.includes("\x1b_G") || line.includes("\x1b]1337;File=") ? line : truncateToWidth(line, width, "");
+}
+
+function brailleHeader(theme: Theme, modelName: string, width: number, cwd: string, images: Map<VeroPose, Image>): string[] {
   const { sage, cream, muted, dim, bold } = colors(theme);
   const GAP = "    ";
   const nameRow = 3; // vertical centre of the 8-row mark
@@ -225,17 +245,17 @@ function brailleHeader(theme: Theme, modelName: string, width: number, cwd: stri
   const wm = RING.map(
     (r, i) => PAD + cream(r) + GAP + (i === nameRow ? brandName : i === nameRow + 1 ? brandTag : ""),
   );
-  return ["", ...wm, "", ...infoLines(theme, modelName, cwd), ""].map((line) => truncateToWidth(line, width, ""));
+  return ["", ...wm, "", ...heroVeroInfo(theme, modelName, width, cwd, images), ""].map((line) => fitHeaderLine(line, width));
 }
 
 // Image header: the REAL Vinci logo (mark + serif wordmark) rendered inline (Ghostty/kitty/iTerm), with
 // the "code" + tagline as text beneath it. image.render() returns the graphics sequence + blank rows so
 // the TUI reserves height. The logo image already carries the wordmark, so no text wordmark here.
-function imageHeader(theme: Theme, image: Image, width: number, modelName: string, cwd: string): string[] {
+function imageHeader(theme: Theme, image: Image, width: number, modelName: string, cwd: string, images: Map<VeroPose, Image>): string[] {
   const { sage, muted, dim } = colors(theme);
   const codeTag = PAD + sage("code") + dim("   ·   ") + muted("Made, not generated.") + dim("   ·   v" + VINCI_VERSION);
-  return ["", ...image.render(width), "", codeTag, "", ...infoLines(theme, modelName, cwd), ""].map((line) =>
-    truncateToWidth(line, width, ""),
+  return ["", ...image.render(width), "", codeTag, "", ...heroVeroInfo(theme, modelName, width, cwd, images), ""].map((line) =>
+    fitHeaderLine(line, width),
   );
 }
 
@@ -245,14 +265,16 @@ function compactHeader(theme: Theme, modelName: string, width: number, cwd: stri
   const { sage, cream, muted, dim, bold } = colors(theme);
   const brand =
     PAD +
-    sage(bold(process.env.VINCI_ASCII_WORDMARK === "1" ? "*" : "✹")) +
+    sage(bold(vinciPlainPresentation() ? "" : process.env.VINCI_ASCII_WORDMARK === "1" ? "*" : "✹")) +
     "  " +
     cream(bold(WORDMARK)) +
     sage(" code") +
     dim("   ·   ") +
     muted("Made, not generated.") +
     dim("   ·   v" + VINCI_VERSION);
-  const context = PAD + cream(modelName) + dim("   ·   " + shortPath(cwd, Math.max(16, width - 30)));
+  const vero = getVeroPresentation();
+  const context = PAD + muted(`Vero ${vero.label}`) + dim("   ·   ") + cream(modelName) +
+    dim("   ·   " + shortPath(cwd, Math.max(16, width - 30)));
   const safety =
     PAD +
     connectionLabel(theme) +
@@ -276,10 +298,11 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Thinking is collapsed by default. Press Ctrl+T anytime to show or hide it.", "info");
     }
     ctx.ui.setHeader((_tui, theme) => {
+      const veroImages = createVeroImages();
       // Render the real logomark image where the terminal supports it (Ghostty/kitty/iTerm); otherwise
       // the braille aperture. VINCI_ASCII_WORDMARK=1 also forces the no-image path. Built per-header so
       // capability + theme are current.
-      const canImage = LOGO_B64 !== "" && process.env.VINCI_ASCII_WORDMARK !== "1" && !!getCapabilities().images;
+      const canImage = LOGO_B64 !== "" && !vinciPlainPresentation() && process.env.VINCI_ASCII_WORDMARK !== "1" && !!getCapabilities().images;
       const image = canImage
         ? new Image(
             LOGO_B64,
@@ -304,15 +327,21 @@ export default function (pi: ExtensionAPI) {
           if (conn === "signed-in" || conn === "signed-out") {
             setVinciConnection(hasCredentialsFresh() ? "signed-in" : "signed-out");
           }
+          if (vinciPlainPresentation()) {
+            return compactHeader(theme, modelName, width, ctx.cwd).map(stripVTControlCharacters);
+          }
           if (process.env.VINCI_HERO_HEADER !== "1") {
-            return compactHeader(theme, modelName, width, ctx.cwd);
+            const pose = getVeroPresentation().pose;
+            const showVero = width >= 40 && !vinciPlainPresentation() && process.env.VINCI_ASCII_WORDMARK !== "1" && !!getCapabilities().images && veroImages.has(pose);
+            return renderVeroHeader(compactHeader(theme, modelName, showVero ? width - 8 : width, ctx.cwd), veroImages.get(pose), width);
           }
           return image
-            ? imageHeader(theme, image, width, modelName, ctx.cwd)
-            : brailleHeader(theme, modelName, width, ctx.cwd);
+            ? imageHeader(theme, image, width, modelName, ctx.cwd, veroImages)
+            : brailleHeader(theme, modelName, width, ctx.cwd, veroImages);
         },
         invalidate() {
           image?.invalidate();
+          for (const veroImage of veroImages.values()) veroImage.invalidate();
         },
       };
     });

@@ -14,7 +14,7 @@
   3 model calls · 300 in / 150 out · 0% cached · ~$0.0000 estimated · <time> active
   Billed by faux, not Vinci.
 
-╭ ✹ Ask Vinci ──────────────────────────────────────────────────── ● connected ╮
+╭ ✹ Ask Vinci · DONE: Read the receipt. ────────────────────────── ● connected ╮
 │                                                                              │
 │›                                                                             │
 │                                                                              │

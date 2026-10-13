@@ -7,6 +7,7 @@ import { stripVTControlCharacters } from "node:util";
 import { TUI, visibleWidth } from "@earendil-works/pi-tui";
 import xterm from "@xterm/headless";
 import { createJiti } from "jiti/static";
+import { parseLauncherExtensions } from "./launcher-extensions.mjs";
 
 const source = fileURLToPath(new URL("../extensions/vinci-shell.ts", import.meta.url));
 const stateSource = fileURLToPath(new URL("../extensions/lib/ui-state.ts", import.meta.url));
@@ -42,9 +43,7 @@ check("failed work visibly adjusts approach", shell.vinciActivityAfterTool("edit
 
 const launcher = await readFile(launcherSource, "utf8");
 const identity = JSON.parse(await readFile(identitySource, "utf8"));
-const launcherExtensions = [...launcher.matchAll(/--extension "\$\{VINCI\}\/extensions\/([^"]+)"/g)].map(
-  (match) => match[1],
-);
+const launcherExtensions = parseLauncherExtensions(launcher);
 const launcherOrder = ["vinci-guard.ts", "vinci-loopbreak.ts", "vinci-shell.ts", "vinci-completion-receipt.ts"].map(
   (extension) => launcherExtensions.indexOf(extension),
 );

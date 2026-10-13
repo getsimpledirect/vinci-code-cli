@@ -20,6 +20,7 @@ import {
   getVinciUiState,
   resetShellUiState,
   setVinciActivity,
+  setVinciBlocker,
   setVinciConnection,
   setVinciContinuationPending,
   setVinciWorking,
@@ -28,6 +29,7 @@ import {
   type VinciActivityState,
 } from "./lib/ui-state.ts";
 import { containsVerificationCommand } from "./vinci-verification.ts";
+import { getVeroPresentation, vinciReducedMotion } from "./lib/vero-state.ts";
 
 export const VINCI_PULSE_FRAMES = ["·", "•", "●", "•"] as const;
 const PULSE_INTERVAL_MS = 260;
@@ -222,7 +224,7 @@ export default function (pi: ExtensionAPI) {
     stopAnimation();
     // Print mode has no TUI to animate; an interval here only pins the event
     // loop open after the answer is written.
-    if (!activeTui) return;
+    if (!activeTui || vinciReducedMotion()) return;
     frame = 0;
     animation = setInterval(() => {
       frame = (frame + 1) % VINCI_PULSE_FRAMES.length;
@@ -281,13 +283,15 @@ export default function (pi: ExtensionAPI) {
                   ? theme.fg("warning", " /login ")
                   : theme.fg("dim", " ◌ checking ");
         const pulse = frame === 2 ? theme.bold(VINCI_PULSE_FRAMES[frame]) : VINCI_PULSE_FRAMES[frame];
+        const vero = getVeroPresentation();
         const topLeft = state.working
           ? theme.fg("accent", ` ${pulse} `) +
             theme.fg("mdHeading", ` ${workingLabel} `) +
             theme.fg("dim", `· ${elapsed} `)
           : state.mode === "plan"
             ? theme.fg("warning", theme.bold(" ◇ Plan with Vinci "))
-            : theme.fg("accent", theme.bold(" ✹ Ask Vinci "));
+            : theme.fg("accent", theme.bold(" ✹ Ask Vinci ")) +
+              (vero.pose === "pixel" ? "" : theme.fg("muted", `· ${vero.label}: ${vero.nextAction} `));
         // Reserve the corners and minimum border gap first, then fit complete status fields before
         // the project. Widening to a full cwd must never steal cells from numeric context metrics.
         const footerBudget = Math.max(0, width - 2 - 3);
@@ -347,6 +351,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
+    setVinciBlocker(undefined);
     verificationToolCallIds.clear();
     clearContinuationWatchdog();
     const continuing = getVinciUiState().continuationPending;
@@ -409,6 +414,7 @@ export default function (pi: ExtensionAPI) {
     const message = event.message;
     if (message.role !== "assistant") return;
     if (message.stopReason === "error") {
+      setVinciBlocker(message.errorMessage || "The provider could not complete this activity.");
       if (authFailed(message.errorMessage)) setVinciConnection("reconnect");
       return;
     }
