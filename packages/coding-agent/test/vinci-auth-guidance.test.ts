@@ -9,7 +9,7 @@ import { ENV_AGENT_DIR, getDocsPath } from "../src/config.ts";
 import type * as AuthGuidance from "../src/core/auth-guidance.ts";
 
 const managedMessage =
-	"You're not connected to Vinci yet. Type /login and authorize in your browser — it takes a few seconds, no key to paste.";
+	"Vero can't connect to Vinci yet. Type /login, choose Vinci, and complete sign-in in your browser.";
 const providers = [
 	{ id: "anthropic", name: "Anthropic", method: "Use an API key", env: "ANTHROPIC_API_KEY" },
 	{ id: "openai", name: "OpenAI", method: "Use an API key", env: "OPENAI_API_KEY" },
@@ -51,8 +51,12 @@ describe("Vinci selected-provider auth guidance", () => {
 		const guidance = await loadGuidance("1");
 		expect(guidance.formatNoApiKeyFoundMessage("vinci")).toBe(managedMessage);
 		expect(guidance.getProviderLoginHelp()).toBe(managedMessage);
-		expect(guidance.formatNoModelsAvailableMessage()).toBe(managedMessage);
-		expect(guidance.formatNoModelSelectedMessage()).toBe(managedMessage);
+		expect(guidance.formatNoModelsAvailableMessage()).toBe(
+			"Vero can't start yet: no models are available. Use /login to check the account or provider, then /model to check its available models.",
+		);
+		expect(guidance.formatNoModelSelectedMessage()).toBe(
+			"Vero can't start yet: no model is selected. Use /model to choose one; if sign-in is needed, use /login.",
+		);
 	});
 
 	test.each(["custom-provider", "unknown", ""])("does not invent authentication for %j", async (provider) => {

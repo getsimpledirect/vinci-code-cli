@@ -18,9 +18,9 @@
  * Additive: pure extension, no core patch.
  */
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatDuration } from "./lib/format-duration.ts";
 import { shortPath } from "./vinci-header.ts";
@@ -34,7 +34,7 @@ import {
   vinciMaskSecrets,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
-import { Input, matchesKey } from "@earendil-works/pi-tui";
+import { Input, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   applyCrewPatch,
@@ -51,6 +51,7 @@ import {
   sweepStaleTempCopies,
 } from "./lib/crew-worktree.ts";
 import { setVinciCrewStatus } from "./lib/crew-status.ts";
+import { vinciPlainPresentation, vinciReducedMotion } from "./lib/vero-state.ts";
 import { VINCI_CREW_HELPER_ENV, scanVinciScopeDriftEntries } from "./lib/scope-drift.ts";
 import {
   getVinciVerificationState,
@@ -124,6 +125,7 @@ interface AgentResult {
   // a different hat.
   omitted: HandoffOmission;
   reason?: string;
+  cancelledAt?: number;
 }
 type CrewPatchMetadata = Pick<CrewPatch, "kind" | "paths" | "deletedPaths" | "baselineFingerprints" | "ignorePatterns">;
 interface Helper {
@@ -159,6 +161,8 @@ interface Helper {
   childSession?: string;
   /** The session ended this helper before it produced any patch (#194) — its task was NOT done. */
   stoppedUnfinished?: boolean;
+  /** Observed final assistant turn with stopReason "aborted"; not a remote-process termination claim. */
+  cancelledAt?: number;
   /**
    * Continuing an earlier agent: fork ITS conversation (`--fork`) into a FRESH worktree seeded from
    * the project as it stands now. Forking preserves the history while rewriting the session cwd to
@@ -583,6 +587,7 @@ function restoredCrewPatch(h: Helper): CrewPatch | undefined {
 }
 
 function normalizeRestoredHonesty(h: Helper): void {
+  if (typeof h.cancelledAt !== "number" || !Number.isFinite(h.cancelledAt) || h.cancelledAt <= 0) h.cancelledAt = undefined;
   const rawAttestation: unknown = h.attestation;
   const rawDeviations: unknown = h.deviations;
   const rawDeferred: unknown = h.deferred;
@@ -782,6 +787,7 @@ function restoreHelpers(pi: ExtensionAPI, ctx: ExtensionContext): void {
         }
       }
       restored.status = restored.diff?.trim() ? "waiting" : "blocked";
+      if (!restored.diff?.trim()) restored.stoppedUnfinished = true;
       finalizeHelper(
         pi,
         restored,
@@ -889,19 +895,33 @@ export function sanitizeLine(text: string): string {
   return sanitizeViewerText(text).replace(/\s+/g, " ").trim();
 }
 
-function statusGlyph(status: Status): string {
-  if (status === "done" || status === "integrated") return "✓";
-  if (status === "working" || status === "verifying" || status === "reviewing") return "◐";
-  if (status === "queued") return "○";
-  if (status === "failed") return "✗";
+function helperProofCurrent(h: Helper): boolean {
+  const proof = h.verification;
+  return Boolean(typeof proof?.command === "string" && proof.command.trim() && Number.isFinite(proof.mutationRevision) &&
+    proof.mutationRevision === proof.verifiedRevision);
+}
+
+function verifiedCompletion(h: Helper): boolean {
+  return !h.cancelledAt && helperProofCurrent(h) &&
+    ((h.status === "integrated" && !h.reason) || (h.status === "done" && !h.applied));
+}
+
+function statusGlyph(h: Helper): string {
+  if (vinciPlainPresentation()) return h.status === "failed" ? "x" : verifiedCompletion(h) ? "+" : "-";
+  if (verifiedCompletion(h)) return "✓";
+  if (h.cancelledAt) return "!";
+  if (h.status === "working" || h.status === "verifying" || h.status === "reviewing") return "◐";
+  if (h.status === "queued" || h.status === "done" || h.status === "integrated") return "○";
+  if (h.status === "failed") return "✗";
   return "!";
 }
 
-function colorStatus(theme: Theme, status: Status, text: string): string {
-  if (status === "done" || status === "integrated") return theme.fg("success", text);
-  if (status === "working" || status === "verifying" || status === "reviewing") return theme.fg("accent", text);
-  if (status === "queued") return theme.fg("dim", text);
-  if (status === "failed") return theme.fg("error", text);
+function colorStatus(theme: Theme, h: Helper, text: string): string {
+  if (vinciPlainPresentation()) return text;
+  if (verifiedCompletion(h)) return theme.fg("success", text);
+  if (h.status === "working" || h.status === "verifying" || h.status === "reviewing") return theme.fg("accent", text);
+  if (h.status === "queued") return theme.fg("dim", text);
+  if (h.status === "failed") return theme.fg("error", text);
   return theme.fg("warning", text);
 }
 
@@ -909,12 +929,15 @@ function colorStatus(theme: Theme, status: Status, text: string): string {
 // adjacent `reviewing` is the AUTOMATED check still running. Two statuses, opposite actors, same word
 // — a user reasonably read the row that needed them as one where a machine was still busy. Say who
 // is being waited on, and keep "review" for the machine's own step out of the user's vocabulary.
-function statusLabel(status: Status, activity?: string): string {
-  if (status === "waiting") return "needs your OK";
-  if (status === "working" && activity) return activity;
-  if (status === "reviewing") return "double-checking…";
-  if (status === "working" || status === "verifying") return `${status}…`;
-  return status;
+function statusLabel(h: Helper): string {
+  if (h.cancelledAt && isTerminalStatus(h.status) && !h.applied) return "cancelled";
+  if (h.status === "waiting") return "waiting approval";
+  if (verifiedCompletion(h)) return "verified";
+  if (h.status === "done" || h.status === "integrated") return h.applied ? "applied-unverified" : "completed-unverified";
+  if (h.status === "working") return "working";
+  if (h.status === "verifying") return "checking";
+  if (h.status === "reviewing") return "reviewing";
+  return h.status;
 }
 
 // An agent row shows plain-language task + elapsed + a calm status word. NO token telemetry — the
@@ -954,9 +977,9 @@ function failedRowIsFading(h: Helper): boolean {
 // The visible, most-recent-first-capped crew (what the ↑↓ cursor moves through).
 const activeHelpers = () => helpers.filter(visible);
 
-// `● main` + the live crew. Plain task, elapsed, token telemetry, calm status word; Vinci palette.
+// One Vero identity around the live crew, with elapsed time and explicit status words.
 // When navActive, a `›` cursor marks the selected helper.
-function renderTree(theme: Theme): string[] {
+function renderTree(theme: Theme, width: number): string[] {
   const active = activeHelpers();
   if (!active.length) {
     navActive = false;
@@ -965,7 +988,7 @@ function renderTree(theme: Theme): string[] {
   }
   if (navIdx > active.length - 1) navIdx = active.length - 1;
   const dim = (s: string) => theme.fg("dim", s);
-  const lines = [theme.fg("accent", theme.bold("● main")) + dim(" — you're here")];
+  const lines = [theme.fg("accent", theme.bold("Vero · Crew")) + dim(" — you're here")];
   const MAX = 6;
   const shown = active.slice(-MAX);
   const base = active.length - shown.length;
@@ -974,21 +997,28 @@ function renderTree(theme: Theme): string[] {
   shown.forEach((h, i) => {
     const sel = navActive && base + i === navIdx;
     const cur = sel ? theme.fg("accent", "› ") : "  ";
-    const name = clip(sanitizeLine(h.name), 22);
+    const name = truncateToWidth(sanitizeLine(h.name), 22);
     const fading = failedRowIsFading(h);
-    const rowColor = (text: string) => (fading ? dim(text) : colorStatus(theme, h.status, text));
+    const rowColor = (text: string) => (fading ? dim(text) : colorStatus(theme, h, text));
     if (h.status === "waiting" || h.status === "blocked") anyReady = true;
-    lines.push(
-      cur +
-        rowColor(`${statusGlyph(h.status)} `) +
-        (fading ? dim(name) : name) +
-        dim(agentMetrics(h)) +
-        rowColor(` · ${statusLabel(h.status, h.activity === undefined ? undefined : sanitizeLine(h.activity))}`),
-    );
+    const label = statusLabel(h);
+    const prefix = `${cur}${rowColor(`${statusGlyph(h)} `)}`;
+    const activity = h.status === "working" && h.activity ? ` · ${sanitizeLine(h.activity)}` : "";
+    const activityWidth = Math.max(0, width - visibleWidth(prefix) - visibleWidth(agentMetrics(h)) - label.length - name.length - 3);
+    const suffix = `${dim(agentMetrics(h))}${rowColor(` · ${label}`)}${dim(truncateToWidth(activity, activityWidth))}`;
+    const nameWidth = width - visibleWidth(prefix) - visibleWidth(suffix);
+    const priority = `${prefix}${rowColor(label)}`;
+    const remainder = width - visibleWidth(priority);
+    lines.push(nameWidth > 0
+      ? `${prefix}${fading ? dim(truncateToWidth(name, nameWidth)) : truncateToWidth(name, nameWidth)}${suffix}`
+      : `${priority}${remainder > 0 ? dim(truncateToWidth(` · ${name}`, remainder)) : ""}`);
   });
   const overlayActive = uiRef?.ui.isOverlayActive?.() ?? false; // [vinci] Never advertise roster navigation through a modal.
-  lines.push(dim(navActive && !overlayActive ? "  ↑↓ move · enter open · esc back" : anyReady ? "  ↓ browse · /agents to apply" : "  ↓ to open an agent"));
-  return lines;
+  const hint = width < 40
+    ? navActive && !overlayActive ? "↑↓ · Enter · Esc" : anyReady ? "↓ · /agents to apply" : "↓ opens agent"
+    : navActive && !overlayActive ? "  ↑↓ move · enter open · esc back" : anyReady ? "  ↓ browse · /agents to apply" : "  ↓ to open an agent";
+  lines.push(dim(hint));
+  return lines.map((line) => truncateToWidth(vinciPlainPresentation() ? stripAnsiSequences(line) : line, width));
 }
 
 export type TranscriptKind = "user" | "toolCall" | "toolResult" | "toolError" | "narration";
@@ -1095,7 +1125,7 @@ function nestedText(content: unknown): string[] {
 }
 
 // Render a helper's captured message history into readable lines for the viewer.
-type TranscriptMessage = { role?: string; content?: unknown; isError?: boolean };
+type TranscriptMessage = { role?: string; content?: unknown; isError?: boolean; stopReason?: string; errorMessage?: string };
 
 function formatTranscript(messages: TranscriptMessage[]): string[] {
   const out: string[] = [];
@@ -1141,6 +1171,9 @@ function lastAssistantText(messages: TranscriptMessage[]): string {
 }
 
 function captureHelperHandoff(h: Helper, messages: TranscriptMessage[] | undefined, assistantText?: string): void {
+  const last = messages?.findLast((message) => message.role === "assistant");
+  if (last?.stopReason === "aborted") h.cancelledAt ??= Date.now();
+  if (last?.stopReason === "error") h.error = sanitizeViewerText(last.errorMessage || "The child model turn failed.");
   const handoff = parseHandoffAttestation(assistantText ?? lastAssistantText(messages ?? []));
   h.summary = handoff.summary;
   h.deviations = handoff.deviations;
@@ -1179,6 +1212,8 @@ export function viewerTranscriptLines(
     | "attestation"
     | "omitted"
     | "scopeDrift"
+    | "reason"
+    | "cancelledAt"
   >,
 ): string[] {
   const markedPartial = h.livePartial?.map((line, index) => markTranscriptLine(h.livePartialKinds?.[index], line)) ?? [];
@@ -1187,8 +1222,11 @@ export function viewerTranscriptLines(
       ? [...(h.liveTranscript ?? []), ...markedPartial]
       : h.transcript?.length
         ? h.transcript
-        : [h.summary || "Working…"];
-  return capLiveTranscript(sanitizeViewerText([...rawLines, ...honestyViewerLines(h)].join("\n")).split("\n"));
+        : [h.summary || (isTerminalStatus(h.status) ? "No transcript captured." : "Working…")];
+  const retention = isTerminalStatus(h.status)
+    ? [...(h.cancelledAt ? ["", "The child turn was cancelled. Saved work is not running."] : []), ...(h.reason ? ["", h.reason] : [])]
+    : [];
+  return capLiveTranscript(sanitizeViewerText([...rawLines, ...retention, ...honestyViewerLines(h)].join("\n")).split("\n"));
 }
 
 /**
@@ -1224,7 +1262,7 @@ function honestyViewerLines(
 
 export function renderTranscriptLine(theme: Theme, line: string | undefined, width: number): string {
   const { kind, text: fullText } = splitTranscriptLine(line);
-  const text = fullText.length > width ? `${fullText.slice(0, Math.max(0, width - 1))}…` : fullText;
+  const text = truncateToWidth(fullText, width);
   if (kind === "user") return theme.fg("muted", text);
   if (kind === "toolCall") return theme.fg("accent", text);
   if (kind === "toolResult") return theme.fg("dim", text);
@@ -1447,7 +1485,18 @@ async function openHelper(ctx: ExtensionContext, h: Helper): Promise<void> {
       // conversation. It is the first thing to go on a short terminal — the way out and the agent's
       // own work matter more than the framing.
       const showBrand = () => tui.terminal.rows >= 12;
-      const viewerChrome = () => 2 + (showBrand() ? 2 : 0) + (showTask() ? 1 : 0) + (showCompose() ? 4 : 0);
+      const layout = () => {
+        const narrow = tui.terminal.columns < 60 && tui.terminal.rows >= 4;
+        let brand = showBrand();
+        let task = showTask();
+        let compose = showCompose();
+        const chrome = () => (narrow ? 3 : 2) + (brand ? 2 : 0) + (task ? 1 : 0) + (compose ? 4 : 0);
+        if (chrome() >= tui.terminal.rows) brand = false;
+        if (chrome() >= tui.terminal.rows) task = false;
+        if (chrome() >= tui.terminal.rows) compose = false;
+        return { narrow, brand, task, compose, chrome: chrome() };
+      };
+      const viewerChrome = () => layout().chrome;
       const transcriptHeight = () => Math.max(1, tui.terminal.rows - viewerChrome());
       const maxOff = () => Math.max(0, lines().length - transcriptHeight());
       const paint = () => {
@@ -1535,17 +1584,20 @@ async function openHelper(ctx: ExtensionContext, h: Helper): Promise<void> {
           if (strippedInput !== input.getValue()) input.setValue(strippedInput);
           const height = transcriptHeight();
           if (follow) off = Math.max(0, currentLines.length - height);
-          const w = Math.max(20, width - 4);
-          const safeActivity = activeHelper.activity === undefined ? undefined : sanitizeLine(activeHelper.activity);
+          const w = Math.max(1, width - 4);
+          const chrome = layout();
           const safeStatus = sanitizeViewerText(
-            `${statusGlyph(activeHelper.status)} ${statusLabel(activeHelper.status, safeActivity)}`,
+            `${statusGlyph(activeHelper)} ${statusLabel(activeHelper)}`,
           );
           const safeMetrics = sanitizeViewerText(agentMetrics(activeHelper));
           const maxNameWidth = Math.max(1, w - safeStatus.length - safeMetrics.length - 11);
           const safeName = clip(sanitizeLine(activeHelper.name), maxNameWidth);
           const safeTask = sanitizeLine(activeHelper.task);
-          const status = colorStatus(theme, activeHelper.status, safeStatus);
+          const status = colorStatus(theme, activeHelper, safeStatus);
           const head = `${theme.fg("accent", theme.bold(`  Agent · ${safeName}`))}  ${status}${theme.fg("dim", safeMetrics)}`;
+          const heads = chrome.narrow
+            ? [theme.fg("accent", theme.bold(`Agent · ${sanitizeLine(activeHelper.name)}`)), colorStatus(theme, activeHelper, statusLabel(activeHelper))]
+            : [head];
           const task = `  ${theme.fg("muted", "Task:")} ${clip(safeTask, Math.max(1, w - 6))}`;
           const body = currentLines.slice(off, off + height).map((line) => {
             return `  ${renderTranscriptLine(theme, line, w)}`;
@@ -1558,7 +1610,7 @@ async function openHelper(ctx: ExtensionContext, h: Helper): Promise<void> {
           const fullFoot = `  ${scrollHint}${fullSwitchHint}Esc to close`;
           const compactFoot = `  ${compactSwitchHint}Esc to close`;
           const foot = theme.fg("muted", fullFoot.length <= width ? fullFoot : compactFoot.length <= width ? compactFoot : "  Esc to close");
-          const compose = showCompose()
+          const compose = chrome.compose
             ? [
                 "",
                 theme.fg("muted", "  Message this agent:"),
@@ -1569,10 +1621,11 @@ async function openHelper(ctx: ExtensionContext, h: Helper): Promise<void> {
           // The tagline is the first thing to drop on a narrow terminal — a half-truncated sentence
           // ("…not the main c") reads worse than no sentence at all.
           const brandNote = width >= 72 ? theme.fg("dim", "   ·   you're inside an agent, not the main chat") : "";
-          const brand = showBrand()
-            ? [`${theme.fg("accent", theme.bold("  ✹  Vinci"))}${theme.fg("accent", " code")}${brandNote}`, ""]
+          const brand = chrome.brand
+            ? [`${theme.fg("accent", theme.bold("  Vero · Crew"))}${brandNote}`, ""]
             : [];
-          return [...brand, head, ...(showTask() ? [task] : []), ...body, ...compose, foot];
+          return [...brand, ...heads, ...(chrome.task ? [task] : []), ...body, ...compose, foot].map((line) =>
+            truncateToWidth(vinciPlainPresentation() ? stripAnsiSequences(line) : line, width));
         },
         invalidate: () => input.invalidate(),
         handleInput: (data: string) => {
@@ -1727,13 +1780,15 @@ function update(): void {
   }
   try {
     const ui = uiRef?.ui;
-    const lines = ui ? renderTree(ui.theme) : [];
-    ui?.setWidget?.("vinci-crew", lines.length ? lines : undefined, { placement: "belowEditor" });
+    ui?.setWidget?.("vinci-crew", active.length ? (_tui, theme) => ({
+      render: (width) => renderTree(theme, width),
+      invalidate: () => {},
+    }) : undefined, { placement: "belowEditor" });
   } catch {
     /* session may be gone (e.g. switched/torn down) */
   }
   // A 1s heartbeat only while something is actively working, so elapsed ticks and the strip feels live.
-  const working = helpers.some((h) => h.status === "working" || h.status === "verifying" || h.status === "reviewing");
+  const working = !vinciReducedMotion() && helpers.some((h) => h.status === "working" || h.status === "verifying" || h.status === "reviewing");
   if (working && !tick) tick = setInterval(update, 1000);
   else if (!working && tick) {
     clearInterval(tick);
@@ -1852,6 +1907,7 @@ export function buildAgentResult(
     | "attestation"
     | "omitted"
     | "scopeDrift"
+    | "cancelledAt"
   >,
   patch?: Pick<CrewPatch, "paths">,
 ): AgentResult {
@@ -1878,6 +1934,7 @@ export function buildAgentResult(
     attestation: h.attestation === "attested" ? "attested" : "missing",
     omitted: h.attestation === "attested" ? { ...NO_OMISSION, ...h.omitted } : NO_OMISSION,
     ...(reason ? { reason } : {}),
+    ...(h.cancelledAt ? { cancelledAt: h.cancelledAt } : {}),
   };
 }
 
@@ -2015,10 +2072,15 @@ function formatAgentResult(result: AgentResult): string {
     attestation: result.attestation ?? "missing",
     omitted: { ...NO_OMISSION, ...result.omitted },
     ...(result.reason ? { reason: sanitizeLine(result.reason) } : {}),
+    ...(result.cancelledAt ? { cancelledAt: result.cancelledAt } : {}),
   };
   const files = safeResult.filesChanged.join(", ");
   const approvalRequired = safeResult.status === "waiting" || (safeResult.status === "blocked" && safeResult.filesChanged.length > 0);
-  const guidance = approvalRequired
+  const guidance = safeResult.cancelledAt
+    ? `The child turn was cancelled and its task did not finish. ${files ? `Partial work is saved for these files: ${files}. Ask the user for fresh explicit approval before calling use_agent_work with agent_id ${safeResult.agentId} and user_approved true.` : "No file changes were applied."} Do not report that this work kept running after cancellation.`
+    : safeResult.status === "failed" || safeResult.status === "blocked"
+      ? `The agent did not finish its task. ${safeResult.reason ?? "Inspect the saved result before deciding how to retry."} Do not report this task as complete.`
+    : approvalRequired
     ? `The agent finished and its work is saved. Files affected: ${files}. Use use_agent_work with agent_id ${safeResult.agentId} to take this work into the project. If the tool says the work affects sensitive project setup, ask the user in plain language, then call it again with user_approved set to true. If it says files changed after the agent started, tell the user which files changed and ask how to resolve them before retrying. DO NOT redo this work.`
     : safeResult.status === "done" && safeResult.filesChanged.length === 0
       ? "The agent finished. It made no file changes."
@@ -2071,7 +2133,11 @@ export function finalizeHelper(
       try {
         const safeName = sanitizeLine(h.name);
         const safeReason = sanitizeLine(h.reason ?? h.error ?? "unknown");
-        if (h.status === "integrated" || h.status === "done" || h.status === "waiting") {
+        if (h.cancelledAt) {
+          ui.notify(`Agent "${safeName}"'s turn was cancelled. ${h.diff?.trim()
+            ? "Its partial work is saved for review; nothing was applied."
+            : "It did not finish the task."}`, "warning");
+        } else if (h.status === "integrated" || h.status === "done" || h.status === "waiting") {
           const notification =
             h.status === "integrated"
               ? "Its changes were checked and added to your project automatically."
@@ -2139,6 +2205,22 @@ export function finalizeHelper(
 }
 
 async function qualifyAndIntegrate(pi: ExtensionAPI, ctx: ExtensionContext, h: Helper, patch: CrewPatch): Promise<void> {
+  if (h.cancelledAt) {
+    if (patch.diff.trim()) savePatch(ctx, h, patch);
+    else h.stoppedUnfinished = true;
+    setStatus(pi, h, patch.diff.trim() ? "waiting" : "blocked",
+      "The child turn reported cancellation; any saved work is retained for review and was not applied.");
+    return;
+  }
+  if (h.error) {
+    if (patch.diff.trim()) savePatch(ctx, h, patch);
+    else h.stoppedUnfinished = true;
+    setStatus(pi, h, patch.diff.trim() ? "waiting" : "failed",
+      `The child model turn failed (${h.error}). ${patch.diff.trim()
+        ? "Its partial work is saved for review; nothing was applied."
+        : "Retry the unfinished task after resolving this error."}`);
+    return;
+  }
   if (!patch.diff.trim()) {
     setStatus(pi, h, "done");
     return;
@@ -2513,6 +2595,38 @@ function applyDiff(cwd: string, diff: string): { ok: boolean; msg: string } {
   } catch (e) {
     return { ok: false, msg: e instanceof Error ? e.message.split("\n")[0] : String(e) };
   }
+}
+
+// Consent for a known conflict covers the files as shown at that decision, not future edits to
+// the same paths. Capture bytes, path type, permissions and Git revision without changing them.
+function approvalFileState(cwd: string, paths: readonly string[]): { revision?: string; snapshot: string } {
+  let root = resolve(cwd);
+  let gitRoot: string | undefined;
+  try {
+    gitRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    // A project without Git still has the exact file-state binding below.
+  }
+  if (gitRoot) root = gitRoot;
+  const revision = gitRoot ? execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"],
+  }).trim() : undefined;
+  const files = paths.map((path) => {
+    const target = resolve(root, path);
+    const fromRoot = relative(root, target);
+    if (!fromRoot || fromRoot === ".." || fromRoot.startsWith(`..${sep}`)) throw new Error("Unsafe saved agent path.");
+    try {
+      const stat = lstatSync(target);
+      const bytes = stat.isSymbolicLink() ? readlinkSync(target) : stat.isFile() ? readFileSync(target) : "non-file";
+      return [path, stat.mode, createHash("sha256").update(bytes).digest("hex")];
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return [path, "missing"];
+      throw error;
+    }
+  });
+  return { revision, snapshot: JSON.stringify({ root, revision, files }) };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -2991,6 +3105,16 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      if (h.cancelledAt && params.user_approved !== true) {
+        return {
+          content: [{ type: "text", text:
+            `Agent "${safeName}"'s turn was cancelled. Its partial work needs fresh explicit user approval before it can be applied. ` +
+            "Ask the user whether to use these saved changes, then call use_agent_work with user_approved true only if they agree.",
+          }],
+          details: { tool: "use_agent_work", agentId: h.id, applied: false, userApprovalRequired: true },
+        };
+      }
+
       const savedPatch = restoredCrewPatch(h);
       if (!savedPatch) {
         return {
@@ -3173,7 +3297,7 @@ export default function (pi: ExtensionAPI) {
     // to spot — buried mid-list behind finished and failed ones. Lead with what it needs, then the
     // name, then as much of the task as fits.
     const label = (h: Helper) =>
-      `${statusGlyph(h.status)} ${statusLabel(h.status)} · ${sanitizeLine(h.name)} — ${sanitizeLine(h.task).slice(0, 48)}${h.task.length > 48 ? "…" : ""}`;
+      `${statusGlyph(h)} ${statusLabel(h)} · ${sanitizeLine(h.name)} — ${sanitizeLine(h.task).slice(0, 48)}${h.task.length > 48 ? "…" : ""}`;
     // Sort by what the user has to do about it: anything awaiting them first, then still-running,
     // then everything already settled.
     const attention = (h: Helper): number =>
@@ -3198,7 +3322,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     // Waiting helpers require explicit approval; integrated and clean helpers are view-only.
-    const canApply = h.status === "waiting" && !!h.diff?.trim() && !h.applied;
+    const canApply = h.status === "waiting" && !!h.diff?.trim() && !h.applied && !h.dismissedAt;
     // An agent that went wrong shouldn't be something you live with. Anything finished can be cleared
     // off the strip by hand, whatever state it ended in.
     const canRemove = isTerminalStatus(h.status) && !h.dismissedAt;
@@ -3208,7 +3332,7 @@ export default function (pi: ExtensionAPI) {
       ...(canRemove ? ["Remove it from the list"] : []),
       "Close",
     ];
-    const action = await ctx.ui.select(`"${sanitizeLine(h.name)}" — ${h.status}`, actions);
+    const action = await ctx.ui.select(`"${sanitizeLine(h.name)}" — ${statusLabel(h)}`, actions);
     if (!action || action === "Close") return;
     if (action === "Remove it from the list") {
       h.dismissedAt = Date.now();
@@ -3228,11 +3352,37 @@ export default function (pi: ExtensionAPI) {
     }
     // Apply
     const diff = h.diff ?? "";
+    const diffPath = h.diffPath;
+    const metadata = JSON.stringify(h.patchMetadata);
+    const paths = [...new Set([...(restoredCrewPatch(h)?.paths ?? h.patchPaths ?? []), ...derivePatchPaths(diff)])];
+    const approvalSession = ctx.sessionManager;
+    const proposalCurrent = () => helpers.includes(h) && h.status === "waiting" && !h.applied && !h.dismissedAt &&
+      h.diff === diff && h.diffPath === diffPath && JSON.stringify(h.patchMetadata) === metadata &&
+      (!diffPath || readFileSync(diffPath, "utf8") === diff) && ctx.sessionManager === approvalSession;
+    const refuseApproval = () => ctx.ui.notify(
+      `Agent "${sanitizeLine(h.name)}"'s work or files changed during approval. Nothing was applied. Review the current work and approve it again.`,
+      "warning",
+    );
+    let previewFiles: ReturnType<typeof approvalFileState>;
+    try {
+      if (!proposalCurrent()) return refuseApproval();
+      previewFiles = approvalFileState(ctx.cwd, paths);
+    } catch {
+      return refuseApproval();
+    }
     const masked = vinciMaskSecrets(diff);
     const preview = masked.length > 1600 ? `${masked.slice(0, 1600)}\n… (${diff.split("\n").length} lines total)` : masked;
     const ok = await ctx.ui.confirm(`Apply "${sanitizeLine(h.name)}"'s changes?`, `${preview}\n\nApply this to your project?`);
     if (!ok) return;
     const savedPatch = restoredCrewPatch(h);
+    let approvedFiles: ReturnType<typeof approvalFileState>;
+    try {
+      if (!proposalCurrent()) return refuseApproval();
+      approvedFiles = approvalFileState(ctx.cwd, paths);
+      if (approvedFiles.revision !== previewFiles.revision) return refuseApproval();
+    } catch {
+      return refuseApproval();
+    }
     let safety: "verified" | "changed" | "unknown" = "unknown";
     let changedPaths: string[] = [];
     if (savedPatch) {
@@ -3260,6 +3410,11 @@ export default function (pi: ExtensionAPI) {
         "This saved agent is from before Vinci recorded file baselines, so Vinci cannot check whether your files changed after it ran. Apply anyway?",
       );
       if (!confirmed) return;
+    }
+    try {
+      if (!proposalCurrent() || approvalFileState(ctx.cwd, paths).snapshot !== approvedFiles.snapshot) return refuseApproval();
+    } catch {
+      return refuseApproval();
     }
     const res = applyDiff(ctx.cwd, diff);
     if (res.ok) {

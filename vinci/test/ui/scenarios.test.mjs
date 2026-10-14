@@ -106,20 +106,35 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 		await expectSnapshot("startup-disconnected-80x24", ui);
 	});
 
-	test("signed-in startup remains honest and usable in a narrow terminal", async () => {
+	test("saved-credential startup remains honest and usable in a narrow terminal", async () => {
 		const ui = await createUi({ columns: 60, rows: 20, connected: true });
-		assert.match(await ui.screen(), /● signed in/);
+		assert.match(await ui.screen(), /● credential saved/);
 		assert.doesNotMatch(await ui.screen(), /● connected/);
 		await expectSnapshot("startup-connected-60x20", ui);
 	});
 
+	for (const columns of [20, 39, 40, 60, 80, 120]) {
+		test(`resize preserves the unsent composer at ${columns} columns and short height`, async () => {
+			const ui = await createUi();
+			ui.sendKeys("DRAFT-SENTINEL");
+			await ui.settle();
+			await ui.resize(columns, 10);
+			assert.equal(ui.mode.editor.getText(), "DRAFT-SENTINEL");
+			assert.match(await ui.screen(), /DRAFT-SENTINEL/);
+			await ui.resize(80, 24);
+			assert.equal(ui.mode.editor.getText(), "DRAFT-SENTINEL");
+			assert.match(await ui.screen(), /Vinci v\d+\.\d+\.\d+/);
+			assert.equal(ui.core.faux.callCount, 0);
+		});
+	}
+
 	test("removing credentials refreshes a signed-in header to signed out", async () => {
 		const ui = await createUi({ connected: true });
-		assert.match(await ui.screen(), /● signed in/);
+		assert.match(await ui.screen(), /● credential saved/);
 		unlinkSync(join(ui.core.tempDir, "auth.json"));
 		ui.sendKeys("x", "\x7f");
 		assert.match(await ui.screen(), /\/login to connect/);
-		assert.doesNotMatch(await ui.screen(), /● signed in/);
+		assert.doesNotMatch(await ui.screen(), /● credential saved/);
 	});
 
 	// Was "exposes only the managed Forte class". The picker deliberately shows every managed class

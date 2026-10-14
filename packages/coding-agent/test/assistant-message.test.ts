@@ -54,7 +54,7 @@ describe("AssistantMessageComponent", () => {
 			const friendly = vinciFriendlyError(err, true);
 			expect(friendly?.text).toContain("this is on our end");
 			expect(friendly?.text).not.toContain("check your connection");
-			expect(friendly?.text).toContain("progress is saved");
+			expect(friendly?.text).not.toContain("progress is saved");
 		}
 		// …but a genuine client-network failure still gets the actionable "check your connection".
 		expect(vinciFriendlyError("ECONNREFUSED", true)?.text).toContain("check your connection");

@@ -740,6 +740,8 @@ run_group print-mode-liveness node --experimental-strip-types --input-type=modul
 # remains one store instead of leaving the composer stuck on "checking".
 run_group ui-state-integration node "${ROOT}/vinci/test/ui-state-integration.mjs"
 run_group vero-integration node "${ROOT}/vinci/test/vero-integration.mjs"
+run_group shell-recovery-integration node "${ROOT}/vinci/test/shell-recovery-integration.mjs"
+run_group non-tty-output-integration node "${ROOT}/vinci/test/non-tty-output-integration.mjs"
 # User messages submitted mid-run remain visibly queued until the agent receives them.
 run_group queue-integration node "${ROOT}/vinci/test/queue-integration.mjs"
 # Requested/resolved model identity and route pins survive session resume; route drift is visible.
@@ -824,7 +826,9 @@ run_group mine-fixtures-unit node "${ROOT}/vinci/test/mine-fixtures-unit.mjs"
 # Core CLI boundaries keep the managed model surface closed; shorthand approvals retain reviewer context.
 run_group coding-agent-cli-units node "${VITEST_CLI}" \
   --root "${ROOT}/packages/coding-agent" --run \
-  "test/args.test.ts" "test/list-models.test.ts" "test/vinci-grader.test.ts"
+  "test/args.test.ts" "test/list-models.test.ts" "test/vinci-grader.test.ts" \
+  "test/vinci-auth-ui.test.ts" "test/vinci-auth-guidance.test.ts" "test/vinci-recovery-guidance.test.ts" \
+  "test/assistant-message.test.ts"
 # Remaining integrations drive the REAL modules directly (Node 23+ strips TS types at load).
 if node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>=23?0:1)'; then
   # bashIntent: the real "what it's doing" labels shown next to each shell command.
@@ -881,6 +885,7 @@ if [ -n "${packaged_tgz}" ] && [ -f "${packaged_tgz}" ] && tar -xzf "${packaged_
     packaged_boundary=(--deny-source "${ROOT}" --deny-source "$(dirname "${common_git}")")
   fi
   run_group packaged-launch-artifact node "${ROOT}/vinci/test/packaged-launch-check.mjs" "${packaged_dir}/unpacked" "${packaged_boundary[@]}"
+  run_group non-tty-output-packaged node "${ROOT}/vinci/test/non-tty-output-integration.mjs" "${packaged_dir}/unpacked"
   run_group runtime-cli-packaged node "${ROOT}/vinci/test/runtime-integration.mjs" "${packaged_dir}/unpacked"
 else
   echo "  ✗ packaged-unpack: artifact \"${packaged_tgz:-<missing>}\" is unavailable. Rebuild the owned unsigned payload before retrying."
@@ -914,6 +919,11 @@ run_group ui-crew-delivery node "${VITEST_CLI}" \
   --root "${ROOT}" --run \
   --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
   "vinci/test/ui/crew-delivery.test.mjs"
+
+run_group ui-crew-status node "${VITEST_CLI}" \
+  --root "${ROOT}" --run \
+  --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
+  "vinci/test/ui/crew-status.test.mjs"
 
 echo
 echo "── VISUAL (rendered TUI header via PTY) ──────────────"

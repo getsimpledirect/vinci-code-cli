@@ -1,6 +1,6 @@
-  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.56
-  Vero BLOCKED   ·   Vinci   ·   <repo>
-  /login to connect   ·   /undo safety net   ·   Ctrl+T thinking   ·   /thinking
+  Vinci v0.0.56 Code
+  Vero BLOCKED · Vinci · <repo>
+  /login to connect · Resolve the blocker. · /undo · Ctrl+T thinking
 
 
 
