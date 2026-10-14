@@ -9,6 +9,12 @@ now preserved. True child-session continuation remains the one genuinely unbuilt
 > readers were misled by it in one session. If a claim here disagrees with the code, the code is right;
 > fix the line rather than working around it.
 
+## Documentation
+
+- [How agents work here](docs/agents.md) — task ownership, hand-offs, independent review,
+  verification, denials, and the boundaries between working practices and Crew features.
+- [Verification system](docs/verification.md) — direct evidence and task outcome states.
+
 ## The vision (George)
 
 A main session that acts as an **orchestrator**, plus named **helper** sessions — each a real Vinci
