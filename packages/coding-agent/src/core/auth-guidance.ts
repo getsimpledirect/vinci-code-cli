@@ -131,11 +131,11 @@ export function formatNoApiKeyFoundMessage(provider: string): string {
 			case "vinci":
 				return VINCI_CONNECT;
 			case "anthropic":
-				return 'No Anthropic API credentials found. Set ANTHROPIC_API_KEY in your environment, or start Vinci with VINCI_SHOW_OTHER_PROVIDERS=1 and use /login, then "Use an API key" and Anthropic.';
+				return 'No Anthropic API credentials found. Set ANTHROPIC_API_KEY in your environment, or start Vinci with VINCI_SHOW_OTHER_PROVIDERS=1 and use /login, then "API key" and Anthropic.';
 			case "openai":
-				return 'No OpenAI API credentials found. Set OPENAI_API_KEY in your environment, or start Vinci with VINCI_SHOW_OTHER_PROVIDERS=1 and use /login, then "Use an API key" and OpenAI.';
+				return 'No OpenAI API credentials found. Set OPENAI_API_KEY in your environment, or start Vinci with VINCI_SHOW_OTHER_PROVIDERS=1 and use /login, then "API key" and OpenAI.';
 			case "openai-codex":
-				return 'You\'re not connected to Codex yet. Start Vinci with VINCI_SHOW_OTHER_PROVIDERS=1 and use /login, then "Use a subscription" and "ChatGPT Plus/Pro (Codex Subscription)".';
+				return 'You\'re not connected to Codex yet. Start Vinci with VINCI_SHOW_OTHER_PROVIDERS=1 and use /login, then "Provider account" and "ChatGPT Plus/Pro (Codex Subscription)".';
 			default:
 				return "No credentials found for the selected provider. Check its authentication settings and setup instructions.";
 		}

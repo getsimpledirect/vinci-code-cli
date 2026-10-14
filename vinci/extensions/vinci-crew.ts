@@ -199,6 +199,7 @@ interface Helper {
   liveTranscript?: string[];
   livePartial?: string[];
   livePartialKinds?: Array<TranscriptKind | undefined>;
+  observedAssistant?: TranscriptMessage;
   activity?: string;
   streaming?: boolean;
   messagedDuringRun?: boolean;
@@ -215,6 +216,7 @@ type PersistedHelper = Omit<
   | "liveTranscript"
   | "livePartial"
   | "livePartialKinds"
+  | "observedAssistant"
   | "activity"
   | "streaming"
   | "messagedDuringRun"
@@ -472,6 +474,7 @@ function persistedHelper(h: Helper): PersistedHelper {
     liveTranscript: _liveTranscript,
     livePartial: _livePartial,
     livePartialKinds: _livePartialKinds,
+    observedAssistant: _observedAssistant,
     activity: _activity,
     streaming: _streaming,
     messagedDuringRun: _messagedDuringRun,
@@ -1171,16 +1174,17 @@ function lastAssistantText(messages: TranscriptMessage[]): string {
 }
 
 function captureHelperHandoff(h: Helper, messages: TranscriptMessage[] | undefined, assistantText?: string): void {
-  const last = messages?.findLast((message) => message.role === "assistant");
+  const captured = messages ?? (h.observedAssistant ? [h.observedAssistant] : undefined);
+  const last = captured?.findLast((message) => message.role === "assistant") ?? h.observedAssistant;
   if (last?.stopReason === "aborted") h.cancelledAt ??= Date.now();
   if (last?.stopReason === "error") h.error = sanitizeViewerText(last.errorMessage || "The child model turn failed.");
-  const handoff = parseHandoffAttestation(assistantText ?? lastAssistantText(messages ?? []));
+  const handoff = parseHandoffAttestation(assistantText ?? lastAssistantText(captured ?? []));
   h.summary = handoff.summary;
   h.deviations = handoff.deviations;
   h.deferred = handoff.deferred;
   h.attestation = handoff.attestation;
   h.omitted = handoff.omitted;
-  if (messages) h.transcript = stripHandoffBlocks(formatTranscript(messages));
+  if (captured) h.transcript = stripHandoffBlocks(formatTranscript(captured));
 }
 
 function capLiveTranscript(lines: string[]): string[] {
@@ -1291,6 +1295,7 @@ export function reduceHelperEvent(h: Helper, event: AgentEvent): void {
   try {
     try {
       if (event.type === "agent_start") {
+        h.observedAssistant = undefined;
         h.streaming = true;
         h.activity = "working…";
       } else if (event.type === "agent_end") {
@@ -1312,6 +1317,14 @@ export function reduceHelperEvent(h: Helper, event: AgentEvent): void {
           event.message.role === "user" || kinds.every((kind) => kind === "toolResult" || kind === "toolError");
         appendLiveTranscript(h, finalLines, duplicateTail);
         if (event.message.role === "assistant") {
+          // Retain the final event before history RPCs can fail. This is runtime-only and bounded;
+          // a later child turn replaces it, so an earlier error cannot classify a successful turn.
+          h.observedAssistant = {
+            role: "assistant",
+            stopReason: event.message.stopReason,
+            errorMessage: event.message.errorMessage ? sanitizeViewerText(event.message.errorMessage) : undefined,
+            content: sanitizeViewerText(lastAssistantText([event.message])).slice(0, MAX_PERSISTED_TRANSCRIPT),
+          };
           h.livePartial = undefined;
           h.livePartialKinds = undefined;
           const usage = event.message.usage;
@@ -2043,7 +2056,7 @@ function derivePatchPaths(diff: string): string[] {
   return [...paths].sort();
 }
 
-function formatAgentResult(result: AgentResult): string {
+function formatAgentResult(result: AgentResult, unfinished = false): string {
   const safeResult: AgentResult = {
     agentId: result.agentId,
     name: sanitizeLine(result.name),
@@ -2080,6 +2093,8 @@ function formatAgentResult(result: AgentResult): string {
     ? `The child turn was cancelled and its task did not finish. ${files ? `Partial work is saved for these files: ${files}. Ask the user for fresh explicit approval before calling use_agent_work with agent_id ${safeResult.agentId} and user_approved true.` : "No file changes were applied."} Do not report that this work kept running after cancellation.`
     : safeResult.status === "failed" || safeResult.status === "blocked"
       ? `The agent did not finish its task. ${safeResult.reason ?? "Inspect the saved result before deciding how to retry."} Do not report this task as complete.`
+    : unfinished
+      ? `The agent did not finish its task. ${safeResult.reason ?? "Review its saved partial work before retrying."} ${files ? `Partial work is saved for these files: ${files}. Use use_agent_work with agent_id ${safeResult.agentId} only for the saved portion; follow its approval and file-change checks, then continue the unfinished task.` : "No file changes were applied."} Do not report this task as complete or redo the saved portion.`
     : approvalRequired
     ? `The agent finished and its work is saved. Files affected: ${files}. Use use_agent_work with agent_id ${safeResult.agentId} to take this work into the project. If the tool says the work affects sensitive project setup, ask the user in plain language, then call it again with user_approved set to true. If it says files changed after the agent started, tell the user which files changed and ask how to resolve them before retrying. DO NOT redo this work.`
     : safeResult.status === "done" && safeResult.filesChanged.length === 0
@@ -2137,6 +2152,8 @@ export function finalizeHelper(
           ui.notify(`Agent "${safeName}"'s turn was cancelled. ${h.diff?.trim()
             ? "Its partial work is saved for review; nothing was applied."
             : "It did not finish the task."}`, "warning");
+        } else if (h.status === "waiting" && (h.error || h.stoppedUnfinished)) {
+          ui.notify(`Agent "${safeName}" couldn't finish. ${safeReason} Review its saved partial work before continuing.`, "warning");
         } else if (h.status === "integrated" || h.status === "done" || h.status === "waiting") {
           const notification =
             h.status === "integrated"
@@ -2180,7 +2197,7 @@ export function finalizeHelper(
       pi.sendMessage<AgentResult & { deliveryId: string }>(
         {
           customType: "vinci-crew-result",
-          content: formatAgentResult(h.result),
+          content: formatAgentResult(h.result, Boolean(h.error || h.stoppedUnfinished)),
           display: false,
           details: { ...h.result, deliveryId: h.deliveryId },
         },
@@ -2455,7 +2472,13 @@ export async function runHelper(pi: ExtensionAPI, ctx: ExtensionContext, h: Help
       /* preserve usage observed from live events */
     }
     await accountHelperUsage(client, { sessionManager }, h);
-    const assistantText = (await client.getLastAssistantText()) ?? "";
+    let assistantText: string | undefined;
+    try {
+      assistantText = (await client.getLastAssistantText()) ?? undefined;
+    } catch (error) {
+      if (!h.observedAssistant) throw error;
+      // The observed final message remains usable when the history RPC is unavailable.
+    }
     try {
       // capture BEFORE stop() below. The raw handoff block is stripped here too: the viewer prefers
       // the transcript over the summary, so leaving it in rendered the attestation twice — once as
@@ -2792,7 +2815,7 @@ export default function (pi: ExtensionAPI) {
             const drift = scanVinciScopeDriftEntries(entries);
             h.scopeDrift = drift.length ? drift : undefined;
           } catch {
-            /* preserve whatever was already captured */
+            if (h.observedAssistant) captureHelperHandoff(h, undefined);
           }
           if (sessionManager) await accountHelperUsage(client, { sessionManager }, h);
           try {

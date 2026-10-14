@@ -12,7 +12,8 @@ import { viewportSvg, viewportText } from "./terminal-render.mjs";
 
 const XtermTerminal = xterm.Terminal;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const ACTIVITY = /(·|•|●)\s+(Contemplating|Considering|Looking|Making|Checking|Reviewing|Organizing|Coordinating|Adjusting|Running|Updating|Working)/;
+// Measure the composer's pulse; a static header separator can precede the same activity text.
+const ACTIVITY = /^╭ (·|•|●)\s+(Contemplating|Considering|Looking|Making|Checking|Reviewing|Organizing|Coordinating|Adjusting|Running|Updating|Working)/m;
 
 function readOption(name, fallback) {
 	const index = process.argv.indexOf(name);

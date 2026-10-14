@@ -1,4 +1,4 @@
-  Vinci v0.0.56 Code
+  Vinci v0.0.57 Code
   Vero WORKING · Vinci · <repo>
   ● connected • Checking the result… · /undo · Ctrl+T thinking
 

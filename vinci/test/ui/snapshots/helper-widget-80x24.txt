@@ -1,4 +1,4 @@
-  Vinci v0.0.56 Code
+  Vinci v0.0.57 Code
   Vero READY · Vinci · <repo>
   /login to connect · Ask Vero a task · /undo · Ctrl+T thinking
 

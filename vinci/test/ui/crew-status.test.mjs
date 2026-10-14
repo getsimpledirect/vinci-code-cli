@@ -30,16 +30,26 @@ const rpc = vi.hoisted(() => {
 		finish(stopReason = "stop") {
 			this.stopReason = stopReason;
 			this.streaming = false;
+			if (this.observeFinal) {
+				for (const listener of this.listeners) listener({ type: "message_end", message: this.finalMessage() });
+			}
 			for (const listener of this.listeners) listener({ type: "agent_end", messages: [] });
 			this.resolve?.();
 		}
-		async getMessages() {
-			return [{ role: "assistant", stopReason: this.stopReason ?? "stop", provider: "faux", model: "crew-c3",
+		finalMessage() {
+			return { role: "assistant", stopReason: this.stopReason ?? "stop", provider: "faux", model: "crew-c3",
 				...(this.stopReason === "error" ? { errorMessage: "Provider fixture unavailable" } : {}),
 				content: [{ type: "text", text: 'Captured child result.\n```vinci-handoff\n{"deviations":[],"deferred":[]}\n```' }],
-				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } }];
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } };
 		}
-		async getLastAssistantText() { return (await this.getMessages())[0].content[0].text; }
+		async getMessages() {
+			if (this.historyFailure) throw new Error("RPC history fixture unavailable");
+			return [this.finalMessage()];
+		}
+		async getLastAssistantText() {
+			if (this.lastTextFailure) throw new Error("RPC final text fixture unavailable");
+			return this.finalMessage().content[0].text;
+		}
 		async getEntries() { return { entries: this.entries ?? [] }; }
 		async getSessionStats() { return { tokens: { total: 2 } }; }
 		async stop() { this.finish(); }
@@ -52,6 +62,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (original) => ({
 	...(await original()), RpcClient: rpc.CrewRpc,
 	runReview: async () => {
 		rpc.review.started = true;
+		if (rpc.review.verdict) return rpc.review.verdict;
 		return new Promise((resolve) => { rpc.review.resolve = resolve; });
 	},
 }));
@@ -81,6 +92,7 @@ afterEach(async () => {
 	rpc.clients.length = 0;
 	rpc.review.started = false;
 	delete rpc.review.resolve;
+	delete rpc.review.verdict;
 });
 
 function helper(id, status, overrides = {}) {
@@ -263,6 +275,7 @@ describe("Crew C3 identity and truthful state presentation", { concurrency: fals
 			writeFileSync(join(ui.core.tempDir, "failed-partial.txt"), "before\n");
 			ui.sendKeys("Unsent failure correction");
 			const child = await spawn(ui);
+			const notify = vi.spyOn(ui.session.extensionRunner.createContext().ui, "notify");
 			if (partial) writeFileSync(join(child.cwd, "failed-partial.txt"), "retained after provider failure\n");
 			child.finish("error");
 			await waitUntil(() => latest(ui, 1)?.finishedAt, "observed provider failure");
@@ -278,7 +291,67 @@ describe("Crew C3 identity and truthful state presentation", { concurrency: fals
 			assert.equal(readFileSync(join(ui.core.tempDir, "failed-partial.txt"), "utf8"), "before\n");
 			assert.equal(ui.session.extensionRunner.createContext().ui.getEditorText(), "Unsent failure correction");
 			assert.equal(ui.core.faux.callCount, 0);
+			await waitUntil(() => ui.session.sessionManager.getBranch().some((entry) => entry.customType === "vinci-crew-result"), "failed result delivery");
+			const result = ui.session.sessionManager.getBranch().find((entry) => entry.customType === "vinci-crew-result");
+			assert.doesNotMatch(result.content, /The agent finished/, "model guidance must not call partial failure finished");
+			assert.ok(notify.mock.calls.some(([message]) => /unresolved|couldn't finish|did not finish/.test(message)));
+			assert.ok(notify.mock.calls.every(([message]) => !/Agent ".*" finished\./.test(message)), "partial failure must not send a completion notification");
 		});
+	}
+
+	for (const stopReason of ["aborted", "error", "stop"]) {
+		for (const { partial, lastTextFailure } of [
+			{ partial: false, lastTextFailure: false },
+			{ partial: true, lastTextFailure: false },
+			{ partial: true, lastTextFailure: true },
+		]) {
+			test(`observed ${stopReason} final event survives a rejected history read${lastTextFailure ? " and final text read" : ""} (${partial ? "partial patch" : "no patch"})`, async () => {
+				const ui = await createUi();
+				writeFileSync(join(ui.core.tempDir, "event-check.mjs"), 'console.log("EVENT_CHECK_OK");\n');
+				writeFileSync(join(ui.core.tempDir, "event-result.txt"), "before\n");
+				ui.sendKeys("Keep this event-boundary correction unsent");
+				const child = await spawn(ui);
+				const notify = vi.spyOn(ui.session.extensionRunner.createContext().ui, "notify");
+				child.observeFinal = true;
+				child.historyFailure = true;
+				child.lastTextFailure = lastTextFailure;
+				if (partial) {
+					writeFileSync(join(child.cwd, "event-result.txt"), "saved event work\n");
+					recordVinciMutation();
+					recordVinciVerification("node event-check.mjs", true, "Recorded event fixture check.", false,
+						"behavioral", "node event-check.mjs", true, child.cwd);
+					child.entries = [{ type: "custom", customType: VINCI_VERIFICATION_ENTRY, data: { ...getVinciVerificationState() } }];
+				}
+				rpc.review.verdict = "## Verdict\nships\n";
+				child.finish(stopReason);
+				await waitUntil(() => latest(ui, 1)?.finishedAt, "event result collection after rejected history");
+				const saved = latest(ui, 1);
+				const successful = stopReason === "stop";
+				assert.equal(saved.status, successful ? partial ? "integrated" : "done" : partial ? "waiting" : stopReason === "aborted" ? "blocked" : "failed");
+				assert.equal(saved.applied === true, successful && partial, "an observed failed/aborted turn cannot auto-integrate despite passed check metadata");
+				assert.equal(typeof saved.cancelledAt, stopReason === "aborted" ? "number" : "undefined");
+				assert.equal(readFileSync(join(ui.core.tempDir, "event-result.txt"), "utf8"), successful && partial ? "saved event work\n" : "before\n");
+				if (!successful) {
+					assert.equal(rpc.review.started, false, "failed/aborted work must not reach independent review");
+					assert.equal(vinciCrewWorkUnresolved(), true);
+					if (partial) assert.ok(readFileSync(saved.diffPath, "utf8").includes("saved event work"));
+					if (stopReason === "error") assert.match(saved.reason, /Provider fixture unavailable/);
+					if (stopReason === "aborted" && partial) {
+						const runner = ui.session.extensionRunner;
+						const refused = await runner.getToolDefinition("use_agent_work").execute("observed-cancel-old-authority", { agent_id: 1 },
+							new AbortController().signal, () => {}, runner.createContext());
+						assert.equal(refused.details.applied, false);
+						assert.equal(refused.details.userApprovalRequired, true);
+					}
+					assert.ok(notify.mock.calls.every(([message]) => !/Agent ".*" finished\./.test(message)));
+				}
+				assert.equal(ui.session.extensionRunner.createContext().ui.getEditorText(), "Keep this event-boundary correction unsent");
+				assert.equal(ui.core.faux.callCount, 0);
+				await waitUntil(() => ui.session.sessionManager.getBranch().some((entry) => entry.customType === "vinci-crew-result"), "event-bound result delivery");
+				const result = ui.session.sessionManager.getBranch().find((entry) => entry.customType === "vinci-crew-result");
+				if (!successful) assert.doesNotMatch(result.content, /The agent finished/);
+			});
+		}
 	}
 
 	test("resizing a real decision dialog leaves navigation with the dialog and retains the main draft", async () => {
