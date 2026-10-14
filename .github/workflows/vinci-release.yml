@@ -70,7 +70,7 @@ jobs:
 
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
-          node-version: "22.19"
+          node-version: "22.19.0"
 
       - name: Tag must match the built identity (version is derived, never injected into shell)
         id: meta
@@ -100,6 +100,23 @@ jobs:
           npm ci --ignore-scripts
           bash vinci/package.sh
           node vinci/test/identity-contract.mjs
+
+      - name: Install Linux sandbox backend
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap apparmor-profiles
+
+      - name: Enable distro Bubblewrap namespace profile
+        run: |
+          set -euo pipefail
+          # Match offline CI: permit namespace setup without granting capabilities to children.
+          sudo apparmor_parser -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sudo grep -Fx 'bwrap (enforce)' /sys/kernel/security/apparmor/profiles
+          sudo grep -Fx 'unpriv_bwrap (enforce)' /sys/kernel/security/apparmor/profiles
+
+      - name: Qualify real Linux scoped sandbox
+        run: node vinci/test/sandbox-integration.mjs
 
       - name: Full offline harness (smoke needs gateway auth; CI proves load + UI + unit)
         env:
@@ -159,7 +176,7 @@ jobs:
 
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
-          node-version: "22.19"
+          node-version: "22.19.0"
 
       - name: Bring in the exact tested payload (not a rebuild)
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
