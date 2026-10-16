@@ -164,7 +164,10 @@ describe("AgentSession retry", () => {
 
 		expect(created.getCallCount()).toBe(2);
 		expect(events).toEqual(["start:1", "end:success=true"]);
-		expect(session.messages.at(-1)).toMatchObject({ stopReason: "stop", content: [{ type: "text", text: "Success" }] });
+		expect(session.messages.at(-1)).toMatchObject({
+			stopReason: "stop",
+			content: [{ type: "text", text: "Success" }],
+		});
 	});
 
 	it.each(["overloaded_error", "Unable to forward upstream stream"])(
@@ -188,7 +191,11 @@ describe("AgentSession retry", () => {
 				expect(created.getCallCount()).toBe(index + 2);
 			}
 			await prompt;
-			expect(starts.map(({ attempt, maxAttempts }) => [attempt, maxAttempts])).toEqual([[1, 3], [2, 3], [3, 3]]);
+			expect(starts.map(({ attempt, maxAttempts }) => [attempt, maxAttempts])).toEqual([
+				[1, 3],
+				[2, 3],
+				[3, 3],
+			]);
 			expect(ends).toEqual([{ type: "auto_retry_end", success: false, attempt: 3, finalError: errorMessage }]);
 			expect(session.messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage });
 			await vi.advanceTimersByTimeAsync(16000);
@@ -222,9 +229,14 @@ describe("AgentSession retry", () => {
 	it.each(["overloaded_error", "The service is temporarily unavailable"])(
 		"does not replay a completed write after a follow-up error: %s",
 		async (errorMessage) => {
-			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "written" }], details: undefined }));
+			const execute = vi.fn(async () => ({
+				content: [{ type: "text" as const, text: "written" }],
+				details: undefined,
+			}));
 			const created = createSession({
-				tools: [{ name: "write", label: "Write", description: "Write a value", parameters: Type.Object({}), execute }],
+				tools: [
+					{ name: "write", label: "Write", description: "Write a value", parameters: Type.Object({}), execute },
+				],
 				responses: [
 					createAssistantMessage("", {
 						stopReason: "toolUse",
@@ -238,16 +250,24 @@ describe("AgentSession retry", () => {
 			expect(created.getCallCount()).toBe(3);
 			expect(execute).toHaveBeenCalledTimes(1);
 			expect(session.messages.filter((message) => message.role === "toolResult")).toHaveLength(1);
-			expect(session.messages.at(-1)).toMatchObject({ stopReason: "stop", content: [{ type: "text", text: "Success" }] });
+			expect(session.messages.at(-1)).toMatchObject({
+				stopReason: "stop",
+				content: [{ type: "text", text: "Success" }],
+			});
 		},
 	);
 
 	it.each(["overloaded_error", "The service is temporarily unavailable"])(
 		"does not execute a tool call from an errored response before retry: %s",
 		async (errorMessage) => {
-			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "written" }], details: undefined }));
+			const execute = vi.fn(async () => ({
+				content: [{ type: "text" as const, text: "written" }],
+				details: undefined,
+			}));
 			const created = createSession({
-				tools: [{ name: "write", label: "Write", description: "Write a value", parameters: Type.Object({}), execute }],
+				tools: [
+					{ name: "write", label: "Write", description: "Write a value", parameters: Type.Object({}), execute },
+				],
 				responses: [
 					createAssistantMessage("", {
 						stopReason: "error",
@@ -261,7 +281,10 @@ describe("AgentSession retry", () => {
 			expect(execute).toHaveBeenCalledTimes(0);
 			expect(created.getCallCount()).toBe(2);
 			expect(session.messages.filter((message) => message.role === "toolResult")).toHaveLength(0);
-			expect(session.messages.at(-1)).toMatchObject({ stopReason: "stop", content: [{ type: "text", text: "Success" }] });
+			expect(session.messages.at(-1)).toMatchObject({
+				stopReason: "stop",
+				content: [{ type: "text", text: "Success" }],
+			});
 		},
 	);
 

@@ -29,6 +29,7 @@ only patch core when there's no hook.)
 |---|---|---|
 | `agent/src/agent-loop.ts` | Canonicalize tool-name synonyms (`editor`→`edit`); repair double-encoded arguments before validation; mark Vinci-blocked results for private display handling | 20,23 |
 | `ai/src/api/openai-completions.ts` | Mark failed/blocked tool results with an explicit `ERROR —` prefix on the wire | 15 |
+| `ai/src/utils/retry.ts` | Keep 401, invalid API key, 402, and refusal errors non-retryable despite transient gateway wording | — |
 | `coding-agent/package.json` | `piConfig.name: "vinci"` — window title / `APP_NAME` (JSON, so no inline tag) | 9 |
 | `coding-agent/src/cli/args.ts` | Hide provider/model/BYOK controls from Vinci help; reject malformed output modes before runtime startup | 4,26 |
 | `coding-agent/src/cli/list-models.ts` | Restrict Vinci's non-interactive model listing to the managed provider | 4 |
