@@ -84,6 +84,7 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
+import { canonicalizeManagedVinciModel, findModelWithVinciAlias, requestedModelId } from "./model-resolver.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
@@ -1662,6 +1663,7 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>): Promise<void> {
+		model = canonicalizeManagedVinciModel(model, this._modelRegistry);
 		if (!this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
@@ -1669,9 +1671,9 @@ export class AgentSession {
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
+		this.sessionManager.appendModelChange(model.provider, requestedModelId(model));
 		if (process.env.VINCI_CODE !== "1") {
-			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+			this.settingsManager.setDefaultModelAndProvider(model.provider, requestedModelId(model));
 		}
 
 		// Re-clamp thinking level for new model's capabilities
@@ -1708,8 +1710,8 @@ export class AgentSession {
 
 		// Apply model
 		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+		this.sessionManager.appendModelChange(next.model.provider, requestedModelId(next.model));
+		this.settingsManager.setDefaultModelAndProvider(next.model.provider, requestedModelId(next.model));
 
 		// Apply thinking level.
 		// - Explicit scoped model thinking level overrides current session level
@@ -2413,7 +2415,12 @@ export class AgentSession {
 			return;
 		}
 
-		const refreshedModel = this._modelRegistry.find(currentModel.provider, currentModel.id);
+		const refreshedModel = findModelWithVinciAlias(
+			this._modelRegistry,
+			currentModel.provider,
+			currentModel.id,
+			requestedModelId(currentModel),
+		);
 		if (!refreshedModel || refreshedModel === currentModel) {
 			return;
 		}

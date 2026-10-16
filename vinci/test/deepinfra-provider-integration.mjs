@@ -49,7 +49,7 @@ assert.deepEqual(
 const [managed] = registrations(false);
 // `auto` first: it is the default and resolves to whatever class the account chose. The concrete
 // classes stay registered so a corpus run can pin one deliberately.
-assert.deepEqual(managed.config.models.map(({ id }) => id), ["auto", "forte", "fortissimo"]);
+assert.deepEqual(managed.config.models.map(({ id }) => id), ["auto", "forte"]);
 // Class name only, never the occupant. The old label hardcoded "(GLM 5.2)", which survived purely
 // because one class existed and its occupant never moved; the whole point of a class is that the
 // model behind it rotates without a client release. The occupant is not exposed to API clients

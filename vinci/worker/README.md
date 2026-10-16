@@ -289,7 +289,7 @@ The class → (provider, model) table is OPERATOR RUNTIME CONFIG, read from
 `VINCI_WORKER_MODEL_CLASSES` — inline JSON, or `@<path>` naming a JSON file of the same shape:
 
 ```
-VINCI_WORKER_MODEL_CLASSES='{"forte":{"provider":"vinci","model":"forte"},"fortissimo":{"provider":"vinci","model":"fortissimo"}}'
+VINCI_WORKER_MODEL_CLASSES='{"forte":{"provider":"vinci","model":"forte"},"fortissimo":{"provider":"vinci","model":"forte"}}'
 VINCI_WORKER_MODEL_CLASSES=@/etc/vinci-worker/model-classes.json
 ```
 

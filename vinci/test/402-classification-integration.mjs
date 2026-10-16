@@ -136,8 +136,8 @@ const retriedPayload = await beforeProviderRequest(
 );
 assert.deepEqual(
   retriedPayload,
-  { model: "fortissimo", max_tokens: 23014, messages: [] },
-  "the one affordability retry must clamp max_tokens without changing models",
+  { model: "forte", max_tokens: 23014, messages: [] },
+  "the one affordability retry must clamp max_tokens and resolve the Fortissimo alias to Forte",
 );
 
 await afterProviderResponse({ status: 402, headers: {} }, context);

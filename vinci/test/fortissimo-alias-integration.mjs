@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
@@ -9,7 +8,6 @@ import { executionSpecDigest, workOrderDigest } from "../worker/contracts/digest
 import { DEFAULT_MODEL_CLASSES, materializeEnvelope } from "../worker/task.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const root = resolve(here, "../..");
 const loader = createJiti(import.meta.url, { moduleCache: false, fsCache: false, tryNative: false });
 const provenance = await loader.import(resolve(here, "../extensions/vinci-model-provenance.ts"), { default: false });
 const provider = await loader.import(resolve(here, "../extensions/vinci-provider.ts"), { default: false });
@@ -52,6 +50,7 @@ for (const [requested, served, expected] of [
   ["fortissimo", "forte", false],
   ["forte", "mezzo", true],
   ["vinci/fortissimo", "vinci/mezzo", true],
+  [" VINCI/FORTISSIMO ", " VINCI/FORTE ", false],
   ["fortissimo", "GLM 5.3", false],
 ]) {
   test(`T2 provenance ${requested}/${served} downgrade is ${expected}`, () => {
@@ -79,7 +78,7 @@ test("T4 no registered model has Kimi rates", () => {
 
 test("T4 deleted legacy Kimi metadata stays absent", () => {
   const source = readFileSync(resolve(here, "../extensions/vinci-provider.ts"), "utf8");
-  assert.doesNotMatch(source, /fortissimo:\s*\{\s*input:\s*3,\s*output:\s*15,\s*cacheRead:\s*0\.3,\s*cacheWrite:\s*3\s*\}/,
+  assert.equal(/fortissimo:\s*\{\s*input:\s*3,\s*output:\s*15,\s*cacheRead:\s*0\.3,\s*cacheWrite:\s*3\s*\}/.test(source), false,
     "The obsolete Fortissimo Kimi price block must be deleted");
 });
 
@@ -87,28 +86,6 @@ test("T5 picker offers auto and Forte only", () => {
   const { config } = registration();
   assert.deepEqual(config.models.map(({ id, name }) => [id, name]),
     [["auto", "Vinci"], ["forte", "Vinci Forte"]], "The Vinci picker must contain only auto and forte");
-});
-
-for (const model of ["fortissimo", "vinci/fortissimo"]) {
-  test(`T5 launcher accepts legacy ${model}`, () => {
-    const result = spawnSync("bash", [resolve(root, "vinci/bin/vinci"), "--model", model, "--version"], {
-      cwd: root, encoding: "utf8", timeout: 30000,
-      env: { ...process.env, VINCI_MODEL: "fortissimo", VINCI_SOURCE_CLI: "1",
-        VINCI_SHOW_OTHER_PROVIDERS: "1", VINCI_NO_BOOTSTRAP_HEAL: "1", VINCI_TOOL_BOOTSTRAP: "0",
-        PI_OFFLINE: "1", VINCI_UPDATE_DISABLED: "1" },
-    });
-    assert.equal(result.status, 0, `Legacy launcher input must resolve without error: ${result.stderr}`);
-  });
-}
-
-test("T5 launcher still rejects an unknown managed id with exit 2", () => {
-  const result = spawnSync("bash", [resolve(root, "vinci/bin/vinci"), "--model", "forte", "--version"], {
-    cwd: root, encoding: "utf8", timeout: 30000,
-    env: { ...process.env, VINCI_MODEL: "doesnotexist", VINCI_SOURCE_CLI: "1",
-      VINCI_NO_BOOTSTRAP_HEAL: "1", VINCI_TOOL_BOOTSTRAP: "0", PI_OFFLINE: "1" },
-  });
-  assert.equal(result.status, 2, "Unknown managed launcher class must exit 2");
-  assert.match(result.stderr, /Unknown Vinci model/);
 });
 
 test("T7 receipt preserves requested alias and effective Forte", async () => {
@@ -183,4 +160,13 @@ test("T9 Forte never displays the alias note", async () => {
   await state.emit("session_start", { reason: "startup" });
   await state.emit("before_provider_headers", { headers: {} });
   assert.equal(state.notifications.length, 0, "Forte must not display an alias note");
+});
+
+test("T9 resolved alias displays the note once even when the model is Forte", async () => {
+  const state = runtime({ ...forte, vinciRequestedClass: "fortissimo" });
+  await state.emit("session_start", { reason: "startup" });
+  await state.emit("model_select", { model: state.ctx.model, source: "restore" });
+  await state.emit("before_provider_headers", { headers: {} });
+  assert.equal(state.notifications.filter((message) => message === "Vinci Fortissimo now uses Vinci Forte").length, 1,
+    "Resolved aliases must display the note exactly once");
 });

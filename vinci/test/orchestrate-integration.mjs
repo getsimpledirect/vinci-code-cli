@@ -39,7 +39,7 @@ assert.ok(Date.now() - started < 500, "aborting during retry backoff must stop t
 const fanoutFaux = registerFauxProvider({
 	api: "faux:orchestrate-fanout",
 	provider: "faux-orchestrate-fanout",
-	models: [{ id: "fortissimo" }],
+	models: [{ id: "forte" }],
 });
 try {
 	fanoutFaux.setResponses([
@@ -51,7 +51,7 @@ try {
 		fauxAssistantMessage("  \n"),
 	]);
 	const result = await orchestrate.runOrchestrator(
-		fanoutFaux.getModel("fortissimo"),
+		fanoutFaux.getModel("forte"),
 		{ apiKey: "faux-key" },
 		"Complete both parts",
 		resolve(here, "../.."),
@@ -66,7 +66,8 @@ try {
 	);
 	assert.equal(result.parts[1].result, "surviving worker output");
 	assert.equal(result.parts[1].verdict, "pass");
-	assert.equal(result.synthesis, "Synthesis unavailable — the reviewed parts are shown as produced.");
+	assert.match(result.synthesis, /No stronger Vinci class was used/);
+	assert.match(result.synthesis, /Synthesis unavailable — the reviewed parts are shown as produced\./);
 } finally {
 	fanoutFaux.unregister();
 }
@@ -74,7 +75,7 @@ try {
 const plannerFaux = registerFauxProvider({
 	api: "faux:orchestrate-planner",
 	provider: "faux-orchestrate-planner",
-	models: [{ id: "fortissimo" }],
+	models: [{ id: "forte" }],
 });
 try {
 	plannerFaux.setResponses([
@@ -84,7 +85,7 @@ try {
 		fauxAssistantMessage("single synthesis"),
 	]);
 	const result = await orchestrate.runOrchestrator(
-		plannerFaux.getModel("fortissimo"),
+		plannerFaux.getModel("forte"),
 		{ apiKey: "faux-key" },
 		"Use the original task",
 		resolve(here, "../.."),

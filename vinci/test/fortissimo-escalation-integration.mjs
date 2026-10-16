@@ -110,6 +110,19 @@ test("T3 advisor positive control: Auto obtains a useful available advisor opini
 	}
 });
 
+test("T3 advisor: Auto uses Forte for its opinion without claiming a stronger class", async () => {
+	const f = fixture("advisor-auto-forte", "auto");
+	try {
+		f.respond("The available Forte opinion is actionable.");
+		const result = await advisorTool().execute("advisor-auto-alias", { question: "Is this approach sound?" }, undefined, undefined, f.ctx);
+		assert.deepEqual(f.calls, ["forte"], "advisor: Auto must retain an available Forte opinion");
+		assert.match(result.content[0].text, NO_STRONGER, "advisor: Auto advice must disclose that no stronger class was used");
+		assert.match(result.content[0].text, /available Forte opinion is actionable/);
+	} finally {
+		f.faux.unregister();
+	}
+});
+
 test("T3 council: Forte synthesizes with honest same-class disclosure", async () => {
 	const f = fixture("council-forte");
 	try {

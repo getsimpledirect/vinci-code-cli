@@ -166,9 +166,9 @@ const WORK_ORDER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 // modelClass -> the (provider, model) the daemon spawns `vinci -p` with. EXPLICIT and closed: a
 // class name the table does not know is BLOCKED (`unknown_model_class`), never passed through
-// as a model id. The class names are the managed-provider model ids (`vinci` provider: `forte`,
-// `fortissimo`; `auto` is deliberately absent — a contract names a class, not "whatever the
-// account resolves to").
+// as a model id. The legacy `fortissimo` class selects `forte` without changing the contract's
+// canonical bytes (`auto` is deliberately absent — a contract names a class, not "whatever
+// the account resolves to").
 //
 // B2: a spec `provider` pin must equal the configured provider for the class (else
 // `provider_mismatch`); it no longer overrides the class's provider. The table itself is
@@ -178,7 +178,7 @@ const WORK_ORDER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 // `unknown_model_class` "MODEL_CLASSES not configured".
 export const DEFAULT_MODEL_CLASSES = Object.freeze({
   forte: Object.freeze({ provider: "vinci", model: "forte" }),
-  fortissimo: Object.freeze({ provider: "vinci", model: "fortissimo" }),
+  fortissimo: Object.freeze({ provider: "vinci", model: "forte" }),
 });
 
 export const MODEL_CLASSES = DEFAULT_MODEL_CLASSES;

@@ -28,6 +28,7 @@ import { classifyCompletionResult, complete } from "@earendil-works/pi-ai/compat
 import { type ExtensionAPI, type ExtensionContext, vinciMaskSecrets } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { canonicalVinciClass } from "./lib/vinci-class.ts";
 import { getVinciConfirmationGates } from "./lib/control.ts";
 import {
   type AskOption,
@@ -72,7 +73,7 @@ const checkedFiles = new Set<string>();
 let scopeChecks = 0;
 const MAX_SCOPE_CHECKS = 6; // bound the LLM calls per turn
 const JUDGE_TIMEOUT_MS = 8000;
-const TIER_ORDER = ["forte", "fortissimo"];
+const TIER_ORDER = ["forte"];
 const SAME_CLASS_ATTEMPTS = 2;
 // Broad-refactor volume — a small ask ballooning into a change across many files. Ask once per turn.
 const touchedFiles = new Set<string>();
@@ -415,8 +416,9 @@ const textOf = (resp: { content: Array<{ type: string; text?: string }> }): stri
 
 export async function judgeScope(ctx: ExtensionContext, file: string): Promise<"in" | "out" | "unsure"> {
   if (!ctx.model || !ctx.modelRegistry) return "unsure";
-  const announce = (message: string, level: "warning" | "error") => {
+  const announce = (message: string, level: "info" | "warning" | "error") => {
     if (ctx.hasUI) ctx.ui.notify(message, level);
+    else if (level === "info") console.info(message);
     else console.error(message);
   };
   let auth: Awaited<ReturnType<ExtensionContext["modelRegistry"]["getApiKeyAndHeaders"]>>;
@@ -435,7 +437,7 @@ export async function judgeScope(ctx: ExtensionContext, file: string): Promise<"
   }
   const prompt = `User asked:\n"${task.slice(0, 400)}"\n\nThe assistant is about to change this file: ${file}\n\nIs that IN scope or OUT of scope?`;
   const tiers: Array<{ classId: string; model?: NonNullable<ExtensionContext["model"]> }> = [];
-  const idx = TIER_ORDER.indexOf(ctx.model.id);
+  const idx = TIER_ORDER.indexOf(canonicalVinciClass(ctx.model.id));
   if (idx >= 0) {
     for (let i = TIER_ORDER.length - 1; i > idx; i--) {
       tiers.push({
@@ -445,6 +447,9 @@ export async function judgeScope(ctx: ExtensionContext, file: string): Promise<"
           | undefined,
       });
     }
+  }
+  if (tiers.length === 0) {
+    announce(`No stronger Vinci class was used; the scope check uses the same model (${ctx.model.name ?? ctx.model.id}).`, "info");
   }
   tiers.push({ classId: ctx.model.id, model: ctx.model });
   for (let tierIndex = 0; tierIndex < tiers.length; tierIndex++) {

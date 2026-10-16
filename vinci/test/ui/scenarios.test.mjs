@@ -137,16 +137,13 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 		assert.doesNotMatch(await ui.screen(), /● credential saved/);
 	});
 
-	// Was "exposes only the managed Forte class". The picker deliberately shows every managed class
-	// now — hiding all but one is the bug that made a second class unreachable no matter what the
-	// account had chosen. What must stay true is that only MANAGED classes appear, labelled by class
-	// rather than by occupant.
+	// Fortissimo remains a legacy alias, while new selections expose only the managed choices.
 	test("model picker exposes the managed classes and nothing else", async () => {
 		const ui = await createUi({ connected: true });
 		ui.sendKeys("/model", "\r");
 		const screen = await ui.waitForText("Model Name: Vinci");
 		assert.match(screen, /Vinci Forte/);
-		assert.match(screen, /Vinci Fortissimo/);
+		assert.doesNotMatch(screen, /Vinci Fortissimo/);
 		// No occupant in the label: the model behind a class rotates server-side, so naming it here
 		// would go stale silently on the next swap.
 		assert.doesNotMatch(screen, /GLM 5\.2|Kimi/);

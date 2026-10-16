@@ -29,6 +29,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { canonicalVinciClass } from "./lib/vinci-class.ts";
 import {
   installVinciUsageAccumulator,
   recordVinciTaskCall,
@@ -167,13 +168,13 @@ export type Orchestration = { synthesis: string; parts: OrchestratedPart[] };
 // Auto-escalation ladder: when a part fails review, Vinci retries it on the next model up. A tier
 // that isn't reachable just throws and we keep the current result; the retry call-site bounds latency.
 type Registry = ExtensionContext["modelRegistry"];
-const TIER_ORDER = ["forte", "fortissimo"];
+const TIER_ORDER = ["forte"];
 class CompletionClassificationError extends Error {}
 // The retry worker runs a full multi-step tool loop, so it gets a longer budget than a single-call
 // guard (loopbreak's 9s) — enough for legit exploration, but still bounding a slow route.
 const ESCALATE_TIMEOUT_MS = 45000;
 function nextTier(model: CtxModel, registry: Registry): CtxModel | null {
-  const idx = TIER_ORDER.indexOf(model.id);
+  const idx = TIER_ORDER.indexOf(canonicalVinciClass(model.id));
   if (idx < 0 || idx >= TIER_ORDER.length - 1) return null;
   return (registry.find("vinci", TIER_ORDER[idx + 1]) as CtxModel | undefined) ?? null;
 }
@@ -333,9 +334,14 @@ export async function runOrchestrator(
   // if one is available. Vinci manages its own knobs — and tells you. The retry is latency-bounded
   // (ESCALATE_TIMEOUT_MS): a tier that isn't serving OR is too slow throws/times out and we keep the
   // current result.
+  let noStrongerNotice: string | undefined;
   for (const p of parts.filter((x) => x.verdict === "needs-work")) {
     if (aborted()) break;
     let stronger = nextTier(model, registry);
+    if (!stronger) {
+      noStrongerNotice = "No stronger Vinci class was used; parts that need work retain their original results and review findings.";
+      onPhase?.(noStrongerNotice);
+    }
     while (stronger) {
       onPhase?.(`This part's tricky — bringing in ${stronger.name ?? stronger.id}…`);
       // Bound the whole stronger-tier retry worker: with no per-call timeout, a slow route could hang
@@ -370,10 +376,12 @@ export async function runOrchestrator(
       2000,
       "orchestrate:synthesis",
     );
-    return { synthesis: textOf(synth), parts };
+    const synthesis = textOf(synth);
+    return { synthesis: noStrongerNotice ? `${noStrongerNotice}\n\n${synthesis}` : synthesis, parts };
   } catch (error) {
     if (!(error instanceof CompletionClassificationError)) throw error;
-    return { synthesis: "Synthesis unavailable — the reviewed parts are shown as produced.", parts };
+    const synthesis = "Synthesis unavailable — the reviewed parts are shown as produced.";
+    return { synthesis: noStrongerNotice ? `${noStrongerNotice}\n\n${synthesis}` : synthesis, parts };
   }
 }
 

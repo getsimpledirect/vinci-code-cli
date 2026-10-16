@@ -62,7 +62,6 @@ async function assert402StopsEscalation(site, body, run, leadingResponses = []) 
 	];
 	const models = {
 		forte: model(api, "forte"),
-		fortissimo: model(api, "fortissimo"),
 	};
 	const stream = (requestModel) => {
 		calls.push(requestModel.id);
@@ -95,7 +94,7 @@ async function assert402StopsEscalation(site, body, run, leadingResponses = []) 
 		await assert.rejects(
 			() => run({ ctx, models, registry, announce: (message, level) => notices.push({ message, level }) }),
 			(error) => {
-				assert.match(error.message, /will not downgrade after an account or terminal error/i);
+				assert.match(error.message, /will not downgrade after an account or terminal error|no cheaper model was selected/i);
 				assert.equal(error.cause?.status, 402, `${site}: the terminal error must retain the real HTTP status`);
 				assert.strictEqual(error.cause, terminalError, `${site}: the terminal wrapper must preserve the provider error`);
 				return true;
@@ -104,7 +103,7 @@ async function assert402StopsEscalation(site, body, run, leadingResponses = []) 
 		);
 		assert.deepEqual(
 			calls,
-			[...leadingResponses.map(() => "forte"), "fortissimo"],
+			[...leadingResponses.map(() => "forte"), "forte"],
 			`${site}: no retry or cheaper class may be attempted after a 402`,
 		);
 		assert.equal(steps.length, 2, `${site}: the same-class retry and cheaper fallback must remain unused`);
