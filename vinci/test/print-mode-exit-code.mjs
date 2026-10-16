@@ -170,4 +170,14 @@ if (failures.length) {
   console.error(`print-mode exit code: ${failures.length} failed`);
   process.exit(1);
 }
+
+for (const mode of ["text", "json"]) {
+  const lastMessage = { role: "assistant", stopReason: "length" };
+  const truncated = decide({ mode, lastMessage, submitted: ["finish the answer"] });
+  assert.equal(truncated.exitCode, 1, `${mode}: final length must exit 1`);
+  assert.equal(truncated.emitText, mode === "text");
+  assert.equal(truncated.message, "Warning: the response was cut off at the output limit and is incomplete.");
+  assert.equal(decide({ mode, lastMessage, submitted: ["finish the answer"], headlessExitHint: 3 }).exitCode, 3);
+  assert.equal(decide({ mode, lastMessage, submitted: ["finish the answer"], headlessExitHint: 0 }).exitCode, 1);
+}
 console.log("  print-mode exit code: provider failures are non-zero in both modes");

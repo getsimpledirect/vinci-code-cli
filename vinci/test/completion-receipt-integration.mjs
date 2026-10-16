@@ -159,4 +159,17 @@ assert.equal(
   "a WAITING/BLOCKED close must not receive a receipt even when verification is current",
 );
 
-console.log("completion-receipt-integration: 11/11 passed");
+verification.resetVinciVerificationState();
+verification.recordVinciMutation();
+verification.recordVinciVerification("npm run check", true, "12 tests passed");
+const normalFinalized = await finalize({ type: "message_end", message }, {});
+assert.match(normalFinalized.message.content.at(-1).text, /Completed:/);
+for (const stopReason of ["error", "aborted", "length"]) {
+  assert.equal(
+    await finalize({ type: "message_end", message: { ...message, stopReason } }, {}),
+    undefined,
+    `${stopReason}: an incomplete final message must not receive a completion receipt`,
+  );
+}
+
+console.log("completion-receipt-integration: 15/15 passed");
