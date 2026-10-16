@@ -4857,11 +4857,12 @@ export class InteractiveMode {
 	}
 
 	private showLoginAuthTypeSelector(): void {
-		const subscriptionLabel = "Use a subscription";
-		const apiKeyLabel = "Use an API key";
+		const vinci = process.env.VINCI_CODE === "1";
+		const subscriptionLabel = vinci ? "Provider account" : "Use a subscription";
+		const apiKeyLabel = vinci ? "API key" : "Use an API key";
 		this.showSelector((done) => {
 			const selector = new ExtensionSelectorComponent(
-				"Select authentication method:",
+				vinci ? "Vero - Connect\nProvider-specific access and billing." : "Select authentication method:",
 				[subscriptionLabel, apiKeyLabel],
 				(option) => {
 					done();
@@ -4870,6 +4871,7 @@ export class InteractiveMode {
 				},
 				() => {
 					done();
+					if (vinci) this.showStatus("Vero: sign-in cancelled. Run /login to start again.");
 					this.ui.requestRender();
 				},
 			);
@@ -5013,11 +5015,10 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.footer.invalidate();
 		this.updateEditorBorderColor();
-		// [vinci] Post-login pointer (VINCI_CODE, set by vinci/bin/vinci): a non-programmer doesn't
-		// need the credentials-file path — close the login with the rest of the ecosystem instead.
+		// [vinci] Saved auth is not a provider access check; point to model selection instead.
 		const credentialsTail =
 			process.env.VINCI_CODE === "1"
-				? "You're connected. Vinci is also on the web and your phone — type /help for links."
+				? "Vero: use /model to choose a model. Access and billing follow that provider."
 				: `Credentials saved to ${getAuthPath()}`;
 		if (selectedModel) {
 			this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. ${credentialsTail}`);
@@ -5071,6 +5072,7 @@ export class InteractiveMode {
 				// Completion handled below
 			},
 			providerName,
+			process.env.VINCI_CODE === "1" ? "API key" : undefined,
 		);
 
 		this.editorContainer.clear();
@@ -5087,6 +5089,7 @@ export class InteractiveMode {
 
 		try {
 			const apiKey = (await dialog.showPrompt("Enter API key:")).trim();
+			if (process.env.VINCI_CODE === "1" && dialog.signal.aborted) throw new Error("Login cancelled");
 			if (!apiKey) {
 				throw new Error("API key cannot be empty.");
 			}
@@ -5098,8 +5101,12 @@ export class InteractiveMode {
 		} catch (error: unknown) {
 			restoreEditor();
 			const errorMsg = error instanceof Error ? error.message : String(error);
-			if (errorMsg !== "Login cancelled") {
-				this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`);
+			if (process.env.VINCI_CODE === "1" && (dialog.signal.aborted || errorMsg === "Login cancelled")) {
+				this.showStatus(`Vero: ${providerName} sign-in cancelled. Run /login to start again.`);
+			} else if (errorMsg !== "Login cancelled") {
+				this.showError(
+					`Failed to save API key for ${providerName}: ${errorMsg}${process.env.VINCI_CODE === "1" ? "\nRun /login to try again." : ""}`,
+				);
 			}
 		}
 	}
@@ -5156,6 +5163,7 @@ export class InteractiveMode {
 		this.editorContainer.addChild(dialog);
 		this.ui.setFocus(dialog);
 		this.ui.requestRender();
+		if (process.env.VINCI_CODE === "1") dialog.showWaiting("Pending: requesting provider sign-in.");
 
 		// Promise for manual code input (racing with callback server)
 		let manualCodeResolve: ((code: string) => void) | undefined;
@@ -5219,13 +5227,23 @@ export class InteractiveMode {
 			});
 
 			// Success
+			if (process.env.VINCI_CODE === "1" && dialog.signal.aborted) throw new Error("Login cancelled");
 			restoreEditor();
 			await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
 		} catch (error: unknown) {
 			restoreEditor();
 			const errorMsg = error instanceof Error ? error.message : String(error);
-			if (errorMsg !== "Login cancelled") {
-				this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
+			if (process.env.VINCI_CODE === "1" && (dialog.signal.aborted || errorMsg === "Login cancelled")) {
+				this.showStatus(`Vero: ${providerName} sign-in cancelled. Run /login to start again.`);
+			} else if (errorMsg !== "Login cancelled") {
+				const expired = /^expired_token(?:\b|:)|^Device flow timed out/i.test(errorMsg);
+				const label =
+					process.env.VINCI_CODE === "1" && expired
+						? `Sign-in expired or timed out for ${providerName}`
+						: `Failed to login to ${providerName}`;
+				this.showError(
+					`${label}: ${errorMsg}${process.env.VINCI_CODE === "1" ? "\nRun /login to start again." : ""}`,
+				);
 			}
 		}
 	}

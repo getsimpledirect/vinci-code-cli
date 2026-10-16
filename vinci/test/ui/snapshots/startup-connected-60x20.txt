@@ -1,11 +1,11 @@
-  *  v1nc1 code   ·   Made, not generated.   ·   v0.0.56
-  Vero READY   ·   Vinci   ·   <repo>
-  ● signed in   ·   /undo safety net   ·   Ctrl+T thinking
+  Vinci v0.0.57 Code
+  Vero READY · Vinci · <repo>
+  ● credential saved · Ask Vero a task · /undo
 
 
 
 
-╭ ✹ Ask Vinci ──────────────────────────────── ● signed in ╮
+╭ ✹ Ask Vinci ─────────────────────────────── ● auth saved ╮
 │                                                          │
 │›                                                         │
 │                                                          │

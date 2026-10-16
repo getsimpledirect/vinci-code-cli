@@ -40,13 +40,15 @@ export class LoginDialogComponent extends Container implements Focusable {
 
 		const providerInfo = getOAuthProviders().find((p) => p.id === providerId);
 		const providerName = providerNameOverride || providerInfo?.name || providerId;
-		const title = titleOverride ?? `Login to ${providerName}`;
+		const vinci = process.env.VINCI_CODE === "1";
+		const title = titleOverride ?? (vinci ? "Sign in" : `Login to ${providerName}`);
 
 		// Top border
 		this.addChild(new DynamicBorder());
 
 		// Title
-		this.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+		this.addChild(new Text(theme.fg("accent", theme.bold(vinci ? `Vero - ${title}` : title)), 1, 0));
+		if (vinci) this.addChild(new Text(theme.fg("dim", `Provider: ${providerName}`), 1, 0));
 
 		// Dynamic content area
 		this.contentContainer = new Container();
@@ -76,9 +78,11 @@ export class LoginDialogComponent extends Container implements Focusable {
 	}
 
 	private replaceInputWithSubmittedText(value: string): void {
+		const vinci = process.env.VINCI_CODE === "1";
 		this.contentContainer.children = this.contentContainer.children.map((child) =>
-			child === this.input ? new Text(`> ${value}`, 0, 0) : child,
+			child === this.input ? new Text(vinci ? "Input submitted" : `> ${value}`, 0, 0) : child,
 		);
+		if (vinci) this.input.setValue("");
 	}
 
 	private cancel(): void {
@@ -97,6 +101,9 @@ export class LoginDialogComponent extends Container implements Focusable {
 	showAuth(url: string, instructions?: string): void {
 		this.contentContainer.clear();
 		this.contentContainer.addChild(new Spacer(1));
+		if (process.env.VINCI_CODE === "1") {
+			this.contentContainer.addChild(new Text("Pending: finish sign-in in your browser.", 1, 0));
+		}
 		const linkedUrl = `\x1b]8;;${url}\x07${url}\x1b]8;;\x07`;
 		this.contentContainer.addChild(new Text(theme.fg("accent", linkedUrl), 1, 0));
 
@@ -107,6 +114,9 @@ export class LoginDialogComponent extends Container implements Focusable {
 		if (instructions) {
 			this.contentContainer.addChild(new Spacer(1));
 			this.contentContainer.addChild(new Text(theme.fg("warning", instructions), 1, 0));
+		}
+		if (process.env.VINCI_CODE === "1") {
+			this.contentContainer.addChild(new Text(keyHint("tui.select.cancel", "cancel"), 1, 0));
 		}
 
 		openBrowser(url);
@@ -119,6 +129,9 @@ export class LoginDialogComponent extends Container implements Focusable {
 	showDeviceCode(info: OAuthDeviceCodeInfo): void {
 		this.contentContainer.clear();
 		this.contentContainer.addChild(new Spacer(1));
+		if (process.env.VINCI_CODE === "1") {
+			this.contentContainer.addChild(new Text("Pending: open the link and authorize the code.", 1, 0));
+		}
 		const linkedUrl = `\x1b]8;;${info.verificationUri}\x07${info.verificationUri}\x1b]8;;\x07`;
 		this.contentContainer.addChild(new Text(theme.fg("accent", linkedUrl), 1, 0));
 

@@ -2508,7 +2508,10 @@ try {
     ui: {
       theme: { fg: (_color, text) => text, bold: (text) => text },
       notify() {},
-      setWidget(_name, lines) {
+      setWidget(_name, content) {
+        const lines = typeof content === "function"
+          ? content({ terminal: { columns: 80, rows: 24 } }, this.theme).render(80)
+          : content;
         toolWidgets.push(lines);
       },
       async select(title, options) {

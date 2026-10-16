@@ -3,17 +3,18 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { getCapabilities, setCapabilities, setCellDimensions, TUI, Text } from "@earendil-works/pi-tui";
 import { createJiti } from "jiti/static";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
+const productVersion = JSON.parse(readFileSync(join(root, "vinci/identity.json"), "utf8")).version;
 const testDir = mkdtempSync(join(root, "node_modules/.vero-integration-"));
 const environmentKeys = [
   "TMPDIR", "GIT_CEILING_DIRECTORIES", "PI_OFFLINE", "VINCI_CODE", "VINCI_NO_VERIFY", "VINCI_NO_SANDBOX",
-  "VINCI_ASCII_WORDMARK", "VINCI_HERO_HEADER", "NO_COLOR", "TERM", "VINCI_PLAIN", "VINCI_SCREEN_READER", "VINCI_REDUCED_MOTION",
+  "VINCI_ASCII_WORDMARK", "VINCI_HERO_HEADER", "VINCI_VERO_IMAGES", "NO_COLOR", "TERM", "VINCI_PLAIN", "VINCI_SCREEN_READER", "VINCI_REDUCED_MOTION",
 ];
 const originalEnvironment = new Map(environmentKeys.map((key) => [key, process.env[key]]));
 const originalCapabilities = { ...getCapabilities() };
@@ -27,7 +28,7 @@ function check(name, condition) {
 }
 
 function presentationEnvironment(overrides = {}) {
-  for (const key of ["VINCI_ASCII_WORDMARK", "VINCI_HERO_HEADER", "NO_COLOR", "VINCI_PLAIN", "VINCI_SCREEN_READER", "VINCI_REDUCED_MOTION"]) {
+  for (const key of ["VINCI_ASCII_WORDMARK", "VINCI_HERO_HEADER", "VINCI_VERO_IMAGES", "NO_COLOR", "VINCI_PLAIN", "VINCI_SCREEN_READER", "VINCI_REDUCED_MOTION"]) {
     delete process.env[key];
   }
   process.env.TERM = "xterm-256color";
@@ -77,6 +78,7 @@ try {
   const shell = await loader.import(resolve(here, "../extensions/vinci-shell.ts"), { default: false });
   const state = await loader.import(resolve(here, "../extensions/lib/ui-state.ts"), { default: false });
   const vero = await loader.import(resolve(here, "../extensions/lib/vero-state.ts"), { default: false });
+  const veroImages = await loader.import(resolve(here, "../extensions/lib/vero-image.ts"), { default: false });
   const control = await loader.import(resolve(here, "../extensions/lib/control.ts"), { default: false });
   const outcomes = await loader.import(resolve(here, "../extensions/lib/task-outcome.ts"), { default: false });
   const themeModule = await loader.import(resolve(root, "packages/coding-agent/src/modes/interactive/theme/theme.ts"), { default: false });
@@ -141,7 +143,7 @@ try {
       setHeader(factory) { registeredHeader = factory(tui, themeModule.theme); },
       setEditorComponent(factory) { editor = factory(tui, themeModule.getEditorTheme(), new KeybindingsManager()); },
     };
-    const context = { mode, cwd: profile, model: { name: "Vinci" }, ui, getContextUsage: () => ({ percent: null, tokens: null }) };
+    const context = { mode, cwd: profile, model: { name: "Vinci", provider: "vinci" }, ui, getContextUsage: () => ({ percent: null, tokens: null }) };
     const pi = {
       on(name, handler) { const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list); },
       registerCommand() {},
@@ -164,7 +166,7 @@ try {
     tui.start();
     await bounded(terminal.waitForRender(), "registered TUI startup");
     return {
-      header: registeredHeader, editor, terminal, tui, writes, emit,
+      header: registeredHeader, editor, terminal, tui, writes, emit, context,
       async frame() { tui.requestRender(); await bounded(terminal.waitForRender(), "registered TUI repaint"); return terminal.getViewport(); },
       async close() { await emit("session_shutdown"); tui.stop(); await bounded(terminal.flush(), "registered TUI shutdown"); },
     };
@@ -180,8 +182,52 @@ try {
     ["DONE", "done", () => outcome("DONE")],
   ];
 
+  // Native image capability alone must not enable the unqualified preview.
+  for (const protocol of ["kitty", "iterm2"]) {
+    presentationEnvironment({ VINCI_REDUCED_MOTION: "1", VINCI_HERO_HEADER: "1" });
+    for (const themeName of ["dark", "light"]) {
+      const ui = await registeredUi(protocol, 80, themeName);
+      try {
+        ui.context.model = undefined;
+        for (const width of [20, 39, 40, 60, 80, 120]) {
+          for (const rows of [10, 24]) {
+            ui.terminal.resize(width, rows);
+            resetPresentation();
+            const lines = ui.header.render(width);
+            const text = stripVTControlCharacters(lines.join("\n"));
+            check(`default ${protocol} ${themeName} ${width}x${rows} fits the compact header`, lines.length === (rows < 12 ? 3 : 5));
+            check(`default ${protocol} ${width}x${rows} retains product, version, Vero and login`, text.includes(`Vinci v${productVersion}`) && /Vero READY/.test(text) && /\/login to connect/.test(text));
+            check(`default ${protocol} ${width}x${rows} has no image or former aperture`, !/\x1b_G|\x1b\]1337;File=|✹|[\u2800-\u28ff]/.test(lines.join("\n")));
+            check(`default ${protocol} has a truthful missing-model hint at ${width} columns`, text.includes(width < 40 ? "/model" : "Choose a model: /model") && !text.includes("GLM 5.2"));
+            await ui.frame();
+            check(`default ${protocol} ${width}x${rows} preserves the unsent draft`, ui.editor.getText() === "UNSENT COMPOSER SENTINEL");
+          }
+        }
+        state.setVinciWorking(false);
+        outcome("DONE_UNVERIFIED");
+        check("20-column completion remains explicitly unverified", stripVTControlCharacters(ui.header.render(20).join("\n")).includes("Vero UNVERIFIED"));
+      } finally {
+        await ui.close();
+      }
+    }
+  }
+
+  presentationEnvironment({ VINCI_VERO_IMAGES: "1" });
+  const fallbackRoot = join(testDir, "fallback");
+  const fallbackAssets = join(fallbackRoot, "assets", "vero");
+  mkdirSync(fallbackAssets, { recursive: true });
+  writeFileSync(join(fallbackAssets, "manifest.json"), JSON.stringify(manifest));
+  const fallbackUrl = pathToFileURL(`${fallbackRoot}/`);
+  check("missing assets retain the text path", veroImages.createVeroImages(fallbackUrl).size === 0);
+  writeFileSync(join(fallbackAssets, "vero-pixel.png"), assets.get("pixel"));
+  check("approved asset fallback positive control loads exact bytes", veroImages.createVeroImages(fallbackUrl).has("pixel"));
+  const corruptPixel = Buffer.from(assets.get("pixel"));
+  corruptPixel[corruptPixel.length - 1] ^= 1;
+  writeFileSync(join(fallbackAssets, "vero-pixel.png"), corruptPixel);
+  check("a corrupt asset with intact dimensions is rejected", !veroImages.createVeroImages(fallbackUrl).has("pixel"));
+
   for (const protocol of ["kitty", "iterm2", null]) {
-    presentationEnvironment({ VINCI_REDUCED_MOTION: "1" });
+    presentationEnvironment({ VINCI_REDUCED_MOTION: "1", VINCI_VERO_IMAGES: "1" });
     for (const themeName of ["dark", "light"]) {
       const ui = await registeredUi(protocol, 80, themeName);
       try {
@@ -217,7 +263,7 @@ try {
               const frame = await ui.frame();
               check(`${protocol ?? "text"} ${label} leaves the draft on the same row at ${width} columns`, frame.findIndex((line) =>
                 line.includes("UNSENT COMPOSER SENTINEL")) === composerRow && ui.editor.getText() === "UNSENT COMPOSER SENTINEL");
-              check(`${protocol ?? "text"} header retains its brand after ${label} at ${width} columns`, frame.some((line) => /v1nc1|𝐯𝟏𝐧𝐜𝟏/.test(line)));
+              check(`${protocol ?? "text"} header retains its brand after ${label} at ${width} columns`, frame.some((line) => line.includes(`Vinci v${productVersion}`)));
             }
           }
         }
@@ -229,7 +275,7 @@ try {
   }
 
   for (const protocol of ["kitty", "iterm2"]) {
-    presentationEnvironment({ VINCI_HERO_HEADER: "1", VINCI_REDUCED_MOTION: "1" });
+    presentationEnvironment({ VINCI_HERO_HEADER: "1", VINCI_REDUCED_MOTION: "1", VINCI_VERO_IMAGES: "1" });
     const ui = await registeredUi(protocol);
     try {
       const idle = ui.header.render(80);
@@ -241,7 +287,7 @@ try {
       const workingPayloads = working.map((line) => imagePayload([line], protocol)).filter(Boolean);
       check(`${protocol} hero working sends the approved working PNG without changing height`, working.length === idleHeight &&
         workingPayloads.some((payload) => payload.bytes.equals(assets.get("working"))));
-      check(`${protocol} hero working keeps its next action readable`, stripVTControlCharacters(withoutImages(working.join("\n"))).includes("Vero WORKING:"));
+      check(`${protocol} hero working keeps its identity and activity readable`, stripVTControlCharacters(withoutImages(working.join("\n"))).includes("Vero WORKING"));
     } finally {
       await ui.close();
     }
@@ -262,18 +308,21 @@ try {
     await nextActionUi.close();
   }
 
-  presentationEnvironment({ VINCI_REDUCED_MOTION: "1" });
+  presentationEnvironment({ VINCI_REDUCED_MOTION: "1", VINCI_VERO_IMAGES: "1" });
   const failedActivityUi = await registeredUi("kitty");
   try {
     await failedActivityUi.emit("agent_start");
     await failedActivityUi.emit("message_end", {
-      message: { role: "assistant", stopReason: "error", errorMessage: "Fixture provider returned 503." },
+      message: { role: "assistant", provider: "vinci", stopReason: "error", errorMessage: "Fixture provider returned 503." },
     });
     await failedActivityUi.emit("agent_end");
     check("a reported provider failure remains visibly blocked after activity ends", vero.getVeroPresentation().pose === "blocked" &&
       imagePayload(failedActivityUi.header.render(80), "kitty")?.bytes.equals(assets.get("blocked")));
     await failedActivityUi.emit("agent_start");
-    check("starting a new activity clears the prior provider blocker and shows working", vero.getVeroPresentation().pose === "working" &&
+    check("starting a new activity retains the unremediated provider blocker", vero.getVeroPresentation().pose === "blocked" &&
+      imagePayload(failedActivityUi.header.render(80), "kitty")?.bytes.equals(assets.get("blocked")));
+    await failedActivityUi.emit("message_end", { message: { role: "assistant", provider: "vinci", stopReason: "stop", content: [{ type: "text", text: "Observed successful response." }] } });
+    check("an observed successful same-provider response clears its blocker", vero.getVeroPresentation().pose === "working" &&
       imagePayload(failedActivityUi.header.render(80), "kitty")?.bytes.equals(assets.get("working")));
   } finally {
     await failedActivityUi.close();
@@ -283,7 +332,7 @@ try {
     ["NO_COLOR", { NO_COLOR: "" }], ["plain", { VINCI_PLAIN: "1" }],
     ["screen reader", { VINCI_SCREEN_READER: "1" }], ["dumb terminal", { TERM: "dumb" }],
   ]) {
-    presentationEnvironment({ ...environment, VINCI_HERO_HEADER: "1" });
+    presentationEnvironment({ ...environment, VINCI_HERO_HEADER: "1", VINCI_VERO_IMAGES: "1" });
     // A fresh module matches a fresh process's environment-derived wordmark selection.
     const plainLoader = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
     const plainHeader = await plainLoader.import(resolve(here, "../extensions/vinci-header.ts"), { default: false });
@@ -295,7 +344,7 @@ try {
       check(`${name} keeps an explicit DONE-UNVERIFIED text fallback without artwork`, plain.length === 5 &&
         stripVTControlCharacters(plain.join("\n")).includes("Vero DONE-UNVERIFIED") && !/\x1b_G|\x1b\]1337;File=|[\u2800-\u28ff]/.test(plain.join("\n")));
       check(`${name} header has no SGR colors or decorative wordmark glyphs`, !/\x1b|[\u2800-\u28ff]|𝐯|✹/.test(plain.join("\n")) &&
-        plain.join("\n").includes("v1nc1"));
+        plain.join("\n").includes("Vinci"));
     } finally {
       await ui.close();
     }

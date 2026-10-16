@@ -42,8 +42,8 @@ assert.ok(
   provider.includes(`vinciClassModel("${identity.defaultModel}", "${identity.defaultModelName}")`),
   "The default Vinci model is not registered",
 );
-assert.ok(header.includes(identity.tagline), "The Vinci tagline is missing from the header");
-assert.ok(header.includes(identity.defaultModelName), "The header fallback model no longer matches the identity contract");
+assert.ok(launcher.toLowerCase().includes(identity.tagline.toLowerCase()), "The Vinci tagline is missing from the launcher sign-off");
+assert.ok(header.includes("Choose a model: /model"), "An unset session model must not imply a configured provider route");
 assert.match(header, /import \{[^}]*VINCI_VERSION[^}]*\} from "\.\/lib\/product-identity\.ts"/, "The header must read Vinci's authoritative product identity");
 const productIdentity = read("vinci/extensions/lib/product-identity.ts");
 assert.match(productIdentity, /readFileSync\(new URL\("identity\.json", VINCI_ROOT\)/, "The header identity must be loaded from vinci/identity.json");

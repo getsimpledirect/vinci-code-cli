@@ -9,11 +9,11 @@ import { ENV_AGENT_DIR, getDocsPath } from "../src/config.ts";
 import type * as AuthGuidance from "../src/core/auth-guidance.ts";
 
 const managedMessage =
-	"You're not connected to Vinci yet. Type /login and authorize in your browser — it takes a few seconds, no key to paste.";
+	"Vero can't connect to Vinci yet. Type /login, choose Vinci, and complete sign-in in your browser.";
 const providers = [
-	{ id: "anthropic", name: "Anthropic", method: "Use an API key", env: "ANTHROPIC_API_KEY" },
-	{ id: "openai", name: "OpenAI", method: "Use an API key", env: "OPENAI_API_KEY" },
-	{ id: "openai-codex", name: "ChatGPT Plus/Pro (Codex Subscription)", method: "Use a subscription" },
+	{ id: "anthropic", name: "Anthropic", method: "API key", env: "ANTHROPIC_API_KEY" },
+	{ id: "openai", name: "OpenAI", method: "API key", env: "OPENAI_API_KEY" },
+	{ id: "openai-codex", name: "ChatGPT Plus/Pro (Codex Subscription)", method: "Provider account" },
 ] as const;
 const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 const extension = fileURLToPath(new URL("./fixtures/vinci-auth-faux-provider.ts", import.meta.url));
@@ -38,12 +38,14 @@ describe("Vinci selected-provider auth guidance", () => {
 		const guidance = await loadGuidance("1");
 		const message = guidance.formatNoApiKeyFoundMessage(provider.id);
 		expect(message).toContain(provider.name);
-		expect(message).toContain(provider.method);
+		expect(message).toContain(`"${provider.method}"`);
 		expect(message).toContain("/login");
 		if ("env" in provider) expect(message).toContain(provider.env);
 		else expect(message).not.toContain("API key");
 		expect(message).not.toContain("not connected to Vinci");
 		expect(message).not.toContain("no key to paste");
+		expect(message).not.toContain('"Use an API key"');
+		expect(message).not.toContain('"Use a subscription"');
 		expect(message).not.toContain(`/login ${provider.id}`);
 	});
 
@@ -51,8 +53,12 @@ describe("Vinci selected-provider auth guidance", () => {
 		const guidance = await loadGuidance("1");
 		expect(guidance.formatNoApiKeyFoundMessage("vinci")).toBe(managedMessage);
 		expect(guidance.getProviderLoginHelp()).toBe(managedMessage);
-		expect(guidance.formatNoModelsAvailableMessage()).toBe(managedMessage);
-		expect(guidance.formatNoModelSelectedMessage()).toBe(managedMessage);
+		expect(guidance.formatNoModelsAvailableMessage()).toBe(
+			"Vero can't start yet: no models are available. Use /login to check the account or provider, then /model to check its available models.",
+		);
+		expect(guidance.formatNoModelSelectedMessage()).toBe(
+			"Vero can't start yet: no model is selected. Use /model to choose one; if sign-in is needed, use /login.",
+		);
 	});
 
 	test.each(["custom-provider", "unknown", ""])("does not invent authentication for %j", async (provider) => {
@@ -155,7 +161,7 @@ describe("Vinci missing-auth executable contract (requires the offline build)", 
 	test.each([
 		{ id: "anthropic", model: "claude-haiku-4-5", expected: "ANTHROPIC_API_KEY" },
 		{ id: "openai", model: "gpt-5.5", expected: "OPENAI_API_KEY" },
-		{ id: "openai-codex", model: "gpt-5.5", expected: "Use a subscription" },
+		{ id: "openai-codex", model: "gpt-5.5", expected: '"Provider account"' },
 	])("rejects built-in $id selection without a credential or request", (provider) => {
 		const result = run(provider.id, "text", false, provider.model);
 		expect(result.status).toBe(1);

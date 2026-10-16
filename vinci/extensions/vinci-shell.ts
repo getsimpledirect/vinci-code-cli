@@ -5,9 +5,12 @@
  * chrome: a stateful composer border, honest connection state, mode/model/project orientation, and
  * the only continuous animation on screen while work is active.
  */
+import { createHash } from "node:crypto";
 import { basename, isAbsolute, relative, sep } from "node:path";
 import {
   CustomEditor,
+  formatVinciRecoveryMessage,
+  getVinciRecoveryGuidance,
   type ExtensionAPI,
   type ExtensionContext,
   type KeybindingsManager,
@@ -170,8 +173,10 @@ function formatProject(cwd: string, width: number): string {
   return fromHome !== ".." && !fromHome.startsWith(`..${sep}`) && !isAbsolute(fromHome) ? `~/${fromHome}` : cwd;
 }
 
-function authFailed(errorMessage: string | undefined): boolean {
-  return !!errorMessage && /\b401\b|\b403\b|unauthor|forbidden|invalid[_ -].*(key|token|credential)|not signed in|authentication/i.test(errorMessage);
+function recoveryTarget(toolName: string, input: unknown, cwd: string): string | undefined {
+  const args = input as { path?: unknown; command?: unknown } | undefined;
+  const target = toolName === "bash" ? args?.command : ["edit", "write", "read"].includes(toolName) ? args?.path : undefined;
+  return typeof target === "string" ? createHash("sha256").update(`${cwd}\0${toolName}\0${target}`).digest("hex") : undefined;
 }
 
 class EmptyFooter implements Component {
@@ -213,6 +218,19 @@ export default function (pi: ExtensionAPI) {
   let continuationWatchdog: ReturnType<typeof setTimeout> | undefined;
   let unsubscribeState: (() => void) | undefined;
   const verificationToolCallIds = new Set<string>();
+  let providerBlocker: { provider?: string; reason: string } | undefined;
+  let toolBlocker: { target?: string; reason: string } | undefined;
+  let displayedRecovery: string | undefined;
+  const publishRecovery = () => {
+    const reason = toolBlocker?.reason ?? providerBlocker?.reason;
+    if (reason) {
+      setVinciBlocker(reason);
+      displayedRecovery = getVinciUiState().blockingReason;
+    } else if (displayedRecovery && getVinciUiState().blockingReason === displayedRecovery) {
+      setVinciBlocker(undefined);
+      displayedRecovery = undefined;
+    }
+  };
 
   const requestRender = () => activeTui?.requestRender();
   const stopAnimation = () => {
@@ -238,6 +256,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     verificationToolCallIds.clear();
     resetShellUiState();
+    providerBlocker = undefined;
+    toolBlocker = undefined;
+    displayedRecovery = undefined;
     stopAnimation();
     clearContinuationWatchdog();
     unsubscribeState?.();
@@ -279,7 +300,7 @@ export default function (pi: ExtensionAPI) {
           state.connection === "connected"
             ? theme.fg("success", " ● connected ")
             : state.connection === "signed-in"
-              ? theme.fg("accent", " ● signed in ")
+              ? theme.fg("accent", " ● auth saved ")
               : state.connection === "reconnect"
                 ? theme.fg("warning", " ! reconnect ")
                 : state.connection === "signed-out"
@@ -354,7 +375,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
-    setVinciBlocker(undefined);
+    publishRecovery();
     verificationToolCallIds.clear();
     clearContinuationWatchdog();
     const continuing = getVinciUiState().continuationPending;
@@ -388,7 +409,21 @@ export default function (pi: ExtensionAPI) {
     setVinciWorkingLabel(vinciActivityForTool(event.toolName, event.input));
   });
 
-  pi.on("tool_result", (event) => {
+  pi.on("tool_result", (event, ctx) => {
+    const output = event.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? "";
+    const recovery = getVinciRecoveryGuidance(output);
+    if (event.isError && (recovery.kind === "sandbox" ||
+      (recovery.kind === "access" && /permission denied|operation not permitted|\b(?:EACCES|EPERM)\b/i.test(output)))) {
+      toolBlocker = { target: recoveryTarget(event.toolName, event.input, ctx.cwd), reason: formatVinciRecoveryMessage(output) };
+      publishRecovery();
+    } else if (!event.isError && toolBlocker?.target && toolBlocker.target === recoveryTarget(event.toolName, event.input, ctx.cwd)) {
+      const execution = (event.details as { execution?: { exitCode?: unknown; originalCommand?: unknown; cwd?: unknown } } | undefined)?.execution;
+      // A shell killed without a numeric exit is not proof that the denied command recovered.
+      if (event.toolName !== "bash" || (execution?.exitCode === 0 && execution.originalCommand === true && execution.cwd === ctx.cwd)) {
+        toolBlocker = undefined;
+        publishRecovery();
+      }
+    }
     if (verificationToolCallIds.size > 0) return;
     setVinciActivity(vinciActivityStateAfterTool());
     setVinciWorkingLabel(vinciActivityAfterTool(event.toolName, !!event.isError));
@@ -413,15 +448,24 @@ export default function (pi: ExtensionAPI) {
     setVinciWorkingLabel(vinciActivityAfterTool(event.toolName, !!event.isError));
   });
 
-  pi.on("message_end", (event) => {
+  pi.on("message_end", (event, ctx) => {
     const message = event.message;
     if (message.role !== "assistant") return;
     if (message.stopReason === "error") {
-      setVinciBlocker(message.errorMessage || "The provider could not complete this activity.");
-      if (authFailed(message.errorMessage)) setVinciConnection("reconnect");
+      const error = message.errorMessage || "The provider could not complete this activity.";
+      const provider = message.provider || ctx?.model?.provider;
+      providerBlocker = { provider, reason: formatVinciRecoveryMessage(error, provider) };
+      publishRecovery();
+      if (getVinciRecoveryGuidance(error, provider).kind === "authentication") setVinciConnection("reconnect");
       return;
     }
-    setVinciConnection("connected");
+    if (message.stopReason === "aborted") return;
+    const provider = message.provider || ctx?.model?.provider;
+    if (provider && providerBlocker?.provider === provider) {
+      providerBlocker = undefined;
+      publishRecovery();
+    }
+    if (!providerBlocker) setVinciConnection("connected");
   });
 
   pi.on("agent_end", () => {
@@ -457,5 +501,8 @@ export default function (pi: ExtensionAPI) {
     unsubscribeState?.();
     unsubscribeState = undefined;
     activeTui = undefined;
+    providerBlocker = undefined;
+    toolBlocker = undefined;
+    displayedRecovery = undefined;
   });
 }

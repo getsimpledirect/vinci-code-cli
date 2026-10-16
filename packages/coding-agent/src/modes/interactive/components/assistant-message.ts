@@ -1,6 +1,8 @@
+import { stripVTControlCharacters } from "node:util";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { getOverflowPatterns, isContextOverflow } from "@earendil-works/pi-ai";
 import { Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import { formatVinciRecoveryMessage, getVinciRecoveryGuidance } from "../../../core/auth-guidance.ts";
 import { vinciMaskSecrets } from "../../../core/vinci-mask-secrets.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 
@@ -15,6 +17,10 @@ const VINCI = process.env.VINCI_CODE === "1";
 // what the model reasons over keep the real value; only the on-screen string is redacted.
 const vinciMaskOut = (s: string): string => (VINCI ? vinciMaskSecrets(s) : s);
 const VINCI_OVERFLOW_LINE = "Context filled up — condensing the history and picking up where I left off…";
+function vinciErrorText(text: string): string {
+	// Node's stripper omits APC/DCS strings, including Kitty images. Error data is plain text.
+	return vinciMaskSecrets(stripVTControlCharacters(text.replace(/\x1b[_P^][\s\S]*?(?:\x1b\\|\x07|\x9c|$)/g, "")));
+}
 function vinciCalmsOverflow(message: AssistantMessage): boolean {
 	if (!VINCI || !message.errorMessage) return false;
 	// isContextOverflow covers the canonical stopReason==="error" case (the exact condition the
@@ -34,6 +40,13 @@ export function vinciFriendlyError(
 ): { text: string; tone: "muted" | "warning" } | null {
 	if (!vinci || !errorMessage) return null;
 	const m = errorMessage;
+	const recovery = getVinciRecoveryGuidance(m);
+	if (recovery.kind !== "unknown") {
+		return {
+			text: vinciErrorText(formatVinciRecoveryMessage(m)),
+			tone: recovery.kind === "provider-unavailable" ? "muted" : "warning",
+		};
+	}
 	if (/\b429\b|rate[_ ]?limit|too many requests|server busy|overloaded|quota/i.test(m)) {
 		return { text: "Vinci's servers are busy right now — give it a moment and try again.", tone: "muted" };
 	}
@@ -49,7 +62,7 @@ export function vinciFriendlyError(
 	// client-connection branch so a timeout/5xx never falls through to the "check your connection" copy.
 	if (/\b5\d\d\b|timeout|timed out|ETIMEDOUT|ECONNRESET|socket hang up|EPIPE/i.test(m)) {
 		return {
-			text: "Vinci's servers are having trouble right now — this is on our end, not your setup. Your progress is saved; give it a moment and try again.",
+			text: "Vinci's servers are having trouble right now — this is on our end, not your setup. Give it a moment and try again.",
 			tone: "muted",
 		};
 	}
@@ -84,7 +97,7 @@ export function vinciRetryFailureMessage(attempt: number, finalError: string | u
 		finalError &&
 		/\b5\d\d\b|timeout|timed out|ETIMEDOUT|ECONNRESET|socket hang up|EPIPE/i.test(finalError)
 	) {
-		return `Vinci's servers didn't respond after ${attempt} attempts — this is on our end. Your progress is saved; try again in a moment.`;
+		return `Vinci's servers didn't respond after ${attempt} attempts — this is on our end. Try again in a moment.`;
 	}
 	return `Retry failed after ${attempt} attempts: ${finalError || "Unknown error"}`;
 }
@@ -94,7 +107,7 @@ export function vinciRetryFailureMessage(attempt: number, finalError: string | u
 // dump (the guide: errors are styled blocks with a next step, not bare red text). Off → plain line.
 function vinciErrorLine(text: string, tone: "muted" | "warning" | "error"): string {
 	if (!VINCI) return theme.fg(tone, text);
-	return theme.fg(tone, "▎ ") + theme.fg(tone === "muted" ? "muted" : "text", text);
+	return theme.fg(tone, "▎ ") + theme.fg(tone === "muted" ? "muted" : "text", vinciErrorText(text));
 }
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";

@@ -1,6 +1,6 @@
-  ✹  Vinci code   ·   you're inside an agent, not the main chat
+  Vero · Crew   ·   you're inside an agent, not the main chat
 
-  Agent · agentname  ◐ working… · <time>
+  Agent · agentname  ◐ working · <time>
   Task: Test escape handling
   LIVE AGENT TRANSCRIPT SENTINEL
 

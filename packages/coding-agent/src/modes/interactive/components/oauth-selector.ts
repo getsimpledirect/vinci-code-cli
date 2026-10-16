@@ -5,11 +5,13 @@ import {
 	getKeybindings,
 	Input,
 	Spacer,
+	Text,
 	TruncatedText,
 } from "@earendil-works/pi-tui";
 import type { AuthStatus, AuthStorage } from "../../../core/auth-storage.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
+import { keyHint } from "./keybinding-hints.ts";
 
 export type AuthSelectorProvider = {
 	id: string;
@@ -66,8 +68,29 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 
 		// Add title
-		const title = mode === "login" ? "Select provider to configure:" : "Select provider to logout:";
+		const vinci = process.env.VINCI_CODE === "1";
+		const title = vinci
+			? mode === "login"
+				? "Vero - Connect"
+				: "Vero - Sign out"
+			: mode === "login"
+				? "Select provider to configure:"
+				: "Select provider to logout:";
 		this.addChild(new TruncatedText(theme.fg("accent", theme.bold(title)), 1, 0));
+		if (vinci) {
+			const method =
+				mode === "logout"
+					? "Stored credentials"
+					: providers.every((provider) => provider.authType === "oauth")
+						? "Provider account"
+						: providers.every((provider) => provider.authType === "api_key")
+							? "API key"
+							: "Provider account or API key";
+			this.addChild(new Text(theme.fg("dim", method), 1, 0));
+			this.addChild(
+				new Text(`${keyHint("tui.select.confirm", "choose")}\n${keyHint("tui.select.cancel", "back")}`, 1, 0),
+			);
+		}
 		this.addChild(new Spacer(1));
 
 		this.searchInput = new Input();

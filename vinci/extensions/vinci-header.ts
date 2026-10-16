@@ -1,19 +1,19 @@
 /**
  * Vinci Code welcome. Everyday sessions get a compact identity/safety header so work owns the
- * screen; VINCI_HERO_HEADER=1 enables the larger logo treatment for demos and first-run moments.
+ * screen; VINCI_HERO_HEADER=1 selects the approved rich Vero pose in an explicit image preview.
  * Additive: ctx.ui.setHeader on session_start (TUI only).
  *
  * Brand "Made, Not Generated." Cream #F4F1EC on sage #B8C5B0.
  */
 import { type ExtensionAPI, getAgentDir, type Theme } from "@earendil-works/pi-coding-agent";
-import { getCapabilities, Image, type ImageTheme, truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { closeSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
 import { join, sep } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { getVinciUiState, setVinciConnection } from "./lib/ui-state.ts";
-import { VINCI_ROOT, VINCI_VERSION } from "./lib/product-identity.ts";
-import { getVeroPresentation, vinciPlainPresentation, type VeroPose } from "./lib/vero-state.ts";
-import { createVeroImages, renderVeroHeader } from "./lib/vero-image.ts";
+import { VINCI_VERSION } from "./lib/product-identity.ts";
+import { getVeroPresentation, vinciPlainPresentation } from "./lib/vero-state.ts";
+import { createVeroImages, renderVeroHeader, veroImagesEnabled } from "./lib/vero-image.ts";
 import { VINCI_GATEWAY_BASE_URL, VINCI_PROD_GATEWAY_URL } from "./vinci-links.ts";
 
 // Both helpers below resolve the agent directory through the core's getAgentDir(). Restating it here
@@ -22,7 +22,7 @@ import { VINCI_GATEWAY_BASE_URL, VINCI_PROD_GATEWAY_URL } from "./vinci-links.ts
 // deliberately stayed ".pi". The stale literal read an env var nothing sets, so a user who moved
 // their agent directory was reported "not signed in" and had ~/.pi/agent created underneath them.
 
-/** Does a Vinci credential exist? This means signed in, not necessarily connected. */
+/** A saved credential is not proof that the provider accepted it. */
 function hasCredentials(): boolean {
   try {
     const data = JSON.parse(readFileSync(join(getAgentDir(), "auth.json"), "utf8"));
@@ -67,79 +67,6 @@ function claimThinkingHint(): boolean {
 }
 
 const PAD = "  "; // left margin
-
-// The Vinci logomark — our signature aperture maker's-mark: 12 filled, tangentially-oriented PETAL
-// blades radiating around a hollow centre. RASTERIZED (not dot-plotted) so it actually reads as the
-// logo: each petal is a filled ellipse drawn on a high-res sub-pixel grid (2×4 per character), then
-// downsampled to BRAILLE — packing 8 sub-pixels per cell for smooth, solid blades. Braille sub-pixels
-// are ~square, so the ring reads round. Modern terminals (incl. Ghostty) render this crisply; the
-// wordmark sits beside it. VINCI_ASCII_WORDMARK also swaps the mark to a simple ring for bare fonts.
-function logomark(cols = 22, rows = 8): string[] {
-  const W = cols * 2;
-  const H = rows * 4;
-  const cx = (W - 1) / 2;
-  const cy = (H - 1) / 2;
-  const R = 16; // ring radius (sub-px) — petal-centre distance from the middle
-  const len = 3.4; // petal half-length, tangential — short enough that the 12 blades stay DISTINCT
-  const wid = 2.9; // petal half-width, radial (blade thickness)
-  const inMark = (sx: number, sy: number): boolean => {
-    for (let i = 0; i < 12; i++) {
-      const ang = (i / 12) * 2 * Math.PI - Math.PI / 2;
-      const px = cx + R * Math.cos(ang);
-      const py = cy + R * Math.sin(ang);
-      const t = ang + Math.PI / 2; // petal long axis = tangential
-      const dx = sx - px;
-      const dy = sy - py;
-      const u = dx * Math.cos(t) + dy * Math.sin(t);
-      const v = -dx * Math.sin(t) + dy * Math.cos(t);
-      if ((u * u) / (len * len) + (v * v) / (wid * wid) <= 1) return true;
-    }
-    return false;
-  };
-  const bit = [
-    [0x01, 0x02, 0x04, 0x40],
-    [0x08, 0x10, 0x20, 0x80],
-  ];
-  const rowsOut: string[] = [];
-  for (let cyi = 0; cyi < rows; cyi++) {
-    let line = "";
-    for (let cxi = 0; cxi < cols; cxi++) {
-      let b = 0;
-      for (let dx = 0; dx < 2; dx++) {
-        for (let dy = 0; dy < 4; dy++) {
-          if (inMark(cxi * 2 + dx, cyi * 4 + dy)) b |= bit[dx][dy];
-        }
-      }
-      line += b === 0 ? " " : String.fromCharCode(0x2800 + b);
-    }
-    rowsOut.push(line);
-  }
-  return rowsOut;
-}
-const RING = logomark();
-
-// The Vinci wordmark, rendered as the brand logotype: an elegant lowercase SERIF "v1nci" with the
-// dotless i's as serifed 1's ("v1nc1") — the ownable brand signature. Unicode "mathematical bold
-// serif" letters/digits are real serif glyphs on modern terminal fonts. VINCI_ASCII_WORDMARK=1 forces
-// the plain fallback for terminals that can't render the math block.
-const SERIF_WORDMARK = "\u{1D42F}\u{1D7CF}\u{1D427}\u{1D41C}\u{1D7CF}"; // 𝐯𝟏𝐧𝐜𝟏
-const PLAIN_WORDMARK = "v1nc1";
-const WORDMARK = vinciPlainPresentation() || process.env.VINCI_ASCII_WORDMARK === "1" ? PLAIN_WORDMARK : SERIF_WORDMARK;
-
-// Vinci Code's OWN version — deliberately simple to start; bump it when we ship something worth
-// iterating on. (NOT the underlying Pi version, which is an internal detail.)
-
-// The REAL Vinci logo — the full lockup (maker's-mark + the actual serif "v1nc1" wordmark), cream on a
-// TRANSPARENT background (rendered from the official SVG), for terminals that draw images (Ghostty /
-// kitty / iTerm). Transparent = no square, blends on any theme. Loaded once; empty → braille fallback.
-let LOGO_B64 = "";
-try {
-  LOGO_B64 = readFileSync(new URL("assets/vinci-logo-lockup.png", VINCI_ROOT)).toString("base64");
-} catch {
-  /* asset missing → braille fallback */
-}
-const LOGO_DIMS = { widthPx: 1400, heightPx: 336 };
-const LOGO_CELLS = 30; // width of the inline logo, in terminal cells
 
 export function shortPath(p: string, w: number): string {
   const home = process.env.HOME;
@@ -195,99 +122,38 @@ function environmentBadge(theme: Theme): string | null {
   return theme.fg("warning", `▲ ${label}`);
 }
 
-// Model / cwd / help / example lines — shared by both header layouts.
-function connectionLabel(theme: Theme): string {
+// Network observations take precedence over credential presence.
+function connectionLabel(theme: Theme, width: number): string {
   const { sage, muted, dim } = colors(theme);
   const state = getVinciUiState().connection;
   // The environment badge leads the connection area so it survives narrow-width truncation.
   const badge = environmentBadge(theme);
   const lead = badge ? badge + dim("   ·   ") : "";
-  if (state === "connected") return lead + theme.fg("success", "● connected");
-  if (state === "signed-in") return lead + sage("● signed in");
-  if (state === "reconnect") return lead + theme.fg("warning", "! reconnect");
+  if (state === "connected") return lead + theme.fg("success", width < 40 ? "connected · ask" : "● connected");
+  if (state === "signed-in") return lead + sage(width < 40 ? "auth saved · ask" : "● credential saved");
+  if (state === "reconnect") return lead + theme.fg("warning", width < 40 ? "reconnect: /login" : "! reconnect");
   return lead + sage("/login") + muted(" to connect");
 }
 
-function infoLines(theme: Theme, modelName: string, cwd: string): string[] {
-  const { sage, cream, muted, dim } = colors(theme);
-  const ctx = PAD + cream(modelName) + dim("   ·   " + shortPath(cwd, 40));
-  const lead = connectionLabel(theme);
-  const sep = dim("     ·     ");
-  // Lead with what reassures a non-programmer: the safety net, plus the two most useful controls.
-  const tips =
-    PAD + lead + sep + sage("/undo") + muted(" to undo") + sep + sage("Ctrl+T") + muted(" thinking") + sep + sage("/thinking") + muted(" speed");
-  const examples =
-    PAD + muted("Try asking:  ") + sage("“build me a simple website”") + dim("   ·   ") + sage("“explain this project”");
-  return [ctx, tips, "", examples];
-}
-
-// Fallback header: the braille aperture mark beside the serif wordmark (no image support).
-function heroVeroInfo(theme: Theme, modelName: string, width: number, cwd: string, images: Map<VeroPose, Image>): string[] {
-  const vero = getVeroPresentation();
-  const image = images.get(vero.pose === "pixel" ? "rich" : vero.pose);
-  const showImage = width >= 40 && !vinciPlainPresentation() && process.env.VINCI_ASCII_WORDMARK !== "1" && !!getCapabilities().images && !!image;
-  const lines = infoLines(theme, modelName, cwd);
-  lines[2] = PAD + colors(theme).muted(`Vero ${vero.label}: ${vero.nextAction}`);
-  return renderVeroHeader(["", ...lines.map((line) => truncateToWidth(line, showImage ? width - 8 : width, "")), ""], image, width).slice(1, -1);
-}
-
-function fitHeaderLine(line: string, width: number): string {
-  // Images and adjacent text are fitted before insertion; text truncation corrupts their payload.
-  return line.includes("\x1b_G") || line.includes("\x1b]1337;File=") ? line : truncateToWidth(line, width, "");
-}
-
-function brailleHeader(theme: Theme, modelName: string, width: number, cwd: string, images: Map<VeroPose, Image>): string[] {
+// The product/version and Vero identity stay visible before optional context is clipped.
+function compactHeader(theme: Theme, modelName: string, width: number, cwd: string, short: boolean): string[] {
   const { sage, cream, muted, dim, bold } = colors(theme);
-  const GAP = "    ";
-  const nameRow = 3; // vertical centre of the 8-row mark
-  const brandName = cream(bold(WORDMARK)) + dim("   ·   ") + sage("code");
-  const brandTag = muted("Made, not generated.") + dim("   ·   v" + VINCI_VERSION);
-  const wm = RING.map(
-    (r, i) => PAD + cream(r) + GAP + (i === nameRow ? brandName : i === nameRow + 1 ? brandTag : ""),
-  );
-  return ["", ...wm, "", ...heroVeroInfo(theme, modelName, width, cwd, images), ""].map((line) => fitHeaderLine(line, width));
-}
-
-// Image header: the REAL Vinci logo (mark + serif wordmark) rendered inline (Ghostty/kitty/iTerm), with
-// the "code" + tagline as text beneath it. image.render() returns the graphics sequence + blank rows so
-// the TUI reserves height. The logo image already carries the wordmark, so no text wordmark here.
-function imageHeader(theme: Theme, image: Image, width: number, modelName: string, cwd: string, images: Map<VeroPose, Image>): string[] {
-  const { sage, muted, dim } = colors(theme);
-  const codeTag = PAD + sage("code") + dim("   ·   ") + muted("Made, not generated.") + dim("   ·   v" + VINCI_VERSION);
-  return ["", ...image.render(width), "", codeTag, "", ...heroVeroInfo(theme, modelName, width, cwd, images), ""].map((line) =>
-    fitHeaderLine(line, width),
-  );
-}
-
-// The everyday header is compact: brand, context, safety. The large logo remains available through
-// VINCI_HERO_HEADER=1 for demos and first-run experiences, but normal sessions preserve workspace.
-function compactHeader(theme: Theme, modelName: string, width: number, cwd: string): string[] {
-  const { sage, cream, muted, dim, bold } = colors(theme);
-  const brand =
-    PAD +
-    sage(bold(vinciPlainPresentation() ? "" : process.env.VINCI_ASCII_WORDMARK === "1" ? "*" : "✹")) +
-    "  " +
-    cream(bold(WORDMARK)) +
-    sage(" code") +
-    dim("   ·   ") +
-    muted("Made, not generated.") +
-    dim("   ·   v" + VINCI_VERSION);
+  const brand = PAD + cream(bold(`Vinci v${VINCI_VERSION}`)) + (width >= 40 ? sage(" Code") : "");
   const vero = getVeroPresentation();
-  const context = PAD + muted(`Vero ${vero.label}`) + dim("   ·   ") + cream(modelName) +
-    dim("   ·   " + shortPath(cwd, Math.max(16, width - 30)));
-  const safety =
-    PAD +
-    connectionLabel(theme) +
-    dim("   ·   ") +
-    sage("/undo") +
-    muted(" safety net") +
-    dim("   ·   ") +
-    sage("Ctrl+T") +
-    muted(" thinking") +
-    dim("   ·   ") +
-    sage("/thinking") +
-    muted(" speed");
-  return ["", brand, context, safety, ""].map((line) => truncateToWidth(line, width, ""));
+  const label = width < 28 && vero.label === "DONE-UNVERIFIED" ? "UNVERIFIED" : vero.label;
+  const model = width < 40 && modelName === "Choose a model: /model" ? "/model" : modelName;
+  const context = PAD + muted(`Vero ${label}`) + dim(width < 40 ? " " : " · ") + cream(model) +
+    (width >= 60 ? dim(" · " + shortPath(cwd, Math.max(16, width - 40))) : "");
+  const next = vero.label === "READY" ? "Ask Vero a task" : vero.nextAction;
+  let safety = PAD + (width < 40 && vero.label !== "READY"
+    ? muted(next)
+    : connectionLabel(theme, width) + (width >= 40 ? dim(" · ") + muted(next) : ""));
+  for (const hint of [sage("/undo"), sage("Ctrl+T") + muted(" thinking")]) {
+    const extended = safety + dim(" · ") + hint;
+    if (width >= 40 && visibleWidth(extended) <= width) safety = extended;
+  }
+  const lines = [brand, context, safety].map((line) => truncateToWidth(line, width, ""));
+  return short ? lines : ["", ...lines, ""];
 }
 
 export default function (pi: ExtensionAPI) {
@@ -297,26 +163,13 @@ export default function (pi: ExtensionAPI) {
     if (claimThinkingHint()) {
       ctx.ui.notify("Thinking is collapsed by default. Press Ctrl+T anytime to show or hide it.", "info");
     }
-    ctx.ui.setHeader((_tui, theme) => {
+    ctx.ui.setHeader((tui, theme) => {
       const veroImages = createVeroImages();
-      // Render the real logomark image where the terminal supports it (Ghostty/kitty/iTerm); otherwise
-      // the braille aperture. VINCI_ASCII_WORDMARK=1 also forces the no-image path. Built per-header so
-      // capability + theme are current.
-      const canImage = LOGO_B64 !== "" && !vinciPlainPresentation() && process.env.VINCI_ASCII_WORDMARK !== "1" && !!getCapabilities().images;
-      const image = canImage
-        ? new Image(
-            LOGO_B64,
-            "image/png",
-            { fallbackColor: (s: string) => theme.fg("dim", s) } satisfies ImageTheme,
-            { maxWidthCells: LOGO_CELLS },
-            LOGO_DIMS,
-          )
-        : undefined;
       return {
         render(width: number): string[] {
           // Read the model at render time so the header shows the REAL session model (it used to
           // hardcode the launch default — a /model switch left the header lying vs. the footer).
-          const modelName = ctx.model?.name ?? ctx.model?.id ?? "Vinci Forte (GLM 5.2)";
+          const modelName = ctx.model?.name ?? ctx.model?.id ?? "Choose a model: /model";
           // Same reason as the model name above: a value read once at startup goes stale in
           // place. The connection state was set only at session_start, so /logout left the
           // header saying "signed in" beside the auth picker it had just opened.
@@ -327,20 +180,15 @@ export default function (pi: ExtensionAPI) {
           if (conn === "signed-in" || conn === "signed-out") {
             setVinciConnection(hasCredentialsFresh() ? "signed-in" : "signed-out");
           }
-          if (vinciPlainPresentation()) {
-            return compactHeader(theme, modelName, width, ctx.cwd).map(stripVTControlCharacters);
-          }
-          if (process.env.VINCI_HERO_HEADER !== "1") {
-            const pose = getVeroPresentation().pose;
-            const showVero = width >= 40 && !vinciPlainPresentation() && process.env.VINCI_ASCII_WORDMARK !== "1" && !!getCapabilities().images && veroImages.has(pose);
-            return renderVeroHeader(compactHeader(theme, modelName, showVero ? width - 8 : width, ctx.cwd), veroImages.get(pose), width);
-          }
-          return image
-            ? imageHeader(theme, image, width, modelName, ctx.cwd, veroImages)
-            : brailleHeader(theme, modelName, width, ctx.cwd, veroImages);
+          const short = (tui?.terminal.rows ?? 24) < 12;
+          const presentation = getVeroPresentation();
+          const pose = process.env.VINCI_HERO_HEADER === "1" && presentation.pose === "pixel" ? "rich" : presentation.pose;
+          const showVero = !short && veroImagesEnabled(width) && veroImages.has(pose);
+          const lines = compactHeader(theme, modelName, showVero ? width - 8 : width, ctx.cwd, short);
+          if (vinciPlainPresentation()) return lines.map(stripVTControlCharacters);
+          return showVero ? renderVeroHeader(lines, veroImages.get(pose), width) : lines;
         },
         invalidate() {
-          image?.invalidate();
           for (const veroImage of veroImages.values()) veroImage.invalidate();
         },
       };

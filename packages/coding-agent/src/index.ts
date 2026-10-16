@@ -25,6 +25,11 @@ export {
 } from "./core/agent-session.ts";
 // Auth and model registry
 export {
+	formatVinciRecoveryMessage,
+	getVinciRecoveryGuidance,
+	type VinciRecoveryGuidance,
+} from "./core/auth-guidance.ts";
+export {
 	type ApiKeyCredential,
 	type AuthCredential,
 	type AuthStatus,
