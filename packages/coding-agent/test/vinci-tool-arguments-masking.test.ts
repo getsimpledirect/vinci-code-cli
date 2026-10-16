@@ -3,8 +3,8 @@ import { join } from "node:path";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
-	AssistantMessageEventStream,
 	type Context,
+	createAssistantMessageEventStream,
 	getModel,
 	type ToolCall,
 } from "@earendil-works/pi-ai/compat";
@@ -60,7 +60,7 @@ describe("Vinci malformed tool argument diagnostics", () => {
 		if (!tmpRoot) throw new Error("Set TMPDIR to the task's tmp directory before running this test.");
 		const directory = mkdtempSync(join(tmpRoot, "tool-arguments-mask-"));
 		const model = getModel("openai", "gpt-4o-mini")!;
-		const execute = vi.fn(async (_id: string, _args: { path: string; content: string }) => ({
+		const execute = vi.fn(async (_id: string, _args: unknown) => ({
 			content: [{ type: "text" as const, text: "accepted" }],
 			details: undefined,
 		}));
@@ -88,7 +88,7 @@ describe("Vinci malformed tool argument diagnostics", () => {
 			getApiKey: () => "offline-test-key",
 			streamFn: (_model, context: Context) => {
 				modelRequests.push(JSON.stringify(context.messages));
-				const stream = new AssistantMessageEventStream();
+				const stream = createAssistantMessageEventStream();
 				const message = responses.shift();
 				if (!message) throw new Error("Unexpected extra offline model request.");
 				queueMicrotask(() => {

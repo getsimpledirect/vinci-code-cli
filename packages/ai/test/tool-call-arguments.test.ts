@@ -47,7 +47,7 @@ describe("completed tool-call arguments", () => {
 
 	it.each(["[1,2]", '"str"'])("T1 rejects non-object JSON %s", (raw) => {
 		const result = parseToolCallArguments(raw);
-		expect(result.argumentsError).toContain("must be a JSON object");
+		expect(result.argumentsError ?? "").toContain("must be a JSON object");
 		expect(result.arguments).toEqual({});
 	});
 

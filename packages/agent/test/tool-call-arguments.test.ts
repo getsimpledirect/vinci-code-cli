@@ -1,4 +1,4 @@
-import { AssistantMessageEventStream, type Context, type ToolCall } from "@earendil-works/pi-ai";
+import { type Context, createAssistantMessageEventStream, type ToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamCompletions } from "../../ai/src/api/openai-completions.ts";
@@ -27,7 +27,7 @@ vi.mock("openai", () => ({
 }));
 
 const model = {
-	id: "offline", name: "offline", api: "openai-completions", provider: "vinci",
+	id: "offline", name: "offline", api: "openai-completions" as const, provider: "vinci",
 	baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024,
 } satisfies AgentLoopConfig["model"];
@@ -45,7 +45,7 @@ async function runCall(name: "write" | "edit", raw: string, options: {
 } = {}) {
 	provider.name = name;
 	provider.arguments = raw;
-	const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "executed" }], details: undefined }));
+	const execute = vi.fn(async (_id: string, _args: unknown) => ({ content: [{ type: "text" as const, text: "executed" }], details: undefined }));
 	const beforeToolCall = vi.fn(async () => undefined);
 	const tool: AgentTool = {
 		name, label: name, description: name, parameters: name === "write" ? writeSchema : editSchema,
@@ -53,9 +53,9 @@ async function runCall(name: "write" | "edit", raw: string, options: {
 	};
 	const contexts: Context[] = [];
 	const streamFn: StreamFn = (_model, context) => {
-		contexts.push(structuredClone(context));
+		contexts.push({ ...context, messages: structuredClone(context.messages) });
 		if (contexts.length === 1 && !options.call) return streamCompletions(model, context, { apiKey: "offline-test" });
-		const result = new AssistantMessageEventStream();
+		const result = createAssistantMessageEventStream();
 		const message = {
 			role: "assistant" as const, api: model.api, provider: model.provider, model: model.id,
 			content: contexts.length === 1 && options.call ? [options.call] : [{ type: "text" as const, text: "done" }],
