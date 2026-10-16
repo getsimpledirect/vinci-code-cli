@@ -13,6 +13,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
+import { canonicalVinciClass } from "./lib/vinci-class.ts";
 
 // vinci-model-classes 0.2.0, src/provenance.ts:22-27
 // (dist/provenance.d.ts:16-17). Pinned by private-contracts-drift.types.ts only.
@@ -35,6 +36,7 @@ type VinciModel = NonNullable<ExtensionContext["model"]>;
 interface RequestedModel {
   provider: string;
   model: string;
+  alias?: true;
 }
 
 interface ClientCapabilities {
@@ -57,6 +59,7 @@ interface SelectionRecord {
   schemaVersion: typeof SCHEMA_VERSION;
   event: "selected";
   requested: RequestedModel;
+  effectiveClass?: string;
   clientCapabilities: ClientCapabilities;
   clientCapabilityFingerprint: string;
   source: string;
@@ -66,6 +69,7 @@ interface ResolutionRecord {
   schemaVersion: typeof SCHEMA_VERSION;
   event: "resolved";
   requested: RequestedModel;
+  effectiveClass?: string;
   clientCapabilityFingerprint: string;
   resolved: ResolvedRoute;
 }
@@ -74,6 +78,7 @@ interface DriftRecord {
   schemaVersion: typeof SCHEMA_VERSION;
   event: "drift";
   requested: RequestedModel;
+  effectiveClass?: string;
   pinned: Omit<ResolvedRoute, "resolutionToken">;
   observed: Omit<ResolvedRoute, "resolutionToken">;
 }
@@ -97,8 +102,8 @@ interface PendingResponse {
 export type VinciModelFailureKind = "account" | "transient" | "unavailable" | "fatal";
 
 const VINCI_CLASS_RANK: Readonly<Record<string, number>> = {
-  forte: 0,
-  fortissimo: 1,
+  mezzo: 0,
+  forte: 1,
 };
 const ACCOUNT_ERROR =
   /\b(?:401|402|403|429)\b|insufficient[_ -]?(?:credits?|funds?|quota)|(?:credit|budget|quota|usage|plan|subscription)[_ -]?(?:exhausted|exceeded|limit|cap|reached)|(?:account )?balance.{0,24}(?:exhausted|insufficient|low|required)|out of (?:credits?|budget)|spend(?:ing)?[_ -]?(?:limit|cap)|billing|payment required|card declined|rate[_ -]?limit|too many requests|unauthori[sz]ed|forbidden|invalid (?:api )?key|expired (?:api )?(?:key|token)|authentication|auth(?:entication)? failed|permission denied|entitlement|not entitled|subscription required|plan limit/i;
@@ -157,7 +162,7 @@ export function assertSuccessfulVinciCompletion(
 }
 
 function normalizedVinciClass(value: string): string {
-  return value.toLowerCase().replace(/^vinci\//, "").trim();
+  return canonicalVinciClass(value).trim().toLowerCase().replace(/^vinci\//, "");
 }
 
 export function isCheaperVinciClass(requested: string, served: string): boolean {
@@ -171,7 +176,12 @@ function sameRequested(left: RequestedModel, right: RequestedModel): boolean {
 }
 
 function requestedFrom(model: VinciModel): RequestedModel {
-  return { provider: model.provider, model: model.id };
+  const original = (model as VinciModel & { vinciRequestedClass?: string }).vinciRequestedClass ?? model.id;
+  return {
+    provider: model.provider,
+    model: original,
+    ...(canonicalVinciClass(original) !== original ? { alias: true as const } : {}),
+  };
 }
 
 export function clientCapabilitiesFor(model: VinciModel): ClientCapabilities {
@@ -300,7 +310,10 @@ function restoreActive(entries: ReturnType<ExtensionContext["sessionManager"]["g
     if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE || !isRecord(entry.data)) continue;
     const record = entry.data;
     if (record.event === "selected") {
-      active = sameRequested(record.requested, requested) ? { selection: record } : undefined;
+      // A historical alias pin may identify its retired occupant. Preserve the record, but
+      // establish a new Forte route rather than carrying that occupant's token forward.
+      active = sameRequested(record.requested, requested) &&
+        (!requested.alias || record.effectiveClass === "forte") ? { selection: record } : undefined;
       continue;
     }
     if (!active || !sameRequested(record.requested, active.selection.requested)) continue;
@@ -311,12 +324,22 @@ function restoreActive(entries: ReturnType<ExtensionContext["sessionManager"]["g
 }
 
 function routeLabel(route: ResolvedRoute): string {
-  return route.version ? `${route.model} (${route.version})` : route.model;
+  const label = canonicalVinciClass(route.model) !== route.model ? "Vinci Forte" : route.model;
+  return route.version ? `${label} (${route.version})` : label;
 }
 
 export default function (pi: ExtensionAPI) {
   let active: ActiveProvenance | undefined;
   let pendingResponse: PendingResponse | undefined;
+  const aliasNotedSessions = new Set<string>();
+
+  const explainAlias = (model: VinciModel, ctx: ExtensionContext): void => {
+    if (model.provider !== "vinci" || !requestedFrom(model).alias) return;
+    const sessionId = ctx.sessionManager.getSessionId?.() ?? "current";
+    if (aliasNotedSessions.has(sessionId)) return;
+    aliasNotedSessions.add(sessionId);
+    ctx.ui.notify("Vinci Fortissimo now uses Vinci Forte", "info");
+  };
 
   const select = (model: VinciModel, source: string): void => {
     pendingResponse = undefined;
@@ -329,6 +352,7 @@ export default function (pi: ExtensionAPI) {
       schemaVersion: SCHEMA_VERSION,
       event: "selected",
       requested: requestedFrom(model),
+      effectiveClass: normalizedVinciClass(model.id),
       clientCapabilities: capabilities,
       clientCapabilityFingerprint: fingerprintCapabilities(capabilities),
       source,
@@ -344,11 +368,13 @@ export default function (pi: ExtensionAPI) {
       active = undefined;
       return;
     }
+    explainAlias(model, ctx);
     active = restoreActive(ctx.sessionManager.getBranch(), requestedFrom(model));
     if (!active) select(model, event.reason);
   });
 
-  pi.on("model_select", (event) => {
+  pi.on("model_select", (event, ctx) => {
+    explainAlias(event.model, ctx);
     const requested = requestedFrom(event.model);
     if (event.source === "restore" && active && sameRequested(active.selection.requested, requested)) return;
     select(event.model, event.source);
@@ -357,6 +383,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_provider_headers", (event, ctx) => {
     const model = ctx.model;
     if (!model || model.provider !== "vinci") return;
+    explainAlias(model, ctx);
 
     // Attribution: the gateway records which client app spent the tokens. Set before the
     // provenance bookkeeping below so it does not depend on selection state.
@@ -366,7 +393,7 @@ export default function (pi: ExtensionAPI) {
     if (!active || !sameRequested(active.selection.requested, requested)) select(model, "request");
     if (!active) return;
 
-    if (model.id !== AUTO_MODEL) event.headers[REQUESTED_TIER_HEADER] = model.id;
+    if (model.id !== AUTO_MODEL) event.headers[REQUESTED_TIER_HEADER] = requested.model;
     event.headers[CLIENT_CAPABILITY_HEADER] = active.selection.clientCapabilityFingerprint;
     if (active.resolution?.resolutionToken) {
       event.headers[RESOLUTION_TOKEN_HEADER] = active.resolution.resolutionToken;
@@ -400,8 +427,13 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", (event, ctx) => {
     const message = event.message;
     if (message.role !== "assistant" || message.provider !== "vinci") return;
-    const requested = { provider: message.provider, model: message.model };
-    const response = pendingResponse && sameRequested(pendingResponse.requested, requested) ? pendingResponse : undefined;
+    const matchesMessage = (requested: RequestedModel) =>
+      requested.provider === message.provider &&
+      canonicalVinciClass(requested.model) === canonicalVinciClass(message.model);
+    const response = pendingResponse && matchesMessage(pendingResponse.requested) ? pendingResponse : undefined;
+    const requested = response?.requested ??
+      (active && matchesMessage(active.selection.requested) ? active.selection.requested :
+        { provider: message.provider, model: message.model });
     pendingResponse = undefined;
     if (message.stopReason === "error" || message.stopReason === "aborted") return;
 
@@ -422,7 +454,7 @@ export default function (pi: ExtensionAPI) {
       resolvedModel = streamedModel;
       evidence = "response-stream";
     } else if (!active.resolution && requested.model !== AUTO_MODEL) {
-      resolvedModel = requested.model;
+      resolvedModel = canonicalVinciClass(requested.model);
       evidence = "requested-model";
     } else if (active.resolution && (response?.version || response?.capabilityFingerprint || response?.resolutionToken)) {
       resolvedModel = active.resolution.model;
@@ -440,7 +472,7 @@ export default function (pi: ExtensionAPI) {
 
     if (
       active.resolution?.evidence === "requested-model" &&
-      active.resolution.model === requested.model &&
+      active.resolution.model === canonicalVinciClass(requested.model) &&
       isStrongerEvidence(active.resolution.evidence, observed.evidence)
     ) {
       active.resolution = undefined;
@@ -453,6 +485,7 @@ export default function (pi: ExtensionAPI) {
           schemaVersion: SCHEMA_VERSION,
           event: "drift",
           requested,
+          effectiveClass: active.selection.effectiveClass ?? normalizedVinciClass(requested.model),
           pinned: withoutToken(active.resolution),
           observed: withoutToken(observed),
         };
@@ -475,6 +508,7 @@ export default function (pi: ExtensionAPI) {
       schemaVersion: SCHEMA_VERSION,
       event: "resolved",
       requested,
+      effectiveClass: active.selection.effectiveClass ?? normalizedVinciClass(requested.model),
       clientCapabilityFingerprint: active.selection.clientCapabilityFingerprint,
       resolved: merged,
     };
@@ -489,10 +523,14 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Model provenance is available for Vinci sessions only.", "info");
         return;
       }
-      const requested = `${model.provider}/${model.id}`;
+      const selection = requestedFrom(model);
+      const requested = selection.alias
+        ? `Vinci Forte (alias selection: ${selection.model})`
+        : `${model.provider}/${model.id}`;
       const current = active && sameRequested(active.selection.requested, requestedFrom(model)) ? active : undefined;
       const lines = [
         `Requested: ${requested}`,
+        ...(selection.alias ? ["Effective class: Vinci Forte"] : []),
         `Resolved: ${current?.resolution ? routeLabel(current.resolution) : "awaiting gateway provenance"}`,
         `Client capabilities: ${current?.selection.clientCapabilityFingerprint ?? fingerprintCapabilities(clientCapabilitiesFor(model))}`,
         `Server capabilities: ${current?.resolution?.capabilityFingerprint ?? "not reported"}`,

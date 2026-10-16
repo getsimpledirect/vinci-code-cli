@@ -32,6 +32,7 @@ import { execFileSync } from "node:child_process";
 import { relative, resolve } from "node:path";
 import { classifyCompletionResult, complete, type UserMessage } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { canonicalVinciClass } from "./lib/vinci-class.ts";
 import { clearVinciAutomationStop, requestVinciAutomationStop, sendVinciControl } from "./lib/control.ts";
 import {
   clearVinciHardStop,
@@ -163,7 +164,7 @@ const POST_MUTATION_STEER =
   "answer. A targeted source read remains available if exact repair lines are still missing.";
 const RECENT_KEEP = 6; // recent (call, result) pairs kept for escalation context
 const ESCALATE_TIMEOUT_MS = 9000; // never let a stronger-model hand-off hang the session
-const TIER_ORDER = ["forte", "fortissimo"];
+const TIER_ORDER = ["forte"];
 const SAME_CLASS_ATTEMPTS = 2;
 
 const TRY_DIFFERENT =
@@ -450,7 +451,7 @@ export async function getUnstuck(ctx: ExtensionContext, stuckKey: string, recent
   const unavailableClasses: string[] = [];
 
   // Climb to the strongest tier ABOVE the current model that actually answers.
-  const idx = TIER_ORDER.indexOf(ctx.model.id);
+  const idx = TIER_ORDER.indexOf(canonicalVinciClass(ctx.model.id));
   if (idx >= 0) {
     for (let i = TIER_ORDER.length - 1; i > idx; i--) {
       const classId = TIER_ORDER[i];
@@ -497,8 +498,8 @@ export async function getUnstuck(ctx: ExtensionContext, stuckKey: string, recent
   const fallbackNotice =
     unavailableClasses.length > 0
       ? `Stronger Vinci ${unavailableClasses.join(", ")} ${unavailableClasses.length === 1 ? "class is" : "classes are"} unavailable. Loop recovery will be served by ${ctx.model.name ?? ctx.model.id}; Vinci is not silently selecting a cheaper class.`
-      : undefined;
-  if (fallbackNotice) announce(fallbackNotice, "warning");
+      : `No stronger Vinci class was used; loop recovery takes a fresh look with the same model (${ctx.model.name ?? ctx.model.id}).`;
+  if (unavailableClasses.length > 0) announce(fallbackNotice, "warning");
   try {
     const attemptSignal = AbortSignal.timeout(ESCALATE_TIMEOUT_MS);
     const response = await complete(

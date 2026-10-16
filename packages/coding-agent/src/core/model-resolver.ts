@@ -6,12 +6,53 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type Api, type KnownProvider, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { minimatch } from "minimatch";
+import { canonicalVinciClass } from "../../../../vinci/extensions/lib/vinci-class.ts";
 import { isValidThinkingLevel } from "../cli/args.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 
 export function isManagedVinciProvider(provider: string | undefined): boolean {
 	return provider?.toLowerCase() === "vinci";
+}
+
+type VinciSelectionModel = Model<Api> & { vinciRequestedClass?: string };
+
+function withRequestedVinciAlias(model: Model<Api> | undefined, requestedId: string): Model<Api> | undefined {
+	if (model && isManagedVinciProvider(model.provider) && canonicalVinciClass(requestedId) !== requestedId) {
+		return { ...model, vinciRequestedClass: "fortissimo" } as VinciSelectionModel;
+	}
+	return model;
+}
+
+/** Resolve legacy selections before registry lookup without changing shared registry models. */
+export function findModelWithVinciAlias(
+	modelRegistry: ModelRegistry,
+	provider: string,
+	modelId: string,
+	requestedId = modelId,
+): Model<Api> | undefined {
+	const effectiveId = isManagedVinciProvider(provider) ? canonicalVinciClass(modelId) : modelId;
+	const model = modelRegistry.find(provider, effectiveId);
+	return withRequestedVinciAlias(model, requestedId);
+}
+
+/** Preserve a user's alias in newly appended settings/session entries, while requests use the effective model. */
+export function requestedModelId(model: Model<Api>): string {
+	return isManagedVinciProvider(model.provider)
+		? ((model as VinciSelectionModel).vinciRequestedClass ?? model.id)
+		: model.id;
+}
+
+/** SDK callers can still pass a historical model object rather than a registered selection. */
+export function canonicalizeManagedVinciModel(model: Model<Api>, modelRegistry: ModelRegistry): Model<Api> {
+	if (!isManagedVinciProvider(model.provider) || canonicalVinciClass(model.id) === model.id) return model;
+	const resolved = findModelWithVinciAlias(modelRegistry, model.provider, model.id);
+	if (!resolved) {
+		throw new Error(
+			`Managed Vinci model vinci/${model.id} is unavailable. Vinci will not substitute a different model for this session.`,
+		);
+	}
+	return resolved;
 }
 
 /** Default model IDs for each known provider */
@@ -81,6 +122,13 @@ export function findExactModelReferenceMatch(
 	modelReference: string,
 	availableModels: Model<Api>[],
 ): Model<Api> | undefined {
+	if (canonicalVinciClass(modelReference) !== modelReference) {
+		const model = availableModels.find(
+			(candidate) => isManagedVinciProvider(candidate.provider) && candidate.id === "forte",
+		);
+		return withRequestedVinciAlias(model, modelReference);
+	}
+
 	const trimmedReference = modelReference.trim();
 	if (!trimmedReference) {
 		return undefined;
@@ -402,6 +450,19 @@ export function resolveCliModel(options: {
 		};
 	}
 
+	if (!provider || isManagedVinciProvider(provider)) {
+		const alias = parseModelPattern(
+			cliModel,
+			availableModels.filter((model) => isManagedVinciProvider(model.provider)),
+			{
+				allowInvalidThinkingLevelFallback: false,
+			},
+		);
+		if (alias.model && (alias.model as VinciSelectionModel).vinciRequestedClass) {
+			return { ...alias, error: undefined };
+		}
+	}
+
 	// If no explicit --provider, try to interpret "provider/model" format first.
 	// When the prefix before the first slash matches a known provider, prefer that
 	// interpretation over matching models whose IDs literally contain slashes
@@ -602,7 +663,7 @@ export async function findInitialModel(options: {
 
 	// 3. Try saved default from settings if auth is configured.
 	if (defaultProvider && defaultModelId) {
-		const found = modelRegistry.find(defaultProvider, defaultModelId);
+		const found = findModelWithVinciAlias(modelRegistry, defaultProvider, defaultModelId);
 		if (found && modelRegistry.hasConfiguredAuth(found)) {
 			model = found;
 			if (defaultThinkingLevel) {
@@ -650,14 +711,14 @@ export async function restoreModelFromSession(
 	shouldPrintMessages: boolean,
 	modelRegistry: ModelRegistry,
 ): Promise<{ model: Model<Api> | undefined; fallbackMessage: string | undefined }> {
-	const restoredModel = modelRegistry.find(savedProvider, savedModelId);
+	const restoredModel = findModelWithVinciAlias(modelRegistry, savedProvider, savedModelId);
 
 	// Check if restored model exists and still has auth configured
 	const hasConfiguredAuth = restoredModel ? modelRegistry.hasConfiguredAuth(restoredModel) : false;
 
 	if (restoredModel && hasConfiguredAuth) {
 		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Restored model: ${savedProvider}/${savedModelId}`));
+			console.log(chalk.dim(`Restored model: ${restoredModel.provider}/${restoredModel.id}`));
 		}
 		return { model: restoredModel, fallbackMessage: undefined };
 	}

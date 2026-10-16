@@ -1,8 +1,8 @@
 /**
  * Vinci advisor — the cheap, fast second opinion (Claude Code's `advisor`, done our way). When
  * Vinci is unsure about a SPECIFIC thing mid-task and just wants a quick gut-check — not several
- * angles — it calls `advisor`: ONE question to the STRONGEST available model. Cost-efficient (a
- * single call) and, unlike the council, it escalates to a bigger brain for the actual opinion.
+ * angles — it calls `advisor`: ONE question to an available advisor model. Cost-efficient (a
+ * single call), with an explicit self-review when no stronger class is available.
  *
  * The pairing: `advisor` = fast single strong opinion · `convene_council` = deep multi-angle.
  *
@@ -14,6 +14,7 @@
 import { classifyCompletionResult, complete, type UserMessage } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { canonicalVinciClass } from "./lib/vinci-class.ts";
 import {
   installVinciUsageAccumulator,
   recordVinciTaskCall,
@@ -28,7 +29,7 @@ type CtxModel = NonNullable<ExtensionContext["model"]>;
 type Registry = ExtensionContext["modelRegistry"];
 type CompleteOpts = { apiKey: string; headers?: Record<string, string>; env?: Record<string, string>; signal?: AbortSignal };
 
-const TIER_ORDER = ["forte", "fortissimo"];
+const TIER_ORDER = ["forte"];
 const AUTO_CLASS = "auto"; // server-resolved; see askStronger (#182)
 const ADVISOR_TIMEOUT_MS = 9000; // never let a stronger-model opinion hang the turn — degrade to self-review
 const SAME_CLASS_ATTEMPTS = 2;
@@ -72,11 +73,11 @@ export async function askStronger(
   // #182: "auto" is resolved SERVER-side, so the client cannot know its concrete class — and the
   // old TIER_ORDER.indexOf("auto") === -1 made the default setting return here silently, turning
   // every advisor request into an undisclosed self-review. Treat auto as "escalate to the top
-  // class": at worst that equals what auto would have served, never weaker, and the reply is
-  // labelled with the class that actually answered.
-  const idx = model.id === AUTO_CLASS ? TIER_ORDER.length - 2 : TIER_ORDER.indexOf(model.id);
+  // class". Auto's effective class is unknown, so the reply names the serving class without
+  // claiming it is stronger. Start below the first tier so a one-tier list still yields an opinion.
+  const idx = model.id === AUTO_CLASS ? -1 : TIER_ORDER.indexOf(canonicalVinciClass(model.id));
   // An id we cannot place at all must fail HONEST, not silently (#182).
-  if (idx < 0) return { unavailableClasses, unknownClass: model.id !== AUTO_CLASS };
+  if (idx < 0 && model.id !== AUTO_CLASS) return { unavailableClasses, unknownClass: true };
   for (let i = TIER_ORDER.length - 1; i > idx; i--) {
     const classId = TIER_ORDER[i];
     const m = registry.find("vinci", classId) as CtxModel | undefined;
@@ -98,7 +99,7 @@ export async function askStronger(
           unavailableClasses.push(classId);
           break;
         }
-        recordVinciTaskCall(taskId, r, "advisor:stronger");
+        recordVinciTaskCall(taskId, r, model.id === AUTO_CLASS ? "advisor:opinion" : "advisor:stronger");
         return { answer: { text: textOf(r), model: m }, unavailableClasses };
       } catch (error) {
         const kind = classifyVinciModelError(error);
@@ -132,7 +133,7 @@ export default function (pi: ExtensionAPI) {
     name: "advisor",
     label: "Advisor",
     description:
-      "Get a QUICK second opinion from a stronger advisor model — a fast gut-check before you commit, " +
+      "Get a QUICK focused advisor opinion — a fast gut-check before you commit, " +
       "cheaper than convening the full council (one call, not several). Use it mid-task to sanity-check " +
       "a SPECIFIC approach or decision when you just want one strong opinion; use convene_council when a " +
       "decision genuinely deserves several independent angles.",
@@ -175,16 +176,21 @@ export default function (pi: ExtensionAPI) {
         throw error;
       }
       if (stronger.answer) {
-        return { content: [{ type: "text", text: `${stronger.answer.model.name ?? stronger.answer.model.id} advises:\n\n${stronger.answer.text}` }], details: reviewedDetails };
+        const disclosure = ctx.model.id === AUTO_CLASS
+          ? "Auto's effective class is server-resolved; no stronger class is claimed.\n\n"
+          : "";
+        return { content: [{ type: "text", text: `${disclosure}${stronger.answer.model.name ?? stronger.answer.model.id} advises:\n\n${stronger.answer.text}` }], details: reviewedDetails };
       }
       const fallbackNotice =
         stronger.unavailableClasses.length > 0
-          ? `Stronger Vinci ${stronger.unavailableClasses.join(", ")} ${stronger.unavailableClasses.length === 1 ? "class is" : "classes are"} unavailable. This advisor request will be served by ${ctx.model.name ?? ctx.model.id}; Vinci is not silently selecting a cheaper class.`
+          ? `Vinci ${stronger.unavailableClasses.join(", ")} advisor ${stronger.unavailableClasses.length === 1 ? "class is" : "classes are"} unavailable. This is a self-review by ${ctx.model.name ?? ctx.model.id}; no stronger class is claimed. Vinci is not silently selecting a cheaper class.`
           : stronger.unknownClass
             ? `Vinci can't identify a class stronger than ${ctx.model.name ?? ctx.model.id}, so this is a self-review by the same model rather than a second opinion from a stronger one.`
-            : undefined;
+            : `No stronger Vinci class is available above ${ctx.model.name ?? ctx.model.id}; this is a self-review by the same model.`;
       if (fallbackNotice) {
-        if (ctx.hasUI) ctx.ui.notify(fallbackNotice, "warning");
+        const level = stronger.unavailableClasses.length > 0 ? "warning" : "info";
+        if (ctx.hasUI) ctx.ui.notify(fallbackNotice, level);
+        else if (level === "info") console.info(fallbackNotice);
         else console.error(fallbackNotice);
       }
       let self: Awaited<ReturnType<typeof complete>>;

@@ -11,7 +11,7 @@ const { runCouncil } = await loader.import(resolve(here, "../extensions/vinci-co
 const councilFaux = registerFauxProvider({
 	api: "faux:council-empty-chair",
 	provider: "faux-council-empty-chair",
-	models: [{ id: "fortissimo" }],
+	models: [{ id: "forte" }],
 });
 try {
 	councilFaux.setResponses([
@@ -22,7 +22,7 @@ try {
 		fauxAssistantMessage("  \n"),
 	]);
 	const result = await runCouncil(
-		councilFaux.getModel("fortissimo"),
+		councilFaux.getModel("forte"),
 		{ apiKey: "faux-key" },
 		"Which option should we choose?",
 		{ find: () => undefined },

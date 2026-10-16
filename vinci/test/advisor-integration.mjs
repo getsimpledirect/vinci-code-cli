@@ -77,45 +77,45 @@ console.log("advisor-integration: completion-status 4/4 passed");
 const strongerFaux = registerFauxProvider({
 	api: "faux:advisor-empty",
 	provider: "faux-advisor-empty",
-	models: [{ id: "fortissimo" }],
+	models: [{ id: "forte" }],
 });
 try {
 	strongerFaux.setResponses([fauxAssistantMessage("  \n")]);
 	const stronger = await extension.askStronger(
-		{ id: "forte", provider: "vinci" },
-		{ find: (_provider, id) => id === "fortissimo" ? strongerFaux.getModel("fortissimo") : undefined },
+		{ id: "auto", provider: "vinci" },
+		{ find: (_provider, id) => id === "forte" ? strongerFaux.getModel("forte") : undefined },
 		{ apiKey: "faux-key" },
 		"Review this approach",
 		"advisor-empty-test",
 	);
-	assert.deepEqual(stronger, { unavailableClasses: ["fortissimo"] });
+	assert.deepEqual(stronger, { unavailableClasses: ["forte"] });
 	assert.equal(strongerFaux.state.callCount, 1, "deterministic empty output must not retry the same class");
 } finally {
 	strongerFaux.unregister();
 }
 
-console.log("advisor-integration: empty stronger tier degradation passed");
+console.log("advisor-integration: empty available advisor opinion degradation passed");
 
 // #182: on the DEFAULT "auto" model the old code returned before attempting any escalation, with an
 // empty unavailableClasses — so the advisor silently became a self-review and nothing disclosed it.
 const autoFaux = registerFauxProvider({
 	api: "faux:advisor-auto",
 	provider: "faux-advisor-auto",
-	models: [{ id: "fortissimo" }],
+	models: [{ id: "forte" }],
 });
 try {
-	autoFaux.setResponses([fauxAssistantMessage("Fortissimo's considered opinion.")]);
+	autoFaux.setResponses([fauxAssistantMessage("Forte's considered opinion.")]);
 	const fromAuto = await extension.askStronger(
 		{ id: "auto", provider: "vinci" },
-		{ find: (_p, id) => (id === "fortissimo" ? autoFaux.getModel("fortissimo") : undefined) },
+		{ find: (_p, id) => (id === "forte" ? autoFaux.getModel("forte") : undefined) },
 		{ apiKey: "faux-key" },
 		"Is this approach sound?",
 		"advisor-auto-test",
 	);
-	assert.equal(fromAuto.answer?.text, "Fortissimo's considered opinion.", "auto must escalate to the top class");
-	assert.equal(fromAuto.answer?.model.id, "fortissimo", "the answering class is the strongest one");
-	assert.equal(autoFaux.state.callCount, 1, "auto escalates once, to the top class only (never down to forte)");
-	assert.notEqual(fromAuto.unknownClass, true, "auto is escalatable, not an unknown class");
+	assert.equal(fromAuto.answer?.text, "Forte's considered opinion.", "Auto must retain its available Forte opinion");
+	assert.equal(fromAuto.answer?.model.id, "forte", "the answering class is Forte");
+	assert.equal(autoFaux.state.callCount, 1, "Auto obtains one available opinion");
+	assert.notEqual(fromAuto.unknownClass, true, "Auto is a known selection");
 } finally {
 	autoFaux.unregister();
 }
@@ -131,4 +131,4 @@ const unknown = await extension.askStronger(
 assert.equal(unknown.answer, undefined, "an unplaceable class yields no stronger answer");
 assert.equal(unknown.unknownClass, true, "and it is flagged so the caller can disclose it");
 
-console.log("advisor-integration: auto escalates and unknown classes disclose (#182)");
+console.log("advisor-integration: Auto obtains an opinion and unknown classes disclose (#182)");

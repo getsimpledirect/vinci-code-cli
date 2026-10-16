@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
+import { canonicalVinciClass } from "../../../../vinci/extensions/lib/vinci-class.ts";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
@@ -10,7 +11,13 @@ import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
-import { findInitialModel, isManagedVinciProvider } from "./model-resolver.ts";
+import {
+	canonicalizeManagedVinciModel,
+	findInitialModel,
+	findModelWithVinciAlias,
+	isManagedVinciProvider,
+	requestedModelId,
+} from "./model-resolver.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -131,8 +138,8 @@ function getDefaultAgentDir(): string {
 }
 
 const MANAGED_VINCI_CLASS_RANK: Readonly<Record<string, number>> = {
-	forte: 0,
-	fortissimo: 1,
+	mezzo: 0,
+	forte: 1,
 };
 
 function providerHeader(headers: Record<string, string>, name: string): string | undefined {
@@ -149,10 +156,17 @@ export function assertNoManagedVinciDowngrade(
 	headers: Record<string, string>,
 ): void {
 	if (!isManagedVinciProvider(model.provider)) return;
-	const served = providerHeader(headers, "x-vinci-resolved-model")
-		?.toLowerCase()
+	const servedHeader = providerHeader(headers, "x-vinci-resolved-model");
+	const served = servedHeader
+		? canonicalVinciClass(servedHeader)
+				.trim()
+				.toLowerCase()
+				.replace(/^vinci\//, "")
+		: undefined;
+	const requested = canonicalVinciClass(model.id)
+		.trim()
+		.toLowerCase()
 		.replace(/^vinci\//, "");
-	const requested = model.id.toLowerCase().replace(/^vinci\//, "");
 	const requestedRank = MANAGED_VINCI_CLASS_RANK[requested];
 	const servedRank = served ? MANAGED_VINCI_CLASS_RANK[served] : undefined;
 	if (requestedRank === undefined || servedRank === undefined || servedRank >= requestedRank) return;
@@ -221,12 +235,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
 
-	let model = options.model;
+	let model = options.model ? canonicalizeManagedVinciModel(options.model, modelRegistry) : undefined;
 	let modelFallbackMessage: string | undefined;
 
 	// If session has data, try to restore model from it
 	if (!model && hasExistingSession && existingSession.model) {
-		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
+		// Assistant entries record the effective model; the last explicit selection retains the user's alias.
+		const lastSelection = sessionManager
+			.getBranch()
+			.slice()
+			.reverse()
+			.find((entry) => entry.type === "model_change");
+		const requestedId =
+			lastSelection?.type === "model_change" &&
+			isManagedVinciProvider(existingSession.model.provider) &&
+			isManagedVinciProvider(lastSelection.provider) &&
+			canonicalVinciClass(lastSelection.modelId) === canonicalVinciClass(existingSession.model.modelId)
+				? lastSelection.modelId
+				: existingSession.model.modelId;
+		const restoredModel = findModelWithVinciAlias(
+			modelRegistry,
+			existingSession.model.provider,
+			existingSession.model.modelId,
+			requestedId,
+		);
 		if (restoredModel && modelRegistry.hasConfiguredAuth(restoredModel)) {
 			model = restoredModel;
 		}
@@ -418,7 +450,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	} else {
 		// Save initial model and thinking level for new sessions so they can be restored on resume
 		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
+			sessionManager.appendModelChange(model.provider, requestedModelId(model));
 		}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}

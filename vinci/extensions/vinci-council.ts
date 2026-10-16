@@ -20,6 +20,7 @@ type CtxModel = NonNullable<ExtensionContext["model"]>;
 import { BorderedLoader, DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { canonicalVinciClass } from "./lib/vinci-class.ts";
 import {
   installVinciUsageAccumulator,
   recordVinciTaskCall,
@@ -67,11 +68,11 @@ const um = (text: string): UserMessage => ({ role: "user", content: [{ type: "te
 // chair call is latency-bounded (CHAIR_TIMEOUT_MS): if the stronger tier isn't serving OR is too
 // slow, the user is told which base class will synthesize before that call starts.
 type Registry = ExtensionContext["modelRegistry"];
-const TIER_ORDER = ["forte", "fortissimo"];
+const TIER_ORDER = ["forte"];
 const CHAIR_TIMEOUT_MS = 15000; // bound stronger-model chair synthesis — degrade to the base-model chair
 const SAME_CLASS_ATTEMPTS = 2;
 function nextTierId(model: CtxModel): string | undefined {
-  const idx = TIER_ORDER.indexOf(model.id);
+  const idx = TIER_ORDER.indexOf(canonicalVinciClass(model.id));
   return idx < 0 || idx >= TIER_ORDER.length - 1 ? undefined : TIER_ORDER[idx + 1];
 }
 
@@ -148,6 +149,7 @@ export async function runCouncil(
     }
   }
   if (fallbackNotice) announce(fallbackNotice, "warning");
+  else fallbackNotice = `No stronger Vinci class was used; council synthesis uses the same model (${model.name ?? model.id}).`;
   try {
     const response = await complete(model, chairCtx, opts);
     assertSuccessfulVinciCompletion(response, opts.signal);
@@ -179,15 +181,15 @@ export default function (pi: ExtensionAPI) {
     name: "convene_council",
     label: "Vinci Council",
     description:
-      "Get a stronger SECOND OPINION when you're genuinely unsure — call this MID-TASK, before you " +
+      "Get several perspectives when you're genuinely unsure — call this MID-TASK, before you " +
       "commit to an approach you're not confident about, when a sub-problem is thorny, or when the user " +
       "faces a real decision/trade-off. Several independent angles (optimist, skeptic, realist, strategist) " +
-      "are weighed and combined BY A STRONGER MODEL into a decisive recommendation with where they " +
+      "are weighed and combined into a decisive recommendation with where they " +
       "agree/disagree and a confidence level. Reach for it whenever you'd otherwise guess at something " +
       "important — not for routine steps you're already confident in.",
-    promptSnippet: "Get a stronger second opinion on something you're unsure about — several angles, combined.",
+    promptSnippet: "Get several perspectives on something you're unsure about — several angles, combined.",
     promptGuidelines: [
-      "When you're genuinely uncertain about an approach, or facing a real trade-off mid-task, call convene_council for a stronger second opinion BEFORE committing — don't just guess.",
+      "When you're genuinely uncertain about an approach, or facing a real trade-off mid-task, call convene_council for several perspectives BEFORE committing — don't just guess.",
     ],
     parameters: COUNCIL_PARAMS,
     async execute(_toolCallId, params, signal, _onUpdate, ctx: ExtensionContext) {

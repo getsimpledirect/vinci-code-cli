@@ -64,3 +64,8 @@ vinci/extensions/lib/verification-contract.js
 vinci/extensions/lib/verification-contract.js.map
 vinci/extensions/lib/verification-contract.d.ts
 vinci/extensions/lib/verification-contract.d.ts.map
+# Same pattern for the shared Vinci class-alias helper (imported by coding-agent core).
+vinci/extensions/lib/vinci-class.js
+vinci/extensions/lib/vinci-class.js.map
+vinci/extensions/lib/vinci-class.d.ts
+vinci/extensions/lib/vinci-class.d.ts.map

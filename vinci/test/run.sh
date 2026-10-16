@@ -282,6 +282,7 @@ run_group release-manifest-cas node "${ROOT}/vinci/test/release-manifest-cas.mjs
 run_group dev-env-integration node "${ROOT}/vinci/test/dev-env-integration.mjs"
 run_group tool-bootstrap-integration node "${ROOT}/vinci/test/tool-bootstrap-integration.mjs"
 run_group advisor-integration node "${ROOT}/vinci/test/advisor-integration.mjs"
+run_group fortissimo-escalation-integration node --test --test-concurrency=1 "${ROOT}/vinci/test/fortissimo-escalation-integration.mjs"
 run_group header-hint-integration node "${ROOT}/vinci/test/header-hint-integration.mjs"
 # The agent-directory override is DERIVED from piConfig, so a hardcoded upstream "PI_…" spelling reads
 # a dead variable: the header then reports "not signed in" and creates ~/.pi/agent on a machine that
@@ -746,6 +747,8 @@ run_group non-tty-output-integration node "${ROOT}/vinci/test/non-tty-output-int
 run_group queue-integration node "${ROOT}/vinci/test/queue-integration.mjs"
 # Requested/resolved model identity and route pins survive session resume; route drift is visible.
 run_group model-provenance-integration node "${ROOT}/vinci/test/model-provenance-integration.mjs"
+run_group fortissimo-alias-integration node --test --test-concurrency=1 "${ROOT}/vinci/test/fortissimo-alias-integration.mjs"
+run_group fortissimo-launcher-host node --test --test-concurrency=1 "${ROOT}/vinci/test/fortissimo-launcher-host.mjs"
 # Dirty-tree grounding: current changes are injected as bounded data before coding work starts.
 run_group workspace-integration node "${ROOT}/vinci/test/workspace-integration.mjs"
 # Failed/stale verification is sticky across edits and cannot be narrated away as success.

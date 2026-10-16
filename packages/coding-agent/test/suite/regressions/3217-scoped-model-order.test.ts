@@ -136,21 +136,14 @@ describe("issue #3217 scoped model ordering", () => {
 					contextWindow: 128_000,
 					maxTokens: 8_192,
 				},
-				{
-					id: "fortissimo",
-					name: "Vinci Fortissimo",
-					reasoning: true,
-					input: ["text"],
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: 128_000,
-					maxTokens: 8_192,
-				},
 			],
 		});
 
 		try {
 			const auto = harness.session.modelRegistry.find("vinci", "auto")!;
-			const fortissimo = harness.session.modelRegistry.find("vinci", "fortissimo")!;
+			// The shipped managed catalogue is auto + forte; Fortissimo is an alias of Forte, not a
+			// selectable model (covered by vinci-fortissimo-alias.test.ts).
+			const forte = harness.session.modelRegistry.find("vinci", "forte")!;
 			const persist = vi.spyOn(harness.settingsManager, "setDefaultModelAndProvider");
 			const selected: string[] = [];
 			const selector = new ModelSelectorComponent(
@@ -168,19 +161,19 @@ describe("issue #3217 scoped model ordering", () => {
 			const rendered = stripAnsi(selector.render(120).join("\n"));
 			expect(rendered).toContain("Vinci");
 			expect(rendered).toContain("Vinci Forte");
-			expect(rendered).toContain("Vinci Fortissimo");
+			expect(rendered).not.toContain("Vinci Fortissimo");
 			expect(rendered).not.toContain(harness.getModel().id);
 
 			(
 				selector as unknown as {
-					handleSelect(model: typeof fortissimo): void;
+					handleSelect(model: typeof forte): void;
 				}
-			).handleSelect(fortissimo);
-			expect(selected).toEqual(["fortissimo"]);
+			).handleSelect(forte);
+			expect(selected).toEqual(["forte"]);
 			expect(persist).not.toHaveBeenCalled();
 
-			await harness.session.setModel(fortissimo);
-			expect(harness.session.model?.id).toBe("fortissimo");
+			await harness.session.setModel(forte);
+			expect(harness.session.model?.id).toBe("forte");
 			expect(persist).not.toHaveBeenCalled();
 		} finally {
 			if (previous === undefined) delete process.env.VINCI_CODE;

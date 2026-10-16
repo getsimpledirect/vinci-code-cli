@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
 import { setVinciConnection } from "./lib/ui-state.ts";
+import { canonicalVinciClass } from "./lib/vinci-class.ts";
 import { VINCI_BILLING_URL, VINCI_GATEWAY_BASE_URL, VINCI_PLATFORM_BASE_URL } from "./vinci-links.ts";
 
 /**
@@ -98,10 +99,8 @@ function terminalBudgetMessage(taskId: string): string {
 }
 
 /**
- * Per-class rates in USD per million tokens, mirroring vinci-chat/config/classes.yaml. They differ
- * by roughly 5x between classes, so sharing one cost block would have reported Fortissimo usage at
- * Forte's prices. These are display/estimate metadata only — the account is billed server-side from
- * provider-reported cost plus markup — but an estimate that is wrong by 5x is worse than none.
+ * Indicative rates in USD per million tokens. Fortissimo is a compatibility alias of Forte,
+ * including its estimates. The account is billed server-side from the actual route.
  *
  * `auto` has no single true price, because the class it resolves to varies per account. It carries
  * the default class's rates as an indicative figure.
@@ -109,19 +108,19 @@ function terminalBudgetMessage(taskId: string): string {
 const CLASS_COSTS: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
   auto: { input: 0.93, output: 3, cacheRead: 0.18, cacheWrite: 0.93 },
   forte: { input: 0.93, output: 3, cacheRead: 0.18, cacheWrite: 0.93 },
-  fortissimo: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 },
 };
 
-function vinciClassModel(id: string, name: string) {
+export function vinciClassModel(id: string, name: string) {
+  const effectiveId = canonicalVinciClass(id);
   return {
-    id,
-    name,
+    id: effectiveId,
+    name: effectiveId !== id ? "Vinci Forte" : name,
     reasoning: true,
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "none", high: "high", xhigh: "xhigh" },
     input: ["text", "image"] as Array<"text" | "image">,
     contextWindow: 900_000,
     maxTokens: 32_768,
-    cost: CLASS_COSTS[id] ?? CLASS_COSTS.auto,
+    cost: CLASS_COSTS[effectiveId] ?? CLASS_COSTS.auto,
     compat: {
       supportsStore: false,
       supportsDeveloperRole: false,
@@ -273,7 +272,6 @@ export default function (pi: ExtensionAPI) {
       // Stable product classes. Their occupants and providers are configured server-side in
       // vinci-chat/config/classes.yaml, so future frontier swaps do not require a CLI release.
       vinciClassModel("forte", "Vinci Forte"),
-      vinciClassModel("fortissimo", "Vinci Fortissimo"),
     ],
     oauth: {
       name: "Vinci",
@@ -344,8 +342,12 @@ export default function (pi: ExtensionAPI) {
       retryDelayMs = undefined;
       await sleep(delayMs);
     }
-    if (affordableTokenLimit === undefined || typeof event.payload !== "object" || event.payload === null) return;
-    const payload = event.payload as Record<string, unknown>;
+    if (typeof event.payload !== "object" || event.payload === null) return;
+    const original = event.payload as Record<string, unknown>;
+    const payload = typeof original.model === "string"
+      ? { ...original, model: canonicalVinciClass(original.model) }
+      : original;
+    if (affordableTokenLimit === undefined) return payload === original ? undefined : payload;
     const currentMaxTokens = payload.max_tokens;
     const maxTokens = affordableTokenLimit;
     affordableTokenLimit = undefined;
