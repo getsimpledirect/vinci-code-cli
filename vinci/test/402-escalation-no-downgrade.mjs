@@ -48,7 +48,7 @@ function successStream(text, requestModel) {
 	return stream;
 }
 
-async function assert402StopsEscalation(site, body, run, leadingResponses = []) {
+async function assert402StopsEscalation(site, body, run, leadingResponses = [], expectedMessage) {
 	const api = `test:402-${site}`;
 	const sourceId = `402-escalation-${site}`;
 	const calls = [];
@@ -94,7 +94,8 @@ async function assert402StopsEscalation(site, body, run, leadingResponses = []) 
 		await assert.rejects(
 			() => run({ ctx, models, registry, announce: (message, level) => notices.push({ message, level }) }),
 			(error) => {
-				assert.match(error.message, /will not downgrade after an account or terminal error|no cheaper model was selected/i);
+				// Each consumer must take its own stop path; a site that silently switches paths fails here.
+				assert.match(error.message, expectedMessage, `${site}: unexpected terminal stop message`);
 				assert.equal(error.cause?.status, 402, `${site}: the terminal error must retain the real HTTP status`);
 				assert.strictEqual(error.cause, terminalError, `${site}: the terminal wrapper must preserve the provider error`);
 				return true;
@@ -136,6 +137,7 @@ const consumers = [
 		"advisor",
 		({ ctx }) => advisorTool.execute("402-advisor", { question: "Review this" }, undefined, undefined, ctx),
 		[],
+		/Advisor stopped on .+; no cheaper model was selected/,
 	],
 	[
 		"council",
@@ -154,9 +156,10 @@ const consumers = [
 			{ text: "realist take" },
 			{ text: "strategist take" },
 		],
+		/Council stopped on .+; no cheaper model was selected/,
 	],
-	["scope", ({ ctx }) => judgeScope(ctx, "unrelated.ts"), []],
-	["loopbreak", ({ ctx }) => getUnstuck(ctx, "bash repeated", [], "Fix the loop"), []],
+	["scope", ({ ctx }) => judgeScope(ctx, "unrelated.ts"), [], /Scope check stopped on .+; Vinci will not downgrade after an account or terminal error/],
+	["loopbreak", ({ ctx }) => getUnstuck(ctx, "bash repeated", [], "Fix the loop"), [], /Loop recovery stopped on .+; Vinci will not downgrade after an account or terminal error/],
 ];
 
 const requestedConsumer = process.env.VINCI_TEST_402_CONSUMER?.trim();
@@ -169,8 +172,8 @@ assert.ok(
 );
 
 for (const [variant, body] of BILLING_ERRORS) {
-	for (const [site, run, leadingResponses] of selectedConsumers) {
-		await assert402StopsEscalation(`${site}-${variant}`, body, run, leadingResponses);
+	for (const [site, run, leadingResponses, expectedMessage] of selectedConsumers) {
+		await assert402StopsEscalation(`${site}-${variant}`, body, run, leadingResponses, expectedMessage);
 	}
 }
 
