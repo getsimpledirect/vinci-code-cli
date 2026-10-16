@@ -1,0 +1,127 @@
+name: Vinci Unsigned Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full reviewed commit SHA to build without signing or publication
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-qualification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VINCI_EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      VINCI_PACKAGE_REQUIRE_CLEAN_SOURCE: "1"
+      JITI_FS_CACHE: "false"
+    steps:
+      - name: Validate the selected source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VINCI_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo '::error::source_sha must be a full lowercase commit SHA. Supply the reviewed commit before retrying.'
+            exit 2
+          }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.19.0"
+          cache: npm
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+      - name: Build the selected source without catalog refresh
+        run: bash vinci/build.sh
+      - name: Package the unsigned archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u VINCI_UPDATE_SIGNING_KEY -u VINCI_UPDATE_SEQUENCE -u VINCI_PACKAGE_REQUIRE_SIGNING bash vinci/package.sh
+      - name: Exercise the archive and retain dependency provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          qualification_root="$(mktemp -d "$RUNNER_TEMP/vinci-unsigned.XXXXXX")"
+          trap 'find "$qualification_root" -mindepth 1 -delete; rmdir "$qualification_root"' EXIT
+          mkdir "$qualification_root/payload" "$qualification_root/home" "$qualification_root/tmp"
+          version="$(node -p "JSON.parse(require('fs').readFileSync('vinci/identity.json','utf8')).version")"
+          archive="$PWD/release/vinci-code-${version}.tgz"
+          tar -xzf "$archive" -C "$qualification_root/payload"
+          export HOME="$qualification_root/home" TMPDIR="$qualification_root/tmp"
+          unset NODE_PATH NODE_OPTIONS
+          node vinci/test/packaged-artifact-check.mjs "$qualification_root/payload"
+          node vinci/test/packaged-launch-check.mjs "$qualification_root/payload"
+          node --input-type=module - "$qualification_root/payload" "$archive" <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { createRequire } from 'node:module';
+          import { readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+          import { dirname, join, relative, resolve, sep } from 'node:path';
+          import { checkInstalledForge } from './scripts/check-forge-backport.mjs';
+          const root = realpathSync(process.argv[2]);
+          const archive = resolve(process.argv[3]);
+          const identity = JSON.parse(readFileSync(join(root, 'vinci/dist/source-identity.json')));
+          assert.equal(identity.sourceCommit, process.env.VINCI_EXPECTED_SOURCE_SHA, 'Rebuild the selected source before qualifying this archive.');
+          assert.equal(identity.dirty, false, 'Commit and rebuild clean source before qualifying this archive.');
+          const inventory = [];
+          let visited = 0;
+          function inspect(directory) {
+            for (const entry of readdirSync(directory, { withFileTypes: true })) {
+              assert.ok(++visited < 20000, 'Inspect unexpected archive growth before retrying.');
+              const file = join(directory, entry.name);
+              if (entry.isDirectory()) inspect(file);
+              else if (entry.isFile() && entry.name === 'package.json') {
+                const metadata = JSON.parse(readFileSync(file));
+                inventory.push({ path: relative(root, file), name: metadata.name, version: metadata.version });
+              }
+            }
+          }
+          inspect(root);
+          const consumer = createRequire(join(root, 'package.json'));
+          const dependencies = [];
+          for (const name of ['node-forge', '@earendil-works/gondolin', '@earendil-works/pi-tui']) {
+            let entry;
+            try { entry = realpathSync(consumer.resolve(name)); }
+            catch (error) {
+              assert.equal(error.code, 'MODULE_NOT_FOUND', 'Inspect the actual package resolution failure before retrying.');
+              assert.notEqual(name, '@earendil-works/pi-tui', 'Restore the shipped TUI positive control before retrying.');
+              dependencies.push({ name, state: 'absent', code: error.code });
+              continue;
+            }
+            assert.ok(entry.startsWith(root + sep), 'Remove checkout/global fallback before qualifying artifact dependencies.');
+            assert.ok(readFileSync(entry).length > 0, 'Restore the actual resolved package bytes before retrying.');
+            const row = { name, state: 'present', entry: relative(root, entry) };
+            if (name === 'node-forge') row.backport = checkInstalledForge(dirname(dirname(entry))).backport;
+            if (name === '@earendil-works/gondolin') {
+              const forge = realpathSync(createRequire(entry).resolve('node-forge'));
+              assert.ok(forge.startsWith(root + sep), 'Restore Gondolin dependency containment before retrying.');
+              row.forge = { entry: relative(root, forge), backport: checkInstalledForge(dirname(dirname(forge))).backport };
+            }
+            dependencies.push(row);
+          }
+          const bytes = readFileSync(archive);
+          const receipt = { schemaVersion: 1, platform: process.platform, architecture: process.arch, nodeVersion: process.versions.node,
+            workflowCommit: process.env.GITHUB_SHA, source: identity, archive: { file: relative(process.cwd(), archive),
+              bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'), signed: false },
+            inventory, dependencies, packagedImportsAndSyntheticLaunch: 'passed', externalProviderCalls: 0, publication: false };
+          writeFileSync('release/unsigned-qualification.json', JSON.stringify(receipt, null, 2) + '\n');
+          console.log(JSON.stringify({ sourceCommit: identity.sourceCommit, archive: receipt.archive, dependencies }, null, 2));
+          NODE
+      - name: Retain the tested unsigned archive and receipt
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: vinci-unsigned-${{ inputs.source_sha }}-${{ github.run_id }}
+          path: |
+            release/vinci-code-*.tgz
+            release/vinci-code-*.tgz.sha256
+            release/unsigned-qualification.json
+          if-no-files-found: error
+          retention-days: 3
