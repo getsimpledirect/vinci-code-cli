@@ -109,6 +109,8 @@ export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	const errorMessage = message.errorMessage;
 	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
 	// [vinci] Keep auth, payment-required, and refusal errors terminal despite transient gateway wording.
-	if (/\b40[12]\b|invalid_api_key|refusal/i.test(errorMessage)) return false;
+	// The status must not follow "=" or a word character, so Vinci's own retryable
+	// "max_tokens=402; please retry" message is not mistaken for HTTP 402.
+	if (/(?<![=\w])40[123]\b|invalid_api_key|refusal/i.test(errorMessage)) return false;
 	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
 }

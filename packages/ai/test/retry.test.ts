@@ -14,12 +14,17 @@ describe("provider retry classification", () => {
 		"service is unavailable",
 		"Service temporarily unavailable",
 		"Service unavailable: The service is temporarily unavailable.",
+		// Vinci's own reduced-limit retry message (vinci-provider.ts) must stay retryable even when the
+		// affordable token count happens to be 401/402.
+		"OpenRouter can serve this request with max_tokens=402; please retry your request once on this same model with the reduced limit.",
+		"OpenRouter can serve this request with max_tokens=401; please retry your request once on this same model with the reduced limit.",
 	])("matches gateway transient wording: %s", (errorMessage) => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
 	});
 
 	it.each([
 		"401 Unauthorized: unable to forward upstream stream",
+		"403 Forbidden: The service is temporarily unavailable",
 		"invalid_api_key: The service is temporarily unavailable",
 		"402 payment_failed: service is temporarily unavailable",
 		"402 Payment Required: unable to forward upstream stream",
