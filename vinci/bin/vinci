@@ -422,18 +422,10 @@ VINCI_PROVIDER="${VINCI_PROVIDER:-vinci}"
 VINCI_MODEL="${VINCI_MODEL:-auto}"
 case "${VINCI_PROVIDER}" in
   vinci)
-    # Validate the effective class while retaining the original selection for the core resolver's
-    # alias provenance. Native Node type stripping uses the same helper without starting tsx.
-    _vinci_model_class="$(node --experimental-strip-types - "${VINCI}/extensions/lib/vinci-class.ts" "${VINCI_MODEL}" <<'EOF'
-const { canonicalVinciClass } = require(process.argv[2]);
-process.stdout.write(canonicalVinciClass(process.argv[3]));
-EOF
-    )"
-    case "${_vinci_model_class}" in
-      auto|forte) ;;
+    case "${VINCI_MODEL}" in
+      auto|forte|fortissimo) ;;
       *) echo "✗ Unknown Vinci model: ${VINCI_MODEL}" >&2; exit 2 ;;
     esac
-    unset _vinci_model_class
     ;;
   openrouter)
     [[ "${VINCI_MODEL}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]] || {
