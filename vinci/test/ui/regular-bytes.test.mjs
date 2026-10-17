@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { test, vi } from "vitest";
 import { VirtualTerminal } from "../../../packages/tui/test/virtual-terminal.ts";
+import { resetCapabilitiesCache, setCapabilities } from "@earendil-works/pi-tui";
 import { createVinciUiHarness } from "./harness.mjs";
 
 const fixture = new URL("./fixtures/regular-bytes.ansi", import.meta.url);
@@ -44,6 +45,10 @@ test("regular InteractiveMode preserves its complete raw output stream", async (
 	const previousTmpdir = process.env.TMPDIR;
 	mkdirSync(FIXED_TMPDIR, { recursive: true });
 	process.env.TMPDIR = FIXED_TMPDIR;
+	// Terminal capabilities are detected from TERM/COLORTERM/TERM_PROGRAM/TMUX and change the
+	// colour and hyperlink bytes, so pin them on the same pi-tui instance the app renders with.
+	resetCapabilitiesCache();
+	setCapabilities({ images: null, trueColor: true, hyperlinks: true });
 	try {
 		ui = await createVinciUiHarness({ responses: ["A deterministic response."] });
 		await ui.prompt("A deterministic prompt.");
@@ -51,6 +56,7 @@ test("regular InteractiveMode preserves its complete raw output stream", async (
 		await ui.resize(60, 20);
 	} finally {
 		if (ui) await ui.close();
+		resetCapabilitiesCache();
 		if (previousTmpdir === undefined) delete process.env.TMPDIR;
 		else process.env.TMPDIR = previousTmpdir;
 		vi.restoreAllMocks();
