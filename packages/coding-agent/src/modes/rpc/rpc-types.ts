@@ -18,6 +18,8 @@ import type { SourceInfo } from "../../core/source-info.ts";
 // ============================================================================
 
 export type RpcCommand =
+	// [vinci] Additive capability query. Legacy clients need not send it.
+	| { id?: string; type: "get_protocol" }
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
@@ -112,6 +114,7 @@ export interface RpcSessionState {
 
 // Success responses with data
 export type RpcResponse =
+	| { id?: string; type: "response"; command: "get_protocol"; success: true; data: { version: number } }
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true }
 	| { id?: string; type: "response"; command: "steer"; success: true }
