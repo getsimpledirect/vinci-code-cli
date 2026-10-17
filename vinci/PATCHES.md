@@ -5,7 +5,8 @@ in new `packages/**/vinci-*.ts` files, none of which can conflict on a sync. Wha
 this small set of **inline edits** to upstream core files: behaviors that genuinely can't be done
 from an extension/config, plus one default-preserving test seam. Product behavior is gated on
 `VINCI_CODE=1` (set by `vinci/bin/vinci`), so **upstream behavior is byte-identical when the env is
-unset** — a plain `pi` is unaffected, and the edits are cheap to re-apply on rebase.
+unset**, except for the [listed ungated divergences](#ungated-divergences-from-upstream) — apart
+from those, a plain `pi` is unaffected, and the edits are cheap to re-apply on rebase.
 
 ## The `[vinci]` marker (how sync stays safe)
 
@@ -92,6 +93,23 @@ The completeness check above has three known differences from this table, all ex
 (`tui/test/markdown.test.ts` tests the markdown patch; `coding-agent/test/provider-visibility.test.ts`
 and `vinci-byok.test.ts` contain `[vinci]` as UI text). Run the check on `src/` paths to compare
 against the table: `git grep -l '\[vinci\]' -- 'packages/*/src/**' | grep -v /vinci-`.
+
+## Ungated divergences from upstream
+
+- **Session-file framing** (`packages/coding-agent/src/core/session-manager.ts:630-636`,
+  `:778-785`; [persistence contract](docs/persistence.md);
+  `packages/coding-agent/test/session-manager/framing-compat.test.ts:41`): plain `pi` from this
+  fork writes framed non-header records. Bare `JSON.parse` consumers, including upstream-shaped
+  readers, see exactly one extra boolean `__vinci_record_start: true` key per record; the fork
+  strips it on load. Framing is intentionally independent of `VINCI_CODE` so truncation detection
+  and the persistence format apply consistently to every session written by the fork.
+- **Tool downloads** (`packages/coding-agent/src/utils/tools-manager.ts:55-65`, `:368-412`):
+  pinned releases and SHA-256 verification before extraction apply to every user. This deliberate
+  supply-chain hardening is not gated on `VINCI_CODE` because download integrity protects all users.
+- **Managed-class aliases** (`packages/coding-agent/src/core/model-resolver.ts:9-17`, `:29-38`):
+  core imports `vinci/extensions/lib/vinci-class.ts`; `isManagedVinciProvider` gates aliases on the
+  provider name `vinci`, not `VINCI_CODE`. Managed model names must resolve consistently for SDK
+  and plain `pi` callers selecting that provider.
 
 ## 1. `/login` goes straight to Vinci (no provider picker)
 
