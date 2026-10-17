@@ -5,8 +5,8 @@ in new `packages/**/vinci-*.ts` files, none of which can conflict on a sync. Wha
 this small set of **inline edits** to upstream core files: behaviors that genuinely can't be done
 from an extension/config, plus one default-preserving test seam. Product behavior is gated on
 `VINCI_CODE=1` (set by `vinci/bin/vinci`), so **upstream behavior is byte-identical when the env is
-unset**, except for the [listed ungated divergences](#ungated-divergences-from-upstream) — a plain
-`pi` is unaffected, and the edits are cheap to re-apply on rebase.
+unset**, except for the [listed ungated divergences](#ungated-divergences-from-upstream) — apart
+from those, a plain `pi` is unaffected, and the edits are cheap to re-apply on rebase.
 
 ## The `[vinci]` marker (how sync stays safe)
 
