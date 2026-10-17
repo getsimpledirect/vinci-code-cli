@@ -32,7 +32,7 @@ only patch core when there's no hook.)
 | `coding-agent/package.json` | `piConfig.name: "vinci"` — window title / `APP_NAME` (JSON, so no inline tag) | 9 |
 | `coding-agent/src/cli/args.ts` | Hide provider/model/BYOK controls from Vinci help; reject malformed output modes before runtime startup | 4,26 |
 | `coding-agent/src/cli/list-models.ts` | Restrict Vinci's non-interactive model listing to the managed provider | 4 |
-| `coding-agent/src/core/agent-session.ts` | Small-window compaction `keepRecentTokens`; auto-continue after threshold compaction AND after a length-cut reply; turn-end verification gate (Phase 2); default active tools incl. grep/find/ls | 7,8,10 |
+| `coding-agent/src/core/agent-session.ts` | Small-window compaction `keepRecentTokens`; auto-continue after threshold compaction AND after a length-cut reply; turn-end verification gate (Phase 2); default active tools incl. grep/find/ls; mask malformed tool-argument diagnostics before events and persistence | 7,8,10,13 |
 | `coding-agent/src/core/extensions/runner.ts` | Default the extension overlay-focus query to false outside interactive UI | — |
 | `coding-agent/src/core/extensions/types.ts` | Expose an optional overlay-focus query to extensions | — |
 | `coding-agent/src/core/vinci-grader.ts` | Shared grader core (verification system): untracked-aware diff, skeptical prompt, verdict parse, completion-claim detector — one check for core + `vinci-review`/`vinci-todo` | 8 |
@@ -351,6 +351,10 @@ so a handful of upstream render paths get a one-line `[vinci]` call under `VINCI
 the `vinci-render` extension can mask expanded (ctrl+o) tool output. **Display-only in all cases** —
 the value written to disk and the value the model sees are never masked, so edits still land
 byte-for-byte and the model can still match the real key. Kill switch: unset `VINCI_CODE`.
+
+Malformed completed tool calls are the diagnostic exception: `agent-session.ts` masks their
+`argumentsError` before emitting or persisting it, also masking the validation error returned to
+the model. Valid tool arguments remain unchanged for execution and persistence.
 
 ## 14. Auto-resume the recent session on interactive relaunch
 

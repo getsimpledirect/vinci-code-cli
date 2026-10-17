@@ -106,6 +106,7 @@ import {
 	taskFromBranch,
 	verificationEvidenceFromBranch,
 } from "./vinci-grader.ts";
+import { vinciMaskEnabled, vinciMaskSecrets } from "./vinci-mask-secrets.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -526,6 +527,19 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		// [vinci] Mask malformed-argument diagnostics before listeners, persistence, and validation echo them.
+		if (
+			vinciMaskEnabled() &&
+			(event.type === "message_start" || event.type === "message_update" || event.type === "message_end") &&
+			event.message.role === "assistant"
+		) {
+			for (const content of event.message.content) {
+				if (content.type === "toolCall" && content.argumentsError) {
+					content.argumentsError = vinciMaskSecrets(content.argumentsError);
+				}
+			}
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
