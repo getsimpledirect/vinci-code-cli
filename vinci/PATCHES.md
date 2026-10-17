@@ -39,7 +39,7 @@ only patch core when there's no hook.)
 | `ai/src/utils/error-body.ts`, `overflow.ts` | Carry the gateway's machine-readable error code; a billing `request_too_large` is not a context overflow | 12 |
 | `ai/src/utils/event-stream.ts` | Reject the final-result promise when a stream ends without a final result, instead of hanging | — |
 | `coding-agent/package.json` | `piConfig.name: "vinci"` — window title / `APP_NAME` (JSON, so no inline tag) | 9 |
-| `coding-agent/src/cli/args.ts` | Hide provider/model/BYOK controls from Vinci help; reject malformed output modes before runtime startup | 4,26 |
+| `coding-agent/src/cli/args.ts` | Hide provider/model/BYOK controls from Vinci help; reject malformed output modes before runtime startup; disclose fullscreen copy-on-select in Vinci help | 4,6,26 |
 | `coding-agent/src/cli/list-models.ts` | Restrict Vinci's non-interactive model listing to the managed provider | 4 |
 | `coding-agent/src/cli/startup-ui.ts` | Export `isOfficialDistribution` so the upstream test suite can be made fork-aware | — |
 | `coding-agent/src/core/agent-session.ts` | Small-window compaction `keepRecentTokens`; auto-continue after threshold compaction AND after a length-cut reply; turn-end verification gate (Phase 2); default active tools incl. grep/find/ls; mask malformed tool-argument diagnostics before events and persistence | 7,8,10,13 |
@@ -57,16 +57,16 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/tools/vinci-result-budget.ts` | Tighter per-result truncation budget for a 9B (env-tunable) | 21 |
 | `coding-agent/src/core/tools/read.ts`, `grep.ts`, `find.ts` | Apply the Vinci result budget; steer `read` to grep over offset-paging | 21 |
 | `coding-agent/src/index.ts` | Export `vinciMaskEnabled`/`vinciMaskSecrets` for the render extension | 13 |
-| `coding-agent/src/main.ts` | Auto-resume the recent session on interactive relaunch (TTY-gated; opens the validated session) | 14 |
+| `coding-agent/src/main.ts` | Auto-resume the recent session on interactive relaunch (TTY-gated; opens the validated session); gate the fullscreen startup clipboard environment override | 6,14 |
 | `coding-agent/src/modes/interactive/components/assistant-message.ts` | Friendly errors + display-mask prose/thinking | 12,13 |
 | `coding-agent/src/modes/interactive/components/diff.ts` | Mask secrets in edit diffs on screen; GitHub-style row tints on added/removed lines | 13,18 |
 | `coding-agent/src/modes/interactive/components/footer.ts` | Friendly model name; drop the provider badge | 10 |
 | `coding-agent/src/modes/interactive/components/model-selector.ts` | Friendly model name in `/model` | 10 |
 | `coding-agent/src/modes/interactive/components/session-selector.ts` | Time-first resume rows + calm header | 14 |
-| `coding-agent/src/modes/interactive/components/settings-selector.ts` | Lean settings (theme only) | 6,9 |
+| `coding-agent/src/modes/interactive/components/settings-selector.ts` | Lean regular settings (theme only); fullscreen mode/copy controls with a read-only environment override | 6,9 |
 | `coding-agent/src/modes/interactive/components/status-indicator.ts` | Reframe the compaction spinner label | 9 |
 | `coding-agent/src/modes/interactive/components/tool-execution.ts` | Tight tool spacing, semantic fallback rows for custom tools, and private display handling for blocked control guidance | 17,23 |
-| `coding-agent/src/modes/interactive/interactive-mode.ts` | `/login`→vinci, Ctrl+C window, clean launch, `/model` filter, lean `/` menu; injectable terminal/process-handler seam for offline UI tests; expose active overlay focus to extensions; post-login ecosystem pointer instead of the credentials path | 1–5,22,25 |
+| `coding-agent/src/modes/interactive/interactive-mode.ts` | `/login`→vinci, Ctrl+C window, clean launch, `/model` filter, lean `/` menu; injectable terminal/process-handler seam for offline UI tests; expose active overlay focus to extensions; post-login ecosystem pointer; fullscreen copy policy, selection-only copy and restart notice | 1–6,22,25 |
 | `coding-agent/src/modes/rpc/rpc-client.ts` | Settle `waitForIdle`/`collectEvents` (and release their timers) when the agent process dies or is stopped — a pure upstream bugfix, not env-gated | — |
 | `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists | — |
 | `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output; preserve verification-blocked exit 3 for a truncated final response | 13 |
@@ -194,6 +194,18 @@ const VINCI_SETTINGS = new Set(["theme","show-images"]);
 const shownItems = process.env.VINCI_CODE === "1" ? items.filter((it) => VINCI_SETTINGS.has(it.id)) : items;
 new SettingsList(shownItems, …);
 ```
+
+Fullscreen remains opt-in through `--tui-mode fullscreen` or `tuiMode` in settings. The
+ported mode and copy-on-select settings appear only while running fullscreen; changing mode
+persists it for the next start. Under `VINCI_CODE=1`, that change shows
+`Takes effect next time you start Vinci`. The launcher-only `VINCI_COPY_ON_SELECT=0` override
+is captured at startup, combined with the setting by the shared policy resolver, and shown as
+a read-only `Off (VINCI_COPY_ON_SELECT=0)` row. Other environment values leave the setting in
+charge. Vinci's fullscreen `app.message.copy` action copies only the active selection, including
+when auto-copy is off; with nothing selected it does nothing. Plain Pi retains the ported
+selection-preference/last-message behavior and ignores the Vinci environment override. The
+Vinci-only help disclosure is marked beside the opt-in in `vinci/README.md`; device QA remains
+NOT_RUN. The clipboard route and feedback shipped before these controls remain ungated.
 
 ## 7. Compaction that fits a small context window (auto-compact recovery)
 

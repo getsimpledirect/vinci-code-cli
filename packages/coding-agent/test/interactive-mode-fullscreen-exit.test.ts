@@ -1,7 +1,7 @@
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
@@ -78,6 +78,7 @@ class ExitChild {
 					]
 				: args,
 			{
+				cwd: this.tempDir,
 				env: childEnv(this.tempDir, this.path),
 				stdio: ["pipe", "pipe", "pipe", "ipc"],
 			},
@@ -265,12 +266,17 @@ async function journey(
 
 // One builder for every child's environment (also used by the no-op isolation check below).
 function childEnv(tempDir: string, caseName: string): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("PI_")) delete env[key];
+	}
+	for (const key of ["VINCI_COPY_ON_SELECT", "VINCI_CODE", "TMUX", "ZELLIJ", "STY"]) delete env[key];
 	return {
-		...process.env,
+		...env,
 		PI_OFFLINE: "1",
 		VINCI_TOOL_BOOTSTRAP: "0",
 		VINCI_CODE: "1",
-		TMUX: "",
+		TERM: "xterm-256color",
 		// The child is a real InteractiveMode with Vinci extensions: give it its own home so no
 		// state, cache or update file can be written under the caller's real HOME.
 		HOME: tempDir,
@@ -303,6 +309,37 @@ test("a child's HOME and XDG dirs sit inside its temp dir (no-op child, safe on 
 			).toBe(true);
 		}
 	} finally {
+		rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("child environment drops ambient copy policy, identity, PI and multiplexer variables", async () => {
+	const tempDir = mkdtempSync(
+		join(process.env.TMPDIR ?? dirname(fileURLToPath(import.meta.url)), ".fullscreen-scrub-"),
+	);
+	const ambient = ["VINCI_COPY_ON_SELECT", "PI_C4_ISOLATION", "TMUX", "ZELLIJ", "STY"];
+	try {
+		for (const name of ambient) vi.stubEnv(name, "ambient-must-not-leak");
+		vi.stubEnv("VINCI_CODE", "ambient-must-not-leak");
+		vi.stubEnv("TERM", "ambient-must-not-leak");
+		const script =
+			'process.stdout.write(JSON.stringify({cwd:process.cwd(),env:Object.fromEntries(["VINCI_COPY_ON_SELECT","PI_C4_ISOLATION","TMUX","ZELLIJ","STY","VINCI_CODE","TERM"].map(k=>[k,process.env[k]]))}))';
+		const reported = await new Promise<{ cwd: string; env: Record<string, string> }>((resolve, reject) => {
+			execFile(
+				process.execPath,
+				["-e", script],
+				{ cwd: tempDir, env: childEnv(tempDir, "scrub-check") },
+				(error, stdout) => (error ? reject(error) : resolve(JSON.parse(stdout))),
+			);
+		});
+		expect(reported.cwd).toBe(realpathSync(tempDir));
+		for (const name of ambient) {
+			expect(reported.env[name], `child must delete ambient ${name}`).toBeUndefined();
+		}
+		expect(reported.env.VINCI_CODE, "Vinci identity is set deliberately").toBe("1");
+		expect(reported.env.TERM, "child terminal is pinned").toBe("xterm-256color");
+	} finally {
+		vi.unstubAllEnvs();
 		rmSync(tempDir, { recursive: true, force: true });
 	}
 });

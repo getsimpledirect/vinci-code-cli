@@ -86,6 +86,8 @@ export interface TuiAltScreenOptions {
 	openUrl?: (url: string) => void;
 	/** Host clipboard route, resolved only after the write attempt completes. */
 	copySelection?: (text: string) => Promise<"native" | "terminal" | "remote-only">;
+	/** Automatically copy selected text on mouse release (default: true). */
+	copyOnSelect?: boolean;
 	/** Defer viewport keys and disable selection while an application modal is open. */
 	deferViewportInput?: () => boolean;
 }
@@ -124,6 +126,7 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 	private readonly wheelScrollLines: number;
 	private readonly mouseEnabled: boolean;
 	private readonly openUrl?: (url: string) => void;
+	private copyOnSelect: boolean;
 	private readonly copySelection?: TuiAltScreenOptions["copySelection"];
 	private readonly deferViewportInput?: () => boolean;
 
@@ -140,6 +143,7 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 		this.wheelScrollLines = Math.max(1, Math.floor(options.wheelScrollLines ?? 3));
 		this.mouseEnabled = options.mouse ?? true;
 		this.openUrl = options.openUrl;
+		this.copyOnSelect = options.copyOnSelect ?? true;
 		this.copySelection = options.copySelection;
 		this.deferViewportInput = options.deferViewportInput;
 		this.addInputListener((data) => this.handleViewportInput(data));
@@ -151,6 +155,43 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 
 	get isFollowingOutput(): boolean {
 		return this.getPrimaryScrollView().isFollowingEnd;
+	}
+
+	getCopyOnSelect(): boolean {
+		return this.copyOnSelect;
+	}
+
+	setCopyOnSelect(enabled: boolean): void {
+		this.copyOnSelect = enabled;
+	}
+
+	/** Whether the fullscreen viewport has a nonempty active text selection. */
+	hasActiveSelection(): boolean {
+		return this.getActiveSelectionText() !== undefined;
+	}
+
+	/** Copy the active selection through the configured clipboard route without rejecting. */
+	async copyActiveSelectionToClipboard(): Promise<boolean> {
+		try {
+			const text = this.getActiveSelectionText();
+			if (!text) return false;
+			const route = (await this.copySelection?.(text)) ?? "remote-only";
+			const message =
+				route === "native"
+					? "Copied"
+					: route === "terminal"
+						? "Sent to terminal clipboard"
+						: "Couldn't copy to clipboard";
+			if (!this.stopped) this.flash(message);
+			return route !== "remote-only";
+		} catch {
+			try {
+				if (!this.stopped) this.flash("Couldn't copy to clipboard");
+			} catch {
+				// A failed feedback render must not interrupt terminal input either.
+			}
+			return false;
+		}
 	}
 
 	/** Show a transient message at the top-right of the viewport. */
@@ -629,7 +670,7 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 				this.requestRender();
 				return;
 			}
-			void this.copySelectionToClipboard();
+			if (this.copyOnSelect) void this.copyActiveSelectionToClipboard();
 			this.requestRender();
 			return;
 		}
@@ -710,7 +751,7 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 		return { start: Math.max(minColumn, start), end: Math.min(maxColumn, end) };
 	}
 
-	private async copySelectionToClipboard(): Promise<void> {
+	private getActiveSelectionText(): string | undefined {
 		const selection = this.getSelectionBounds();
 		if (!selection || this.hasOverlay() || this.deferViewportInput?.() || !this.currentLayout) return;
 		const view = selection.start.scrollView;
@@ -727,17 +768,7 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 			);
 		}
 		const text = lines.join("\n");
-		if (text.length === 0) return;
-		let message = "Couldn't copy to clipboard";
-		try {
-			if (this.copySelection) {
-				const route = await this.copySelection(text);
-				message = route === "native" ? "Copied" : route === "terminal" ? "Sent to terminal clipboard" : message;
-			}
-		} catch {
-			// Copy failure is visible without interrupting terminal input.
-		}
-		if (!this.stopped) this.flash(message);
+		return text.length === 0 ? undefined : text;
 	}
 
 	private applySelectionHighlight(text: string): string {
