@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Agent, type AgentEvent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
@@ -61,14 +61,24 @@ describe("AgentSession retry", () => {
 
 	afterEach(() => {
 		if (session) {
+			session.abortRetry();
 			session.dispose();
 		}
+		vi.useRealTimers();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
 	});
 
-	function createSession(options?: { failCount?: number; maxRetries?: number; delayAssistantMessageEndMs?: number }) {
+	function createSession(options?: {
+		failCount?: number;
+		maxRetries?: number;
+		delayAssistantMessageEndMs?: number;
+		errorMessage?: string;
+		responses?: AssistantMessage[];
+		tools?: AgentTool[];
+		defaultRetrySettings?: boolean;
+	}) {
 		const failCount = options?.failCount ?? 1;
 		const maxRetries = options?.maxRetries ?? 3;
 		const delayAssistantMessageEndMs = options?.delayAssistantMessageEndMs ?? 0;
@@ -82,10 +92,20 @@ describe("AgentSession retry", () => {
 				callCount++;
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
+					const response = options?.responses?.[callCount - 1];
+					if (response) {
+						stream.push({ type: "start", partial: response });
+						if (response.stopReason === "error" || response.stopReason === "aborted") {
+							stream.push({ type: "error", reason: response.stopReason, error: response });
+						} else {
+							stream.push({ type: "done", reason: response.stopReason, message: response });
+						}
+						return;
+					}
 					if (callCount <= failCount) {
 						const msg = createAssistantMessage("", {
 							stopReason: "error",
-							errorMessage: "overloaded_error",
+							errorMessage: options?.errorMessage ?? "overloaded_error",
 						});
 						stream.push({ type: "start", partial: msg });
 						stream.push({ type: "error", reason: "error", error: msg });
@@ -104,7 +124,9 @@ describe("AgentSession retry", () => {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries, baseDelayMs: 1 } });
+		if (!options?.defaultRetrySettings) {
+			settingsManager.applyOverrides({ retry: { enabled: true, maxRetries, baseDelayMs: 1 } });
+		}
 
 		session = new AgentSession({
 			agent,
@@ -113,6 +135,7 @@ describe("AgentSession retry", () => {
 			cwd: tempDir,
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
+			baseToolsOverride: Object.fromEntries((options?.tools ?? []).map((tool) => [tool.name, tool])),
 		});
 
 		if (delayAssistantMessageEndMs > 0) {
@@ -128,6 +151,160 @@ describe("AgentSession retry", () => {
 
 		return { session, getCallCount: () => callCount };
 	}
+
+	it("retries an upstream gateway failure exactly once and succeeds", async () => {
+		const created = createSession({ errorMessage: "Unable to forward upstream stream" });
+		const events: string[] = [];
+		session.subscribe((event) => {
+			if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+			if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
+		});
+
+		await session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(2);
+		expect(events).toEqual(["start:1", "end:success=true"]);
+		expect(session.messages.at(-1)).toMatchObject({
+			stopReason: "stop",
+			content: [{ type: "text", text: "Success" }],
+		});
+	});
+
+	it.each(["overloaded_error", "Unable to forward upstream stream"])(
+		"bounds persistent transient retries to the default 2/4/8 second schedule: %s",
+		async (errorMessage) => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			const created = createSession({ errorMessage, failCount: 99, defaultRetrySettings: true });
+			const starts: { attempt: number; maxAttempts: number; delayMs: number }[] = [];
+			const ends: { success: boolean; attempt: number; finalError?: string }[] = [];
+			session.subscribe((event) => {
+				if (event.type === "auto_retry_start") starts.push(event);
+				if (event.type === "auto_retry_end") ends.push(event);
+			});
+			const prompt = session.prompt("Test");
+			await vi.advanceTimersByTimeAsync(0);
+			for (const [index, delayMs] of [2000, 4000, 8000].entries()) {
+				expect(starts.map(({ delayMs: delay }) => delay)).toEqual([2000, 4000, 8000].slice(0, index + 1));
+				await vi.advanceTimersByTimeAsync(delayMs - 1);
+				expect(created.getCallCount()).toBe(index + 1);
+				await vi.advanceTimersByTimeAsync(1);
+				expect(created.getCallCount()).toBe(index + 2);
+			}
+			await prompt;
+			expect(starts.map(({ attempt, maxAttempts }) => [attempt, maxAttempts])).toEqual([
+				[1, 3],
+				[2, 3],
+				[3, 3],
+			]);
+			expect(ends).toEqual([{ type: "auto_retry_end", success: false, attempt: 3, finalError: errorMessage }]);
+			expect(session.messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage });
+			await vi.advanceTimersByTimeAsync(16000);
+			expect(created.getCallCount()).toBe(4);
+			expect(session.isRetrying).toBe(false);
+		},
+	);
+
+	it.each(["overloaded_error", "Unable to forward upstream stream"])(
+		"cancels the backoff without another provider call: %s",
+		async (errorMessage) => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			const created = createSession({ errorMessage, failCount: 99, defaultRetrySettings: true });
+			const finalErrors: (string | undefined)[] = [];
+			session.subscribe((event) => {
+				if (event.type === "auto_retry_end") finalErrors.push(event.finalError);
+			});
+			const prompt = session.prompt("Test");
+			await vi.advanceTimersByTimeAsync(0);
+			expect(session.isRetrying).toBe(true);
+			await vi.advanceTimersByTimeAsync(1000);
+			session.abortRetry();
+			await prompt;
+			expect(finalErrors).toEqual(["Retry cancelled"]);
+			await vi.advanceTimersByTimeAsync(30000);
+			expect(created.getCallCount()).toBe(1);
+			expect(session.isRetrying).toBe(false);
+		},
+	);
+
+	it.each(["overloaded_error", "The service is temporarily unavailable"])(
+		"does not replay a completed write after a follow-up error: %s",
+		async (errorMessage) => {
+			const execute = vi.fn(async () => ({
+				content: [{ type: "text" as const, text: "written" }],
+				details: undefined,
+			}));
+			const created = createSession({
+				tools: [
+					{ name: "write", label: "Write", description: "Write a value", parameters: Type.Object({}), execute },
+				],
+				responses: [
+					createAssistantMessage("", {
+						stopReason: "toolUse",
+						content: [{ type: "toolCall", id: "write_1", name: "write", arguments: {} }],
+					}),
+					createAssistantMessage("", { stopReason: "error", errorMessage }),
+					createAssistantMessage("Success"),
+				],
+			});
+			await session.prompt("Test");
+			expect(created.getCallCount()).toBe(3);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(session.messages.filter((message) => message.role === "toolResult")).toHaveLength(1);
+			expect(session.messages.at(-1)).toMatchObject({
+				stopReason: "stop",
+				content: [{ type: "text", text: "Success" }],
+			});
+		},
+	);
+
+	it.each(["overloaded_error", "The service is temporarily unavailable"])(
+		"does not execute a tool call from an errored response before retry: %s",
+		async (errorMessage) => {
+			const execute = vi.fn(async () => ({
+				content: [{ type: "text" as const, text: "written" }],
+				details: undefined,
+			}));
+			const created = createSession({
+				tools: [
+					{ name: "write", label: "Write", description: "Write a value", parameters: Type.Object({}), execute },
+				],
+				responses: [
+					createAssistantMessage("", {
+						stopReason: "error",
+						errorMessage,
+						content: [{ type: "toolCall", id: "uncertain_write", name: "write", arguments: {} }],
+					}),
+					createAssistantMessage("Success"),
+				],
+			});
+			await session.prompt("Test");
+			expect(execute).toHaveBeenCalledTimes(0);
+			expect(created.getCallCount()).toBe(2);
+			expect(session.messages.filter((message) => message.role === "toolResult")).toHaveLength(0);
+			expect(session.messages.at(-1)).toMatchObject({
+				stopReason: "stop",
+				content: [{ type: "text", text: "Success" }],
+			});
+		},
+	);
+
+	it.each([
+		"401 Unauthorized: unable to forward upstream stream",
+		"invalid_api_key: The service is temporarily unavailable",
+		"402 payment_failed: service is temporarily unavailable",
+		"402 Payment Required: unable to forward upstream stream",
+		"refusal: unable to forward upstream stream",
+	])("surfaces a terminal error without session retries: %s", async (errorMessage) => {
+		const created = createSession({ errorMessage });
+		const retries: number[] = [];
+		session.subscribe((event) => {
+			if (event.type === "auto_retry_start") retries.push(event.attempt);
+		});
+		await session.prompt("Test");
+		expect(retries).toEqual([]);
+		expect(created.getCallCount()).toBe(1);
+		expect(session.messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage });
+	});
 
 	it("retries after a transient error and succeeds", async () => {
 		const created = createSession({ failCount: 1 });

@@ -8,6 +8,49 @@ const bedrockExplicitRetryMessage =
 	'{"message":"The system encountered an unexpected error during processing. Try your request again."}';
 
 describe("provider retry classification", () => {
+	it.each([
+		"Unable to forward upstream stream",
+		"The service is temporarily unavailable",
+		"service is unavailable",
+		"Service temporarily unavailable",
+		"Service unavailable: The service is temporarily unavailable.",
+		// Vinci's own reduced-limit retry message (vinci-provider.ts) must stay retryable even when the
+		// affordable token count happens to be 401/402.
+		"OpenRouter can serve this request with max_tokens=402; please retry your request once on this same model with the reduced limit.",
+		"OpenRouter can serve this request with max_tokens=401; please retry your request once on this same model with the reduced limit.",
+	])("matches gateway transient wording: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each([
+		"401 Unauthorized: unable to forward upstream stream",
+		"403 Forbidden: The service is temporarily unavailable",
+		"invalid_api_key: The service is temporarily unavailable",
+		"402 payment_failed: service is temporarily unavailable",
+		"402 Payment Required: unable to forward upstream stream",
+		"balance_exhausted: The service is temporarily unavailable",
+		"billing: unable to forward upstream stream",
+		"insufficient_quota: unable to forward upstream stream",
+		"out of budget: The service is temporarily unavailable",
+		"quota exceeded: unable to forward upstream stream",
+		"free_daily_cap: unable to forward upstream stream",
+		"request_too_large: The service is temporarily unavailable",
+		"refusal: unable to forward upstream stream",
+	])("keeps terminal errors non-retryable despite transient wording: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+
+	it.each(["stop", "aborted", "toolUse", "length"] as const)(
+		"does not retry transient wording with stop reason %s",
+		(stopReason) => {
+			expect(
+				isRetryableAssistantError(
+					fauxAssistantMessage("", { stopReason, errorMessage: "Unable to forward upstream stream" }),
+				),
+			).toBe(false);
+		},
+	);
+
 	it("matches explicit provider retry guidance", () => {
 		expect(
 			isRetryableAssistantError(
