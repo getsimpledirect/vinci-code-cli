@@ -33,6 +33,7 @@ interface DistributionMetadata {
 	configDirName: string;
 }
 
+// [vinci] exported so the upstream test suite can be made fork-aware
 export function isOfficialDistribution({ packageName, appName, configDirName }: DistributionMetadata): boolean {
 	return (
 		packageName === OFFICIAL_PACKAGE_NAME &&

@@ -28,11 +28,19 @@ only patch core when there's no hook.)
 | File | What the `[vinci]` edit does | § |
 |---|---|---|
 | `agent/src/agent-loop.ts` | Canonicalize tool-name synonyms (`editor`→`edit`); repair double-encoded arguments before validation; mark Vinci-blocked results for private display handling | 20,23 |
+| `agent/src/types.ts` | `tool_hooks_start` agent event so a hung extension hook can be timed and killed | — |
 | `ai/src/api/openai-completions.ts` | Mark failed/blocked tool results with an explicit `ERROR —` prefix on the wire | 15 |
 | `ai/src/utils/retry.ts` | Keep 401, invalid API key, 402, and refusal errors non-retryable despite transient gateway wording | — |
+| `ai/src/index.ts` | Export the completion-status classifier used by Vinci's supplemental LLM call sites | — |
+| `ai/src/providers/all.ts` | Capability-based model selection helpers, so catalog churn cannot break the build | — |
+| `ai/src/providers/opencode-go.ts` | Wire `openai-responses` on opencode-go so the build compiles | — |
+| `ai/src/types.ts` | `serviceTier` on usage: the tier the gateway actually served (priority badge) | — |
+| `ai/src/utils/error-body.ts`, `overflow.ts` | Carry the gateway's machine-readable error code; a billing `request_too_large` is not a context overflow | 12 |
+| `ai/src/utils/event-stream.ts` | Reject the final-result promise when a stream ends without a final result, instead of hanging | — |
 | `coding-agent/package.json` | `piConfig.name: "vinci"` — window title / `APP_NAME` (JSON, so no inline tag) | 9 |
 | `coding-agent/src/cli/args.ts` | Hide provider/model/BYOK controls from Vinci help; reject malformed output modes before runtime startup | 4,26 |
 | `coding-agent/src/cli/list-models.ts` | Restrict Vinci's non-interactive model listing to the managed provider | 4 |
+| `coding-agent/src/cli/startup-ui.ts` | Export `isOfficialDistribution` so the upstream test suite can be made fork-aware | — |
 | `coding-agent/src/core/agent-session.ts` | Small-window compaction `keepRecentTokens`; auto-continue after threshold compaction AND after a length-cut reply; turn-end verification gate (Phase 2); default active tools incl. grep/find/ls; mask malformed tool-argument diagnostics before events and persistence | 7,8,10,13 |
 | `coding-agent/src/core/extensions/runner.ts` | Default the extension overlay-focus query to false outside interactive UI | — |
 | `coding-agent/src/core/extensions/types.ts` | Expose an optional overlay-focus query to extensions | — |
@@ -65,6 +73,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/model-resolver.ts` | Managed-class aliases (Fortissimo resolves to Forte) for provider `vinci` only | — |
 | `coding-agent/src/core/session-manager.ts` | Shared verification-state entries and record framing for the turn-end verification gate | 8 |
 | `coding-agent/src/core/settings-manager.ts` | Vinci-mode settings: other-provider visibility (`VINCI_SHOW_OTHER_PROVIDERS`), thinking hidden by default | 4 |
+| `coding-agent/src/modes/interactive/components/countdown-timer.ts` | `ElapsedTimer` for live compaction progress | — |
 | `coding-agent/src/modes/interactive/components/extension-selector.ts` | Report the rows/width left after widgets and footer so approval context stays reviewable in small terminals | — |
 | `coding-agent/src/modes/interactive/components/login-dialog.ts`, `oauth-selector.ts` | Vero sign-in copy under `VINCI_CODE=1` | 9 |
 | `coding-agent/src/utils/tools-manager.ts` | Offline tool bootstrap (`VINCI_TOOL_BOOTSTRAP`), pinned tool assets (`VINCI_TOOL_PIN_*`), sandboxed child env | 9 |

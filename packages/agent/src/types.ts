@@ -425,5 +425,6 @@ export type AgentEvent =
 	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
+	// [vinci] tool_hooks_start event so a hung extension hook can be timed and killed (Vinci #131/#133)
 	| { type: "tool_hooks_start"; toolCallId: string; toolName: string }
 	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };

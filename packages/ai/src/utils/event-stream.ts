@@ -7,6 +7,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	private done = false;
 	private finalResultPromise: Promise<R>;
 	private resolveFinalResult!: (result: R) => void;
+	// [vinci] reject the final-result promise when the stream ends without a final result, instead of hanging
 	private rejectFinalResult!: (error: Error) => void;
 	private isComplete: (event: T) => boolean;
 	private extractResult: (event: T) => R;

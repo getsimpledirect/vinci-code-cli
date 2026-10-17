@@ -26,6 +26,7 @@ export * from "./models.ts";
 export * from "./providers/faux.ts";
 export * from "./session-resources.ts";
 export * from "./types.ts";
+// [vinci] export completion-status classification for Vinci's supplemental call sites (#150)
 export * from "./utils/completion-status.ts";
 export * from "./utils/diagnostics.ts";
 export * from "./utils/event-stream.ts";

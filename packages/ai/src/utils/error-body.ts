@@ -20,6 +20,7 @@ export interface NormalizedProviderError {
 	status?: number;
 	/** Raw HTTP body reason, already trimmed and truncated to the cap. */
 	body?: string;
+	// [vinci] carry the gateway's machine-readable error code so each billing failure gets its own remedy (#120)
 	/** Machine-readable error code from the gateway, when present in structured bodies. */
 	code?: string;
 	/** `error.message`, or `safeJsonStringify(error)` for a non-`Error` throw. */
