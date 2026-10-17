@@ -1,4 +1,5 @@
 import { appendFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { ProcessTerminal } from "@earendil-works/pi-tui";
 import { ENV_AGENT_DIR } from "../src/config.ts";
@@ -6,6 +7,13 @@ import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { createHarnessWithExtensions } from "./test-harness.ts";
 
+// Record the home this child resolves, so the parent can prove it never used the caller's real HOME.
+if (process.env.VINCI_FULLSCREEN_CHILD_LOG) {
+	appendFileSync(
+		process.env.VINCI_FULLSCREEN_CHILD_LOG,
+		`${new Date().toISOString()} HOME pid=${process.pid} case=${process.env.VINCI_FULLSCREEN_CHILD_CASE} home=${homedir()} xdg=${["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"].map((key) => `${key}:${process.env[key] ?? "<unset>"}`).join(",")}\n`,
+	);
+}
 const tuiMode = process.argv[2] === "fullscreen" ? "fullscreen" : "regular";
 const startError = process.argv[3] === "start-error";
 const transcriptMarker = "fullscreen-exit-transcript-marker";

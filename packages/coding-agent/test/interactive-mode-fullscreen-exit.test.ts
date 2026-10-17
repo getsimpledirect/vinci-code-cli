@@ -1,5 +1,5 @@
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,25 +78,7 @@ class ExitChild {
 					]
 				: args,
 			{
-				env: {
-					...process.env,
-					PI_OFFLINE: "1",
-					VINCI_TOOL_BOOTSTRAP: "0",
-					VINCI_CODE: "1",
-					TMUX: "",
-					// The child is a real InteractiveMode with Vinci extensions: give it its own home so no
-					// state, cache or update file can be written under the caller's real HOME.
-					HOME: this.tempDir,
-					XDG_CONFIG_HOME: join(this.tempDir, ".config"),
-					XDG_DATA_HOME: join(this.tempDir, ".local", "share"),
-					XDG_STATE_HOME: join(this.tempDir, ".local", "state"),
-					XDG_CACHE_HOME: join(this.tempDir, ".cache"),
-					[ENV_AGENT_DIR]: this.tempDir,
-					TMPDIR: this.tempDir,
-					GIT_CEILING_DIRECTORIES: this.tempDir,
-					VINCI_FULLSCREEN_CHILD_LOG: childLog,
-					VINCI_FULLSCREEN_CHILD_CASE: this.path,
-				},
+				env: childEnv(this.tempDir, this.path),
 				stdio: ["pipe", "pipe", "pipe", "ipc"],
 			},
 		);
@@ -120,6 +102,18 @@ class ExitChild {
 					childLog,
 					`${new Date().toISOString()} CLOSE pid=${this.process.pid} case=${this.path} code=${code} signal=${signal}\n`,
 				);
+				const homes = readFileSync(childLog, "utf8")
+					.split("\n")
+					.filter((line) => line.includes(` HOME pid=${this.process.pid} `));
+				const home = homes.at(-1)?.split(" home=")[1];
+				if (!home || !home.startsWith(this.tempDir)) {
+					reject(
+						new Error(
+							`child HOME must be inside the case temp dir "${this.tempDir}", got "${home ?? "<not recorded>"}"; fix the child env before any host run`,
+						),
+					);
+					return;
+				}
 				resolve(this.outcome);
 			});
 		});
@@ -268,6 +262,50 @@ async function journey(
 	if (failure) throw failure;
 	if (cleanupFailure) throw cleanupFailure;
 }
+
+// One builder for every child's environment (also used by the no-op isolation check below).
+function childEnv(tempDir: string, caseName: string): NodeJS.ProcessEnv {
+	return {
+		...process.env,
+		PI_OFFLINE: "1",
+		VINCI_TOOL_BOOTSTRAP: "0",
+		VINCI_CODE: "1",
+		TMUX: "",
+		// The child is a real InteractiveMode with Vinci extensions: give it its own home so no
+		// state, cache or update file can be written under the caller's real HOME.
+		HOME: tempDir,
+		XDG_CONFIG_HOME: join(tempDir, ".config"),
+		XDG_DATA_HOME: join(tempDir, ".local", "share"),
+		XDG_STATE_HOME: join(tempDir, ".local", "state"),
+		XDG_CACHE_HOME: join(tempDir, ".cache"),
+		[ENV_AGENT_DIR]: tempDir,
+		TMPDIR: tempDir,
+		GIT_CEILING_DIRECTORIES: tempDir,
+		VINCI_FULLSCREEN_CHILD_LOG: childLog,
+		VINCI_FULLSCREEN_CHILD_CASE: caseName,
+	};
+}
+
+test("a child's HOME and XDG dirs sit inside its temp dir (no-op child, safe on any host)", async () => {
+	const tempDir = mkdtempSync(join(tmpdir(), "vinci-fullscreen-env-"));
+	try {
+		const script =
+			'const os=require("node:os");process.stdout.write(JSON.stringify({home:os.homedir(),xdg:["XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_STATE_HOME","XDG_CACHE_HOME"].map((k)=>process.env[k])}))';
+		const reported = await new Promise<{ home: string; xdg: string[] }>((resolve, reject) => {
+			execFile(process.execPath, ["-e", script], { env: childEnv(tempDir, "env-check") }, (error, stdout) =>
+				error ? reject(error) : resolve(JSON.parse(stdout)),
+			);
+		});
+		for (const value of [reported.home, ...reported.xdg]) {
+			expect(
+				value?.startsWith(tempDir),
+				`child home/XDG "${value}" must be inside the case temp dir "${tempDir}"`,
+			).toBe(true);
+		}
+	} finally {
+		rmSync(tempDir, { recursive: true, force: true });
+	}
+});
 
 describe.each(["fullscreen", "regular"] as const)("InteractiveMode %s real child exits", (mode) => {
 	for (const [path, key] of [
