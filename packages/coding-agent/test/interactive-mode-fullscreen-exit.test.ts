@@ -84,6 +84,13 @@ class ExitChild {
 					VINCI_TOOL_BOOTSTRAP: "0",
 					VINCI_CODE: "1",
 					TMUX: "",
+					// The child is a real InteractiveMode with Vinci extensions: give it its own home so no
+					// state, cache or update file can be written under the caller's real HOME.
+					HOME: this.tempDir,
+					XDG_CONFIG_HOME: join(this.tempDir, ".config"),
+					XDG_DATA_HOME: join(this.tempDir, ".local", "share"),
+					XDG_STATE_HOME: join(this.tempDir, ".local", "state"),
+					XDG_CACHE_HOME: join(this.tempDir, ".cache"),
 					[ENV_AGENT_DIR]: this.tempDir,
 					TMPDIR: this.tempDir,
 					GIT_CEILING_DIRECTORIES: this.tempDir,
