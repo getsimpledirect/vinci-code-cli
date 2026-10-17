@@ -1,0 +1,22 @@
+  Vinci v<version> Code
+  Vero WORKING · Vinci · <repo>
+  ● connected • Working through it… · /undo · Ctrl+T thinking
+
+
+
+ Clean generated files
+
+ ● Confirm change
+
+
+▎ ──────────────────────────────────────────────────────────────────────────────
+▎
+▎  Vinci wants to delete generated files
+▎
+▌  → Allow once
+▎  Always allow this
+▎  Skip
+▎
+▎  ↑↓ navigate  enter select  escape/ctrl+c cancel
+▎
+▎ ──────────────────────────────────────────────────────────────────────────────

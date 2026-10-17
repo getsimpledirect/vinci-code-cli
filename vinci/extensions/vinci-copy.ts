@@ -8,7 +8,7 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
-  copyToClipboard,
+  copyToClipboardWithRoute,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
@@ -22,7 +22,8 @@ type CopyChoice = {
   text: string;
 };
 
-type ClipboardWriter = (text: string) => Promise<void>;
+type ClipboardRoute = "native" | "terminal" | "remote-only";
+type ClipboardWriter = (text: string) => Promise<ClipboardRoute> | Promise<void>;
 
 /** Remove ANSI escape sequences and terminal control characters from copied output. */
 export function stripAnsiSequences(text: string): string {
@@ -103,7 +104,7 @@ function sessionMessages(ctx: ExtensionContext): AgentMessage[] {
     .map((entry) => entry.message);
 }
 
-export default function (pi: ExtensionAPI, writeClipboard: ClipboardWriter = copyToClipboard) {
+export default function (pi: ExtensionAPI, writeClipboard: ClipboardWriter = copyToClipboardWithRoute) {
   let liveMessages: AgentMessage[] = [];
   let featureUsed = false;
   let hintShown = false;
@@ -133,8 +134,15 @@ export default function (pi: ExtensionAPI, writeClipboard: ClipboardWriter = cop
       const choice = choices.find((candidate) => candidate.label === selected);
       if (!choice) return;
 
-      await writeClipboard(stripAnsiSequences(choice.text));
-      ctx.ui.notify(`Copied ${choice.label.toLowerCase()}.`, "info");
+      const route = await writeClipboard(stripAnsiSequences(choice.text));
+      const label = choice.label.toLowerCase();
+      const message =
+        route === "terminal"
+          ? `Sent ${label} to terminal clipboard.`
+          : route === "remote-only"
+            ? `Copied ${label} on the remote machine only; it was too large to send to your local clipboard.`
+            : `Copied ${label}.`;
+      ctx.ui.notify(message, "info");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`Couldn't copy to clipboard: ${message}`, "error");

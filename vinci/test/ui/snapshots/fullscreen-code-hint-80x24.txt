@@ -1,0 +1,22 @@
+  Vinci v<version> Code
+  Vero DONE · Vinci · <repo>
+  ● connected · Read the receipt. · /undo · Ctrl+T thinking
+
+
+
+ Show the guard
+
+
+ Here is the guard:
+
+   const limit = 5;
+
+ That caps retries.
+
+  Tip · Use /copy when you want Vinci's output on your clipboard.
+
+╭ ✹ Ask Vinci · DONE: Read the receipt. ────────────────────────── ● connected ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ▶ AUTO  ·  Vinci ─── <workspace>…  ·  0% full · ↓ 150 ╯

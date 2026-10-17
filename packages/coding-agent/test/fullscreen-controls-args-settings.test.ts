@@ -1,13 +1,13 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { TuiMode } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { parseArgs, printHelp } from "../src/cli/args.ts";
 import { resolveCopyOnSelect, SettingsManager } from "../src/core/settings-manager.ts";
 
 let caseDir: string;
-const tempRoot = process.env.TMPDIR ?? dirname(fileURLToPath(import.meta.url));
+const tempRoot = process.env.TMPDIR ?? tmpdir();
 
 beforeEach(() => {
 	caseDir = mkdtempSync(join(tempRoot, "fullscreen-controls-settings-"));

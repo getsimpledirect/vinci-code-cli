@@ -1,7 +1,7 @@
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
@@ -268,7 +268,7 @@ async function journey(
 function childEnv(tempDir: string, caseName: string): NodeJS.ProcessEnv {
 	const env = { ...process.env };
 	for (const key of Object.keys(env)) {
-		if (key.startsWith("PI_")) delete env[key];
+		if (key.startsWith("PI_") || key.startsWith("XDG_")) delete env[key];
 	}
 	for (const key of ["VINCI_COPY_ON_SELECT", "VINCI_CODE", "TMUX", "ZELLIJ", "STY"]) delete env[key];
 	return {
@@ -284,6 +284,7 @@ function childEnv(tempDir: string, caseName: string): NodeJS.ProcessEnv {
 		XDG_DATA_HOME: join(tempDir, ".local", "share"),
 		XDG_STATE_HOME: join(tempDir, ".local", "state"),
 		XDG_CACHE_HOME: join(tempDir, ".cache"),
+		XDG_RUNTIME_DIR: join(tempDir, ".runtime"),
 		[ENV_AGENT_DIR]: tempDir,
 		TMPDIR: tempDir,
 		GIT_CEILING_DIRECTORIES: tempDir,
@@ -296,10 +297,13 @@ test("a child's HOME and XDG dirs sit inside its temp dir (no-op child, safe on 
 	const tempDir = mkdtempSync(join(tmpdir(), "vinci-fullscreen-env-"));
 	try {
 		const script =
-			'const os=require("node:os");process.stdout.write(JSON.stringify({home:os.homedir(),xdg:["XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_STATE_HOME","XDG_CACHE_HOME"].map((k)=>process.env[k])}))';
+			'const os=require("node:os");process.stdout.write(JSON.stringify({home:os.homedir(),xdg:["XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_STATE_HOME","XDG_CACHE_HOME","XDG_RUNTIME_DIR",...Object.keys(process.env).filter((k)=>k.startsWith("XDG_"))].map((k)=>process.env[k])}))';
 		const reported = await new Promise<{ home: string; xdg: string[] }>((resolve, reject) => {
-			execFile(process.execPath, ["-e", script], { env: childEnv(tempDir, "env-check") }, (error, stdout) =>
-				error ? reject(error) : resolve(JSON.parse(stdout)),
+			execFile(
+				process.execPath,
+				["-e", script],
+				{ cwd: tempDir, env: childEnv(tempDir, "env-check") },
+				(error, stdout) => (error ? reject(error) : resolve(JSON.parse(stdout))),
 			);
 		});
 		for (const value of [reported.home, ...reported.xdg]) {
@@ -314,9 +318,7 @@ test("a child's HOME and XDG dirs sit inside its temp dir (no-op child, safe on 
 });
 
 test("child environment drops ambient copy policy, identity, PI and multiplexer variables", async () => {
-	const tempDir = mkdtempSync(
-		join(process.env.TMPDIR ?? dirname(fileURLToPath(import.meta.url)), ".fullscreen-scrub-"),
-	);
+	const tempDir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), ".fullscreen-scrub-"));
 	const ambient = ["VINCI_COPY_ON_SELECT", "PI_C4_ISOLATION", "TMUX", "ZELLIJ", "STY"];
 	try {
 		for (const name of ambient) vi.stubEnv(name, "ambient-must-not-leak");

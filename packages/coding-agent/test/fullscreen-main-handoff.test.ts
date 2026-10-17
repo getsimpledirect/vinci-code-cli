@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
@@ -9,14 +10,14 @@ const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 const preload = new URL("./fullscreen-main-preload.ts", import.meta.url).href;
 const faux = fileURLToPath(new URL("./fixtures/vinci-mode-faux-provider.ts", import.meta.url));
 const enter = "\x1b[?1049h";
-const tempRoot = process.env.TMPDIR ?? dirname(fileURLToPath(import.meta.url));
+const tempRoot = process.env.TMPDIR ?? tmpdir();
 vi.setConfig({ testTimeout: 20_000 });
 
 // Equivalent to the lifecycle suite's childEnv, with explicit startup/multiplexer scrubbing.
 function childEnv(caseDir: string, vinciCode: string | undefined): NodeJS.ProcessEnv {
 	const env = { ...process.env };
 	for (const key of Object.keys(env)) {
-		if (key.startsWith("PI_")) delete env[key];
+		if (key.startsWith("PI_") || key.startsWith("XDG_")) delete env[key];
 	}
 	for (const key of ["VINCI_COPY_ON_SELECT", "VINCI_CODE", "TMUX", "ZELLIJ", "STY"]) delete env[key];
 	Object.assign(env, {

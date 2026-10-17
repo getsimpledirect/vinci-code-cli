@@ -1,0 +1,14 @@
+  Vero · Crew
+
+  Agent · agent-A  ! waiting approval
+  Task: TASK FOR agent-A
+  agent-A ROW 42 safe end
+  agent-A ROW 43 safe end
+  agent-A ROW 44 safe end
+
+  Deliberately left: not reported — scope unconfirmed
+
+  Message this agent:
+  (read-only)
+
+  Tab/Shift+Tab · Esc to close

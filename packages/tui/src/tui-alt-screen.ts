@@ -90,6 +90,10 @@ export interface TuiAltScreenOptions {
 	copyOnSelect?: boolean;
 	/** Defer viewport keys and disable selection while an application modal is open. */
 	deferViewportInput?: () => boolean;
+	/** [vinci] Opt-in LINE-copy fallback when rendered text cannot distinguish fill padding. */
+	trimLineSelectionPadding?: boolean;
+	/** [vinci] Host policy for mouse input to a custom modal; unset keeps ported behavior. */
+	customModalMouse?: () => "strip" | "forward" | undefined;
 }
 
 /** Alternate-screen TUI with a scrollable, application-owned viewport. */
@@ -129,6 +133,8 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 	private copyOnSelect: boolean;
 	private readonly copySelection?: TuiAltScreenOptions["copySelection"];
 	private readonly deferViewportInput?: () => boolean;
+	private readonly trimLineSelectionPadding: boolean;
+	private readonly customModalMouse?: TuiAltScreenOptions["customModalMouse"];
 
 	constructor(terminal: Terminal, showHardwareCursor?: boolean, options: TuiAltScreenOptions = {}) {
 		super(terminal, showHardwareCursor);
@@ -146,6 +152,8 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 		this.copyOnSelect = options.copyOnSelect ?? true;
 		this.copySelection = options.copySelection;
 		this.deferViewportInput = options.deferViewportInput;
+		this.trimLineSelectionPadding = options.trimLineSelectionPadding ?? false;
+		this.customModalMouse = options.customModalMouse;
 		this.addInputListener((data) => this.handleViewportInput(data));
 	}
 
@@ -383,6 +391,12 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 		if (data === "\x1b[I") return { consume: true };
 		const defer = this.isOverlayFocused() || this.deferViewportInput?.() === true;
 		if (this.hasOverlay() || this.deferViewportInput?.()) this.cancelSelection();
+		// [vinci] Only a host-selected custom modal changes SGR ownership.
+		if (/^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data)) {
+			const policy = this.customModalMouse?.();
+			if (policy === "strip") return { consume: true };
+			if (policy === "forward") return undefined;
+		}
 		const wheelEvent = this.parseWheelEvent(data);
 		if (wheelEvent) {
 			if (defer) return undefined;
@@ -763,8 +777,14 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 			const line = (box.scrollContentLines[row] ?? "").replaceAll(CURSOR_MARKER, "");
 			if (isImageLine(line)) continue;
 			const columns = this.getSelectionColumns(line, row, selection, 0, box.rect.width);
+			const selected = stripTerminalSequences(
+				sliceByColumn(line, columns.start, Math.max(0, columns.end - columns.start), true),
+			);
+			// [vinci] No source-space metadata survives rendering; trim only LINE copies on opt-in.
 			lines.push(
-				stripTerminalSequences(sliceByColumn(line, columns.start, Math.max(0, columns.end - columns.start), true)),
+				this.trimLineSelectionPadding && this.selectionGranularity === "line"
+					? selected.replace(/ +$/, "")
+					: selected,
 			);
 		}
 		const text = lines.join("\n");

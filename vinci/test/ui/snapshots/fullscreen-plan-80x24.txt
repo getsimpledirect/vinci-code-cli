@@ -1,0 +1,22 @@
+  Vinci v<version> Code
+  Vero DONE · Vinci · <repo>
+  ● connected · Read the receipt. · /undo · Ctrl+T thinking
+
+
+
+ Plan mode — exploring and designing without changing your project.
+
+
+ Plan the layout
+
+
+ The plan is ready. Which terminal size should we prioritize?
+
+  Plan  1/2  ━━━━━━━━━━━━━
+  ● Verify terminal sizes
+
+╭ ◇ Plan with Vinci ────────────────────────────────────────────── ● connected ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ◇ PLAN  ·  Vinci ─── <workspace>…  ·  0% full · ↓ 150 ╯

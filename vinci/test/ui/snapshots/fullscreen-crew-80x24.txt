@@ -1,0 +1,24 @@
+  Vero · Crew   ·   you're inside an agent, not the main chat
+
+  Agent · agent-A  ! waiting approval
+  Task: TASK FOR agent-A
+  agent-A ROW 32 safe end
+  agent-A ROW 33 safe end
+  agent-A ROW 34 safe end
+  agent-A ROW 35 safe end
+  agent-A ROW 36 safe end
+  agent-A ROW 37 safe end
+  agent-A ROW 38 safe end
+  agent-A ROW 39 safe end
+  agent-A ROW 40 safe end
+  agent-A ROW 41 safe end
+  agent-A ROW 42 safe end
+  agent-A ROW 43 safe end
+  agent-A ROW 44 safe end
+
+  Deliberately left: not reported — scope unconfirmed
+
+  Message this agent:
+  (read-only)
+
+  47/47 · PageUp/PageDown scroll · Tab/Shift+Tab switch · Esc to close
