@@ -121,6 +121,7 @@ export {
 	type SizeValue,
 	TUI,
 	type TuiMode,
+	type TuiStopOptions,
 	VIEWPORT_TUI,
 	type ViewportTUI,
 } from "./tui.ts";

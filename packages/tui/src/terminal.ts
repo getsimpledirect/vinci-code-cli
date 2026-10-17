@@ -67,6 +67,9 @@ export interface Terminal {
 	// Write output to terminal
 	write(data: string): void;
 
+	/** Write immediately when no event-loop turn remains before process exit. */
+	writeSync?(data: string): void;
+
 	// Get terminal dimensions
 	get columns(): number;
 	get rows(): number;
@@ -453,6 +456,15 @@ export class ProcessTerminal implements Terminal {
 
 	write(data: string): void {
 		process.stdout.write(data);
+		this.logWrite(data);
+	}
+
+	writeSync(data: string): void {
+		fs.writeSync(process.stdout.fd, data);
+		this.logWrite(data);
+	}
+
+	private logWrite(data: string): void {
 		if (this.writeLogPath) {
 			try {
 				fs.appendFileSync(this.writeLogPath, data, { encoding: "utf8" });

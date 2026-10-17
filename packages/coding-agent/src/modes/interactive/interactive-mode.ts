@@ -44,6 +44,8 @@ import {
 	Text,
 	TruncatedText,
 	TUI,
+	TuiAltScreen,
+	type TuiMode,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
@@ -285,6 +287,8 @@ export interface InteractiveModeOptions {
 	terminal?: Terminal;
 	/** Register process signal and uncaught-error handlers. Defaults to true. */
 	manageProcessSignals?: boolean;
+	/** Internal constructor seam; mode is fixed for this instance. Defaults to regular. */
+	tuiMode?: TuiMode;
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
 	/** Warning message if session model couldn't be restored */
@@ -362,6 +366,9 @@ export class InteractiveMode {
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
 	private signalCleanupHandlers: Array<() => void> = [];
+	private fullscreenExitHandler?: () => void;
+	private fullscreenSuspendHandler?: () => void;
+	private fullscreenSuspended = false;
 
 	// Track if editor is in bash mode (text starts with !)
 	private isBashMode = false;
@@ -437,7 +444,8 @@ export class InteractiveMode {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
 		});
 		this.version = VERSION;
-		this.ui = new TUI(options.terminal ?? new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
+		const Renderer = options.tuiMode === "fullscreen" ? TuiAltScreen : TUI;
+		this.ui = new Renderer(options.terminal ?? new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
@@ -3547,6 +3555,7 @@ export class InteractiveMode {
 
 	private emergencyTerminalExit(): never {
 		this.isShuttingDown = true;
+		if (this.ui.mode === "fullscreen") this.ui.markTerminalDead();
 		this.unregisterSignalHandlers();
 		killTrackedDetachedChildren();
 		// The terminal is gone. Do not run normal shutdown because TUI and
@@ -3577,7 +3586,8 @@ export class InteractiveMode {
 			killTrackedDetachedChildren();
 		} catch {}
 		try {
-			this.ui.stop();
+			if (this.ui.mode === "fullscreen") this.ui.stop({ preserveScreen: true });
+			else this.ui.stop();
 		} catch {}
 		console.error("pi exiting due to uncaughtException:");
 		console.error(error);
@@ -3594,6 +3604,35 @@ export class InteractiveMode {
 
 	private registerSignalHandlers(): void {
 		this.unregisterSignalHandlers();
+
+		if (this.ui.mode === "fullscreen") {
+			// This fallback outlives ordinary signal cleanup, including a failed stop.
+			// Exit listeners cannot await buffered stdout or render a transcript.
+			if (!this.fullscreenExitHandler) {
+				this.fullscreenExitHandler = () => {
+					try {
+						this.ui.resetTerminal(true);
+					} catch {}
+				};
+				process.on("exit", this.fullscreenExitHandler);
+			}
+			const sigintHandler = () => {
+				if (this.fullscreenSuspended) return;
+				killTrackedDetachedChildren();
+				void this.shutdown({ fromSignal: true });
+			};
+			process.prependListener("SIGINT", sigintHandler);
+			this.signalCleanupHandlers.push(() => process.off("SIGINT", sigintHandler));
+			if (process.platform !== "win32") {
+				const suspendHandler = () => this.handleCtrlZ();
+				this.fullscreenSuspendHandler = suspendHandler;
+				process.prependListener("SIGTSTP", suspendHandler);
+				this.signalCleanupHandlers.push(() => {
+					process.off("SIGTSTP", suspendHandler);
+					this.fullscreenSuspendHandler = undefined;
+				});
+			}
+		}
 
 		const signals: NodeJS.Signals[] = ["SIGTERM"];
 		if (process.platform !== "win32") {
@@ -3645,6 +3684,15 @@ export class InteractiveMode {
 			return;
 		}
 
+		const fullscreen = this.ui.mode === "fullscreen";
+		if (fullscreen && this.fullscreenSuspended) return;
+		const suspendHandler = this.fullscreenSuspendHandler;
+		if (fullscreen) {
+			this.fullscreenSuspended = true;
+			// The group signal below must reach the kernel's default stop action.
+			if (suspendHandler) process.off("SIGTSTP", suspendHandler);
+		}
+
 		// Keep the event loop alive while suspended. Without this, stopping the TUI
 		// can leave Node with no ref'ed handles, causing the process to exit on fg
 		// before the SIGCONT handler gets a chance to restore the terminal.
@@ -3656,22 +3704,38 @@ export class InteractiveMode {
 		process.on("SIGINT", ignoreSigint);
 
 		// Set up handler to restore TUI when resumed
-		process.once("SIGCONT", () => {
+		const resume = () => {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
+			if (fullscreen) {
+				this.fullscreenSuspended = false;
+				if (this.isShuttingDown) return;
+				if (suspendHandler && this.fullscreenSuspendHandler === suspendHandler) {
+					process.prependListener("SIGTSTP", suspendHandler);
+				}
+			}
 			this.ui.start();
 			this.ui.requestRender(true);
-		});
+		};
+		process.once("SIGCONT", resume);
 
 		try {
 			// Stop the TUI (restore terminal to normal mode)
-			this.ui.stop();
+			if (fullscreen) this.ui.stop({ preserveScreen: true });
+			else this.ui.stop();
 
 			// Send SIGTSTP to process group (pid=0 means all processes in group)
 			process.kill(0, "SIGTSTP");
 		} catch (error) {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
+			if (fullscreen) {
+				process.removeListener("SIGCONT", resume);
+				this.fullscreenSuspended = false;
+				if (suspendHandler && this.fullscreenSuspendHandler === suspendHandler) {
+					process.prependListener("SIGTSTP", suspendHandler);
+				}
+			}
 			throw error;
 		}
 	}
@@ -3810,7 +3874,8 @@ export class InteractiveMode {
 			fs.writeFileSync(tmpFile, currentText, "utf-8");
 
 			// Stop TUI to release terminal
-			this.ui.stop();
+			if (this.ui.mode === "fullscreen") this.ui.stop({ preserveScreen: true });
+			else this.ui.stop();
 
 			// Split by space to support editor arguments (e.g., "code --wait")
 			const [editor, ...editorArgs] = editorCmd.split(" ");
