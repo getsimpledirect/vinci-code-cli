@@ -1,11 +1,12 @@
 import "./env.mjs";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { test, vi } from "vitest";
 import { VirtualTerminal } from "../../../packages/tui/test/virtual-terminal.ts";
 import { createVinciUiHarness } from "./harness.mjs";
 
 const fixture = new URL("./fixtures/regular-bytes.ansi", import.meta.url);
+const FIXED_TMPDIR = "/tmp/vinci-regular-bytes";
 
 test("regular InteractiveMode preserves its complete raw output stream", async () => {
 	const output = [];
@@ -38,6 +39,11 @@ test("regular InteractiveMode preserves its complete raw output stream", async (
 		});
 	}
 	let ui;
+	// The harness workspace lives under os.tmpdir() and its path is rendered, so pin the temp root
+	// to one fixed absolute path: the frozen bytes must not depend on the caller's TMPDIR (CI has none).
+	const previousTmpdir = process.env.TMPDIR;
+	mkdirSync(FIXED_TMPDIR, { recursive: true });
+	process.env.TMPDIR = FIXED_TMPDIR;
 	try {
 		ui = await createVinciUiHarness({ responses: ["A deterministic response."] });
 		await ui.prompt("A deterministic prompt.");
@@ -45,6 +51,8 @@ test("regular InteractiveMode preserves its complete raw output stream", async (
 		await ui.resize(60, 20);
 	} finally {
 		if (ui) await ui.close();
+		if (previousTmpdir === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = previousTmpdir;
 		vi.restoreAllMocks();
 		vi.useRealTimers();
 	}
