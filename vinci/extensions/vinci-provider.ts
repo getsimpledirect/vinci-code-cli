@@ -29,7 +29,19 @@ const MAX_RETRY_AFTER_MS = 300_000;
 const MAX_IN_FLIGHT_RETRIES = 3;
 const MAX_TOTAL_402_RETRIES = 10;
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener("abort", finish, { once: true });
+  });
+};
 
 function boundedRetryAfterMs(value: string | null | undefined, fallbackSeconds: number): number {
   const seconds = Number(value);
@@ -340,7 +352,10 @@ export default function (pi: ExtensionAPI) {
     if (retryDelayMs !== undefined) {
       const delayMs = retryDelayMs;
       retryDelayMs = undefined;
-      await sleep(delayMs);
+      const signal = ctx.signal;
+      await sleep(delayMs, signal);
+      // The provider SDK observes the aborted signal before issuing the HTTP request.
+      if (signal?.aborted) return;
     }
     if (typeof event.payload !== "object" || event.payload === null) return;
     const original = event.payload as Record<string, unknown>;
