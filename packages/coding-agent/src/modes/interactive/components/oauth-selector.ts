@@ -68,6 +68,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 
 		// Add title
+		// [vinci] Vero sign-in copy under VINCI_CODE=1
 		const vinci = process.env.VINCI_CODE === "1";
 		const title = vinci
 			? mode === "login"

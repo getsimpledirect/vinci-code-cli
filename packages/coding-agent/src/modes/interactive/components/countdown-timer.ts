@@ -38,6 +38,7 @@ export class CountdownTimer {
 	}
 }
 
+// [vinci] ElapsedTimer for live compaction progress
 export class ElapsedTimer {
 	private intervalId: ReturnType<typeof setInterval> | undefined;
 	private readonly startedAt = Date.now();

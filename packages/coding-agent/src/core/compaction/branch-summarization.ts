@@ -344,6 +344,7 @@ export async function generateBranchSummary(
 		: await completeSimple(model, context, requestOptions);
 	const reporter = (
 		globalThis as typeof globalThis & {
+			// [vinci] optional usage hook so Vinci can record this summarization call; absent in upstream, so a no-op there
 			__vinciRecordTaskCall?: (response: AssistantMessage, source: string) => void;
 		}
 	).__vinciRecordTaskCall;

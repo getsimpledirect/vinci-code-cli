@@ -131,6 +131,7 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 	if (message.stopReason === "error" && message.errorMessage) {
 		// If the structured code indicates a billing request_too_large (not context overflow),
 		// return false early. This distinguishes the billing ceiling from a genuine overflow.
+		// [vinci] a billing request_too_large code is not a context overflow (#120)
 		if (code === "request_too_large") {
 			return false;
 		}

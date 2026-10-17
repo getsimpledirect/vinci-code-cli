@@ -556,6 +556,7 @@ async function completeSummarization(
 		: await completeSimple(model, context, options);
 	const reporter = (
 		globalThis as typeof globalThis & {
+			// [vinci] optional usage hook so Vinci can record this compaction call; absent in upstream, so a no-op there
 			__vinciRecordTaskCall?: (response: AssistantMessage, source: string) => void;
 		}
 	).__vinciRecordTaskCall;

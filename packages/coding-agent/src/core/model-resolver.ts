@@ -6,6 +6,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type Api, type KnownProvider, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { minimatch } from "minimatch";
+// [vinci] managed-provider class aliases (Fortissimo -> Forte); applies only to provider "vinci"
 import { canonicalVinciClass } from "../../../../vinci/extensions/lib/vinci-class.ts";
 import { isValidThinkingLevel } from "../cli/args.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
