@@ -25,6 +25,7 @@ function childEnv(caseDir: string, vinciCode: string | undefined): NodeJS.Proces
 		XDG_DATA_HOME: join(caseDir, "data"),
 		XDG_STATE_HOME: join(caseDir, "state"),
 		XDG_CACHE_HOME: join(caseDir, "cache"),
+		XDG_RUNTIME_DIR: join(caseDir, "runtime"),
 		[ENV_AGENT_DIR]: join(caseDir, "agent"),
 		TMPDIR: caseDir,
 		TERM: "xterm-256color",
