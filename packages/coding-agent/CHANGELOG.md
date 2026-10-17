@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added opt-in bounded Vinci RPC transport with protocol negotiation, complete-environment spawning, finite stream/request limits, correlated UI responses, and confirmed direct-child shutdown.
+
 - Added `ExtensionContext.pendingMessageCount()`, so an extension mirroring the steering/follow-up queue can reconcile against the session's own count instead of correlating events by message text.
 - Added Vinci drag, clipboard-path, and `@path` image attachments through the managed Vinci Vision route.
 - Added fail-closed Vinci credential redaction, sensitive-read controls, sandbox enforcement, and one-command shell network grants.

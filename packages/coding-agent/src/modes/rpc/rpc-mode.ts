@@ -385,6 +385,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		const id = command.id;
 
 		switch (command.type) {
+			// [vinci] Side-effect-free additive negotiation; no provider request.
+			case "get_protocol":
+				return success(id, "get_protocol", { version: 1 });
 			// =================================================================
 			// Prompting
 			// =================================================================

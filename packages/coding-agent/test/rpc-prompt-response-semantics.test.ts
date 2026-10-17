@@ -190,6 +190,25 @@ describe("RPC prompt response semantics", () => {
 		rpcIo.lineHandler = undefined;
 	});
 
+	it("answers additive protocol negotiation without a prompt or provider call", async () => {
+		const { lineHandler, cleanup } = await startRpcMode({ withAuth: false, responseDelayMs: 0 });
+		try {
+			lineHandler(JSON.stringify({ id: "protocol-1", type: "get_protocol" }));
+			await vi.waitFor(() =>
+				expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({
+					id: "protocol-1",
+					type: "response",
+					command: "get_protocol",
+					success: true,
+					data: { version: 1 },
+				}),
+			);
+			expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_start")).toBe(false);
+		} finally {
+			await cleanup();
+		}
+	});
+
 	it("emits one failure response when prompt preflight rejects", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({
 			withAuth: false,
