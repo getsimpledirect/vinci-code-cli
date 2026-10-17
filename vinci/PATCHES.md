@@ -34,7 +34,7 @@ only patch core when there's no hook.)
 | `ai/src/index.ts` | Export the completion-status classifier used by Vinci's supplemental LLM call sites | — |
 | `ai/src/providers/all.ts` | Capability-based model selection helpers, so catalog churn cannot break the build | — |
 | `ai/src/providers/opencode-go.ts` | Wire `openai-responses` on opencode-go so the build compiles | — |
-| `ai/src/types.ts` | `serviceTier` on usage: the tier the gateway actually served (priority badge) | — |
+| `ai/src/types.ts` | `serviceTier` on `AssistantMessage`: the tier the gateway actually served (priority badge) | — |
 | `ai/src/utils/error-body.ts`, `overflow.ts` | Carry the gateway's machine-readable error code; a billing `request_too_large` is not a context overflow | 12 |
 | `ai/src/utils/event-stream.ts` | Reject the final-result promise when a stream ends without a final result, instead of hanging | — |
 | `coding-agent/package.json` | `piConfig.name: "vinci"` — window title / `APP_NAME` (JSON, so no inline tag) | 9 |
