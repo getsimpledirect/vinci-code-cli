@@ -33,6 +33,10 @@ function emitOsc52(text: string): boolean {
 }
 
 export async function copyToClipboard(text: string): Promise<void> {
+	await copyToClipboardWithRoute(text);
+}
+
+export async function copyToClipboardWithRoute(text: string): Promise<"native" | "terminal" | "remote-only"> {
 	let copied = false;
 
 	const p = platform();
@@ -58,7 +62,7 @@ export async function copyToClipboard(text: string): Promise<void> {
 
 	const remote = isRemoteSession();
 	if (copied && !remote) {
-		return;
+		return "native";
 	}
 
 	const options: NativeClipboardExecOptions = { input: text, timeout: 5000, stdio: ["pipe", "ignore", "ignore"] };
@@ -119,9 +123,11 @@ export async function copyToClipboard(text: string): Promise<void> {
 	if (remote || !copied) {
 		const osc52Copied = emitOsc52(text);
 		copied = copied || osc52Copied;
+		if (osc52Copied) return "terminal";
 	}
 
 	if (!copied) {
 		throw new Error("Failed to copy to clipboard");
 	}
+	return remote ? "remote-only" : "native";
 }
