@@ -618,6 +618,13 @@ export class TUI extends Container {
 		return this.overlayStack.some((o) => this.isOverlayVisible(o));
 	}
 
+	/** Check whether a visible overlay owns keyboard focus. */
+	protected isOverlayFocused(): boolean {
+		return this.overlayStack.some(
+			(entry) => entry.component === this.focusedComponent && this.isOverlayVisible(entry),
+		);
+	}
+
 	/** Check if an overlay entry is currently visible */
 	private isOverlayVisible(entry: OverlayStackEntry): boolean {
 		if (entry.hidden) return false;

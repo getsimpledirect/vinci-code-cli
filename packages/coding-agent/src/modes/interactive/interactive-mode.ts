@@ -39,6 +39,7 @@ import {
 	Markdown,
 	matchesKey,
 	ProcessTerminal,
+	ScrollView,
 	Spacer,
 	setKeybindings,
 	Text,
@@ -46,6 +47,7 @@ import {
 	TUI,
 	TuiAltScreen,
 	type TuiMode,
+	VStack,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
@@ -110,7 +112,7 @@ import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
-import { copyToClipboard } from "../../utils/clipboard.ts";
+import { copyToClipboard, copyToClipboardWithRoute } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { getCwdRelativePath } from "../../utils/paths.ts";
@@ -289,6 +291,8 @@ export interface InteractiveModeOptions {
 	manageProcessSignals?: boolean;
 	/** Internal constructor seam; mode is fixed for this instance. Defaults to regular. */
 	tuiMode?: TuiMode;
+	/** Internal host clipboard boundary for fullscreen selection. */
+	copySelection?: (text: string) => Promise<"native" | "terminal" | "remote-only">;
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
 	/** Warning message if session model couldn't be restored */
@@ -396,6 +400,8 @@ export class InteractiveMode {
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
+	private activeCustomModals = new Set<symbol>();
+	private fullscreenFooter: Container | undefined;
 
 	// Extension widgets (components rendered above/below the editor)
 	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
@@ -444,8 +450,18 @@ export class InteractiveMode {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
 		});
 		this.version = VERSION;
-		const Renderer = options.tuiMode === "fullscreen" ? TuiAltScreen : TUI;
-		this.ui = new Renderer(options.terminal ?? new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
+		const terminal = options.terminal ?? new ProcessTerminal();
+		const showHardwareCursor = this.settingsManager.getShowHardwareCursor();
+		this.ui =
+			options.tuiMode === "fullscreen"
+				? new TuiAltScreen(terminal, showHardwareCursor, {
+						copySelection: options.copySelection ?? copyToClipboardWithRoute,
+						deferViewportInput: () =>
+							this.activeCustomModals.size > 0 ||
+							this.editorContainer.children.length !== 1 ||
+							this.editorContainer.children[0] !== this.editor,
+					})
+				: new TUI(terminal, showHardwareCursor);
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
@@ -468,6 +484,28 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+		if (this.ui instanceof TuiAltScreen) {
+			const transcript = new Container();
+			transcript.addChild(this.loadedResourcesContainer);
+			transcript.addChild(this.chatContainer);
+			transcript.addChild(this.pendingMessagesContainer);
+			transcript.addChild(this.statusContainer);
+			this.fullscreenFooter = new Container();
+			this.fullscreenFooter.addChild(this.footer);
+			const dock = new VStack([
+				{ component: this.widgetContainerAbove, shrink: 0 },
+				{ component: new ScrollView(this.editorContainer, { follow: "end", overscroll: "contain" }), shrink: 0 },
+				{ component: this.widgetContainerBelow, shrink: 0 },
+				{ component: this.fullscreenFooter, shrink: 0 },
+			]);
+			this.ui.setLayoutRoot(
+				new VStack([
+					{ component: this.headerContainer, shrink: 0 },
+					{ component: new ScrollView(transcript, { follow: "end", primary: true }), grow: 1 },
+					{ component: dock, shrink: 0 },
+				]),
+			);
+		}
 
 		// Load hide thinking block setting
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -1955,6 +1993,7 @@ export class InteractiveMode {
 			this.hideExtensionEditor();
 		}
 		this.ui.hideOverlay();
+		this.activeCustomModals.clear();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
 		this.setExtensionHeader(undefined);
@@ -2027,20 +2066,21 @@ export class InteractiveMode {
 		}
 
 		// Remove current footer from UI
+		const footerParent = this.fullscreenFooter ?? this.ui;
 		if (this.customFooter) {
-			this.ui.removeChild(this.customFooter);
+			footerParent.removeChild(this.customFooter);
 		} else {
-			this.ui.removeChild(this.footer);
+			footerParent.removeChild(this.footer);
 		}
 
 		if (factory) {
 			// Create and add custom footer, passing the data provider
 			this.customFooter = factory(this.ui, theme, this.footerDataProvider);
-			this.ui.addChild(this.customFooter);
+			footerParent.addChild(this.customFooter);
 		} else {
 			// Restore built-in footer
 			this.customFooter = undefined;
-			this.ui.addChild(this.footer);
+			footerParent.addChild(this.footer);
 		}
 
 		this.ui.requestRender();
@@ -2475,6 +2515,11 @@ export class InteractiveMode {
 	): Promise<T> {
 		const savedText = this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
+		const fullscreenModal = this.ui.mode === "fullscreen" ? Symbol() : undefined;
+		if (fullscreenModal) {
+			this.activeCustomModals.add(fullscreenModal);
+			this.ui.requestRender();
+		}
 
 		const restoreEditor = () => {
 			this.editorContainer.clear();
@@ -2484,7 +2529,7 @@ export class InteractiveMode {
 			this.ui.requestRender();
 		};
 
-		return new Promise((resolve, reject) => {
+		const result = new Promise<T>((resolve, reject) => {
 			let component: Component & { dispose?(): void };
 			let closed = false;
 
@@ -2535,6 +2580,11 @@ export class InteractiveMode {
 					if (!isOverlay) restoreEditor();
 					reject(err);
 				});
+		});
+		if (!fullscreenModal) return result;
+		return result.finally(() => {
+			this.activeCustomModals.delete(fullscreenModal);
+			this.ui.requestRender();
 		});
 	}
 
