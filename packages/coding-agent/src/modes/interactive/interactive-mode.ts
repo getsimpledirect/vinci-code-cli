@@ -3493,7 +3493,7 @@ export class InteractiveMode {
 				new Text(
 					theme.fg(
 						"warning",
-						`! ${count} from this session couldn't be read and ${unreadable.length === 1 ? "was" : "were"} skipped — the restored conversation may be missing recent steps.`,
+						`⚠ ${count} from this session couldn't be read and ${unreadable.length === 1 ? "was" : "were"} skipped — the restored conversation may be missing recent steps.`,
 					),
 					1,
 					0,
