@@ -1,4 +1,5 @@
 import type { Transport } from "@earendil-works/pi-ai";
+import type { TuiMode } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
@@ -80,6 +81,8 @@ export type PackageSource =
 	  };
 
 export interface Settings {
+	tuiMode?: TuiMode; // default: "regular"
+	copyOnSelect?: boolean; // default: true; fullscreen only
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
 	defaultModel?: string;
@@ -171,6 +174,14 @@ function parseTimeoutSetting(value: unknown, settingName: string): number | unde
 }
 
 export type SettingsScope = "global" | "project";
+
+export function resolveCopyOnSelect(
+	tuiMode: TuiMode,
+	setting: boolean | undefined,
+	envValue: string | undefined,
+): boolean {
+	return tuiMode === "fullscreen" && envValue !== "0" && (setting ?? true);
+}
 
 export interface SettingsManagerCreateOptions {
 	projectTrusted?: boolean;
@@ -659,6 +670,26 @@ export class SettingsManager {
 
 	getLastChangelogVersion(): string | undefined {
 		return this.settings.lastChangelogVersion;
+	}
+
+	getTuiMode(): TuiMode {
+		return this.settings.tuiMode === "fullscreen" ? "fullscreen" : "regular";
+	}
+
+	setTuiMode(mode: TuiMode): void {
+		this.globalSettings.tuiMode = mode;
+		this.markModified("tuiMode");
+		this.save();
+	}
+
+	getCopyOnSelect(): boolean {
+		return this.settings.copyOnSelect ?? true;
+	}
+
+	setCopyOnSelect(enabled: boolean): void {
+		this.globalSettings.copyOnSelect = enabled;
+		this.markModified("copyOnSelect");
+		this.save();
 	}
 
 	setLastChangelogVersion(version: string): void {

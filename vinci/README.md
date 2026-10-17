@@ -228,6 +228,34 @@ it opens the browser, you authorize, and the CLI gets its own revocable key (man
 Backend: vinci-chat `device_pairings` (#91) + vinci-platform `/api/device/*` (#2) — **must
 be deployed for `/login` to work.** Symlink `vinci/bin/vinci` onto your PATH as `vinci`.
 
+### Fullscreen (opt-in)
+
+Regular mode remains the default. Start fullscreen with `vinci --tui-mode fullscreen`, or set
+`"tuiMode": "fullscreen"` in `~/.pi/agent/settings.json` (global) or `.pi/settings.json`
+(project settings take precedence). Turn it off with the fullscreen `/settings` TUI mode row,
+`vinci --tui-mode regular`, or by removing `tuiMode` from the settings files. A mode change in
+`/settings` takes effect on the next start; the current screen does not switch.
+
+Selecting text copies it to your clipboard. Use Shift+drag (Option+drag in iTerm2 and Terminal.app) to select without copying.
+
+Turn automatic copying off with `"copyOnSelect": false` in settings or `VINCI_COPY_ON_SELECT=0 vinci`.
+
+`VINCI_COPY_ON_SELECT=0` turns copy-on-select off only when you start Vinci with the `vinci` command. The `copyOnSelect` setting works however Vinci is started.
+
+The fullscreen `/settings` copy-on-select row changes this setting immediately. When the environment
+switch is `0`, the row reads `Off (VINCI_COPY_ON_SELECT=0)` and is read-only. Ctrl+X copies the
+current selection even when automatic copying is off; with no selection it does nothing.
+
+If Vinci is force-quit or your connection drops while in fullscreen mode, run `reset` to restore your terminal.
+
+In fullscreen mode, if Vinci crashes or you suspend it with Ctrl+Z, the conversation is not printed to your terminal's scrollback; your session is still saved.
+
+Scroll with the mouse wheel, Shift+PageUp/PageDown, or Ctrl+Home/End. Some terminals use these keys themselves; if they don't scroll Vinci, use the mouse wheel.
+
+Device QA for these fullscreen controls, native Shift/Option-drag bypass, recovery and scroll keys:
+**NOT_RUN** on Terminal.app, iTerm2, Ghostty, kitty, WezTerm and tmux. These instructions do not
+establish compatibility with those terminals or whether Shift+PageUp/PageDown reaches Vinci.
+
 ### Running against a non-prod Vinci (internal)
 
 `VINCI_ENV=dev` is the supported one-variable way to run against the Chat+Platform dev box:

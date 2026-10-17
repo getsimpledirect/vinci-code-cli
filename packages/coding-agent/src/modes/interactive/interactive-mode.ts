@@ -87,6 +87,7 @@ import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-nam
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
+import { resolveCopyOnSelect } from "../../core/settings-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 
 // [vinci] The built-ins the lean `/` menu keeps under VINCI_CODE. Module-scoped because TWO
@@ -291,6 +292,7 @@ export interface InteractiveModeOptions {
 	manageProcessSignals?: boolean;
 	/** Internal constructor seam; mode is fixed for this instance. Defaults to regular. */
 	tuiMode?: TuiMode;
+	copyOnSelect?: boolean;
 	/** Internal host clipboard boundary for fullscreen selection. */
 	copySelection?: (text: string) => Promise<"native" | "terminal" | "remote-only">;
 	/** Providers that were migrated to auth.json (shows warning) */
@@ -422,6 +424,7 @@ export class InteractiveMode {
 	private customHeader: (Component & { dispose?(): void }) | undefined = undefined;
 
 	private options: InteractiveModeOptions;
+	private readonly copyOnSelectEnvValue: string | undefined;
 	private autoTrustOnReloadCwd: string | undefined;
 	private themeController: InteractiveThemeController;
 
@@ -442,6 +445,8 @@ export class InteractiveMode {
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
 		this.options = options;
+		// [vinci] Only the Vinci launcher activates the startup-captured environment override.
+		this.copyOnSelectEnvValue = process.env.VINCI_CODE === "1" ? process.env.VINCI_COPY_ON_SELECT : undefined;
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
 			this.resetExtensionUI();
@@ -452,9 +457,14 @@ export class InteractiveMode {
 		this.version = VERSION;
 		const terminal = options.terminal ?? new ProcessTerminal();
 		const showHardwareCursor = this.settingsManager.getShowHardwareCursor();
+		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
+		const copyOnSelect =
+			options.copyOnSelect ??
+			resolveCopyOnSelect(tuiMode, this.settingsManager.getCopyOnSelect(), this.copyOnSelectEnvValue);
 		this.ui =
-			options.tuiMode === "fullscreen"
+			tuiMode === "fullscreen"
 				? new TuiAltScreen(terminal, showHardwareCursor, {
+						copyOnSelect,
 						copySelection: options.copySelection ?? copyToClipboardWithRoute,
 						deferViewportInput: () =>
 							this.activeCustomModals.size > 0 ||
@@ -1735,6 +1745,11 @@ export class InteractiveMode {
 
 	private applyRuntimeSettings(): void {
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
+		if (this.ui instanceof TuiAltScreen) {
+			this.ui.setCopyOnSelect(
+				resolveCopyOnSelect(this.ui.mode, this.settingsManager.getCopyOnSelect(), this.copyOnSelectEnvValue),
+			);
+		}
 		this.footer.setSession(this.session);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 		this.footerDataProvider.setCwd(this.sessionManager.getCwd());
@@ -2658,6 +2673,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
+		if (this.ui instanceof TuiAltScreen) {
+			this.defaultEditor.onAction("app.message.copy", () => void this.handleFullscreenCopy());
+		}
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
@@ -4266,6 +4284,9 @@ export class InteractiveMode {
 					quietStartup: this.settingsManager.getQuietStartup(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
+					tuiMode: this.ui.mode,
+					copyOnSelect: this.settingsManager.getCopyOnSelect(),
+					copyOnSelectEnvDisabled: this.copyOnSelectEnvValue === "0",
 					warnings: this.settingsManager.getWarnings(),
 				},
 				{
@@ -4397,6 +4418,23 @@ export class InteractiveMode {
 					},
 					onShowTerminalProgressChange: (enabled) => {
 						this.settingsManager.setShowTerminalProgress(enabled);
+					},
+					onTuiModeChange: (mode) => {
+						this.settingsManager.setTuiMode(mode);
+						// [vinci] Mode changes never replace the running renderer.
+						if (process.env.VINCI_CODE === "1") this.showStatus("Takes effect next time you start Vinci");
+					},
+					onCopyOnSelectChange: (enabled) => {
+						this.settingsManager.setCopyOnSelect(enabled);
+						if (this.ui instanceof TuiAltScreen) {
+							this.ui.setCopyOnSelect(
+								resolveCopyOnSelect(
+									this.ui.mode,
+									this.settingsManager.getCopyOnSelect(),
+									this.copyOnSelectEnvValue,
+								),
+							);
+						}
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -5419,6 +5457,11 @@ export class InteractiveMode {
 			await this.session.reload({ beforeSessionStart: restoreChatBeforeSessionStart });
 			restoreChatBeforeSessionStart();
 			configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
+			if (this.ui instanceof TuiAltScreen) {
+				this.ui.setCopyOnSelect(
+					resolveCopyOnSelect(this.ui.mode, this.settingsManager.getCopyOnSelect(), this.copyOnSelectEnvValue),
+				);
+			}
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
 			if (isExpandable(activeHeader)) {
@@ -5646,6 +5689,40 @@ export class InteractiveMode {
 			if (!loader.signal.aborted) {
 				restoreEditor();
 				this.showError(`Failed to create gist: ${error instanceof Error ? error.message : "Unknown error"}`);
+			}
+		}
+	}
+
+	private async handleFullscreenCopy(): Promise<void> {
+		if (!(this.ui instanceof TuiAltScreen)) return;
+		try {
+			// [vinci] Ctrl+X always means copy the selection, including when automatic copy is on.
+			if (process.env.VINCI_CODE === "1") {
+				await this.ui.copyActiveSelectionToClipboard();
+				return;
+			}
+			if (!this.ui.getCopyOnSelect() && this.ui.hasActiveSelection()) {
+				await this.ui.copyActiveSelectionToClipboard();
+				return;
+			}
+			const text = this.session.getLastAssistantText();
+			if (!text) {
+				this.showError("No agent messages to copy yet.");
+				return;
+			}
+			const route = await (this.options.copySelection ?? copyToClipboardWithRoute)(text);
+			this.ui.flash(
+				route === "native"
+					? "Copied"
+					: route === "terminal"
+						? "Sent to terminal clipboard"
+						: "Couldn't copy to clipboard",
+			);
+		} catch {
+			try {
+				this.ui.flash("Couldn't copy to clipboard");
+			} catch {
+				// Feedback rendering must not turn a copy action into an unhandled rejection.
 			}
 		}
 	}

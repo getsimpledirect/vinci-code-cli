@@ -45,7 +45,7 @@ import {
 	getDefaultSessionDir,
 	SessionManager,
 } from "./core/session-manager.ts";
-import { SettingsManager } from "./core/settings-manager.ts";
+import { resolveCopyOnSelect, SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
@@ -892,7 +892,12 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
+		const tuiMode = parsed.tuiMode ?? settingsManager.getTuiMode();
+		// [vinci] The launcher's identity gate owns Vinci's startup-only clipboard environment override.
+		const copyOnSelectEnv = process.env.VINCI_CODE === "1" ? process.env.VINCI_COPY_ON_SELECT : undefined;
 		const interactiveMode = new InteractiveMode(runtime, {
+			tuiMode,
+			copyOnSelect: resolveCopyOnSelect(tuiMode, settingsManager.getCopyOnSelect(), copyOnSelectEnv),
 			migratedProviders,
 			modelFallbackMessage,
 			autoTrustOnReloadCwd,

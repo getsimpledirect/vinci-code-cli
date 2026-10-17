@@ -3,6 +3,7 @@
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { TuiMode } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
 import type { ExtensionFlag } from "../core/extensions/types.ts";
@@ -10,6 +11,7 @@ import type { ExtensionFlag } from "../core/extensions/types.ts";
 export type Mode = "text" | "json" | "rpc";
 
 export interface Args {
+	tuiMode?: TuiMode;
 	provider?: string;
 	model?: string;
 	apiKey?: string;
@@ -188,6 +190,18 @@ export function parseArgs(args: string[]): Args {
 			} else {
 				result.listModels = true;
 			}
+		} else if (arg === "--tui-mode") {
+			const mode = args[i + 1];
+			if (mode === "regular" || mode === "fullscreen") {
+				result.tuiMode = mode;
+				i++;
+			} else {
+				result.diagnostics.push({
+					type: "error",
+					message: "Invalid or missing --tui-mode value. Valid values: regular, fullscreen",
+				});
+				if (mode !== undefined && !mode.startsWith("-") && !mode.startsWith("@")) i++;
+			}
 		} else if (arg === "--verbose") {
 			result.verbose = true;
 		} else if (arg === "--approve" || arg === "-a") {
@@ -224,6 +238,10 @@ export function parseArgs(args: string[]): Args {
 
 export function printHelp(extensionFlags?: ExtensionFlag[]): void {
 	const vinciCode = process.env.VINCI_CODE === "1";
+	// [vinci] Disclose automatic clipboard writes only in Vinci's fullscreen opt-in help.
+	const fullscreenDisclosure = vinciCode
+		? "                                 Selecting text copies it to your clipboard. Use Shift+drag (Option+drag in iTerm2 and Terminal.app) to select without copying.\n"
+		: "";
 	// [vinci] Provider selection and credentials are managed by Vinci, while plain Pi keeps its full help.
 	const providerRouteOptionsText = vinciCode
 		? ""
@@ -326,7 +344,8 @@ ${chalk.bold("Options:")}
 ${providerRouteOptionsText}  --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
-  --print, -p                    Non-interactive mode: process prompt and exit
+  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
+${fullscreenDisclosure}  --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID

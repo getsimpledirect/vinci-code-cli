@@ -11,6 +11,7 @@ import {
 	SettingsList,
 	Spacer,
 	Text,
+	type TuiMode,
 } from "@earendil-works/pi-tui";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
 import type { DefaultProjectTrust, WarningSettings } from "../../../core/settings-manager.ts";
@@ -77,6 +78,9 @@ export interface SettingsConfig {
 	defaultProjectTrust: DefaultProjectTrust;
 	clearOnShrink: boolean;
 	showTerminalProgress: boolean;
+	tuiMode: TuiMode;
+	copyOnSelect: boolean;
+	copyOnSelectEnvDisabled: boolean;
 	warnings: WarningSettings;
 }
 
@@ -107,6 +111,8 @@ export interface SettingsCallbacks {
 	onDefaultProjectTrustChange: (defaultProjectTrust: DefaultProjectTrust) => void;
 	onClearOnShrinkChange: (enabled: boolean) => void;
 	onShowTerminalProgressChange: (enabled: boolean) => void;
+	onTuiModeChange: (mode: TuiMode) => void;
+	onCopyOnSelectChange: (enabled: boolean) => void;
 	onWarningsChange: (warnings: WarningSettings) => void;
 	onCancel: () => void;
 }
@@ -720,6 +726,26 @@ export class SettingsSelectorComponent extends Container {
 
 		// Add borders
 		this.addChild(new DynamicBorder());
+		if (config.tuiMode === "fullscreen") {
+			// [vinci] The startup-only environment override is visible and cannot be edited away.
+			const envDisabled = process.env.VINCI_CODE === "1" && config.copyOnSelectEnvDisabled;
+			items.push(
+				{
+					id: "tui-mode",
+					label: "TUI mode",
+					description: "Interface layout; takes effect after restart",
+					currentValue: config.tuiMode,
+					values: ["regular", "fullscreen"],
+				},
+				{
+					id: "copy-on-select",
+					label: "Copy on select",
+					description: "Automatically copy selected text in fullscreen mode",
+					currentValue: envDisabled ? "Off (VINCI_COPY_ON_SELECT=0)" : String(config.copyOnSelect),
+					values: envDisabled ? undefined : ["true", "false"],
+				},
+			);
+		}
 
 		// [vinci] Simplicity: Vinci's users aren't pro programmers tuning transport protocols — Vinci
 		// handles the plumbing. Under VINCI_CODE show only genuine user PREFERENCES; everything else is
@@ -727,8 +753,8 @@ export class SettingsSelectorComponent extends Container {
 		// visible). The orchestrator will adjust these dynamically + tell the user, rather than exposing
 		// hard toggles. Edit VINCI_SETTINGS to tweak.
 		// [vinci] show-images is a dead knob — every Vinci model is text-only (input: ["text"]),
-		// so images are never sent. Theme is the one real user preference; Vinci manages the rest.
-		const VINCI_SETTINGS = new Set(["theme"]);
+		// so images are never sent. Keep themes and opted-in fullscreen preferences; Vinci manages the rest.
+		const VINCI_SETTINGS = new Set(["theme", "tui-mode", "copy-on-select"]);
 		const shownItems = process.env.VINCI_CODE === "1" ? items.filter((it) => VINCI_SETTINGS.has(it.id)) : items;
 
 		this.settingsList = new SettingsList(
@@ -815,6 +841,12 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "terminal-progress":
 						callbacks.onShowTerminalProgressChange(newValue === "true");
+						break;
+					case "tui-mode":
+						callbacks.onTuiModeChange(newValue as TuiMode);
+						break;
+					case "copy-on-select":
+						callbacks.onCopyOnSelectChange(newValue === "true");
 						break;
 					case "theme":
 						callbacks.onThemeChange(newValue);
