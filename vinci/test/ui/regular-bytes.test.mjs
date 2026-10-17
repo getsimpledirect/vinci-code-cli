@@ -20,8 +20,11 @@ function privateModes(stream) {
 	return [...new Set(stream.match(/\x1b\[\?[0-9;]+[hl]/g) ?? [])].sort();
 }
 
+// The header shows the release version; normalise it so a version bump is not a screen change.
+const normaliseVersion = (screen) => screen.replace(/Vinci v\d+\.\d+\.\d+/g, "Vinci v<version>");
+
 async function checkpoint(ui) {
-	return { screen: await ui.screen(), cursor: ui.terminal.getCursorPosition() };
+	return { screen: normaliseVersion(await ui.screen()), cursor: ui.terminal.getCursorPosition() };
 }
 
 test("regular InteractiveMode emits no new terminal modes and settles on the base screen", async () => {
