@@ -253,6 +253,14 @@ export function printModeExitCode({
 	if (lastMessage.stopReason === "error" || lastMessage.stopReason === "aborted") {
 		return { exitCode: 1, emitText: false, message: lastMessage.errorMessage || `Request ${lastMessage.stopReason}` };
 	}
+	if (lastMessage.stopReason === "length") {
+		return {
+			// [vinci] Keep verification-blocked exit 3 when the final response is also truncated.
+			exitCode: headlessExitHint === 3 ? 3 : 1,
+			emitText: mode === "text",
+			message: "Warning: the response was cut off at the output limit and is incomplete.",
+		};
+	}
 	return { exitCode: headlessExitHint ?? 0, emitText: mode === "text" };
 }
 

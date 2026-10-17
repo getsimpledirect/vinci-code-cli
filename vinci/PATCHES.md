@@ -60,7 +60,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/modes/interactive/interactive-mode.ts` | `/login`→vinci, Ctrl+C window, clean launch, `/model` filter, lean `/` menu; injectable terminal/process-handler seam for offline UI tests; expose active overlay focus to extensions; post-login ecosystem pointer instead of the credentials path | 1–5,22,25 |
 | `coding-agent/src/modes/rpc/rpc-client.ts` | Settle `waitForIdle`/`collectEvents` (and release their timers) when the agent process dies or is stopped — a pure upstream bugfix, not env-gated | — |
 | `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists | — |
-| `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output | 13 |
+| `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output; preserve verification-blocked exit 3 for a truncated final response | 13 |
 
 The `§` column points at the detailed rationale below (— = self-explanatory from the in-code
 `[vinci]` comment). §13 is the cross-cutting display-only secret masking (the masker itself lives in

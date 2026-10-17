@@ -91,9 +91,101 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
 });
 
 describe("runPrintMode", () => {
+	const truncationWarning = "Warning: the response was cut off at the output limit and is incomplete.";
+
+	for (const mode of ["text", "json"] as const) {
+		it(`${mode}: prints masked partial output and exits 1 for final length`, async () => {
+			vi.stubEnv("VINCI_CODE", "1");
+			const secret = "sk-ant-TESTONLY-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+			const message = createAssistantMessage({ text: `Partial answer AUTH_TOKEN=${secret}`, stopReason: "length" });
+			const runtime = createRuntimeHost(message);
+			const writes: string[] = [];
+			vi.spyOn(process.stdout, "write").mockImplementation((chunk, encodingOrCallback, callback) => {
+				writes.push(String(chunk));
+				const done = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+				done?.();
+				return true;
+			});
+			const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+			runtime.session.subscribe.mockImplementation((listener: (event: object) => void) => {
+				listener({ type: "message_end", message });
+				return () => {};
+			});
+
+			const exitCode = await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], { mode });
+			expect(exitCode).toBe(1);
+			expect(errors.mock.calls).toEqual([[truncationWarning]]);
+			const output = writes.join("");
+			expect(output).toContain("Partial answer");
+			expect(output).not.toContain(secret);
+			expect(output).toContain("redacted");
+			if (mode === "text") {
+				expect(output.trim().split("\n")).toHaveLength(1);
+			} else {
+				const events = output
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				expect(events).toHaveLength(1);
+				expect(events[0]).toEqual({
+					type: "message_end",
+					message: { ...message, content: [{ type: "text", text: expect.stringContaining("redacted") }] },
+				});
+				// The normal path must produce the same event envelope and fields.
+				writes.length = 0;
+				message.stopReason = "stop";
+				expect(await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(0);
+				expect(JSON.parse(writes.join("")).message).toEqual({ ...events[0].message, stopReason: "stop" });
+				expect(errors.mock.calls).toEqual([[truncationWarning]]);
+			}
+		});
+
+		it(`${mode}: preserves verification-blocked hint 3 for final length`, async () => {
+			const runtime = createRuntimeHost(createAssistantMessage({ stopReason: "length" }));
+			runtime.session.extensionRunner.getHeadlessExitHint = () => 3;
+			const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+			expect(await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(3);
+			expect(errors.mock.calls).toEqual([[truncationWarning]]);
+		});
+
+		for (const stopReason of ["error", "aborted"] as const) {
+			it(`${mode}: ${stopReason} still overrides verification-blocked hint 3`, async () => {
+				const runtime = createRuntimeHost(createAssistantMessage({ stopReason }));
+				runtime.session.extensionRunner.getHeadlessExitHint = () => 3;
+				const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+				expect(await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(1);
+				expect(errors.mock.calls).toEqual([[`Request ${stopReason}`]]);
+			});
+		}
+
+		it(`${mode}: normal final stop exits 0 without a warning`, async () => {
+			const runtime = createRuntimeHost(createAssistantMessage());
+			const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+			expect(await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(0);
+			expect(errors).not.toHaveBeenCalled();
+		});
+
+		it(`${mode}: recovered length uses the later final stop without a warning`, async () => {
+			const runtime = createRuntimeHost(createAssistantMessage({ stopReason: "length" }));
+			runtime.session.prompt.mockImplementation(async () => {
+				runtime.session.state.messages.push(createAssistantMessage());
+			});
+			const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+			expect(
+				await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], {
+					mode,
+					initialMessage: "finish the answer",
+				}),
+			).toBe(0);
+			expect(runtime.session.state.messages.map((message) => message.stopReason)).toEqual(["length", "stop"]);
+			expect(errors).not.toHaveBeenCalled();
+		});
+	}
+
 	it("emits session_shutdown in text mode", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
 		const { session } = runtimeHost;

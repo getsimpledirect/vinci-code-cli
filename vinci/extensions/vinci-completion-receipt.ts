@@ -12,7 +12,11 @@ import { vinciVerificationDisabled } from "./lib/verification-control.ts";
 export default function (pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     if (vinciVerificationDisabled() || event.message.role !== "assistant") return undefined;
-    if (event.message.stopReason === "error" || event.message.stopReason === "aborted") return undefined;
+    if (
+      event.message.stopReason === "error" ||
+      event.message.stopReason === "aborted" ||
+      event.message.stopReason === "length"
+    ) return undefined;
     if (event.message.content.some((part) => part.type === "toolCall")) return undefined;
 
     const text = event.message.content
