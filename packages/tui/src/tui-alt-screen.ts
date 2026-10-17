@@ -10,7 +10,7 @@ import {
 	setCapabilities,
 	type TerminalCapabilities,
 } from "./terminal-image.ts";
-import { type Component, CURSOR_MARKER, TUI, VIEWPORT_TUI, type ViewportTUI } from "./tui.ts";
+import { type Component, CURSOR_MARKER, TUI, type TuiStopOptions, VIEWPORT_TUI, type ViewportTUI } from "./tui.ts";
 import { extractAnsiCode, getGraphemeCellRange, getOsc8LinkAtColumn, sliceByColumn, visibleWidth } from "./utils.ts";
 
 const ENTER_ALT_SCREEN = "\x1b[?1049h";
@@ -18,7 +18,7 @@ const EXIT_ALT_SCREEN = "\x1b[?1049l";
 const DISABLE_AUTOWRAP = "\x1b[?7l";
 const ENABLE_AUTOWRAP = "\x1b[?7h";
 const ENABLE_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 const BEGIN_SYNCHRONIZED_OUTPUT = "\x1b[?2026h";
 const END_SYNCHRONIZED_OUTPUT = "\x1b[?2026l";
 const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
@@ -64,6 +64,9 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 	private readonly implicitDocument: Component;
 	private readonly implicitScrollView: ScrollView;
 	private altScreenActive = false;
+	private terminalStopPending = false;
+	private terminalDead = false;
+	private transcriptPending = false;
 	private imageProtocol: ImageProtocol = null;
 	private savedCapabilities?: TerminalCapabilities;
 	private selectionAnchor?: SelectionPoint;
@@ -125,8 +128,70 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 		return this.currentLayout?.primaryScrollView ?? this.implicitScrollView;
 	}
 
+	override start(): void {
+		if (this.terminalDead) return;
+		try {
+			super.start();
+		} catch (error) {
+			try {
+				this.stop({ preserveScreen: true });
+			} catch {}
+			throw error;
+		}
+	}
+
+	override stop(options: TuiStopOptions = {}): void {
+		if (this.terminalDead || (this.stopped && !this.altScreenActive && !this.terminalStopPending)) return;
+		try {
+			super.stop(options);
+		} catch (error) {
+			try {
+				this.resetTerminal();
+			} catch {}
+			throw error;
+		}
+	}
+
+	override resetTerminal(synchronous = false): void {
+		this.stopRendering(true);
+		this.stopSelectionAutoScroll();
+		this.transcriptPending = false;
+		if (this.terminalDead) return;
+		if (synchronous && this.terminalStopPending) {
+			try {
+				this.terminal.stop();
+				this.terminalStopPending = false;
+			} catch {
+				// Restore renderer modes even if restoring terminal input failed.
+			}
+		}
+		if (this.terminalDead || !this.altScreenActive) return;
+		const reset = `${BEGIN_SYNCHRONIZED_OUTPUT}${this.deleteViewportKittyImages()}${DISABLE_MOUSE}${ENABLE_AUTOWRAP}\x1b[?25h${EXIT_ALT_SCREEN}${END_SYNCHRONIZED_OUTPUT}`;
+		if (synchronous && this.terminal.writeSync) this.terminal.writeSync(reset);
+		else this.terminal.write(reset);
+		this.altScreenActive = false;
+		if (this.savedCapabilities) {
+			setCapabilities(this.savedCapabilities);
+			this.savedCapabilities = undefined;
+		}
+	}
+
+	override markTerminalDead(): void {
+		this.terminalDead = true;
+		this.altScreenActive = false;
+		this.terminalStopPending = false;
+		this.transcriptPending = false;
+		this.stopRendering(true);
+		this.stopSelectionAutoScroll();
+		if (this.savedCapabilities) {
+			setCapabilities(this.savedCapabilities);
+			this.savedCapabilities = undefined;
+		}
+	}
+
 	protected override beforeTerminalStart(): void {
 		this.stopSelectionAutoScroll();
+		this.terminalStopPending = true;
 		this.altScreenActive = true;
 		const capabilities = getCapabilities();
 		this.imageProtocol = capabilities.images;
@@ -146,23 +211,22 @@ export class TuiAltScreen extends TUI implements ViewportTUI {
 		);
 	}
 
-	protected override beforeTerminalStop(): void {
-		this.stopSelectionAutoScroll();
-		if (!this.altScreenActive) return;
-		this.terminal.write(
-			`${BEGIN_SYNCHRONIZED_OUTPUT}${this.deleteViewportKittyImages()}${this.mouseEnabled ? DISABLE_MOUSE : ""}${ENABLE_AUTOWRAP}${END_SYNCHRONIZED_OUTPUT}`,
-		);
+	protected override beforeTerminalStop(options: TuiStopOptions): void {
+		const printTranscript = this.altScreenActive && !options.preserveScreen;
+		this.resetTerminal();
+		this.transcriptPending = printTranscript;
 	}
 
 	protected override afterTerminalStop(): void {
-		if (!this.altScreenActive) return;
-		this.altScreenActive = false;
+		this.terminalStopPending = false;
+		if (!this.transcriptPending) return;
+		this.transcriptPending = false;
 		const width = Math.max(1, this.terminal.columns);
 		const documentLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
 		this.lastDocument = this.applyLineResets(documentLines.map((line) => line.replaceAll(CURSOR_MARKER, ""))).map(
 			(line) => (isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true)),
 		);
-		let buffer = `${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}${DISABLE_AUTOWRAP}`;
+		let buffer = `${BEGIN_SYNCHRONIZED_OUTPUT}${DISABLE_AUTOWRAP}`;
 		for (let row = 0; row < this.lastDocument.length; row++) {
 			if (row > 0) buffer += "\r\n";
 			buffer += `\r\x1b[2K${this.lastDocument[row] ?? ""}`;

@@ -291,6 +291,11 @@ export class Container implements Component {
 
 export type TuiMode = "regular" | "fullscreen";
 
+export interface TuiStopOptions {
+	/** Restore terminal state without writing a final transcript. */
+	preserveScreen?: boolean;
+}
+
 /**
  * TUI - Main class for managing terminal UI with differential rendering
  */
@@ -692,25 +697,37 @@ export class TUI extends Container {
 		this.terminal.write("\x1b[16t");
 	}
 
-	stop(): void {
+	stop(options: TuiStopOptions = {}): void {
+		this.stopRendering();
+		if (this.terminalColorSchemeNotificationsEnabled) {
+			this.terminal.write("\x1b[?2031l");
+		}
+		this.beforeTerminalStop(options);
+
+		this.terminal.showCursor();
+		this.terminal.stop();
+		this.afterTerminalStop(options);
+	}
+
+	/** Synchronously restore renderer-owned modes on a last-resort process exit. */
+	resetTerminal(_synchronous = false): void {}
+
+	/** Prevent renderer cleanup from writing to a disconnected terminal. */
+	markTerminalDead(): void {}
+
+	protected stopRendering(discardPendingRender = false): void {
 		this.stopped = true;
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
 		}
-		if (this.terminalColorSchemeNotificationsEnabled) {
-			this.terminal.write("\x1b[?2031l");
-		}
-		this.beforeTerminalStop();
-
-		this.terminal.showCursor();
-		this.terminal.stop();
-		this.afterTerminalStop();
+		if (discardPendingRender) this.renderRequested = false;
 	}
 
 	protected beforeTerminalStart(): void {}
 
-	protected beforeTerminalStop(): void {
+	protected beforeTerminalStop(options: TuiStopOptions): void {
+		if (options.preserveScreen) return;
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.previousLines.length > 0) {
 			const targetRow = this.previousLines.length; // Line after the last content
@@ -724,7 +741,7 @@ export class TUI extends Container {
 		}
 	}
 
-	protected afterTerminalStop(): void {}
+	protected afterTerminalStop(_options: TuiStopOptions): void {}
 
 	protected resetRenderState(): void {
 		this.previousLines = [];
