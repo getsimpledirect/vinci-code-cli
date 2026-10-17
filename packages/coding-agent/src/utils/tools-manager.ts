@@ -17,6 +17,7 @@ import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { getBinDir } from "../config.ts";
+// [vinci] offline tool bootstrap (VINCI_TOOL_BOOTSTRAP), pinned tool assets (VINCI_TOOL_PIN_*), sandboxed child env
 import { vinciSandboxChildEnv } from "../core/vinci-sandbox.ts";
 
 const TOOLS_DIR = getBinDir();

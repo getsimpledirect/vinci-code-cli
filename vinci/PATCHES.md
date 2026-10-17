@@ -61,6 +61,14 @@ only patch core when there's no hook.)
 | `coding-agent/src/modes/rpc/rpc-client.ts` | Settle `waitForIdle`/`collectEvents` (and release their timers) when the agent process dies or is stopped — a pure upstream bugfix, not env-gated | — |
 | `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists | — |
 | `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output; preserve verification-blocked exit 3 for a truncated final response | 13 |
+| `coding-agent/src/core/compaction/branch-summarization.ts`, `compaction.ts` | Optional `__vinciRecordTaskCall` hook so Vinci can record summarization/compaction calls (no-op when absent) | — |
+| `coding-agent/src/core/model-resolver.ts` | Managed-class aliases (Fortissimo resolves to Forte) for provider `vinci` only | — |
+| `coding-agent/src/core/session-manager.ts` | Shared verification-state entries and record framing for the turn-end verification gate | 8 |
+| `coding-agent/src/core/settings-manager.ts` | Vinci-mode settings: other-provider visibility (`VINCI_SHOW_OTHER_PROVIDERS`), thinking hidden by default | 4 |
+| `coding-agent/src/modes/interactive/components/extension-selector.ts` | Report the rows/width left after widgets and footer so approval context stays reviewable in small terminals | — |
+| `coding-agent/src/modes/interactive/components/login-dialog.ts`, `oauth-selector.ts` | Vero sign-in copy under `VINCI_CODE=1` | 9 |
+| `coding-agent/src/utils/tools-manager.ts` | Offline tool bootstrap (`VINCI_TOOL_BOOTSTRAP`), pinned tool assets (`VINCI_TOOL_PIN_*`), sandboxed child env | 9 |
+| `tui/src/components/markdown.ts` | Render fenced code as shaded, indented lines with no ``` delimiters under `VINCI_CODE=1` | — |
 
 The `§` column points at the detailed rationale below (— = self-explanatory from the in-code
 `[vinci]` comment). §13 is the cross-cutting display-only secret masking (the masker itself lives in
@@ -68,6 +76,13 @@ the new file `core/vinci-mask-secrets.ts`; these files just call it on their ren
 
 When `vinci/sync-upstream.sh` rebases and one of these conflicts, re-apply the marked block
 (search the file for `[vinci]`).
+
+The completeness check above has three known differences from this table, all expected:
+`coding-agent/package.json` has no tag (JSON); `vinci-*` files carry tags but are excluded by
+`grep -v /vinci-` (they are new files, not inline edits); and test files may carry the tag
+(`tui/test/markdown.test.ts` tests the markdown patch; `coding-agent/test/provider-visibility.test.ts`
+and `vinci-byok.test.ts` contain `[vinci]` as UI text). Run the check on `src/` paths to compare
+against the table: `git grep -l '\[vinci\]' -- 'packages/*/src/**' | grep -v /vinci-`.
 
 ## 1. `/login` goes straight to Vinci (no provider picker)
 

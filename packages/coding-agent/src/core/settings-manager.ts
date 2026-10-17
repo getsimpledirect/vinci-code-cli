@@ -92,6 +92,7 @@ export interface Settings {
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
+	// [vinci] Vinci-mode settings: other-provider visibility and hidden thinking default (VINCI_CODE / VINCI_SHOW_OTHER_PROVIDERS)
 	showOtherProviders?: boolean; // Vinci mode only; default: TRUE — no account required
 	externalEditor?: string; // Command for Ctrl+G external editor; takes precedence over VISUAL/EDITOR
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)

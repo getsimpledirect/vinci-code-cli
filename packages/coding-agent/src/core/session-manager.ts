@@ -27,6 +27,7 @@ import {
 	createCustomMessage,
 } from "./messages.ts";
 import {
+	// [vinci] shared verification state entries and record framing for Vinci's turn-end verification
 	type SharedVinciTerminalUnverifiableState,
 	selectSharedVinciVerificationState,
 	VINCI_CORRUPTED_VERIFICATION_MESSAGE,

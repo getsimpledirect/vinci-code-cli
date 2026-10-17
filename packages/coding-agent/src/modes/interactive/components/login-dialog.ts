@@ -40,6 +40,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 
 		const providerInfo = getOAuthProviders().find((p) => p.id === providerId);
 		const providerName = providerNameOverride || providerInfo?.name || providerId;
+		// [vinci] Vero sign-in copy under VINCI_CODE=1
 		const vinci = process.env.VINCI_CODE === "1";
 		const title = titleOverride ?? (vinci ? "Sign in" : `Login to ${providerName}`);
 
