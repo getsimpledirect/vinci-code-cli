@@ -6,10 +6,25 @@ import { VirtualTerminal } from "../../../packages/tui/test/virtual-terminal.ts"
 import { resetCapabilitiesCache, setCapabilities } from "@earendil-works/pi-tui";
 import { createVinciUiHarness } from "./harness.mjs";
 
-const fixture = new URL("./fixtures/regular-bytes.ansi", import.meta.url);
+const fixture = new URL("./fixtures/regular-journey.json", import.meta.url);
 const FIXED_TMPDIR = "/tmp/vinci-regular-bytes";
 
-test("regular InteractiveMode preserves its complete raw output stream", async () => {
+// What this pins (the raw stream itself is not frozen: TUI.requestRender coalesces frames on a
+// real setTimeout, so the number of intermediate frames a real InteractiveMode journey paints
+// varies by machine; byte-exactness is pinned at the TUI level in packages/tui/test):
+// regular mode never toggles a mouse/focus/alt-screen mode, uses exactly the base's set of
+// private terminal modes, and settles on the base's screen and cursor at each checkpoint.
+const FORBIDDEN_MODES = [1000, 1002, 1003, 1004, 1006, 1049];
+
+function privateModes(stream) {
+	return [...new Set(stream.match(/\x1b\[\?[0-9;]+[hl]/g) ?? [])].sort();
+}
+
+async function checkpoint(ui) {
+	return { screen: await ui.screen(), cursor: ui.terminal.getCursorPosition() };
+}
+
+test("regular InteractiveMode emits no new terminal modes and settles on the base screen", async () => {
 	const output = [];
 	vi.useFakeTimers({ now: 1_792_238_400_000, toFake: ["Date", "setInterval", "clearInterval"] });
 	vi.spyOn(Math, "random").mockReturnValue(0.5);
@@ -40,6 +55,7 @@ test("regular InteractiveMode preserves its complete raw output stream", async (
 		});
 	}
 	let ui;
+	const checkpoints = {};
 	// The harness workspace lives under os.tmpdir() and its path is rendered, so pin the temp root
 	// to one fixed absolute path: the frozen bytes must not depend on the caller's TMPDIR (CI has none).
 	const previousTmpdir = process.env.TMPDIR;
@@ -51,9 +67,12 @@ test("regular InteractiveMode preserves its complete raw output stream", async (
 	setCapabilities({ images: null, trueColor: true, hyperlinks: true });
 	try {
 		ui = await createVinciUiHarness({ responses: ["A deterministic response."] });
+		checkpoints.started = await checkpoint(ui);
 		await ui.prompt("A deterministic prompt.");
 		assert.equal(ui.core.faux.callCount, 1);
+		checkpoints.answered = await checkpoint(ui);
 		await ui.resize(60, 20);
+		checkpoints.resized = await checkpoint(ui);
 	} finally {
 		if (ui) await ui.close();
 		resetCapabilitiesCache();
@@ -62,12 +81,21 @@ test("regular InteractiveMode preserves its complete raw output stream", async (
 		vi.restoreAllMocks();
 		vi.useRealTimers();
 	}
-	const actual = Buffer.from(output.join(""));
-	for (const mode of [1000, 1002, 1003, 1004, 1006, 1049]) {
-		assert.equal(actual.includes(`\x1b[?${mode}h`), false, `regular mode must never enable ${mode}`);
+	const stream = output.join("");
+	// Positive control: the journey really rendered the prompt and the response.
+	assert.ok(stream.length > 0, "the regular journey must write terminal output");
+	assert.ok(stream.includes("A deterministic prompt."), "the stream must contain the prompt");
+	assert.ok(stream.includes("A deterministic response."), "the stream must contain the response");
+	for (const mode of FORBIDDEN_MODES) {
+		for (const action of ["h", "l"]) {
+			assert.equal(stream.includes(`\x1b[?${mode}${action}`), false, `regular mode must never emit ?${mode}${action}`);
+		}
 	}
+	const actual = { modes: privateModes(stream), checkpoints };
 	if (process.env.CAPTURE_REGULAR_BASELINE === "1") {
-		writeFileSync(fixture, actual, { flag: "wx" });
+		writeFileSync(fixture, `${JSON.stringify(actual, null, "\t")}\n`, { flag: "wx" });
 	}
-	assert.deepEqual(actual, readFileSync(fixture), "regular InteractiveMode output must equal its frozen bytes");
+	const expected = JSON.parse(readFileSync(fixture, "utf8"));
+	assert.deepEqual(actual.modes, expected.modes, "regular mode must use exactly the base's set of private terminal modes");
+	assert.deepEqual(actual.checkpoints, expected.checkpoints, "regular mode must settle on the base's screen and cursor");
 });
