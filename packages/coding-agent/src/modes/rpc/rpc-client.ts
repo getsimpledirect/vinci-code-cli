@@ -237,6 +237,8 @@ export class RpcClient {
 	 * Stop the RPC agent process.
 	 */
 	async stop(): Promise<void> {
+		// Legacy Crew consumers depend on exit-driven settlement ordering.
+		if (!this.bounds) return this.stopLegacy();
 		if (this.stopping) return this.stopping;
 		const child = this.process;
 		if (!child) return;
@@ -278,6 +280,35 @@ export class RpcClient {
 		} finally {
 			this.stopping = null;
 		}
+	}
+
+	private async stopLegacy(): Promise<void> {
+		if (!this.process) return;
+
+		this.stopReadingStdout?.();
+		this.stopReadingStdout = null;
+		this.process.kill("SIGTERM");
+
+		// Wait for process to exit
+		await new Promise<void>((resolve) => {
+			const timeout = setTimeout(() => {
+				this.process?.kill("SIGKILL");
+				resolve();
+			}, 1000);
+
+			this.process?.on("exit", () => {
+				clearTimeout(timeout);
+				resolve();
+			});
+		});
+
+		this.process = null;
+		this.pendingRequests.clear();
+		// [vinci] The exit handler above normally does this, but stop() must not depend on it: an
+		// already-exited child never re-emits `exit`, and the SIGKILL fallback path resolves without
+		// one either. Leaving a waiter armed here is what kept a stopped helper's 10-minute timer
+		// holding the process open long after every agent was gone.
+		this.abortEventWaiters(this.exitError ?? new Error("Agent process was stopped."));
 	}
 
 	/** [vinci] UI requests are separate from agent progress. No automatic approval. */
@@ -678,6 +709,7 @@ export class RpcClient {
 	 * Send prompt and wait for completion, returning all events.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
+		if (!this.bounds) return this.promptAndWaitLegacy(message, images, timeout);
 		const controller = new AbortController();
 		const eventsPromise = this.collectEvents(timeout, controller.signal);
 		try {
@@ -687,6 +719,20 @@ export class RpcClient {
 		} finally {
 			controller.abort();
 		}
+	}
+
+	private async promptAndWaitLegacy(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
+		const eventsPromise = this.collectEvents(timeout);
+		try {
+			await this.prompt(message, images);
+		} catch (error) {
+			// [vinci] The collection promise is already live and now settles on process death too, so
+			// abandoning it here would surface as an unhandled rejection (it used to just hang forever,
+			// silently). Absorb it and report the send failure, which is the real cause.
+			eventsPromise.catch(() => {});
+			throw error;
+		}
+		return eventsPromise;
 	}
 
 	// =========================================================================
