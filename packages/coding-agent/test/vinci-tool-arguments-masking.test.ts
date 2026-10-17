@@ -1,4 +1,5 @@
 import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import {
@@ -26,7 +27,10 @@ const MALFORMED_ARGUMENTS = `{"path":"a.txt","content":"${SECRET}`;
 const ARGUMENTS_ERROR = `Unexpected end of JSON input\nReceived arguments:\n${MALFORMED_ARGUMENTS}`;
 type DiagnosticToolCall = ToolCall & { argumentsError?: string };
 
-function assistantMessage(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage {
+function assistantMessage(
+	content: AssistantMessage["content"],
+	stopReason: AssistantMessage["stopReason"],
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content,
@@ -56,9 +60,7 @@ describe("Vinci malformed tool argument diagnostics", () => {
 	});
 
 	function createSession(malformed: boolean) {
-		const tmpRoot = process.env.TMPDIR;
-		if (!tmpRoot) throw new Error("Set TMPDIR to the task's tmp directory before running this test.");
-		const directory = mkdtempSync(join(tmpRoot, "tool-arguments-mask-"));
+		const directory = mkdtempSync(join(tmpdir(), "tool-arguments-mask-"));
 		const model = getModel("openai", "gpt-4o-mini")!;
 		const execute = vi.fn(async (_id: string, _args: unknown) => ({
 			content: [{ type: "text" as const, text: "accepted" }],
@@ -125,10 +127,14 @@ describe("Vinci malformed tool argument diagnostics", () => {
 		const persisted = readFileSync(sessionManager.getSessionFile()!, "utf8");
 		expect(persisted).not.toContain(SECRET);
 		const restored = SessionManager.open(sessionManager.getSessionFile()!, join(directory, "sessions"));
-		const assistantEntry = restored.getEntries().find((entry) => entry.type === "message" && entry.message.role === "assistant");
+		const assistantEntry = restored
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "assistant");
 		expect(assistantEntry?.type).toBe("message");
 		if (assistantEntry?.type !== "message" || assistantEntry.message.role !== "assistant") return;
-		const restoredCall = assistantEntry.message.content.find((content) => content.type === "toolCall") as DiagnosticToolCall;
+		const restoredCall = assistantEntry.message.content.find(
+			(content) => content.type === "toolCall",
+		) as DiagnosticToolCall;
 		expect(restoredCall.argumentsError).toBe(vinciMaskSecrets(ARGUMENTS_ERROR));
 		expect(restoredCall.arguments).toEqual({});
 		expect(emitted.join("\n")).not.toContain(SECRET);
@@ -179,10 +185,15 @@ describe("Vinci malformed tool argument diagnostics", () => {
 			dispose: async () => session.dispose(),
 		} as unknown as AgentSessionRuntime;
 
-		expect(await runPrintMode(runtime, { mode: "json", messages: ["Inspect this offline print diagnostic"] })).toBe(0);
+		expect(await runPrintMode(runtime, { mode: "json", messages: ["Inspect this offline print diagnostic"] })).toBe(
+			0,
+		);
 
 		const output = writes.join("");
-		const records = output.trim().split("\n").map((line) => JSON.parse(line));
+		const records = output
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
 		const ended = records.find((record) => record.type === "message_end" && record.message.role === "assistant");
 		expect(ended.message.content[0].argumentsError).toBe(vinciMaskSecrets(ARGUMENTS_ERROR));
 		expect(ended.message.usage.totalTokens).toBe(2);
