@@ -16,6 +16,7 @@ export { Image, type ImageOptions, type ImageTheme } from "./components/image.ts
 export { Input } from "./components/input.ts";
 export { Loader, type LoaderIndicatorOptions } from "./components/loader.ts";
 export { type DefaultTextStyle, Markdown, type MarkdownOptions, type MarkdownTheme } from "./components/markdown.ts";
+export { ScrollView, type ScrollViewOptions } from "./components/scroll-view.ts";
 export {
 	type SelectItem,
 	SelectList,
@@ -27,12 +28,20 @@ export { type SettingItem, SettingsList, type SettingsListTheme } from "./compon
 export { Spacer } from "./components/spacer.ts";
 export { Text } from "./components/text.ts";
 export { TruncatedText } from "./components/truncated-text.ts";
+export {
+	type StackChild,
+	type StackEntry,
+	type StackEntryOptions,
+	type StackOptions,
+	VStack,
+} from "./components/v-stack.ts";
 // Editor component interface (for custom editors)
 export type { EditorComponent } from "./editor-component.ts";
 // Fuzzy matching
 export { type FuzzyMatch, fuzzyFilter, fuzzyMatch } from "./fuzzy.ts";
 // Keybindings
 export {
+	ALT_SCREEN_KEYBINDINGS,
 	getKeybindings,
 	type Keybinding,
 	type KeybindingConflict,
@@ -100,8 +109,10 @@ export {
 	type Component,
 	Container,
 	CURSOR_MARKER,
+	compositeTuiLine,
 	type Focusable,
 	isFocusable,
+	isViewportTUI,
 	type OverlayAnchor,
 	type OverlayHandle,
 	type OverlayMargin,
@@ -109,6 +120,17 @@ export {
 	type OverlayUnfocusOptions,
 	type SizeValue,
 	TUI,
+	type TuiMode,
+	VIEWPORT_TUI,
+	type ViewportTUI,
 } from "./tui.ts";
+export { TuiAltScreen, type TuiAltScreenOptions } from "./tui-alt-screen.ts";
 // Utilities
-export { sliceByColumn, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "./utils.ts";
+export {
+	getOsc8LinkAtColumn,
+	sliceByColumn,
+	stripTerminalSequences,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "./utils.ts";
