@@ -907,6 +907,7 @@ run_group ui-scenarios node "${VITEST_CLI}" \
   --root "${ROOT}" --run \
   --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
   "vinci/test/ui/scenarios.test.mjs"
+run_group ui-regular-bytes node "${VITEST_CLI}" --root "${ROOT}" --run --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' --pool=forks --maxWorkers=1 --no-file-parallelism --configLoader native --no-cache "vinci/test/ui/regular-bytes.test.mjs"
 
 run_group ui-fixture-lifecycle node "${VITEST_CLI}" \
   --root "${ROOT}" --run \

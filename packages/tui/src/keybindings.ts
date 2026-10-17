@@ -5,6 +5,10 @@ import { type KeyId, matchesKey } from "./keys.ts";
  * Downstream packages can add keybindings via declaration merging.
  */
 export interface Keybindings {
+	"tui.altScreen.pageUp": true;
+	"tui.altScreen.pageDown": true;
+	"tui.altScreen.top": true;
+	"tui.altScreen.bottom": true;
 	// Editor navigation and editing
 	"tui.editor.cursorUp": true;
 	"tui.editor.cursorDown": true;
@@ -242,3 +246,11 @@ export function getKeybindings(): KeybindingsManager {
 	}
 	return globalKeybindings;
 }
+
+// Added only to fullscreen renderers; regular defaults remain unchanged.
+export const ALT_SCREEN_KEYBINDINGS = {
+	"tui.altScreen.pageUp": { defaultKeys: "shift+pageUp", description: "Scroll viewport up one page" },
+	"tui.altScreen.pageDown": { defaultKeys: "shift+pageDown", description: "Scroll viewport down one page" },
+	"tui.altScreen.top": { defaultKeys: "ctrl+home", description: "Scroll viewport to top" },
+	"tui.altScreen.bottom": { defaultKeys: "ctrl+end", description: "Scroll viewport to bottom" },
+} as const satisfies KeybindingDefinitions;

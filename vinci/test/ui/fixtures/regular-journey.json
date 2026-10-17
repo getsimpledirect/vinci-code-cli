@@ -1,0 +1,33 @@
+{
+	"modes": [
+		"\u001b[?2004h",
+		"\u001b[?2004l",
+		"\u001b[?2026h",
+		"\u001b[?2026l",
+		"\u001b[?25h",
+		"\u001b[?25l"
+	],
+	"checkpoints": {
+		"started": {
+			"screen": "  Vinci v<version> Code\n  Vero READY · Vinci · <repo>\n  /login to connect · Ask Vero a task · /undo · Ctrl+T thinking\n\n\n\n\n╭ ✹ Ask Vinci ───────────────────────────────────────────────────────── /login ╮\n│                                                                              │\n│›                                                                             │\n│                                                                              │\n╰ ▶ AUTO  ·  Vinci ──── <workspace>  ·  0% full · ↓ 0 ╯",
+			"cursor": {
+				"x": 3,
+				"y": 11
+			}
+		},
+		"answered": {
+			"screen": "  Vinci v<version> Code\n  Vero DONE · Vinci · <repo>\n  ● connected · Read the receipt. · /undo · Ctrl+T thinking\n\n\n\n A deterministic prompt.\n\n\n A deterministic response.\n\n\n╭ ✹ Ask Vinci · DONE: Read the receipt. ────────────────────────── ● connected ╮\n│                                                                              │\n│›                                                                             │\n│                                                                              │\n╰ ▶ AUTO  ·  Vinci ─── <workspace>…  ·  0% full · ↓ 150 ╯",
+			"cursor": {
+				"x": 3,
+				"y": 16
+			}
+		},
+		"resized": {
+			"screen": "  Vinci v<version> Code\n  Vero DONE · Vinci · <repo>\n  ● connected · Read the receipt. · /undo · Ctrl+T thinking\n\n\n\n A deterministic prompt.\n\n\n A deterministic response.\n\n\n╭ ✹ Ask Vinci · DONE: Read the receipt. ────── ● connected ╮\n│                                                          │\n│›                                                         │\n│                                                          │\n╰ ▶ AUTO  ·  Vinci ─── <workspace>… ╯",
+			"cursor": {
+				"x": 3,
+				"y": 16
+			}
+		}
+	}
+}
