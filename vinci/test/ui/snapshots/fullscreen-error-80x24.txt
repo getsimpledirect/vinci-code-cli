@@ -1,0 +1,22 @@
+  Vinci v<version> Code
+  Vero BLOCKED · Vinci · <repo>
+  /login to connect · Resolve the blocker. · /undo · Ctrl+T thinking
+
+
+
+ Run the checks
+
+
+ ▎ Error: The local provider stopped responding.
+
+
+  ! Stopped — needs you
+  The local provider stopped responding.
+  1 model call · 100 in / 50 out · 0% cached · ~$0.0000 estimated · <time> active
+  Billed by faux, not Vinci.
+
+╭ ✹ Ask Vinci · BLOCKED: Resolve the blocker. ───────────────────────── /login ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ▶ AUTO  ·  Vinci ──── <workspace>  ·  0% full · ↓ 4 ╯

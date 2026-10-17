@@ -1,7 +1,6 @@
 import { mkdtempSync, rmSync } from "node:fs";
-import type * as os from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import * as os from "node:os";
+import { join } from "node:path";
 import type { Component, Container, EditorComponent, TUI, TuiAltScreen } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -128,9 +127,7 @@ afterEach(() => {
 });
 
 async function fixture(mode: "fullscreen" | "regular" = "fullscreen", useDefaultClipboard = false) {
-	const caseDir = mkdtempSync(
-		join(process.env.TMPDIR ?? dirname(fileURLToPath(import.meta.url)), ".fullscreen-selection-"),
-	);
+	const caseDir = mkdtempSync(join(process.env.TMPDIR ?? os.tmpdir(), ".fullscreen-selection-"));
 	cleanups.push(() => rmSync(caseDir, { recursive: true, force: true }));
 	vi.stubEnv("TMPDIR", caseDir);
 	const core = createHarness({

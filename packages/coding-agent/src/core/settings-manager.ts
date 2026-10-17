@@ -83,6 +83,8 @@ export type PackageSource =
 export interface Settings {
 	tuiMode?: TuiMode; // default: "regular"
 	copyOnSelect?: boolean; // default: true; fullscreen only
+	// [vinci] Global first-copy disclosure acknowledgement; ignored outside VINCI_CODE=1.
+	vinciCopyDisclosureShown?: boolean;
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
 	defaultModel?: string;
@@ -689,6 +691,19 @@ export class SettingsManager {
 	setCopyOnSelect(enabled: boolean): void {
 		this.globalSettings.copyOnSelect = enabled;
 		this.markModified("copyOnSelect");
+		this.save();
+	}
+
+	// [vinci] An install acknowledgement is global, regardless of project overrides.
+	getVinciCopyDisclosureShown(): boolean {
+		return process.env.VINCI_CODE === "1" && this.globalSettings.vinciCopyDisclosureShown === true;
+	}
+
+	setVinciCopyDisclosureShown(): void {
+		// [vinci] Plain pi must never persist Vinci's disclosure acknowledgement.
+		if (process.env.VINCI_CODE !== "1") return;
+		this.globalSettings.vinciCopyDisclosureShown = true;
+		this.markModified("vinciCopyDisclosureShown");
 		this.save();
 	}
 

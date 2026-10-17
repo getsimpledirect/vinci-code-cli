@@ -56,7 +56,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/tools/write.ts` | Mask secret-looking values in a write preview | 13 |
 | `coding-agent/src/core/tools/vinci-result-budget.ts` | Tighter per-result truncation budget for a 9B (env-tunable) | 21 |
 | `coding-agent/src/core/tools/read.ts`, `grep.ts`, `find.ts` | Apply the Vinci result budget; steer `read` to grep over offset-paging | 21 |
-| `coding-agent/src/index.ts` | Export `vinciMaskEnabled`/`vinciMaskSecrets` for the render extension | 13 |
+| `coding-agent/src/index.ts` | Export `vinciMaskEnabled`/`vinciMaskSecrets` for the render extension; export `copyToClipboardWithRoute` for the vinci-copy picker's route-aware status | 13 |
 | `coding-agent/src/main.ts` | Auto-resume the recent session on interactive relaunch (TTY-gated; opens the validated session); gate the fullscreen startup clipboard environment override | 6,14 |
 | `coding-agent/src/modes/interactive/components/assistant-message.ts` | Friendly errors + display-mask prose/thinking | 12,13 |
 | `coding-agent/src/modes/interactive/components/diff.ts` | Mask secrets in edit diffs on screen; GitHub-style row tints on added/removed lines | 13,18 |
@@ -66,19 +66,20 @@ only patch core when there's no hook.)
 | `coding-agent/src/modes/interactive/components/settings-selector.ts` | Lean regular settings (theme only); fullscreen mode/copy controls with a read-only environment override | 6,9 |
 | `coding-agent/src/modes/interactive/components/status-indicator.ts` | Reframe the compaction spinner label | 9 |
 | `coding-agent/src/modes/interactive/components/tool-execution.ts` | Tight tool spacing, semantic fallback rows for custom tools, and private display handling for blocked control guidance | 17,23 |
-| `coding-agent/src/modes/interactive/interactive-mode.ts` | `/login`→vinci, Ctrl+C window, clean launch, `/model` filter, lean `/` menu; injectable terminal/process-handler seam for offline UI tests; expose active overlay focus to extensions; post-login ecosystem pointer; fullscreen copy policy, selection-only copy and restart notice | 1–6,22,25 |
+| `coding-agent/src/modes/interactive/interactive-mode.ts` | `/login`→vinci, Ctrl+C window, clean launch, `/model` filter, lean `/` menu; injectable terminal/process-handler seam for offline UI tests; expose active overlay focus to extensions; post-login ecosystem pointer; fullscreen copy policy, selection-only copy, restart notice, LINE padding option, custom-modal mouse policy, first-copy disclosure and route-aware `/copy` status | 1–6,22,25 |
 | `coding-agent/src/modes/rpc/rpc-client.ts` | Settle `waitForIdle`/`collectEvents` (and release their timers) when the agent process dies or is stopped — a pure upstream bugfix, not env-gated | — |
 | `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists | — |
 | `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output; preserve verification-blocked exit 3 for a truncated final response | 13 |
 | `coding-agent/src/core/compaction/branch-summarization.ts`, `compaction.ts` | Optional `__vinciRecordTaskCall` hook so Vinci can record summarization/compaction calls (no-op when absent) | — |
 | `coding-agent/src/core/model-resolver.ts` | Managed-class aliases (Fortissimo resolves to Forte) for provider `vinci` only | — |
 | `coding-agent/src/core/session-manager.ts` | Shared verification-state entries and record framing for the turn-end verification gate | 8 |
-| `coding-agent/src/core/settings-manager.ts` | Vinci-mode settings: other-provider visibility (`VINCI_SHOW_OTHER_PROVIDERS`), thinking hidden by default | 4 |
+| `coding-agent/src/core/settings-manager.ts` | Vinci-mode settings: other-provider visibility (`VINCI_SHOW_OTHER_PROVIDERS`), thinking hidden by default; global first-copy disclosure acknowledgement | 4,6 |
 | `coding-agent/src/modes/interactive/components/countdown-timer.ts` | `ElapsedTimer` for live compaction progress | — |
 | `coding-agent/src/modes/interactive/components/extension-selector.ts` | Report the rows/width left after widgets and footer so approval context stays reviewable in small terminals | — |
 | `coding-agent/src/modes/interactive/components/login-dialog.ts`, `oauth-selector.ts` | Vero sign-in copy under `VINCI_CODE=1` | 9 |
 | `coding-agent/src/utils/tools-manager.ts` | Offline tool bootstrap (`VINCI_TOOL_BOOTSTRAP`), pinned tool assets (`VINCI_TOOL_PIN_*`), sandboxed child env | 9 |
 | `tui/src/components/markdown.ts` | Render fenced code as shaded, indented lines with no ``` delimiters under `VINCI_CODE=1` | — |
+| `tui/src/tui-alt-screen.ts` | Default-preserving host options for LINE-only padding trimming and custom-modal mouse ownership; InteractiveMode enables them only under `VINCI_CODE=1`, with no Vinci environment reads in TUI | 6 |
 
 The `§` column points at the detailed rationale below (— = self-explanatory from the in-code
 `[vinci]` comment). §13 is the cross-cutting display-only secret masking (the masker itself lives in
@@ -206,6 +207,18 @@ when auto-copy is off; with nothing selected it does nothing. Plain Pi retains t
 selection-preference/last-message behavior and ignores the Vinci environment override. The
 Vinci-only help disclosure is marked beside the opt-in in `vinci/README.md`; device QA remains
 NOT_RUN. The clipboard route and feedback shipped before these controls remain ungated.
+
+Under `VINCI_CODE=1`, fullscreen LINE copies trim trailing spaces because the rendered string
+contract does not distinguish fill padding from source spaces; word and character-drag copies
+retain their exact selected spaces. Custom modals receive no mouse SGR unless their component
+sets `acceptsMouseInput: true`. Built-in fullscreen selectors retain wheel navigation through
+their configured selection keys. Plain Pi keeps the ported padding and mouse behavior.
+
+The first automatic fullscreen selection copy shows the exact opt-in disclosure above the editor
+for five seconds and persists `vinciCopyDisclosureShown` in global settings. Manual Ctrl+X,
+regular mode and disabled automatic copying never trigger it. Typed `/copy` uses the clipboard
+route to distinguish native, terminal and remote-only status under `VINCI_CODE=1`; plain Pi
+retains its original status. The `/copy` hint and existing selection flash strings are unchanged.
 
 ## 7. Compaction that fits a small context window (auto-compact recovery)
 

@@ -11,6 +11,7 @@ import {
 } from "../../../packages/coding-agent/test/test-harness.ts";
 import { VirtualTerminal } from "../../../packages/tui/test/virtual-terminal.ts";
 import vinciCharacter from "../../extensions/vinci-character.ts";
+import vinciCopy from "../../extensions/vinci-copy.ts";
 import vinciHeader from "../../extensions/vinci-header.ts";
 import vinciPlan from "../../extensions/vinci-plan.ts";
 import vinciProvider from "../../extensions/vinci-provider.ts";
@@ -145,6 +146,9 @@ export async function createVinciUiHarness(options = {}) {
 		{ factory: vinciHeader, path: "vinci/extensions/vinci-header.ts" },
 		{ factory: vinciReceipt, path: "vinci/extensions/vinci-receipt.ts" },
 		{ factory: vinciRender, path: "vinci/extensions/vinci-render.ts" },
+		...(options.loadVinciCopy
+			? [{ factory: (pi) => vinciCopy(pi, options.copyWriter), path: "vinci/extensions/vinci-copy.ts" }]
+			: []),
 		...(options.extensions ?? []),
 	];
 	const baseToolsOverride = options.tools
@@ -202,7 +206,13 @@ export async function createVinciUiHarness(options = {}) {
 	const runtime = new AgentSessionRuntime(core.session, services, async () => {
 		throw new Error("Session replacement is not supported by the UI scenario harness");
 	});
-	const mode = new InteractiveMode(runtime, { terminal, verbose: true, manageProcessSignals: false });
+	const mode = new InteractiveMode(runtime, {
+		terminal,
+		verbose: true,
+		manageProcessSignals: false,
+		tuiMode: options.tuiMode,
+		copySelection: options.copySelection,
+	});
 
 	try {
 		await mode.init();

@@ -1,6 +1,6 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import type * as os from "node:os";
-import { dirname, join } from "node:path";
+import * as os from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Component, Container, EditorComponent, SettingsList, TUI, TuiAltScreen } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
@@ -120,7 +120,7 @@ afterEach(async () => {
 });
 
 async function fixture(options: FixtureOptions = {}) {
-	const caseDir = mkdtempSync(join(process.env.TMPDIR ?? dirname(fileURLToPath(import.meta.url)), ".controls-"));
+	const caseDir = mkdtempSync(join(process.env.TMPDIR ?? os.tmpdir(), ".controls-"));
 	cleanups.push(() => rmSync(caseDir, { recursive: true, force: true }));
 	for (const key of Object.keys(process.env)) {
 		if (key.startsWith("PI_")) vi.stubEnv(key, undefined);

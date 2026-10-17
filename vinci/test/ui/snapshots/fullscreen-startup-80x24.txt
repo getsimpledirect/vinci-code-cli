@@ -1,0 +1,22 @@
+  Vinci v<version> Code
+  Vero READY · Vinci · <repo>
+  /login to connect · Ask Vero a task · /undo · Ctrl+T thinking
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+╭ ✹ Ask Vinci ───────────────────────────────────────────────────────── /login ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ▶ AUTO  ·  Vinci ──── <workspace>  ·  0% full · ↓ 0 ╯

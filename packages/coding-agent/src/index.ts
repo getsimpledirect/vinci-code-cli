@@ -420,7 +420,8 @@ export {
 } from "./modes/interactive/theme/theme.ts";
 export { sanitizeTerminalLabel } from "./terminal-utils.ts";
 // Clipboard utilities
-export { copyToClipboard } from "./utils/clipboard.ts";
+// [vinci] Route-aware writer for the vinci-copy picker's honest /copy status (copy-on-select commit 5).
+export { copyToClipboard, copyToClipboardWithRoute } from "./utils/clipboard.ts";
 export { type FormatDurationOptions, formatDuration } from "./utils/format-duration.ts";
 export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.ts";
 export { convertToPng } from "./utils/image-convert.ts";

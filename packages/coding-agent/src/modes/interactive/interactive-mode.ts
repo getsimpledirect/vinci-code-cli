@@ -403,6 +403,10 @@ export class InteractiveMode {
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
 	private activeCustomModals = new Set<symbol>();
+	// [vinci] Custom modal mouse ownership and first automatic-copy disclosure state.
+	private activeCustomMouseInput = new Map<symbol, boolean>();
+	private manualCopyInProgress = false;
+	private copyDisclosureTimer?: ReturnType<typeof setTimeout>;
 	private fullscreenFooter: Container | undefined;
 
 	// Extension widgets (components rendered above/below the editor)
@@ -465,7 +469,41 @@ export class InteractiveMode {
 			tuiMode === "fullscreen"
 				? new TuiAltScreen(terminal, showHardwareCursor, {
 						copyOnSelect,
-						copySelection: options.copySelection ?? copyToClipboardWithRoute,
+						// [vinci] Keep ported line semantics and modal input unchanged in plain pi.
+						trimLineSelectionPadding: process.env.VINCI_CODE === "1",
+						customModalMouse:
+							process.env.VINCI_CODE === "1"
+								? () => {
+										const inputs = [...this.activeCustomMouseInput.values()];
+										return inputs.length ? (inputs.at(-1) ? "forward" : "strip") : undefined;
+									}
+								: undefined,
+						// [vinci] Only automatic selection copies disclose clipboard ownership, once per install.
+						copySelection:
+							process.env.VINCI_CODE === "1"
+								? async (text) => {
+										const automatic = !this.manualCopyInProgress;
+										const route = await (options.copySelection ?? copyToClipboardWithRoute)(text);
+										// [vinci] Disclose (and spend the once-per-install flag) only when the copy reached a clipboard.
+										if (
+											automatic &&
+											(route === "native" || route === "terminal") &&
+											this.ui instanceof TuiAltScreen &&
+											this.ui.getCopyOnSelect() &&
+											!this.settingsManager.getVinciCopyDisclosureShown()
+										) {
+											this.settingsManager.setVinciCopyDisclosureShown();
+											this.setExtensionWidget("vinci-copy-disclosure", [
+												"Selecting text copies it to your clipboard. Use Shift+drag (Option+drag in iTerm2 and Terminal.app) to select without copying.",
+											]);
+											this.copyDisclosureTimer = setTimeout(() => {
+												this.copyDisclosureTimer = undefined;
+												this.setExtensionWidget("vinci-copy-disclosure", undefined);
+											}, 5_000);
+										}
+										return route;
+									}
+								: (options.copySelection ?? copyToClipboardWithRoute),
 						deferViewportInput: () =>
 							this.activeCustomModals.size > 0 ||
 							this.editorContainer.children.length !== 1 ||
@@ -2009,6 +2047,8 @@ export class InteractiveMode {
 		}
 		this.ui.hideOverlay();
 		this.activeCustomModals.clear();
+		// [vinci] A reload cannot leave a stale custom-modal mouse owner behind.
+		if (process.env.VINCI_CODE === "1") this.activeCustomMouseInput.clear();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
 		this.setExtensionHeader(undefined);
@@ -2533,6 +2573,8 @@ export class InteractiveMode {
 		const fullscreenModal = this.ui.mode === "fullscreen" ? Symbol() : undefined;
 		if (fullscreenModal) {
 			this.activeCustomModals.add(fullscreenModal);
+			// [vinci] Custom modals must explicitly opt in before receiving raw mouse input.
+			if (process.env.VINCI_CODE === "1") this.activeCustomMouseInput.set(fullscreenModal, false);
 			this.ui.requestRender();
 		}
 
@@ -2547,6 +2589,7 @@ export class InteractiveMode {
 		const result = new Promise<T>((resolve, reject) => {
 			let component: Component & { dispose?(): void };
 			let closed = false;
+			let restoreMouseInput: (() => void) | undefined;
 
 			const close = (result: T) => {
 				if (closed) return;
@@ -2555,6 +2598,7 @@ export class InteractiveMode {
 				else restoreEditor();
 				// Note: both branches above already call requestRender
 				resolve(result);
+				restoreMouseInput?.();
 				try {
 					component?.dispose?.();
 				} catch {
@@ -2566,6 +2610,22 @@ export class InteractiveMode {
 				.then((c) => {
 					if (closed) return;
 					component = c;
+					// [vinci] Strip mouse packets from mixed input too, preserving the component receiver.
+					if (fullscreenModal && process.env.VINCI_CODE === "1") {
+						const acceptsMouseInput =
+							(c as Component & { acceptsMouseInput?: boolean }).acceptsMouseInput === true;
+						this.activeCustomMouseInput.set(fullscreenModal, acceptsMouseInput);
+						if (!acceptsMouseInput && c.handleInput) {
+							const handleInput = c.handleInput;
+							c.handleInput = (data) => {
+								const filtered = data.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, "");
+								if (filtered) handleInput.call(c, filtered);
+							};
+							restoreMouseInput = () => {
+								c.handleInput = handleInput;
+							};
+						}
+					}
 					if (isOverlay) {
 						// Resolve overlay options - can be static or dynamic function
 						const resolveOptions = (): OverlayOptions | undefined => {
@@ -2599,6 +2659,8 @@ export class InteractiveMode {
 		if (!fullscreenModal) return result;
 		return result.finally(() => {
 			this.activeCustomModals.delete(fullscreenModal);
+			// [vinci] Restore the previous modal's opt-in when nested custom UI closes.
+			if (process.env.VINCI_CODE === "1") this.activeCustomMouseInput.delete(fullscreenModal);
 			this.ui.requestRender();
 		});
 	}
@@ -4246,6 +4308,33 @@ export class InteractiveMode {
 			this.ui.setFocus(this.editor);
 		};
 		const { component, focus } = create(done);
+		// [vinci] Built-in fullscreen selectors keep wheel navigation, including remapped keys.
+		if (process.env.VINCI_CODE === "1" && this.ui.mode === "fullscreen" && focus.handleInput) {
+			const handleInput = focus.handleInput.bind(focus);
+			focus.handleInput = (data) => {
+				const wheel = /^\x1b\[<(64|65);\d+;\d+M$/.exec(data);
+				if (wheel) {
+					const action = wheel[1] === "64" ? "tui.select.up" : "tui.select.down";
+					for (const key of this.keybindings.getKeys(action)) {
+						const parts = key.split("+");
+						const base = parts.pop() ?? "";
+						const modifier =
+							1 + parts.reduce((bits, part) => bits | ({ shift: 1, alt: 2, ctrl: 4, super: 8 }[part] ?? 0), 0);
+						const encoded =
+							base === "up" || base === "down"
+								? `\x1b[1;${modifier}${base === "up" ? "A" : "B"}`
+								: base.length === 1
+									? `\x1b[${base.codePointAt(0)};${modifier}u`
+									: undefined;
+						if (encoded) {
+							handleInput(encoded);
+							return;
+						}
+					}
+				}
+				handleInput(data);
+			};
+		}
 		this.editorContainer.clear();
 		this.editorContainer.addChild(component);
 		this.ui.setFocus(focus);
@@ -5698,7 +5787,12 @@ export class InteractiveMode {
 		try {
 			// [vinci] Ctrl+X always means copy the selection, including when automatic copy is on.
 			if (process.env.VINCI_CODE === "1") {
-				await this.ui.copyActiveSelectionToClipboard();
+				this.manualCopyInProgress = true;
+				try {
+					await this.ui.copyActiveSelectionToClipboard();
+				} finally {
+					this.manualCopyInProgress = false;
+				}
 				return;
 			}
 			if (!this.ui.getCopyOnSelect() && this.ui.hasActiveSelection()) {
@@ -5735,8 +5829,20 @@ export class InteractiveMode {
 		}
 
 		try {
-			await copyToClipboard(text);
-			this.showStatus("Copied last agent message to clipboard");
+			// [vinci] Route-aware status does not promise local delivery after remote-only copying.
+			if (process.env.VINCI_CODE === "1") {
+				const route = await copyToClipboardWithRoute(text);
+				this.showStatus(
+					route === "terminal"
+						? "Sent last agent message to terminal clipboard"
+						: route === "remote-only"
+							? "Copied on the remote machine only; it was too large to send to your local clipboard."
+							: "Copied last agent message to clipboard",
+				);
+			} else {
+				await copyToClipboard(text);
+				this.showStatus("Copied last agent message to clipboard");
+			}
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -6122,6 +6228,8 @@ export class InteractiveMode {
 	}
 
 	stop(): void {
+		// [vinci] A stopped session must not keep the disclosure expiry timer alive.
+		if (process.env.VINCI_CODE === "1") clearTimeout(this.copyDisclosureTimer);
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}

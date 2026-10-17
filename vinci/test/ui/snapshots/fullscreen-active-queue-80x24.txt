@@ -1,0 +1,22 @@
+  Vinci v<version> Code
+  Vero WORKING · Vinci · <repo>
+  ● connected • Checking the result… · /undo · Ctrl+T thinking
+
+
+ Check the project
+
+
+ I am checking the project setup.
+ ● Check project
+
+ Follow-up: Keep the docs unchanged
+ ↳ <alt>+Up to edit all queued messages
+
+  ↳ Queued for Vinci · 1 message
+  “Keep the docs unchanged”  ·  Vinci will read it after this step
+
+╭ •  Checking the result… · <time> ─────────────────────────────────── ● connected ╮
+│                                                                              │
+│›                                                                             │
+│                                                                              │
+╰ ▶ AUTO  ·  Vinci ─── <workspace>…  ·  0% full · ↓ 150 ╯

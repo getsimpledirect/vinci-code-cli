@@ -124,3 +124,79 @@ assert.deepEqual(withContent.copied, ["ready output"], "/copy must send the sele
 assert.match(withContent.notifications[0].message, /Copied last tool output/);
 
 console.log("vinci-copy-integration: 7/7 passed");
+
+async function routePicker(writeClipboard, selection) {
+  const harness = createHarness({
+    messages: [codeMessage, { role: "toolResult", content: [{ type: "text", text: "ready output" }] }],
+    selection,
+  });
+  const commands = {};
+  copy.default(
+    {
+      on() {},
+      registerCommand(name, definition) {
+        commands[name] = definition;
+      },
+    },
+    async (text) => {
+      harness.copied.push(text);
+      return await writeClipboard(text);
+    },
+  );
+  await commands.copy.handler("", harness.context);
+  return harness;
+}
+
+const routeFailures = [];
+let routeCases = 0;
+for (const [selection, text] of [
+  ["Vinci's last message", "Here it is:\n```ts\nconst answer = 42;\n```"],
+  ["Last code block", "const answer = 42;"],
+  ["Last tool output", "ready output"],
+]) {
+  const label = selection.toLowerCase();
+  for (const [route, message] of [
+    ["native", `Copied ${label}.`],
+    ["terminal", `Sent ${label} to terminal clipboard.`],
+    [
+      "remote-only",
+      `Copied ${label} on the remote machine only; it was too large to send to your local clipboard.`,
+    ],
+  ]) {
+    routeCases++;
+    const harness = await routePicker(async () => route, selection);
+    try {
+      assert.deepEqual(harness.copied, [text], `${route}: ${selection} copies exactly the selected text once`);
+      assert.deepEqual(
+        harness.notifications,
+        [{ message, type: "info" }],
+        `${route}: ${selection} reports its exact clipboard route`,
+      );
+    } catch (error) {
+      routeFailures.push(error);
+    }
+  }
+}
+
+routeCases++;
+const plainWriter = await routePicker(async () => {}, "Last code block");
+assert.deepEqual(plainWriter.copied, ["const answer = 42;"], "plain Promise<void> writers still copy the selected text");
+assert.deepEqual(
+  plainWriter.notifications,
+  [{ message: "Copied last code block.", type: "info" }],
+  "plain Promise<void> writers retain the native clipboard message",
+);
+
+routeCases++;
+const failedWriter = await routePicker(async () => {
+  throw new Error("recorded clipboard failure");
+}, "Last tool output");
+assert.deepEqual(failedWriter.copied, ["ready output"], "a failing writer is called exactly once");
+assert.deepEqual(
+  failedWriter.notifications,
+  [{ message: "Couldn't copy to clipboard: recorded clipboard failure", type: "error" }],
+  "clipboard failures retain their existing exact message",
+);
+
+if (routeFailures.length > 0) throw new AggregateError(routeFailures, "Picker clipboard route messages must be honest");
+console.log(`vinci-copy-route-integration: ${routeCases}/${routeCases} passed`);
