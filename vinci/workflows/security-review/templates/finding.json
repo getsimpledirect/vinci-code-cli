@@ -1,0 +1,37 @@
+{
+  "id": "",
+  "title": "",
+  "status": "hypothesis",
+  "severity": "medium",
+  "confidence": "medium",
+  "evidence": {
+    "path": "",
+    "start_line": 2,
+    "end_line": 4,
+    "source_sha256": "",
+    "observation": "The synthetic function returns a looked-up invoice without checking its tenant.",
+    "preconditions": "A caller can select another tenant invoice; no upstream authorization exists. Neither is established by this isolated snippet.",
+    "reachability": "Unknown in real systems. This is an intentionally incomplete synthetic function.",
+    "limitations": "No application, route, authentication stack, database, or customer data was inspected."
+  },
+  "remediation": {
+    "state": "not_proposed",
+    "proposal_ref": null,
+    "patch_sha256": null,
+    "owner": null,
+    "rationale": null
+  },
+  "retest": {
+    "state": "NOT_RUN",
+    "evidence_ref": null,
+    "tested_commit": null,
+    "patch_sha256": null,
+    "reviewer": null,
+    "limitations": "Behavioral/model tests NOT_RUN; fixture text was not executed."
+  },
+  "human_review": {
+    "state": "pending",
+    "reviewer": null,
+    "evidence_ref": null
+  }
+}

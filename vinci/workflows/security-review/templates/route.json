@@ -1,0 +1,12 @@
+{
+  "mode": "offline_only",
+  "provider": null,
+  "endpoint": null,
+  "model": null,
+  "requested_class": null,
+  "approval_ref": null,
+  "verification_ref": null,
+  "region": null,
+  "retention": null,
+  "data_classes": []
+}

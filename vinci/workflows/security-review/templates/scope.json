@@ -1,0 +1,15 @@
+{
+  "repository": "",
+  "commit": "",
+  "allowed_paths": [],
+  "owner": "",
+  "approval_ref": "",
+  "issued_at": "",
+  "expires_at": "",
+  "actions": [
+    "read_source",
+    "propose_patch"
+  ],
+  "data_class": "synthetic",
+  "environment": "offline_sanitized_copy"
+}

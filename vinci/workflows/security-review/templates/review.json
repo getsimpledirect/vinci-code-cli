@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0",
+  "review_id": "",
+  "scope": {
+    "repository": "",
+    "commit": "",
+    "allowed_paths": [],
+    "owner": "",
+    "approval_ref": "",
+    "issued_at": "",
+    "expires_at": "",
+    "actions": [
+      "read_source",
+      "propose_patch"
+    ],
+    "data_class": "synthetic",
+    "environment": "offline_sanitized_copy"
+  },
+  "route": {
+    "mode": "offline_only",
+    "provider": null,
+    "endpoint": null,
+    "model": null,
+    "requested_class": null,
+    "approval_ref": null,
+    "verification_ref": null,
+    "region": null,
+    "retention": null,
+    "data_classes": []
+  },
+  "findings": [],
+  "coverage": {
+    "reviewed_paths": [],
+    "not_reviewed": [],
+    "limitations": []
+  },
+  "conclusion": "review_incomplete"
+}
