@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "review_id": "SYNTHETIC-DEMONSTRATION-NOT-A-CUSTOMER-REVIEW",
   "scope": {
     "repository": "SYNTHETIC/example",
@@ -20,6 +20,7 @@
   },
   "route": {
     "mode": "unknown",
+    "verification_state": "not_applicable",
     "provider": null,
     "endpoint": null,
     "model": null,

@@ -48,7 +48,7 @@ class ContractTests(unittest.TestCase):
         self.doc['findings'].append(copy.deepcopy(self.doc['findings'][0]))
         with self.assertRaises(Invalid): validate(self.doc, NOW)
     def hosted(self):
-        self.doc['route'] = {'mode':'hosted','provider':'SYNTHETIC provider','endpoint':'https://example.invalid/inference','model':'synthetic-model-revision','requested_class':'synthetic-class','approval_ref':'SYNTHETIC-ONLY-EXPORT-APPROVAL','verification_ref':'SYNTHETIC-ONLY-ROUTE-RECEIPT','region':'synthetic-region','retention':'synthetic no-retention declaration','data_classes':['synthetic']}
+        self.doc['route'] = {'mode':'hosted','verification_state':'verified','provider':'SYNTHETIC provider','endpoint':'https://example.invalid/inference','model':'synthetic-model-revision','requested_class':'synthetic-class','approval_ref':'SYNTHETIC-ONLY-EXPORT-APPROVAL','verification_ref':'SYNTHETIC-ONLY-ROUTE-RECEIPT','region':'synthetic-region','retention':'synthetic no-retention declaration','data_classes':['synthetic']}
     def test_synthetic_hosted_declaration(self):
         self.hosted(); self.assertFalse(validate(self.doc, NOW)['runtime_enforcement'])
     def test_hosted_unknown_model(self):
@@ -83,15 +83,67 @@ class ContractTests(unittest.TestCase):
     def test_synthetic_human_disposition(self):
         f=self.doc['findings'][0]
         f['status']='dismissed'
-        f['human_review']={'state':'dismissed','reviewer':'SYNTHETIC human','evidence_ref':'SYNTHETIC disposition, no real approval'}
+        f['human_review']={'state':'dismissed','reviewer':{'type':'human','identity_ref':'SYNTHETIC human'},'evidence_ref':'SYNTHETIC disposition, no real approval'}
         self.doc['conclusion']='review_complete_with_limitations'
         self.assertFalse(validate(self.doc, NOW)['authorization_verified'])
     def test_positive_synthetic_remediation_and_hash_mismatch(self):
         f=self.doc['findings'][0]; f['status']='remediated'
-        f['human_review']={'state':'accepted','reviewer':'SYNTHETIC human','evidence_ref':'SYNTHETIC acceptance'}
+        f['human_review']={'state':'accepted','reviewer':{'type':'human','identity_ref':'SYNTHETIC human'},'evidence_ref':'SYNTHETIC acceptance'}
         f['remediation']={'state':'applied','proposal_ref':'SYNTHETIC patch','patch_sha256':'a'*64,'owner':'SYNTHETIC owner','rationale':'SYNTHETIC rationale'}
-        f['retest']={'state':'pass','evidence_ref':'SYNTHETIC test only','tested_commit':'b'*40,'patch_sha256':'a'*64,'reviewer':'SYNTHETIC reviewer','limitations':'No real behavior executed'}
+        f['retest']={'state':'pass','evidence_ref':'SYNTHETIC test only','tested_commit':'b'*40,'patch_sha256':'a'*64,'reviewer':{'type':'human','identity_ref':'SYNTHETIC reviewer'},'limitations':'No real behavior executed'}
         self.assertFalse(validate(self.doc, NOW)['authorization_verified'])
         self.rejected(['findings',0,'retest','patch_sha256'], 'c'*64)
+
+    def test_compound_hosted_placeholders(self):
+        for field in ['provider','model','requested_class','approval_ref','verification_ref','region','retention']:
+            for value in ['unknown-region','PENDING legal review','TBD_provider','unverified route','not yet known','not verified','to be determined','not confirmed','not established','ＵＮＫＮＯＷＮ region']:
+                with self.subTest(field=field,value=value):
+                    self.hosted(); self.rejected(['route',field],value)
+    def test_compound_placeholder_in_endpoint(self):
+        self.hosted(); self.rejected(['route','endpoint'],'https://unknown-region.example.invalid/inference')
+    def test_route_verification_state(self):
+        for value in ['unknown','pending','unresolved','not_applicable',None,True]:
+            with self.subTest(value=value):
+                self.hosted(); self.rejected(['route','verification_state'],value)
+    def test_route_missing_verification_state(self):
+        self.hosted(); del self.doc['route']['verification_state']
+        with self.assertRaises(Invalid): validate(self.doc,NOW)
+    def test_offline_false_verification(self):
+        self.rejected(['route','verification_state'],'verified')
+    def test_status_review_matrix(self):
+        mapping={'hypothesis':'pending','confirmed':'accepted','dismissed':'dismissed','remediated':'accepted'}
+        for status,expected in mapping.items():
+            for state in ['pending','accepted','dismissed']:
+                if state == expected: continue
+                with self.subTest(status=status,state=state):
+                    d=copy.deepcopy(self.doc); f=d['findings'][0]; f['status']=status
+                    f['human_review']={'state':state,'reviewer':None if state=='pending' else {'type':'human','identity_ref':'SYNTHETIC reviewer'},'evidence_ref':None if state=='pending' else 'synthetic disposition'}
+                    with self.assertRaisesRegex(Invalid,'status and human review'): validate(d,NOW)
+    def test_hypothesis_cannot_complete_with_human_disposition(self):
+        for state in ['accepted','dismissed']:
+            with self.subTest(state=state):
+                d=copy.deepcopy(self.doc); d['conclusion']='review_complete_with_limitations'
+                d['findings'][0]['human_review']={'state':state,'reviewer':{'type':'human','identity_ref':'SYNTHETIC reviewer'},'evidence_ref':'synthetic disposition'}
+                with self.assertRaisesRegex(Invalid,'status and human review'): validate(d,NOW)
+    def test_freeform_reviewer_labels_rejected(self):
+        for who in ['human','AI','GPT-5','model reviewer','Alice']:
+            with self.subTest(who=who):
+                d=copy.deepcopy(self.doc); f=d['findings'][0]; f['status']='confirmed'
+                f['human_review']={'state':'accepted','reviewer':who,'evidence_ref':'synthetic receipt'}
+                with self.assertRaisesRegex(Invalid,'expected object'): validate(d,NOW)
+    def test_nonhuman_reviewer_types_rejected(self):
+        for kind in ['model','ai','AI','GPT-5','unknown','agent','service',None,True]:
+            with self.subTest(kind=kind):
+                d=copy.deepcopy(self.doc); f=d['findings'][0]; f['status']='confirmed'
+                f['human_review']={'state':'accepted','reviewer':{'type':kind,'identity_ref':'synthetic actor'},'evidence_ref':'synthetic receipt'}
+                with self.assertRaisesRegex(Invalid,'human reviewer type'): validate(d,NOW)
+    def test_retest_reviewer_is_structured_human(self):
+        for who in ['AI','GPT-5','model reviewer', {'type':'model','identity_ref':'synthetic actor'}, {'type':'human','identity_ref':''}]:
+            with self.subTest(who=who):
+                d=copy.deepcopy(self.doc); f=d['findings'][0]
+                f['remediation']={'state':'proposed','proposal_ref':'synthetic patch','patch_sha256':'a'*64,'owner':'synthetic owner','rationale':'synthetic rationale'}
+                f['retest']={'state':'pass','evidence_ref':'synthetic test','tested_commit':'b'*40,'patch_sha256':'a'*64,'reviewer':who,'limitations':'synthetic only'}
+                with self.assertRaises(Invalid): validate(d,NOW)
+    def test_legacy_schema_rejected(self): self.rejected(['schema_version'],'1.0')
 
 if __name__ == '__main__': unittest.main(verbosity=2)

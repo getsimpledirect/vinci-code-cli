@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import json
 import re
+import unicodedata
 from pathlib import PurePosixPath, Path
 
 class Invalid(ValueError):
@@ -19,6 +20,23 @@ def fields(value, names, label):
 
 def text(value, label):
     require(type(value) is str and bool(value.strip()) and len(value) <= 4096, label + ': expected nonempty text')
+
+def resolved_text(value, label):
+    text(value, label)
+    normalized = unicodedata.normalize('NFKC', value).casefold()
+    # Reserved unresolved markers also fail in compound values, not just exact matches.
+    # This is a declaration vocabulary check, not a natural-language truth detector.
+    words = re.sub(r'[^a-z0-9]+', ' ', normalized).strip().split()
+    require(not (set(words) & {'unknown', 'pending', 'tbd', 'unresolved', 'unverified'}), label + ': unresolved declaration')
+    phrase = ' '.join(words)
+    require(not any(marker in phrase for marker in ['not verified', 'not yet known', 'to be determined', 'not established', 'not confirmed']), label + ': unresolved declaration')
+
+def human_reviewer(value, label):
+    fields(value, 'type identity_ref', label)
+    require(value['type'] == 'human', label + ': requires explicit human reviewer type')
+    text(value['identity_ref'], label + '.identity_ref')
+    # Human is a declared actor type, not an identity attestation. Operators must
+    # authenticate the identity reference independently; labels are never proof.
 
 def sha(value, label, length=64):
     require(type(value) is str and re.fullmatch('[0-9a-f]{' + str(length) + '}', value), label + ': expected lowercase hash')
@@ -57,7 +75,7 @@ def load(path):
 def validate(doc, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     fields(doc, 'schema_version review_id scope route findings coverage conclusion', 'review')
-    require(doc['schema_version'] == '1.0', 'unknown schema version')
+    require(doc['schema_version'] == '1.1', 'unknown schema version')
     text(doc['review_id'], 'review_id')
     s = doc['scope']
     fields(s, 'repository commit allowed_paths owner approval_ref issued_at expires_at actions data_class environment', 'scope')
@@ -73,15 +91,16 @@ def validate(doc, now=None):
     require(set(s['actions']) <= {'read_source', 'propose_patch'}, 'active execution or publication outside this workflow')
     require('read_source' in s['actions'], 'read_source not authorized')
     r = doc['route']
-    fields(r, 'mode provider endpoint model requested_class approval_ref verification_ref region retention data_classes', 'route')
+    fields(r, 'mode verification_state provider endpoint model requested_class approval_ref verification_ref region retention data_classes', 'route')
     require(r['mode'] in {'offline_only', 'hosted'}, 'unknown route mode')
     if r['mode'] == 'offline_only':
+        require(r['verification_state'] == 'not_applicable', 'offline route must use not_applicable verification state')
         require(all(r[k] is None for k in ['provider','endpoint','model','requested_class','approval_ref','verification_ref','region','retention']), 'offline route must not assert hosted details')
         require(r['data_classes'] == [], 'offline route must not declare export')
     else:
+        require(r['verification_state'] == 'verified', 'hosted route must explicitly declare verified state')
         for key in ['provider','endpoint','model','requested_class','approval_ref','verification_ref','region','retention']:
-            text(r[key], 'route.' + key)
-            require(r[key].strip().lower() not in {'unknown','pending','tbd'}, 'unverified hosted route')
+            resolved_text(r[key], 'route.' + key)
         from urllib.parse import urlsplit
         u = urlsplit(r['endpoint'])
         require(u.scheme == 'https' and u.hostname and not u.username and not u.password and not u.query and not u.fragment, 'route must be credential-free HTTPS endpoint')
@@ -109,8 +128,9 @@ def validate(doc, now=None):
         if h['state'] == 'pending':
             require(h['reviewer'] is None and h['evidence_ref'] is None, 'pending review cannot assert acceptance')
         else:
-            text(h['reviewer'], 'reviewer'); text(h['evidence_ref'], 'human review evidence')
-            require(h['reviewer'].strip().lower() != 'model', 'model cannot independently accept findings')
+            human_reviewer(h['reviewer'], 'human_review.reviewer'); text(h['evidence_ref'], 'human review evidence')
+        expected_review = {'hypothesis':'pending', 'confirmed':'accepted', 'dismissed':'dismissed', 'remediated':'accepted'}
+        require(h['state'] == expected_review[f['status']], 'finding status and human review state disagree')
         if f['status'] in {'confirmed','remediated'}:
             require(h['state'] == 'accepted' and f['severity'] != 'unknown', 'confirmed status requires human acceptance and severity')
         if f['status'] == 'dismissed':
@@ -132,8 +152,7 @@ def validate(doc, now=None):
         if t['state'] == 'NOT_RUN':
             require(all(t[k] is None for k in ['evidence_ref','tested_commit','patch_sha256','reviewer']), 'NOT_RUN cannot assert test evidence')
         else:
-            text(t['evidence_ref'], 'retest evidence'); text(t['reviewer'], 'retest reviewer')
-            require(t['reviewer'].strip().lower() != 'model', 'model verdict is not independent retest')
+            text(t['evidence_ref'], 'retest evidence'); human_reviewer(t['reviewer'], 'retest.reviewer')
             sha(t['tested_commit'], 'tested_commit', 40); sha(t['patch_sha256'], 'retest patch')
             require(m['state'] != 'not_proposed' and t['patch_sha256'] == m['patch_sha256'], 'retest must bind exact proposed patch')
         if f['status'] == 'remediated':
@@ -148,7 +167,7 @@ def validate(doc, now=None):
     strings(c['limitations'], 'coverage limitations')
     require(doc['conclusion'] in {'review_incomplete','review_complete_with_limitations'}, 'no security certification or unknown conclusion')
     if doc['conclusion'] == 'review_complete_with_limitations':
-        require(not c['not_reviewed'] and all(f['human_review']['state'] != 'pending' for f in doc['findings']), 'complete review requires accounted coverage and human dispositions')
+        require(not c['not_reviewed'] and all(f['status'] != 'hypothesis' and f['human_review']['state'] != 'pending' for f in doc['findings']), 'complete review requires accounted coverage and resolved human dispositions')
     return {'contract_status': 'VALID_DECLARATION_ONLY', 'authorization_verified': False,
             'model_accuracy_validated': False, 'runtime_enforcement': False}
 

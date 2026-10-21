@@ -1,5 +1,6 @@
 {
   "mode": "offline_only",
+  "verification_state": "not_applicable",
   "provider": null,
   "endpoint": null,
   "model": null,
