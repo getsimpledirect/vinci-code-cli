@@ -145,5 +145,23 @@ class ContractTests(unittest.TestCase):
                 f['retest']={'state':'pass','evidence_ref':'synthetic test','tested_commit':'b'*40,'patch_sha256':'a'*64,'reviewer':who,'limitations':'synthetic only'}
                 with self.assertRaises(Invalid): validate(d,NOW)
     def test_legacy_schema_rejected(self): self.rejected(['schema_version'],'1.0')
+    def test_malformed_https_endpoints(self):
+        invalid=['https://bad host.example/inference','https://example.invalid:notaport/inference','https://example.invalid:99999/inference',
+                 'https://example.invalid:0/','https://example.invalid:/','https://example.invalid:+443/',
+                 'https://example.invalid\n/inference','https://example.invalid\t/inference',' https://example.invalid/',
+                 'https://a..example/','https://-bad.example/','https://bad-.example/','https://a_b.example/',
+                 'https://256.0.0.1/','https://127.1/','https://[::1]:notaport/','https://[::1]:99999/',
+                 'https://[invalid]/','https://[fe80::1%25eth0]/','https://example.invalid/%zz',
+                 'https://example.invalid/?','https://example.invalid/#','https://example.invalid\\other/',
+                 'https://user@example.invalid/','https://example.invalid:１２３/', 'https://'+('a'*64)+'.example/']
+        for endpoint in invalid:
+            with self.subTest(endpoint=endpoint):
+                self.hosted(); self.rejected(['route','endpoint'],endpoint)
+    def test_valid_https_endpoint_syntax_not_network_clearance(self):
+        for endpoint in ['https://example.invalid/inference','https://example.invalid:443/v1','https://example.invalid:65535/v1',
+                         'https://192.0.2.1/v1','https://[2001:db8::1]:443/v1','https://xn--bcher-kva.example/v1/path%20value']:
+            with self.subTest(endpoint=endpoint):
+                self.hosted(); self.doc['route']['endpoint']=endpoint
+                self.assertFalse(validate(self.doc,NOW)['runtime_enforcement'])
 
 if __name__ == '__main__': unittest.main(verbosity=2)

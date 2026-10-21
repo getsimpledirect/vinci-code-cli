@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Offline declaration consistency checker. NOT an authorization or sandbox service."""
 import argparse
+import ipaddress
 import datetime as dt
 import json
 import re
 import unicodedata
 from pathlib import PurePosixPath, Path
+from urllib.parse import urlsplit
 
 class Invalid(ValueError):
     pass
@@ -37,6 +39,34 @@ def human_reviewer(value, label):
     text(value['identity_ref'], label + '.identity_ref')
     # Human is a declared actor type, not an identity attestation. Operators must
     # authenticate the identity reference independently; labels are never proof.
+
+def https_endpoint(value):
+    """Validate a bounded ASCII HTTPS URL syntax, without DNS or network access."""
+    text(value, 'endpoint')
+    require(all(33 <= ord(c) <= 126 for c in value) and '\\' not in value, 'endpoint contains whitespace, controls or non-ASCII characters')
+    require(value.startswith('https://') and '?' not in value and '#' not in value, 'endpoint must be HTTPS without query or fragment')
+    try:
+        u = urlsplit(value)
+        require(u.scheme == 'https' and u.netloc and not u.username and not u.password and '@' not in u.netloc, 'endpoint must have credential-free authority')
+        # Parse the port explicitly: urlsplit alone accepts nonnumeric/out-of-range ports.
+        port = u.port
+        require(port is None or 1 <= port <= 65535, 'endpoint port outside 1..65535')
+        if u.netloc.startswith('['):
+            m = re.fullmatch(r'\[([0-9a-fA-F:]+)\](?::([0-9]+))?', u.netloc)
+            require(m is not None, 'invalid bracketed IPv6 authority')
+            ipaddress.IPv6Address(m.group(1))
+        else:
+            m = re.fullmatch(r'([A-Za-z0-9.-]+)(?::([0-9]+))?', u.netloc)
+            require(m is not None, 'invalid hostname or port syntax')
+            host = m.group(1)
+            require(len(host) <= 253, 'hostname too long')
+            if re.fullmatch(r'[0-9.]+', host):
+                ipaddress.IPv4Address(host)
+            else:
+                require(all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in host.split('.')), 'invalid DNS label')
+        require(re.fullmatch(r"(?:[A-Za-z0-9._~!$&'()*+,;=:@/\-]|%[0-9a-fA-F]{2})*", u.path), 'invalid URL path encoding')
+    except ValueError as exc:
+        raise Invalid('invalid HTTPS endpoint: ' + str(exc)) from exc
 
 def sha(value, label, length=64):
     require(type(value) is str and re.fullmatch('[0-9a-f]{' + str(length) + '}', value), label + ': expected lowercase hash')
@@ -101,9 +131,7 @@ def validate(doc, now=None):
         require(r['verification_state'] == 'verified', 'hosted route must explicitly declare verified state')
         for key in ['provider','endpoint','model','requested_class','approval_ref','verification_ref','region','retention']:
             resolved_text(r[key], 'route.' + key)
-        from urllib.parse import urlsplit
-        u = urlsplit(r['endpoint'])
-        require(u.scheme == 'https' and u.hostname and not u.username and not u.password and not u.query and not u.fragment, 'route must be credential-free HTTPS endpoint')
+        https_endpoint(r['endpoint'])
         strings(r['data_classes'], 'route.data_classes')
         require(set(r['data_classes']) <= {'synthetic','public','sanitized_private'} and s['data_class'] in r['data_classes'], 'data not approved for route')
     require(type(doc['findings']) is list, 'findings must be list')

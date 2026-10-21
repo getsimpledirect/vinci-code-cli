@@ -19,6 +19,7 @@ Use a known-clean Python 3.10+ environment. Do not start Python in a suspected c
 ```sh
 python3 -I -S -m unittest discover -s tests -v
 python3 -I -S tests/reproduce_review_findings.py
+python3 -I -S tests/reproduce_endpoint_findings.py
 python3 -I -S tools/validate_review.py examples/synthetic-review.json --at 2026-10-21T19:30:00Z
 python3 -I -S tools/validate_review.py examples/reject-unknown-route.json --at 2026-10-21T19:30:00Z
 python3 -I -S tools/validate_review.py examples/reject-false-remediation.json --at 2026-10-21T19:30:00Z
@@ -26,7 +27,7 @@ python3 -I -S tools/validate_review.py examples/reject-false-remediation.json --
 
 Expected exits: tests 0; positive declaration 0; each negative 2. `--at` is historical fixture replay, never permission to bypass a current expiry. Omit it for current declaration-time checks. Exit 0 says VALID_DECLARATION_ONLY, not authorized to run. The check reads exactly the supplied JSON, not its referenced repo/files/endpoints. Hash syntax is checked; file authenticity, human identities, approval validity and actual route are not attested.
 
-Contract 1.1 closes three independently reproduced declaration holes: compound unresolved route markers, inconsistent hypothesis/disposition states, and free-form model reviewer labels. The full offline suite now contains 49 tests, with additional table-driven cases. The nine review reproducers must all report accepted=false and the script exits nonzero if any is accepted. See REVIEW-FIXES.md for exact scope. Old 1.0 declarations must be reviewed and migrated; the validator does not supply missing authority or identity.
+Contract 1.1 closes independently reproduced declaration holes in unresolved route markers, inconsistent hypothesis/disposition states, free-form model reviewer labels and malformed HTTPS endpoints. Run the full offline suite above, including table-driven endpoint and state-transition controls. Both reproducer scripts must report accepted=false for every negative case and exit nonzero if any is accepted. Old 1.0 declarations must be reviewed and migrated; the validator does not supply missing authority or identity.
 
 ## Operator flow
 
