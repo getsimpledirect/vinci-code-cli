@@ -52,7 +52,7 @@ def https_endpoint(value):
         port = u.port
         require(port is None or 1 <= port <= 65535, 'endpoint port outside 1..65535')
         if u.netloc.startswith('['):
-            m = re.fullmatch(r'\[([0-9a-fA-F:]+)\](?::([0-9]+))?', u.netloc)
+            m = re.fullmatch(r'\[([0-9a-fA-F:.]+)\](?::([0-9]+))?', u.netloc)
             require(m is not None, 'invalid bracketed IPv6 authority')
             ipaddress.IPv6Address(m.group(1))
         else:
@@ -83,7 +83,7 @@ def timestamp(value):
 def relpath(value):
     text(value, 'path')
     p = PurePosixPath(value)
-    require(not p.is_absolute() and '..' not in p.parts and str(p) == value and '\\' not in value and value != '.', 'path must be canonical repository relative')
+    require(not p.is_absolute() and '..' not in p.parts and str(p) == value and '\\' not in value and '\x00' not in value and value != '.', 'path must be canonical repository relative')
 
 def strings(value, label, nonempty=True):
     require(type(value) is list and (bool(value) or not nonempty), label + ': expected list')

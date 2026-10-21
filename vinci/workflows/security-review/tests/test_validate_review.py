@@ -32,6 +32,27 @@ class ContractTests(unittest.TestCase):
     def test_out_of_scope_evidence(self): self.rejected(['findings',0,'evidence','path'], 'other.py')
     def test_parent_path(self): self.rejected(['scope','allowed_paths'], ['../secret'])
     def test_absolute_path(self): self.rejected(['scope','allowed_paths'], ['/etc/passwd'])
+    def test_nul_scope_path(self):
+        self.doc['scope']['allowed_paths'] = ['examples/bad\x00.py']
+        with self.assertRaisesRegex(Invalid, 'path must be canonical repository relative'):
+            validate(self.doc, NOW)
+    def test_nul_evidence_path(self):
+        self.doc['findings'][0]['evidence']['path'] = 'examples/bad\x00.py'
+        with self.assertRaisesRegex(Invalid, 'path must be canonical repository relative'):
+            validate(self.doc, NOW)
+    def test_nul_consistent_reviewed_path_and_evidence(self):
+        path = 'examples/bad\x00.py'
+        self.doc['scope']['allowed_paths'] = [path]
+        self.doc['coverage']['reviewed_paths'] = [path]
+        self.doc['findings'][0]['evidence']['path'] = path
+        with self.assertRaisesRegex(Invalid, 'path must be canonical repository relative'):
+            validate(self.doc, NOW)
+    def test_nul_consistent_not_reviewed_path(self):
+        path = 'examples/bad\x00.py'
+        self.doc['scope']['allowed_paths'].append(path)
+        self.doc['coverage']['not_reviewed'] = [path]
+        with self.assertRaisesRegex(Invalid, 'path must be canonical repository relative'):
+            validate(self.doc, NOW)
     def test_bad_hash(self): self.rejected(['findings',0,'evidence','source_sha256'], 'unknown')
     def test_line_boolean(self): self.rejected(['findings',0,'evidence','start_line'], True)
     def test_unreviewed_confirmation(self): self.rejected(['findings',0,'status'], 'confirmed')
@@ -157,6 +178,28 @@ class ContractTests(unittest.TestCase):
         for endpoint in invalid:
             with self.subTest(endpoint=endpoint):
                 self.hosted(); self.rejected(['route','endpoint'],endpoint)
+    def test_ipv4_embedded_ipv6_endpoint_declaration_only(self):
+        for endpoint in ['https://[::ffff:192.0.2.1]/v1',
+                         'https://[::ffff:192.0.2.1]:443/v1']:
+            with self.subTest(endpoint=endpoint):
+                self.hosted(); self.doc['route']['endpoint'] = endpoint
+                self.assertEqual(validate(self.doc, NOW), {
+                    'contract_status': 'VALID_DECLARATION_ONLY',
+                    'authorization_verified': False,
+                    'model_accuracy_validated': False,
+                    'runtime_enforcement': False})
+    def test_malformed_ipv4_embedded_ipv6_endpoints(self):
+        for endpoint in ['https://[::ffff:256.0.0.1]/',
+                         'https://[::ffff:192.0.2]/',
+                         'https://[::ffff:192.0.2.01]/',
+                         'https://[192.0.2.1]/',
+                         'https://[::ffff:192.0.2.1%25eth0]/',
+                         'https://[::ffff:192.0.2.1]suffix/',
+                         'https://[::ffff:192.0.2.1]:/',
+                         'https://[::ffff:192.0.2.1]:0/',
+                         'https://[::ffff:192.0.2.1]:65536/']:
+            with self.subTest(endpoint=endpoint):
+                self.hosted(); self.rejected(['route','endpoint'], endpoint)
     def test_valid_https_endpoint_syntax_not_network_clearance(self):
         for endpoint in ['https://example.invalid/inference','https://example.invalid:443/v1','https://example.invalid:65535/v1',
                          'https://192.0.2.1/v1','https://[2001:db8::1]:443/v1','https://xn--bcher-kva.example/v1/path%20value']:
