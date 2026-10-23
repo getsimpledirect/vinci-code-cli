@@ -9,6 +9,21 @@ import unicodedata
 from pathlib import PurePosixPath, Path
 from urllib.parse import urlsplit
 
+# Contract field declarations also define which key names are safe in diagnostics.
+FIELD_NAMES = {
+    'human_reviewer': 'type identity_ref',
+    'review': 'schema_version review_id scope route findings coverage conclusion',
+    'scope': 'repository commit allowed_paths owner approval_ref issued_at expires_at actions data_class environment',
+    'route': 'mode verification_state provider endpoint model requested_class approval_ref verification_ref region retention data_classes',
+    'finding': 'id title status severity confidence evidence remediation retest human_review',
+    'evidence': 'path start_line end_line source_sha256 observation preconditions reachability limitations',
+    'human_review': 'state reviewer evidence_ref',
+    'remediation': 'state proposal_ref patch_sha256 owner rationale',
+    'retest': 'state evidence_ref tested_commit patch_sha256 reviewer limitations',
+    'coverage': 'reviewed_paths not_reviewed limitations',
+}
+CONTRACT_FIELDS = frozenset(name for names in FIELD_NAMES.values() for name in names.split())
+
 class Invalid(ValueError):
     pass
 
@@ -34,7 +49,7 @@ def resolved_text(value, label):
     require(not any(marker in phrase for marker in ['not verified', 'not yet known', 'to be determined', 'not established', 'not confirmed']), label + ': unresolved declaration')
 
 def human_reviewer(value, label):
-    fields(value, 'type identity_ref', label)
+    fields(value, FIELD_NAMES['human_reviewer'], label)
     require(value['type'] == 'human', label + ': requires explicit human reviewer type')
     text(value['identity_ref'], label + '.identity_ref')
     # Human is a declared actor type, not an identity attestation. Operators must
@@ -65,8 +80,10 @@ def https_endpoint(value):
             else:
                 require(all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in host.split('.')), 'invalid DNS label')
         require(re.fullmatch(r"(?:[A-Za-z0-9._~!$&'()*+,;=:@/\-]|%[0-9a-fA-F]{2})*", u.path), 'invalid URL path encoding')
-    except ValueError as exc:
+    except Invalid as exc:
         raise Invalid('invalid HTTPS endpoint: ' + str(exc)) from exc
+    except ValueError as exc:
+        raise Invalid('invalid HTTPS endpoint') from exc
 
 def sha(value, label, length=64):
     require(type(value) is str and re.fullmatch('[0-9a-f]{' + str(length) + '}', value), label + ': expected lowercase hash')
@@ -95,20 +112,20 @@ def load(path):
     def pairs(items):
         result = {}
         for key, value in items:
-            require(key not in result, 'duplicate JSON key: ' + key)
+            require(key not in result, 'duplicate JSON key: ' + key if key in CONTRACT_FIELDS else 'duplicate JSON key (unrecognized key name withheld)')
             result[key] = value
         return result
     def nonfinite(value):
-        raise Invalid('non-finite JSON number: ' + value)
+        raise Invalid('non-finite JSON number')
     return json.loads(Path(path).read_text(), object_pairs_hook=pairs, parse_constant=nonfinite)
 
 def validate(doc, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
-    fields(doc, 'schema_version review_id scope route findings coverage conclusion', 'review')
+    fields(doc, FIELD_NAMES['review'], 'review')
     require(doc['schema_version'] == '1.1', 'unknown schema version')
     text(doc['review_id'], 'review_id')
     s = doc['scope']
-    fields(s, 'repository commit allowed_paths owner approval_ref issued_at expires_at actions data_class environment', 'scope')
+    fields(s, FIELD_NAMES['scope'], 'scope')
     text(s['repository'], 'repository'); sha(s['commit'], 'commit', 40)
     strings(s['allowed_paths'], 'allowed_paths')
     for p in s['allowed_paths']:
@@ -121,7 +138,7 @@ def validate(doc, now=None):
     require(set(s['actions']) <= {'read_source', 'propose_patch'}, 'active execution or publication outside this workflow')
     require('read_source' in s['actions'], 'read_source not authorized')
     r = doc['route']
-    fields(r, 'mode verification_state provider endpoint model requested_class approval_ref verification_ref region retention data_classes', 'route')
+    fields(r, FIELD_NAMES['route'], 'route')
     require(r['mode'] in {'offline_only', 'hosted'}, 'unknown route mode')
     if r['mode'] == 'offline_only':
         require(r['verification_state'] == 'not_applicable', 'offline route must use not_applicable verification state')
@@ -137,21 +154,21 @@ def validate(doc, now=None):
     require(type(doc['findings']) is list, 'findings must be list')
     ids = set()
     for f in doc['findings']:
-        fields(f, 'id title status severity confidence evidence remediation retest human_review', 'finding')
+        fields(f, FIELD_NAMES['finding'], 'finding')
         text(f['id'], 'finding.id'); require(f['id'] not in ids, 'duplicate finding id'); ids.add(f['id'])
         text(f['title'], 'title')
         require(f['status'] in {'hypothesis','confirmed','dismissed','remediated'}, 'unknown finding status')
         require(f['severity'] in {'unknown','low','medium','high','critical'}, 'unknown severity')
         require(f['confidence'] in {'low','medium','high'}, 'unknown confidence')
         e = f['evidence']
-        fields(e, 'path start_line end_line source_sha256 observation preconditions reachability limitations', 'evidence')
+        fields(e, FIELD_NAMES['evidence'], 'evidence')
         relpath(e['path']); require(e['path'] in s['allowed_paths'], 'evidence path outside exact allowlist')
         require(type(e['start_line']) is int and type(e['end_line']) is int and 1 <= e['start_line'] <= e['end_line'], 'invalid line range')
         sha(e['source_sha256'], 'source_sha256')
         for k in ['observation','preconditions','reachability','limitations']:
             text(e[k], k)
         h = f['human_review']
-        fields(h, 'state reviewer evidence_ref', 'human_review')
+        fields(h, FIELD_NAMES['human_review'], 'human_review')
         require(h['state'] in {'pending','accepted','dismissed'}, 'unknown human review state')
         if h['state'] == 'pending':
             require(h['reviewer'] is None and h['evidence_ref'] is None, 'pending review cannot assert acceptance')
@@ -164,7 +181,7 @@ def validate(doc, now=None):
         if f['status'] == 'dismissed':
             require(h['state'] == 'dismissed', 'dismissal needs human evidence')
         m = f['remediation']
-        fields(m, 'state proposal_ref patch_sha256 owner rationale', 'remediation')
+        fields(m, FIELD_NAMES['remediation'], 'remediation')
         require(m['state'] in {'not_proposed','proposed','applied'}, 'unknown remediation state')
         if m['state'] == 'not_proposed':
             require(all(m[k] is None for k in ['proposal_ref','patch_sha256','owner','rationale']), 'empty remediation must not claim a patch')
@@ -174,7 +191,7 @@ def validate(doc, now=None):
                 text(m[k], k)
             sha(m['patch_sha256'], 'patch_sha256')
         t = f['retest']
-        fields(t, 'state evidence_ref tested_commit patch_sha256 reviewer limitations', 'retest')
+        fields(t, FIELD_NAMES['retest'], 'retest')
         require(t['state'] in {'NOT_RUN','pass','fail','inconclusive'}, 'unknown retest state')
         text(t['limitations'], 'retest limitations')
         if t['state'] == 'NOT_RUN':
@@ -186,7 +203,7 @@ def validate(doc, now=None):
         if f['status'] == 'remediated':
             require(m['state'] == 'applied' and t['state'] == 'pass', 'remediated requires exact-patch passing retest')
     c = doc['coverage']
-    fields(c, 'reviewed_paths not_reviewed limitations', 'coverage')
+    fields(c, FIELD_NAMES['coverage'], 'coverage')
     strings(c['reviewed_paths'], 'reviewed_paths', False)
     require(set(c['reviewed_paths']) <= set(s['allowed_paths']), 'coverage outside scope')
     strings(c['not_reviewed'], 'not_reviewed', False)
@@ -206,8 +223,17 @@ def main():
     try:
         result = validate(load(a.report), timestamp(a.at) if a.at else None)
         print(json.dumps(result, sort_keys=True)); return 0
-    except (Invalid, OSError, ValueError, TypeError, KeyError) as exc:
-        print(json.dumps({'contract_status':'REJECTED', 'reason':str(exc)})); return 2
+    except Invalid as exc:
+        reason = str(exc)
+    except json.JSONDecodeError as exc:
+        reason = f'invalid JSON at line {exc.lineno} column {exc.colno}'
+    except UnicodeError:
+        reason = 'report must contain valid UTF-8 text'
+    except OSError:
+        reason = 'unable to read report'
+    except (ValueError, TypeError, KeyError):
+        reason = 'invalid report value or structure'
+    print(json.dumps({'contract_status':'REJECTED', 'reason':reason})); return 2
 
 if __name__ == '__main__':
     raise SystemExit(main())
