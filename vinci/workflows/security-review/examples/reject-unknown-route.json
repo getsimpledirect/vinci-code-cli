@@ -1,0 +1,83 @@
+{
+  "schema_version": "1.1",
+  "review_id": "SYNTHETIC-DEMONSTRATION-NOT-A-CUSTOMER-REVIEW",
+  "scope": {
+    "repository": "SYNTHETIC/example",
+    "commit": "0000000000000000000000000000000000000000",
+    "allowed_paths": [
+      "examples/tenant_fixture.py.txt"
+    ],
+    "owner": "SYNTHETIC owner",
+    "approval_ref": "SYNTHETIC declaration, not real permission",
+    "issued_at": "2026-10-21T19:00:00Z",
+    "expires_at": "2026-10-22T19:00:00Z",
+    "actions": [
+      "read_source",
+      "propose_patch"
+    ],
+    "data_class": "synthetic",
+    "environment": "offline_sanitized_copy"
+  },
+  "route": {
+    "mode": "unknown",
+    "verification_state": "not_applicable",
+    "provider": null,
+    "endpoint": null,
+    "model": null,
+    "requested_class": null,
+    "approval_ref": null,
+    "verification_ref": null,
+    "region": null,
+    "retention": null,
+    "data_classes": []
+  },
+  "findings": [
+    {
+      "id": "SYNTHETIC-F001",
+      "title": "Tenant ownership is not checked in synthetic invoice lookup",
+      "status": "hypothesis",
+      "severity": "medium",
+      "confidence": "medium",
+      "evidence": {
+        "path": "examples/tenant_fixture.py.txt",
+        "start_line": 2,
+        "end_line": 4,
+        "source_sha256": "96da329a7c3e23d4d023b0505e188f45dc915cb8dfc475f33ae09c762e8ffab1",
+        "observation": "The synthetic function returns a looked-up invoice without checking its tenant.",
+        "preconditions": "A caller can select another tenant invoice; no upstream authorization exists. Neither is established by this isolated snippet.",
+        "reachability": "Unknown in real systems. This is an intentionally incomplete synthetic function.",
+        "limitations": "No application, route, authentication stack, database, or customer data was inspected."
+      },
+      "remediation": {
+        "state": "not_proposed",
+        "proposal_ref": null,
+        "patch_sha256": null,
+        "owner": null,
+        "rationale": null
+      },
+      "retest": {
+        "state": "NOT_RUN",
+        "evidence_ref": null,
+        "tested_commit": null,
+        "patch_sha256": null,
+        "reviewer": null,
+        "limitations": "Behavioral/model tests NOT_RUN; fixture text was not executed."
+      },
+      "human_review": {
+        "state": "pending",
+        "reviewer": null,
+        "evidence_ref": null
+      }
+    }
+  ],
+  "coverage": {
+    "reviewed_paths": [
+      "examples/tenant_fixture.py.txt"
+    ],
+    "not_reviewed": [],
+    "limitations": [
+      "Synthetic single-file example only. No live model, scanner, customer, CLI or runtime qualification."
+    ]
+  },
+  "conclusion": "review_incomplete"
+}

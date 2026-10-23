@@ -443,3 +443,8 @@ in-app local runtime, a per-task dollar cap, plan-based concurrency, or a paid p
 Offline fixtures and packaged startup do not establish useful real-model execution. The tracked
 launch report remains `not-qualified` until the required production outcomes and independent
 comparison evidence are qualified and recorded by their owners.
+
+
+## Experimental security review workflow
+
+An opt-in [security review workflow](workflows/security-review/README.md) provides a prompt, scope/evidence templates and offline declaration checks. It is not runtime authorization enforcement or a security certification. No command is installed or enabled automatically; read the integration limits before use.

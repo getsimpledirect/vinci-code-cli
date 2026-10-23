@@ -1,0 +1,8 @@
+{
+  "state": "NOT_RUN",
+  "evidence_ref": null,
+  "tested_commit": null,
+  "patch_sha256": null,
+  "reviewer": null,
+  "limitations": "Behavioral/model tests NOT_RUN; fixture text was not executed."
+}

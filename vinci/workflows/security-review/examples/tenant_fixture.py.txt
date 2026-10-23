@@ -1,0 +1,14 @@
+# Synthetic review-only text. Not imported or executed by this pack.
+def get_invoice(request, invoice_id, invoices):
+    invoice = invoices[invoice_id]
+    return invoice
+
+# Proposed correction, subject to application policy and reviewer approval:
+def proposed_get_invoice(request, invoice_id, invoices):
+    invoice = invoices[invoice_id]
+    if invoice.tenant_id != request.authenticated_tenant_id:
+        raise PermissionError("Invoice unavailable")
+    return invoice
+
+# Remaining questions: trusted tenant identity derivation, enumeration behavior,
+# nonexistent IDs, authorization before lookup, logging and cross-tenant roles.
