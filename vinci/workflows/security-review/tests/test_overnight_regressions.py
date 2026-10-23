@@ -240,5 +240,52 @@ class DiagnosticRegressions(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["contract_status"], "VALID_DECLARATION_ONLY")
 
 
+
+class ReachabilityRegressions(unittest.TestCase):
+    """Cases N08/N09 from the 2026-10-23 PR111 reachability packet (synthetic data), plus the output cap."""
+    MARKER = "opaqueReachability739z"  # packet marker, fabricated text
+
+    def run_validator(self, path):
+        return subprocess.run(
+            [sys.executable, "-I", "-S", str(ROOT / "tools/validate_review.py"), str(path)],
+            capture_output=True, timeout=5, env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+        )
+
+    def test_n08_missing_report_excludes_supplied_path_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="vinci-synthetic-n08-") as directory:
+            result = self.run_validator(Path(directory) / ("missing-" + self.MARKER + ".json"))
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(self.MARKER, result.stdout.decode())
+
+    def test_n09_large_duplicate_key_output_is_bounded(self):
+        large_key = self.MARKER + "q" * 8192
+        with tempfile.TemporaryDirectory(prefix="vinci-synthetic-n09-") as directory:
+            path = Path(directory) / "synthetic-large-duplicate.json"
+            path.write_text("{" + json.dumps(large_key) + ":1," + json.dumps(large_key) + ":2}")
+            result = self.run_validator(path)
+        self.assertEqual(result.returncode, 2)
+        self.assertLessEqual(len(result.stdout), 1024)
+        self.assertNotIn(self.MARKER, result.stdout.decode())
+
+    def test_rejection_line_clamps_long_reasons(self):
+        import validate_review
+        for reason in ["x" * 8192, '"\\' * 3000, "\u00e9" * 3000, "fits"]:
+            line = validate_review.rejection_line(reason)
+            self.assertLessEqual(len((line + "\n").encode()), validate_review.MAX_OUTPUT_BYTES)
+            self.assertEqual(json.loads(line)["contract_status"], "REJECTED")
+        self.assertEqual(json.loads(validate_review.rejection_line("fits"))["reason"], "fits")
+        self.assertTrue(json.loads(validate_review.rejection_line("x" * 8192))["reason"].endswith(" [truncated]"))
+
+    def test_main_routes_rejections_through_the_clamp(self):
+        import contextlib, io
+        from unittest import mock
+        import validate_review
+        out = io.StringIO()
+        with mock.patch.object(validate_review, "load", side_effect=Invalid("y" * 5000)), \
+             mock.patch.object(sys, "argv", ["validate_review.py", "synthetic.json"]), contextlib.redirect_stdout(out):
+            self.assertEqual(validate_review.main(), 2)
+        self.assertLessEqual(len(out.getvalue().encode()), 1024)
+        self.assertEqual(json.loads(out.getvalue())["contract_status"], "REJECTED")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

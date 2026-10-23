@@ -216,6 +216,16 @@ def validate(doc, now=None):
     return {'contract_status': 'VALID_DECLARATION_ONLY', 'authorization_verified': False,
             'model_accuracy_validated': False, 'runtime_enforcement': False}
 
+MAX_OUTPUT_BYTES = 1024  # one REJECTED line on stdout, newline included
+
+def rejection_line(reason):
+    """Return the REJECTED JSON line, clamped so that it plus its newline fits MAX_OUTPUT_BYTES."""
+    line = json.dumps({'contract_status':'REJECTED', 'reason':reason})
+    while len(line) >= MAX_OUTPUT_BYTES:  # ensure_ascii output: characters == bytes
+        reason = reason[:max(0, len(reason) - (len(line) - MAX_OUTPUT_BYTES) - 16)]
+        line = json.dumps({'contract_status':'REJECTED', 'reason':reason + ' [truncated]'})
+    return line
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('report'); p.add_argument('--at', help='Explicit evidence-time for fixture replay, not current authorization')
@@ -233,7 +243,7 @@ def main():
         reason = 'unable to read report'
     except (ValueError, TypeError, KeyError):
         reason = 'invalid report value or structure'
-    print(json.dumps({'contract_status':'REJECTED', 'reason':reason})); return 2
+    print(rejection_line(reason)); return 2
 
 if __name__ == '__main__':
     raise SystemExit(main())
