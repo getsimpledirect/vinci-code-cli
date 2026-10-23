@@ -77,6 +77,15 @@ for (const [path, masker] of [["display", vinciMaskJson], ["model", redactSecret
     assert.equal(JSON.stringify(masker({ credential: { value: opaque } })).includes(opaque), false);
   });
 
+  test(`sensitive arrays below ordinary arrays and objects mask on ${path}`, () => {
+    // Converter-shaped provider body (reachability packet N05): the sensitive key sits under ordinary keys.
+    const input = { messages: [{ role: "assistant", content: [{ type: "tool_use", input: { password: [opaque], note: "plain" } }] }] };
+    const masked = masker(input);
+    assert.equal(JSON.stringify(masked).includes(opaque), false);
+    assert.equal(masked.messages[0].content[0].input.note, "plain");
+    assert.equal(masked.messages[0].role, "assistant");
+  });
+
   test(`deep mixed descendants inherit property context on ${path}`, () => {
     assert.equal(JSON.stringify(masker({ password: [[{ nested: { values: [[opaque]] } }]] })).includes(opaque), false);
   });
