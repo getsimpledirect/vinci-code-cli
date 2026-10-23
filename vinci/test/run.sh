@@ -840,6 +840,7 @@ if node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.ex
   run_group toolname-integration node --experimental-strip-types "${ROOT}/vinci/test/toolname-integration.mjs"
   # secret masking: API keys never painted across the screen in an edit diff / write preview.
   run_group mask-integration node --experimental-strip-types "${ROOT}/vinci/test/mask-integration.mjs"
+  run_group mask-array-context node --experimental-strip-types "${ROOT}/vinci/test/mask-array-context.mjs"
   # prompt-injection boundary: untrusted web content fenced so a page can't hijack the agent.
   run_group search-integration node --experimental-strip-types "${ROOT}/vinci/test/search-integration.mjs"
   # SSRF boundary: drive the real search extension through helper and WHATWG URL forms.

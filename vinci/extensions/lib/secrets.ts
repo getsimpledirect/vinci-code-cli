@@ -21,10 +21,15 @@ export function redactSecretsDeep(value: unknown, propertyName = ""): unknown {
     const masked = vinciMaskSecrets(source, { propertyName, render: renderForModel });
     return masked === source ? value : masked;
   }
-  if (Array.isArray(value)) return value.map((entry) => redactSecretsDeep(entry));
+  // Sensitive ancestors cover arrays and object values; use the shared scalar rule to recognize them.
+  if (Array.isArray(value)) return value.map((entry) => redactSecretsDeep(entry, propertyName));
   if (typeof value === "object") {
     const redacted: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value)) redacted[key] = redactSecretsDeep(entry, key);
+    const inheritedPropertyName =
+      vinciMaskSecrets("1", { propertyName, render: renderForModel }) === MODEL_SECRET ? propertyName : "";
+    for (const [key, entry] of Object.entries(value)) {
+      redacted[key] = redactSecretsDeep(entry, inheritedPropertyName || key);
+    }
     return redacted;
   }
   return value;
