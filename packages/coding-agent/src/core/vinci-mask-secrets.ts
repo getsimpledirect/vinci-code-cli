@@ -597,10 +597,14 @@ export function vinciMaskJson(value: unknown, propertyName = ""): unknown {
 	if (typeof value === "number" || typeof value === "boolean" || value === null || value === undefined) {
 		return propertyName && isSecretProperty(propertyName) && value !== null && value !== undefined ? RED : value;
 	}
-	if (Array.isArray(value)) return value.map((entry) => vinciMaskJson(entry));
+	// Sensitive ancestors cover every descendant, including array elements and ordinary object keys.
+	if (Array.isArray(value)) return value.map((entry) => vinciMaskJson(entry, propertyName));
 	if (typeof value === "object") {
 		const masked: Record<string, unknown> = {};
-		for (const [key, entry] of Object.entries(value)) masked[key] = vinciMaskJson(entry, key);
+		const inheritedPropertyName = isSecretProperty(propertyName) ? propertyName : "";
+		for (const [key, entry] of Object.entries(value)) {
+			masked[key] = vinciMaskJson(entry, inheritedPropertyName || key);
+		}
 		return masked;
 	}
 	return value;
