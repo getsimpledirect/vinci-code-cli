@@ -53,6 +53,28 @@ test("the real commit-msg hook checks a quoted message-file path", () => {
 	}
 });
 
+for (const [name, header, status] of [
+	["regional-indicator flag", "fix: reject \u{1F1FA}\u{1F1F8}", 1],
+	["keycap with a variation selector", "fix: reject 1\uFE0F\u20E3", 1],
+	["keycap without a variation selector", "fix: reject #\u20E3", 1],
+	["standalone emoji modifier", "fix: reject \u{1F3FB}", 1],
+	["ordinary digits, hash and asterisk", "fix: preserve #1, * and digits 0123456789", 0],
+]) {
+	test(`the real checker and hook enforce the emoji rule for ${name}`, () => {
+		const message = join(temporary, "unicode commit message.txt");
+		writeFileSync(message, `${header}\n`);
+		const results = [
+			spawnSync(process.execPath, [checker, message], { encoding: "utf8", timeout: 10000 }),
+			spawnSync("sh", [hook, message], { encoding: "utf8", timeout: 10000 }),
+		];
+		for (const result of results) {
+			assert.equal(result.status, status, `${name}: ${result.stderr}`);
+			if (status === 1) assert.match(result.stderr, /Remove emojis from the commit header/);
+		}
+		assert.equal(validateCommitMessage(header), status === 1 ? "Remove emojis from the commit header." : undefined);
+	});
+}
+
 test("the structured event entry reads a PR title without evaluating it", () => {
 	const event = join(temporary, "event.json");
 	const marker = "commit-convention-must-not-execute";

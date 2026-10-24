@@ -17,7 +17,7 @@ export function validateCommitMessage(message, { allowGenerated = true } = {}) {
 		return "Use type(scope): description with a documented type and an optional lowercase area scope.";
 	}
 	if ([...header].length > 100) return "Shorten the commit header to at most 100 characters.";
-	if (/\p{Extended_Pictographic}/u.test(header)) return "Remove emojis from the commit header.";
+	if (/[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Modifier}\u20E3]/u.test(header)) return "Remove emojis from the commit header.";
 }
 
 export function checkCommitMessage(args) {
