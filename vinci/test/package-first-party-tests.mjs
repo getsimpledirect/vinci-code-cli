@@ -236,8 +236,12 @@ try {
 			shipped.has("vinci/worker/provider-definitions.mjs"),
 	);
 	check(
-		"every other vinci/worker member survived (22 runtime paths)",
-		[...shipped].filter((m) => m.startsWith("vinci/worker/")).length === 22,
+		"output custody runtime ships with the worker",
+		shipped.has("vinci/worker/output-custody.mjs"),
+	);
+	check(
+		"every other vinci/worker member survived (23 runtime paths)",
+		[...shipped].filter((m) => m.startsWith("vinci/worker/")).length === 23,
 	);
 
 	// Closure check over the WHOLE archive, not just the paths this test planted or named. The checks
