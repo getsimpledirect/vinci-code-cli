@@ -311,6 +311,11 @@ test("clean-room checks out and opens the PR against a non-main base_ref", async
   execFileSync("git", ["commit", "--quiet", "-m", "release base"], { cwd: seed });
   execFileSync("git", ["push", "--quiet", "origin", "release/2026-08"], { cwd: seed });
   const releaseHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: seed, encoding: "utf8" }).trim();
+  const mainTree = execFileSync("git", ["ls-tree", "--name-only", "origin/main"], { cwd: seed, encoding: "utf8" });
+  assert.ok(
+    !mainTree.split("\n").includes("BASE_MARKER"),
+    "BASE_MARKER must be absent from main so a checkout of main cannot satisfy the release-base assertion",
+  );
 
   fixture.linkTools(TOOLS);
   await fixture.startBus([{
@@ -333,6 +338,13 @@ test("clean-room checks out and opens the PR against a non-main base_ref", async
   const create = ghCalls.find(({ argv }) => argv[0] === "pr" && argv[1] === "create");
   assert.ok(create, "the eligible run must create a PR");
   assert.equal(create.argv[create.argv.indexOf("--base") + 1], "release/2026-08");
+
+  // Reported base_commit and PR metadata cannot establish what the attempt actually checked out.
+  const attemptDir = join(fixture.tempDir, "attempts", "test", "repo", "typed-base", "1");
+  assert.ok(
+    existsSync(join(attemptDir, "BASE_MARKER")),
+    "the attempt worktree must contain BASE_MARKER from release/2026-08, not merely report that base",
+  );
 });
 
 test("the real finalState fall-through posts status with outcome UNVERIFIED", async (t) => {

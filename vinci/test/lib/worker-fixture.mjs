@@ -30,15 +30,12 @@ function readBody(request) {
   });
 }
 
-// The claim-paths 200 body the DEPLOYED server actually returns (vinci-gpu-control
-// `app.py:2888-2893`, verified on main): `{ok, reason, claim_hash, paths}` — and NO `ttl`, even
-// though the handler computes one (`ttl = min(GOVERNOR_CLAIM_TTL_S, remaining_s)`) and passes it
-// into `governor_runtime.claim_paths`; a comment there even says "The client ignores `ttl`". This
-// client does NOT ignore it: `governor.mjs` refuses a 200 whose ttl is not finite-positive, and
-// `tightenEnvelopeLimits` caps the run's `max_runtime_s` on it. So against today's server a
-// governed task blocks at `Governor lease invalid: ttl=undefined`. That disagreement is real and
-// the server fix is dispatched on gpu-control #201; until it lands this is what the wire looks
-// like, and the fixture says so instead of inventing the field.
+// Historical pre-fix claim-paths 200 body: `{ok, reason, claim_hash, paths}` without `ttl`.
+// Issue #71 (2026-09-07) records that the gpu-control #201 fix had deployed and returned a
+// validated numeric ttl. Keep this historical negative fixture and its legacy export name;
+// neither describes the current deployment. `governor.mjs` refuses a response whose ttl is not
+// finite-positive, and `tightenEnvelopeLimits` caps the run's `max_runtime_s` on it. The missing
+// ttl therefore blocks at `Governor lease invalid: ttl=undefined` instead of losing that cap.
 export const CLAIM_PATHS_DEPLOYED = Object.freeze({
   ok: true,
   reason: null,
@@ -46,8 +43,8 @@ export const CLAIM_PATHS_DEPLOYED = Object.freeze({
   paths: ["."],
 });
 
-// The same body once gpu-control #201 adds the `ttl` it already computes. Tests that need a
-// GRANTED claim opt into this explicitly, so every such test names the server version it assumes.
+// A valid claim body with ttl. Tests that need a GRANTED claim opt into this explicitly,
+// without inferring a deployment's wire shape from the fixture default.
 export const CLAIM_PATHS_WITH_TTL = Object.freeze({ ...CLAIM_PATHS_DEPLOYED, ttl: 3600 });
 
 // Wave 1B: a fake Governor with the lease endpoints (acquire / renew / release / check) plus the
@@ -65,9 +62,9 @@ export const CLAIM_PATHS_WITH_TTL = Object.freeze({ ...CLAIM_PATHS_DEPLOYED, ttl
 //   check           true | false | (body, effectIndex) => ({ valid, reason })
 //   releaseStatus   HTTP status for release (200)
 //   claim           body served (200) on /v1/governor/claim-paths, or { status, body }.
-//                   DEFAULTS TO `CLAIM_PATHS_DEPLOYED` — the shape the deployed server actually
-//                   returns. A test that needs a GRANTED claim must say so with
-//                   `claim: CLAIM_PATHS_WITH_TTL`; the fixture does not invent the field.
+//                   DEFAULTS TO `CLAIM_PATHS_DEPLOYED` — the historical pre-fix shape without ttl.
+//                   A test that needs a GRANTED claim must say so with `claim: CLAIM_PATHS_WITH_TTL`;
+//                   the fixture does not invent the field.
 //   claimHolderGate the Governor's holder gate (governor_runtime.py:335-338), ON by default: once
 //                   a lease is live, a claim is refused 403 {reason:"leased_by_other_attempt"}
 //                   unless its `attempt_id` equals the CURRENT holder's — and an absent attempt_id
