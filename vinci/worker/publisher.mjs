@@ -186,7 +186,9 @@ async function findOurOpenPr(context) {
 // P2: what origin holds for the branch right now; null sha when the branch is absent.
 export async function remoteBranchSha({ repoDir, branch, remote = "origin", exec = defaultExec }) {
   const ref = `refs/heads/${branch}`;
-  const probe = await exec("git", ["-C", repoDir, "ls-remote", remote, ref]);
+  const probe = await exec("git", ["-C", repoDir, "ls-remote", remote, ref], {
+    timeoutMs: 30000, maxOutputBytes: 1024 * 1024,
+  });
   if (probe.status !== 0) return { sha: null, error: probe.stderr || `ls-remote exited ${probe.status}` };
   const lines = probe.stdout ? probe.stdout.split("\n") : [];
   if (lines.length === 0) return { sha: null, error: null };

@@ -28,24 +28,36 @@ export function command(commandName, args, options = {}) {
       "VINCI_WORKER_DEBRIS_AUTHORITY_SERVICE_SHA256",
       "VINCI_WORKER_DEBRIS_AUTHORITY_PUBLIC_KEY_SPKI",
     ]) delete commandEnvironment[name];
+    // A bounded Git command can leave SSH holding its pipes after Git exits. Own the POSIX
+    // process group so the bound stops those helpers too; legacy unbounded calls keep their group.
+    const ownsProcessGroup = process.platform !== "win32" && Boolean(options.timeoutMs || options.maxOutputBytes);
     const child = spawn(executable, args, {
       cwd: options.cwd,
       env: commandEnvironment,
+      detached: ownsProcessGroup,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = options.rawStdout ? [] : "";
     let stderr = "";
     let outputBytes = 0;
     let captureError = null;
+    const killCapturedCommand = () => {
+      if (ownsProcessGroup && child.pid) {
+        try { process.kill(-child.pid, "SIGKILL"); return; }
+        catch (error) { if (error.code === "ESRCH") return; }
+      }
+      // Windows retains the existing direct-child termination behavior.
+      child.kill("SIGKILL");
+    };
     const timer = options.timeoutMs ? setTimeout(() => {
       captureError = `command exceeded ${options.timeoutMs} ms`;
-      child.kill("SIGKILL");
+      killCapturedCommand();
     }, options.timeoutMs) : null;
     const acceptsChunk = (chunk) => {
       outputBytes += Buffer.byteLength(chunk);
       if (options.maxOutputBytes && outputBytes > options.maxOutputBytes) {
         captureError = `command output exceeded ${options.maxOutputBytes} bytes`;
-        child.kill("SIGKILL");
+        killCapturedCommand();
       }
       return captureError === null;
     };
