@@ -9,8 +9,9 @@ import { fileURLToPath } from "node:url";
 
 import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
 import { executionSpecDigest, workOrderDigest } from "../worker/contracts/digest.mjs";
-import { custodyTerminalState, OUTPUT_CAPTURE_LIMITS, outputRemotePostFields } from "../worker/output-custody.mjs";
+import { custodyTerminalState, OUTPUT_CAPTURE_LIMITS, outputRemotePostFields, settleOutputCustody } from "../worker/output-custody.mjs";
 import { remoteTransportIdentity } from "../worker/publisher.mjs";
+import { uploadEvidence } from "../worker/evidence.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const TOOLS = join(ROOT, "vinci/test/fixtures/worker-test-tools");
@@ -19,7 +20,7 @@ const BINARY = Buffer.from([0, 255, 13, 10, 4, 128]);
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { stdio: "pipe" }).toString().trim();
 
-async function scenario(name, { output = "branch", upload = true, uploadExit = 0, metadataStatus = null, producer = "binary", outcome = "DONE", exitCode = 0, cleanRoom = false, badReadback = false, missingRemoteUrl = false } = {}, verify) {
+async function scenario(name, { output = "branch", upload = true, uploadExit = 0, metadataStatus = null, producer = "binary", outcome = "DONE", exitCode = 0, cleanRoom = false, badReadback = false, missingRemoteUrl = false, legacyRef = false } = {}, verify) {
   if (process.env.VINCI_CUSTODY_CASE && process.env.VINCI_CUSTODY_CASE !== name) return;
   const fixture = new WorkerTestFixture(`custody-${name}`);
   try {
@@ -39,10 +40,11 @@ async function scenario(name, { output = "branch", upload = true, uploadExit = 0
       promotion: output === "branch" ? "pull_request" : "none",
     };
     const registry = { [order.id]: { work_order: order, execution_spec: spec } };
-    fixture.workOrderPrograms[order.id] = fixture.evidenceProgramId;
     await fixture.startBus([{
       message_id: name, to_agent: "worker:w1", kind: "handoff", subject: name,
-      body: JSON.stringify({ work_order_id: order.id, contract_digest: workOrderDigest(order), execution_spec_digest: executionSpecDigest(spec) }),
+      body: legacyRef
+        ? `repo: getsimpledirect/vinci-contracts\nevidence: pr\nref: bk_custody_${name}\n\nProduce local fixture output.`
+        : JSON.stringify({ work_order_id: order.id, contract_digest: workOrderDigest(order), execution_spec_digest: executionSpecDigest(spec) }),
       ts: new Date().toISOString(), posted_by: "fixture",
     }], registry);
     const ownTools = join(fixture.tempDir, "own-tools");
@@ -192,9 +194,49 @@ await scenario("artifact-deletion", { output: "artifact", producer: "deleted" },
   assert.equal(task.output_custody.status, "bundle_uploaded");
   assert.deepEqual(JSON.parse(member("artifact-capture.json")).entries, [{ path: "result.bin", status: "committed_deletion" }]);
 });
-await scenario("artifact-ledger-refused", { output: "artifact", metadataStatus: 422 }, ({ task, fixture }) => {
-  assert.equal(task.output_custody.status, "bundle_uploaded", "landed bytes survive metadata rejection");
+await scenario("artifact-ledger-refused", { output: "artifact", metadataStatus: 422 }, async ({ task, fixture, member }) => {
+  // Main intentionally leaves governed artifact envelopes unfiled. Exercise the real captured
+  // artifact bundle through the existing bk_ ingress without enabling the #54 WorkOrder contract.
+  const planned = JSON.parse(member("result.json"));
+  const manifestBytes = member("artifact-capture.json");
+  const manifest = JSON.parse(manifestBytes);
+  const extraFiles = { "artifact-capture.json": manifestBytes, "artifacts.json": member("artifacts.json") };
+  for (const entry of manifest.entries) if (entry.status === "captured") extraFiles[entry.member] = member(entry.member);
+  const record = join(fixture.tempDir, "aws-legacy.jsonl");
+  const overrides = { PATH: `${fixture.toolsDir}:${process.env.PATH}`, FAKE_AWS_EXIT: "0", FAKE_AWS_RECORD: record };
+  const saved = Object.fromEntries(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  let evidence;
+  try {
+    Object.assign(process.env, overrides);
+    evidence = await uploadEvidence({
+      resultJson: { snapshot: "pre-terminal", terminal: false, output_custody: planned.output_custody },
+      extraFiles, taskId: "legacy-artifact-refused",
+      uriPrefix: "s3://offline-evidence/worker/", busUrl: fixture.busUrl(),
+      busToken: fixture.getEnv().VINCI_BUS_TOKEN, ref: "bk_custody_artifact_refused",
+    });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  assert.equal(planned.output_custody.status, "pending_upload");
+  assert.equal(evidence.uploaded, true);
+  assert.equal(evidence.success, false);
+  assert.equal(evidence.error, "Bus POST failed: 422");
+  const custody = settleOutputCustody(planned.output_custody, evidence);
+  assert.equal(custody.status, "bundle_uploaded", "landed artifact bytes survive legacy metadata rejection");
+  assert.equal(custody.durable, true);
+  const archive = JSON.parse(readFileSync(record, "utf8").trim()).argv[3];
+  const captured = manifest.entries.find((entry) => entry.status === "captured");
+  assert.deepEqual(execFileSync("tar", ["xzOf", archive, `./${captured.member}`]), BINARY);
+  assert.equal(custodyTerminalState("UNVERIFIED", custody), "UNVERIFIED", "durable bytes do not manufacture a successful terminal");
   assert.equal(task.state, "UNVERIFIED");
+});
+await scenario("legacy-ledger-refused", { legacyRef: true, metadataStatus: 422 }, ({ task, fixture }) => {
+  assert.ok(task.pr, "legacy worker reaches its otherwise-completed PR path");
+  assert.equal(task.output_custody.status, "remote_verified");
+  assert.equal(task.state, "UNVERIFIED", "the real worker downgrades a legacy metadata refusal");
   assert.equal(task.evidence_error, "Bus POST failed: 422");
   assert.equal(fixture.getPostedMessages().at(-1).refs, undefined);
 });
