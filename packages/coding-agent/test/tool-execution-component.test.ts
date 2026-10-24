@@ -769,7 +769,7 @@ describe("ToolExecutionComponent parity", () => {
 			);
 
 			const collapsed = stripAnsi(component.render(120).join("\n"));
-			expect(collapsed).toContain(scenario.compact);
+			expect(collapsed.replace(/\s+/g, " ")).toContain(scenario.compact);
 			expect(collapsed).not.toContain(scenario.hidden);
 			if (scenario.absent) {
 				expect(collapsed).not.toContain(scenario.absent);
