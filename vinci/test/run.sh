@@ -870,6 +870,7 @@ run_group resultbudget-integration node "${ROOT}/vinci/test/resultbudget-integra
 
 echo
 echo "── PACKAGED (exact archive, offline launcher) ────────"
+run_group packaged-artifact-static node "${ROOT}/vinci/test/packaged-artifact-check.test.mjs"
 run_group packaged-vocabulary env VINCI_PACKAGED_VOCABULARY_REUSE_BUILD=1 node "${ROOT}/vinci/test/packaged-vocabulary.mjs"
 run_group packaged-runtime-contract-guard bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh"
 packaged_dir="$(mktemp -d "${TMPDIR:-/tmp}/vinci-packaged-test.XXXXXX")"
