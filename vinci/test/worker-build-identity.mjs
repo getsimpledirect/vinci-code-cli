@@ -372,6 +372,21 @@ await test("T9 HEAD is read from .git files: unborn, detached, packed ref, workt
       const wt = wtMod.buildIdentity();
       assert.equal(wt.commit, second, JSON.stringify(wt));
       assert.equal(wt.source, "git");
+      assert.equal(wt.dirty, false, "a clean real worktree is measured as clean");
+      writeFileSync(join(worktreeRoot, "a.txt"), "dirty linked worktree\n");
+      const worktreeStatus = spawnSync("git", ["-C", worktreeRoot, "status", "--porcelain", "--untracked-files=no"], { encoding: "utf8", timeout: 5000 });
+      assert.equal(worktreeStatus.status, 0, worktreeStatus.stderr);
+      assert.match(worktreeStatus.stdout, /a\.txt/, "real Git must observe the tracked worktree edit");
+      assert.equal(wtMod.buildIdentity().dirty, true, "the worktree's own dirty state survives root verification");
+      const alias = `${worktreeRoot}-alias`;
+      symlinkSync(worktreeRoot, alias, process.platform === "win32" ? "junction" : "dir");
+      try {
+        const viaAlias = wtMod.buildIdentity(join(alias, "vinci/worker"));
+        assert.equal(viaAlias.commit, second);
+        assert.equal(viaAlias.dirty, true, "Git and filesystem resolution agree through a directory alias");
+      } finally {
+        rmSync(alias, { force: true });
+      }
       // Pack the worktree branch too: the ref is now only in the MAIN repo's packed-refs.
       repo.git("pack-refs", "--all");
       assert.equal(existsSync(join(repo.root, ".git/refs/heads/wt-branch")), false, "fixture: ref must be packed");
@@ -429,8 +444,8 @@ await test("T10 git refuses (dubious ownership, simulated by PATH-shadowing git)
     // path is honoured by every git that has safe.directory; the `*` wildcard needs >= 2.35.3),
     // and no git call was made for the commit.
     const calls = readFileSync(argvLog, "utf8").trim().split("\n").filter((line) => !/^rev-parse HEAD$/.test(line));
-    assert.equal(calls.length, 1, `expected exactly one git call (status), got: ${calls.join(" | ")}`);
-    assert.equal(calls[0], `-c safe.directory=${repo.root} -C ${join(repo.root, "vinci/worker")} status --porcelain --untracked-files=no`);
+    assert.equal(calls.length, 1, `expected exactly one repository-root probe, got: ${calls.join(" | ")}`);
+    assert.equal(calls[0], `-c safe.directory=${repo.root} -C ${join(repo.root, "vinci/worker")} rev-parse --show-toplevel`);
   } finally {
     process.env.PATH = originalPath;
     rmSync(repo.root, { recursive: true, force: true });
@@ -744,3 +759,41 @@ await test("T17 a ref cannot escape the git dir: `..` with an EXISTING valid tar
     rmSync(outside, { recursive: true, force: true });
   }
 });
+
+for (const mode of ["missing", "unreadable"]) {
+  await test(`T18 ${mode} child HEAD never borrows a dirty parent repository's status`, async () => {
+    const parent = makeRepo(`worker-build-nested-${mode}-`);
+    const child = join(parent.root, "installed-worker");
+    const childHead = join(child, ".git/HEAD");
+    try {
+      writeFileSync(join(parent.root, "tracked.txt"), "clean parent\n");
+      parent.git("add", "-A");
+      parent.git("commit", "-q", "-m", "parent fixture");
+      writeFileSync(join(parent.root, "tracked.txt"), "dirty parent\n");
+      assert.ok(parent.git("status", "--porcelain", "--untracked-files=no"), "the real parent must be dirty");
+      const modulePath = layOut(child);
+      const initialized = spawnSync("git", ["-C", child, "init", "-q", "--initial-branch=main"], { encoding: "utf8", timeout: 5000 });
+      assert.equal(initialized.status, 0, initialized.stderr);
+      if (mode === "missing") rmSync(childHead);
+      else if (process.platform === "win32" || process.getuid?.() === 0) {
+        rmSync(childHead);
+        mkdirSync(childHead);
+      } else {
+        chmodSync(childHead, 0o000);
+        assert.throws(() => readFileSync(childHead), "fixture HEAD must be unreadable");
+      }
+      const discovery = spawnSync("git", ["-C", join(child, "vinci/worker"), "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 5000 });
+      assert.equal(discovery.status, 0, discovery.stderr);
+      assert.equal(realpathSync(discovery.stdout.trim()), parent.root, "real Git must demonstrate the ancestor-discovery hazard");
+      const copied = await import(pathToFileURL(modulePath).href);
+      const identity = copied.buildIdentity();
+      assert.equal(identity.commit, null);
+      assert.equal(identity.unresolved, true);
+      assert.equal(identity.dirty, null, "a foreign parent's dirty flag is not evidence about this worker");
+      assert.equal(copied.formatWorkerBuild(identity), `${here.version}-UNRESOLVED`);
+    } finally {
+      try { chmodSync(childHead, 0o644); } catch {}
+      rmSync(parent.root, { recursive: true, force: true });
+    }
+  });
+}

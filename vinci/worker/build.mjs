@@ -211,7 +211,16 @@ export function buildIdentity(dir = dirname(fileURLToPath(import.meta.url))) {
   } catch {
     commit = null;
   }
-  const status = git(["status", "--porcelain", "--untracked-files=no"], dir, found.root);
+  // An unusable nested .git can make Git discover an unrelated ancestor. Its dirty flag
+  // is not evidence about this worker. Compare actual Git and filesystem root resolution;
+  // linked worktrees and directory aliases still refer to the same physical checkout.
+  let status = null;
+  try {
+    const topLevel = git(["rev-parse", "--show-toplevel"], dir, found.root);
+    if (topLevel !== null && realpathSync(topLevel.replace(/\r?\n$/, "")) === realpathSync(found.root)) {
+      status = git(["status", "--porcelain", "--untracked-files=no"], dir, found.root);
+    }
+  } catch { /* Unavailable or mismatched repository identity keeps dirty unknown. */ }
   const dirty = status === null ? null : status.trim().length > 0;
   if (!commit) return { version, commit: null, dirty, source: "package", unresolved: true };
   return { version, commit, dirty, source: "git", unresolved: false };
