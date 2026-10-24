@@ -1,3 +1,17 @@
+# Vinci Code CLI
+
+The canonical public source and release lineage for Vinci Code, a terminal coding agent distributed from the MIT-licensed Pi harness.
+
+Bring-your-own-provider use does not require a Vinci account. Managed inference is a separate service dependency. The private vinci-code repository contains operations and historical reference, not a second product publisher.
+
+## Start here
+
+[Installation](#installation) · [Quick start](#quick-start) · [Privacy](vinci/PRIVACY.md) · [Security reports](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Releases](#releases)
+
+Preserve Pi provenance, the MIT grants and third-party notices. Code licensing does not grant the Vinci/SimpleDirect trademarks or separately governed artwork rights.
+
+## Product and developer reference
+
 <div align="center">
 
 <picture>
@@ -5,7 +19,6 @@
   <img src="vinci/assets/logomark.svg" alt="Vinci logomark" width="120" />
 </picture>
 
-# Vinci Code CLI
 
 A terminal coding agent you can run with **your own provider key** — or with Vinci's managed
 service.<br/>Same guard rails either way.
@@ -154,7 +167,7 @@ Nothing to configure. Install it, run it, pick a provider:
 ```
 
 `/login` asks how you want to authenticate before it asks who with. "Use an API key" lists every
-provider Pi supports — 33 of them at the time of writing — each marked `unconfigured` until you
+provider Pi supports — including the providers supported by the pinned Pi version — each marked `unconfigured` until you
 add a key. A Vinci account is one of the options, never a prerequisite.
 
 <img src="vinci/assets/screenshot-auth.png" alt="The /login prompt: Select authentication method, offering Use a subscription or Use an API key" width="820" />
