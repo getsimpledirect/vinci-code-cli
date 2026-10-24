@@ -24,6 +24,7 @@ Open an issue and ask; that costs a comment, guessing wrong costs a rewrite.
 
 ## Checks
 
+- [ ] PR title and new local commit headers follow `type(scope): description` in `CONTRIBUTING.md`
 - [ ] `npm run check` is clean - errors, warnings and infos alike
 - [ ] `./test.sh` passes (not vitest directly; it filters the e2e tests that need provider keys)
 - [ ] Added a test for anything that could regress. Issue-specific regressions go in

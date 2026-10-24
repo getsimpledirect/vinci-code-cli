@@ -24,7 +24,7 @@ policy, not ours.
 ## Before you open a PR
 
 ```sh
-npm install
+npm install --ignore-scripts
 bash vinci/build.sh          # the offline build — no external catalog refresh
 npm run check                # biome, tsgo, lockfile gates, secret scan
 bash vinci/test/run.sh       # the full harness
@@ -58,6 +58,49 @@ scanner exists.
 TypeScript, tabs, biome-formatted (`npm run check` fixes formatting). Match the file you are
 editing. Vinci-layer patches inside `packages/` are marked `[vinci]` in a comment and gated on
 an env var, so upstream merges stay clean — follow that convention.
+
+## Commit messages and PR titles
+
+Use `type(scope): description`, with an optional lowercase scope and `!` before `:` for a
+breaking change. Headers are at most 100 characters, without emojis. Types are `feat`, `fix`,
+`docs`, `refactor`, `test`, `chore`, `ci`, `build`, `perf`, and `revert`. Use an area scope such as
+`vinci`, `worker`, `provider`, `release`, `updater`, `ai`, `tui`, `agent`, `coding-agent`,
+`orchestrator`, or `deps`; scope names may use hyphens or `/` separators.
+
+For example: `fix(worker): preserve partial output` or `ci: check packaged imports`.
+The activated Husky `commit-msg` hook checks new local commits; PR titles follow the convention
+during review. Generated Git merge/revert messages and valid `fixup!`, `squash!`, and `amend!`
+messages remain supported locally. This does not validate or rewrite historical upstream commits.
+
+An install with `--ignore-scripts` does not initialize Husky. To activate the repository hooks,
+run this explicit setup command from the repository root:
+
+```sh
+node node_modules/husky/bin.js
+```
+
+This configures the repository's local `core.hooksPath`, which also applies to its worktrees.
+To check a message file directly, run `node scripts/check-commit-message.mjs <message-file>`.
+
+## Preparing a Vinci release
+
+On a clean `release/vinci-v<version>` branch created from current `main`, prepare maintained
+user-facing notes outside the checkout and run:
+
+```sh
+node vinci/scripts/prepare-release.mjs <version> --notes-file <path> --dry-run
+node vinci/scripts/prepare-release.mjs <version> --notes-file <path>
+```
+
+The helper checks local and live remote tags, updates the authoritative `vinci/identity.json`,
+copies notes to `vinci/release-notes/<version>.md`, and runs the existing UI snapshot scenarios.
+Review every changed frame and the notes, then run the documented checks and open a release PR.
+A failed snapshot step leaves a reviewable partial diff and reports the failed step.
+
+Vinci, root and Pi package versions are separate. The helper does not commit, tag, push or publish.
+After the release PR merges and release authorization is granted, the maintainer tags the reviewed
+public commit; the protected workflow signs and publishes the exact tested artifact. See
+[`AGENTS.md`](AGENTS.md#cutting-a-release) for the release checks and immutable-tag rules.
 
 ## Reporting bugs and vulnerabilities
 
