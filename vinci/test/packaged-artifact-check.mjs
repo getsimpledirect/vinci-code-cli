@@ -11,7 +11,7 @@
 //
 // Usage:  node vinci/test/packaged-artifact-check.mjs <unpacked-artifact-root>
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -19,11 +19,12 @@ import { dirname, join, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const root = process.argv[2];
-if (!root || !existsSync(root)) {
+const rootArgument = process.argv[2];
+if (!rootArgument || !existsSync(rootArgument)) {
   console.error("usage: packaged-artifact-check.mjs <unpacked-artifact-root>");
   process.exit(2);
 }
+const root = realpathSync(rootArgument);
 
 // Every relative specifier the shipped extension layer resolves at RUNTIME. Bare specifiers
 // (node:, package names) are resolved by node/jiti and are out of scope here.
