@@ -37,10 +37,18 @@ test("fullscreen opt-in documents both directions, copy controls and pending dev
 	expect(section).toMatch(/VINCI_COPY_ON_SELECT=0 vinci[^\n]*\n\n`VINCI_COPY_ON_SELECT=0` turns/);
 });
 
-test("existing README copy hint wording stays byte-identical", () => {
-	const block =
-		"| `extensions/vinci-copy.ts` | Clipboard helper — `/copy` or Alt+C opens Vinci's last message, last code block, and last tool output without terminal text selection |";
-	expect(readme.split(block).length - 1).toBe(1);
+test("README copy row preserves copy choices and explains fullscreen and terminal selection help", () => {
+	const rows = readme.split("\n").filter((line) => line.startsWith("| `extensions/vinci-copy.ts` |"));
+	expect(rows, "the layout documents the copy extension exactly once").toHaveLength(1);
+	const row = rows[0] ?? "";
+	for (const text of [
+		"`/copy` or Alt+C",
+		"Vinci's last message, last code block, and last tool output",
+		"without terminal text selection",
+		"The picker also explains fullscreen and terminal selection settings.",
+	]) {
+		expect(row, `the copy help preserves ${text}`).toContain(text);
+	}
 });
 
 test("source-order check: launcher exports Vinci identity before running the Pi CLI", () => {
