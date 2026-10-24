@@ -28,6 +28,7 @@ const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const MAX_RETRY_AFTER_MS = 300_000;
 const MAX_IN_FLIGHT_RETRIES = 3;
 const MAX_TOTAL_402_RETRIES = 10;
+const TERMINAL_BILLING_CODES = new Set(["balance_exhausted", "payment_failed", "free_daily_cap", "request_too_large"]);
 
 const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
   if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
@@ -69,11 +70,23 @@ export function vinciAffordableTokenLimit(errorBodyOrMessage: string | undefined
 
 function parsedErrorBody(errorBodyOrMessage: string): Record<string, unknown> | undefined {
   try {
-    const parsed: unknown = JSON.parse(errorBodyOrMessage);
+    // The completions normalizer prefixes structured HTTP 402 bodies with "402: ".
+    // Decode that exact envelope without extracting JSON or status from arbitrary prose.
+    const parsed: unknown = JSON.parse(errorBodyOrMessage.replace(/^402:\s*(?=\{)/, ""));
     return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined;
   } catch {
     return undefined;
   }
+}
+
+function structuredBudgetCode(errorBodyOrMessage: string): string | undefined {
+  const parsed = parsedErrorBody(errorBodyOrMessage);
+  const structuredError = parsed?.error;
+  if (typeof structuredError === "object" && structuredError !== null) {
+    const errorCode = (structuredError as Record<string, unknown>).code;
+    if (typeof errorCode === "string" && errorCode) return errorCode;
+  }
+  return typeof parsed?.code === "string" ? parsed.code : undefined;
 }
 
 export function isInFlightBudgetExhausted(errorBodyOrMessage: string): boolean {
@@ -157,22 +170,14 @@ export function vinciClassModel(id: string, name: string) {
 export function vinciBudgetBlockedMessage(errorBodyOrMessage: string | undefined, taskId: string): string | undefined {
   if (!errorBodyOrMessage) return undefined;
 
+  const code = structuredBudgetCode(errorBodyOrMessage);
   if (
-    isInFlightBudgetExhausted(errorBodyOrMessage) ||
-    vinciAffordableTokenLimit(errorBodyOrMessage) !== undefined
+    !TERMINAL_BILLING_CODES.has(code ?? "") &&
+    (isInFlightBudgetExhausted(errorBodyOrMessage) ||
+      vinciAffordableTokenLimit(errorBodyOrMessage) !== undefined)
   ) {
     return undefined;
   }
-
-  // Try to parse as JSON and extract structured code
-  let code: string | undefined;
-  const parsed = parsedErrorBody(errorBodyOrMessage);
-  const structuredError = parsed?.error;
-  if (typeof structuredError === "object" && structuredError !== null) {
-    const errorCode = (structuredError as Record<string, unknown>).code;
-    if (typeof errorCode === "string") code = errorCode;
-  }
-  if (!code && typeof parsed?.code === "string") code = parsed.code;
 
   // Route based on structured code if present
   if (code) {
@@ -266,6 +271,7 @@ async function loginVinci(callbacks: OAuthLoginCallbacks): Promise<OAuthCredenti
 }
 
 export default function (pi: ExtensionAPI) {
+  let pendingResponseStatus: number | undefined;
   let pending402RetryAfterMs: number | undefined;
   let retryDelayMs: number | undefined;
   let affordableTokenLimit: number | undefined;
@@ -330,9 +336,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("after_provider_response", (event, ctx) => {
+    pendingResponseStatus = undefined;
+    pending402RetryAfterMs = undefined;
     if (ctx.model?.provider !== "vinci") return;
+    pendingResponseStatus = event.status;
     if (event.status >= 200 && event.status < 300) {
-      pending402RetryAfterMs = undefined;
       retryDelayMs = undefined;
       affordableTokenLimit = undefined;
       affordabilityRetryAttempted = false;
@@ -340,7 +348,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (event.status !== 402) {
-      pending402RetryAfterMs = undefined;
       return;
     }
     const retryAfter = Object.entries(event.headers).find(([name]) => name.toLowerCase() === "retry-after")?.[1];
@@ -348,7 +355,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", async (event, ctx) => {
-    if (ctx.model?.provider !== "vinci") return;
+    // A transport failure without a response must not inherit a previous call's status/header.
+    pendingResponseStatus = undefined;
+    pending402RetryAfterMs = undefined;
+    if (ctx.model?.provider !== "vinci") {
+      retryDelayMs = undefined;
+      affordableTokenLimit = undefined;
+      return;
+    }
     if (retryDelayMs !== undefined) {
       const delayMs = retryDelayMs;
       retryDelayMs = undefined;
@@ -449,36 +463,45 @@ export default function (pi: ExtensionAPI) {
   const VINCI_OVERFLOW = /maximum context length|context window|too long/i;
   pi.on("message_end", (event, ctx) => {
     const m = event.message;
-    if (m.role !== "assistant" || m.stopReason !== "error") return;
+    if (m.role !== "assistant") return;
+    const responseStatus = pendingResponseStatus;
+    const retryAfterMs = pending402RetryAfterMs;
+    pendingResponseStatus = undefined;
+    pending402RetryAfterMs = undefined;
+    if (m.stopReason !== "error") return;
     if (m.provider !== "vinci" && ctx.model?.provider !== "vinci") return;
+    retryDelayMs = undefined;
+    affordableTokenLimit = undefined;
     const em = m.errorMessage ?? "";
-    if (isInFlightBudgetExhausted(em)) {
+    const inFlightBudgetExhausted = isInFlightBudgetExhausted(em);
+    const terminalBilling = TERMINAL_BILLING_CODES.has(structuredBudgetCode(em) ?? "") ||
+      (!inFlightBudgetExhausted && vinciAffordableTokenLimit(em) === undefined && VINCI_TERMINAL_BUDGET_ERROR.test(em));
+    const affordableTokens = responseStatus === 402 && !terminalBilling ? vinciAffordableTokenLimit(em) : undefined;
+    if (!terminalBilling && (inFlightBudgetExhausted ||
+      (responseStatus === 402 && retryAfterMs !== undefined && affordableTokens === undefined))) {
+      const retryReason = inFlightBudgetExhausted ? "OpenRouter's in-flight request limit" : "The provider's requested retry window";
       if (inFlightRetryCount < MAX_IN_FLIGHT_RETRIES && total402RetryCount < MAX_TOTAL_402_RETRIES) {
         inFlightRetryCount++;
         total402RetryCount++;
-        retryDelayMs = pending402RetryAfterMs ?? vinciRetryAfterMs(em);
-        pending402RetryAfterMs = undefined;
+        retryDelayMs = retryAfterMs ?? vinciRetryAfterMs(em);
         return {
           message: {
             ...m,
-            errorMessage: `OpenRouter's in-flight request limit is temporary; please retry your request on this same model (${inFlightRetryCount}/${MAX_IN_FLIGHT_RETRIES}).`,
+            errorMessage: `${retryReason} is temporary; please retry your request on this same model (${inFlightRetryCount}/${MAX_IN_FLIGHT_RETRIES}).`,
           },
         };
       }
-      pending402RetryAfterMs = undefined;
       return {
         message: {
           ...m,
           errorMessage:
             total402RetryCount >= MAX_TOTAL_402_RETRIES
               ? `BLOCKED: provider — Vinci stopped retrying after ${MAX_TOTAL_402_RETRIES} HTTP 402 retries in this session. Your checkpoint is saved.`
-              : `BLOCKED: provider — OpenRouter's in-flight request limit did not clear after ${MAX_IN_FLIGHT_RETRIES} retries. Your checkpoint is saved.`,
+              : `BLOCKED: provider — ${retryReason} did not clear after ${MAX_IN_FLIGHT_RETRIES} retries. Your checkpoint is saved.`,
         },
       };
     }
-    const affordableTokens = vinciAffordableTokenLimit(em);
     if (affordableTokens !== undefined) {
-      pending402RetryAfterMs = undefined;
       if (!affordabilityRetryAttempted && total402RetryCount < MAX_TOTAL_402_RETRIES) {
         affordabilityRetryAttempted = true;
         total402RetryCount++;
@@ -493,7 +516,6 @@ export default function (pi: ExtensionAPI) {
       affordableTokenLimit = undefined;
       return { message: { ...m, errorMessage: terminalBudgetMessage(ctx.sessionManager.getSessionId()) } };
     }
-    pending402RetryAfterMs = undefined;
     const budgetMessage = vinciBudgetBlockedMessage(em, ctx.sessionManager.getSessionId());
     if (budgetMessage) return { message: { ...m, errorMessage: budgetMessage } };
 

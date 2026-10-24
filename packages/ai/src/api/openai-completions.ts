@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { APIError } from "openai/core/error";
 import type {
 	ChatCompletionAssistantMessageParam,
 	ChatCompletionChunk,
@@ -193,7 +194,28 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			};
 			const { data: openaiStream, response } = await client.chat.completions
 				.create(params, requestOptions)
-				.withResponse();
+				.withResponse()
+				.catch(async (error: unknown) => {
+					// [vinci] The SDK rejects HTTP errors before withResponse exposes their headers.
+					// Managed billing recovery needs the actual status, independent of error prose.
+					if (
+						model.provider === "vinci" &&
+						!options?.signal?.aborted &&
+						error instanceof APIError &&
+						error.status !== undefined &&
+						error.headers
+					) {
+						try {
+							await options?.onResponse?.(
+								{ status: error.status, headers: headersToRecord(error.headers) },
+								model,
+							);
+						} catch {
+							// Preserve the HTTP failure and settle the error stream if its observer fails.
+						}
+					}
+					throw error;
+				});
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
