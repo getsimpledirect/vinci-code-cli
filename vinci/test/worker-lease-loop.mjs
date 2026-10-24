@@ -111,6 +111,16 @@ function processGroupExists(pid) {
   }
 }
 
+async function waitForProcessGroupExit(pid, label) {
+  await waitFor(() => {
+    try { return !processGroupExists(pid); }
+    catch (error) {
+      if (error.code === 'EPERM') return false;
+      throw error;
+    }
+  }, { timeoutMs: 5000, label });
+}
+
 async function waitForWorkerClose(worker, timeoutMs = 5000) {
   let timer;
   try {
@@ -1010,7 +1020,7 @@ for (const authority of ['work', 'both', 'branch']) {
         try {
           worker?.proc.kill('SIGKILL');
           if (worker) await waitForWorkerClose(worker);
-          if (Number.isInteger(childPid)) await waitFor(() => !processGroupExists(childPid), { timeoutMs: 5000, label: 'the cleanup task group to disappear' });
+          if (Number.isInteger(childPid)) await waitForProcessGroupExit(childPid, 'the cleanup task group to disappear');
         } catch (error) {
           cleanupError ??= error;
         } finally {
@@ -1023,126 +1033,188 @@ for (const authority of ['work', 'both', 'branch']) {
   }
 }
 
-await test('SIGTERM during post-run readHead: retain descendant tracking and refuse terminal publication', async () => {
-  const fixture = new WorkerTestFixture('lease-sigterm-post-run');
-  const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1 });
-  const groupAtWorkRelease = [];
-  const groupAtBranchRelease = [];
-  let worker = null;
-  let childPid = null;
-  let gitPid = null;
-  await governor.start();
-  const handleGovernor = governor.handle.bind(governor);
-  governor.handle = (request, response) => {
-    if (request.url.endsWith('/release')) groupAtWorkRelease.push(processGroupExists(childPid));
-    return handleGovernor(request, response);
-  };
-  try {
-    fixture.createRepo('test', 'repo');
-    fixture.linkTools(TOOLS);
-    const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' });
-    assert.equal(realGit.status, 0, realGit.stderr);
-    const exitMarker = join(fixture.tempDir, 'run-exited');
-    const gitPaused = join(fixture.tempDir, 'git-paused');
-    const gitContinue = join(fixture.tempDir, 'git-continue');
-    const gitResolved = join(fixture.tempDir, 'git-resolved');
-    const gitWrapper = join(fixture.toolsDir, 'git');
-    // Forward real Git; pause only the worker's HEAD read after the actual task leader exits.
-    writeFileSync(gitWrapper, `#!/usr/bin/env node
-import { existsSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
-const args = process.argv.slice(2);
-const paused = existsSync(${JSON.stringify(exitMarker)}) && args.includes('rev-parse') && args.at(-1) === 'HEAD';
-if (paused) {
-  writeFileSync(${JSON.stringify(gitPaused)}, String(process.pid));
-  const deadline = Date.now() + 5000;
-  while (!existsSync(${JSON.stringify(gitContinue)})) {
-    if (Date.now() >= deadline) { console.error('The post-run Git fixture timed out; release its pause marker.'); process.exit(1); }
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+for (const signalScenario of ['normal', 'transient', 'persistent']) {
+  await test(`SIGTERM during post-run readHead: retain descendant tracking and refuse terminal publication (${signalScenario})`, async () => {
+    const fixture = new WorkerTestFixture('lease-sigterm-post-run');
+    const governor = new FakeGovernor({ claim: CLAIM_PATHS_WITH_TTL, ttlS: 1 });
+    const groupAtWorkRelease = [];
+    const groupAtBranchRelease = [];
+    let worker = null;
+    let childPid = null;
+    let gitPid = null;
+    await governor.start();
+    const handleGovernor = governor.handle.bind(governor);
+    governor.handle = (request, response) => {
+      if (request.url.endsWith('/release')) groupAtWorkRelease.push(processGroupExists(childPid));
+      return handleGovernor(request, response);
+    };
+    try {
+      fixture.createRepo('test', 'repo');
+      fixture.linkTools(TOOLS);
+      const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' });
+      assert.equal(realGit.status, 0, realGit.stderr);
+      const exitMarker = join(fixture.tempDir, 'run-exited');
+      const gitPaused = join(fixture.tempDir, 'git-paused');
+      const gitContinue = join(fixture.tempDir, 'git-continue');
+      const gitResolved = join(fixture.tempDir, 'git-resolved');
+      const gitWrapper = join(fixture.toolsDir, 'git');
+      // Forward real Git; pause only the worker's HEAD read after the actual task leader exits.
+      writeFileSync(gitWrapper, `#!/usr/bin/env node
+  import { existsSync, writeFileSync } from 'node:fs';
+  import { spawnSync } from 'node:child_process';
+  const args = process.argv.slice(2);
+  const paused = existsSync(${JSON.stringify(exitMarker)}) && args.includes('rev-parse') && args.at(-1) === 'HEAD';
+  if (paused) {
+    writeFileSync(${JSON.stringify(gitPaused)}, String(process.pid));
+    const deadline = Date.now() + 5000;
+    while (!existsSync(${JSON.stringify(gitContinue)})) {
+      if (Date.now() >= deadline) { console.error('The post-run Git fixture timed out; release its pause marker.'); process.exit(1); }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
   }
-}
-const result = spawnSync(${JSON.stringify(realGit.stdout.trim())}, args, { encoding: 'utf8', timeout: 5000 });
-if (result.stdout) process.stdout.write(result.stdout);
-if (result.stderr) process.stderr.write(result.stderr);
-if (paused && result.status === 0) writeFileSync(${JSON.stringify(gitResolved)}, String(process.pid));
-process.exit(result.status ?? 1);
-`);
-    chmodSync(gitWrapper, 0o755);
-    await fixture.startBus([handoff('118', 'w5', 'repo: test/repo\nevidence: pr\n\nTask')]);
-    const handleBus = fixture.busServer.listeners('request')[0];
-    fixture.busServer.removeListener('request', handleBus);
-    fixture.busServer.on('request', (request, response) => {
-      if (!request.url.startsWith('/v1/branch-leases')) return handleBus(request, response);
-      if (request.method === 'DELETE') groupAtBranchRelease.push(processGroupExists(childPid));
-      response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ ok: true, valid: true, lease: { repo: 'test/repo', branch: 'worker/118', fencing_generation: 200 } }));
-    });
-    const descendantReady = join(fixture.tempDir, 'descendant-ready');
-    worker = spawnWorker(fixture, 'w5', ['--governor', governor.url], {
-      VINCI_BRANCH_LEASE: '1',
-      VINCI_WORKER_LEASE_KILL_GRACE_MS: '1000',
-      FAKE_VINCI_SLEEP: '1',
-      FAKE_VINCI_DESCENDANT_READY_FILE: descendantReady,
-      FAKE_VINCI_RUN_EXIT_MARKER: exitMarker,
-    });
-    try {
-      await waitFor(() => fixture.getVinciCalls().length === 1, { label: 'the actual post-run task invocation' });
-    } catch (error) {
-      throw new Error(`${error.message}; inspect the worker startup output: ${worker.stderr()}`);
-    }
-    childPid = fixture.getVinciCalls()[0].pid;
-    assert(Number.isInteger(childPid) && childPid > 0);
-    await waitFor(() => {
-      try { gitPid = Number(readFileSync(gitPaused, 'utf8')); return Number.isInteger(gitPid) && gitPid > 0; }
-      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-    }, { label: 'the real post-run HEAD read to pause' });
-    assert.equal(Number(readFileSync(exitMarker, 'utf8')), childPid);
-    await waitFor(() => !processExists(childPid), { label: 'the actual task leader to exit before shutdown' });
-    const descendantPid = Number(readFileSync(descendantReady, 'utf8'));
-    assert(Number.isInteger(descendantPid) && descendantPid > 0);
-    assert.equal(processExists(descendantPid), true, 'the owned descendant remains after leader close');
-    assert.equal(processGroupExists(childPid), true);
-    worker.proc.kill('SIGTERM');
-    await waitFor(() => vinciRecordLines(fixture).includes('DESCENDANT_SIGTERM'), { label: 'the retained group to receive SIGTERM' });
-    assert.equal(processExists(descendantPid), true, 'the ignoring descendant keeps shutdown in flight');
-    writeFileSync(gitContinue, 'continue');
-    await waitFor(() => {
-      try { return Number(readFileSync(gitResolved, 'utf8')) === gitPid; }
-      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-    }, { label: 'the actual HEAD read to succeed after the shutdown latch' });
-    const { code, stderr } = await waitForWorkerClose(worker);
-    assert.equal(code, 0, stderr);
-    assert.equal(processGroupExists(childPid), false);
-    assert.equal(processExists(descendantPid), false);
-    assert.deepEqual(groupAtWorkRelease, [false]);
-    assert.deepEqual(groupAtBranchRelease, [false]);
-    assert.deepEqual(governor.releases.map((release) => release.outcome), ['abandoned']);
-    assert.equal(state(fixture, '118').state, 'RUNNING');
-    assert.equal(originHasBranch(join(fixture.reposDir, 'test', 'repo.git'), 'worker/118'), false);
-    assert.equal(ghCalls(fixture).length, 0);
-    assert(fixture.getPostedMessages().some((message) => message.subject === 'task 118 claimed' && message.in_reply_to === '118'));
-    assert.equal(fixture.getPostedMessages().some((message) => message.in_reply_to === '118' && message.outcome !== undefined), false, 'a successful post-run await during shutdown must not publish any terminal outcome');
-    assert.deepEqual(JSON.parse(readFileSync(join(fixture.tempDir, 'cursor.json'), 'utf8')).w5, { ts: '2000-01-01T00:00:00.000Z', message_ids: [] });
-  } finally {
-    let cleanupError = null;
-    for (const [pid, group] of [[childPid, true], [gitPid, false]]) {
-      if (!Number.isInteger(pid)) continue;
-      try { process.kill(group ? -pid : pid, 'SIGKILL'); }
-      catch (error) { if (error.code !== 'ESRCH') cleanupError ??= error; }
-    }
-    try {
-      worker?.proc.kill('SIGKILL');
-      if (worker) await waitForWorkerClose(worker);
-      if (Number.isInteger(childPid)) await waitFor(() => !processGroupExists(childPid), { timeoutMs: 5000, label: 'the post-run cleanup group to disappear' });
-    } catch (error) {
-      cleanupError ??= error;
+  const result = spawnSync(${JSON.stringify(realGit.stdout.trim())}, args, { encoding: 'utf8', timeout: 5000 });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (paused && result.status === 0) writeFileSync(${JSON.stringify(gitResolved)}, String(process.pid));
+  process.exit(result.status ?? 1);
+  `);
+      chmodSync(gitWrapper, 0o755);
+      await fixture.startBus([handoff('118', 'w5', 'repo: test/repo\nevidence: pr\n\nTask')]);
+      const handleBus = fixture.busServer.listeners('request')[0];
+      fixture.busServer.removeListener('request', handleBus);
+      fixture.busServer.on('request', (request, response) => {
+        if (!request.url.startsWith('/v1/branch-leases')) return handleBus(request, response);
+        if (request.method === 'DELETE') groupAtBranchRelease.push(processGroupExists(childPid));
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ ok: true, valid: true, lease: { repo: 'test/repo', branch: 'worker/118', fencing_generation: 200 } }));
+      });
+      const descendantReady = join(fixture.tempDir, 'descendant-ready');
+      const signalObserver = join(fixture.tempDir, 'signal-observer.mjs');
+      const signalObservations = join(fixture.tempDir, 'signal-observations.jsonl');
+      if (signalScenario !== 'normal') {
+        // Inject errors only into this actual daemon's known task group; other signals stay native.
+        writeFileSync(signalObserver, `
+  import { appendFileSync, readFileSync } from 'node:fs';
+  if (process.argv[1] === ${JSON.stringify(WORKER)}) {
+    const nativeKill = process.kill.bind(process);
+    const scenario = ${JSON.stringify(signalScenario)};
+    let killed = false;
+    let denied = false;
+    let refusedProbe = false;
+    const refusal = () => Object.assign(new Error('kill EPERM'), { code: 'EPERM' });
+    const observe = (event, pid, signal) => appendFileSync(${JSON.stringify(signalObservations)}, JSON.stringify({ event, taskGroupPid: -pid, signal }) + String.fromCharCode(10));
+    process.kill = (pid, signal) => {
+      let taskPid;
+      try { taskPid = Number(readFileSync(${JSON.stringify(exitMarker)}, 'utf8')); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (pid === -taskPid && signal === 'SIGKILL') {
+        if (scenario === 'persistent') {
+          denied = true;
+          observe('Injected a persistent task-group signal refusal.', pid, signal);
+          throw refusal();
+        }
+        const result = nativeKill(pid, signal);
+        killed = true;
+        observe('Native SIGKILL completed for the actual task group.', pid, signal);
+        return result;
+      }
+      if (pid === -taskPid && signal === 0) {
+        if (scenario === 'persistent' && denied) {
+          observe('Injected a persistent task-group probe refusal.', pid, signal);
+          throw refusal();
+        }
+        if (scenario === 'transient' && killed && !refusedProbe) {
+          refusedProbe = true;
+          observe('Injected one transient task-group probe refusal.', pid, signal);
+          throw refusal();
+        }
+      }
+      return nativeKill(pid, signal);
+    };
+  }
+  `);
+      }
+      worker = spawnWorker(fixture, 'w5', ['--governor', governor.url], {
+        VINCI_BRANCH_LEASE: '1',
+        VINCI_WORKER_LEASE_KILL_GRACE_MS: '1000',
+        FAKE_VINCI_SLEEP: '1',
+        FAKE_VINCI_DESCENDANT_READY_FILE: descendantReady,
+        FAKE_VINCI_RUN_EXIT_MARKER: exitMarker,
+        ...(signalScenario === 'normal' ? {} : { NODE_OPTIONS: `--import=${signalObserver}` }),
+      });
+      try {
+        await waitFor(() => fixture.getVinciCalls().length === 1, { label: 'the actual post-run task invocation' });
+      } catch (error) {
+        throw new Error(`${error.message}; inspect the worker startup output: ${worker.stderr()}`);
+      }
+      childPid = fixture.getVinciCalls()[0].pid;
+      assert(Number.isInteger(childPid) && childPid > 0);
+      await waitFor(() => {
+        try { gitPid = Number(readFileSync(gitPaused, 'utf8')); return Number.isInteger(gitPid) && gitPid > 0; }
+        catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+      }, { label: 'the real post-run HEAD read to pause' });
+      assert.equal(Number(readFileSync(exitMarker, 'utf8')), childPid);
+      await waitFor(() => !processExists(childPid), { label: 'the actual task leader to exit before shutdown' });
+      const descendantPid = Number(readFileSync(descendantReady, 'utf8'));
+      assert(Number.isInteger(descendantPid) && descendantPid > 0);
+      assert.equal(processExists(descendantPid), true, 'the owned descendant remains after leader close');
+      assert.equal(processGroupExists(childPid), true);
+      worker.proc.kill('SIGTERM');
+      await waitFor(() => vinciRecordLines(fixture).includes('DESCENDANT_SIGTERM'), { label: 'the retained group to receive SIGTERM' });
+      assert.equal(processExists(descendantPid), true, 'the ignoring descendant keeps shutdown in flight');
+      writeFileSync(gitContinue, 'continue');
+      await waitFor(() => {
+        try { return Number(readFileSync(gitResolved, 'utf8')) === gitPid; }
+        catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+      }, { label: 'the actual HEAD read to succeed after the shutdown latch' });
+      const { code, stderr } = await waitForWorkerClose(worker, signalScenario === 'persistent' ? 8000 : 5000);
+      const persistentRefusal = signalScenario === 'persistent';
+      assert.equal(processGroupExists(childPid), persistentRefusal, 'a refused live group remains owned until cleanup');
+      assert.equal(processExists(descendantPid), persistentRefusal, 'permission refusal cannot stand in for stopping the descendant');
+      assert.deepEqual(groupAtWorkRelease, persistentRefusal ? [] : [false], 'release work authority only after verified group disappearance');
+      assert.deepEqual(groupAtBranchRelease, persistentRefusal ? [] : [false], 'release branch authority only after verified group disappearance');
+      assert.deepEqual(governor.releases.map((release) => release.outcome), persistentRefusal ? [] : ['abandoned']);
+      assert.equal(code, persistentRefusal ? 1 : 0, stderr);
+      if (signalScenario !== 'normal') {
+        const observations = readFileSync(signalObservations, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+        assert(observations.every((observation) => observation.taskGroupPid === childPid), 'only the actual task group is instrumented');
+        if (persistentRefusal) {
+          assert(observations.some((observation) => observation.event === 'Injected a persistent task-group signal refusal.'));
+          assert(observations.some((observation) => observation.event === 'Injected a persistent task-group probe refusal.'));
+          assert.match(stderr, /shutdown failed.*EPERM/);
+          assert.match(stderr, /leases were not released/);
+        } else {
+          assert(observations.some((observation) => observation.event === 'Native SIGKILL completed for the actual task group.'));
+          assert.equal(observations.filter((observation) => observation.event === 'Injected one transient task-group probe refusal.').length, 1);
+        }
+      }
+      assert.equal(state(fixture, '118').state, 'RUNNING');
+      assert.equal(originHasBranch(join(fixture.reposDir, 'test', 'repo.git'), 'worker/118'), false);
+      assert.equal(ghCalls(fixture).length, 0);
+      assert(fixture.getPostedMessages().some((message) => message.subject === 'task 118 claimed' && message.in_reply_to === '118'));
+      assert.equal(fixture.getPostedMessages().some((message) => message.in_reply_to === '118' && message.outcome !== undefined), false, 'a successful post-run await during shutdown must not publish any terminal outcome');
+      assert.deepEqual(JSON.parse(readFileSync(join(fixture.tempDir, 'cursor.json'), 'utf8')).w5, { ts: '2000-01-01T00:00:00.000Z', message_ids: [] });
     } finally {
-      await governor.close();
-      await fixture.cleanup();
+      let cleanupError = null;
+      for (const [pid, group] of [[childPid, true], [gitPid, false]]) {
+        if (!Number.isInteger(pid)) continue;
+        try { process.kill(group ? -pid : pid, 'SIGKILL'); }
+        catch (error) { if (error.code !== 'ESRCH') cleanupError ??= error; }
+      }
+      try {
+        worker?.proc.kill('SIGKILL');
+        if (worker) await waitForWorkerClose(worker);
+        if (Number.isInteger(childPid)) await waitForProcessGroupExit(childPid, 'the post-run cleanup group to disappear');
+      } catch (error) {
+        cleanupError ??= error;
+      } finally {
+        await governor.close();
+        await fixture.cleanup();
+      }
+      if (cleanupError) throw cleanupError;
     }
-    if (cleanupError) throw cleanupError;
-  }
-});
+  });
+}
 
 // ---------------------------------------------------------------------------------------------
 await test('--governor unset => no declaration, no digest, no lease fields, no fencing footer', async () => {
