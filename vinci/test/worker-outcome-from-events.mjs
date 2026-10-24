@@ -2,7 +2,7 @@
 // own outcome entry, and exit code zero alone never yields COMPLETED (issues #5 and #6).
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,11 +74,15 @@ const LATCH_REASON =
 
 // --- daemon end to end ---------------------------------------------------------------------------
 
-async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
+async function runScenario(name, workerId, { evidence, env, sessionFixture, printExit = false }) {
   const fixture = new WorkerTestFixture(`outcome-${name}`);
   try {
     fixture.createRepo("test", "repo");
     fixture.linkTools(TOOLS);
+    if (printExit) {
+      unlinkSync(join(fixture.toolsDir, "vinci"));
+      symlinkSync(join(FIXTURES, "worker-print-exit.mjs"), join(fixture.toolsDir, "vinci"));
+    }
     await fixture.startBus([{
       message_id: name,
       to_agent: `worker:${workerId}`,
@@ -102,12 +106,35 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
-    const code = await new Promise((resolveClose) => child.once("close", resolveClose));
+    const code = await new Promise((resolveClose, reject) => {
+      let timedOut = false;
+      let killTimer;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+      }, 60_000);
+      child.once("error", (error) => {
+        clearTimeout(timer);
+        clearTimeout(killTimer);
+        reject(error);
+      });
+      child.once("close", (exitCode) => {
+        clearTimeout(timer);
+        clearTimeout(killTimer);
+        if (timedOut) reject(new Error(`Worker scenario "${name}" exceeded 60 seconds; inspect its daemon output: ${stderr}`));
+        else resolveClose(exitCode);
+      });
+    });
     assert.equal(code, 0, `worker exited ${code}\n${stderr}`);
+    const taskState = JSON.parse(readFileSync(join(fixture.tempDir, "tasks", `${name}.json`), "utf8"));
+    const session = readSessionState(join(fixture.tempDir, "sessions", name), taskState.session_id);
     return {
-      state: JSON.parse(readFileSync(join(fixture.tempDir, "tasks", `${name}.json`), "utf8")),
+      state: taskState,
       posts: fixture.getPostedMessages(),
       tempDir: fixture.tempDir,
+      stderr,
+      sessionText: session.path ? readFileSync(session.path, "utf8") : "",
     };
   } finally {
     await fixture.cleanup();
@@ -194,10 +221,112 @@ async function runScenario(name, workerId, { evidence, env, sessionFixture }) {
   assert.doesNotMatch(t5.posts.at(-1).body, /stop=instrument/, "T5: the FAILED post is not attributed to an instrument stop");
 }
 
+// #27: the actual print-mode decision distinguishes a harness hint from a provider/runtime failure.
+for (const exitCode of [1, 3]) {
+  const refused = await runScenario(`hint-${exitCode}`, "w5", {
+    evidence: "pr", printExit: true, env: { FAKE_PRINT_EXIT_HINT: String(exitCode) },
+  });
+  assert.equal(refused.state.harness_stop?.count, 2, `the real print fixture must persist its captured stops: ${refused.stderr}`);
+  assert.equal(refused.state.exit_attribution?.cause, "headless_hint", `the real print entry must supply attribution: ${refused.stderr}`);
+  assert.equal(refused.state.state, "BLOCKED", `#27: a print-mode refusal exit ${exitCode} must be BLOCKED`);
+  assert.equal(refused.state.exit_code, exitCode, "the actual nonzero process exit remains recorded");
+  assert.equal(refused.state.exit_attribution?.exitCode, exitCode);
+  assert.equal(refused.state.pr, null, "an attributed refusal cannot open a PR");
+  assert.equal(refused.posts.at(-1).outcome, "BLOCKED");
+  assert.match(refused.posts.at(-1).body, /stop=instrument harness_stops=2/);
+  if (exitCode === 1) {
+    const records = refused.sessionText.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const sessionId = records.find((entry) => entry.type === "session").id;
+    const directory = mkdtempSync(join(tmpdir(), "worker-print-attribution-"));
+    const file = join(directory, "session.jsonl");
+    try {
+      writeFileSync(file, refused.sessionText);
+      assert.deepEqual(readSessionState(directory, sessionId).exitAttribution, refused.state.exit_attribution,
+        "the captured real print/session writer is the positive control for attribution validation");
+      for (const [name, mutate] of [
+        ["wrong invocation", (entries) => { entries.at(-1).data.printRunId = "different-invocation"; }],
+        ["wrong assistant", (entries) => { entries.at(-1).data.assistantEntryId = "different-assistant"; }],
+        ["wrong stop", (entries) => { entries.at(-1).data.harnessStopEntryId = "different-stop"; }],
+        ["stop before invocation", (entries) => {
+          const data = entries.at(-1).data;
+          const startIndex = entries.findIndex((entry) => entry.id === data.printRunId);
+          const [start] = entries.splice(startIndex, 1);
+          const messageIndex = entries.findIndex((entry) => entry.id === data.assistantEntryId);
+          entries.splice(messageIndex, 0, start);
+        }],
+        ["zero exit", (entries) => { entries.at(-1).data.exitCode = 0; }],
+        ["unknown schema", (entries) => { entries.at(-1).data.schemaVersion = 2; }],
+        ["legacy reason only", (entries) => {
+          for (const entry of entries) if (entry.message?.role === "toolResult") delete entry.message.details;
+        }],
+        ["later provider error", (entries) => {
+          const source = entries.findLast((entry) => entry.message?.role === "assistant");
+          entries.splice(entries.length - 1, 0, { ...source, id: "later-error", message: { ...source.message, stopReason: "error" } });
+        }],
+        ["later invocation", (entries) => { entries.push({ type: "custom", id: "later-start", customType: "vinci-print-start", data: { schemaVersion: 1 } }); }],
+      ]) {
+        const changed = structuredClone(records);
+        mutate(changed);
+        writeFileSync(file, `${changed.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+        assert.equal(readSessionState(directory, sessionId).exitAttribution, undefined, `#27: ${name} cannot attribute the exit`);
+      }
+      writeFileSync(file, `${refused.sessionText}{"truncated":`);
+      assert.equal(readSessionState(directory, sessionId).exitAttribution, undefined,
+        "#27: a partial later record cannot expose stale attribution through a fail-open parser");
+    } finally {
+      unlinkSync(file);
+      rmdirSync(directory);
+    }
+  }
+}
+
+for (const [name, env] of [
+  ["provider", { FAKE_PRINT_STOP_REASON: "error" }],
+  ["runtime", { FAKE_PRINT_THROW: "1" }],
+  ["disposal", { FAKE_PRINT_DISPOSE_ERROR: "1" }],
+  ["later-provider", { FAKE_PRINT_LATER_ERROR: "1" }],
+  ["later-hint-without-current-stop", { FAKE_PRINT_LATER_HINT: "1" }],
+]) {
+  const crashed = await runScenario(`crash-${name}`, "w5", { evidence: "pr", printExit: true, env });
+  assert.equal(crashed.state.state, "FAILED", `#27: ${name} failure after a refusal must stay FAILED`);
+  assert.equal(crashed.state.exit_code, 1);
+  assert.equal(crashed.state.harness_stop?.count, 2, "the earlier stops remain visible beside the independent failure");
+  assert.equal(crashed.state.exit_attribution, undefined, "a stale or failed print decision is not refusal attribution");
+  assert.equal(crashed.posts.at(-1).outcome, "FAILED");
+}
+
+{
+  const limited = await runScenario("hint-budget", "w5", {
+    evidence: "pr", printExit: true, env: { FAKE_PRINT_COST_USD: "21" },
+  });
+  assert.equal(limited.state.state, "FAILED", "#27: a measured limit wins even over matching refusal attribution");
+  assert.equal(limited.state.limit_tripped, "budget_usd");
+  assert.equal(limited.state.exit_attribution?.cause, "headless_hint");
+  assert.equal(limited.state.harness_stop?.count, 2);
+}
+
+{
+  const completed = await runScenario("print-complete", "w5", {
+    evidence: "pr", printExit: true, env: { FAKE_PRINT_NO_STOP: "1", FAKE_PRINT_EXIT_HINT: "0" },
+  });
+  assert.equal(completed.state.state, "COMPLETED", "#27: completion through the same print/worker entry remains possible");
+  assert.equal(completed.state.exit_code, 0);
+  assert.equal(completed.state.harness_stop, null);
+  assert.equal(completed.state.exit_attribution, undefined);
+  assert.equal(completed.posts.at(-1).kind, "finding");
+}
+
 // --- finalState precedence (pure) ----------------------------------------------------------------
 
 const done = { state: "DONE" };
 const stop = [{ index: 1, reason: LATCH_REASON }];
+const attributed = { cause: "headless_hint", exitCode: 1 };
+assert.equal(finalState({ exitCode: 1, exitAttribution: attributed, limitTripped: null, outcome: done, pr: null, harnessStops: stop }), "BLOCKED");
+assert.equal(finalState({ exitCode: 1, exitAttribution: { ...attributed, exitCode: 3 }, limitTripped: null, outcome: done, pr: null, harnessStops: stop }), "FAILED", "the actual process exit must match the attribution");
+assert.equal(finalState({ exitCode: 1, exitAttribution: attributed, limitTripped: null, outcome: done, pr: null, harnessStops: [] }), "FAILED", "an exit hint alone is not a harness refusal");
+for (const limitTripped of ["budget_usd", "max_runtime_s", "deadline"]) {
+  assert.equal(finalState({ exitCode: 1, exitAttribution: attributed, limitTripped, outcome: done, pr: null, harnessStops: stop }), "FAILED", `${limitTripped} outranks a refusal exit`);
+}
 assert.equal(finalState({ exitCode: 1, limitTripped: null, outcome: done, blocker: false, pr: "x", harnessStops: stop }), "FAILED");
 assert.equal(finalState({ exitCode: 0, limitTripped: "budget_usd", outcome: done, blocker: false, pr: "x", harnessStops: [] }), "FAILED");
 assert.equal(finalState({ exitCode: 0, limitTripped: null, outcome: done, blocker: false, pr: "x", harnessStops: stop }), "BLOCKED", "a harness stop outranks DONE + PR");

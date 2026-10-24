@@ -1500,6 +1500,7 @@ async function processHandoff(
     });
     const prEligible = !authorityLost && finalState({
       exitCode: run.exit_code,
+      exitAttribution: run.exit_attribution,
       limitTripped: run.limit_tripped,
       outcome: preOutcome,
       blocker: null,
@@ -1547,6 +1548,7 @@ async function processHandoff(
       ? "BLOCKED"
       : finalState({
           exitCode: run.exit_code,
+          exitAttribution: run.exit_attribution,
           limitTripped: run.limit_tripped,
           outcome,
           blocker: Boolean(published.blocker_reason),

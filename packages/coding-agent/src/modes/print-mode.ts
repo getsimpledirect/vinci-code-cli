@@ -276,6 +276,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	// When a signal is received, the intended process exit code (143 SIGTERM / 129 SIGHUP). The main flow
 	// returns THIS when terminating, so whichever path exits first yields the same code (race made benign).
 	let signalExitCode: number | undefined;
+	let printRunId: string | undefined;
+	let headlessHintApplied = false;
+	let finalAssistantTimestamp: number | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 	const timeoutMs = printModePrestreamTimeoutMs();
 	let prestreamWatchdog: PrintModeLivenessWatchdog | undefined;
@@ -353,6 +356,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
+		// [vinci #27] A new print invocation invalidates any earlier exit attribution, including
+		// when this invocation crashes before it can record a terminal decision.
+		printRunId =
+			process.env.VINCI_CODE === "1"
+				? session.sessionManager.appendCustomEntry?.("vinci-print-start", { schemaVersion: 1 })
+				: undefined;
 		await session.bindExtensions({
 			mode: mode === "json" ? "json" : "print",
 			headlessNotify: (message, type = "info") => {
@@ -463,12 +472,20 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			const submitted = [initialMessage, ...messages].filter((m): m is string => typeof m === "string");
 			// ONE decision, shared by both modes. Keeping this inline is how `--mode json` drifted to
 			// always-0 while text mode was fixed; printModeExitCode is unit-tested for both modes.
+			const headlessExitHint = session.extensionRunner?.getHeadlessExitHint();
 			const decision = printModeExitCode({
 				mode,
 				lastMessage,
 				submitted,
-				headlessExitHint: session.extensionRunner?.getHeadlessExitHint(),
+				headlessExitHint,
 			});
+			headlessHintApplied =
+				lastMessage?.role === "assistant" &&
+				lastMessage.stopReason === "stop" &&
+				typeof headlessExitHint === "number" &&
+				headlessExitHint > 0 &&
+				decision.exitCode === headlessExitHint;
+			finalAssistantTimestamp = lastMessage?.role === "assistant" ? lastMessage.timestamp : undefined;
 			if (decision.message) console.error(decision.message);
 			exitCode = decision.exitCode;
 			if (decision.emitText && lastMessage?.role === "assistant") {
@@ -481,13 +498,10 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				}
 			}
 		}
-
-		// If a signal fired, return its exit code (143/129), never a normal one — so if the main flow
-		// wins the race against the signal handler's process.exit, the caller still exits with the signal code.
-		return signalExitCode ?? exitCode;
 	} catch (error: unknown) {
 		console.error(error instanceof Error ? error.message : String(error));
-		return signalExitCode ?? 1;
+		headlessHintApplied = false;
+		exitCode = 1;
 	} finally {
 		cancelPrestreamWatchdog();
 		cancelStartupLivenessWatchdog();
@@ -497,4 +511,36 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		await disposeRuntime();
 		await flushRawStdout();
 	}
+	// A signal or failed cleanup must never inherit an earlier headless hint. Emit only after
+	// disposal/output flush complete, and bind the decision to the current session entries.
+	if (signalExitCode !== undefined) return signalExitCode;
+	if (printRunId !== undefined) {
+		const branch = session.sessionManager.getBranch?.() ?? [];
+		const startIndex = branch.findIndex((entry) => entry.id === printRunId);
+		const reversedEntries = startIndex < 0 ? [] : branch.slice(startIndex + 1).reverse();
+		const lastEntry = reversedEntries.find((entry) => entry.type === "message");
+		const sameAssistant =
+			lastEntry?.type === "message" &&
+			lastEntry.message.role === "assistant" &&
+			lastEntry.message.stopReason === "stop" &&
+			lastEntry.message.timestamp === finalAssistantTimestamp;
+		const stopEntry = reversedEntries.find(
+			(entry) =>
+				entry.type === "message" &&
+				entry.message.role === "toolResult" &&
+				entry.message.isError === true &&
+				typeof entry.message.details === "object" &&
+				entry.message.details !== null &&
+				(entry.message.details as { vinciBlocked?: unknown }).vinciBlocked === true,
+		);
+		session.sessionManager.appendCustomEntry?.("vinci-print-exit", {
+			schemaVersion: 1,
+			printRunId,
+			exitCode,
+			cause: headlessHintApplied && sameAssistant ? "headless_hint" : "other",
+			assistantEntryId: sameAssistant ? lastEntry.id : null,
+			harnessStopEntryId: stopEntry?.id ?? null,
+		});
+	}
+	return exitCode;
 }

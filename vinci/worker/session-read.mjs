@@ -22,24 +22,27 @@ function sessionFiles(directory) {
 
 function readEntries(path) {
   try {
-    return readFileSync(path, "utf8")
+    let malformed = false;
+    const entries = readFileSync(path, "utf8")
       .split("\n")
       .filter((line) => line.trim())
       .flatMap((line) => {
         try {
           return [JSON.parse(line)];
         } catch {
+          malformed = true;
           return [];
         }
       });
+    return { entries, malformed };
   } catch {
-    return [];
+    return { entries: [], malformed: true };
   }
 }
 
 function fileForSession(sessionDir, sessionId) {
   const candidates = sessionFiles(sessionDir)
-    .map((path) => ({ path, entries: readEntries(path) }))
+    .map((path) => ({ path, ...readEntries(path) }))
     .filter(({ entries }) => entries.some((entry) => entry?.type === "session" && entry.id === sessionId))
     .sort((left, right) => {
       try {
@@ -238,6 +241,7 @@ export function readSessionState(sessionDir, sessionId) {
       costUsd: 0,
       outcome: undefined,
       harnessStops: [],
+      exitAttribution: undefined,
       unattendedPolicy: [],
       usageEntries: [],
       crewRan: false,
@@ -259,6 +263,34 @@ export function readSessionState(sessionDir, sessionId) {
     const decision = unattendedPolicyDecision(entry);
     if (decision) unattendedPolicy.push(decision);
   });
+  // #27: only the real print-mode terminal decision may attribute a nonzero exit to a hint.
+  // A prior stop, a model's prose, or an earlier print invocation is not evidence of the cause.
+  const exitEntry = session.entries.at(-1);
+  const data = exitEntry?.type === "custom" && exitEntry.customType === "vinci-print-exit" ? exitEntry.data : null;
+  const startIndex = session.entries.findLastIndex((entry) => entry?.type === "custom" && entry.customType === "vinci-print-start");
+  const startEntry = session.entries[startIndex];
+  const messageIndex = session.entries.findLastIndex((entry) => entry?.type === "message");
+  const messageEntry = session.entries[messageIndex];
+  const stopIndex = harnessStops.at(-1)?.index;
+  const stopEntry = stopIndex === undefined ? undefined : session.entries[stopIndex];
+  let exitAttribution;
+  if (!session.malformed && data?.schemaVersion === 1 && data.cause === "headless_hint"
+      && Number.isInteger(data.exitCode) && data.exitCode > 0 && data.exitCode <= 255
+      && typeof startEntry?.id === "string" && startEntry.data?.schemaVersion === 1 && data.printRunId === startEntry.id
+      && typeof messageEntry?.id === "string" && data.assistantEntryId === messageEntry.id
+      && messageEntry.message?.role === "assistant" && messageEntry.message.stopReason === "stop"
+      && typeof stopEntry?.id === "string" && data.harnessStopEntryId === stopEntry.id
+      && stopEntry.message?.details?.vinciBlocked === true
+      && startIndex < stopIndex && stopIndex < messageIndex && messageIndex < session.entries.length - 1) {
+    exitAttribution = {
+      schemaVersion: 1,
+      cause: "headless_hint",
+      exitCode: data.exitCode,
+      printRunId: data.printRunId,
+      assistantEntryId: data.assistantEntryId,
+      harnessStopEntryId: data.harnessStopEntryId,
+    };
+  }
   const extractedUsageEntries = usageEntries(session.entries);
   // Crew helpers run in their own RPC sessions; their usage is NOT in this session. Flag it so the
   // economics summary reports crew_unattributed instead of silently under-counting.
@@ -296,6 +328,7 @@ export function readSessionState(sessionDir, sessionId) {
     costUsd,
     outcome,
     harnessStops,
+    exitAttribution,
     unattendedPolicy,
     usageEntries: extractedUsageEntries,
     crewRan,
