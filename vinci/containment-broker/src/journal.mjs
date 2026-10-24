@@ -2,14 +2,17 @@ import {
   closeSync,
   constants,
   existsSync,
+  fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
-  writeFileSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import { canonicalBytes, sha256 } from "./canonical.mjs";
@@ -81,6 +84,27 @@ function validUtcTime(value) {
   if (typeof value !== "string") return false;
   const milliseconds = Date.parse(value);
   return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function readRecoveryTombstone(target, episodeId) {
+  let fd;
+  try {
+    fd = openSync(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const metadata = fstatSync(fd);
+    if (!metadata.isFile() || metadata.size > 65536) throw new Error("invalid tombstone file");
+    const existing = JSON.parse(readFileSync(fd, "utf8"));
+    if (existing?.schema !== "vinci.containment-broker.recovery-tombstone/v3" || existing?.episode_id !== episodeId
+      || existing?.state !== "UNCONTAINED" || existing?.authority !== false || existing?.trusted_output !== false) {
+      throw new Error("invalid tombstone fields");
+    }
+    fsyncSync(fd);
+    return Object.freeze(existing);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new JournalError("existing recovery tombstone is invalid", "RECOVERY_TOMBSTONE_INVALID");
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 function parseRecords(bytes, episodeId) {
@@ -182,24 +206,32 @@ export class EpisodeJournal {
         observed_at: clock(),
       };
       const target = join(episodeDir, "UNCONTAINED.json");
-      if (existsSync(target)) {
-        const existing = JSON.parse(readFileSync(target, "utf8"));
-        if (existing?.schema !== tombstone.schema || existing?.episode_id !== episodeId
-          || existing?.state !== "UNCONTAINED" || existing?.authority !== false
-          || existing?.trusted_output !== false) {
-          throw new JournalError("existing recovery tombstone is invalid", "RECOVERY_TOMBSTONE_INVALID");
-        }
-        return Object.freeze(existing);
+      const existing = readRecoveryTombstone(target, episodeId);
+      if (existing) {
+        fsyncDirectory(episodeDir);
+        return existing;
       }
-      writeFileSync(target, canonicalBytes(tombstone), { flag: "wx", mode: 0o600 });
-      const fd = openSync(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const temporary = join(episodeDir, `.UNCONTAINED-${randomUUID()}.tmp`);
+      const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
       try {
+        writeAll(fd, canonicalBytes(tombstone));
         fsyncSync(fd);
+        try {
+          // A hard link publishes complete, synced bytes without replacing a concurrent recovery.
+          linkSync(temporary, target);
+        } catch (error) {
+          if (error.code !== "EEXIST") throw error;
+          const concurrent = readRecoveryTombstone(target, episodeId);
+          if (!concurrent) throw new JournalError("recovery tombstone disappeared", "RECOVERY_TOMBSTONE_INVALID");
+          fsyncDirectory(episodeDir);
+          return concurrent;
+        }
+        fsyncDirectory(episodeDir);
+        return Object.freeze(tombstone);
       } finally {
         closeSync(fd);
+        unlinkSync(temporary);
       }
-      fsyncDirectory(episodeDir);
-      return Object.freeze(tombstone);
     }
     const current = records.at(-1);
     if (current.state === "SEALED" || current.state === "UNCONTAINED") return current;

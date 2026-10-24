@@ -63,10 +63,16 @@ static int zero_region(const uint8_t *bytes, size_t length) {
     uint8_t aggregate = 0; for (size_t index = 0; index < length; index++) aggregate |= bytes[index]; return aggregate == 0;
 }
 
+static void clear_secret(uint8_t *bytes, size_t length) {
+    volatile uint8_t *held = bytes;
+    for (size_t index = 0; index < length; index++) held[index] = 0;
+}
+
 static int monotonic_now(uint64_t *now) {
     struct timespec value;
-    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0 || value.tv_sec < 0) return -errno;
-    if ((uint64_t)value.tv_sec > UINT64_MAX / UINT64_C(1000000000)) return -EOVERFLOW;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return -errno;
+    if (value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1000000000L) return -EINVAL;
+    if ((uint64_t)value.tv_sec > (UINT64_MAX - (uint64_t)value.tv_nsec) / UINT64_C(1000000000)) return -EOVERFLOW;
     *now = (uint64_t)value.tv_sec * UINT64_C(1000000000) + (uint64_t)value.tv_nsec;
     return 0;
 }
@@ -278,8 +284,17 @@ static int persist_atomic(int directory_fd, const char *name, const uint8_t *byt
     int fd = openat(directory_fd, ".", O_WRONLY | O_TMPFILE | O_CLOEXEC, 0400); if (fd < 0) return -errno;
     int result = write_all(fd, bytes, length);
     if (result == 0 && fsync(fd) != 0) result = -errno;
-    if (result == 0 && linkat(fd, "", directory_fd, name, AT_EMPTY_PATH) != 0) {
-        int saved = errno; result = saved == EEXIST ? identical_existing(directory_fd, name, bytes, length) : -saved;
+    if (result == 0) {
+        int linked = linkat(fd, "", directory_fd, name, AT_EMPTY_PATH);
+        if (linked != 0 && (errno == EPERM || errno == ENOENT)) {
+            /* /proc/self/fd publishes the same held inode without CAP_DAC_READ_SEARCH. */
+            char source[64]; int count = snprintf(source, sizeof(source), "/proc/self/fd/%d", fd);
+            if (count <= 0 || (size_t)count >= sizeof(source)) result = -EOVERFLOW;
+            else linked = linkat(AT_FDCWD, source, directory_fd, name, AT_SYMLINK_FOLLOW);
+        }
+        if (result == 0 && linked != 0) {
+            int saved = errno; result = saved == EEXIST ? identical_existing(directory_fd, name, bytes, length) : -saved;
+        }
     }
     if (result == 0 && fsync(directory_fd) != 0) result = -errno;
     close(fd); return result;
@@ -896,21 +911,21 @@ int vinci_broker_session_finalize_terminal(struct vinci_broker_session *session,
                                 held_identity, policy_key, policy_digest) != 0
         || validate_evidence_fd(inputs->ingress_closure_receipt_fd, 4u, session->hello.session_identity_sha256,
                                 held_identity, ingress_key, ingress_digest) != 0) {
-        memset(key, 0, sizeof(key)); memset(attach_key, 0, sizeof(attach_key)); memset(capture_key, 0, sizeof(capture_key));
-        memset(policy_key, 0, sizeof(policy_key)); memset(ingress_key, 0, sizeof(ingress_key));
+        clear_secret(key, sizeof(key)); clear_secret(attach_key, sizeof(attach_key)); clear_secret(capture_key, sizeof(capture_key));
+        clear_secret(policy_key, sizeof(policy_key)); clear_secret(ingress_key, sizeof(ingress_key));
         session->phase = VINCI_SESSION_UNCONTAINED; return -EKEYREJECTED;
     }
-    memset(attach_key, 0, sizeof(attach_key)); memset(capture_key, 0, sizeof(capture_key));
-    memset(policy_key, 0, sizeof(policy_key)); memset(ingress_key, 0, sizeof(ingress_key));
+    clear_secret(attach_key, sizeof(attach_key)); clear_secret(capture_key, sizeof(capture_key));
+    clear_secret(policy_key, sizeof(policy_key)); clear_secret(ingress_key, sizeof(ingress_key));
     int freeze_fd = openat(session->cgroup_directory_fd, "cgroup.freeze", O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (freeze_fd < 0) { session->phase = VINCI_SESSION_UNCONTAINED; return -errno; }
+    if (freeze_fd < 0) { result = -errno; goto fail; }
     ssize_t freeze_count = write(freeze_fd, "1\n", 2u); int freeze_error = errno; close(freeze_fd);
-    if (freeze_count != 2) { session->phase = VINCI_SESSION_UNCONTAINED; return freeze_count < 0 ? -freeze_error : -EIO; }
+    if (freeze_count != 2) { result = freeze_count < 0 ? -freeze_error : -EIO; goto fail; }
     int kill_fd = openat(session->cgroup_directory_fd, "cgroup.kill", O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (kill_fd < 0) { session->phase = VINCI_SESSION_UNCONTAINED; return -errno; }
+    if (kill_fd < 0) { result = -errno; goto fail; }
     ssize_t kill_count = write(kill_fd, "1\n", 2u); int kill_error = errno;
-    if (close(kill_fd) != 0 && kill_count == 2) { session->phase = VINCI_SESSION_UNCONTAINED; return -errno; }
-    if (kill_count != 2) { session->phase = VINCI_SESSION_UNCONTAINED; return kill_count < 0 ? -kill_error : -EIO; }
+    if (close(kill_fd) != 0 && kill_count == 2) { result = -errno; goto fail; }
+    if (kill_count != 2) { result = kill_count < 0 ? -kill_error : -EIO; goto fail; }
     session->phase = VINCI_SESSION_DOMAIN_KILLED;
     siginfo_t info; result = wait_pidfd_terminal(session, &info); if (result != 0) goto fail;
     session->phase = VINCI_SESSION_TASK_TERMINAL_OBSERVED;
@@ -938,8 +953,8 @@ int vinci_broker_session_finalize_terminal(struct vinci_broker_session *session,
     struct vinci_sha256_context context;
     vinci_sha256_init(&context); vinci_sha256_update(&context, events1, e1); vinci_sha256_final(&context, receipt_wire + 288u);
     vinci_sha256_init(&context); vinci_sha256_update(&context, receipt_wire, 640u); vinci_sha256_final(&context, receipt_wire + 640u);
-    if (vinci_hmac_sha256(key, 32u, receipt_wire, 672u, receipt_wire + 672u) != 0) { memset(key, 0, sizeof(key)); result = -EIO; goto fail; }
-    memset(key, 0, sizeof(key)); session->phase = VINCI_SESSION_TERMINAL_BODY_COMMITTED;
+    if (vinci_hmac_sha256(key, 32u, receipt_wire, 672u, receipt_wire + 672u) != 0) { result = -EIO; goto fail; }
+    clear_secret(key, sizeof(key)); session->phase = VINCI_SESSION_TERMINAL_BODY_COMMITTED;
     char digest_hex[65], name[128]; hex32(digest_hex, receipt_wire + 640u);
     int name_bytes = snprintf(name, sizeof(name), "terminal-%016llx-%s.receipt", (unsigned long long)session->policy.attempt_identity, digest_hex);
     if (name_bytes <= 0 || (size_t)name_bytes >= sizeof(name)) { result = -EOVERFLOW; goto fail; }
@@ -952,8 +967,8 @@ int vinci_broker_session_finalize_terminal(struct vinci_broker_session *session,
         session->reconcile_stage = 3u; session->phase = VINCI_SESSION_RECONCILE_ONLY; return -ECHILD;
     }
     session->phase = VINCI_SESSION_SEALED; return 0;
-reconcile: memset(key, 0, sizeof(key)); session->phase = VINCI_SESSION_RECONCILE_ONLY; return result;
-fail: memset(key, 0, sizeof(key)); session->phase = VINCI_SESSION_UNCONTAINED; return result;
+reconcile: clear_secret(key, sizeof(key)); session->phase = VINCI_SESSION_RECONCILE_ONLY; return result;
+fail: clear_secret(key, sizeof(key)); session->phase = VINCI_SESSION_UNCONTAINED; return result;
 }
 
 int vinci_broker_session_close(struct vinci_broker_session *session) {

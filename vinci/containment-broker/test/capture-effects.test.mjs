@@ -148,6 +148,27 @@ function preparedEffect() {
   });
 }
 
+test("a second domain-zero call preserves the first proof and makes capture failure absorbing", () => {
+  for (const replacement of [{ closing_sequence: 9 }, {}, { populated: 1 }]) {
+    const capture = new BrokerCaptureModel({ streamIds: ["stdout"], maxBytes: 8 });
+    capture.closeIngress();
+    const proof = {
+      populated: 0, no_writers: true, attach_attempts: 0, transient_repopulation: false,
+      descriptor_continuity: true, mediator_joined: true, counts_durable: true,
+      ingress_generation: 1, kill_result: "success", domain_tombstoned: true,
+      closing_sequence: 8, attach_audit_start: 100, attach_audit_end: 100,
+    };
+    const original = capture.recordDomainZero(proof);
+    assert.deepEqual(original, proof);
+    assert.throws(() => capture.recordDomainZero({ ...proof, ...replacement }),
+      (error) => error.code === "CAPTURE_ZERO_DUPLICATE");
+    assert.equal(capture.zeroProof, original);
+    assert.equal(capture.failed, true);
+    assert.throws(() => capture.seal({ capture_fsync: true, seals: REQUIRED_SEALS,
+      identity_before: "id", identity_after: "id" }), (error) => error.code === "CAPTURE_ABSORBING");
+  }
+});
+
 function terminalReceipt() {
   return authenticateReceipt({
     kind: "terminal",
