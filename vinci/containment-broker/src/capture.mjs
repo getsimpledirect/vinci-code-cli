@@ -71,6 +71,7 @@ export class BrokerCaptureModel {
 
   recordDomainZero(proof) {
     if (this.failed) throw new CaptureInvariantError("capture is absorbing failed", "CAPTURE_ABSORBING");
+    if (this.zeroProof) this.#fail("domain zero is already recorded", "CAPTURE_ZERO_DUPLICATE");
     if (this.accepting) this.#fail("capture ingress must close before zero", "CAPTURE_ORDER");
     const failures = [];
     if (proof?.populated !== 0) failures.push("domain_not_zero");

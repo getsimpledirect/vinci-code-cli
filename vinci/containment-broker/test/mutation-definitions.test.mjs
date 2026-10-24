@@ -269,7 +269,7 @@ test("canonical security mutations are each killed by a behavioral discriminator
   });
 });
 
-test("crash harness names every irreversible launch, close, seal and receipt edge", () => {
+test("planned crash-case inventory names launch, close, seal and receipt edges", () => {
   assert.equal(CRASH_EDGES.length, 29);
   for (const required of ["launch_intent", "task_create", "prelaunch_receipt", "release_armed", "closing", "ingress_close", "kill", "zero", "capture_fsync", "seal", "terminal_receipt"]) {
     assert.ok(CRASH_EDGES.some((edge) => edge.includes(required)), required);
@@ -279,7 +279,7 @@ test("crash harness names every irreversible launch, close, seal and receipt edg
   }
 });
 
-test("mutation definitions cover every v3 authority-bearing invariant", () => {
+test("planned mutation inventory names v3 authority-bearing invariants", () => {
   assert.equal(MUTATION_CASES.length, 22);
   for (const required of ["trampoline", "launch_intent", "UNCONTAINED", "descriptor", "ingress", "zero", "writer", "fsync", "seal", "bytes", "capability", "FD", "target", "authority", "retry", "remote", "fallback"]) {
     assert.ok(MUTATION_CASES.some((entry) => entry.join(" ").toLowerCase().includes(required.toLowerCase())), required);
@@ -294,6 +294,8 @@ test("mutation definitions cover every v3 authority-bearing invariant", () => {
     "prelaunch_divergent_journal_response_loss_and_directory_fsync_failure",
   ]) assert.ok(NATIVE_LINUX_CASES.includes(required), required);
 });
+
+test.todo("execute the planned native, crash-injection and authority mutation matrices on an admitted Linux runner; inventory checks do not execute these cases");
 
 test("native sources implement the reviewed boundary while admission remains categorically false", () => {
   const trampoline = readFileSync(new URL("../native/trampoline_linux.c", import.meta.url), "utf8");

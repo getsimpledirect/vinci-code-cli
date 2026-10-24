@@ -41,7 +41,9 @@ causality, consumer integration or safe deployment.
 - A separate durable remote-effect state model binding authority, target,
   content, precondition and single-use operation identity. Ambiguity permits only
   the predeclared read-only reconciliation and never a mutation retry.
-- Exact declarative crash, native-Linux and mutation matrices under `test/`.
+- Planned crash, native-Linux and authority mutation inventories under `test/`.
+  Inventory assertions do not execute those cases; the test runner reports their execution as TODO.
+  The canonical receipt mutation tests separately mutate and execute product code.
 
 ## Native candidate boundary
 
