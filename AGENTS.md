@@ -53,7 +53,7 @@ Committing:
 - Stage explicit paths (`git add <path1> <path2>`); never `git add -A` / `git add .`.
 - Before committing, run `git status` and verify you are only staging your files.
 - `packages/ai/src/models.generated.ts` may always be included alongside your files.
-- Message format: `{feat,fix,docs}[(ai,tui,agent,coding-agent)]: <commit message> (optionally multiple lines)`. Message is informative and concise.
+- Commit headers and PR titles use `type(scope): description` (optional scope; optional `!` before `:` for breaking changes), at most 100 characters, without emojis. Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `ci`, `build`, `perf`, `revert`. Scopes are lowercase area names, such as `vinci`, `worker`, `provider`, `release`, `updater`, `ai`, `tui`, `agent`, `coding-agent`, `orchestrator`, or `deps`; hyphens and `/` separators are supported. The activated Husky hook checks new local commits; PR titles follow the convention during review. Historical upstream messages are not rewritten or checked. Generated Git merge/revert and valid autosquash messages remain supported locally. See `CONTRIBUTING.md` for explicit hook setup after an install with scripts disabled.
 
 Never run (destroys other agents' work or bypasses checks):
 
@@ -149,13 +149,18 @@ The product version is authoritative in `vinci/identity.json`; the header and pa
 read it. UI snapshots render that version and must be regenerated and reviewed:
 
 1. Branch `release/vinci-v<version>` off `main`.
-2. Bump only the product version in `vinci/identity.json`; do not synchronize root or Pi package versions.
-3. Regenerate the UI snapshots, which print the version in the header:
-   `UPDATE_VINCI_UI_SNAPSHOTS=1 node packages/coding-agent/node_modules/vitest/dist/cli.js --root . --run vinci/test/ui/scenarios.test.mjs`
-   Review every changed frame and confirm the intended version and UI state; do not use a stale
+2. Prepare maintained user-facing notes outside the clean release checkout, then run
+   `node vinci/scripts/prepare-release.mjs <version> --notes-file <path> --dry-run`.
+   Run again without `--dry-run` to update only the product identity, copy the notes, and regenerate
+   UI snapshots. The helper checks both local and live remote tags for a spent version; it does not
+   commit, tag, push, or publish. Root and Pi package versions retain their own namespaces.
+3. Review every changed UI frame. To repair a partial preparation, rerun the `ui-scenarios` command
+   from `vinci/test/run.sh` with `UPDATE_VINCI_UI_SNAPSHOTS=1`, using its root-or-workspace Vitest
+   resolution and exclusions.
+   Confirm the intended version and UI state in each frame; do not use a stale
    snapshot count as evidence that nothing else changed.
-4. Add `vinci/release-notes/<version>.md`. The workflow looks for exactly that filename; a
-   mismatched name is skipped with a warning, not an error.
+4. Review the copied `vinci/release-notes/<version>.md`. If preparation fails, the helper leaves its
+   partial diff for review and names the failed step; repair that step without resetting other work.
 5. Run `npm run check`, the offline harness, and the exact packaged-launch gates. After explicit
    release authorization, merge, annotate-tag the reviewed public commit, and push the tag.
 

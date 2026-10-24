@@ -273,6 +273,7 @@ run_group docs-accuracy-integration node "${ROOT}/vinci/test/docs-accuracy-integ
 # so its coverage is pinned here per shape — the scanner itself only ever sees staged content, and
 # a pattern that never ran anywhere was exactly the inert-guard failure run.sh exists to prevent.
 run_group check-secrets-patterns node --test "${ROOT}/scripts/check-secrets.test.mjs"
+run_group release-bookkeeping node --test "${ROOT}/scripts/check-commit-message.test.mjs" "${ROOT}/vinci/scripts/prepare-release.test.mjs"
 run_group install-guard-integration node "${ROOT}/vinci/test/install-guard-integration.mjs"
 run_group priority-integration node "${ROOT}/vinci/test/priority-integration.mjs"
 run_group update-integration node "${ROOT}/vinci/test/update-integration.mjs"
