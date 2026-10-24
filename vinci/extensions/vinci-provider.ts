@@ -70,7 +70,9 @@ export function vinciAffordableTokenLimit(errorBodyOrMessage: string | undefined
 
 function parsedErrorBody(errorBodyOrMessage: string): Record<string, unknown> | undefined {
   try {
-    const parsed: unknown = JSON.parse(errorBodyOrMessage);
+    // The completions normalizer prefixes structured HTTP 402 bodies with "402: ".
+    // Decode that exact envelope without extracting JSON or status from arbitrary prose.
+    const parsed: unknown = JSON.parse(errorBodyOrMessage.replace(/^402:\s*(?=\{)/, ""));
     return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined;
   } catch {
     return undefined;
