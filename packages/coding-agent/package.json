@@ -60,6 +60,9 @@
 		"yaml": "2.9.0"
 	},
 	"overrides": {
+		"@mistralai/mistralai": {
+			"zod": "4.6.6"
+		},
 		"rimraf": "6.1.2",
 		"gaxios": {
 			"rimraf": "6.1.2"
