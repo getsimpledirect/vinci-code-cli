@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import { dirname, join, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import ts from "typescript";
 
 const rootArgument = process.argv[2];
 if (!rootArgument || !existsSync(rootArgument)) {
@@ -28,8 +29,20 @@ const root = realpathSync(rootArgument);
 
 // Every relative specifier the shipped extension layer resolves at RUNTIME. Bare specifiers
 // (node:, package names) are resolved by node/jiti and are out of scope here.
-const RELATIVE_IMPORT = /(?:^|\n)\s*(?:import|export)[^'"]*?from\s+["'](\.[^"']+)["']/g;
-const SIDE_EFFECT_IMPORT = /(?:^|\n)\s*import\s+["'](\.[^"']+)["']/g;
+function staticRelativeImports(file, source) {
+  const parsed = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, file.endsWith(".ts") ? ts.ScriptKind.TS : ts.ScriptKind.JS);
+  assert.equal(parsed.parseDiagnostics.length, 0, `${file} has malformed module syntax. Restore the selected module before packaging.`);
+  const specifiers = [];
+  for (const statement of parsed.statements) {
+    if (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) continue;
+    // `import type` / `export type` are erased; a value declaration containing named type
+    // bindings still loads its module. The parser decodes escaped specifiers like Node/Jiti.
+    if (statement.isTypeOnly || statement.importClause?.isTypeOnly) continue;
+    const specifier = statement.moduleSpecifier;
+    if (specifier && ts.isStringLiteralLike(specifier) && specifier.text.startsWith(".")) specifiers.push(specifier.text);
+  }
+  return specifiers;
+}
 
 function walk(dir, out = []) {
   for (const entry of readdirSync(dir)) {
@@ -55,10 +68,7 @@ let checked = 0;
 
 for (const file of walk(extensionsRoot)) {
   const source = readFileSync(file, "utf8");
-  const specifiers = [
-    ...[...source.matchAll(RELATIVE_IMPORT)].map((m) => m[1]),
-    ...[...source.matchAll(SIDE_EFFECT_IMPORT)].map((m) => m[1]),
-  ];
+  const specifiers = staticRelativeImports(file, source);
   for (const specifier of specifiers) {
     checked += 1;
     const base = resolve(dirname(file), specifier);
@@ -79,6 +89,62 @@ if (failures.length > 0) {
 }
 
 console.log(`  ✓ packaged artifact: ${checked} relative imports in vinci/extensions all resolve inside the tarball`);
+
+// --- Launcher dispatch targets -------------------------------------------------------------------
+// vinci/bin/vinci hands whole subcommands to standalone programs (`exec node "${VINCI}/<path>"`).
+// Each such target is a runtime dependency of the shipped launcher exactly like an extension
+// import, and the tarball is assembled from an explicit path list, so a target the list forgets
+// ships as a dead subcommand: the launcher execs a file that is not there and node prints
+// ERR_MODULE_NOT_FOUND. That is how `vinci worker` shipped in every 0.0.x tarball up to 0.0.51 --
+// package.sh listed vinci/bin, vinci/extensions, vinci/themes ... and never vinci/worker -- and
+// nothing here could see it, because this check only followed imports under vinci/extensions.
+//
+// Read from the SHIPPED launcher, not from a hardcoded list, so a new `exec node` dispatch is
+// covered the moment it is added; refuse outright if the grammar stops matching, because a check
+// that finds zero targets has gone blind, not clean.
+const launcherPath = join(root, "vinci", "bin", "vinci");
+if (!existsSync(launcherPath)) {
+  console.error(`✗ packaged artifact has no launcher: ${launcherPath}`);
+  process.exit(1);
+}
+const DISPATCH = /exec node "\$\{VINCI\}\/([^"\s]+)"/g;
+const dispatchTargets = [...readFileSync(launcherPath, "utf8").matchAll(DISPATCH)].map((m) => m[1]);
+if (dispatchTargets.length === 0) {
+  console.error("✗ packaged artifact: found no `exec node \"${VINCI}/...\"` dispatch in vinci/bin/vinci -- the launcher grammar changed and this check can no longer see its targets");
+  process.exit(1);
+}
+const missingTargets = dispatchTargets.filter((target) => !existsSync(join(root, "vinci", target)));
+if (missingTargets.length > 0) {
+  console.error(`✗ packaged artifact: ${missingTargets.length} launcher dispatch target(s) are not in the tarball`);
+  console.error("  vinci/bin/vinci execs these, so the subcommand dies with ERR_MODULE_NOT_FOUND on an installed copy:");
+  for (const target of missingTargets) console.error(`    vinci/${target}`);
+  console.error("\n  Most likely cause: the directory is missing from the path list at the end of vinci/package.sh.");
+  process.exit(1);
+}
+
+// Follow the standalone programs' own relative imports too, with the same resolver the extension
+// layer gets: the worker is a module graph (worker.mjs -> run.mjs -> contracts/...), and a
+// present entry file with an absent sibling is the same dead subcommand one level down.
+const targetFailures = [];
+let targetImports = 0;
+for (const target of dispatchTargets) {
+  const dir = dirname(join(root, "vinci", target));
+  for (const file of walk(dir)) {
+    const source = readFileSync(file, "utf8");
+    for (const specifier of staticRelativeImports(file, source)) {
+      targetImports += 1;
+      const base = resolve(dirname(file), specifier);
+      if ([base, `${base}.js`, `${base}.mjs`, join(base, "index.js")].some((c) => existsSync(c))) continue;
+      targetFailures.push(`${file.slice(root.length + 1)} -> ${specifier}`);
+    }
+  }
+}
+if (targetFailures.length > 0) {
+  console.error(`✗ packaged artifact: ${targetFailures.length} unresolvable import(s) under launcher dispatch targets`);
+  for (const failure of targetFailures) console.error(`    ${failure}`);
+  process.exit(1);
+}
+console.log(`  ✓ packaged artifact: ${dispatchTargets.length} static launcher target(s), ${targetImports} relative imports under their directories resolve`);
 
 const packagedIdentity = JSON.parse(readFileSync(join(root, "vinci/identity.json"), "utf8"));
 assert.ok(readFileSync(join(root, "LICENSE"), "utf8").includes("MIT License"), "The actual distribution must retain the upstream root LICENSE. Restore it before packaging.");
@@ -178,61 +244,6 @@ await api.request("POST", "/private");
   if (!retainEvidence) await rm(temporary, { recursive: true, force: true });
   else process.stderr.write(`Packaged type cleanup is unconfirmed; retain ${temporary} and reconcile its exact compiler child before cleanup.\n`);
 }
-// --- Launcher dispatch targets -------------------------------------------------------------------
-// vinci/bin/vinci hands whole subcommands to standalone programs (`exec node "${VINCI}/<path>"`).
-// Each such target is a runtime dependency of the shipped launcher exactly like an extension
-// import, and the tarball is assembled from an explicit path list, so a target the list forgets
-// ships as a dead subcommand: the launcher execs a file that is not there and node prints
-// ERR_MODULE_NOT_FOUND. That is how `vinci worker` shipped in every 0.0.x tarball up to 0.0.51 --
-// package.sh listed vinci/bin, vinci/extensions, vinci/themes ... and never vinci/worker -- and
-// nothing here could see it, because this check only followed imports under vinci/extensions.
-//
-// Read from the SHIPPED launcher, not from a hardcoded list, so a new `exec node` dispatch is
-// covered the moment it is added; refuse outright if the grammar stops matching, because a check
-// that finds zero targets has gone blind, not clean.
-const launcherPath = join(root, "vinci", "bin", "vinci");
-if (!existsSync(launcherPath)) {
-  console.error(`✗ packaged artifact has no launcher: ${launcherPath}`);
-  process.exit(1);
-}
-const DISPATCH = /exec node "\$\{VINCI\}\/([^"\s]+)"/g;
-const dispatchTargets = [...readFileSync(launcherPath, "utf8").matchAll(DISPATCH)].map((m) => m[1]);
-if (dispatchTargets.length === 0) {
-  console.error("✗ packaged artifact: found no `exec node \"${VINCI}/...\"` dispatch in vinci/bin/vinci -- the launcher grammar changed and this check can no longer see its targets");
-  process.exit(1);
-}
-const missingTargets = dispatchTargets.filter((target) => !existsSync(join(root, "vinci", target)));
-if (missingTargets.length > 0) {
-  console.error(`✗ packaged artifact: ${missingTargets.length} launcher dispatch target(s) are not in the tarball`);
-  console.error("  vinci/bin/vinci execs these, so the subcommand dies with ERR_MODULE_NOT_FOUND on an installed copy:");
-  for (const target of missingTargets) console.error(`    vinci/${target}`);
-  console.error("\n  Most likely cause: the directory is missing from the path list at the end of vinci/package.sh.");
-  process.exit(1);
-}
-
-// Follow the standalone programs' own relative imports too, with the same resolver the extension
-// layer gets: the worker is a module graph (worker.mjs -> run.mjs -> contracts/...), and a
-// present entry file with an absent sibling is the same dead subcommand one level down.
-const targetFailures = [];
-let targetImports = 0;
-for (const target of dispatchTargets) {
-  const dir = dirname(join(root, "vinci", target));
-  for (const file of walk(dir)) {
-    const source = readFileSync(file, "utf8");
-    for (const specifier of [...source.matchAll(RELATIVE_IMPORT)].map((m) => m[1])) {
-      targetImports += 1;
-      const base = resolve(dirname(file), specifier);
-      if ([base, `${base}.js`, `${base}.mjs`, join(base, "index.js")].some((c) => existsSync(c))) continue;
-      targetFailures.push(`${file.slice(root.length + 1)} -> ${specifier}`);
-    }
-  }
-}
-if (targetFailures.length > 0) {
-  console.error(`✗ packaged artifact: ${targetFailures.length} unresolvable import(s) under launcher dispatch targets`);
-  for (const failure of targetFailures) console.error(`    ${failure}`);
-  process.exit(1);
-}
-
 // And DRIVE it: the worker with no arguments must reach its own usage refusal, which proves the
 // whole module graph loads from the unpacked tree (not from the repo) with node alone. A file-
 // existence check would pass an entry file whose import of identity.json or a sibling is broken.
