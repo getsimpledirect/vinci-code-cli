@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,8 +14,8 @@ const fixture = join(temporary, "source");
 const snapshot = join(temporary, "snapshot.json");
 const identity = join(temporary, "identity.json");
 const env = { ...process.env, VINCI_EXPECTED_SOURCE_SHA: "", VINCI_PACKAGE_REQUIRE_CLEAN_SOURCE: "0" };
-function run(mode, extraEnv = {}) {
-	return spawnSync(process.execPath, [helper, mode, fixture, mode === "check" ? identity : snapshot, ...(mode === "verify" ? [identity] : [])], { encoding: "utf8", timeout: 10000, env: { ...env, ...extraEnv } });
+function run(mode, extraEnv = {}, sourceRoot = fixture) {
+	return spawnSync(process.execPath, [helper, mode, sourceRoot, mode === "check" ? identity : snapshot, ...(mode === "verify" ? [identity] : [])], { encoding: "utf8", timeout: 10000, env: { ...env, ...extraEnv } });
 }
 function git(...args) {
 	const result = spawnSync("git", ["-C", fixture, "-c", "user.name=Provenance fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8", timeout: 10000 });
@@ -68,6 +68,16 @@ try {
 	assert.equal(linkedSnapshot.inputs.some((input) => input.path === "storage/source.mjs"), false, "The control target must be reached only through consumer link semantics");
 	assert.equal(linkedIdentity.targetPath, "storage/source.mjs");
 	assert.equal(linkedIdentity.targetSha256, createHash("sha256").update(original).digest("hex"));
+	const aliasedFixture = join(temporary, "aliased-source");
+	symlinkSync(fixture, aliasedFixture, "dir");
+	assert.notEqual(resolve(aliasedFixture), realpathSync(aliasedFixture), "The selected source root must be a persistent filesystem alias");
+	const aliasedSnapshot = run("snapshot", {}, aliasedFixture);
+	assert.equal(aliasedSnapshot.status, 0, `An aliased source root must accept its valid internal source link: ${aliasedSnapshot.stderr}`);
+	assert.deepEqual(JSON.parse(readFileSync(snapshot, "utf8")), linkedSnapshot, "Physical and aliased roots must bind the same actual Git state and consumer bytes");
+	const aliasedVerify = run("verify", {}, aliasedFixture);
+	assert.equal(aliasedVerify.status, 0, aliasedVerify.stderr);
+	assert.equal(run("check", {}, aliasedFixture).status, 0, "The aliased root must consume the verified provenance");
+	assert.equal(run("check").status, 0, "The physical root must consume the same verified provenance");
 	writeFileSync(target, "export const value = 'changed target';\n");
 	assert.equal(run("verify").status, 1, "The consumer follows the link; changing its target must invalidate provenance");
 	writeFileSync(target, original);
@@ -87,7 +97,7 @@ try {
 	const directory = run("snapshot");
 	assert.equal(directory.status, 1);
 	assert.match(directory.stderr, /targets a directory/);
-	console.log("Source provenance passed its actual Git/byte positive control and refused changed runtime bytes, executable modes, dirty release source, wrong commit, changed link targets, and escaping/dangling/directory links.");
+	console.log("Source provenance passed its actual Git/byte positive control and aliased root with an internal source link, and refused changed runtime bytes, executable modes, dirty release source, wrong commit, changed link targets, and escaping/dangling/directory links.");
 } finally {
 	assert.equal(spawnSync("find", [temporary, "-mindepth", "1", "-delete"], { timeout: 10000 }).status, 0, "Remove the owned provenance fixture before retrying.");
 	rmdirSync(temporary);
