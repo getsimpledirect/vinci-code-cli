@@ -12,7 +12,7 @@ if (!["snapshot", "verify", "check"].includes(mode) || !rootArgument || !snapsho
 	console.error("Usage: build-source-identity.mjs <snapshot|verify|check> <source-root> <snapshot-or-identity-file> [output-file]; select the owned source and build evidence before retrying.");
 	process.exit(2);
 }
-const root = resolve(rootArgument);
+const root = realpathSync(resolve(rootArgument));
 const git = (...args) => execFileSync("git", ["-C", root, ...args], { timeout: 30000 });
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 function currentIdentity() {
