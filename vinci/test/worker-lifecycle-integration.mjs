@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { WorkerTestFixture } from "./lib/worker-fixture.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const launcher = join(root, "vinci/bin/vinci");
@@ -135,8 +135,8 @@ function runWorker(url, stateDir, extraEnv = {}) {
           VINCI_WORKER_LIMIT_POLL_MS: "25",
           FAKE_GH_RECORD: join(stateDir, "gh.log"),
           FAKE_GIT_RECORD: join(stateDir, "git.log"),
-          FAKE_VINCI_RECORD: vinciRecord,
           ...extraEnv,
+          FAKE_VINCI_RECORD: vinciRecord,
         },
       },
     );
@@ -168,18 +168,21 @@ function taskState(stateDir) {
 }
 
 async function scenario(name, body, env, verify, prepare) {
-  const stateDir = mkdtempSync(join(tmpdir(), `vinci-worker-${name}-`));
+  const fixture = new WorkerTestFixture(`lifecycle-${name}`);
+  const stateDir = fixture.tempDir;
+  fixture.createRepo("test", "repo");
+  fixture.linkTools(fixtures);
   // First-run cursor starts at NOW (skip-history); these scenarios serve historical handoffs,
   // so seed an ancient cursor. worker-first-run-cursor.mjs proves the unseeded behaviour.
   writeFileSync(join(stateDir, "cursor.json"), JSON.stringify({ t1: { ts: "2000-01-01T00:00:00.000Z", message_ids: [] } }));
   const bus = await fakeBus(body);
   try {
     if (prepare) prepare(stateDir);
-    const vinciRecord = await runWorker(bus.url, stateDir, env);
+    const vinciRecord = await runWorker(bus.url, stateDir, { ...fixture.getEnv(), ...env });
     await verify({ bus, state: taskState(stateDir), vinciRecord });
   } finally {
     await new Promise((resolveClose) => bus.server.close(resolveClose));
-    rmSync(stateDir, { recursive: true, force: true });
+    await fixture.cleanup();
   }
 }
 

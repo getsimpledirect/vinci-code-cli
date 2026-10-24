@@ -1689,19 +1689,17 @@ await test('BLOCK-B: the refresh interval defaults to 3600 s and ignores an unus
 });
 
 // ---------------------------------------------------------------------------------------------
-// The claim-paths ttl interlock. VERIFIED against vinci-gpu-control main: the 200 body is
-// `{ok, reason, claim_hash, paths}` (app.py:2888-2893) with NO `ttl`, while this client refuses a
-// 200 without a finite positive ttl (governor.mjs) — so with BLOCK-A fixed and the claim finally
-// reaching the gate, today's server blocks every governed task one step later, at
-// `Governor lease invalid: ttl=undefined`. The server fix (returning the ttl it already computes)
-// is dispatched on gpu-control #201.
+// The claim-paths ttl interlock retains the historical pre-fix 200 body:
+// `{ok, reason, claim_hash, paths}` with NO `ttl`. Issue #71 (2026-09-07) records that the
+// gpu-control #201 fix had deployed and returned a validated numeric ttl. This fixture models
+// the historical wire shape, not the current deployment; the legacy CLAIM_PATHS_DEPLOYED export
+// name is retained. The client refuses this body at `Governor lease invalid: ttl=undefined`.
 //
 // The client's ttl requirement STAYS: `tightenEnvelopeLimits` caps the run's `max_runtime_s` on
 // the claim ttl (worker-governor-fail-closed.mjs T3/T3b/T3c), so accepting a ttl-less claim would
-// silently delete a runtime cap rather than fix anything. This test is the tripwire on that
-// disagreement: it fails if the client stops requiring the ttl, and it fails if the fixture goes
-// back to inventing one.
-await test('claim-paths without ttl (the DEPLOYED server shape) blocks before any work', async () => {
+// silently delete a runtime cap rather than fix anything. This test pins the historical shape:
+// it fails if the client stops requiring the ttl, and it fails if the fixture invents one.
+await test('claim-paths without ttl (historical pre-fix server shape) blocks before any work', async () => {
   const fixture = new WorkerTestFixture('claim-no-ttl');
   const governor = new FakeGovernor({ claim: CLAIM_PATHS_DEPLOYED });
   await governor.start();
@@ -1711,8 +1709,8 @@ await test('claim-paths without ttl (the DEPLOYED server shape) blocks before an
     await fixture.startBus([handoff('140', 'w6', 'repo: test/repo\nevidence: pr\n\nTask')]);
     const { code } = await runWorker(fixture, 'w6', ['--governor', governor.url]);
     assert.equal(code, 0);
-    // The fixture is serving the real shape, not an invented one.
-    assert.equal('ttl' in CLAIM_PATHS_DEPLOYED, false, 'the deployed claim response has no ttl');
+    // The fixture preserves the historical pre-fix shape.
+    assert.equal('ttl' in CLAIM_PATHS_DEPLOYED, false, 'the historical pre-fix claim response has no ttl');
     assert.deepEqual(Object.keys(CLAIM_PATHS_DEPLOYED).sort(), ['claim_hash', 'ok', 'paths', 'reason']);
     const snapshot = state(fixture, '140');
     assert.equal(snapshot.state, 'BLOCKED', `expected BLOCKED, got ${snapshot.state} (${JSON.stringify(snapshot.outcome)})`);
@@ -1731,9 +1729,9 @@ await test('claim-paths without ttl (the DEPLOYED server shape) blocks before an
   }
 });
 
-// The same body once #201 adds the ttl: the identical task runs to completion, and the claim ttl
-// becomes the run's runtime cap. Together with the test above this pins BOTH sides of the fix.
-await test('claim-paths WITH ttl (the fixed server) runs, and the claim ttl caps the runtime', async () => {
+// The valid body includes ttl: the identical task runs to completion, and the claim ttl becomes
+// the run's runtime cap. Together with the test above this pins both accepted and refused shapes.
+await test('claim-paths with a valid ttl runs, and the claim ttl caps the runtime', async () => {
   const fixture = new WorkerTestFixture('claim-with-ttl');
   const governor = new FakeGovernor({ claim: { ...CLAIM_PATHS_WITH_TTL, ttl: 77 } });
   await governor.start();

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { canonicalJson, buildEconomicsSummary, economicsSha256, ECONOMICS_SCHEMA } from "../economics.mjs";
 
 // ============================================================================
@@ -93,6 +94,87 @@ test("buildEconomicsSummary: never throws on malformed input", () => {
   const emptyResult = buildEconomicsSummary({});
   assert.ok(Array.isArray(emptyResult.incomplete), "incomplete should be array");
   assert.ok(emptyResult.incomplete.length > 0, "incomplete should list missing fields");
+});
+
+test("inner degraded summary preserves receiver fields without claiming reconstructed usage", () => {
+  let receiptReads = 0;
+  const input = {
+    workOrderId: "bk_inner_degraded",
+    task: { id: "task_inner", envelope: { ref: "bk_wrong_binding" }, attempt: 1 },
+    attemptLabel: "task_inner/1",
+    sessionState: { path: "/s/inner.jsonl", source: "usage_entries" },
+    requestedProvider: "provider-requested",
+    requestedModel: "model-requested",
+    receipt: {
+      get usage() {
+        receiptReads += 1;
+        throw new Error("controlled malformed receipt");
+      },
+    },
+  };
+  const summary = buildEconomicsSummary(input);
+
+  assert.equal(receiptReads, 1, "the real builder must reach the throwing receipt");
+  assert.equal(summary.schema, ECONOMICS_SCHEMA);
+  assert.equal(summary.work_order_id, input.workOrderId, "the known contract binding survives degradation");
+  assert.equal(summary.attempt_label, input.attemptLabel);
+  assert.equal(summary.cost_reconstruction, "none", "failed reconstruction cannot claim usage_entries");
+  assert.equal(Object.hasOwn(summary, "usage"), false, "unknown cost must not become an empty or zero usage row");
+  assert.equal(summary.generation_identity.observation, "unavailable");
+  assert.equal(summary.generation_identity.observed_model, null);
+  assert.equal(summary.generation_identity.matches_requested, null);
+  assert.deepEqual(summary.generation_identity.used_generation_ids, []);
+  assert.deepEqual(summary.lineage, { root_objective_id: null, backlog_row_id: null, parent_work_order_id: null });
+  assert.deepEqual(summary.decision_refs, []);
+  assert.ok(summary.incomplete.includes("malformed_entries"));
+  for (const [field, code] of [
+    ["execution_world_ref", "execution_world_missing"],
+    ["capacity_events", "capacity_unobserved"],
+    ["measurement_cost", "measurement_cost_unknown"],
+  ]) {
+    assert.ok(Object.hasOwn(summary, field), `receiver field ${field} must be present`);
+    assert.equal(summary[field], null, `${field} must remain unknown`);
+    assert.ok(summary.incomplete.includes(code), `${field} must carry its incomplete code`);
+  }
+  assert.ok(summary.incomplete.includes("lineage_unbound"));
+  assert.equal(new Set(summary.incomplete).size, summary.incomplete.length, "incomplete codes must be unique");
+  assert.ok(!summary.incomplete.includes("missing"), "a known work order remains joinable");
+
+  const canonical = canonicalJson(summary);
+  assert.deepEqual(JSON.parse(canonical), summary);
+  assert.equal(economicsSha256(canonical), createHash("sha256").update(canonical, "utf8").digest("hex"));
+  assert.ok(!canonical.includes("controlled malformed receipt"), "error text must not enter the summary");
+
+  const measured = buildEconomicsSummary({
+    ...input,
+    receipt: {},
+    usageEntries: [{ provider: "provider-runtime", model: "model-runtime", model_calls: 1, cost_microusd: 42 }],
+  });
+  assert.equal(receiptReads, 1, "the positive control uses a valid receipt");
+  assert.equal(measured.cost_reconstruction, "usage_entries");
+  assert.equal(measured.usage[0].cost_microusd, 42);
+  assert.equal(measured.generation_identity.runtime_provider, "provider-runtime");
+  assert.ok(!measured.incomplete.includes("malformed_entries"), "valid input must retain the normal path");
+});
+
+test("inner degraded summary keeps an absent work-order binding unknown", () => {
+  let receiptReads = 0;
+  const summary = buildEconomicsSummary({
+    receipt: {
+      get usage() {
+        receiptReads += 1;
+        throw new Error("controlled unbound receipt");
+      },
+    },
+  });
+  assert.equal(receiptReads, 1, "the unbound case must also reach the inner catch");
+  assert.equal(summary.work_order_id, null);
+  assert.equal(summary.attempt_label, null);
+  assert.ok(summary.incomplete.includes("missing"));
+  assert.ok(summary.incomplete.includes("no_session"));
+  assert.equal(summary.cost_reconstruction, "none");
+  assert.deepEqual(summary.lineage, { root_objective_id: null, backlog_row_id: null, parent_work_order_id: null });
+  assert.ok(summary.incomplete.includes("lineage_unbound"));
 });
 
 // ============================================================================

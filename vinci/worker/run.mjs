@@ -1306,6 +1306,7 @@ export function runVinci({ envelope, repoDir, stateDir, taskId, sessionId, env, 
         cost_usd: session.costUsd,
         outcome: session.outcome,
         harness_stops: session.harnessStops,
+        exit_attribution: session.exitAttribution,
         // W2: what the governed unattended profile actually did this run, one entry per gate.
         unattended_policy: session.unattendedPolicy ?? [],
       };
@@ -1416,15 +1417,18 @@ export async function publish({
 
 // Outcome precedence — machine-observed events outrank the model's narrative about itself
 // (issues #5/#6: the harness refused the required work mid-run and the outcome entry still said DONE).
-//   1. non-zero exit or a tripped limit                         => FAILED
+//   1. a tripped limit or an unattributed non-zero exit         => FAILED
 //   2. any harness stop in the session (see HARNESS_STOP_PATTERNS) => BLOCKED, even over DONE + PR
 //   3. outcome BLOCKED/WAITING, or BLOCKER.md at HEAD            => BLOCKED
 //   4. outcome DONE_UNVERIFIED                                    => UNVERIFIED
 //   5. outcome DONE and a PR exists                               => COMPLETED
 //   6. anything else (incl. evidence: none, exit 0 alone)         => UNVERIFIED (produced, unassessed)
-export function finalState({ exitCode, limitTripped, outcome, blocker, pr, harnessStops }) {
-  if (exitCode !== 0 || limitTripped) return "FAILED";
-  if (Array.isArray(harnessStops) && harnessStops.length > 0) return "BLOCKED";
+export function finalState({ exitCode, exitAttribution, limitTripped, outcome, blocker, pr, harnessStops }) {
+  const hasHarnessStop = Array.isArray(harnessStops) && harnessStops.length > 0;
+  const refusalExit = hasHarnessStop && exitAttribution?.cause === "headless_hint"
+    && exitAttribution.exitCode === exitCode;
+  if (limitTripped || (exitCode !== 0 && !refusalExit)) return "FAILED";
+  if (hasHarnessStop) return "BLOCKED";
   if (outcome?.state === "BLOCKED" || outcome?.state === "WAITING" || blocker) return "BLOCKED";
   if (outcome?.state === "DONE_UNVERIFIED") return "UNVERIFIED";
   // No commit produced: work did not land. Refuse COMPLETED even if evidence was verified.

@@ -4,6 +4,7 @@ import { accessSync, constants } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { delimiter, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 
 import { isLedgerRef } from "./bus.mjs";
 import { checkFence } from "./publisher.mjs";
@@ -78,7 +79,7 @@ export async function uploadEvidence({
   if (!uriPrefix) return null;
 
   // Build bundle directory
-  const bundleDir = join("/tmp", `evidence-${taskId}-${Date.now()}`);
+  const bundleDir = join(tmpdir(), `evidence-${taskId}-${Date.now()}`);
   const tarPath = `${bundleDir}.tgz`;
 
   try {

@@ -24,6 +24,7 @@ import { BranchLeaseClient, branchLeaseFence } from "./branch-lease.mjs";
 import { composeFences } from "./publisher.mjs";
 import { readSessionState, summarizeUnattendedPolicy } from "./session-read.mjs";
 import { uploadEvidence } from "./evidence.mjs";
+import { custodyTerminalState, outputRemotePostFields, prepareOutputCustody, settleOutputCustody } from "./output-custody.mjs";
 import { buildEconomicsSummary, canonicalJson, economicsSha256 } from "./economics.mjs";
 import { buildIdentity, fetchServerBuild, formatServerBuild, formatVinciBinary, formatWorkerBuild, vinciBinaryVersion } from "./build.mjs";
 
@@ -797,6 +798,13 @@ async function postFinal(bus, message, envelope, state, evidence, economics = nu
     state.limit_tripped ? `limit=${state.limit_tripped}` : undefined,
     state.head ? `head=${state.head}` : undefined,
     state.pr ? `pr=${state.pr}` : undefined,
+    state.output_custody ? `output_custody=${state.output_custody.status}` : undefined,
+    state.output_custody ? `output_durable=${state.output_custody.durable}` : undefined,
+    state.output_custody?.reason ? `output_custody_reason=${JSON.stringify(state.output_custody.reason.slice(0, 240))}` : undefined,
+    ...outputRemotePostFields(state.output_custody),
+    state.output_custody?.status === "remote_verified" ? `output_transport_sha256=${state.output_custody.remote_transport_sha256}` : undefined,
+    state.output_custody?.status === "remote_verified" ? `output_ref=${JSON.stringify(state.output_custody.remote_ref)}` : undefined,
+    state.output_custody?.status === "remote_verified" ? `output_sha=${state.output_custody.observed_sha}` : undefined,
     ...policyDetails,
     ...identityDetails,
     contractTag(state),
@@ -1519,6 +1527,7 @@ async function processHandoff(
     });
     const prEligible = !authorityLost && finalState({
       exitCode: run.exit_code,
+      exitAttribution: run.exit_attribution,
       limitTripped: run.limit_tripped,
       outcome: preOutcome,
       blocker: null,
@@ -1556,6 +1565,13 @@ async function processHandoff(
         files: artifacts,
       }, null, 2)}\n`;
     }
+    const preparedOutput = await prepareOutputCustody({
+      mode: outputMode, repoDir: repository.repoDir, publication,
+      baseCommit: contractFields?.base_commit ?? lifecycle.snapshot().base_commit,
+      head, attempt: attempt.attempt,
+    });
+    Object.assign(extraFiles, preparedOutput.extraFiles);
+    published.output_custody = preparedOutput.custody;
     const fencedOut = authorityLost ?? published.fenced_out ?? null;
     if (!authorityLost && published.fenced_out) fencedOutReason = published.fenced_out;
     // Build outcome: start with fence/blocker reasons, then augment with no_commit if needed (so both can coexist).
@@ -1566,6 +1582,7 @@ async function processHandoff(
       ? "BLOCKED"
       : finalState({
           exitCode: run.exit_code,
+          exitAttribution: run.exit_attribution,
           limitTripped: run.limit_tripped,
           outcome,
           blocker: Boolean(published.blocker_reason),
@@ -1712,9 +1729,11 @@ async function processHandoff(
       await pruneAttempts({ stateDir, repo: envelopeToUse.repo, taskId, keep: cleanRoom.keepAttempts, protect: attempt.attempt });
       if (stopping) return false;
     }
-    const state = evidenceFencedOut ? "BLOCKED" : evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState;
+    const outputCustody = settleOutputCustody(preparedOutput.custody, evidenceResult);
+    const state = evidenceFencedOut ? "BLOCKED" : custodyTerminalState(evidenceError && intendedState === "COMPLETED" ? "UNVERIFIED" : intendedState, outputCustody);
     lifecycle.transition(state, {
       ...planned,
+      output_custody: outputCustody,
       ...(evidenceFencedOut ? { outcome: { reason: evidenceFencedOut }, fenced_out: evidenceFencedOut } : {}),
       ...(lease ? { lease: { ...lifecycle.snapshot().lease, ...lease } } : {}),
       evidence_error: evidenceError,

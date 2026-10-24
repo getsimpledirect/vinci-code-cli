@@ -50,7 +50,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, st
 import { dirname, join } from "node:path";
 
 import { classifyDivergedLocal, command, readHeadBlocker, renameBranchAside } from "./run.mjs";
-import { prTitle } from "./publisher.mjs";
+import { prTitle, remoteBranchSha, remoteTransportIdentity } from "./publisher.mjs";
 import { isPlainRefName } from "./task.mjs";
 
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -610,13 +610,28 @@ export async function prepareCleanRoom({ stateDir, repo, taskId, attempt, branch
 export async function publishFromCache({ envelope, cacheDir, attemptDir, branch, taskId, limitTripped, prEligible = true, objective = null }) {
   const blockerReason = await readHeadBlocker(attemptDir);
   const originUrl = await command("git", ["-C", cacheDir, "config", "--get", "remote.origin.url"], { allowFailure: true });
-  const push = originUrl.status === 0 && originUrl.stdout
-    ? await command("git", ["-C", cacheDir, "push", "--no-verify", originUrl.stdout, `refs/heads/${branch}:refs/heads/${branch}`], { allowFailure: true })
+  const localHead = await command("git", ["-C", attemptDir, "rev-parse", "--verify", "HEAD"], { allowFailure: true });
+  const head = localHead.status === 0 && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(localHead.stdout) ? localHead.stdout : null;
+  const push = originUrl.status === 0 && originUrl.stdout && head
+    ? await command("git", ["-C", cacheDir, "push", "--no-verify", originUrl.stdout, `${head}:refs/heads/${branch}`], { allowFailure: true })
     : { status: 1, stderr: `clean room: cache ${cacheDir} has no remote.origin.url to publish to` };
-  const result = { publish: push.status === 0 ? "pushed" : "push_failed", pr: null };
+  const readback = push.status === 0
+    ? await remoteBranchSha({ repoDir: cacheDir, branch, remote: originUrl.stdout }) : null;
+  const verified = readback !== null && !readback.error && readback.sha === head;
+  const result = {
+    publish: push.status === 0 ? verified ? "pushed" : "remote_readback_mismatch" : "push_failed",
+    pr: null,
+    pushed_sha: push.status === 0 ? head : null,
+    ...remoteTransportIdentity(originUrl.status === 0 ? originUrl.stdout : null),
+    remote_ref: `refs/heads/${branch}`,
+    remote_measurement: "git ls-remote explicit push destination",
+    remote_sha_after: readback?.sha ?? null,
+    remote_readback_verified: verified,
+    ...(push.status !== 0 ? { push_error: `clean room push exited ${push.status}` } : !verified ? { refusal_reason: `clean room remote readback did not match ${head}` } : {}),
+  };
   if (blockerReason) return { ...result, publish: push.status === 0 ? "blocked" : "push_failed", blocker_reason: blockerReason };
   if (limitTripped) return result;
-  if (push.status !== 0 || envelope.evidence !== "pr") return result;
+  if (!verified || envelope.evidence !== "pr") return result;
   // The PR gate, same as the standard publisher. An earlier version of this function relied on
   // the blocker and limitTripped checks above and a comment calling them "this path's
   // equivalent of the eligibility gate". They are not equivalent: finalState also refuses

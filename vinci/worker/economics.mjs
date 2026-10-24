@@ -408,6 +408,14 @@ export function buildEconomicsSummary(input = {}) {
     return summary;
   } catch {
     if (!incomplete.includes("malformed_entries")) incomplete.push("malformed_entries");
+    for (const code of [
+      "lineage_unbound",
+      "execution_world_missing",
+      "capacity_unobserved",
+      "measurement_cost_unknown",
+    ]) {
+      if (!incomplete.includes(code)) incomplete.push(code);
+    }
     return {
       schema: "vinci.work-order-economics-summary.v1",
       work_order_id: str(input?.workOrderId) ?? str(input?.task?.envelope?.ref),
@@ -450,7 +458,13 @@ export function buildEconomicsSummary(input = {}) {
         limit_tripped: null,
         harness_stop: null,
       },
-      cost_reconstruction: "usage_entries",
+      lineage: { root_objective_id: null, backlog_row_id: null, parent_work_order_id: null },
+      execution_world_ref: null,
+      capacity_events: null,
+      decision_refs: [],
+      measurement_cost: null,
+      // The builder failed before it could produce trustworthy usage; absence is not zero spend.
+      cost_reconstruction: "none",
       incomplete,
     };
   }
