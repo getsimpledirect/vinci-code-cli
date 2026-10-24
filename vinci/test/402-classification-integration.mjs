@@ -358,3 +358,170 @@ for (const abort of [true, false]) {
     }
   });
 }
+
+function managedRetryFixture() {
+  const handlers = new Map();
+  provider.default({
+    registerProvider() {},
+    on(event, handler) { handlers.set(event, handler); },
+  });
+  const ctx = { ...context, model: { ...context.model } };
+  const payload = { model: "fortissimo", max_tokens: 32768, messages: [] };
+  return {
+    ctx,
+    payload,
+    after: (status, headers = {}) => handlers.get("after_provider_response")({ status, headers }, ctx),
+    end: (errorMessage, message = {}) => handlers.get("message_end")({ message: { ...inFlightError, errorMessage, ...message } }, ctx),
+    before: (requestContext = ctx) => handlers.get("before_provider_request")({ payload }, requestContext),
+  };
+}
+
+test("header-only 402 recovery reaches the core retry policy and honors bounded Retry-After", async (t) => {
+  for (const [header, delay] of [["0.05", 50], ["900000", 300000], ["invalid", 5000], ["0", 0]]) {
+    await t.test(`Retry-After ${header}`, async () => {
+      const fixture = managedRetryFixture();
+      await fixture.after(402, { "ReTrY-AfTeR": header });
+      const result = await fixture.end("HTTP 402: Payment Required");
+      assert.ok(result, "a real 402 response with only a retry header must schedule recovery");
+      assert.equal(retry.isRetryableAssistantError(result.message), true, "the real core policy must consume the recovery message");
+      assert.equal(result.message.model, fixture.ctx.model.id, "retry must retain the selected model");
+      assert.match(result.message.errorMessage, /same model/);
+      const clock = retryClock();
+      let settled = false;
+      const wait = fixture.before().then((payload) => { settled = true; return payload; });
+      try {
+        assert.equal(clock.timers.size, 1, "the real request handler must enter its retry timer");
+        if (delay > 0) {
+          await clock.advance(delay - 1);
+          assert.equal(settled, false, "the retry must wait the full bounded delay");
+          await clock.advance(1);
+        } else {
+          await clock.advance(0);
+        }
+        assert.deepEqual(await wait, { ...fixture.payload, model: "forte" }, "recovery keeps the same class and original token budget");
+        assert.deepEqual(fixture.ctx.model, context.model, "the selected provider/model is unchanged");
+        const next = fixture.before();
+        assert.equal(clock.timers.size, 0, "the consumed delay must not survive into a later request");
+        await next;
+      } finally {
+        await clock.advance(delay);
+        await wait;
+        clock.restore();
+      }
+    });
+  }
+});
+
+test("header-only 402 recovery stops after three retries and preserves the session ceiling", async () => {
+  const fixture = managedRetryFixture();
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await fixture.after(402, { "Retry-After": "0" });
+    const result = await fixture.end("HTTP 402: Payment Required");
+    assert.equal(retry.isRetryableAssistantError(result.message), attempt <= 3, `bounded retry ${attempt}`);
+    if (attempt === 4) assert.match(result.message.errorMessage, /did not clear after 3 retries/);
+  }
+  await fixture.after(200);
+  for (let attempt = 4; attempt <= 10; attempt++) {
+    await fixture.after(402, { "Retry-After": "0" });
+    const result = await fixture.end("HTTP 402: Payment Required");
+    assert.equal(retry.isRetryableAssistantError(result.message), true, `session retry ${attempt}`);
+    await fixture.after(200);
+  }
+  await fixture.after(402, { "Retry-After": "0" });
+  const exhausted = await fixture.end("HTTP 402: Payment Required");
+  assert.equal(retry.isRetryableAssistantError(exhausted.message), false);
+  assert.match(exhausted.message.errorMessage, /after 10 HTTP 402 retries in this session/);
+  assert.equal(exhausted.message.model, fixture.ctx.model.id);
+});
+
+test("affordability recovery requires the current HTTP response to be 402", async (t) => {
+  for (const status of [400, 401, 429, 500, 503, undefined]) {
+    await t.test(`status ${status ?? "unobserved"}`, async () => {
+      const fixture = managedRetryFixture();
+      if (status !== undefined) await fixture.after(status, { "Retry-After": "0" });
+      const original = { ...affordabilityError, errorMessage: `${status ?? 402}: ${AFFORDABILITY_BODY}` };
+      const result = await fixture.end(original.errorMessage);
+      assert.equal(result, undefined, "non-402 or unobserved status must retain its original error policy");
+      assert.equal(retry.isRetryableAssistantError(original), status === 429 || status === 500 || status === 503);
+      assert.deepEqual(await fixture.before(), { ...fixture.payload, model: "forte" }, "a non-402 must not clamp max_tokens");
+    });
+  }
+  const eligible = managedRetryFixture();
+  await eligible.after(402, { "Retry-After": "0" });
+  const result = await eligible.end("402: can only afford 19 tokens");
+  assert.equal(retry.isRetryableAssistantError(result.message), true);
+  assert.deepEqual(await eligible.before(), { ...eligible.payload, model: "forte", max_tokens: 19 });
+  await eligible.after(402);
+  assert.equal(retry.isRetryableAssistantError((await eligible.end("402: can only afford 19 tokens")).message), false,
+    "affordability retry remains limited to one before a successful response");
+});
+
+test("a previous 402 status or header cannot classify a later response or transport error", async () => {
+  for (const reset of ["request", "response", "message"]) {
+    const fixture = managedRetryFixture();
+    await fixture.after(402, { "Retry-After": "0" });
+    if (reset === "request") await fixture.before();
+    else if (reset === "response") await fixture.after(503);
+    else await fixture.end(undefined, { stopReason: "stop" });
+    assert.equal(await fixture.end("503: can only afford 19 tokens"), undefined, `${reset} must invalidate stale 402 state`);
+    assert.deepEqual(await fixture.before(), { ...fixture.payload, model: "forte" });
+  }
+  const consumed = managedRetryFixture();
+  await consumed.after(402);
+  await consumed.end("402: can only afford 19 tokens");
+  assert.equal(await consumed.end("503: can only afford 7 tokens"), undefined, "each response status is consumed only once");
+  assert.deepEqual(await consumed.before(), { ...consumed.payload, model: "forte" }, "an unrelated terminal must clear an unconsumed clamp");
+});
+
+test("explicit exhausted-credit and billing refusals remain terminal even with retry hints", async () => {
+  for (const body of [
+    OUT_OF_CREDIT_BODY,
+    "402: out of credits",
+    JSON.stringify({ code: "payment_failed", message: "can only afford 19 tokens" }),
+    JSON.stringify({ error: { code: "free_daily_cap", message: "in_flight_budget_exhausted" } }),
+    JSON.stringify({ error: { code: "request_too_large", message: "can only afford 19 tokens" } }),
+  ]) {
+    const fixture = managedRetryFixture();
+    await fixture.after(402, { "Retry-After": "0" });
+    const result = await fixture.end(body);
+    assert.ok(result, "a definite billing refusal must retain actionable terminal messaging");
+    assert.equal(retry.isRetryableAssistantError(result.message), false, body);
+    assert.equal(result.message.model, fixture.ctx.model.id);
+    assert.deepEqual(await fixture.before(), { ...fixture.payload, model: "forte" }, "terminal billing errors must not schedule a token clamp");
+  }
+});
+
+test("header-only 402 waiting remains cancelable and does not cross a provider switch", async () => {
+  const controller = new AbortController();
+  const fixture = managedRetryFixture();
+  fixture.ctx.signal = controller.signal;
+  await fixture.after(402, { "Retry-After": "120" });
+  await fixture.end("HTTP 402: Payment Required");
+  const clock = retryClock();
+  let settled = false;
+  const wait = fixture.before().then((result) => { settled = true; return result; });
+  try {
+    await clock.advance(25);
+    assert.equal(settled, false);
+    controller.abort();
+    await clock.advance(0);
+    assert.equal(await wait, undefined);
+    assert.equal(settled, true);
+    assert.equal(clock.timers.size, 0);
+  } finally {
+    await clock.advance(120000);
+    await wait;
+    clock.restore();
+  }
+  await fixture.after(402, { "Retry-After": "120" });
+  await fixture.end("HTTP 402: Payment Required");
+  assert.equal(await fixture.before({ ...fixture.ctx, model: { provider: "other", id: "other-model" } }), undefined);
+  const switchedClock = retryClock();
+  try {
+    const next = fixture.before({ ...fixture.ctx, signal: new AbortController().signal });
+    assert.equal(switchedClock.timers.size, 0, "a delay from another provider selection must not be replayed");
+    assert.deepEqual(await next, { ...fixture.payload, model: "forte" });
+  } finally {
+    switchedClock.restore();
+  }
+});
