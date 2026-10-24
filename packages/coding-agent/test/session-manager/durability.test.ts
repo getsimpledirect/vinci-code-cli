@@ -312,22 +312,46 @@ describe("issue #38 append-only record framing", () => {
 		expect(result.parsingErrors).toEqual([]);
 	});
 
-	it("preserves every append from two synchronized worker writers", async () => {
-		const header = legacyHeader();
-		const assistant = assistantEntry("assistant-entry");
-		const original = `${JSON.stringify(header)}\n${JSON.stringify(assistant)}\n`;
-		writeFileSync(file, original);
-		const sessionManagerUrl = new URL("../../src/core/session-manager.ts", import.meta.url).href;
-		const workerSource = `
+	it.each(["simultaneous", "notify-before-wait"] as const)(
+		"preserves every append from two synchronized worker writers (%s)",
+		async (schedule) => {
+			const header = legacyHeader();
+			const assistant = assistantEntry("assistant-entry");
+			const original = `${JSON.stringify(header)}\n${JSON.stringify(assistant)}\n`;
+			writeFileSync(file, original);
+			const sessionManagerUrl = new URL("../../src/core/session-manager.ts", import.meta.url).href;
+			const workerSource = `
 			import { parentPort, workerData } from "node:worker_threads";
 			import { SessionManager } from ${JSON.stringify(sessionManagerUrl)};
 
 			const gate = new Int32Array(workerData.gate);
 			const manager = SessionManager.open(workerData.file, workerData.tempDir);
+			const deadline = Date.now() + 10_000;
+			if (workerData.notifyBeforeWait && workerData.writer === 2) {
+				if (Atomics.wait(gate, 1, 0, 10_000) === "timed-out") {
+					throw new Error("Writer scheduling timed out; inspect the first writer's readiness.");
+				}
+			}
 			const readyWriters = Atomics.add(gate, 0, 1) + 1;
 			if (readyWriters === 2) Atomics.notify(gate, 0);
-			while (Atomics.load(gate, 0) < 2) {
-				Atomics.wait(gate, 0, Atomics.load(gate, 0));
+			let ready = Atomics.load(gate, 0);
+			while (ready < 2) {
+				// Complete the second writer's notification after this snapshot and before the wait.
+				if (workerData.notifyBeforeWait) {
+					Atomics.store(gate, 1, 1);
+					Atomics.notify(gate, 1);
+					if (Atomics.wait(gate, 0, 1, Math.max(0, deadline - Date.now())) === "timed-out") {
+						throw new Error("Writer scheduling timed out; inspect the second writer's readiness.");
+					}
+					if (Atomics.load(gate, 0) !== 2) {
+						throw new Error("Writer scheduling did not complete; inspect the ready-before-wait control.");
+					}
+				}
+				const remaining = deadline - Date.now();
+				if (remaining <= 0 || Atomics.wait(gate, 0, ready, remaining) === "timed-out") {
+					throw new Error("Writer barrier timed out; inspect the readiness snapshot passed to Atomics.wait.");
+				}
+				ready = Atomics.load(gate, 0);
 			}
 
 			const ids = [];
@@ -336,45 +360,79 @@ describe("issue #38 append-only record framing", () => {
 			}
 			parentPort.postMessage(ids);
 		`;
-		const gate = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-		const writerCount = 64;
-		const workerResults = await Promise.all(
-			[1, 2].map(
-				(writer) =>
-					new Promise<string[]>((resolve, reject) => {
-						const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(workerSource)}`), {
-							workerData: { gate, file, tempDir, writer, count: writerCount },
-						});
-						worker.once("message", resolve);
-						worker.once("error", reject);
-						worker.once("exit", (code) => {
-							if (code !== 0) reject(new Error(`writer ${writer} exited with code ${code}`));
-						});
+			const gate = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+			const writerCount = 64;
+			const workers: Worker[] = [];
+			let writerTimeout: ReturnType<typeof setTimeout> | undefined;
+			let workerResults: string[][];
+			try {
+				workerResults = await Promise.race([
+					Promise.all(
+						[1, 2].map(
+							(writer) =>
+								new Promise<string[]>((resolve, reject) => {
+									const worker = new Worker(
+										new URL(`data:text/javascript,${encodeURIComponent(workerSource)}`),
+										{
+											workerData: {
+												gate,
+												file,
+												tempDir,
+												writer,
+												count: writerCount,
+												notifyBeforeWait: schedule === "notify-before-wait",
+											},
+										},
+									);
+									workers.push(worker);
+									worker.once("message", resolve);
+									worker.once("error", reject);
+									worker.once("exit", (code) => {
+										if (code !== 0)
+											reject(
+												new Error(`writer ${writer} exited with code ${code}; inspect the writer failure.`),
+											);
+									});
+								}),
+						),
+					),
+					new Promise<never>((_resolve, reject) => {
+						writerTimeout = setTimeout(() => {
+							reject(
+								new Error(
+									"Worker writers did not complete within 20 seconds; inspect their readiness and append progress.",
+								),
+							);
+						}, 20_000);
 					}),
-			),
-		);
-
-		const contents = readFileSync(file, "utf8");
-		const reloaded = SessionManager.open(file, tempDir);
-		const writerIds = workerResults.flat();
-		const payloads = reloaded
-			.getEntries()
-			.filter((entry): entry is CustomEntry<{ writer: number; sequence: number }> => entry.type === "custom")
-			.map((entry) => entry.data);
-		expect(reloaded.getEntries().map((entry) => entry.id)).toEqual(
-			expect.arrayContaining(["assistant-entry", ...writerIds]),
-		);
-		expect(writerIds).toHaveLength(writerCount * 2);
-		expect(new Set(writerIds).size).toBe(writerCount * 2);
-		expect(payloads).toHaveLength(writerCount * 2);
-		for (const writer of [1, 2]) {
-			for (let sequence = 0; sequence < writerCount; sequence++) {
-				expect(payloads).toContainEqual({ writer, sequence });
+				]);
+			} finally {
+				clearTimeout(writerTimeout);
+				await Promise.all(workers.map((worker) => worker.terminate()));
 			}
-		}
-		expect(reloaded.getParsingErrors()).toEqual([]);
-		expect(contents.startsWith(original)).toBe(true);
-	});
+
+			const contents = readFileSync(file, "utf8");
+			const reloaded = SessionManager.open(file, tempDir);
+			const writerIds = workerResults.flat();
+			const payloads = reloaded
+				.getEntries()
+				.filter((entry): entry is CustomEntry<{ writer: number; sequence: number }> => entry.type === "custom")
+				.map((entry) => entry.data);
+			expect(reloaded.getEntries().map((entry) => entry.id)).toEqual(
+				expect.arrayContaining(["assistant-entry", ...writerIds]),
+			);
+			expect(writerIds).toHaveLength(writerCount * 2);
+			expect(new Set(writerIds).size).toBe(writerCount * 2);
+			expect(payloads).toHaveLength(writerCount * 2);
+			for (const writer of [1, 2]) {
+				for (let sequence = 0; sequence < writerCount; sequence++) {
+					expect(payloads).toContainEqual({ writer, sequence });
+				}
+			}
+			expect(reloaded.getParsingErrors()).toEqual([]);
+			expect(contents.startsWith(original)).toBe(true);
+		},
+	);
 
 	it("loads a legacy header without cwd", () => {
 		const header = legacyHeader();
