@@ -173,9 +173,28 @@ async function stopActiveRuns(signal) {
           }
         }, graceMs);
         const deadline = Date.now() + boundMs;
-        while (taskGroupExists(pid)) {
-          if (signalError) throw signalError;
-          if (Date.now() >= deadline) throw new Error(`task process group ${pid} remains present after ${boundMs} ms`);
+        let permissionError = null;
+        let permissionWaitReported = false;
+        while (true) {
+          let groupPresent;
+          try {
+            groupPresent = taskGroupExists(pid);
+          } catch (error) {
+            if (error.code !== "EPERM") throw error;
+            permissionError = error;
+            groupPresent = true;
+          }
+          if ((permissionError || signalError?.code === "EPERM") && !permissionWaitReported) {
+            process.stderr.write(`vinci worker: ${signal}: task ${entry.taskId} process group ${pid} returned EPERM; waiting within ${boundMs} ms for verified disappearance before releasing its leases\n`);
+            permissionWaitReported = true;
+          }
+          // An exiting group can briefly refuse probes; only ESRCH proves it disappeared.
+          if (!groupPresent) break;
+          if (signalError && signalError.code !== "EPERM") throw signalError;
+          if (Date.now() >= deadline) {
+            const refusal = signalError ?? permissionError;
+            throw new Error(`task process group ${pid} remains unverified after ${boundMs} ms${refusal ? ` (${refusal.message})` : ""}`);
+          }
           await new Promise((resolveWait) => setTimeout(resolveWait, 25));
         }
       }
