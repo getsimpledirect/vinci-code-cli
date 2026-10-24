@@ -27,6 +27,7 @@
 //   repoOwner: the GitHub owner of origin (the envelope's repo); derived from the origin URL if absent.
 //   exec:      the structured runner (exec.mjs `command` with allowFailure); injectable for tests.
 import { command } from "./exec.mjs";
+import { createHash } from "node:crypto";
 
 const PR_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
 const SHA = /^[0-9a-f]{7,64}$/;
@@ -34,6 +35,27 @@ const FOOTER_TASK = /^vinci-worker: task=(\S+)/m;
 const PR_JSON_FIELDS = "number,url,state,headRefOid,headRefName,baseRefName,headRepositoryOwner,body";
 
 export const DEFAULT_BASE_REF = "main";
+
+// Persist a credential-free identity, never the configured transport string. The digest binds
+// the exact string consumed by Git without copying URL userinfo, query tokens or fragments.
+export function remoteTransportIdentity(transport) {
+  if (typeof transport !== "string" || !transport) return { remote_url: null, remote_transport_sha256: null };
+  const digest = createHash("sha256").update(transport).digest("hex");
+  let identity = `git-transport:sha256:${digest}`;
+  try {
+    const url = new URL(transport);
+    if (["https:", "http:", "ssh:", "git:", "file:"].includes(url.protocol)) {
+      url.username = ""; url.password = ""; url.search = ""; url.hash = "";
+      identity = url.toString();
+    }
+  } catch {
+    // SCP-style SSH URLs carry a login before '@'. Only the host and repository path survive.
+    const scp = /^(?:[^@\s]+@)?([A-Za-z0-9.-]+):([^\s?#]+)(?:[?#].*)?$/.exec(transport);
+    if (scp) identity = `ssh://${scp[1]}/${scp[2]}`;
+    else if (transport.startsWith("/") && !/[\s?#]/.test(transport)) identity = `file://${transport}`;
+  }
+  return { remote_url: identity, remote_transport_sha256: digest };
+}
 
 const defaultExec = (name, args, options = {}) => command(name, args, { ...options, allowFailure: true });
 
@@ -162,10 +184,17 @@ async function findOurOpenPr(context) {
 }
 
 // P2: what origin holds for the branch right now; null sha when the branch is absent.
-export async function remoteBranchSha({ repoDir, branch, exec }) {
-  const probe = await exec("git", ["-C", repoDir, "ls-remote", "origin", `refs/heads/${branch}`]);
+export async function remoteBranchSha({ repoDir, branch, remote = "origin", exec = defaultExec }) {
+  const ref = `refs/heads/${branch}`;
+  const probe = await exec("git", ["-C", repoDir, "ls-remote", remote, ref]);
   if (probe.status !== 0) return { sha: null, error: probe.stderr || `ls-remote exited ${probe.status}` };
-  return { sha: shaOrNull(probe.stdout), error: null };
+  const lines = probe.stdout ? probe.stdout.split("\n") : [];
+  if (lines.length === 0) return { sha: null, error: null };
+  const fields = lines.length === 1 ? lines[0].split("\t") : [];
+  if (fields.length !== 2 || fields[1] !== ref || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(fields[0])) {
+    return { sha: null, error: `ls-remote did not return exactly ${ref}` };
+  }
+  return { sha: fields[0], error: null };
 }
 
 // B5: the PR we are about to record must be AT the pushed sha.
@@ -217,12 +246,19 @@ export async function publish({
     remote_sha_before: null,
     remote_sha_after: null,
     base_ref: base,
+    remote_url: null,
+    remote_transport_sha256: null,
+    remote_ref: `refs/heads/${branch}`,
+    remote_measurement: "git ls-remote origin; fetch URL resolution",
+    remote_readback_verified: false,
   };
 
   // The sha we publish is captured ONCE; every later step refers to it, never to the branch name.
   const localHead = await exec("git", ["-C", repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
   const head = localHead.status === 0 ? shaOrNull(localHead.stdout) : null;
   if (!head) return { ...record, publish: "push_failed", push_error: `local refs/heads/${branch} does not resolve to a commit` };
+  const remoteUrl = await exec("git", ["-C", repoDir, "remote", "get-url", "origin"]);
+  Object.assign(record, remoteTransportIdentity(remoteUrl.status === 0 ? remoteUrl.stdout : null));
 
   // --- P2: remote SHA discipline (sample T0) --------------------------------------------------
   const remote = await remoteBranchSha({ repoDir, branch, exec });
@@ -253,6 +289,7 @@ export async function publish({
     record.pushed_sha = head;
     record.remote_sha_after = head;
     record.push_skipped = "remote_at_head";
+    record.remote_readback_verified = true;
   } else {
     const gate = await checkFence(fence, "push");
     if (!gate.valid) return { ...record, publish: "fenced_out", fenced_out: gate.reason };
@@ -279,6 +316,7 @@ export async function publish({
       return { ...record, publish: "remote_readback_mismatch", refusal_reason: `origin/${branch} reads ${readback.sha ?? readback.error ?? "absent"} after pushing ${head}` };
     }
     record.publish = "pushed";
+    record.remote_readback_verified = true;
   }
 
   if (!wantPr) return record;

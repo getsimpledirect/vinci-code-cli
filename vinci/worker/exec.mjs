@@ -35,32 +35,50 @@ export function command(commandName, args, options = {}) {
     });
     let stdout = options.rawStdout ? [] : "";
     let stderr = "";
+    let outputBytes = 0;
+    let captureError = null;
+    const timer = options.timeoutMs ? setTimeout(() => {
+      captureError = `command exceeded ${options.timeoutMs} ms`;
+      child.kill("SIGKILL");
+    }, options.timeoutMs) : null;
+    const acceptsChunk = (chunk) => {
+      outputBytes += Buffer.byteLength(chunk);
+      if (options.maxOutputBytes && outputBytes > options.maxOutputBytes) {
+        captureError = `command output exceeded ${options.maxOutputBytes} bytes`;
+        child.kill("SIGKILL");
+      }
+      return captureError === null;
+    };
     if (!options.rawStdout) child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
+      if (!acceptsChunk(chunk)) return;
       if (options.rawStdout) stdout.push(Buffer.from(chunk));
       else stdout += chunk;
     });
     child.stderr.on("data", (chunk) => {
+      if (!acceptsChunk(chunk)) return;
       stderr += chunk;
     });
     let settled = false;
     child.once("error", (error) => {
+      if (timer) clearTimeout(timer);
       settled = true;
       if (options.allowFailure) resolveCommand({ status: null, signal: null, stdout: options.rawStdout ? Buffer.alloc(0) : "", stderr: error.message });
       else rejectCommand(error);
     });
     child.once("close", (status, signal) => {
+      if (timer) clearTimeout(timer);
       if (settled) return;
       settled = true;
       const result = {
-        status,
+        status: captureError ? null : status,
         signal,
-        stdout: options.rawStdout ? Buffer.concat(stdout) : stdout.trim(),
-        stderr: stderr.trim(),
+        stdout: captureError ? (options.rawStdout ? Buffer.alloc(0) : "") : options.rawStdout ? Buffer.concat(stdout) : stdout.trim(),
+        stderr: captureError ?? stderr.trim(),
       };
-      if (status === 0 || options.allowFailure) resolveCommand(result);
-      else rejectCommand(new Error(`${commandName} ${args.join(" ")} failed: ${stderr.trim() || signal || status}`));
+      if ((!captureError && status === 0) || options.allowFailure) resolveCommand(result);
+      else rejectCommand(new Error(`${commandName} ${args.join(" ")} failed: ${result.stderr || signal || status}`));
     });
   });
 }
