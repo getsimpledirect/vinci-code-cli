@@ -107,7 +107,7 @@ or rewrites the archive. Dispatching either workflow requires its own authorizat
 | `extensions/vinci-receipt.ts` | Durable task handoff — explicit `DONE`, `DONE-UNVERIFIED`, `WAITING`, or `BLOCKED`; changed files, verifier-owned evidence, `/undo`, active duration, and a session-local model-call/token/cache/cost meter. `/usage` shows the same record and points to the Vinci app for authoritative account credits |
 | `extensions/vinci-render.ts` | Friendly activity display — semantic action headers, outcome-first collapsed results, burst folding, and secret masking on expanded output |
 | `extensions/vinci-compact.ts` | Calm compaction UX (reframe + "caught up, here's what I kept" resume) |
-| `extensions/vinci-copy.ts` | Clipboard helper — `/copy` or Alt+C opens Vinci's last message, last code block, and last tool output without terminal text selection |
+| `extensions/vinci-copy.ts` | Clipboard helper — `/copy` or Alt+C opens Vinci's last message, last code block, and last tool output without terminal text selection. The picker also explains fullscreen and terminal selection settings. |
 | `APPEND_SYSTEM.md` | Character pack (reinforcement; the gateway injects it server-side too) |
 | `assets/` · `BRAND.md` | Brandmark + wordmark + palette (SVG) · palette hex |
 | `bin/vinci` | Launcher — Pi + the brand layer + extensions via flags |

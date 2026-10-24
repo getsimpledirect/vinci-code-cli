@@ -25,6 +25,27 @@ type CopyChoice = {
 type ClipboardRoute = "native" | "terminal" | "remote-only";
 type ClipboardWriter = (text: string) => Promise<ClipboardRoute> | Promise<void>;
 
+export function selectionCopyHint(env: Record<string, string | undefined>): string {
+  let hint = "For terminal selection, use copy-on-select if your terminal supports it, or use /copy.";
+  if (env.TERM_PROGRAM === "iTerm.app" || env.LC_TERMINAL === "iTerm2") {
+    hint = 'For terminal selection, iTerm2: Settings > General > Selection > "Copy to clipboard on selection".';
+  } else if (env.TERM_PROGRAM === "Apple_Terminal") {
+    hint = "For terminal selection, Terminal.app: select text, then press Cmd+C, or use /copy.";
+  } else if (env.TERM_PROGRAM === "ghostty") {
+    hint = 'For terminal selection, Ghostty: set "copy-on-select = clipboard" in your Ghostty config.';
+  } else if (env.KITTY_WINDOW_ID || env.TERM === "xterm-kitty") {
+    hint = 'For terminal selection, kitty: set "copy_on_select clipboard" in kitty.conf.';
+  } else if (env.TERM_PROGRAM === "WezTerm") {
+    hint = "For terminal selection, WezTerm copies mouse selections by default; check mouse_bindings in your config.";
+  } else if (env.TERM_PROGRAM === "vscode") {
+    hint = 'For terminal selection, VS Code: enable "terminal.integrated.copyOnSelection".';
+  } else if (env.WT_SESSION) {
+    hint = 'For terminal selection, Windows Terminal: set "copyOnSelect": true in settings.json.';
+  }
+  const tmuxHint = env.TMUX ? " In tmux, check its copy-mode and clipboard settings too." : "";
+  return "Vinci fullscreen: /settings > Copy on select (VINCI_COPY_ON_SELECT=0 keeps it off). " + hint + tmuxHint;
+}
+
 /** Remove ANSI escape sequences and terminal control characters from copied output. */
 export function stripAnsiSequences(text: string): string {
   return (
@@ -124,13 +145,16 @@ export default function (pi: ExtensionAPI, writeClipboard: ClipboardWriter = cop
       const choices = copyChoices([...sessionMessages(ctx), ...liveMessages]);
       if (choices.length === 0) {
         ctx.ui.notify("Nothing from Vinci is ready to copy yet.", "info");
+        ctx.ui.notify(selectionCopyHint(process.env), "info");
         return;
       }
 
-      const selected = await ctx.ui.select(
-        "Copy to clipboard",
-        choices.map((choice) => choice.label),
-      );
+      const hintLabel = "How to copy by selecting text";
+      const selected = await ctx.ui.select("Copy to clipboard", [...choices.map((choice) => choice.label), hintLabel]);
+      if (selected === hintLabel) {
+        ctx.ui.notify(selectionCopyHint(process.env), "info");
+        return;
+      }
       const choice = choices.find((candidate) => candidate.label === selected);
       if (!choice) return;
 
