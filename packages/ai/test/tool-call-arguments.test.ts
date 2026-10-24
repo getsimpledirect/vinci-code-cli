@@ -14,13 +14,29 @@ vi.mock("openai", () => ({
 						async *[Symbol.asyncIterator]() {
 							for (const part of [provider.arguments.slice(0, 12), provider.arguments.slice(12)]) {
 								yield {
-									choices: [{ delta: { tool_calls: [{ index: 0, id: "call-write", type: "function", function: { name: "write", arguments: part } }] }, finish_reason: null }],
+									choices: [
+										{
+											delta: {
+												tool_calls: [
+													{
+														index: 0,
+														id: "call-write",
+														type: "function",
+														function: { name: "write", arguments: part },
+													},
+												],
+											},
+											finish_reason: null,
+										},
+									],
 								};
 							}
 							yield { choices: [{ delta: {}, finish_reason: "tool_calls" }] };
 						},
 					};
-					return { withResponse: async () => ({ data: chunks, response: { status: 200, headers: new Headers() } }) };
+					return {
+						withResponse: async () => ({ data: chunks, response: { status: 200, headers: new Headers() } }),
+					};
 				},
 			},
 		};
@@ -77,9 +93,16 @@ describe("completed tool-call arguments", () => {
 		provider.arguments = raw;
 		const response = await stream(
 			{
-				id: "offline", name: "offline", api: "openai-completions", provider: "vinci",
-				baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024,
+				id: "offline",
+				name: "offline",
+				api: "openai-completions",
+				provider: "vinci",
+				baseUrl: "https://example.invalid",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 8192,
+				maxTokens: 1024,
 			},
 			{ messages: [{ role: "user", content: "write", timestamp: 0 }] },
 			{ apiKey: "offline-test" },

@@ -22,7 +22,7 @@ import { runPrintMode } from "../src/modes/print-mode.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
 // Synthetic, unusable provider-shaped text follows the existing mask-integration test pattern.
-const SECRET = "sk-ant-" + "TESTONLY-" + "c".repeat(40);
+const SECRET = `sk-ant-TESTONLY-${"c".repeat(40)}`;
 const MALFORMED_ARGUMENTS = `{"path":"a.txt","content":"${SECRET}`;
 const ARGUMENTS_ERROR = `Unexpected end of JSON input\nReceived arguments:\n${MALFORMED_ARGUMENTS}`;
 type DiagnosticToolCall = ToolCall & { argumentsError?: string };

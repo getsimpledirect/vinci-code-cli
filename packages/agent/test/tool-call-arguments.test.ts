@@ -15,11 +15,29 @@ vi.mock("openai", () => ({
 				create: () => {
 					const chunks = {
 						async *[Symbol.asyncIterator]() {
-							yield { choices: [{ delta: { tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: provider.name, arguments: provider.arguments } }] }, finish_reason: null }] };
+							yield {
+								choices: [
+									{
+										delta: {
+											tool_calls: [
+												{
+													index: 0,
+													id: "call-1",
+													type: "function",
+													function: { name: provider.name, arguments: provider.arguments },
+												},
+											],
+										},
+										finish_reason: null,
+									},
+								],
+							};
 							yield { choices: [{ delta: {}, finish_reason: "tool_calls" }] };
 						},
 					};
-					return { withResponse: async () => ({ data: chunks, response: { status: 200, headers: new Headers() } }) };
+					return {
+						withResponse: async () => ({ data: chunks, response: { status: 200, headers: new Headers() } }),
+					};
 				},
 			},
 		};
@@ -27,29 +45,50 @@ vi.mock("openai", () => ({
 }));
 
 const model = {
-	id: "offline", name: "offline", api: "openai-completions" as const, provider: "vinci",
-	baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024,
+	id: "offline",
+	name: "offline",
+	api: "openai-completions" as const,
+	provider: "vinci",
+	baseUrl: "https://example.invalid",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 8192,
+	maxTokens: 1024,
 } satisfies AgentLoopConfig["model"];
 
 const edits = [{ oldText: "before", newText: "after" }];
 
 // Faithful write/edit schemas from coding-agent/core/tools; spies replace filesystem operations.
 const writeSchema = Type.Object({ path: Type.String(), content: Type.String() });
-const editSchema = Type.Object({ path: Type.String(), edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }, {})) }, {});
+const editSchema = Type.Object(
+	{ path: Type.String(), edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }, {})) },
+	{},
+);
 
-async function runCall(name: "write" | "edit", raw: string, options: {
-	call?: ToolCall;
-	prepareArguments?: AgentTool["prepareArguments"];
-	mode?: "parallel" | "sequential";
-} = {}) {
+async function runCall(
+	name: "write" | "edit",
+	raw: string,
+	options: {
+		call?: ToolCall;
+		prepareArguments?: AgentTool["prepareArguments"];
+		mode?: "parallel" | "sequential";
+	} = {},
+) {
 	provider.name = name;
 	provider.arguments = raw;
-	const execute = vi.fn(async (_id: string, _args: unknown) => ({ content: [{ type: "text" as const, text: "executed" }], details: undefined }));
+	const execute = vi.fn(async (_id: string, _args: unknown) => ({
+		content: [{ type: "text" as const, text: "executed" }],
+		details: undefined,
+	}));
 	const beforeToolCall = vi.fn(async () => undefined);
 	const tool: AgentTool = {
-		name, label: name, description: name, parameters: name === "write" ? writeSchema : editSchema,
-		execute, prepareArguments: options.prepareArguments,
+		name,
+		label: name,
+		description: name,
+		parameters: name === "write" ? writeSchema : editSchema,
+		execute,
+		prepareArguments: options.prepareArguments,
 	};
 	const contexts: Context[] = [];
 	const streamFn: StreamFn = (_model, context) => {
@@ -57,10 +96,21 @@ async function runCall(name: "write" | "edit", raw: string, options: {
 		if (contexts.length === 1 && !options.call) return streamCompletions(model, context, { apiKey: "offline-test" });
 		const result = createAssistantMessageEventStream();
 		const message = {
-			role: "assistant" as const, api: model.api, provider: model.provider, model: model.id,
+			role: "assistant" as const,
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
 			content: contexts.length === 1 && options.call ? [options.call] : [{ type: "text" as const, text: "done" }],
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-			stopReason: contexts.length === 1 && options.call ? "toolUse" as const : "stop" as const, timestamp: 0,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: contexts.length === 1 && options.call ? ("toolUse" as const) : ("stop" as const),
+			timestamp: 0,
 		};
 		result.push({ type: "done", reason: message.stopReason, message });
 		result.end(message);
@@ -70,8 +120,17 @@ async function runCall(name: "write" | "edit", raw: string, options: {
 	await runAgentLoop(
 		[{ role: "user", content: "perform the operation", timestamp: 0 }],
 		{ systemPrompt: "", messages: [], tools: [tool] },
-		{ model, convertToLlm: (messages) => messages as Context["messages"], beforeToolCall, toolExecution: options.mode },
-		(event) => { events.push(event); }, undefined, streamFn,
+		{
+			model,
+			convertToLlm: (messages) => messages as Context["messages"],
+			beforeToolCall,
+			toolExecution: options.mode,
+		},
+		(event) => {
+			events.push(event);
+		},
+		undefined,
+		streamFn,
 	);
 	const returned = contexts[1]?.messages.find((message) => message.role === "toolResult");
 	return { execute, beforeToolCall, returned, events };
@@ -80,12 +139,20 @@ async function runCall(name: "write" | "edit", raw: string, options: {
 function expectRefused(result: Awaited<ReturnType<typeof runCall>>) {
 	expect(result.execute).toHaveBeenCalledTimes(0);
 	expect(result.beforeToolCall).toHaveBeenCalledTimes(0);
-	expect(result.returned).toMatchObject({ role: "toolResult", isError: true, content: [{ type: "text", text: expect.stringContaining("Invalid arguments") }] });
+	expect(result.returned).toMatchObject({
+		role: "toolResult",
+		isError: true,
+		content: [{ type: "text", text: expect.stringContaining("Invalid arguments") }],
+	});
 }
 
 describe("agent completed tool-call argument validation", () => {
-	beforeEach(() => { vi.stubEnv("VINCI_CODE", "1"); });
-	afterEach(() => { vi.unstubAllEnvs(); });
+	beforeEach(() => {
+		vi.stubEnv("VINCI_CODE", "1");
+	});
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
 
 	it.each(["parallel", "sequential"] as const)("T4 managed malformed write executes zero times (%s)", async (mode) => {
 		expectRefused(await runCall("write", '{"path":"a.txt","content":"hel', { mode }));
@@ -105,7 +172,13 @@ describe("agent completed tool-call argument validation", () => {
 
 	it("T4 refuses a provider parse error even when argument preparation supplies valid fields", async () => {
 		const result = await runCall("write", "", {
-			call: { type: "toolCall", id: "call-1", name: "write", arguments: {}, argumentsError: "Malformed outer JSON" } as ToolCall,
+			call: {
+				type: "toolCall",
+				id: "call-1",
+				name: "write",
+				arguments: {},
+				argumentsError: "Malformed outer JSON",
+			} as ToolCall,
 			prepareArguments: () => ({ path: "a.txt", content: "default" }),
 		});
 		expectRefused(result);
@@ -129,7 +202,13 @@ describe("agent completed tool-call argument validation", () => {
 		const raw = `${JSON.stringify({ path: "a.txt", edits: JSON.stringify(edits) }).slice(0, -1)},"tail":"cut`;
 		// External/faux providers may retain a streamed prefix together with the final parse error.
 		// Repairing that prefix must never make the failed outer call executable.
-		const call = { type: "toolCall", id: "call-1", name: "edit", arguments: parseStreamingJson(raw), argumentsError: `Malformed outer JSON\n\nReceived arguments:\n${raw}` } as ToolCall;
+		const call = {
+			type: "toolCall",
+			id: "call-1",
+			name: "edit",
+			arguments: parseStreamingJson(raw),
+			argumentsError: `Malformed outer JSON\n\nReceived arguments:\n${raw}`,
+		} as ToolCall;
 		expectRefused(await runCall("edit", raw, { call }));
 	});
 });
