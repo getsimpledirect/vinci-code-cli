@@ -69,3 +69,12 @@ vinci/extensions/lib/vinci-class.js
 vinci/extensions/lib/vinci-class.js.map
 vinci/extensions/lib/vinci-class.d.ts
 vinci/extensions/lib/vinci-class.d.ts.map
+# Same pattern for the Vinci model catalogue and the shared links it imports (imported by the coding-agent model picker).
+vinci/extensions/lib/model-catalogue.js
+vinci/extensions/lib/model-catalogue.js.map
+vinci/extensions/lib/model-catalogue.d.ts
+vinci/extensions/lib/model-catalogue.d.ts.map
+vinci/extensions/vinci-links.js
+vinci/extensions/vinci-links.js.map
+vinci/extensions/vinci-links.d.ts
+vinci/extensions/vinci-links.d.ts.map
