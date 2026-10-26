@@ -149,7 +149,7 @@ test("F-11 usage separates empty, missing telemetry and cumulative session usage
   assert.match(text, /400 in \/ 40 out/);
   assert.match(text, /50% cached/);
   assert.match(text, /~\$0\.0930 estimated/);
-  const zero = harness([message({ usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } })], "b2-real-zero");
+  const zero = harness([message({ content: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } })], "b2-real-zero");
   await zero.commands.usage.handler("", zero.ctx);
   assert.match(zero.notifications.at(-1), /~\$0\.0000 estimated/, "measured zero differs from missing telemetry");
   assert.doesNotMatch(zero.notifications.at(-1), /Usage unavailable/);
@@ -162,6 +162,49 @@ test("F-11 usage separates empty, missing telemetry and cumulative session usage
   accumulator.hydrateVinciTaskUsage("b2-cumulative", snapshot);
   await live.commands.usage.handler("", live.ctx);
   assert.match(live.notifications.at(-1), /Usage unavailable/, "resuming preserves missing-telemetry status");
+});
+
+test("F1 content or tool calls with all-zero usage report unavailable telemetry", async () => {
+  const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+  for (const [kind, content] of [
+    ["text", [{ type: "text", text: "Done." }]],
+    ["tool", [{ type: "toolCall", id: "b2-tool", name: "read", arguments: { path: "parser.ts" } }]],
+    ["string", "Done."],
+  ]) {
+    // This is the completed message shape when the stream never carries a usage chunk.
+    const missing = harness([message({ content, usage: zeroUsage })], `b2-zero-${kind}`);
+    await missing.commands.usage.handler("", missing.ctx);
+    const text = missing.notifications.at(-1);
+    assert.match(text, /1 model call · Usage unavailable/, `${kind} without telemetry`);
+    assert.doesNotMatch(text, /0 in \/ 0 out|0% cached|\$0\.0000/);
+    assert.equal(missing.saved.usage.telemetryUnavailable, true);
+    assert.equal(accumulator.vinciUsageFromResponse(message({ content, usage: zeroUsage })).telemetryUnavailable, true);
+  }
+
+  const mixed = harness([message(), message({ responseId: "b2-zero-mixed", usage: zeroUsage })], "b2-zero-mixed");
+  await mixed.commands.usage.handler("", mixed.ctx);
+  assert.match(mixed.notifications.at(-1), /2 model calls · Usage unavailable/);
+  assert.doesNotMatch(mixed.notifications.at(-1), /200 in \/ 20 out|\$0\.0465/);
+
+  // Each real field independently prevents the all-zero check; totalTokens is not required.
+  for (const field of ["input", "output", "cacheRead", "cacheWrite", "cost"]) {
+    const usage = { ...zeroUsage, [field]: field === "cost" ? { total: 0.01 } : 1 };
+    const measured = harness([message({ usage })], `b2-nonzero-${field}`);
+    await measured.commands.usage.handler("", measured.ctx);
+    assert.doesNotMatch(measured.notifications.at(-1), /Usage unavailable/, `${field} is non-zero`);
+    assert.notEqual(accumulator.vinciUsageFromResponse(message({ usage })).telemetryUnavailable, true);
+  }
+
+  const supplemental = harness([message()], "b2-zero-supplemental");
+  accumulator.recordVinciTaskCall("b2-zero-supplemental", message({ responseId: "b2-zero-extra", usage: zeroUsage }), "test");
+  await supplemental.commands.usage.handler("", supplemental.ctx);
+  assert.match(supplemental.notifications.at(-1), /2 model calls · Usage unavailable/);
+  const snapshot = JSON.parse(JSON.stringify(accumulator.getVinciTaskUsageSnapshot("b2-zero-supplemental")));
+  assert(accumulator.isVinciUsageSnapshot(snapshot));
+  accumulator.resetVinciTaskUsage("b2-zero-supplemental");
+  accumulator.hydrateVinciTaskUsage("b2-zero-supplemental", snapshot);
+  await supplemental.commands.usage.handler("", supplemental.ctx);
+  assert.match(supplemental.notifications.at(-1), /2 model calls · Usage unavailable/, "resuming preserves all-zero telemetry status");
 });
 
 test("F-14 usage puts plain model, billing and readable key lines before diagnostics", async () => {

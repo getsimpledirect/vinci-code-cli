@@ -352,7 +352,7 @@ function summarizeAssistantUsage(messages: readonly unknown[]): VinciTaskUsage {
   };
   for (const message of assistantMessages(messages)) {
     usage.modelCalls++;
-    if (!hasVinciUsageTelemetry(message.usage)) usage.telemetryUnavailable = true;
+    if (!hasVinciUsageTelemetry(message.usage, message.content)) usage.telemetryUnavailable = true;
     usage.inputTokens += finite(message.usage?.input);
     usage.outputTokens += finite(message.usage?.output);
     usage.cachedTokens += finite(message.usage?.cacheRead);

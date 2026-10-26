@@ -49,13 +49,18 @@ type UsageLike = {
   cost?: { total?: unknown };
 };
 
-export function hasVinciUsageTelemetry(usage: UsageLike | undefined): boolean {
-  return !!usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.cost?.total].every(
-    (value) => typeof value === "number" && Number.isFinite(value) && value >= 0,
-  );
+export function hasVinciUsageTelemetry(usage: UsageLike | undefined, content?: unknown): boolean {
+  if (!usage) return false;
+  const values = [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.cost?.total];
+  if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0)) return false;
+  // Streams can leave their initial zero counters untouched when no usage chunk arrives.
+  // Content (including tool calls) with only zeros is therefore not usable telemetry.
+  const hasContent = typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
+  return !hasContent || values.some((value) => value !== 0);
 }
 
 type ModelResponseLike = {
+  content?: unknown;
   provider?: unknown;
   model?: unknown;
   responseModel?: unknown;
@@ -219,7 +224,7 @@ function usageFromResponse(response: ModelResponseLike): VinciAccumulatedUsage {
     cacheWriteTokens: finite(response.usage?.cacheWrite),
     reasoningTokens: finite(response.usage?.reasoning),
     estimatedCostUsd: finite(response.usage?.cost?.total),
-    ...(!hasVinciUsageTelemetry(response.usage) ? { telemetryUnavailable: true } : {}),
+    ...(!hasVinciUsageTelemetry(response.usage, response.content) ? { telemetryUnavailable: true } : {}),
     providers: provider,
     models: model ? [model] : [],
     observedModels: observed ? [observed] : [],
