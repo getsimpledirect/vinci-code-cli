@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,23 +45,18 @@ async function runAll(value) {
 	return Promise.all(flagCases.map((args) => run(args, value)));
 }
 
-// 🔴 DEFAULT (nothing set) MUST ACCEPT. Vinci Code is an open-source client: someone who clones it
-// and has their own provider key must be able to work immediately, with no Vinci account. This case
-// is the whole point — it previously asserted the opposite, and nothing caught that, because this
-// file was not wired into vinci/test/run.sh at all.
+// T8: catch the launcher default before dispatching an external runtime.
+assert.match(readFileSync(launcher, "utf8"), /\$\{VINCI_SHOW_OTHER_PROVIDERS:-0\}/, "T8 launcher defaults to managed-only");
+
+// A fresh launch keeps the managed account boundary until the user opts in.
 const defaultResults = await runAll(undefined);
 for (const [i, args] of flagCases.entries()) {
 	const result = defaultResults[i];
-	assert.equal(result.status, 0, `default must ACCEPT ${args[0]} — no account required: ${result.stderr}`);
-	assert.doesNotMatch(
-		result.stderr,
-		/managed Vinci model class/,
-		`default must not tell a BYOK user ${args[0]} is unsupported`,
-	);
-	assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+$/, `${args[0]} must reach normal dispatch`);
+	assert.equal(result.status, 2, `default must reject ${args[0]}`);
+	assert.match(result.stderr, /managed Vinci model class/);
 }
 
-// Explicit opt-in behaves the same as the default.
+// Explicit opt-in still reaches the other providers.
 const optInResults = await runAll("1");
 for (const [i, args] of flagCases.entries()) {
 	const result = optInResults[i];
@@ -78,5 +74,5 @@ for (const [i, args] of flagCases.entries()) {
 }
 
 process.stdout.write(
-	`byok-launcher-integration: default and =1 ACCEPT all ${flagCases.length} provider flags (no account required); =0 restores the managed-only boundary\n`,
+	`byok-launcher-integration: default and explicit opt-out reject all ${flagCases.length} provider flags; explicit opt-in accepts them\n`,
 );

@@ -9,6 +9,12 @@ import {
 	Text,
 	type TUI,
 } from "@earendil-works/pi-tui";
+import {
+	createVinciModelCatalogue,
+	groupVinciModels,
+	loadVinciModelCatalogue,
+	type VinciModelCatalogue,
+} from "../../../../../../vinci/extensions/lib/model-catalogue.ts";
 import type { ModelRegistry } from "../../../core/model-registry.ts";
 import type { SettingsManager } from "../../../core/settings-manager.ts";
 import { getModelSelectorSearchText } from "../model-search.ts";
@@ -61,6 +67,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private scope: ModelScope = "all";
 	private scopeText?: Text;
 	private scopeHintText?: Text;
+	private vinciCatalogue: VinciModelCatalogue;
+	private loadVinciCatalogue: () => Promise<VinciModelCatalogue>;
 
 	constructor(
 		tui: TUI,
@@ -71,6 +79,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		onSelect: (model: Model<any>) => void,
 		onCancel: () => void,
 		initialSearchInput?: string,
+		catalogueFetch?: typeof fetch,
 	) {
 		super();
 
@@ -82,18 +91,24 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.scope = scopedModels.length > 0 ? "scoped" : "all";
 		this.onSelectCallback = onSelect;
 		this.onCancelCallback = onCancel;
+		this.loadVinciCatalogue = catalogueFetch ? createVinciModelCatalogue(catalogueFetch) : loadVinciModelCatalogue;
 
 		// Add top border
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 
 		// Add hint about model filtering
+		if (process.env.VINCI_CODE === "1") {
+			this.addChild(
+				new Text(theme.fg("muted", "Showing Vinci models. Use /providers to add other providers."), 0, 0),
+			);
+		}
 		if (scopedModels.length > 0) {
 			this.scopeText = new Text(this.getScopeText(), 0, 0);
 			this.addChild(this.scopeText);
 			this.scopeHintText = new Text(this.getScopeHintText(), 0, 0);
 			this.addChild(this.scopeHintText);
-		} else {
+		} else if (process.env.VINCI_CODE !== "1") {
 			const hintText = "Only showing models from configured providers. Use /login to add providers.";
 			this.addChild(new Text(theme.fg("warning", hintText), 0, 0));
 		}
@@ -137,6 +152,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private async loadModels(): Promise<void> {
 		let models: ModelItem[];
+		if (process.env.VINCI_CODE === "1") this.vinciCatalogue = await this.loadVinciCatalogue();
 
 		// Refresh to pick up any changes to models.json
 		this.modelRegistry.refresh();
@@ -181,6 +197,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			id: scoped.model.id,
 			model: scoped.model,
 		}));
+		if (process.env.VINCI_CODE === "1") {
+			this.scopedModelItems = groupVinciModels(
+				this.scopedModelItems.filter((item) => this.settingsManager.getShowOtherProviders() || item.provider === "vinci"),
+			);
+		}
 		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
 		this.filteredModels = this.activeModels;
 		const currentIndex = this.filteredModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
@@ -192,17 +213,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		const sorted = [...models];
 		// Sort: Vinci first in managed mode, then current model, then provider.
 		sorted.sort((a, b) => {
-			if (process.env.VINCI_CODE === "1" && this.settingsManager.getShowOtherProviders()) {
-				const vinciOrder = Number(b.provider === "vinci") - Number(a.provider === "vinci");
-				if (vinciOrder !== 0) return vinciOrder;
-			}
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
 			if (aIsCurrent && !bIsCurrent) return -1;
 			if (!aIsCurrent && bIsCurrent) return 1;
 			return a.provider.localeCompare(b.provider);
 		});
-		return sorted;
+		return process.env.VINCI_CODE === "1" ? groupVinciModels(sorted) : sorted;
 	}
 
 	private getScopeText(): string {
@@ -233,6 +250,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 					getModelSelectorSearchText({ id, provider, name: model.name }),
 				)
 			: this.activeModels;
+		if (process.env.VINCI_CODE === "1") this.filteredModels = groupVinciModels(this.filteredModels);
 		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
 		this.updateList();
 	}
@@ -254,29 +272,42 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 			const isSelected = i === this.selectedIndex;
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
+			const vinci = process.env.VINCI_CODE === "1";
+			if (vinci && this.settingsManager.getShowOtherProviders()) {
+				const previous = this.filteredModels[i - 1];
+				if (i === startIndex || (previous?.provider === "vinci") !== (item.provider === "vinci")) {
+					this.listContainer.addChild(
+						new Text(theme.fg("muted", item.provider === "vinci" ? "Vinci models" : "Other providers"), 0, 0),
+					);
+				}
+			}
 
 			let line = "";
 			// [vinci] Keep friendly display names in both single-provider and mixed lists. The provider badge
 			// is redundant only in the default Vinci-only view; mixed lists need it to remain readable.
-			const vinci = process.env.VINCI_CODE === "1";
-			// [vinci] Friendly names are for the MANAGED catalog, where "Vinci Forte (GLM 5.2)" reads better
-			// than a raw id to a non-programmer. A BYOK user picking someone else's model needs the exact
-			// id — that is what they configured and what the provider will accept — so foreign entries
-			// keep their id alongside the provider badge.
-			const label = (vinci && item.model.provider === "vinci" && item.model.name) || item.id;
+			// [vinci] Only the picker adds live server details; registered names remain plain.
+			const detail = vinci && item.provider === "vinci" ? this.vinciCatalogue?.get(item.id) : undefined;
+			const label = detail?.label || (vinci && item.provider === "vinci" && item.model.name) || item.id;
+			const description = vinci && item.provider === "vinci"
+				? item.id === "auto" ? "your plan's default" : detail?.occupant
+				: undefined;
+			const suffix = description ? theme.fg("muted", `  ${description}`) : "";
 			const showProviderBadge = !vinci || this.settingsManager.getShowOtherProviders();
 			if (isSelected) {
 				const prefix = theme.fg("accent", "→ ");
 				const providerBadge = showProviderBadge ? ` ${theme.fg("muted", `[${item.provider}]`)}` : "";
 				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `${prefix + theme.fg("accent", label)}${providerBadge}${checkmark}`;
+				line = `${prefix + theme.fg("accent", label)}${suffix}${providerBadge}${checkmark}`;
 			} else {
 				const providerBadge = showProviderBadge ? ` ${theme.fg("muted", `[${item.provider}]`)}` : "";
 				const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-				line = `  ${label}${providerBadge}${checkmark}`;
+				line = `  ${label}${suffix}${providerBadge}${checkmark}`;
 			}
 
 			this.listContainer.addChild(new Text(line, 0, 0));
+		}
+		if (process.env.VINCI_CODE === "1" && !this.vinciCatalogue) {
+			this.listContainer.addChild(new Text(theme.fg("muted", "model details unavailable offline"), 0, 0));
 		}
 
 		// Add scroll indicator if needed

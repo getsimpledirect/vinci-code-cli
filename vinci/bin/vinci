@@ -396,11 +396,9 @@ if [ "${1:-}" = "resume" ]; then
   set -- --session "${_vinci_resume_id}" "$@"
 fi
 
-# Provider flags are OPEN by default: Vinci Code is an open-source client and should work the moment
-# you have it, with your own key and no account. Set VINCI_SHOW_OTHER_PROVIDERS=0 to restore the
-# managed-only boundary, where a user cannot bypass the stable Forte class. Every VINCI_CODE guard
-# stays active either way: sandbox, secret masking, result budget, degroove, keybindings.
-if [ "${VINCI_SHOW_OTHER_PROVIDERS:-1}" != "1" ]; then
+# Sign in with a Vinci account by default. Other providers are an explicit opt-in;
+# all VINCI_CODE guards stay active when they are enabled.
+if [ "${VINCI_SHOW_OTHER_PROVIDERS:-0}" != "1" ]; then
   for _vinci_arg in "$@"; do
     case "${_vinci_arg}" in
       --provider | --provider=* | --model | --model=* | --models | --models=* | --api-key | --api-key=*)
