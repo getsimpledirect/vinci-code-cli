@@ -126,11 +126,13 @@ function terminalBudgetMessage(taskId: string): string {
 
 /**
  * Indicative DeepInfra rates in USD per million tokens, from classes.yaml@94c6811d.
- * Fortissimo is a compatibility alias of Forte,
- * including its estimates. The account is billed server-side from the actual route.
+ * Fortissimo is a compatibility alias of Forte, including its estimates.
+ * The account is billed server-side from the actual route.
  *
  * `auto` has no single true price, because the class it resolves to varies per account. It carries
  * the default class's rates as an indicative figure.
+ * cacheWrite equals the input rate ($0.15 for Auto/Mezzo, $0.90 for Forte): the catalogue
+ * supplies no separate cache-write price, so estimates treat those tokens as normal input.
  */
 const CLASS_COSTS: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
   // Auto estimates use the server default class, Mezzo; billing is resolved server-side.

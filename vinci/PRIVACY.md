@@ -17,13 +17,10 @@ is the point of this document.**
 | Usage metered by Vinci | no | yes |
 | Guard, receipts, checkpoints, review | **yes — identical** | yes |
 
-**Neither mode is "the default".** What is open by default is the CHOICE: every provider Pi
-supports is visible from a fresh install, Vinci's own classes among them and listed first. The
-provider you pick determines which mode you are in — pick your own, and you are in direct mode;
-pick Vinci and sign in, and you are in managed mode.
-
-To restrict the client to Vinci's managed service only, set `showOtherProviders: false` or
-`VINCI_SHOW_OTHER_PROVIDERS=0`.
+**Vinci account sign-in is the default.** `/login` opens Vinci pairing directly. To use your own
+provider, run `/providers`, confirm enabling other providers, then use `/login`. No Vinci account
+is required for BYOK. The preference persists globally; `showOtherProviders: true` or
+`VINCI_SHOW_OTHER_PROVIDERS=1` also opts in. The environment overrides the saved setting in either direction.
 
 ## Managed mode
 
@@ -37,15 +34,25 @@ them. That is what the managed service is.
 
 ## Direct / BYOK mode
 
-You supply your own provider credential. `/login` presents the providers Pi supports,
+You supply your own provider credential. After opting in through `/providers`, `/login` presents the providers Pi supports,
 and the credential is stored by Pi in `~/.pi/agent/auth.json` on your machine. Vinci
 Code adds **no second credential store**. Your key is transmitted to the provider you chose —
 authenticating to them requires sending it — and to nobody else. Requests go from your machine
 straight to that provider; Vinci is not in the path.
 
-**In this mode Vinci's servers are not in the path at all**, apart from an optional
-update check. Your relationship for retention and training is with the provider you
-chose, under their terms — not ours.
+**In this mode Vinci's servers are outside the inference path.** Public model catalogue
+discovery and optional update checks are separate outbound calls, described below. Your
+relationship for retention and training is with the provider you chose, under their terms.
+
+## Public model details
+
+Opening `/model` in Vinci mode lazily attempts a public `GET <platform>/api/models`, at most
+once per process, with a timeout of 1500 ms. The platform base comes from the existing links
+module (`VINCI_PLATFORM_URL` override). This request sends no credentials, provider keys,
+conversation content or repository content. It supplies the picker labels and underlying model
+details, including when BYOK is enabled. The result is kept only in memory; failure shows plain
+Vinci names and "model details unavailable offline". Implementation:
+`vinci/extensions/lib/model-catalogue.ts` and `model-selector.ts`.
 
 ## What stays local in BOTH modes
 

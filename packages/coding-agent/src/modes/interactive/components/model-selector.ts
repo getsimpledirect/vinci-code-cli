@@ -199,7 +199,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}));
 		if (process.env.VINCI_CODE === "1") {
 			this.scopedModelItems = groupVinciModels(
-				this.scopedModelItems.filter((item) => this.settingsManager.getShowOtherProviders() || item.provider === "vinci"),
+				this.scopedModelItems.filter(
+					(item) => this.settingsManager.getShowOtherProviders() || item.provider === "vinci",
+				),
 			);
 		}
 		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
@@ -288,9 +290,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			// [vinci] Only the picker adds live server details; registered names remain plain.
 			const detail = vinci && item.provider === "vinci" ? this.vinciCatalogue?.get(item.id) : undefined;
 			const label = detail?.label || (vinci && item.provider === "vinci" && item.model.name) || item.id;
-			const description = vinci && item.provider === "vinci"
-				? item.id === "auto" ? "your plan's default" : detail?.occupant
-				: undefined;
+			const description =
+				vinci && item.provider === "vinci"
+					? item.id === "auto"
+						? "your plan's default"
+						: detail?.occupant
+					: undefined;
 			const suffix = description ? theme.fg("muted", `  ${description}`) : "";
 			const showProviderBadge = !vinci || this.settingsManager.getShowOtherProviders();
 			if (isSelected) {

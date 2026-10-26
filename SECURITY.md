@@ -45,7 +45,8 @@ credentials. The areas where a bug matters most:
   and requires confirmation. A phrasing that slips a destructive command past it is in
   scope.
 - **Sandbox escape.** `packages/coding-agent/src/core/vinci-sandbox.ts`.
-- **BYOK credential handling.** With `showOtherProviders` enabled, your provider key
+- **BYOK credential handling.** Other providers are off by default. After enabling them with
+  `/providers` (or `showOtherProviders: true` / `VINCI_SHOW_OTHER_PROVIDERS=1`), your provider key
   is used locally and stored by Pi in `~/.pi/agent/auth.json`. Anything that causes it
   to be transmitted somewhere it should not be — including to Vinci — is in scope.
 

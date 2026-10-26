@@ -399,15 +399,43 @@ fi
 # Sign in with a Vinci account by default. Other providers are an explicit opt-in;
 # all VINCI_CODE guards stay active when they are enabled.
 if [ "${VINCI_SHOW_OTHER_PROVIDERS:-0}" != "1" ]; then
-  for _vinci_arg in "$@"; do
+  _vinci_managed_args=()
+  while [ "$#" -gt 0 ]; do
+    _vinci_arg="$1"
+    shift
     case "${_vinci_arg}" in
-      --provider | --provider=* | --model | --model=* | --models | --models=* | --api-key | --api-key=*)
-        echo "✗ Vinci Code uses your account's managed Vinci model class; provider, model, and API-key overrides are not supported." >&2
-        echo "  To use your own provider key, enable BYOK: VINCI_SHOW_OTHER_PROVIDERS=1" >&2
+      --provider | --model | --models)
+        _vinci_value="${1:-}"
+        if [ "$#" -gt 0 ]; then shift; fi
+        ;;
+      --provider=* | --model=* | --models=*)
+        _vinci_value="${_vinci_arg#*=}"
+        _vinci_arg="${_vinci_arg%%=*}"
+        ;;
+      --api-key | --api-key=*) _vinci_value="" ;;
+      *) _vinci_managed_args+=("${_vinci_arg}"); continue ;;
+    esac
+    # Pi accepts split flags. Normalize both spellings and case at this boundary (Bash 3 compatible).
+    _vinci_value="$(printf '%s' "${_vinci_value}" | tr '[:upper:]' '[:lower:]')"
+    case "${_vinci_arg}:${_vinci_value}" in
+      --provider:vinci \
+      | --model:auto | --model:mezzo | --model:forte | --model:fortissimo \
+      | --model:vinci/auto | --model:vinci/mezzo | --model:vinci/forte | --model:vinci/fortissimo \
+      | --models:auto | --models:mezzo | --models:forte | --models:fortissimo \
+      | --models:vinci/auto | --models:vinci/mezzo | --models:vinci/forte | --models:vinci/fortissimo)
+        _vinci_managed_args+=("${_vinci_arg}" "${_vinci_value}")
+        ;;
+      *)
+        echo "✗ Other providers are off. Vinci models: auto, mezzo, forte (fortissimo is an alias of forte)." >&2
+        echo "  To use your own provider key, run /providers inside Vinci or set VINCI_SHOW_OTHER_PROVIDERS=1." >&2
         exit 2
         ;;
     esac
   done
+  # Bash 3 treats an empty array as unset under nounset; bare launches must keep zero arguments.
+  if [ "${_vinci_managed_args[0]+set}" = "set" ]; then
+    set -- "${_vinci_managed_args[@]}"
+  fi
 fi
 
 # Provider/model selection stays explicit for reproducible corpus runs. Vinci remains the managed
@@ -421,7 +449,7 @@ VINCI_MODEL="${VINCI_MODEL:-auto}"
 case "${VINCI_PROVIDER}" in
   vinci)
     case "${VINCI_MODEL}" in
-      auto|forte|fortissimo) ;;
+      auto|mezzo|forte|fortissimo) ;;
       *) echo "✗ Unknown Vinci model: ${VINCI_MODEL}" >&2; exit 2 ;;
     esac
     ;;

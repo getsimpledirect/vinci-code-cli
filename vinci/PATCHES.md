@@ -46,7 +46,8 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/extensions/runner.ts` | Default the extension overlay-focus query to false outside interactive UI | — |
 | `coding-agent/src/core/extensions/types.ts` | Expose an optional overlay-focus query to extensions | — |
 | `coding-agent/src/core/vinci-grader.ts` | Shared grader core (verification system): untracked-aware diff, skeptical prompt, verdict parse, completion-claim detector — one check for core + `vinci-review`/`vinci-todo` | 8 |
-| `coding-agent/src/core/auth-guidance.ts` | Warm managed sign-in copy; selected-provider credential guidance | 9 |
+| `coding-agent/src/core/auth-guidance.ts` | Warm managed sign-in copy; selected-provider credential guidance through `/providers` | 4,9 |
+| `coding-agent/src/core/slash-commands.ts` | Register the Vinci-only `/providers` command for autocomplete | 4 |
 | `coding-agent/src/core/keybindings.ts` | Free `shift+tab` for the Auto/Plan cycle | 11 |
 | `coding-agent/src/core/sdk.ts` | One-line call into `vinci-degroove.ts` — collapse identical failed-call loops in the model's context view | 19 |
 | `coding-agent/src/core/system-prompt.ts` | Drop the blanket "Be concise" guideline — the Vinci pack owns the voice (narration) | 16 |
@@ -61,7 +62,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/modes/interactive/components/assistant-message.ts` | Friendly errors + display-mask prose/thinking | 12,13 |
 | `coding-agent/src/modes/interactive/components/diff.ts` | Mask secrets in edit diffs on screen; GitHub-style row tints on added/removed lines | 13,18 |
 | `coding-agent/src/modes/interactive/components/footer.ts` | Friendly model name; drop the provider badge | 10 |
-| `coding-agent/src/modes/interactive/components/model-selector.ts` | Friendly model name in `/model` | 10 |
+| `coding-agent/src/modes/interactive/components/model-selector.ts` | Friendly names, lazy public catalogue details, offline fallback and Vinci-first grouping in `/model` | 4,10 |
 | `coding-agent/src/modes/interactive/components/session-selector.ts` | Time-first resume rows + calm header | 14 |
 | `coding-agent/src/modes/interactive/components/settings-selector.ts` | Lean regular settings (theme only); fullscreen mode/copy controls with a read-only environment override | 6,9 |
 | `coding-agent/src/modes/interactive/components/status-indicator.ts` | Reframe the compaction spinner label | 9 |
@@ -73,7 +74,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/compaction/branch-summarization.ts`, `compaction.ts` | Optional `__vinciRecordTaskCall` hook so Vinci can record summarization/compaction calls (no-op when absent) | — |
 | `coding-agent/src/core/model-resolver.ts` | Managed-class aliases (Fortissimo resolves to Forte) for provider `vinci` only | — |
 | `coding-agent/src/core/session-manager.ts` | Shared verification-state entries and record framing for the turn-end verification gate | 8 |
-| `coding-agent/src/core/settings-manager.ts` | Vinci-mode settings: other-provider visibility (`VINCI_SHOW_OTHER_PROVIDERS`), thinking hidden by default; global first-copy disclosure acknowledgement | 4,6 |
+| `coding-agent/src/core/settings-manager.ts` | Other providers default off; global `/providers` preference with environment overrides; thinking hidden by default; global first-copy disclosure acknowledgement | 4,6 |
 | `coding-agent/src/modes/interactive/components/countdown-timer.ts` | `ElapsedTimer` for live compaction progress | — |
 | `coding-agent/src/modes/interactive/components/extension-selector.ts` | Report the rows/width left after widgets and footer so approval context stays reviewable in small terminals | — |
 | `coding-agent/src/modes/interactive/components/login-dialog.ts`, `oauth-selector.ts` | Vero sign-in copy under `VINCI_CODE=1` | 9 |
@@ -117,11 +118,14 @@ against the table: `git grep -l '\[vinci\]' -- 'packages/*/src/**' | grep -v /vi
 `packages/coding-agent/src/modes/interactive/interactive-mode.ts` → `showOAuthSelector()`.
 The built-in OAuth providers (anthropic / openai-codex / github-copilot) are **sticky** —
 `unregisterOAuthProvider` restores them and `resetOAuthProviders` re-seeds them — and the
-`/login` handler is hardcoded, so there's no extension hook. Under `VINCI_CODE=1` we skip the
-picker and open the Vinci login directly:
+`/login` handler is hardcoded, so there's no extension hook. Under `VINCI_CODE=1`, with other
+providers off (the default), we skip the picker and open Vinci login directly. Opting in with
+`/providers` restores the authentication-method and provider selectors:
 
 ```ts
-if (process.env.VINCI_CODE === "1") { void this.showLoginDialog("vinci", "Vinci"); return; }
+if (process.env.VINCI_CODE === "1" && !this.settingsManager.getShowOtherProviders()) {
+  void this.showLoginDialog("vinci", "Vinci"); return;
+}
 ```
 
 ## 2. Ctrl+C twice to exit — friendlier window
@@ -144,21 +148,29 @@ Pi, clutter for a product launch. Gated off under `VINCI_CODE=1`:
 if (showListing && process.env.VINCI_CODE !== "1") { … }
 ```
 
-## 4. Model surfaces show only Vinci models
+## 4. Vinci-first model surfaces and explicit provider opt-in
 
-`interactive-mode.ts` → `getModelCandidates()` (the single choke point for the selector,
-exact-match, and provider count). Pi's built-in catalog lists every provider's models;
-Vinci Code is single-provider, so filter to `provider === "vinci"` under `VINCI_CODE=1`:
+`core/settings-manager.ts` defaults `showOtherProviders` to false. `/providers` in
+`interactive-mode.ts` shows the effective state, confirms a toggle and saves it globally.
+The environment overrides the saved preference in both directions. `core/slash-commands.ts`
+adds one discoverable entry, hidden outside Vinci mode; `vinci-help.ts` adds its help row.
+`core/auth-guidance.ts` points other-provider users to `/providers`, then `/login`.
 
-```ts
-return process.env.VINCI_CODE === "1" ? models.filter((m) => m.provider === "vinci") : models;
-```
+Under `VINCI_CODE=1`, `interactive-mode.ts` and `model-selector.ts` filter to Vinci by default.
+With opt-in, they group every Vinci entry first, including scoped and searched lists; the picker
+labels the two groups. Plain Pi keeps its existing order, hint and login selectors.
+`cli/list-models.ts` already uses the same visibility setting for its local catalogue listing.
 
-The picker component and `--list-models` narrow this provider to the stable `forte` class.
-`cli/args.ts` hides provider, model, API-key, and provider-credential help under `VINCI_CODE=1`;
-plain Pi keeps the complete help. Finally, `vinci/bin/vinci` rejects user-supplied `--provider`,
-`--model`, `--models`, and `--api-key` arguments. Internal source-qualification routes remain
-environment-gated and are not user BYOK.
+`model-selector.ts` lazily loads public `GET /api/models` through the shared links module and
+`vinci/extensions/lib/model-catalogue.ts`, once per process with a 1500 ms timeout and injectable
+fetch. Only Mezzo and Forte details are accepted; Auto keeps "your plan's default". Failed or
+malformed responses show plain names and "model details unavailable offline" without a pinned
+occupant. Registration supplies plain Auto, Mezzo and Forte names to existing footer/usage consumers.
+
+`cli/args.ts` still hides provider controls from Vinci help. At the launcher boundary, Vinci
+provider and class flags are accepted case-insensitively, including equals syntax and `vinci/`
+prefixes. Other-provider flags and `--api-key` exit 2 unless explicitly opted in. Fortissimo
+remains an alias of Forte; Auto remains the default. Internal qualification lanes are unchanged.
 
 ## 5. Lean `/` command menu
 

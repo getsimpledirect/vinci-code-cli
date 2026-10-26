@@ -2,7 +2,7 @@
 
 The canonical public source and release lineage for Vinci Code, a terminal coding agent distributed from the MIT-licensed Pi harness.
 
-Bring-your-own-provider use does not require a Vinci account. Managed inference is a separate service dependency. The private vinci-code repository contains operations and historical reference, not a second product publisher.
+Sign in with your Vinci account to start. Bring-your-own-provider use is available through `/providers` and does not require a Vinci account. Managed inference is a separate service dependency. The private vinci-code repository contains operations and historical reference, not a second product publisher.
 
 ## Start here
 
@@ -20,8 +20,8 @@ Preserve Pi provenance, the MIT grants and third-party notices. Code licensing d
 </picture>
 
 
-A terminal coding agent you can run with **your own provider key** — or with Vinci's managed
-service.<br/>Same guard rails either way.
+A terminal coding agent with **Vinci account sign-in** and optional bring-your-own-provider
+keys through `/providers`.<br/>Same guard rails either way.
 
 [![Node](https://img.shields.io/badge/Node-22.19%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/License-MIT-2ECC71?style=flat-square)](LICENSE)
@@ -66,9 +66,9 @@ flowchart LR
     style Gateway fill:#6C3483,color:#fff
 ```
 
-In **BYOK** the right-hand Vinci path does not exist — your key and your prompts go straight
-to your provider, and Vinci's servers are not involved. Everything in the grey box runs
-locally and is the same either way.
+In **BYOK** your inference key and prompts go straight to your provider. Opening `/model`
+can fetch Vinci's public model details without credentials or conversation content; see
+[`PRIVACY.md`](vinci/PRIVACY.md). Everything in the grey box runs locally in either mode.
 
 ## Two ways to run it
 
@@ -157,40 +157,37 @@ curl -fsSL https://vinci.getsimpledirect.com/install | sh
 
 ## Quick start
 
-Nothing to configure. Install it, run it, pick a provider:
+Install it, run it, and sign in with your Vinci account:
 
 ```sh
 ./vinci/bin/vinci
 
-/login      # pick Anthropic, OpenAI, Google, Groq, … or Vinci
-/model      # pick a model from providers with configured authentication
+/login      # sign in to Vinci in your browser
+/model      # choose Vinci Auto, Vinci Mezzo, or Vinci Forte
 ```
 
-`/login` asks how you want to authenticate before it asks who with. "Use an API key" lists every
-provider Pi supports — including the providers supported by the pinned Pi version — each marked `unconfigured` until you
-add a key. A Vinci account is one of the options, never a prerequisite.
+By default, `/login` opens Vinci browser sign-in directly, and the model surfaces offer Vinci
+models. Auto remains the initial model and uses your plan's default. The picker shows live
+underlying model details for Mezzo and Forte when available, or a note when details are unavailable offline.
 
-<img src="vinci/assets/screenshot-auth.png" alt="The /login prompt: Select authentication method, offering Use a subscription or Use an API key" width="820" />
+To bring your own provider key, run `/providers` and confirm enabling other providers, then
+use `/login` to choose an authentication method and provider. This opt-in persists globally.
+You can also set `showOtherProviders: true` in settings or `VINCI_SHOW_OTHER_PROVIDERS=1`.
+Vinci entries stay first, followed by a separate group of other providers in `/model`.
+Run `/providers` again to hide them; the environment switch overrides the setting in either direction.
 
-Providers are visible before you configure anything — on a fresh checkout `--list-models` already
-lists other providers' models next to Vinci's own classes, which simply sort first:
+<img src="vinci/assets/screenshot-auth.png" alt="After enabling other providers, /login offers a subscription or an API key" width="820" />
 
-The `auth` column marks each model `configured` or `unconfigured`. This is a local credential
-presence check, not a login, token-validity, or account-access check. Listing the catalog does
-not contact providers. Use `--list-models <search>` to filter it; use `/login` to configure a
-provider before selecting its model with `/model`. The interactive picker only lists models
-with configured authentication.
+`--list-models` works before sign-in. Its `auth` column marks local credential presence as
+`configured` or `unconfigured`, without validating credentials or contacting providers.
+Use `--list-models <search>` to filter it. Other providers appear after opt-in; the interactive
+picker lists models with configured authentication.
 
-<img src="vinci/assets/demo-byok.gif" alt="On a fresh checkout with nothing configured, vinci --list-models already shows Anthropic, DeepSeek and Google models alongside Vinci's own classes, which sort first" width="900" />
+<img src="vinci/assets/demo-byok.gif" alt="With other providers enabled, --list-models shows other providers alongside Vinci's classes, which sort first" width="900" />
 
-**No account, no environment variable, no sign-up.** Vinci's own classes are offered first, so
-signing in to Vinci stays one keystroke away if you want managed inference — but nothing makes
-you. Credentials are stored by Pi in `~/.pi/agent/auth.json`. Vinci Code adds no second credential
-store, and your key is sent **only to the provider you picked** — authenticating to them requires
-it — and never to Vinci.
-
-Want the lean, Vinci-only view back? `VINCI_SHOW_OTHER_PROVIDERS=0`, or `showOtherProviders:
-false` in settings.
+**BYOK needs no Vinci account.** Credentials are stored by Pi in `~/.pi/agent/auth.json`.
+Vinci Code adds no second credential store, and your provider key is sent only to the provider
+you picked, never to Vinci. The coding demo above uses this optional mode.
 
 ## CLI reference
 
@@ -198,6 +195,7 @@ These are the commands `/help` lists in a session:
 
 ```
 /login       Connect to Vinci
+/providers   Add or hide other providers
 /logout      Disconnect from Vinci
 /model       Choose which Vinci model to use
 /new         Start a fresh conversation
@@ -218,9 +216,9 @@ The Vinci layer adds more on top of these — `/review`, `/checkpoint`, `/plan`,
 
 | Variable | Effect |
 |---|---|
-| `VINCI_SHOW_OTHER_PROVIDERS=0` | Hide the other providers and go back to the lean, Vinci-only view. The full catalogue is shown by **default** — this is an opt-out, not an opt-in. |
+| `VINCI_SHOW_OTHER_PROVIDERS` | Other providers are off by default. `1` enables them, `0` hides them; either overrides the saved `/providers` preference. |
 | `VINCI_PROVIDER` | `vinci` (default) or `openrouter` |
-| `VINCI_MODEL` | With `VINCI_PROVIDER=vinci`: `auto` (default), `forte`, or `fortissimo`. `auto` resolves server-side to your account's class. With `openrouter`: a full `vendor/model` id. |
+| `VINCI_MODEL` | With `VINCI_PROVIDER=vinci`: `auto` (default), `mezzo`, `forte`, or `fortissimo` (alias of Forte). `auto` resolves server-side to your account's class. With `openrouter`: a full `vendor/model` id. |
 | `VINCI_NO_SANDBOX=1` | Disable the sandbox. A development escape hatch — it removes a real safety boundary. |
 | `VINCI_ISSUE_REPO_URL` | Override where `/issue` files reports |
 

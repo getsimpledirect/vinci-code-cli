@@ -611,9 +611,9 @@ export class InteractiveMode {
 		// a collision that does not exist and that the user cannot act on.
 		const vinciCode = process.env.VINCI_CODE === "1";
 		const builtinNames = new Set(
-			BUILTIN_SLASH_COMMANDS.filter((command) => vinciCode ? VINCI_MENU_COMMANDS.has(command.name) : command.name !== "providers").map(
-				(command) => command.name,
-			),
+			BUILTIN_SLASH_COMMANDS.filter((command) =>
+				vinciCode ? VINCI_MENU_COMMANDS.has(command.name) : command.name !== "providers",
+			).map((command) => command.name),
 		);
 		return extensionRunner
 			.getRegisteredCommands()
@@ -650,8 +650,8 @@ export class InteractiveMode {
 			help: "See what Vinci can do",
 		};
 		const vinciCode = process.env.VINCI_CODE === "1";
-		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.filter(
-			(command) => vinciCode ? VINCI_MENU.has(command.name) : command.name !== "providers",
+		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.filter((command) =>
+			vinciCode ? VINCI_MENU.has(command.name) : command.name !== "providers",
 		).map((command) => ({
 			name: command.name,
 			description: (vinciCode && VINCI_DESCRIPTIONS[command.name]) || command.description,
@@ -3563,7 +3563,7 @@ export class InteractiveMode {
 				new Text(
 					theme.fg(
 						"warning",
-						`⚠ ${count} from this session couldn't be read and ${unreadable.length === 1 ? "was" : "were"} skipped — the restored conversation may be missing recent steps.`,
+						`! ${count} from this session couldn't be read and ${unreadable.length === 1 ? "was" : "were"} skipped — the restored conversation may be missing recent steps.`,
 					),
 					1,
 					0,
