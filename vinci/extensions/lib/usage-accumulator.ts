@@ -11,6 +11,8 @@ export type VinciAccumulatedUsage = {
   cacheWriteTokens: number;
   reasoningTokens: number;
   estimatedCostUsd: number;
+  /** At least one call omitted usable token or cost telemetry; totals are incomplete. */
+  telemetryUnavailable?: boolean;
   providers: string[];
   models: string[];
   // MACHINE-OBSERVED model identity only: the ids the provider itself reported on the wire
@@ -46,6 +48,12 @@ type UsageLike = {
   reasoning?: unknown;
   cost?: { total?: unknown };
 };
+
+export function hasVinciUsageTelemetry(usage: UsageLike | undefined): boolean {
+  return !!usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.cost?.total].every(
+    (value) => typeof value === "number" && Number.isFinite(value) && value >= 0,
+  );
+}
 
 type ModelResponseLike = {
   provider?: unknown;
@@ -132,6 +140,7 @@ function normalizedUsage(usage: Readonly<VinciAccumulatedUsage>): VinciAccumulat
     cacheWriteTokens: finite(usage.cacheWriteTokens),
     reasoningTokens: finite(usage.reasoningTokens),
     estimatedCostUsd: finite(usage.estimatedCostUsd),
+    ...(usage.telemetryUnavailable ? { telemetryUnavailable: true } : {}),
     providers: [...new Set(usage.providers.filter(Boolean))].sort(),
     models: [...new Set(usage.models.filter(Boolean))].sort(),
     observedModels: [...new Set((usage.observedModels ?? []).filter(Boolean))].sort(),
@@ -155,6 +164,7 @@ export function addVinciAccumulatedUsage(
   const targetMicroUsd = usdToMicroUsd(target.estimatedCostUsd);
   const additionMicroUsd = usdToMicroUsd(addition.estimatedCostUsd);
   target.estimatedCostUsd = microUsdToUsd(targetMicroUsd + additionMicroUsd);
+  if (addition.telemetryUnavailable) target.telemetryUnavailable = true;
   target.providers = [...new Set([...target.providers, ...addition.providers.filter(Boolean)])].sort();
   target.models = [...new Set([...target.models, ...addition.models.filter(Boolean)])].sort();
   target.observedModels = [
@@ -209,6 +219,7 @@ function usageFromResponse(response: ModelResponseLike): VinciAccumulatedUsage {
     cacheWriteTokens: finite(response.usage?.cacheWrite),
     reasoningTokens: finite(response.usage?.reasoning),
     estimatedCostUsd: finite(response.usage?.cost?.total),
+    ...(!hasVinciUsageTelemetry(response.usage) ? { telemetryUnavailable: true } : {}),
     providers: provider,
     models: model ? [model] : [],
     observedModels: observed ? [observed] : [],
@@ -341,6 +352,7 @@ export function isVinciUsageSnapshot(value: unknown): value is VinciUsageSnapsho
         usageNumbers.every(
           (number) => typeof number === "number" && Number.isFinite(number) && number >= 0,
         ) &&
+        (usage.telemetryUnavailable === undefined || typeof usage.telemetryUnavailable === "boolean") &&
         Array.isArray(usage.providers) &&
         usage.providers.every((provider) => typeof provider === "string") &&
         Array.isArray(usage.models) &&

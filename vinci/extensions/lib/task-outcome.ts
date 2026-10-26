@@ -4,6 +4,7 @@ import { getVinciHardStop } from "./hard-stop.ts";
 import {
   addVinciAccumulatedUsage,
   getVinciTaskUsageSnapshot,
+  hasVinciUsageTelemetry,
   hydrateVinciTaskUsage,
   isVinciUsageSnapshot,
   microUsdToUsd,
@@ -112,6 +113,8 @@ export type VinciTaskUsage = {
   cacheWriteTokens: number;
   reasoningTokens: number;
   estimatedCostUsd: number;
+  /** True when any session call has missing token or cost telemetry. */
+  telemetryUnavailable?: boolean;
   providers: string[];
   models: string[];
   // Same three-way split as the accumulator: `models` stays the collapsed observed-or-resolved
@@ -229,6 +232,7 @@ function isTaskUsageRecord(value: unknown): boolean {
       usage.reasoningTokens,
       usage.estimatedCostUsd,
     ].every((number) => typeof number === "number" && Number.isFinite(number) && number >= 0) &&
+    (usage.telemetryUnavailable === undefined || typeof usage.telemetryUnavailable === "boolean") &&
     Array.isArray(usage.providers) &&
     usage.providers.every((provider) => typeof provider === "string") &&
     Array.isArray(usage.models) &&
@@ -348,6 +352,7 @@ function summarizeAssistantUsage(messages: readonly unknown[]): VinciTaskUsage {
   };
   for (const message of assistantMessages(messages)) {
     usage.modelCalls++;
+    if (!hasVinciUsageTelemetry(message.usage)) usage.telemetryUnavailable = true;
     usage.inputTokens += finite(message.usage?.input);
     usage.outputTokens += finite(message.usage?.output);
     usage.cachedTokens += finite(message.usage?.cacheRead);
@@ -836,6 +841,7 @@ export function formatVinciTaskUsage(usage: Readonly<VinciTaskUsage>): string {
   const promptTokens = usage.inputTokens + usage.cachedTokens + usage.cacheWriteTokens;
   const cachedPercent = promptTokens > 0 ? Math.round((usage.cachedTokens / promptTokens) * 100) : 0;
   const calls = `${usage.modelCalls} model call${usage.modelCalls === 1 ? "" : "s"}`;
+  if (usage.telemetryUnavailable) return `${calls} · Usage unavailable`;
   return `${calls} · ${tokenLabel(promptTokens)} in / ${tokenLabel(usage.outputTokens)} out · ${cachedPercent}% cached · ~$${usage.estimatedCostUsd.toFixed(4)} estimated`;
 }
 
