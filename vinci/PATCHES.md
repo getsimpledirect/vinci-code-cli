@@ -610,6 +610,9 @@ or provider calls on malformed modes, valid text/JSON output, and an RPC state q
 - **`modes/interactive/components/content-overlay.ts`** → Vinci puts the close instruction on
   its own wrapping footer line and subtracts the footer's rendered height from the scrollable
   body. This keeps the instruction complete at narrow widths without hiding the bottom border.
+  At short heights Vinci removes the two blank spacer rows before allocating body space, and
+  permits an empty body when necessary to preserve the footer. At eight rows the close line,
+  one body row, and both borders fit inside the six-row overlay limit.
   Upstream keeps its single truncated footer.
 - **`modes/interactive/components/assistant-message.ts`** → expanded thinking uses the normal
   `muted` foreground in Vinci, retaining italics and adding no dim style. Upstream still uses

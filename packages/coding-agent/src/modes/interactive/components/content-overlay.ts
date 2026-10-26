@@ -31,6 +31,7 @@ export class ContentOverlayComponent extends Container implements Focusable {
 	private readonly tui: TUI;
 	private readonly markdown: Markdown;
 	private readonly footer: Text | TruncatedText;
+	private readonly vinci = process.env.VINCI_CODE === "1";
 	private renderWidth: number;
 	private readonly onClose: () => void;
 	private scrollOffset = 0;
@@ -62,7 +63,7 @@ export class ContentOverlayComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 		this.addChild(this.markdown);
 		this.addChild(new Spacer(1));
-		const vinci = process.env.VINCI_CODE === "1";
+		const vinci = this.vinci;
 		const footerText = theme.fg(
 			"muted",
 			`${upKey}/${downKey} or ${pageUpKey}/${pageDownKey} to scroll${vinci ? "\n" : " · "}Press ${closeKey} to close`,
@@ -73,10 +74,17 @@ export class ContentOverlayComponent extends Container implements Focusable {
 		this.addChild(new DynamicBorder());
 	}
 
+	private shouldCompactFrame(): boolean {
+		const maxHeight = Math.max(1, this.tui.terminal.rows - OVERLAY_MARGIN * 2);
+		return this.vinci && maxHeight < FRAME_HEIGHT + this.footer.render(this.renderWidth).length;
+	}
+
 	private getVisibleBodyHeight(): number {
 		const maxHeight = Math.max(1, this.tui.terminal.rows - OVERLAY_MARGIN * 2);
 		const extraFooterLines = this.footer.render(this.renderWidth).length - 1;
-		return Math.max(1, maxHeight - FRAME_HEIGHT - extraFooterLines);
+		// [vinci] Reclaim blank spacing first, then give the footer priority over a body minimum.
+		const reclaimedSpacing = this.shouldCompactFrame() ? 2 : 0;
+		return Math.max(this.vinci ? 0 : 1, maxHeight - FRAME_HEIGHT - extraFooterLines + reclaimedSpacing);
 	}
 
 	private scrollBy(delta: number): void {
@@ -92,10 +100,13 @@ export class ContentOverlayComponent extends Container implements Focusable {
 		this.contentLineCount = bodyLines.length;
 		this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, bodyLines.length - visibleBodyHeight));
 
+		const compact = this.shouldCompactFrame();
 		const frameLines = this.children.flatMap((child) =>
 			child === this.markdown
 				? bodyLines.slice(this.scrollOffset, this.scrollOffset + visibleBodyHeight)
-				: child.render(width),
+				: compact && child instanceof Spacer
+					? []
+					: child.render(width),
 		);
 		return frameLines.map((line) => line + " ".repeat(Math.max(0, width - visibleWidth(line))));
 	}
