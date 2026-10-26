@@ -601,6 +601,25 @@ Regressions: `packages/coding-agent/test/args.test.ts` covers parsing;
 an isolated HOME and local faux provider. It covers piped input, Linux TTY errors, zero extension
 or provider calls on malformed modes, valid text/JSON output, and an RPC state query.
 
+## 27. Everyday shortcuts and readable thinking
+
+- **`modes/interactive/interactive-mode.ts`** → under `VINCI_CODE=1`, `/hotkeys` starts with a
+  five-row BASICS table (Send, New line, Stop, Show/hide thinking, Exit on an empty editor), then
+  an Advanced heading and the existing full table. All key labels use the effective keybinding
+  configuration. The upstream table is unchanged.
+- **`modes/interactive/components/content-overlay.ts`** → Vinci puts the close instruction on
+  its own wrapping footer line and subtracts the footer's rendered height from the scrollable
+  body. This keeps the instruction complete at narrow widths without hiding the bottom border.
+  Upstream keeps its single truncated footer.
+- **`modes/interactive/components/assistant-message.ts`** → expanded thinking uses the normal
+  `muted` foreground in Vinci, retaining italics and adding no dim style. Upstream still uses
+  `thinkingText`; collapsed labels are unchanged. No shared theme changes are required.
+
+Regressions: `test/vinci-hotkeys.test.ts`, `test/content-overlay.test.ts`, and
+`test/vinci-thinking-style.test.ts` in `packages/coding-agent`. The additive help foreground and
+single pairing-progress line are covered by `vinci/test/help-command.mjs` and
+`vinci/test/pairing-progress.mjs`.
+
 ---
 
 Everything else (theme, welcome header, provider + device-login, character/behavior pack, tool

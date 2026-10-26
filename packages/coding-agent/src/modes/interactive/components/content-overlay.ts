@@ -30,6 +30,8 @@ export function getContentOverlayOptions(tui: TUI): OverlayOptions {
 export class ContentOverlayComponent extends Container implements Focusable {
 	private readonly tui: TUI;
 	private readonly markdown: Markdown;
+	private readonly footer: Text | TruncatedText;
+	private renderWidth: number;
 	private readonly onClose: () => void;
 	private scrollOffset = 0;
 	private contentLineCount = 0;
@@ -45,6 +47,7 @@ export class ContentOverlayComponent extends Container implements Focusable {
 	constructor(tui: TUI, title: string, body: string, markdownTheme: MarkdownTheme, onClose: () => void) {
 		super();
 		this.tui = tui;
+		this.renderWidth = tui.terminal.columns;
 		this.markdown = new Markdown(body, 1, 0, markdownTheme);
 		this.onClose = onClose;
 
@@ -59,22 +62,21 @@ export class ContentOverlayComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 		this.addChild(this.markdown);
 		this.addChild(new Spacer(1));
-		this.addChild(
-			new TruncatedText(
-				theme.fg(
-					"muted",
-					`${upKey}/${downKey} or ${pageUpKey}/${pageDownKey} to scroll · Press ${closeKey} to close`,
-				),
-				1,
-				0,
-			),
+		const vinci = process.env.VINCI_CODE === "1";
+		const footerText = theme.fg(
+			"muted",
+			`${upKey}/${downKey} or ${pageUpKey}/${pageDownKey} to scroll${vinci ? "\n" : " · "}Press ${closeKey} to close`,
 		);
+		// [vinci] Keep closing instructions complete, including when configured key names wrap.
+		this.footer = vinci ? new Text(footerText, 1, 0) : new TruncatedText(footerText, 1, 0);
+		this.addChild(this.footer);
 		this.addChild(new DynamicBorder());
 	}
 
 	private getVisibleBodyHeight(): number {
 		const maxHeight = Math.max(1, this.tui.terminal.rows - OVERLAY_MARGIN * 2);
-		return Math.max(1, maxHeight - FRAME_HEIGHT);
+		const extraFooterLines = this.footer.render(this.renderWidth).length - 1;
+		return Math.max(1, maxHeight - FRAME_HEIGHT - extraFooterLines);
 	}
 
 	private scrollBy(delta: number): void {
@@ -84,6 +86,7 @@ export class ContentOverlayComponent extends Container implements Focusable {
 	}
 
 	override render(width: number): string[] {
+		this.renderWidth = width;
 		const bodyLines = this.markdown.render(width);
 		const visibleBodyHeight = this.getVisibleBodyHeight();
 		this.contentLineCount = bodyLines.length;

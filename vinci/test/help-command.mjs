@@ -65,11 +65,18 @@ for (const url of expectedUrls) {
   assert.ok(linked.includes(`\x1b]8;;${url}\x07${url}\x1b]8;;\x07`), `URL not OSC-8 linked: ${url}`);
 }
 
-// Interactive: goes through ctx.ui.notify as one info notification.
+// Interactive: readable foreground inside the status notification's dim outer color.
 const notifications = [];
+const foregroundCalls = [];
 await command.handler("", {
   hasUI: true,
   ui: {
+    theme: {
+      fg(color, text) {
+        foregroundCalls.push(color);
+        return `<${color}>${text}</${color}>`;
+      },
+    },
     notify(message, type) {
       notifications.push({ message, type });
     },
@@ -77,7 +84,8 @@ await command.handler("", {
 });
 assert.equal(notifications.length, 1);
 assert.equal(notifications[0].type, "info");
-assert.equal(notifications[0].message, helpModule.vinciHelpText());
+assert.deepEqual(foregroundCalls, ["text"]);
+assert.equal(notifications[0].message, `<text>${helpModule.vinciHelpText()}</text>`);
 
 // Headless: writes the same text to stdout.
 const originalWrite = process.stdout.write;
