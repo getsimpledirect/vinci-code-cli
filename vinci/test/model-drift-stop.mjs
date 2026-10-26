@@ -90,8 +90,9 @@ function assertDeferredAbort(state) {
   assert.equal(state.records("drift").length, 1, "real drift must be recorded");
   assert.match(
     state.errors().at(-1).message,
-    /Vinci stopped this turn: the model changed from .+ to .+\. Start a new session \(\/new\) to continue with .+, or re-run the request\./,
+    /Vinci stopped this turn: the model changed from .+ to .+\. This session stays stopped; start a new session \(\/new\) to continue with .+\./,
   );
+  assert.doesNotMatch(state.errors().at(-1).message, /re-run/, "a re-run in the same session is stopped again; never offer it");
 }
 
 const cases = [

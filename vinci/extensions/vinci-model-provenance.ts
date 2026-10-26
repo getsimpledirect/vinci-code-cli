@@ -570,7 +570,7 @@ export default function (pi: ExtensionAPI) {
         const from = classChanged ? expectedClass : routeLabel(pinned);
         const to = classChanged ? resolvedClass : routeLabel(observed);
         ctx.ui.notify(
-          `${cheaper ? "CRITICAL: " : ""}Vinci stopped this turn: the model changed from ${from} to ${to}. Start a new session (/new) to continue with ${to}, or re-run the request.`,
+          `${cheaper ? "CRITICAL: " : ""}Vinci stopped this turn: the model changed from ${from} to ${to}. This session stays stopped; start a new session (/new) to continue with ${to}.`,
           "error",
         );
       }
