@@ -35,12 +35,16 @@ assert.match(launcher, /--model "\$\{VINCI_MODEL\}"/, "The launcher must pass it
 assert.match(launcher, /if \[ "\$\{1:-\}" = "resume" \]/, "The Vinci task resume command is missing");
 assert.match(launcher, /set -- --session "\$\{_vinci_resume_id\}"/, "Task resume must use Pi's durable session loader");
 assert.match(provider, new RegExp(`registerProvider\\("${identity.provider}"`), "The Vinci provider registration is missing");
-// Classes are registered through the vinciClassModel(id, name) helper rather than inline object
-// literals, so the contract matches the call form. Asserting both arguments together also keeps the
-// id and its display name from drifting apart, which two separate substring checks did not.
+// Classes are registered by mapping VINCI_MODEL_NAMES through vinciClassModel(id, name).
+// Check the catalogue entry and registration form together to keep the id and display name aligned.
+const modelNames = read("vinci/extensions/lib/model-catalogue.ts").match(/\bVINCI_MODEL_NAMES\b[^=]*=\s*\{([^}]*)\}/)?.[1];
 assert.ok(
-  provider.includes(`vinciClassModel("${identity.defaultModel}", "${identity.defaultModelName}")`),
+  modelNames?.split("\n").some((entry) => entry.trim() === `${identity.defaultModel}: "${identity.defaultModelName}",`),
   "The default Vinci model is not registered",
+);
+assert.ok(
+  provider.includes("Object.entries(VINCI_MODEL_NAMES).map(([id, name]) => vinciClassModel(id, name))"),
+  "The Vinci provider must register its classes from VINCI_MODEL_NAMES",
 );
 assert.ok(launcher.toLowerCase().includes(identity.tagline.toLowerCase()), "The Vinci tagline is missing from the launcher sign-off");
 assert.ok(header.includes("Choose a model: /model"), "An unset session model must not imply a configured provider route");

@@ -54,7 +54,7 @@ provider.default({
 
 assert.deepEqual(
   registrations[0].config.models.map(({ id }) => id),
-  ["auto", "forte"],
+  ["auto", "mezzo", "forte"],
 );
 assert.equal(typeof messageEnd, "function");
 
