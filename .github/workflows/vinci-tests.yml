@@ -58,6 +58,13 @@ on:
     # and so fires no `synchronize`, which without this line would let a PR
     # go draft -> ready -> merged having only ever run the Node 24 leg.
     types: [opened, synchronize, reopened, ready_for_review]
+
+# Superseded PR heads need no second full harness. Main pushes each retain
+# their own run, so a newer push cannot erase validation of an earlier one.
+concurrency:
+  group: vinci-tests-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # biome + tsgo + the pinned-deps/shrinkwrap/install-lock checks. `ci.yml` runs these
   # only for `branches: [main]`, so nothing gated them on a vinci-targeted PR: a
@@ -83,6 +90,8 @@ jobs:
       - name: Build workspace
         run: bash vinci/build.sh
       - name: Package unsigned artifact
+        env:
+          VINCI_PACKAGE_REUSE_BUILD: '1'
         run: bash vinci/package.sh
       # Keep the unpack procedure aligned with vinci-release.yml lines 91-93.
       - name: Unpack packaged artifact
@@ -214,4 +223,8 @@ jobs:
       # trust, preview, toolload, outcome, etc.). Each skipped lane prints a visible ⚠ marker; failures
       # report the specific lane and reason so no coverage silently vanishes.
       - name: Full Vinci test harness (Node ${{ matrix.node }})
-        run: VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh
+        env:
+          VINCI_TEST_REUSE_BUILD: '1'
+        run: |
+          node vinci/scripts/build-source-identity.mjs check . vinci/dist/source-identity.json
+          VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh
