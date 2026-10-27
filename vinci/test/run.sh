@@ -785,6 +785,7 @@ run_group acceptance-packaged-integration node "${ROOT}/vinci/test/acceptance-pa
 run_group package-first-party-tests node "${ROOT}/vinci/test/package-first-party-tests.mjs"
 run_group remote-verdict-integration node "${ROOT}/vinci/test/remote-verdict-integration.mjs"
 run_group accept-tool-integration node "${ROOT}/vinci/test/accept-tool-integration.mjs"
+run_group accept-render-result-characterization node "${ROOT}/vinci/test/accept-render-result-characterization.mjs"
 run_group receipt-remote-verdict node "${ROOT}/vinci/test/receipt-remote-verdict.mjs"
 run_group accept-config-precedence node "${ROOT}/vinci/test/accept-config-precedence.mjs"
 # /feedback keeps transcripts local, redacts both paths, and tolerates network failure.

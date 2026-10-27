@@ -14,7 +14,12 @@ import { resolve } from "node:path";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { isAcceptedWireStatus } from "./lib/canonical-verdicts.ts";
+import {
+  isAcceptanceConditionalStatus,
+  isAcceptanceFailureStatus,
+  isAcceptancePassStatus,
+  isAcceptedWireStatus,
+} from "./lib/canonical-verdicts.ts";
 import { recordRemoteAcceptanceVerdict } from "./lib/control.ts";
 
 const ACCEPT_SCHEMA = Type.Object({
@@ -173,15 +178,15 @@ export default function (pi: ExtensionAPI) {
         // Guidance and interrupted jobs do not contain a verdict.
       }
       const passed = !options.isPartial && !context.isError && details?.exitCode === 0 &&
-        details.latchRecorded === true && status === "VERIFIED_PASS";
+        details.latchRecorded === true && isAcceptancePassStatus(status);
       const notSetUp = details?.exitCode === 127;
       const failed = !options.isPartial && !notSetUp && (context.isError ||
-        (typeof details?.exitCode === "number" && details.exitCode !== 0) || status === "BLOCKED" || status === "FAILED");
+        (typeof details?.exitCode === "number" && details.exitCode !== 0) || isAcceptanceFailureStatus(status));
       const label = passed ? "Acceptance verification passed."
         : notSetUp ? VAC_NOT_FOUND_GUIDANCE
           : options.isPartial || status === "RUNNING" || status === "QUEUED" ? "Verification in progress; no pass recorded."
             : failed ? "Verification failed; no acceptance pass recorded."
-              : status === "CONDITIONAL" ? "Verification completed conditionally; no acceptance pass recorded."
+              : isAcceptanceConditionalStatus(status) ? "Verification completed conditionally; no acceptance pass recorded."
                 : "Verification skipped; no acceptance pass recorded.";
       const color = passed ? "success" : failed ? "error" : "text";
       const marker = passed ? "  └ ✓ " : failed ? "  └ ! " : "  └ ";

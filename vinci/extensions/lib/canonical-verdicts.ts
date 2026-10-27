@@ -71,6 +71,20 @@ export function isAttemptStatus(value: unknown): value is CanonicalAttemptStatus
   return typeof value === "string" && ATTEMPT_STATUSES.some((status) => status === value);
 }
 
+/** Acceptance rendering distinguishes an issued pass, failure, and conditional completion. */
+export function isAcceptancePassStatus(value: unknown): value is "VERIFIED_PASS" {
+  return value === "VERIFIED_PASS";
+}
+
+// CANCELLED remains neutral unless the tool's exit code or error context indicates failure.
+export function isAcceptanceFailureStatus(value: unknown): value is "BLOCKED" | "FAILED" {
+  return value === "BLOCKED" || value === "FAILED";
+}
+
+export function isAcceptanceConditionalStatus(value: unknown): value is "CONDITIONAL" {
+  return value === "CONDITIONAL";
+}
+
 export function isAcceptedWireStatus(
   value: unknown,
 ): value is (typeof ACCEPTED_WIRE_STATUSES)[number] {
