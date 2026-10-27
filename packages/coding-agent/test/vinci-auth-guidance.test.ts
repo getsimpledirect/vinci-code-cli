@@ -42,6 +42,8 @@ describe("Vinci selected-provider auth guidance", () => {
 		expect(message).toContain("/login");
 		if ("env" in provider) expect(message).toContain(provider.env);
 		else expect(message).not.toContain("API key");
+		if ("env" in provider) expect(message).toContain("/other");
+		if ("env" in provider) expect(message).toContain("VINCI_SHOW_OTHER_PROVIDERS=1");
 		expect(message).not.toContain("not connected to Vinci");
 		expect(message).not.toContain("no key to paste");
 		expect(message).not.toContain('"Use an API key"');

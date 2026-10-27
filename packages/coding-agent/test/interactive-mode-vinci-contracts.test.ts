@@ -268,7 +268,12 @@ for (const vinci of ["1", undefined])
 	test.each([false, true])(`built-in model selector wheel navigation VINCI_CODE=${vinci} remap=%s`, async (remap) => {
 		const { terminal, core, internals } = await fixture(vinci, { mode: "fullscreen", remap });
 		vi.spyOn(core.modelRegistry, "getAvailable").mockReturnValue(
-			Array.from({ length: 12 }, (_, i) => ({ ...fauxModel, id: `wheel-${i}`, name: `Wheel ${i}` })),
+			Array.from({ length: 12 }, (_, i) => ({
+				...fauxModel,
+				...(vinci === "1" ? { provider: "vinci" } : {}),
+				id: `wheel-${i}`,
+				name: `Wheel ${i}`,
+			})),
 		);
 		terminal.sendInput("/model");
 		terminal.sendInput("\r");
