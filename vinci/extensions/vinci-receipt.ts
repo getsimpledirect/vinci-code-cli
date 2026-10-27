@@ -10,7 +10,7 @@ import { basename, isAbsolute, resolve, sep } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
   currentRemoteVerdict,
   getVinciVerificationState,
@@ -27,6 +27,7 @@ import {
   getVinciTaskOutcome,
   isVinciTaskOutcome,
   setVinciTaskOutcome,
+  summarizeVinciTaskUsage,
   taskStateLabel,
   VINCI_FALSE_COMPLETION_ENTRY,
   VINCI_TASK_OUTCOME_ENTRY,
@@ -151,11 +152,16 @@ function receiptWidget(outcome: Readonly<VinciTaskOutcome>, remoteVerdict?: Para
         : foreign.length === 0
           ? theme.fg("dim", "  Billed total in Platform.")
           : theme.fg("dim", `  Billed by ${[...new Set(foreign)].sort().join(", ")}, not Vinci.`);
+      const trimIndent = (line: string): string =>
+        line.replace(new RegExp("^(?: |\\x1b\\[[\\d;:]*m)+"), (prefix) => prefix.replace(/ /g, ""));
+      const wrapIndented = (text: string, color: "muted" | "dim"): string[] =>
+        wrapTextWithAnsi(trimIndent(text), Math.max(1, width - 2))
+          .map((line) => theme.fg(color, "  ") + trimIndent(line));
       return [
         truncateToWidth(head, width, theme.fg("dim", "…")),
-        truncateToWidth(detail, width, theme.fg("dim", "…")),
-        truncateToWidth(usage, width, theme.fg("dim", "…")),
-        ...(billing ? [truncateToWidth(billing, width, theme.fg("dim", "…"))] : []),
+        ...wrapIndented(detail, "muted"),
+        ...wrapIndented(usage, "dim"),
+        ...(billing ? wrapIndented(billing, "dim") : []),
       ];
     },
     invalidate(): void {},
@@ -164,7 +170,7 @@ function receiptWidget(outcome: Readonly<VinciTaskOutcome>, remoteVerdict?: Para
 
 function messageKey(message: AgentMessage): string {
   if (message.role === "assistant") {
-    return `assistant:${message.timestamp}:${message.responseId ?? ""}:${message.stopReason}:${message.usage.totalTokens}`;
+    return `assistant:${message.timestamp}:${message.responseId ?? ""}:${message.stopReason}:${message.usage?.totalTokens ?? ""}`;
   }
   if (message.role === "toolResult") return `tool:${message.timestamp}:${message.toolCallId}`;
   return `user:${message.timestamp}`;
@@ -652,32 +658,46 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("usage", {
-    description: "Show this task's model calls, tokens, cache use, and local cost estimate",
+    description: "Show this session's model calls, tokens, local cost estimate, account billing, then Details",
     handler: async (_args, ctx) => {
-      const messages = taskMessages(ctx);
-      const outcome = getVinciTaskOutcome() ?? buildVinciTaskOutcome({
-        taskId: ctx.sessionManager.getSessionId(),
-        messages,
-        changedFiles: changedFiles(messages, ctx.cwd),
-        verification: getVinciVerificationState(),
-      });
-      const provider = outcome.usage.providers.join(", ") || "unavailable";
-      const model = outcome.usage.models.join(", ") || "unavailable";
+      const taskId = ctx.sessionManager.getSessionId();
+      const saved = getVinciTaskOutcome();
+      const outcome = saved?.taskId === taskId ? saved : undefined;
+      // Read the whole current branch, including calls since the last receipt. Adding receipts
+      // together would double-count the same cumulative session usage on every follow-up.
+      const usage = summarizeVinciTaskUsage(taskMessages(ctx), taskId);
+      const selected = ctx.model?.name || "No model selected";
+      const noCalls = usage.modelCalls === 0;
+      const selectionNote = noCalls && ctx.model ? " (selected; no calls yet)" : "";
+      const provider = usage.providers.join(", ") || (ctx.model ? `${ctx.model.provider}${selectionNote}` : "No provider selected");
+      const modelIds = usage.models.join(", ") || (ctx.model ? `${ctx.model.id}${selectionNote}` : "No model selected");
+      // Details are always last, after the customer-facing session and account sections.
+      const lines = [
+        "This session",
+        `Model: ${selected}${selectionNote}`,
+        ...(noCalls ? ["No model calls in this session yet."] : [`Usage: ${formatVinciTaskUsage(usage)}`]),
+        ...(outcome ? [`Active time: ${formatVinciTaskDuration(outcome.activeDurationMs)}`] : []),
+        "",
+        "Your Vinci account",
+        "Account balance: not available in the CLI yet",
+        `Open billing: ${VINCI_BILLING_URL}`,
+        "",
+        "Details",
+        `Task: ${taskId}`,
+        ...(outcome ? [`State: ${taskStateLabel(outcome.state)}`] : []),
+        `Provider: ${provider}`,
+        `Model IDs: ${modelIds}`,
+        ...(usage.telemetryUnavailable
+          ? ["Cache breakdown: Usage unavailable"]
+          : noCalls ? [] : [`Cache read: ${usage.cachedTokens} tokens`, `Cache write: ${usage.cacheWriteTokens} tokens`]),
+        `Reported wrong: ${outcome && reportedWrong(ctx, outcome) ? "yes" : "no"}`,
+        ...(outcome && (outcome.state === "DONE" || outcome.state === "DONE_UNVERIFIED")
+          ? [`Report wrong: vinci report-wrong ${taskId}`]
+          : []),
+      ];
       ctx.ui.notify(
-        [
-          `Task: ${outcome.taskId}`,
-          `State: ${taskStateLabel(outcome.state)}`,
-          `Usage: ${formatVinciTaskUsage(outcome.usage)}`,
-          `Active time: ${formatVinciTaskDuration(outcome.activeDurationMs)}`,
-          `Provider: ${provider}`,
-          `Model: ${model}`,
-          `Reported wrong: ${reportedWrong(ctx, outcome) ? "yes" : "no"}`,
-          ...(outcome.state === "DONE" || outcome.state === "DONE_UNVERIFIED"
-            ? [`Report wrong: vinci report-wrong ${outcome.taskId}`]
-            : []),
-          `Account credits: ${VINCI_BILLING_URL} (authoritative)`,
-        ].join("\n"),
-        outcome.state === "BLOCKED" ? "warning" : "info",
+        ctx.ui.theme.fg("text", lines.join("\n")),
+        outcome?.state === "BLOCKED" ? "warning" : "info",
       );
     },
   });

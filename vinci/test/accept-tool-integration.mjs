@@ -64,7 +64,11 @@ writeFileSync(stubVacPath, stubVacScript);
 chmodSync(stubVacPath, 0o755);
 
 // Load the accept tool extension to test
-const loader = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
+const loader = createJiti(import.meta.url, {
+  alias: { "@earendil-works/pi-tui": resolve(root, "packages/tui/src/index.ts") },
+  moduleCache: false,
+  tryNative: false,
+});
 
 // Mock PI object
 const mockPI = {
@@ -128,6 +132,13 @@ process.env.VAC_CLI_PATH = stubVacPath;
   process.env.VAC_CLI_PATH = stubVacPath;
   assert.equal(result.details.exitCode, 127);
   assert(text(result).includes("Verification isn't set up yet"), "plain-language guidance");
+  const colors = [];
+  const rendered = tool.renderResult(result, { expanded: false, isPartial: false }, {
+    fg(color, text) { colors.push(color); return text; },
+  }, { isError: false }).render(56).join("\n");
+  assert.match(rendered, /Verification isn't set up yet/);
+  assert.doesNotMatch(rendered, /✓/, "missing verification is not a successful check");
+  assert.equal(colors.includes("success"), false, "setup guidance uses a neutral foreground");
   console.log("ok (c) missing vac guidance + 127");
 }
 
