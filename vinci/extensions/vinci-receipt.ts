@@ -152,11 +152,16 @@ function receiptWidget(outcome: Readonly<VinciTaskOutcome>, remoteVerdict?: Para
         : foreign.length === 0
           ? theme.fg("dim", "  Billed total in Platform.")
           : theme.fg("dim", `  Billed by ${[...new Set(foreign)].sort().join(", ")}, not Vinci.`);
+      const trimIndent = (line: string): string =>
+        line.replace(/^(?: |\x1b\[[\d;:]*m)+/, (prefix) => prefix.replace(/ /g, ""));
+      const wrapIndented = (text: string, color: "muted" | "dim"): string[] =>
+        wrapTextWithAnsi(trimIndent(text), Math.max(1, width - 2))
+          .map((line) => theme.fg(color, "  ") + trimIndent(line));
       return [
         truncateToWidth(head, width, theme.fg("dim", "…")),
-        ...wrapTextWithAnsi(detail, Math.max(1, width)),
-        ...wrapTextWithAnsi(usage, Math.max(1, width)),
-        ...(billing ? wrapTextWithAnsi(billing, Math.max(1, width)) : []),
+        ...wrapIndented(detail, "muted"),
+        ...wrapIndented(usage, "dim"),
+        ...(billing ? wrapIndented(billing, "dim") : []),
       ];
     },
     invalidate(): void {},

@@ -1,4 +1,3 @@
-  Vinci v0.0.57 Code
   Vero DONE · Vinci · <repo>
   ● connected · Read the receipt. · /undo · Ctrl+T thinking
 
@@ -13,7 +12,8 @@
  I updated the README and left it ready for review.
 
   ✓ Done  ·  1 file
-  README.md  ·  Documentation change applied; no project check was required.  ·…
+  README.md  ·  Documentation change applied; no project check was required.  ·
+  /undo available
   2 model calls · 200 in / 100 out · 0% cached · ~$0.0000 estimated · <time> active
   Billed by faux, not Vinci.
 

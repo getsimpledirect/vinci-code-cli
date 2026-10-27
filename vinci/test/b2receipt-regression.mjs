@@ -110,6 +110,7 @@ test("F-06 receipt preserves complete cost and check at 56, 60 and 80 columns", 
   for (const handler of h.handlers.session_start) await handler({ reason: "resume" }, h.ctx);
   for (const width of [56, 60, 80]) {
     const lines = h.widget()({}, theme).render(width);
+    assert(lines.slice(1).every((line) => /^  \S/.test(tui.stripTerminalSequences(line))), `continuation lines keep the indent at ${width} columns`);
     assert(lines.every((line) => tui.visibleWidth(line) <= width), `receipt fits ${width} columns`);
     assert.doesNotMatch(lines.join("\n"), /…/, `receipt wraps at ${width} columns`);
     assert.match(lines.join("\n"), /~\$0\.0465\s+estimated/, `full cost at ${width} columns`);
