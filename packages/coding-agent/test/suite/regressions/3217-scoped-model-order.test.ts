@@ -25,11 +25,18 @@ describe("issue #3217 scoped model ordering", () => {
 	});
 
 	beforeEach(() => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("Offline catalogue test");
+			}),
+		);
 		// Ensure test isolation: keybindings are a global singleton
 		setKeybindings(new KeybindingsManager());
 	});
 
 	afterEach(() => {
+		vi.unstubAllGlobals();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -106,10 +113,8 @@ describe("issue #3217 scoped model ordering", () => {
 		const previous = process.env.VINCI_CODE;
 		const previousShow = process.env.VINCI_SHOW_OTHER_PROVIDERS;
 		process.env.VINCI_CODE = "1";
-		// This regression is about scoped-model ORDER and session-local selection, not provider
-		// visibility. Pin the managed-only view explicitly: providers are open by DEFAULT now, so
-		// relying on the default would make this assert on a mixed catalogue it was never about.
-		process.env.VINCI_SHOW_OTHER_PROVIDERS = "0";
+		// A fresh Vinci session uses the managed-only default.
+		delete process.env.VINCI_SHOW_OTHER_PROVIDERS;
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.authStorage.setRuntimeApiKey("vinci", "vinci-key");
@@ -120,7 +125,16 @@ describe("issue #3217 scoped model ordering", () => {
 			models: [
 				{
 					id: "auto",
-					name: "Vinci",
+					name: "Vinci Auto",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+				},
+				{
+					id: "mezzo",
+					name: "Vinci Mezzo",
 					reasoning: true,
 					input: ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -141,7 +155,7 @@ describe("issue #3217 scoped model ordering", () => {
 
 		try {
 			const auto = harness.session.modelRegistry.find("vinci", "auto")!;
-			// The shipped managed catalogue is auto + forte; Fortissimo is an alias of Forte, not a
+			// The shipped managed catalogue is auto + mezzo + forte; Fortissimo is an alias of Forte, not a
 			// selectable model (covered by vinci-fortissimo-alias.test.ts).
 			const forte = harness.session.modelRegistry.find("vinci", "forte")!;
 			const persist = vi.spyOn(harness.settingsManager, "setDefaultModelAndProvider");
@@ -159,7 +173,8 @@ describe("issue #3217 scoped model ordering", () => {
 			await waitForAsyncRender();
 
 			const rendered = stripAnsi(selector.render(120).join("\n"));
-			expect(rendered).toContain("Vinci");
+			expect(rendered).toContain("Vinci Auto");
+			expect(rendered).toContain("Vinci Mezzo");
 			expect(rendered).toContain("Vinci Forte");
 			expect(rendered).not.toContain("Vinci Fortissimo");
 			expect(rendered).not.toContain(harness.getModel().id);

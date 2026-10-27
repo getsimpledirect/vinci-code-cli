@@ -49,12 +49,12 @@ assert.deepEqual(
 const [managed] = registrations(false);
 // `auto` first: it is the default and resolves to whatever class the account chose. The concrete
 // classes stay registered so a corpus run can pin one deliberately.
-assert.deepEqual(managed.config.models.map(({ id }) => id), ["auto", "forte"]);
+assert.deepEqual(managed.config.models.map(({ id }) => id), ["auto", "mezzo", "forte"]);
 // Class name only, never the occupant. The old label hardcoded "(GLM 5.2)", which survived purely
 // because one class existed and its occupant never moved; the whole point of a class is that the
 // model behind it rotates without a client release. The occupant is not exposed to API clients
 // today anyway — /api/v1/models returns ids only — so any occupant here would be a stale guess.
-assert.equal(managed.config.models[0].name, "Vinci");
+assert.equal(managed.config.models[0].name, "Vinci Auto");
 assert.equal(managed.config.models[0].reasoning, true);
 assert.equal(managed.config.models[0].thinkingLevelMap.high, "high");
 assert.equal(managed.config.models[0].thinkingLevelMap.xhigh, "xhigh");
@@ -107,38 +107,43 @@ for (const args of [
   ["--models", "forte,other", "--version"],
   ["--api-key=test-key", "--version"],
 ]) {
-  // Explicit opt-out, not the default. Vinci Code ships OPEN — an open-source client must work
-  // with your own key and no account — so the managed-only boundary is something you ask for.
+  // Vinci Code keeps other providers off until the user explicitly opts in.
   const rejected = spawnSync("bash", [resolve(root, "vinci/bin/vinci"), ...args], {
     cwd: root,
     encoding: "utf8",
     env: { ...process.env, VINCI_SHOW_OTHER_PROVIDERS: "0" },
   });
   assert.equal(rejected.status, 2, `Managed Vinci must reject ${args[0]}`);
-  // The rejection message names the class mechanism, not one class: Vinci Code follows whichever
-  // class the account resolved, so naming Forte here would be wrong for anyone on another.
-  assert.match(rejected.stderr, /managed Vinci model class/);
+  // The rejection explains that command-line provider flags require the environment opt-in.
+  assert.match(rejected.stderr, /Other providers are off/);
+  assert.match(rejected.stderr, /need VINCI_SHOW_OTHER_PROVIDERS=1/);
 }
 
-// The other direction, and the one that matters for an open-source client: with NOTHING set — no
-// account, no env var, a fresh checkout — the launcher must ACCEPT a third-party provider. If this
-// goes red, someone re-defaulted Vinci Code to require a Vinci sign-in before it will do anything.
+// Other providers stay off on a fresh checkout and become available through an explicit opt-in.
 {
   const openEnv = { ...process.env };
   delete openEnv.VINCI_SHOW_OTHER_PROVIDERS;
   delete openEnv.VINCI_API_KEY;
-  const accepted = spawnSync("bash", [resolve(root, "vinci/bin/vinci"), "--provider", "anthropic", "--version"], {
+  const rejected = spawnSync("bash", [resolve(root, "vinci/bin/vinci"), "--provider", "anthropic", "--version"], {
     cwd: root,
     encoding: "utf8",
     env: openEnv,
   });
-  assert.notEqual(accepted.status, 2, "Default Vinci Code must ACCEPT --provider — no account required");
+  assert.equal(rejected.status, 2, "Default Vinci Code keeps other providers off until the user opts in");
+  assert.match(rejected.stderr, /Other providers are off/, "Default Vinci Code keeps other providers off until the user opts in");
+  assert.match(rejected.stderr, /need VINCI_SHOW_OTHER_PROVIDERS=1/, "Default Vinci Code keeps other providers off until the user opts in");
+  const accepted = spawnSync("bash", [resolve(root, "vinci/bin/vinci"), "--provider", "anthropic", "--version"], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...openEnv, VINCI_SHOW_OTHER_PROVIDERS: "1" },
+  });
+  assert.notEqual(accepted.status, 2, "Opting in with VINCI_SHOW_OTHER_PROVIDERS=1 accepts --provider");
   assert.doesNotMatch(
     accepted.stderr,
-    /managed Vinci model class/,
-    "Default Vinci Code must not tell a BYOK user their provider is unsupported",
+    /Other providers are off/,
+    "Opting in with VINCI_SHOW_OTHER_PROVIDERS=1 accepts --provider",
   );
-  console.log("  \u2713 default accepts a third-party provider with no Vinci account");
+  console.log("  ✓ other providers stay off by default and turn on with VINCI_SHOW_OTHER_PROVIDERS=1");
 }
 
 let messageEnd;

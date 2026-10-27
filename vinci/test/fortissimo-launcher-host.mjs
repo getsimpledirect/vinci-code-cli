@@ -34,7 +34,6 @@ async function launch(args, model) {
           VINCI_API_KEY: "offline-test-key",
           VINCI_MODEL: model,
           VINCI_SOURCE_CLI: "1",
-          VINCI_SHOW_OTHER_PROVIDERS: "1",
           VINCI_NO_BOOTSTRAP_HEAL: "1",
           VINCI_TOOL_BOOTSTRAP: "0",
           VINCI_UPDATE_DISABLED: "1",
@@ -83,6 +82,7 @@ for (const { name, args, model } of [
   { name: "VINCI_MODEL=fortissimo", args: [], model: "fortissimo" },
   { name: "--model fortissimo", args: ["--model", "fortissimo"], model: "auto" },
   { name: "--model vinci/fortissimo", args: ["--model", "vinci/fortissimo"], model: "auto" },
+  { name: "--model=VINCI/FORTISSIMO", args: ["--model=VINCI/FORTISSIMO"], model: "auto" },
 ]) {
   test(`T5 HOST-RUN launcher resolves ${name} to Forte`, async () => {
     const result = await launch(args, model);
@@ -94,6 +94,33 @@ for (const { name, args, model } of [
     assert.doesNotMatch(result.stderr, /will not substitute|unavailable|Unknown Vinci model/);
   });
 }
+
+for (const id of ["auto", "mezzo", "forte"]) {
+  for (const args of [
+    ["--model", id], [`--model=VINCI/${id.toUpperCase()}`],
+    ["--provider", "VINCI", "--model", `vinci/${id}`],
+    ["--provider=VINCI", `--model=${id.toUpperCase()}`],
+    ["--models", id], [`--models=VINCI/${id.toUpperCase()}`],
+  ]) {
+    test(`HOST-RUN managed default resolves ${args.join(" ")}`, async () => {
+      const result = await launch(args, "auto");
+      assert.equal(result.failure, undefined, result.failure);
+      assert.equal(result.status, 0, "managed Vinci class must dispatch");
+      assert.equal(result.state?.success, true, "RPC get_state must succeed");
+      assert.equal(result.state.data.model.provider, "vinci");
+      // --models limits the cycling scope; the launcher's explicit Auto startup is unchanged.
+      assert.equal(result.state.data.model.id, args[0].startsWith("--models") ? "auto" : id);
+    });
+  }
+}
+
+test("HOST-RUN environment Mezzo resolves through the launcher", async () => {
+  const result = await launch([], "mezzo");
+  assert.equal(result.failure, undefined, result.failure);
+  assert.equal(result.status, 0);
+  assert.equal(result.state?.success, true);
+  assert.equal(result.state.data.model.id, "mezzo");
+});
 
 test("T5 HOST-RUN launcher still rejects an unknown environment class with exit 2", async () => {
   const result = await launch([], "doesnotexist");

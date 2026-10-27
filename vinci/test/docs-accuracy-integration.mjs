@@ -26,11 +26,10 @@ for (const file of files) {
 	const rel = file.slice(root.length + 1);
 	if (rel.startsWith("vinci/UPSTREAM-")) continue; // upstream Pi's own docs, preserved verbatim
 
-	// 1. The opt-in is obsolete: providers are OPEN by default and no account is required.
-	//    Telling a reader to set this makes the product look gated when it is not.
+	// 1. Vinci sign-in is the default; other providers require an explicit opt-in.
 	for (const [i, line] of text.split("\n").entries()) {
-		if (/VINCI_SHOW_OTHER_PROVIDERS\s*=\s*1/.test(line)) {
-			violations.push(`${rel}:${i + 1} teaches the obsolete opt-in (default is already open)`);
+		if (/(?:providers) (?:are )?open by default|Neither mode is "the default"|full catalogue is shown by \*\*default\*\*/i.test(line)) {
+			violations.push(`${rel}:${i + 1} teaches the obsolete other-providers default`);
 		}
 		// 2. A private repository a public reader cannot open.
 		if (/getsimpledirect\/vinci-code(?!-cli|-releases)\b/.test(line)) {
@@ -47,7 +46,7 @@ for (const file of files) {
 			[/the limit is pattern coverage,? not timing/i, "false: `!` results and large bash spill files bypass the persistence hook"],
 			[/masking (?:runs|happens) before storage,? so pattern coverage is the real limit/i, "false: some local persistence paths bypass the masking hooks"],
 			[/managed cloud product/i, "false: works with your own provider key too"],
-			[/(?:\/login|\/model)[^.\n]*show only Vinci/i, "false: every Pi provider is offered"],
+			[/(?:\/login|\/model)[^.\n]*always show only Vinci/i, "false: /other can enable other providers"],
 			[/Vinci is single-provider/i, "false: BYOK is supported"],
 			[/sends? (?:your |the )?key nowhere/i, "false: the key IS sent to the chosen provider"],
 		]) {
@@ -104,6 +103,13 @@ for (const file of files) {
 // check here was about links and versions, not about the page contradicting itself.
 {
 	const readme = readFileSync(resolve(root, "README.md"), "utf8");
+	const quickStart = readme.split("## Quick start")[1]?.split("## CLI reference")[0] ?? "";
+	assert.match(quickStart, /sign in with your Vinci account/i);
+	assert.match(quickStart, /\/other/);
+	assert.match(quickStart, /VINCI_SHOW_OTHER_PROVIDERS=1/);
+	const privacy = readFileSync(resolve(root, "vinci/PRIVACY.md"), "utf8");
+	assert.match(privacy, /GET <platform>\/api\/models/);
+	assert.match(privacy, /no credentials/);
 	// Strip fenced code blocks first: the install section contains `# From source ...` shell
 	// comments, which are not headings. Matching raw text would flag them and the check would
 	// be turned off as noisy.
@@ -119,5 +125,5 @@ for (const file of files) {
 
 assert.deepEqual(violations, [], `public docs are inaccurate:\n  ${violations.join("\n  ")}`);
 process.stdout.write(
-	`docs-accuracy-integration: ${files.length} public docs carry no obsolete opt-in, private-repo link, or pinned version\n`,
+	`docs-accuracy-integration: ${files.length} public docs carry no obsolete default, private-repo link, or pinned version; Vinci sign-in, opt-in and public catalogue documented\n`,
 );

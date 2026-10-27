@@ -82,10 +82,10 @@ test("T4 deleted legacy Kimi metadata stays absent", () => {
     "The obsolete Fortissimo Kimi price block must be deleted");
 });
 
-test("T5 picker offers auto and Forte only", () => {
+test("T5 picker offers auto, Mezzo and Forte only", () => {
   const { config } = registration();
   assert.deepEqual(config.models.map(({ id, name }) => [id, name]),
-    [["auto", "Vinci"], ["forte", "Vinci Forte"]], "The Vinci picker must contain only auto and forte");
+    [["auto", "Vinci Auto"], ["mezzo", "Vinci Mezzo"], ["forte", "Vinci Forte"]], "The Vinci picker must contain only auto, Mezzo and Forte");
 });
 
 test("T7 receipt preserves requested alias and effective Forte", async () => {

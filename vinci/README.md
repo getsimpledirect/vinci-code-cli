@@ -19,10 +19,10 @@ updates almost never conflicts. See [`UPSTREAM.md`](UPSTREAM.md) for maintenance
 
 Two things stated up front rather than discovered:
 
-- **You do not need a Vinci account.** Run it, `/login`, pick any provider Pi supports and use
-  your own key. The guard, receipts, checkpoints and review all work identically. Signing in to
-  Vinci is offered, never required — `VINCI_SHOW_OTHER_PROVIDERS=0` restores the managed-only view. See [`PRIVACY.md`](PRIVACY.md) for exactly
-  what changes between the two modes — in BYOK, Vinci's servers are not in the path.
+- **Sign in with your Vinci account by default.** `/login` opens Vinci browser pairing and
+  model surfaces offer Vinci models. To use your own key without a Vinci account, enable other
+  providers through `/other`, then `/login`. The guard, receipts, checkpoints and review work
+  in both modes. See [`PRIVACY.md`](PRIVACY.md) for inference routing and public catalogue discovery.
 - **Recognised secrets in normal prompts and tool results are masked before the session
   transcript is written.** The `!` shell shortcut is recorded outside those hooks, and large
   bash output can spill raw to `$TMPDIR/pi-bash-*.log` before masking runs. Unrecognised formats
@@ -49,9 +49,12 @@ npm ci --ignore-scripts && bash vinci/build.sh
 ./vinci/bin/vinci
 ```
 
-Then `/login` — it offers every provider Pi supports, plus Vinci. Use your own key and no
-account is required; sign in to Vinci if you want managed inference. See
-[`PRIVACY.md`](PRIVACY.md) for exactly what differs between the two.
+Then `/login` to sign in with your Vinci account. `/model` offers Auto (your plan's default),
+Mezzo and Forte, with live underlying model details when available. For BYOK, `/other`
+asks for confirmation and saves the preference, then `/login` offers the supported providers.
+`showOtherProviders: true` or `VINCI_SHOW_OTHER_PROVIDERS=1` also enables them; the environment
+overrides the saved preference both ways. Vinci entries stay first in a separate group.
+See [`PRIVACY.md`](PRIVACY.md) for what differs between the two modes.
 
 
 ## Releasing (increment slowly)
@@ -86,7 +89,7 @@ or rewrites the archive. Dispatching either workflow requires its own authorizat
 | `themes/vinci-{dark,light}.json` | Brand palette as Pi themes (all 51 tokens) |
 | `identity.json` | Canonical Vinci app/provider/model/theme/extension contract, enforced after upstream syncs |
 | `updater/` | Stable signed-manifest updater, public trust root, atomic version activation, and rollback launcher |
-| `extensions/vinci-provider.ts` | Managed Vinci gateway (`/api/v1`) + `/login` device pairing for Vinci. The product contract is the stable `forte` frontier class, initially GLM 5.2 on approved DeepInfra. The picker exposes only Forte; the direct DeepInfra lane is internal qualification only |
+| `extensions/vinci-provider.ts` | Managed Vinci gateway (`/api/v1`) + `/login` device pairing. Registers plain Vinci Auto, Vinci Mezzo and Vinci Forte names; `/model` adds details from the public catalogue. Fortissimo remains an alias of Forte |
 | `extensions/vinci-shell.ts` | Vinci-owned framed composer and status shell — a spacious raised input surface with breathing room above it, one slow `· → • → ● → •` pulse, semantic phase copy, honest connection state, Auto/Plan, model, project/branch, and context orientation |
 | `extensions/vinci-character.ts` | Coding behavior — own the user's goal, explore freely, use a high permission bar, **narrate every step in plain language**, and finish the task |
 | `extensions/vinci-memory.ts` | Transparent project memory — `remember` tool + `/memory`, local `.vinci/memory.md` |
@@ -171,9 +174,9 @@ or rewrites the archive. Dispatching either workflow requires its own authorizat
 
 ## Before your first task
 
-Choose the provider and authentication method in `/login` before starting work. Vinci browser
-pairing uses Vinci's managed account. With your own provider enabled, choose its supported login or
-API key explicitly and check which account will be charged.
+Sign in to your Vinci account with `/login` before starting work. To bring your own provider,
+enable it with `/other`, then choose its supported login or API key in `/login` and check
+which account will be charged.
 
 - **OpenAI:** the supported ChatGPT/Codex sign-in and an OpenAI API key are separate billing
   choices. API-key usage is billed through the API Platform rather than your ChatGPT subscription;
@@ -434,8 +437,10 @@ source-ownership, Crew reconciliation, and sealed-comparator work. Qualification
 dated check and harness outputs for the exact source and artifact under review, rather than a
 test count or blanket passing claim maintained in this README.
 
-The product target is **Vinci Forte**, initially GLM 5.2 on DeepInfra with confirmed ZDR approval.
-The CLI requests the stable `forte` class and records requested/resolved provenance and route drift.
+The selectable managed lineup is **Vinci Auto**, **Vinci Mezzo** and **Vinci Forte**.
+Auto remains the initial selection and resolves to the account's default server-side. The CLI
+records requested/resolved provenance and route drift; `/model` obtains underlying details from
+the public catalogue instead of treating a pinned occupant as current.
 The remaining serving work is signed resolution metadata, complete capability/cost headers, repeated
 production qualification, and a checked-in promotion/rollback gate. Do not replace that with BYOK, an
 in-app local runtime, a per-task dollar cap, plan-based concurrency, or a paid priority lane.

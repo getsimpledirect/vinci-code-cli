@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
+import { VINCI_MODEL_NAMES } from "./lib/model-catalogue.ts";
 import { setVinciConnection } from "./lib/ui-state.ts";
 import { canonicalVinciClass } from "./lib/vinci-class.ts";
 import { VINCI_BILLING_URL, VINCI_GATEWAY_BASE_URL, VINCI_PLATFORM_BASE_URL } from "./vinci-links.ts";
@@ -124,15 +125,20 @@ function terminalBudgetMessage(taskId: string): string {
 }
 
 /**
- * Indicative rates in USD per million tokens. Fortissimo is a compatibility alias of Forte,
- * including its estimates. The account is billed server-side from the actual route.
+ * Indicative DeepInfra rates in USD per million tokens, from classes.yaml@94c6811d.
+ * Fortissimo is a compatibility alias of Forte, including its estimates.
+ * The account is billed server-side from the actual route.
  *
  * `auto` has no single true price, because the class it resolves to varies per account. It carries
  * the default class's rates as an indicative figure.
+ * cacheWrite equals the input rate ($0.15 for Auto/Mezzo, $0.90 for Forte): the catalogue
+ * supplies no separate cache-write price, so estimates treat those tokens as normal input.
  */
 const CLASS_COSTS: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
-  auto: { input: 0.93, output: 3, cacheRead: 0.18, cacheWrite: 0.93 },
-  forte: { input: 0.93, output: 3, cacheRead: 0.18, cacheWrite: 0.93 },
+  // Auto estimates use the server default class, Mezzo; billing is resolved server-side.
+  auto: { input: 0.15, output: 0.50, cacheRead: 0.03, cacheWrite: 0.15 },
+  mezzo: { input: 0.15, output: 0.50, cacheRead: 0.03, cacheWrite: 0.15 },
+  forte: { input: 0.90, output: 4.00, cacheRead: 0.20, cacheWrite: 0.90 },
 };
 
 export function vinciClassModel(id: string, name: string) {
@@ -284,13 +290,9 @@ export default function (pi: ExtensionAPI) {
     baseUrl: BASE_URL,
     apiKey: "$VINCI_API_KEY", // fallback / CI escape hatch — OAuth creds take precedence
     api: "openai-completions",
-    models: [
-      // `auto` lets the gateway resolve the account's class without persisting an explicit override.
-      vinciClassModel("auto", "Vinci"),
-      // Stable product classes. Their occupants and providers are configured server-side in
-      // vinci-chat/config/classes.yaml, so future frontier swaps do not require a CLI release.
-      vinciClassModel("forte", "Vinci Forte"),
-    ],
+    // Plain model names also feed footer, usage and receipts. /model alone adds live details.
+    // `auto` still lets the gateway resolve the account's class without an explicit override.
+    models: Object.entries(VINCI_MODEL_NAMES).map(([id, name]) => vinciClassModel(id, name)),
     oauth: {
       name: "Vinci",
       login: loginVinci,

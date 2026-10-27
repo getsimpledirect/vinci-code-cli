@@ -52,6 +52,7 @@ import {
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { spawn, spawnSync } from "child_process";
+import { groupVinciModels } from "../../../../../vinci/extensions/lib/model-catalogue.ts";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -97,6 +98,7 @@ import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 // panel about a collision the menu filter had already resolved.
 const VINCI_MENU_COMMANDS = new Set([
 	"login",
+	"other",
 	"logout",
 	"model",
 	"new",
@@ -609,9 +611,9 @@ export class InteractiveMode {
 		// a collision that does not exist and that the user cannot act on.
 		const vinciCode = process.env.VINCI_CODE === "1";
 		const builtinNames = new Set(
-			BUILTIN_SLASH_COMMANDS.filter((command) => !vinciCode || VINCI_MENU_COMMANDS.has(command.name)).map(
-				(command) => command.name,
-			),
+			BUILTIN_SLASH_COMMANDS.filter((command) =>
+				vinciCode ? VINCI_MENU_COMMANDS.has(command.name) : command.name !== "other",
+			).map((command) => command.name),
 		);
 		return extensionRunner
 			.getRegisteredCommands()
@@ -636,6 +638,7 @@ export class InteractiveMode {
 		// "provider authentication", "session context", or "keybindings/extensions/skills" jargon.
 		const VINCI_DESCRIPTIONS: Record<string, string> = {
 			login: "Connect to Vinci",
+			other: "Add or hide other providers",
 			logout: "Disconnect from Vinci",
 			model: "Choose which Vinci model to use",
 			new: "Start a fresh conversation",
@@ -647,8 +650,8 @@ export class InteractiveMode {
 			help: "See what Vinci can do",
 		};
 		const vinciCode = process.env.VINCI_CODE === "1";
-		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.filter(
-			(command) => !vinciCode || VINCI_MENU.has(command.name),
+		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.filter((command) =>
+			vinciCode ? VINCI_MENU.has(command.name) : command.name !== "other",
 		).map((command) => ({
 			name: command.name,
 			description: (vinciCode && VINCI_DESCRIPTIONS[command.name]) || command.description,
@@ -2863,6 +2866,11 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (process.env.VINCI_CODE === "1" && text === "/other") {
+				this.editor.setText("");
+				this.showOtherProvidersSelector();
+				return;
+			}
 			if (text === "/login") {
 				this.showOAuthSelector("login");
 				this.editor.setText("");
@@ -3555,7 +3563,7 @@ export class InteractiveMode {
 				new Text(
 					theme.fg(
 						"warning",
-						`⚠ ${count} from this session couldn't be read and ${unreadable.length === 1 ? "was" : "were"} skipped — the restored conversation may be missing recent steps.`,
+						`! ${count} from this session couldn't be read and ${unreadable.length === 1 ? "was" : "were"} skipped — the restored conversation may be missing recent steps.`,
 					),
 					1,
 					0,
@@ -4576,7 +4584,7 @@ export class InteractiveMode {
 			const scoped = this.session.scopedModels.map((entry) => entry.model);
 			if (process.env.VINCI_CODE !== "1") return scoped;
 			return this.settingsManager.getShowOtherProviders()
-				? scoped
+				? groupVinciModels(scoped)
 				: scoped.filter((model) => model.provider === "vinci");
 		}
 
@@ -4589,7 +4597,7 @@ export class InteractiveMode {
 			if (!this.settingsManager.getShowOtherProviders()) {
 				return models.filter((model) => model.provider === "vinci");
 			}
-			return [...models].sort((a, b) => Number(b.provider === "vinci") - Number(a.provider === "vinci"));
+			return groupVinciModels(models);
 		} catch {
 			return [];
 		}
@@ -5096,6 +5104,33 @@ export class InteractiveMode {
 		}
 
 		return options.sort((a, b) => a.name.localeCompare(b.name));
+	}
+
+	private showOtherProvidersSelector(): void {
+		const enabled = this.settingsManager.getShowOtherProviders();
+		const action = enabled ? "Hide other providers" : "Enable other providers";
+		this.showSelector((done) => {
+			const selector = new ExtensionSelectorComponent(
+				`Other providers are ${enabled ? "on" : "off"}.`,
+				[action, "Cancel"],
+				(option) => {
+					done();
+					if (option !== action) return;
+					this.settingsManager.setShowOtherProviders(!enabled);
+					const effective = this.settingsManager.getShowOtherProviders();
+					this.showStatus(
+						effective !== !enabled
+							? `Preference saved. VINCI_SHOW_OTHER_PROVIDERS keeps other providers ${effective ? "on" : "off"}.`
+							: effective
+								? "Other providers are on. Use /login to add a provider key."
+								: "Other providers are off. Showing Vinci models.",
+					);
+					void this.updateAvailableProviderCount();
+				},
+				() => done(),
+			);
+			return { component: selector, focus: selector };
+		});
 	}
 
 	private showLoginAuthTypeSelector(): void {

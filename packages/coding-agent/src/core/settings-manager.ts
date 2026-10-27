@@ -98,7 +98,7 @@ export interface Settings {
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
 	// [vinci] Vinci-mode settings: other-provider visibility and hidden thinking default (VINCI_CODE / VINCI_SHOW_OTHER_PROVIDERS)
-	showOtherProviders?: boolean; // Vinci mode only; default: TRUE — no account required
+	showOtherProviders?: boolean; // Vinci mode only; default: false; opt in with /other
 	externalEditor?: string; // Command for Ctrl+G external editor; takes precedence over VISUAL/EDITOR
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
@@ -896,21 +896,14 @@ export class SettingsManager {
 	/**
 	 * Whether providers other than Vinci's managed service are offered.
 	 *
-	 * DEFAULT: true. Vinci Code is an open-source client — anyone should be able to clone or
-	 * download it and start working with their own provider key, without creating an account.
-	 * The account requirement only ever existed because Vinci supplied the inference; requiring
-	 * a sign-up to use a client you already have on disk is hostile, and for a public repo it is
-	 * the first thing a new user hits.
-	 *
-	 * Vinci's own classes still sort FIRST in every picker, so the managed path stays the obvious
-	 * choice for anyone who wants it. Set `showOtherProviders: false` (or
-	 * VINCI_SHOW_OTHER_PROVIDERS=0) to get the lean, Vinci-only view back.
+	 * Default: false. In Vinci mode, /other persists an explicit opt-in globally.
+	 * VINCI_SHOW_OTHER_PROVIDERS overrides the setting in either direction.
 	 */
 	getShowOtherProviders(): boolean {
 		if (process.env.VINCI_SHOW_OTHER_PROVIDERS !== undefined) {
 			return process.env.VINCI_SHOW_OTHER_PROVIDERS === "1";
 		}
-		return this.settings.showOtherProviders ?? true;
+		return this.settings.showOtherProviders ?? false;
 	}
 
 	setShowOtherProviders(show: boolean): void {

@@ -71,10 +71,19 @@ describe("Vinci BYOK provider visibility", () => {
 
 	beforeEach(() => {
 		process.env.VINCI_CODE = "1";
+		vi.stubEnv("VINCI_SHOW_OTHER_PROVIDERS", undefined);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("Offline catalogue test");
+			}),
+		);
 		setKeybindings(new KeybindingsManager());
 	});
 
 	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -84,7 +93,7 @@ describe("Vinci BYOK provider visibility", () => {
 
 	it.each([
 		{ showOtherProviders: false, expectedProviders: ["vinci"] },
-		{ showOtherProviders: true, expectedProviders: ["anthropic", "vinci"] },
+		{ showOtherProviders: true, expectedProviders: ["vinci", "anthropic"] },
 	])(
 		"returns registry candidates for showOtherProviders=$showOtherProviders",
 		async ({ showOtherProviders, expectedProviders }) => {
@@ -102,13 +111,13 @@ describe("Vinci BYOK provider visibility", () => {
 
 			const candidates = await getModelCandidates.call(context);
 
-			expect(candidates.map((model) => model.provider).sort()).toEqual(expectedProviders);
+			expect(candidates.map((model) => model.provider)).toEqual(expectedProviders);
 		},
 	);
 
 	it.each([
 		{ showOtherProviders: false, expectedProviders: ["vinci"] },
-		{ showOtherProviders: true, expectedProviders: ["anthropic", "vinci"] },
+		{ showOtherProviders: true, expectedProviders: ["vinci", "anthropic"] },
 	])(
 		"filters scoped candidates for showOtherProviders=$showOtherProviders",
 		async ({ showOtherProviders, expectedProviders }) => {
@@ -128,7 +137,7 @@ describe("Vinci BYOK provider visibility", () => {
 
 			const candidates = await getModelCandidates.call(context);
 
-			expect(candidates.map((model) => model.provider).sort()).toEqual(expectedProviders);
+			expect(candidates.map((model) => model.provider)).toEqual(expectedProviders);
 		},
 	);
 

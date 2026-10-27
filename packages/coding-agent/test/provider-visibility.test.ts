@@ -152,10 +152,18 @@ describe.sequential("Vinci provider visibility", () => {
 		previousShowOtherProviders = process.env.VINCI_SHOW_OTHER_PROVIDERS;
 		delete process.env.VINCI_CODE;
 		delete process.env.VINCI_SHOW_OTHER_PROVIDERS;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("Offline catalogue test");
+			}),
+		);
 		setKeybindings(new KeybindingsManager());
 	});
 
 	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.restoreAllMocks();
 		if (previousVinciCode === undefined) delete process.env.VINCI_CODE;
 		else process.env.VINCI_CODE = previousVinciCode;
 		if (previousShowOtherProviders === undefined) delete process.env.VINCI_SHOW_OTHER_PROVIDERS;
@@ -181,7 +189,7 @@ describe.sequential("Vinci provider visibility", () => {
 	test("renders Vinci names and foreign ids, both badged, in each selection branch", async () => {
 		process.env.VINCI_CODE = "1";
 		const openai = { ...createModel("openai", "gpt-test"), name: "GPT Test" };
-		const vinci = { ...createModel("vinci", "auto"), name: "Vinci" };
+		const vinci = { ...createModel("vinci", "auto"), name: "Vinci Auto" };
 
 		const lines = await renderSelector(
 			SettingsManager.inMemory({ showOtherProviders: true }),
@@ -190,7 +198,7 @@ describe.sequential("Vinci provider visibility", () => {
 		);
 
 		expect(lines).toContain("→ gpt-test [openai] ✓");
-		expect(lines).toContain("  Vinci [vinci]");
+		expect(lines).toContain("  Vinci Auto  your plan's default [vinci]");
 	});
 
 	test("renders friendly names without provider badges in both selection branches when other providers are disabled", async () => {
@@ -234,19 +242,15 @@ describe.sequential("Vinci provider visibility", () => {
 		["interactive model candidates", getInteractiveProviders],
 		["list models", getListProviders],
 	] as const)("%s", (_site, getProviders) => {
-		// 🔴 The default is OPEN. Vinci Code is an open-source client and must work the moment you
-		// have it, with your own key and no account. Runs at all three sites, so a re-default to
-		// false goes red everywhere it would actually be felt.
-		test("offers other providers BY DEFAULT — no account required", async () => {
+		// Pin the fresh-install default at every model surface.
+		test("offers only Vinci by default until the user opts in", async () => {
 			process.env.VINCI_CODE = "1";
 			delete process.env.VINCI_SHOW_OTHER_PROVIDERS;
 
 			const fresh = SettingsManager.inMemory();
-			expect(fresh.getShowOtherProviders()).toBe(true);
+			expect(fresh.getShowOtherProviders()).toBe(false);
 			const providers = await getProviders(fresh);
-			expect(providers).toContain("openai");
-			// Vinci still sorts first, so the managed path stays the obvious choice.
-			expect(providers[0]).toBe("vinci");
+			expect(providers).toEqual(["vinci"]);
 		});
 
 		test("shows only Vinci models when other providers are disabled in Vinci mode", async () => {
