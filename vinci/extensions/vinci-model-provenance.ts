@@ -4,15 +4,16 @@
  * A public Vinci class must not silently become an unauditable model alias. This extension records
  * the requested Vinci model, the client-declared capability fingerprint, and the first concrete
  * route reported by the gateway/stream. It restores the route pin across resume and fork, sends the
- * opaque pin on later requests, and makes any mid-session model/version/capability drift visible.
+ * opaque pin on later requests, and stops mid-session model/class/version/capability drift.
+ * Streamed provider spellings remain visible without being treated as model changes.
  *
  * The current gateway can already populate `responseModel` through the OpenAI stream. The dedicated
  * Vinci response headers below are the stronger future contract; until they exist, `auto` remains
  * explicitly unresolved rather than being falsely recorded as its own concrete implementation.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { canonicalVinciClass } from "./lib/vinci-class.ts";
 
 // vinci-model-classes 0.2.0, src/provenance.ts:22-27
@@ -28,8 +29,11 @@ const CLIENT_CAPABILITY_HEADER = "x-vinci-client-capability-fingerprint";
 const RESOLUTION_TOKEN_HEADER = "x-vinci-resolution-token";
 const PLATFORM_HEADER = "x-vinci-platform";
 const RESOLVED_MODEL_HEADER = "x-vinci-resolved-model";
+const RESOLVED_CLASS_HEADER = "x-vinci-resolved-class";
 const RESOLVED_VERSION_HEADER = "x-vinci-model-version";
 const SERVER_CAPABILITY_HEADER = "x-vinci-capability-fingerprint";
+// Match vinci-loopbreak's deferred turn-stop; aborting synchronously inside a hook can deadlock.
+const DRIFT_STOP = process.env.VINCI_NO_DRIFT_STOP !== "1";
 
 type VinciModel = NonNullable<ExtensionContext["model"]>;
 
@@ -49,6 +53,11 @@ interface ClientCapabilities {
 
 interface ResolvedRoute {
   model: string;
+  resolvedClass?: string;
+  expectedClass?: string;
+  streamModels?: string[];
+  routeChanges?: number;
+  lastStreamModel?: string;
   version?: string;
   capabilityFingerprint?: string;
   resolutionToken?: string;
@@ -94,6 +103,7 @@ interface ActiveProvenance {
 interface PendingResponse {
   requested: RequestedModel;
   resolvedModel?: string;
+  resolvedClass?: string;
   version?: string;
   capabilityFingerprint?: string;
   resolutionToken?: string;
@@ -129,14 +139,17 @@ function errorStatus(error: unknown): number | undefined {
 
 export function describeVinciModelError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message.replaceAll("\r", " ").replaceAll("\n", " ").replace(/\s+/g, " ").trim().slice(0, 500) || "unknown error";
+  return (
+    message.replaceAll("\r", " ").replaceAll("\n", " ").replace(/\s+/g, " ").trim().slice(0, 500) || "unknown error"
+  );
 }
 
 export function classifyVinciModelError(error: unknown): VinciModelFailureKind {
   const status = errorStatus(error);
   const name = error instanceof Error ? error.name : "";
   const text = `${status ?? ""} ${name} ${describeVinciModelError(error)}`;
-  if (status === 401 || status === 402 || status === 403 || status === 429 || ACCOUNT_ERROR.test(text)) return "account";
+  if (status === 401 || status === 402 || status === 403 || status === 429 || ACCOUNT_ERROR.test(text))
+    return "account";
   if (status === 404 || status === 410 || UNAVAILABLE_ERROR.test(text)) return "unavailable";
   if (
     status === 408 ||
@@ -162,7 +175,10 @@ export function assertSuccessfulVinciCompletion(
 }
 
 function normalizedVinciClass(value: string): string {
-  return canonicalVinciClass(value).trim().toLowerCase().replace(/^vinci\//, "");
+  return canonicalVinciClass(value)
+    .trim()
+    .toLowerCase()
+    .replace(/^vinci\//, "");
 }
 
 export function isCheaperVinciClass(requested: string, served: string): boolean {
@@ -238,6 +254,14 @@ function isResolvedRoute(value: unknown): value is ResolvedRoute {
   return Boolean(
     candidate &&
       typeof candidate.model === "string" &&
+      (candidate.resolvedClass === undefined || typeof candidate.resolvedClass === "string") &&
+      (candidate.expectedClass === undefined || typeof candidate.expectedClass === "string") &&
+      (candidate.streamModels === undefined ||
+        (Array.isArray(candidate.streamModels) &&
+          candidate.streamModels.every((model) => typeof model === "string"))) &&
+      (candidate.routeChanges === undefined ||
+        (Number.isSafeInteger(candidate.routeChanges) && Number(candidate.routeChanges) >= 0)) &&
+      (candidate.lastStreamModel === undefined || typeof candidate.lastStreamModel === "string") &&
       (candidate.version === undefined || typeof candidate.version === "string") &&
       (candidate.capabilityFingerprint === undefined || typeof candidate.capabilityFingerprint === "string") &&
       (candidate.resolutionToken === undefined || typeof candidate.resolutionToken === "string") &&
@@ -285,7 +309,10 @@ function isStrongerEvidence(current: ResolutionEvidence, next: ResolutionEvidenc
 }
 
 function hasRouteDrift(pinned: ResolvedRoute, observed: ResolvedRoute): boolean {
-  if (pinned.model !== observed.model) return true;
+  if (pinned.resolvedClass && observed.resolvedClass && pinned.resolvedClass !== observed.resolvedClass) return true;
+  if (isStrongerEvidence(pinned.evidence, observed.evidence)) return false;
+  if (pinned.evidence === "response-stream" && observed.evidence === "response-stream") return false;
+  if (pinned.evidence === observed.evidence && pinned.model !== observed.model) return true;
   if (pinned.version && observed.version && pinned.version !== observed.version) return true;
   return Boolean(
     pinned.capabilityFingerprint &&
@@ -296,7 +323,12 @@ function hasRouteDrift(pinned: ResolvedRoute, observed: ResolvedRoute): boolean 
 
 function mergeRoute(current: ResolvedRoute, next: ResolvedRoute): ResolvedRoute {
   return {
-    model: next.model,
+    model: isStrongerEvidence(next.evidence, current.evidence) ? current.model : next.model,
+    resolvedClass: next.resolvedClass ?? current.resolvedClass,
+    expectedClass: next.expectedClass ?? current.expectedClass,
+    streamModels: next.streamModels,
+    routeChanges: next.routeChanges,
+    lastStreamModel: next.lastStreamModel,
     version: next.version ?? current.version,
     capabilityFingerprint: next.capabilityFingerprint ?? current.capabilityFingerprint,
     resolutionToken: next.resolutionToken ?? current.resolutionToken,
@@ -304,7 +336,10 @@ function mergeRoute(current: ResolvedRoute, next: ResolvedRoute): ResolvedRoute 
   };
 }
 
-function restoreActive(entries: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>, requested: RequestedModel) {
+function restoreActive(
+  entries: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>,
+  requested: RequestedModel,
+) {
   let active: ActiveProvenance | undefined;
   for (const entry of entries) {
     if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE || !isRecord(entry.data)) continue;
@@ -312,8 +347,10 @@ function restoreActive(entries: ReturnType<ExtensionContext["sessionManager"]["g
     if (record.event === "selected") {
       // A historical alias pin may identify its retired occupant. Preserve the record, but
       // establish a new Forte route rather than carrying that occupant's token forward.
-      active = sameRequested(record.requested, requested) &&
-        (!requested.alias || record.effectiveClass === "forte") ? { selection: record } : undefined;
+      active =
+        sameRequested(record.requested, requested) && (!requested.alias || record.effectiveClass === "forte")
+          ? { selection: record }
+          : undefined;
       continue;
     }
     if (!active || !sameRequested(record.requested, active.selection.requested)) continue;
@@ -332,6 +369,20 @@ export default function (pi: ExtensionAPI) {
   let active: ActiveProvenance | undefined;
   let pendingResponse: PendingResponse | undefined;
   const aliasNotedSessions = new Set<string>();
+
+  const recordResolution = (resolved: ResolvedRoute): void => {
+    if (!active || JSON.stringify(resolved) === JSON.stringify(active.resolution)) return;
+    active.resolution = resolved;
+    const record: ResolutionRecord = {
+      schemaVersion: SCHEMA_VERSION,
+      event: "resolved",
+      requested: active.selection.requested,
+      effectiveClass: active.selection.effectiveClass ?? normalizedVinciClass(active.selection.requested.model),
+      clientCapabilityFingerprint: active.selection.clientCapabilityFingerprint,
+      resolved,
+    };
+    pi.appendEntry(ENTRY_TYPE, record);
+  };
 
   const explainAlias = (model: VinciModel, ctx: ExtensionContext): void => {
     if (model.provider !== "vinci" || !requestedFrom(model).alias) return;
@@ -409,6 +460,7 @@ export default function (pi: ExtensionAPI) {
     pendingResponse = {
       requested: requestedFrom(model),
       resolvedModel: headerValue(event.headers, RESOLVED_MODEL_HEADER),
+      resolvedClass: headerValue(event.headers, RESOLVED_CLASS_HEADER),
       version: headerValue(event.headers, RESOLVED_VERSION_HEADER),
       capabilityFingerprint: headerValue(event.headers, SERVER_CAPABILITY_HEADER),
       resolutionToken: headerValue(event.headers, RESOLUTION_TOKEN_HEADER, 512),
@@ -431,9 +483,11 @@ export default function (pi: ExtensionAPI) {
       requested.provider === message.provider &&
       canonicalVinciClass(requested.model) === canonicalVinciClass(message.model);
     const response = pendingResponse && matchesMessage(pendingResponse.requested) ? pendingResponse : undefined;
-    const requested = response?.requested ??
-      (active && matchesMessage(active.selection.requested) ? active.selection.requested :
-        { provider: message.provider, model: message.model });
+    const requested =
+      response?.requested ??
+      (active && matchesMessage(active.selection.requested)
+        ? active.selection.requested
+        : { provider: message.provider, model: message.model });
     pendingResponse = undefined;
     if (message.stopReason === "error" || message.stopReason === "aborted") return;
 
@@ -445,6 +499,19 @@ export default function (pi: ExtensionAPI) {
     if (!active) return;
 
     const streamedModel = cleanHeader(message.responseModel, 256);
+    const streamModels = [...(active.resolution?.streamModels ?? [])];
+    if (streamedModel && !streamModels.includes(streamedModel)) streamModels.push(streamedModel);
+    const lastStreamModel = active.resolution?.lastStreamModel;
+    const routeChanges =
+      (active.resolution?.routeChanges ?? 0) +
+      (streamedModel && lastStreamModel && streamedModel !== lastStreamModel ? 1 : 0);
+    const routeHistory = { streamModels, routeChanges, lastStreamModel: streamedModel ?? lastStreamModel };
+    const requestedClass = normalizedVinciClass(requested.model);
+    const resolvedClass = response?.resolvedClass ? normalizedVinciClass(response.resolvedClass) : undefined;
+    // Auto and non-class requests learn their expectation from the first server class signal.
+    const expectedClass = Object.hasOwn(VINCI_CLASS_RANK, requestedClass)
+      ? requestedClass
+      : (active.resolution?.expectedClass ?? active.resolution?.resolvedClass ?? resolvedClass);
     let evidence: ResolutionEvidence | undefined;
     let resolvedModel: string | undefined;
     if (response?.resolvedModel) {
@@ -456,63 +523,71 @@ export default function (pi: ExtensionAPI) {
     } else if (!active.resolution && requested.model !== AUTO_MODEL) {
       resolvedModel = canonicalVinciClass(requested.model);
       evidence = "requested-model";
-    } else if (active.resolution && (response?.version || response?.capabilityFingerprint || response?.resolutionToken)) {
-      resolvedModel = active.resolution.model;
-      evidence = active.resolution.evidence;
+    } else if (
+      response?.resolvedClass ||
+      (active.resolution &&
+        (streamedModel || response?.version || response?.capabilityFingerprint || response?.resolutionToken))
+    ) {
+      resolvedModel = active.resolution?.model ?? canonicalVinciClass(requested.model);
+      evidence = active.resolution?.evidence ?? "requested-model";
     }
     if (!resolvedModel || !evidence) return;
 
     const observed: ResolvedRoute = {
       model: resolvedModel,
+      resolvedClass,
+      expectedClass,
+      ...routeHistory,
       version: response?.version,
       capabilityFingerprint: response?.capabilityFingerprint,
       resolutionToken: response?.resolutionToken,
       evidence,
     };
 
-    if (
-      active.resolution?.evidence === "requested-model" &&
-      active.resolution.model === canonicalVinciClass(requested.model) &&
-      isStrongerEvidence(active.resolution.evidence, observed.evidence)
-    ) {
-      active.resolution = undefined;
-    }
-
-    if (active.resolution && hasRouteDrift(active.resolution, observed)) {
+    const classChanged = Boolean(expectedClass && resolvedClass && expectedClass !== resolvedClass);
+    const cheaper = isCheaperVinciClass(requested.model, observed.resolvedClass ?? observed.model);
+    if (classChanged || cheaper || (active.resolution && hasRouteDrift(active.resolution, observed))) {
+      // Persist route history even when the observed occupant cannot replace the session pin.
+      if (active.resolution) recordResolution({ ...active.resolution, ...routeHistory });
+      const pinned: ResolvedRoute = active.resolution ?? {
+        model: canonicalVinciClass(requested.model),
+        expectedClass,
+        resolvedClass: expectedClass,
+        evidence: "requested-model",
+        ...routeHistory,
+      };
       if (!active.drift) {
-        const cheaper = isCheaperVinciClass(requested.model, observed.model);
         const drift: DriftRecord = {
           schemaVersion: SCHEMA_VERSION,
           event: "drift",
           requested,
           effectiveClass: active.selection.effectiveClass ?? normalizedVinciClass(requested.model),
-          pinned: withoutToken(active.resolution),
+          pinned: withoutToken(pinned),
           observed: withoutToken(observed),
         };
         active.drift = drift;
         pi.appendEntry(ENTRY_TYPE, drift);
+        const from = classChanged ? expectedClass : routeLabel(pinned);
+        const to = classChanged ? resolvedClass : routeLabel(observed);
         ctx.ui.notify(
-          cheaper
-            ? `CRITICAL: Vinci received a cheaper model class than requested. Requested ${requested.model}; served ${routeLabel(observed)}. Do not use this response. Start a new session or restore the requested class.`
-            : `Vinci model drift detected. This session is pinned to ${routeLabel(active.resolution)}, but the gateway returned ${routeLabel(observed)}. Start a new session or restore the pinned route before trusting further results.`,
+          `${cheaper ? "CRITICAL: " : ""}Vinci stopped this turn: the model changed from ${from} to ${to}. This session stays stopped; start a new session (/new) to continue with ${to}.`,
           "error",
         );
+      }
+      if (DRIFT_STOP) {
+        setTimeout(() => {
+          try {
+            ctx.abort();
+          } catch {
+            /* best-effort, as in vinci-loopbreak */
+          }
+        }, 200);
       }
       return;
     }
 
     const merged = active.resolution ? mergeRoute(active.resolution, observed) : observed;
-    if (JSON.stringify(merged) === JSON.stringify(active.resolution)) return;
-    active.resolution = merged;
-    const record: ResolutionRecord = {
-      schemaVersion: SCHEMA_VERSION,
-      event: "resolved",
-      requested,
-      effectiveClass: active.selection.effectiveClass ?? normalizedVinciClass(requested.model),
-      clientCapabilityFingerprint: active.selection.clientCapabilityFingerprint,
-      resolved: merged,
-    };
-    pi.appendEntry(ENTRY_TYPE, record);
+    recordResolution(merged);
   });
 
   pi.registerCommand("model-info", {
@@ -528,6 +603,11 @@ export default function (pi: ExtensionAPI) {
         ? `Vinci Forte (alias selection: ${selection.model})`
         : `${model.provider}/${model.id}`;
       const current = active && sameRequested(active.selection.requested, requestedFrom(model)) ? active : undefined;
+      const routeChanges = current?.resolution?.routeChanges ?? 0;
+      const streamModels = current?.resolution?.streamModels ?? current?.drift?.observed.streamModels ?? [];
+      let status = current?.resolution ? "stable" : "unresolved";
+      if (current?.drift) status = "model drift detected";
+      else if (routeChanges) status = `stable (provider route changed ${routeChanges} times; same model class)`;
       const lines = [
         `Requested: ${requested}`,
         ...(selection.alias ? ["Effective class: Vinci Forte"] : []),
@@ -535,7 +615,8 @@ export default function (pi: ExtensionAPI) {
         `Client capabilities: ${current?.selection.clientCapabilityFingerprint ?? fingerprintCapabilities(clientCapabilitiesFor(model))}`,
         `Server capabilities: ${current?.resolution?.capabilityFingerprint ?? "not reported"}`,
         `Session pin: ${current?.resolution?.resolutionToken ? "active" : "not reported"}`,
-        `Status: ${current?.drift ? "model drift detected" : current?.resolution ? "stable" : "unresolved"}`,
+        ...(streamModels.length ? [`Provider routes seen: ${streamModels.join(", ")}`] : []),
+        `Status: ${status}`,
       ];
       ctx.ui.notify(lines.join("\n"), current?.drift ? "error" : "info");
     },

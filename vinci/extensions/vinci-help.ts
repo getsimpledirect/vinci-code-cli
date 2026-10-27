@@ -30,6 +30,7 @@ function osc8(url: string): string {
 
 const COMMANDS: ReadonlyArray<[string, string]> = [
   ["/login", "Connect to Vinci"],
+  ["/other", "Add or hide other providers"],
   ["/logout", "Disconnect from Vinci"],
   ["/model", "Choose which Vinci model to use"],
   ["/new", "Start a fresh conversation"],
@@ -68,7 +69,8 @@ export default function (pi: ExtensionAPI) {
     description: "See what Vinci can do",
     handler: async (_args, ctx) => {
       if (ctx.hasUI) {
-        ctx.ui.notify(vinciHelpText(), "info");
+        // Help is chat scrollback, so give its body a readable foreground inside the status line.
+        ctx.ui.notify(ctx.ui.theme.fg("text", vinciHelpText()), "info");
       } else {
         process.stdout.write(`${vinciHelpText()}\n`);
       }

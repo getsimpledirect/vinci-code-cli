@@ -127,38 +127,44 @@ describe("listModels", () => {
 		expect(lines.join("\n")).not.toContain("auto");
 	});
 
-	test("lists only Vinci models when other providers are explicitly disabled", async () => {
-		const previous = process.env.VINCI_CODE;
-		const previousShow = process.env.VINCI_SHOW_OTHER_PROVIDERS;
-		process.env.VINCI_CODE = "1";
-		// Explicit opt-out. The DEFAULT is open — see provider-visibility.test.ts, which pins that
-		// a fresh install offers other providers so no account is required.
-		process.env.VINCI_SHOW_OTHER_PROVIDERS = "0";
-		const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+	test.each([undefined, "0"])(
+		"lists only Vinci models with default or disabled visibility (%s)",
+		async (visibility) => {
+			const previous = process.env.VINCI_CODE;
+			const previousShow = process.env.VINCI_SHOW_OTHER_PROVIDERS;
+			process.env.VINCI_CODE = "1";
+			if (visibility === undefined) delete process.env.VINCI_SHOW_OTHER_PROVIDERS;
+			else process.env.VINCI_SHOW_OTHER_PROVIDERS = visibility;
+			const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
-		try {
-			await listModels(
-				registry([
-					model("openai", "gpt-test"),
-					model("vinci", "auto"),
-					model("vinci", "forte"),
-					model("vinci", "fortissimo"),
-				]),
-			);
-			const output = log.mock.calls.map(([value]) => String(value)).join("\n");
-			expect(output).toContain("auto");
-			expect(output).toContain("forte");
-			expect(output).toContain("fortissimo");
-			expect(output).not.toContain("gpt-test");
-			expect(output).not.toContain("openai");
-		} finally {
-			if (previous === undefined) delete process.env.VINCI_CODE;
-			else process.env.VINCI_CODE = previous;
-			if (previousShow === undefined) delete process.env.VINCI_SHOW_OTHER_PROVIDERS;
-			else process.env.VINCI_SHOW_OTHER_PROVIDERS = previousShow;
-			log.mockRestore();
-		}
-	});
+			try {
+				await listModels(
+					registry([
+						model("openai", "gpt-test"),
+						model("vinci", "auto"),
+						model("vinci", "mezzo"),
+						model("vinci", "forte"),
+						model("vinci", "fortissimo"),
+					]),
+					undefined,
+					SettingsManager.inMemory(),
+				);
+				const output = log.mock.calls.map(([value]) => String(value)).join("\n");
+				expect(output).toContain("auto");
+				expect(output).toContain("mezzo");
+				expect(output).toContain("forte");
+				expect(output).toContain("fortissimo");
+				expect(output).not.toContain("gpt-test");
+				expect(output).not.toContain("openai");
+			} finally {
+				if (previous === undefined) delete process.env.VINCI_CODE;
+				else process.env.VINCI_CODE = previous;
+				if (previousShow === undefined) delete process.env.VINCI_SHOW_OTHER_PROVIDERS;
+				else process.env.VINCI_SHOW_OTHER_PROVIDERS = previousShow;
+				log.mockRestore();
+			}
+		},
+	);
 
 	test("keeps the complete provider catalog in upstream Pi", async () => {
 		const previous = process.env.VINCI_CODE;

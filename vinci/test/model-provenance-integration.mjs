@@ -47,7 +47,8 @@ function runtime(existingEntries = []) {
       });
     },
     on(name, handler) {
-      (handlers[name] ??= []).push(handler);
+      handlers[name] ??= [];
+      handlers[name].push(handler);
     },
     registerCommand(name, options) {
       commands[name] = options;
@@ -60,6 +61,9 @@ function runtime(existingEntries = []) {
 function context(state, model) {
   return {
     model,
+    abort() {
+      state.aborts = (state.aborts ?? 0) + 1;
+    },
     sessionManager: {
       getBranch() {
         return state.entries;
@@ -208,11 +212,15 @@ assert.equal(drift[0].pinned.version, "2026-07-12");
 assert.equal(drift[0].observed.version, "2026-07-13");
 assert.equal("resolutionToken" in drift[0].pinned, false, "drift evidence must not render or duplicate route pins");
 assert.equal(state.notifications.at(-1).type, "error");
-assert.match(state.notifications.at(-1).message, /model drift detected/i);
+assert.match(state.notifications.at(-1).message, /Vinci stopped this turn: the model changed from/);
 
 const afterDriftHeaders = {};
 await emit(state, "before_provider_headers", { type: "before_provider_headers", headers: afterDriftHeaders }, ctx);
-assert.equal(afterDriftHeaders["x-vinci-resolution-token"], "opaque-route-pin", "drift must not replace the session pin");
+assert.equal(
+  afterDriftHeaders["x-vinci-resolution-token"],
+  "opaque-route-pin",
+  "drift must not replace the session pin",
+);
 
 const direct = runtime();
 const directCtx = context(direct, fixedModel);
@@ -245,7 +253,11 @@ await emit(
   },
   directCtx,
 );
-assert.equal(records(direct, "drift").length, 0, "stronger route evidence must enrich an alias, not report false drift");
+assert.equal(
+  records(direct, "drift").length,
+  0,
+  "stronger route evidence must enrich an alias, not report false drift",
+);
 assert.equal(records(direct, "resolved").at(-1).resolved.model, "provider/fixed-model-v1");
 assert.equal(records(direct, "resolved").at(-1).resolved.evidence, "response-stream");
 
@@ -262,7 +274,6 @@ for (const model of providerConfig.models) {
   assert.equal(model.compat?.sendSessionAffinityHeaders, true, `${model.id} must send session affinity headers`);
 }
 
-
 // Attribution must never reach a third-party provider: the hook is scoped to
 // provider === "vinci", so a non-Vinci model must come back with no headers at all.
 {
@@ -276,4 +287,6 @@ for (const model of providerConfig.models) {
   assert.deepEqual(Object.keys(leaked), [], "no Vinci headers may be set for a third-party provider");
 }
 
-process.stdout.write("  model provenance: requested/resolved identity, resume pin, capabilities, and drift are durable\n");
+process.stdout.write(
+  "  model provenance: requested/resolved identity, resume pin, capabilities, and drift are durable\n",
+);

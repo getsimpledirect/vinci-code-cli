@@ -109,6 +109,7 @@ const context = {
     },
   },
   ui: {
+    get theme() { return theme; },
     async select() {
       return undefined;
     },
@@ -635,8 +636,9 @@ assert.match(notifications.at(-1).message, /Active time: 0s active/);
 assert.match(notifications.at(-1).message, /Report wrong: vinci report-wrong task-receipt-test/);
 assert.match(
   notifications.at(-1).message,
-  /Account credits: https:\/\/platform\.getsimpledirect\.com\/billing\?source=code \(authoritative\)/,
+  /Open billing: https:\/\/platform\.getsimpledirect\.com\/billing\?source=code/,
 );
+assert.match(notifications.at(-1).message, /Account balance: not available in the CLI yet/);
 
 // Supplemental usage can arrive after agent_end (autoname, crew shutdown). The refreshed full
 // outcome must be appended durably, not only updated in the process-local store.

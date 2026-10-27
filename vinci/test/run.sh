@@ -772,6 +772,7 @@ run_group checkpoint-process-integration node "${ROOT}/vinci/test/checkpoint-pro
 run_group fact-grounding-integration node "${ROOT}/vinci/test/fact-grounding-integration.mjs"
 # Completion cards render the verifier state rather than inferring success from tool exit alone.
 run_group receipt-integration node "${ROOT}/vinci/test/receipt-integration.mjs"
+run_group b2receipt-regression node "${ROOT}/vinci/test/b2receipt-regression.mjs"
 run_group completion-receipt-integration node "${ROOT}/vinci/test/completion-receipt-integration.mjs"
 # Durable project memory never changes a repository unless the user explicitly requested it.
 run_group memory-integration node "${ROOT}/vinci/test/memory-integration.mjs"
@@ -784,6 +785,7 @@ run_group acceptance-packaged-integration node "${ROOT}/vinci/test/acceptance-pa
 run_group package-first-party-tests node "${ROOT}/vinci/test/package-first-party-tests.mjs"
 run_group remote-verdict-integration node "${ROOT}/vinci/test/remote-verdict-integration.mjs"
 run_group accept-tool-integration node "${ROOT}/vinci/test/accept-tool-integration.mjs"
+run_group accept-render-result-characterization node "${ROOT}/vinci/test/accept-render-result-characterization.mjs"
 run_group receipt-remote-verdict node "${ROOT}/vinci/test/receipt-remote-verdict.mjs"
 run_group accept-config-precedence node "${ROOT}/vinci/test/accept-config-precedence.mjs"
 # /feedback keeps transcripts local, redacts both paths, and tolerates network failure.
