@@ -155,12 +155,14 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 
 		ui.sendKeys("/hotkeys", "\r");
 		let screen = await ui.waitForText("Keyboard Shortcuts");
-		assert.match(screen, /Navigation/);
+		assert.match(screen, /BASICS/);
 		assert.match(screen, /Press Escape\/Ctrl\+C to close/);
+		assert.match(screen, /Send/);
+		assert.match(screen, /Stop/);
 
 		ui.sendKeys("\x1b[6~");
-		screen = await ui.waitForText("Editing");
-		assert.doesNotMatch(screen, /Navigation/);
+		screen = await ui.waitForText("Navigation");
+		assert.doesNotMatch(screen, /BASICS/);
 
 		ui.sendKeys("\x1b");
 		screen = await ui.screen();

@@ -235,6 +235,7 @@ async function loginVinci(callbacks: OAuthLoginCallbacks): Promise<OAuthCredenti
 
   let intervalMs = Math.max(1, d.interval ?? 5) * 1000;
   const deadline = Date.now() + (d.expires_in ?? 600) * 1000;
+  let waitingNotified = false;
 
   while (Date.now() < deadline) {
     if (callbacks.signal?.aborted) throw new Error("Sign-in cancelled.");
@@ -263,7 +264,10 @@ async function loginVinci(callbacks: OAuthLoginCallbacks): Promise<OAuthCredenti
       return { access: body.access_token, refresh: "", expires: FAR_FUTURE };
     }
     if (body.error === "authorization_pending") {
-      callbacks.onProgress?.("Waiting for you to authorize in the browser…");
+      if (!waitingNotified) {
+        callbacks.onProgress?.("Waiting for you to authorize in the browser…");
+        waitingNotified = true;
+      }
       continue;
     }
     if (body.error === "slow_down") {

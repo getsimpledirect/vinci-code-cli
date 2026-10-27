@@ -227,10 +227,10 @@ export class AssistantMessageComponent extends Container {
 						this.contentContainer.addChild(new Spacer(1));
 					}
 				} else {
-					// Thinking traces in thinkingText color, italic
+					// [vinci] Use normal muted foreground for expanded thinking; keep italics.
 					this.contentContainer.addChild(
 						new Markdown(vinciMaskOut(content.thinking.trim()), this.outputPad, 0, this.markdownTheme, {
-							color: (text: string) => theme.fg("thinkingText", text),
+							color: (text: string) => theme.fg(VINCI ? "muted" : "thinkingText", text),
 							italic: true,
 						}),
 					);

@@ -6074,6 +6074,22 @@ export class InteractiveMode {
 | \`!!\` | Run bash command (excluded from context) |
 `;
 
+		// [vinci] Put everyday controls first, using the same configured bindings as the full table.
+		if (process.env.VINCI_CODE === "1") {
+			hotkeys = `
+**BASICS**
+| Key | Action |
+|-----|--------|
+| \`${submit}\` | Send |
+| \`${newLine}\` | New line |
+| \`${interrupt}\` | Stop |
+| \`${toggleThinking}\` | Show/hide thinking |
+| \`${exit}\` | Exit (when editor is empty) |
+
+**Advanced**
+${hotkeys}`;
+		}
+
 		// Add extension-registered shortcuts
 		const extensionRunner = this.session.extensionRunner;
 		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
