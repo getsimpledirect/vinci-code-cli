@@ -99,9 +99,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 		// Add hint about model filtering
 		if (process.env.VINCI_CODE === "1") {
-			this.addChild(
-				new Text(theme.fg("muted", "Showing Vinci models. Use /providers to add other providers."), 0, 0),
-			);
+			this.addChild(new Text(theme.fg("muted", "Showing Vinci models. Use /other to add other providers."), 0, 0));
 		}
 		if (scopedModels.length > 0) {
 			this.scopeText = new Text(this.getScopeText(), 0, 0);

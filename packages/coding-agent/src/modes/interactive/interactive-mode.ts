@@ -98,7 +98,7 @@ import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 // panel about a collision the menu filter had already resolved.
 const VINCI_MENU_COMMANDS = new Set([
 	"login",
-	"providers",
+	"other",
 	"logout",
 	"model",
 	"new",
@@ -612,7 +612,7 @@ export class InteractiveMode {
 		const vinciCode = process.env.VINCI_CODE === "1";
 		const builtinNames = new Set(
 			BUILTIN_SLASH_COMMANDS.filter((command) =>
-				vinciCode ? VINCI_MENU_COMMANDS.has(command.name) : command.name !== "providers",
+				vinciCode ? VINCI_MENU_COMMANDS.has(command.name) : command.name !== "other",
 			).map((command) => command.name),
 		);
 		return extensionRunner
@@ -638,7 +638,7 @@ export class InteractiveMode {
 		// "provider authentication", "session context", or "keybindings/extensions/skills" jargon.
 		const VINCI_DESCRIPTIONS: Record<string, string> = {
 			login: "Connect to Vinci",
-			providers: "Add or hide other providers",
+			other: "Add or hide other providers",
 			logout: "Disconnect from Vinci",
 			model: "Choose which Vinci model to use",
 			new: "Start a fresh conversation",
@@ -651,7 +651,7 @@ export class InteractiveMode {
 		};
 		const vinciCode = process.env.VINCI_CODE === "1";
 		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.filter((command) =>
-			vinciCode ? VINCI_MENU.has(command.name) : command.name !== "providers",
+			vinciCode ? VINCI_MENU.has(command.name) : command.name !== "other",
 		).map((command) => ({
 			name: command.name,
 			description: (vinciCode && VINCI_DESCRIPTIONS[command.name]) || command.description,
@@ -2866,9 +2866,9 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
-			if (process.env.VINCI_CODE === "1" && text === "/providers") {
+			if (process.env.VINCI_CODE === "1" && text === "/other") {
 				this.editor.setText("");
-				this.showProvidersSelector();
+				this.showOtherProvidersSelector();
 				return;
 			}
 			if (text === "/login") {
@@ -5106,7 +5106,7 @@ export class InteractiveMode {
 		return options.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
-	private showProvidersSelector(): void {
+	private showOtherProvidersSelector(): void {
 		const enabled = this.settingsManager.getShowOtherProviders();
 		const action = enabled ? "Hide other providers" : "Enable other providers";
 		this.showSelector((done) => {

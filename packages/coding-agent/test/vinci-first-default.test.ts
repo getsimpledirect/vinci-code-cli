@@ -1,6 +1,6 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
-import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
+import { type AutocompleteProvider, setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { createVinciModelCatalogue } from "../../../vinci/extensions/lib/model-catalogue.ts";
 import { vinciHelpText } from "../../../vinci/extensions/vinci-help.ts";
@@ -105,6 +105,11 @@ const submit = (
 		setupEditorSubmitHandler(this: object): void;
 	}
 ).setupEditorSubmitHandler;
+const autocomplete = (
+	InteractiveMode.prototype as unknown as {
+		createBaseAutocompleteProvider(this: object): AutocompleteProvider;
+	}
+).createBaseAutocompleteProvider;
 
 function commandContext(settingsManager: SettingsManager) {
 	const editor = { setText: vi.fn(), onSubmit: undefined as undefined | ((text: string) => Promise<void>) };
@@ -163,7 +168,7 @@ describe.sequential("Vinci-first default T0 regressions", () => {
 		});
 		expect(result.every((model) => model.provider === "vinci")).toBe(true);
 		const { text } = await picker(settingsManager, fetch);
-		expect(text).toContain("Showing Vinci models. Use /providers to add other providers.");
+		expect(text).toContain("Showing Vinci models. Use /other to add other providers.");
 	});
 
 	test("T2 default login opens Vinci sign-in directly", async () => {
@@ -184,7 +189,7 @@ describe.sequential("Vinci-first default T0 regressions", () => {
 			if (route === "environment") vi.stubEnv("VINCI_SHOW_OTHER_PROVIDERS", "1");
 			if (route === "command") {
 				const { context, editor } = commandContext(settingsManager);
-				await editor.onSubmit?.("/providers");
+				await editor.onSubmit?.("/other");
 				expect(settingsManager.getShowOtherProviders()).toBe(true);
 				expect(context.confirmation).toContain("Other providers are off");
 				expect(context.showStatus).toHaveBeenCalledWith(expect.stringContaining("/login"));
@@ -213,8 +218,32 @@ describe.sequential("Vinci-first default T0 regressions", () => {
 	);
 
 	test("T3 command is discoverable in autocomplete and help", () => {
-		expect(BUILTIN_SLASH_COMMANDS.filter((command) => command.name === "providers")).toHaveLength(1);
-		expect(vinciHelpText()).toContain("/providers");
+		expect(BUILTIN_SLASH_COMMANDS.filter((command) => command.name === "other")).toHaveLength(1);
+		expect(vinciHelpText()).toContain("/other");
+	});
+
+	test("T3 retired command is no longer a built-in", () => {
+		expect(BUILTIN_SLASH_COMMANDS.some(({ name }) => `/${name}` === "/providers")).toBe(false);
+	});
+
+	test.each([true, false])("T3 /other autocomplete visibility with Vinci mode=%s", async (vinciMode) => {
+		vi.stubEnv("VINCI_CODE", vinciMode ? "1" : undefined);
+		const provider = autocomplete.call({
+			settingsManager: SettingsManager.inMemory(),
+			skillCommands: new Map(),
+			sessionManager: { getCwd: () => process.cwd() },
+			session: {
+				promptTemplates: [],
+				extensionRunner: { getRegisteredCommands: () => [] },
+				resourceLoader: { getSkills: () => ({ skills: [] }) },
+			},
+		});
+		const items =
+			(await provider.getSuggestions(["/o"], 0, 2, { signal: new AbortController().signal }))?.items ?? [];
+		expect(items.some(({ value }) => value === "other")).toBe(vinciMode);
+		if (vinciMode) {
+			expect(items.find(({ value }) => value === "other")?.description).toBe("Add or hide other providers");
+		}
 	});
 
 	test("T4 catalogue lineup has plain names and live occupants, excludes reserved and unknown ids", async () => {

@@ -21,7 +21,7 @@ Two things stated up front rather than discovered:
 
 - **Sign in with your Vinci account by default.** `/login` opens Vinci browser pairing and
   model surfaces offer Vinci models. To use your own key without a Vinci account, enable other
-  providers through `/providers`, then `/login`. The guard, receipts, checkpoints and review work
+  providers through `/other`, then `/login`. The guard, receipts, checkpoints and review work
   in both modes. See [`PRIVACY.md`](PRIVACY.md) for inference routing and public catalogue discovery.
 - **Recognised secrets in normal prompts and tool results are masked before the session
   transcript is written.** The `!` shell shortcut is recorded outside those hooks, and large
@@ -50,7 +50,7 @@ npm ci --ignore-scripts && bash vinci/build.sh
 ```
 
 Then `/login` to sign in with your Vinci account. `/model` offers Auto (your plan's default),
-Mezzo and Forte, with live underlying model details when available. For BYOK, `/providers`
+Mezzo and Forte, with live underlying model details when available. For BYOK, `/other`
 asks for confirmation and saves the preference, then `/login` offers the supported providers.
 `showOtherProviders: true` or `VINCI_SHOW_OTHER_PROVIDERS=1` also enables them; the environment
 overrides the saved preference both ways. Vinci entries stay first in a separate group.
@@ -175,7 +175,7 @@ or rewrites the archive. Dispatching either workflow requires its own authorizat
 ## Before your first task
 
 Sign in to your Vinci account with `/login` before starting work. To bring your own provider,
-enable it with `/providers`, then choose its supported login or API key in `/login` and check
+enable it with `/other`, then choose its supported login or API key in `/login` and check
 which account will be charged.
 
 - **OpenAI:** the supported ChatGPT/Codex sign-in and an OpenAI API key are separate billing

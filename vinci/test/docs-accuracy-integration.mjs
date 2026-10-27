@@ -28,7 +28,7 @@ for (const file of files) {
 
 	// 1. Vinci sign-in is the default; other providers require an explicit opt-in.
 	for (const [i, line] of text.split("\n").entries()) {
-		if (/providers (?:are )?open by default|Neither mode is "the default"|full catalogue is shown by \*\*default\*\*/i.test(line)) {
+		if (/(?:providers) (?:are )?open by default|Neither mode is "the default"|full catalogue is shown by \*\*default\*\*/i.test(line)) {
 			violations.push(`${rel}:${i + 1} teaches the obsolete other-providers default`);
 		}
 		// 2. A private repository a public reader cannot open.
@@ -46,7 +46,7 @@ for (const file of files) {
 			[/the limit is pattern coverage,? not timing/i, "false: `!` results and large bash spill files bypass the persistence hook"],
 			[/masking (?:runs|happens) before storage,? so pattern coverage is the real limit/i, "false: some local persistence paths bypass the masking hooks"],
 			[/managed cloud product/i, "false: works with your own provider key too"],
-			[/(?:\/login|\/model)[^.\n]*always show only Vinci/i, "false: /providers can enable other providers"],
+			[/(?:\/login|\/model)[^.\n]*always show only Vinci/i, "false: /other can enable other providers"],
 			[/Vinci is single-provider/i, "false: BYOK is supported"],
 			[/sends? (?:your |the )?key nowhere/i, "false: the key IS sent to the chosen provider"],
 		]) {
@@ -105,7 +105,7 @@ for (const file of files) {
 	const readme = readFileSync(resolve(root, "README.md"), "utf8");
 	const quickStart = readme.split("## Quick start")[1]?.split("## CLI reference")[0] ?? "";
 	assert.match(quickStart, /sign in with your Vinci account/i);
-	assert.match(quickStart, /\/providers/);
+	assert.match(quickStart, /\/other/);
 	assert.match(quickStart, /VINCI_SHOW_OTHER_PROVIDERS=1/);
 	const privacy = readFileSync(resolve(root, "vinci/PRIVACY.md"), "utf8");
 	assert.match(privacy, /GET <platform>\/api\/models/);

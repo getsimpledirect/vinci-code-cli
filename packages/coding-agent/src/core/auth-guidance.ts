@@ -131,11 +131,11 @@ export function formatNoApiKeyFoundMessage(provider: string): string {
 			case "vinci":
 				return VINCI_CONNECT;
 			case "anthropic":
-				return 'No Anthropic API credentials found. Use /providers to enable other providers, then /login, "API key" and Anthropic.';
+				return 'No Anthropic API credentials found. Use /other to enable other providers, then /login, "API key" and Anthropic.';
 			case "openai":
-				return 'No OpenAI API credentials found. Use /providers to enable other providers, then /login, "API key" and OpenAI.';
+				return 'No OpenAI API credentials found. Use /other to enable other providers, then /login, "API key" and OpenAI.';
 			case "openai-codex":
-				return 'You\'re not connected to Codex yet. Use /providers to enable other providers, then /login, "Provider account" and "ChatGPT Plus/Pro (Codex Subscription)".';
+				return 'You\'re not connected to Codex yet. Use /other to enable other providers, then /login, "Provider account" and "ChatGPT Plus/Pro (Codex Subscription)".';
 			default:
 				return "No credentials found for the selected provider. Check its authentication settings and setup instructions.";
 		}

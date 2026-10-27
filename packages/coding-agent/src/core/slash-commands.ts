@@ -32,7 +32,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "tree", description: "Navigate session tree (switch branches)" },
 	{ name: "trust", description: "Save project trust decision for future sessions" },
 	{ name: "login", description: "Configure provider authentication" },
-	{ name: "providers", description: "Choose whether to show other providers" },
+	{ name: "other", description: "Choose whether to show other providers" },
 	{ name: "logout", description: "Remove provider authentication" },
 	{ name: "new", description: "Start a new session" },
 	{ name: "compact", description: "Manually compact the session context" },

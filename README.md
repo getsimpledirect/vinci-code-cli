@@ -2,7 +2,7 @@
 
 The canonical public source and release lineage for Vinci Code, a terminal coding agent distributed from the MIT-licensed Pi harness.
 
-Sign in with your Vinci account to start. Bring-your-own-provider use is available through `/providers` and does not require a Vinci account. Managed inference is a separate service dependency. The private vinci-code repository contains operations and historical reference, not a second product publisher.
+Sign in with your Vinci account to start. Bring-your-own-provider use is available through `/other` and does not require a Vinci account. Managed inference is a separate service dependency. The private vinci-code repository contains operations and historical reference, not a second product publisher.
 
 ## Start here
 
@@ -21,7 +21,7 @@ Preserve Pi provenance, the MIT grants and third-party notices. Code licensing d
 
 
 A terminal coding agent with **Vinci account sign-in** and optional bring-your-own-provider
-keys through `/providers`.<br/>Same guard rails either way.
+keys through `/other`.<br/>Same guard rails either way.
 
 [![Node](https://img.shields.io/badge/Node-22.19%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/License-MIT-2ECC71?style=flat-square)](LICENSE)
@@ -170,11 +170,11 @@ By default, `/login` opens Vinci browser sign-in directly, and the model surface
 models. Auto remains the initial model and uses your plan's default. The picker shows live
 underlying model details for Mezzo and Forte when available, or a note when details are unavailable offline.
 
-To bring your own provider key, run `/providers` and confirm enabling other providers, then
+To bring your own provider key, run `/other` and confirm enabling other providers, then
 use `/login` to choose an authentication method and provider. This opt-in persists globally.
 You can also set `showOtherProviders: true` in settings or `VINCI_SHOW_OTHER_PROVIDERS=1`.
 Vinci entries stay first, followed by a separate group of other providers in `/model`.
-Run `/providers` again to hide them; the environment switch overrides the setting in either direction.
+Run `/other` again to hide them; the environment switch overrides the setting in either direction.
 
 <img src="vinci/assets/screenshot-auth.png" alt="After enabling other providers, /login offers a subscription or an API key" width="820" />
 
@@ -195,7 +195,7 @@ These are the commands `/help` lists in a session:
 
 ```
 /login       Connect to Vinci
-/providers   Add or hide other providers
+/other       Add or hide other providers
 /logout      Disconnect from Vinci
 /model       Choose which Vinci model to use
 /new         Start a fresh conversation
@@ -216,7 +216,7 @@ The Vinci layer adds more on top of these — `/review`, `/checkpoint`, `/plan`,
 
 | Variable | Effect |
 |---|---|
-| `VINCI_SHOW_OTHER_PROVIDERS` | Other providers are off by default. `1` enables them, `0` hides them; either overrides the saved `/providers` preference. |
+| `VINCI_SHOW_OTHER_PROVIDERS` | Other providers are off by default. `1` enables them, `0` hides them; either overrides the saved `/other` preference. |
 | `VINCI_PROVIDER` | `vinci` (default) or `openrouter` |
 | `VINCI_MODEL` | With `VINCI_PROVIDER=vinci`: `auto` (default), `mezzo`, `forte`, or `fortissimo` (alias of Forte). `auto` resolves server-side to your account's class. With `openrouter`: a full `vendor/model` id. |
 | `VINCI_NO_SANDBOX=1` | Disable the sandbox. A development escape hatch — it removes a real safety boundary. |

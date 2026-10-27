@@ -30,7 +30,7 @@ function osc8(url: string): string {
 
 const COMMANDS: ReadonlyArray<[string, string]> = [
   ["/login", "Connect to Vinci"],
-  ["/providers", "Add or hide other providers"],
+  ["/other", "Add or hide other providers"],
   ["/logout", "Disconnect from Vinci"],
   ["/model", "Choose which Vinci model to use"],
   ["/new", "Start a fresh conversation"],

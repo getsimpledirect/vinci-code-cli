@@ -427,7 +427,7 @@ if [ "${VINCI_SHOW_OTHER_PROVIDERS:-0}" != "1" ]; then
         ;;
       *)
         echo "✗ Other providers are off. Vinci models: auto, mezzo, forte (fortissimo is an alias of forte)." >&2
-        echo "  To use your own provider key, run /providers inside Vinci or set VINCI_SHOW_OTHER_PROVIDERS=1." >&2
+        echo "  To use your own provider key, run /other inside Vinci or set VINCI_SHOW_OTHER_PROVIDERS=1." >&2
         exit 2
         ;;
     esac

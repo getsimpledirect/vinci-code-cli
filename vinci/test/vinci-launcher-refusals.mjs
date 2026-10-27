@@ -34,7 +34,7 @@ for (const visibility of [undefined, "0"]) {
     assert.equal(result.status, 2, "other-provider arguments must exit before dispatch");
     assert.match(result.stderr, /Other providers are off/);
     assert.match(result.stderr, /auto, mezzo, forte/);
-    assert.match(result.stderr, /\/providers/);
+    assert.match(result.stderr, /\/other/);
     assert.equal(result.stdout, "", "refusal must not start the runtime");
     count++;
   }

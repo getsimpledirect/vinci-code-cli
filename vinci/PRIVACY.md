@@ -18,7 +18,7 @@ is the point of this document.**
 | Guard, receipts, checkpoints, review | **yes — identical** | yes |
 
 **Vinci account sign-in is the default.** `/login` opens Vinci pairing directly. To use your own
-provider, run `/providers`, confirm enabling other providers, then use `/login`. No Vinci account
+provider, run `/other`, confirm enabling other providers, then use `/login`. No Vinci account
 is required for BYOK. The preference persists globally; `showOtherProviders: true` or
 `VINCI_SHOW_OTHER_PROVIDERS=1` also opts in. The environment overrides the saved setting in either direction.
 
@@ -34,7 +34,7 @@ them. That is what the managed service is.
 
 ## Direct / BYOK mode
 
-You supply your own provider credential. After opting in through `/providers`, `/login` presents the providers Pi supports,
+You supply your own provider credential. After opting in through `/other`, `/login` presents the providers Pi supports,
 and the credential is stored by Pi in `~/.pi/agent/auth.json` on your machine. Vinci
 Code adds **no second credential store**. Your key is transmitted to the provider you chose —
 authenticating to them requires sending it — and to nobody else. Requests go from your machine

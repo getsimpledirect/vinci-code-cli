@@ -46,8 +46,8 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/extensions/runner.ts` | Default the extension overlay-focus query to false outside interactive UI | — |
 | `coding-agent/src/core/extensions/types.ts` | Expose an optional overlay-focus query to extensions | — |
 | `coding-agent/src/core/vinci-grader.ts` | Shared grader core (verification system): untracked-aware diff, skeptical prompt, verdict parse, completion-claim detector — one check for core + `vinci-review`/`vinci-todo` | 8 |
-| `coding-agent/src/core/auth-guidance.ts` | Warm managed sign-in copy; selected-provider credential guidance through `/providers` | 4,9 |
-| `coding-agent/src/core/slash-commands.ts` | Register the Vinci-only `/providers` command for autocomplete | 4 |
+| `coding-agent/src/core/auth-guidance.ts` | Warm managed sign-in copy; selected-provider credential guidance through `/other` | 4,9 |
+| `coding-agent/src/core/slash-commands.ts` | Register the Vinci-only `/other` command for autocomplete | 4 |
 | `coding-agent/src/core/keybindings.ts` | Free `shift+tab` for the Auto/Plan cycle | 11 |
 | `coding-agent/src/core/sdk.ts` | One-line call into `vinci-degroove.ts` — collapse identical failed-call loops in the model's context view | 19 |
 | `coding-agent/src/core/system-prompt.ts` | Drop the blanket "Be concise" guideline — the Vinci pack owns the voice (narration) | 16 |
@@ -74,7 +74,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/compaction/branch-summarization.ts`, `compaction.ts` | Optional `__vinciRecordTaskCall` hook so Vinci can record summarization/compaction calls (no-op when absent) | — |
 | `coding-agent/src/core/model-resolver.ts` | Managed-class aliases (Fortissimo resolves to Forte) for provider `vinci` only | — |
 | `coding-agent/src/core/session-manager.ts` | Shared verification-state entries and record framing for the turn-end verification gate | 8 |
-| `coding-agent/src/core/settings-manager.ts` | Other providers default off; global `/providers` preference with environment overrides; thinking hidden by default; global first-copy disclosure acknowledgement | 4,6 |
+| `coding-agent/src/core/settings-manager.ts` | Other providers default off; global `/other` preference with environment overrides; thinking hidden by default; global first-copy disclosure acknowledgement | 4,6 |
 | `coding-agent/src/modes/interactive/components/countdown-timer.ts` | `ElapsedTimer` for live compaction progress | — |
 | `coding-agent/src/modes/interactive/components/extension-selector.ts` | Report the rows/width left after widgets and footer so approval context stays reviewable in small terminals | — |
 | `coding-agent/src/modes/interactive/components/login-dialog.ts`, `oauth-selector.ts` | Vero sign-in copy under `VINCI_CODE=1` | 9 |
@@ -120,7 +120,7 @@ The built-in OAuth providers (anthropic / openai-codex / github-copilot) are **s
 `unregisterOAuthProvider` restores them and `resetOAuthProviders` re-seeds them — and the
 `/login` handler is hardcoded, so there's no extension hook. Under `VINCI_CODE=1`, with other
 providers off (the default), we skip the picker and open Vinci login directly. Opting in with
-`/providers` restores the authentication-method and provider selectors:
+`/other` restores the authentication-method and provider selectors:
 
 ```ts
 if (process.env.VINCI_CODE === "1" && !this.settingsManager.getShowOtherProviders()) {
@@ -150,11 +150,11 @@ if (showListing && process.env.VINCI_CODE !== "1") { … }
 
 ## 4. Vinci-first model surfaces and explicit provider opt-in
 
-`core/settings-manager.ts` defaults `showOtherProviders` to false. `/providers` in
+`core/settings-manager.ts` defaults `showOtherProviders` to false. `/other` in
 `interactive-mode.ts` shows the effective state, confirms a toggle and saves it globally.
 The environment overrides the saved preference in both directions. `core/slash-commands.ts`
 adds one discoverable entry, hidden outside Vinci mode; `vinci-help.ts` adds its help row.
-`core/auth-guidance.ts` points other-provider users to `/providers`, then `/login`.
+`core/auth-guidance.ts` points other-provider users to `/other`, then `/login`.
 
 Under `VINCI_CODE=1`, `interactive-mode.ts` and `model-selector.ts` filter to Vinci by default.
 With opt-in, they group every Vinci entry first, including scoped and searched lists; the picker
