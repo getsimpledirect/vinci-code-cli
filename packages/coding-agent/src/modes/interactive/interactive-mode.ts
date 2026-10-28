@@ -2776,8 +2776,8 @@ export class InteractiveMode {
 			const filePath = path.join(tmpDir, fileName);
 			fs.writeFileSync(filePath, Buffer.from(image.bytes));
 
-			// Insert file path directly
-			this.editor.insertTextAtCursor?.(filePath);
+			if (this.editor === this.defaultEditor) this.defaultEditor.insertImageAttachment(filePath);
+			else this.editor.insertTextAtCursor?.(filePath);
 			this.ui.requestRender();
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)
@@ -5135,14 +5135,19 @@ export class InteractiveMode {
 
 	private showLoginAuthTypeSelector(): void {
 		const vinci = process.env.VINCI_CODE === "1";
+		const vinciLabel = "Vinci account";
 		const subscriptionLabel = vinci ? "Provider account" : "Use a subscription";
 		const apiKeyLabel = vinci ? "API key" : "Use an API key";
 		this.showSelector((done) => {
 			const selector = new ExtensionSelectorComponent(
 				vinci ? "Vero - Connect\nProvider-specific access and billing." : "Select authentication method:",
-				[subscriptionLabel, apiKeyLabel],
+				[...(vinci ? [vinciLabel] : []), subscriptionLabel, apiKeyLabel],
 				(option) => {
 					done();
+					if (vinci && option === vinciLabel) {
+						void this.showLoginDialog("vinci", "Vinci");
+						return;
+					}
 					const authType = option === subscriptionLabel ? "oauth" : "api_key";
 					this.showLoginProviderSelector(authType);
 				},

@@ -1,4 +1,4 @@
-  Vinci v0.0.57 Code
+  Vinci v0.0.58 Code
   Vero BLOCKED · Vinci · <repo>
   /login to connect · Resolve the blocker. · /undo · Ctrl+T thinking
 

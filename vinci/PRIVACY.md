@@ -67,9 +67,14 @@ that make this distribution worth using.
 - **`/feedback`** posts to Vinci. **`/issue`** opens a GitHub issue. Both run your
   content through `redactSecrets()` first (`vinci/extensions/lib/secrets.ts`), but
   both send your text, so read what you are sending.
-- **Update checks** fetch a release manifest. Disable with `PI_OFFLINE=1`.
-- **Tool bootstrap** fetches `fd` and `ripgrep` from GitHub Releases on first run.
-  Disable with `VINCI_TOOL_BOOTSTRAP=0`.
+- **Update checks** fetch a release manifest. `PI_OFFLINE=1` or `--offline` suppresses
+  automatic installed-launch checks before the payload starts; explicit updater network
+  requests also refuse under this policy. Local recovery operations remain available.
+- **Tool bootstrap** can fetch pinned `fd` and `ripgrep` releases only outside offline
+  and bounded QA mode. `PI_OFFLINE=1` always wins over a bootstrap opt-in; `true` and
+  `yes` are also recognized, case-insensitively. The Vinci payload defaults to offline
+  startup. Cached and PATH tools remain usable. `VINCI_TOOL_BOOTSTRAP=0` also disables
+  bootstrap outside offline mode. This is an application policy, not an OS network sandbox.
 
 ## Secret redaction, and its limits
 

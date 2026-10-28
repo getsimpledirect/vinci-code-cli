@@ -19,6 +19,7 @@ import {
 import { vinciVerificationDisabled } from "./lib/verification-control.ts";
 import { getVinciCrewStatus } from "./lib/crew-status.ts";
 import { VINCI_BILLING_URL } from "./vinci-links.ts";
+import { closeCompletedQaAllowance } from "./lib/qa-allowance.ts";
 import {
   buildVinciTaskOutcome,
   classifyVinciLocalTaskState,
@@ -643,6 +644,7 @@ export default function (pi: ExtensionAPI) {
     }
     pi.appendEntry(VINCI_TASK_OUTCOME_ENTRY, outcome);
     setVinciTaskOutcome(outcome);
+    closeCompletedQaAllowance(outcome.state);
     // [vinci #171] Split precedence. The receipt above DISPLAYS the remote acceptance verdict, but
     // the exit code answers a script, so it takes whichever of local and remote is more
     // conservative: a remote pass can never report success on a run whose own check failed (#22

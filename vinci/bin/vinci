@@ -380,12 +380,10 @@ fi
 # and Ctrl+C-twice-to-exit gets a friendlier window. Upstream behavior when unset.
 export VINCI_CODE=1
 
-# No update or telemetry phone-home. PI_OFFLINE disables Pi's version check, package-update nag, and
-# install telemetry. Vinci still needs fd + ripgrep to explore reliably on a fresh machine, so the
-# explicit bootstrap exception may fetch only those two binaries from their official GitHub releases.
-# Set VINCI_TOOL_BOOTSTRAP=0 to keep first-run startup completely offline.
+# No automatic update, telemetry or executable-tool downloads. Offline policy takes precedence
+# over VINCI_TOOL_BOOTSTRAP; existing cached/PATH fd and ripgrep remain usable.
 export PI_OFFLINE=1
-export VINCI_TOOL_BOOTSTRAP="${VINCI_TOOL_BOOTSTRAP:-1}"
+export VINCI_TOOL_BOOTSTRAP="${VINCI_TOOL_BOOTSTRAP:-0}"
 
 # Product-level resume syntax. Pi's durable session UUID is Vinci's task ID; translate the friendly
 # command onto the existing session loader instead of introducing a second task database.

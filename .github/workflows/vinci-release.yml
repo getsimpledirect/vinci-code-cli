@@ -1,10 +1,11 @@
 name: Vinci Release
 
-# Ships a signed Vinci Code release from a protected vinci-v* TAG: build → harness → (approval) →
-# sign the TESTED archive → upload the immutable payload write-once → verify the staged S3 object →
-# verify the signed manifest locally → publish the manifest LAST (its single activation point) →
-# verify the live manifest byte-for-byte → GitHub Release. Publish waits for maintainer approval in
-# the protected `vinci-release` environment.
+# Tag push/default manual candidate run: build/test -> protected approval -> sign/stage -> END.
+# A SEPARATE manual activation run requires exact candidate/QA hashes and a new protected approval.
+# Activation verifies unchanged baseline and retained signed bytes, CASes the manifest without
+# rebuilding/re-signing, then publishes tested public entry points. No automatic activation event.
+# Both phases retain the existing vinci-release environment, tag/OIDC guards and concurrency lock.
+# Unconfirmed/expired VINCI_SIGNED_QA_POLICY fails closed; no environment/IAM setting is changed here.
 #
 # SECURITY MODEL — release signing is documented in the internal ops repository:
 #   * Only a vinci-v* TAG ref can run this (asserted here AND in the IAM trust `ref` condition).
@@ -17,7 +18,35 @@ on:
   push:
     tags:
       - "vinci-v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [candidate, activate]
+        default: candidate
+        required: true
+      candidate_run_id:
+        type: string
+      candidate_run_attempt:
+        type: string
+      candidate_artifact_id:
+        type: string
+      candidate_receipt_sha256:
+        type: string
+      qa_receipt_base64:
+        description: Sanitized owner QA JSON only; no credentials or clipboard contents
+        type: string
+      qa_receipt_sha256:
+        type: string
+      reason:
+        type: string
+
+env:
+  RELEASE_OPERATION: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'candidate' }}
+  # Empty/unconfirmed policy refuses. Ops must review existing approvals/OIDC/exposure/retention.
+  VINCI_SIGNED_QA_POLICY: ${{ vars.VINCI_SIGNED_QA_POLICY }}
+  AWS_MAX_ATTEMPTS: "1"
+  AWS_RETRY_MODE: standard
 
 permissions: {}
 
@@ -46,7 +75,7 @@ jobs:
     # ran, skipped both jobs, and reported success while publishing nothing. GitHub Releases still
     # showed 0.0.50 as latest. A skip is indistinguishable from a pass at a glance, which is what
     # let it go unnoticed for a whole version.
-    if: github.repository == 'getsimpledirect/vinci-code-cli'
+    if: github.repository == 'getsimpledirect/vinci-code-cli' && (github.event_name == 'push' || inputs.operation == 'candidate')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -158,12 +187,14 @@ jobs:
           retention-days: 1
 
   publish:
+    name: Stage signed candidate
+    if: github.repository == 'getsimpledirect/vinci-code-cli' && (github.event_name == 'push' || inputs.operation == 'candidate')
     needs: build-and-verify
     runs-on: ubuntu-latest
-    # Protected environment: publishing pauses here until the maintainer approves the run.
+    # First approval permits signing/staging ONLY. This job cannot activate or publish entry points.
     environment: vinci-release
     permissions:
-      contents: write # create the GitHub Release for this tag
+      contents: read # no GitHub Release or notes permission in the candidate phase
       id-token: write # OIDC federation to the narrowly-scoped AWS release role
     env:
       VERSION: ${{ needs.build-and-verify.outputs.version }}
@@ -177,6 +208,10 @@ jobs:
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: "22.19.0"
+
+      - name: Require explicit current ops prerequisites before signing or staging
+        id: policy
+        run: node vinci/scripts/release-candidate.mjs preflight
 
       - name: Bring in the exact tested payload (not a rebuild)
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
@@ -227,11 +262,11 @@ jobs:
 
           # Bind the next sequence to this exact live body and its ETag. Conditional activation
           # below refuses a concurrent manifest change rather than overwriting it.
-          curl -fsSL --max-time 30 -D live-before.headers "$MANIFEST_URL" > live-before.json
+          curl -fsSL --max-time 30 -D release/live-before.headers "$MANIFEST_URL" > release/live-before.json
           NEXT_SEQ="$(node --input-type=module <<'EOF'
           import { readFileSync } from "node:fs";
           import { createPublicKey, verify } from "node:crypto";
-          const m = JSON.parse(readFileSync("live-before.json", "utf8"));
+          const m = JSON.parse(readFileSync("release/live-before.json", "utf8"));
           const pk = createPublicKey(readFileSync("vinci/updater/public-key.pem"));
           if (!verify(null, Buffer.from(JSON.stringify(m.signed)), pk, Buffer.from(m.signature, "base64")))
             throw new Error("live manifest signature does not verify against the repo trust root");
@@ -242,7 +277,7 @@ jobs:
           EOF
           )"
           echo "next sequence: $NEXT_SEQ"
-          LIVE_ETAG="$(node -p "const h=require('fs').readFileSync('live-before.headers','utf8'); const blocks=h.trim().split(/\\r?\\n\\r?\\n/); const m=blocks.at(-1).match(/^etag:\\s*(\\S+)\\s*$/im); if(!m) throw new Error('Live manifest GET carried no ETag. Restore conditional manifest publishing before retrying.'); m[1]")"
+          LIVE_ETAG="$(node -p "const h=require('fs').readFileSync('release/live-before.headers','utf8'); const blocks=h.trim().split(/\\r?\\n\\r?\\n/); const m=blocks.at(-1).match(/^etag:\\s*(\\S+)\\s*$/im); if(!m) throw new Error('Live manifest GET carried no ETag. Restore conditional manifest publishing before retrying.'); m[1]")"
           printf 'live_etag=%s\n' "$LIVE_ETAG" >> "$GITHUB_OUTPUT"
 
           # Sign the DOWNLOADED artifact directly — create-update-manifest.mjs signs an existing
@@ -278,19 +313,20 @@ jobs:
           console.log(`signed manifest verified locally: v${version} seq ${m.signed.sequence}`);
           EOF
 
-      - name: Upload the immutable payload WRITE-ONCE (manifest not yet)
+      - name: Retain the exact signed candidate and baseline before any upload
+        id: record
+        run: node vinci/scripts/release-candidate.mjs record
+
+      - name: Upload ONLY immutable versioned candidate objects
         run: |
           set -euo pipefail
           B="$S3_BUCKET"; P="$S3_PREFIX"
           # If-None-Match:* fails atomically if the versioned key already exists — a published
           # version can never be silently overwritten (no TOCTOU HEAD-then-PUT window).
           aws s3api put-object --bucket "$B" --key "$P/vinci-code-${VERSION}.tgz" \
-            --body "release/vinci-code-${VERSION}.tgz" --if-none-match "*"
+            --body "release/vinci-code-${VERSION}.tgz" --if-none-match "*" > candidate/staged-archive-put.json
           aws s3api put-object --bucket "$B" --key "$P/vinci-code-${VERSION}.tgz.sha256" \
-            --body "release/vinci-code-${VERSION}.tgz.sha256" --if-none-match "*"
-          # Mutable pointers (must be overwritable): the compat copy and the installer.
-          aws s3 cp release/vinci-code.tgz "s3://$B/$P/"
-          aws s3 cp release/install.sh "s3://$B/$P/"
+            --body "release/vinci-code-${VERSION}.tgz.sha256" --if-none-match "*" > candidate/staged-checksum-put.json
 
       - name: Verify the STAGED S3 object matches the signed manifest before activating clients
         run: |
@@ -305,35 +341,119 @@ jobs:
           console.log(`staged payload verified: sha ${staged.slice(0, 12)}…`);
           EOF
 
-      - name: Publish the manifest LAST — compare-and-swap on the live ETag
-        env:
-          LIVE_ETAG: ${{ steps.sign.outputs.live_etag }}
-        run: |
-          set -euo pipefail
-          if aws s3api put-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/manifest-beta.json" \
-               --body release/manifest-beta.json --content-type application/json \
-               --if-match "$LIVE_ETAG"; then
-            echo "Signed release manifest activated against the observed live ETag."
-          else
-            echo "::error::Conditional manifest publication failed for ETag $LIVE_ETAG. Inspect the live manifest and prepare a new signed sequence before retrying."
-            exit 1
-          fi
+      - name: Retain candidate for owner QA; no activation follows
+        id: retained
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: vinci-signed-candidate-${{ env.VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: ${{ steps.policy.outputs.retention_days }}
 
-      - name: Verify the LIVE manifest is byte-for-byte the one we signed
+      - name: Candidate identity; end without publication
+        env:
+          RECEIPT_SHA256: ${{ steps.record.outputs.receipt_sha256 }}
+          MANIFEST_SHA256: ${{ steps.record.outputs.manifest_sha256 }}
+          CANDIDATE_ARTIFACT_ID: ${{ steps.retained.outputs.artifact-id }}
+        run: |
+          printf 'Signed candidate retained. NOT ACTIVATED.\nReceipt SHA256: %s\nManifest SHA256: %s\nArtifact ID: %s\n' "$RECEIPT_SHA256" "$MANIFEST_SHA256" "$CANDIDATE_ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"
+
+  activate:
+    name: Activate reviewed signed candidate
+    if: github.repository == 'getsimpledirect/vinci-code-cli' && github.event_name == 'workflow_dispatch' && inputs.operation == 'activate'
+    runs-on: ubuntu-latest
+    # A SEPARATE run and George's existing protected approval. Never signs or rebuilds.
+    environment: vinci-release
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    env:
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+      CANDIDATE_ARTIFACT_ID: ${{ inputs.candidate_artifact_id }}
+      CANDIDATE_RECEIPT_SHA256: ${{ inputs.candidate_receipt_sha256 }}
+      QA_RECEIPT_BASE64: ${{ inputs.qa_receipt_base64 }}
+      QA_RECEIPT_SHA256: ${{ inputs.qa_receipt_sha256 }}
+      ACTIVATION_REASON: ${{ inputs.reason }}
+      S3_BUCKET: vinci-assets
+      S3_PREFIX: vinci-code
+      MANIFEST_URL: https://vinci-assets.s3.ca-central-1.amazonaws.com/vinci-code/manifest-beta.json
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.19.0"
+      - name: Refuse missing ops confirmation or activation identity
+        id: policy
+        run: node vinci/scripts/release-candidate.mjs preflight
+      - name: Read immutable producer and artifact metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          curl -fsSL "$MANIFEST_URL" > live-after.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > producer-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT_ID" > candidate-artifact.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/attempts/$CANDIDATE_RUN_ATTEMPT/jobs?per_page=100" > producer-jobs.json
+      - name: Refuse untrusted or expired producer metadata before artifact extraction
+        run: node vinci/scripts/release-candidate.mjs select-candidate
+      - name: Download only the approved artifact ID with bounded identity and extraction checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node vinci/scripts/release-candidate-download.mjs
+      - name: Assume existing release role; activation never requests a signing key
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ vars.VINCI_RELEASE_ROLE_ARN }}
+          aws-region: ca-central-1
+      - name: Read the current baseline and staged bytes
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#vinci-v}"
+          curl -fsSL --max-time 30 -D activation-live.headers "$MANIFEST_URL" > activation-live.json
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/vinci-code-${VERSION}.tgz" activation-staged.tgz
+      - name: Require exact owner-reviewed candidate, QA receipt and unchanged baseline
+        id: reviewed
+        run: node vinci/scripts/release-candidate.mjs verify-activation
+      - name: Activate the reviewed manifest with a single conditional write
+        env:
+          LIVE_ETAG: ${{ steps.reviewed.outputs.live_etag }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.reviewed.outputs.manifest_sha256 }}
+          CANDIDATE_EXPIRES_AT: ${{ steps.reviewed.outputs.expires_at }}
+        run: |
+          set -euo pipefail
           node --input-type=module <<'EOF'
+          import assert from "node:assert/strict";
           import { readFileSync } from "node:fs";
           import { createHash } from "node:crypto";
-          const local = createHash("sha256").update(readFileSync("release/manifest-beta.json")).digest("hex");
-          const live = createHash("sha256").update(readFileSync("live-after.json")).digest("hex");
-          if (local !== live) throw new Error("live manifest bytes differ from the manifest we signed");
-          console.log("live manifest is byte-identical to the signed manifest");
+          assert.match(process.env.EXPECTED_MANIFEST_SHA256 ?? "", /^[a-f0-9]{64}$/);
+          assert.equal(createHash("sha256").update(readFileSync("activation/manifest-beta.json")).digest("hex"), process.env.EXPECTED_MANIFEST_SHA256);
+          assert.ok(Date.parse(process.env.CANDIDATE_EXPIRES_AT) > Date.now(), "Candidate/QA/ops authorization expired");
           EOF
-
+          if aws s3api put-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/manifest-beta.json" \
+               --body activation/manifest-beta.json --content-type application/json --if-match "$LIVE_ETAG"; then
+            echo "Exact reviewed signed candidate activated."
+          else
+            echo "::error::Conditional activation failed or its outcome is uncertain. Inspect the live manifest before retrying; never refresh ETag or re-sign automatically."
+            exit 1
+          fi
+      - name: Verify exact live bytes before publishing public entry points
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 30 "$MANIFEST_URL" > activation/live-after.json
+          cmp activation/manifest-beta.json activation/live-after.json
+      - name: Publish retained tested installer and compatibility bytes only after activation
+        env:
+          VERSION: ${{ steps.reviewed.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp "candidate/vinci-code-${VERSION}.tgz" "candidate/vinci-code-${VERSION}.tgz.sha256" candidate/manifest-beta.json release/
+          aws s3 cp candidate/vinci-code.tgz "s3://$S3_BUCKET/$S3_PREFIX/vinci-code.tgz"
+          aws s3 cp candidate/install.sh "s3://$S3_BUCKET/$S3_PREFIX/install.sh"
       - name: GitHub Release with the shipped artifacts
         env:
+          VERSION: ${{ steps.reviewed.outputs.version }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -359,6 +479,7 @@ jobs:
       - name: Public release notes
         continue-on-error: true
         env:
+          VERSION: ${{ steps.reviewed.outputs.version }}
           GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
           RELEASE_TAG: ${{ github.ref_name }}
           PUBLIC_REPO: getsimpledirect/vinci-code-releases
@@ -401,3 +522,19 @@ jobs:
             exit 1
           fi
           echo "Published $RELEASE_TAG to $PUBLIC_REPO."
+
+      - name: Retain sanitized activation or refusal receipt
+        if: ${{ !cancelled() && steps.policy.outcome == 'success' }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: vinci-activation-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            activation/
+            candidate/candidate.json
+            artifact-download-receipt.json
+            artifact-download-refusal.json
+            producer-run.json
+            producer-jobs.json
+            candidate-artifact.json
+          if-no-files-found: warn
+          retention-days: ${{ steps.policy.outputs.receipt_retention_days }}

@@ -78,7 +78,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/modes/interactive/components/countdown-timer.ts` | `ElapsedTimer` for live compaction progress | — |
 | `coding-agent/src/modes/interactive/components/extension-selector.ts` | Report the rows/width left after widgets and footer so approval context stays reviewable in small terminals | — |
 | `coding-agent/src/modes/interactive/components/login-dialog.ts`, `oauth-selector.ts` | Vero sign-in copy under `VINCI_CODE=1` | 9 |
-| `coding-agent/src/utils/tools-manager.ts` | Offline tool bootstrap (`VINCI_TOOL_BOOTSTRAP`), pinned tool assets (`VINCI_TOOL_PIN_*`), sandboxed child env | 9 |
+| `coding-agent/src/utils/tools-manager.ts` | Strict offline download refusal, optional online bootstrap (`VINCI_TOOL_BOOTSTRAP`), pinned tool assets (`VINCI_TOOL_PIN_*`), sandboxed child env | 9 |
 | `tui/src/components/markdown.ts` | Render fenced code as shaded, indented lines with no ``` delimiters under `VINCI_CODE=1` | — |
 | `tui/src/tui-alt-screen.ts` | Default-preserving host options for LINE-only padding trimming and custom-modal mouse ownership; InteractiveMode enables them only under `VINCI_CODE=1`, with no Vinci environment reads in TUI | 6 |
 
@@ -366,9 +366,13 @@ Small, mostly env-gated edits so a non-programmer never sees raw "pi" or dev jar
   `show-images` knob — every Vinci model is text-only).
 
 `vinci/bin/vinci` also `export PI_OFFLINE=1` — no pi.dev version check / npm-update nags / install
-telemetry network calls (Vinci ships its own updates; off-brand for a ZDR product). A narrow
-`VINCI_TOOL_BOOTSTRAP=1` exception in `tools-manager.ts` still provisions fd and ripgrep from their
-official GitHub releases on a fresh machine; users can set it to `0` for completely offline startup.
+telemetry network calls (Vinci ships its own updates; off-brand for a ZDR product). Offline mode
+always refuses fd/ripgrep downloads, including exported downloader calls and inherited helper/RPC
+paths, even with `VINCI_TOOL_BOOTSTRAP=1`. Cached and PATH tools remain usable. Outside offline/QA
+mode, pinned bootstrap remains available unless explicitly disabled. The installed shim honors
+inherited offline intent and `--offline` before its automatic updater; the updater checks its own
+network boundary too. Explicit runtime-service, login and provider actions retain their separate
+policies; this is not a machine-wide firewall.
 
 ## 10. Structured search tools on by default + friendly model names
 

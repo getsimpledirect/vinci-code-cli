@@ -19,10 +19,10 @@ const graphemeSegmenter = getGraphemeSegmenter();
 const wordSegmenter = getWordSegmenter();
 
 /** Regex matching paste markers like `[paste #1 +123 lines]` or `[paste #2 1234 chars]`. */
-const PASTE_MARKER_REGEX = /\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]/g;
+const PASTE_MARKER_REGEX = /\[(?:paste|image) #(\d+)( (\+\d+ lines|\d+ chars))?\]/g;
 
 /** Non-global version for single-segment testing. */
-const PASTE_MARKER_SINGLE = /^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/;
+const PASTE_MARKER_SINGLE = /^\[(?:paste|image) #(\d+)( (\+\d+ lines|\d+ chars))?\]$/;
 
 /** Check if a segment is a paste marker (i.e. was merged by segmentWithMarkers). */
 function isPasteMarker(segment: string): boolean {
@@ -42,7 +42,7 @@ function segmentWithMarkers(
 	validIds: Set<number>,
 ): Iterable<Intl.SegmentData> {
 	// Fast path: no paste markers in the text or no valid IDs.
-	if (validIds.size === 0 || !text.includes("[paste #")) {
+	if (validIds.size === 0 || (!text.includes("[paste #") && !text.includes("[image #"))) {
 		return baseSegmenter.segment(text);
 	}
 
@@ -973,7 +973,7 @@ export class Editor implements Component, Focusable {
 	private expandPasteMarkers(text: string): string {
 		let result = text;
 		for (const [pasteId, pasteContent] of this.pastes) {
-			const markerRegex = new RegExp(`\\[paste #${pasteId}( (\\+\\d+ lines|\\d+ chars))?\\]`, "g");
+			const markerRegex = new RegExp(`\\[(?:paste|image) #${pasteId}( (\\+\\d+ lines|\\d+ chars))?\\]`, "g");
 			result = result.replace(markerRegex, () => pasteContent);
 		}
 		return result;
@@ -1019,6 +1019,13 @@ export class Editor implements Component, Focusable {
 		this.lastAction = null;
 		this.exitHistoryBrowsing();
 		this.insertTextAtCursorInternal(text);
+	}
+
+	/** Keep an unsent image path in an atomic marker, expanded only when submitted. */
+	insertImageAttachment(filePath: string): void {
+		this.pasteCounter++;
+		this.pastes.set(this.pasteCounter, ` ${filePath} `);
+		this.insertTextAtCursor(`[image #${this.pasteCounter}]`);
 	}
 
 	/**

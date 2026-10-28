@@ -28,6 +28,7 @@ export function getContentOverlayOptions(tui: TUI): OverlayOptions {
 }
 
 export class ContentOverlayComponent extends Container implements Focusable {
+	readonly acceptsMouseInput = true;
 	private readonly tui: TUI;
 	private readonly markdown: Markdown;
 	private readonly footer: Text | TruncatedText;
@@ -51,6 +52,7 @@ export class ContentOverlayComponent extends Container implements Focusable {
 		this.renderWidth = tui.terminal.columns;
 		this.markdown = new Markdown(body, 1, 0, markdownTheme);
 		this.onClose = onClose;
+		if (tui.mode === "regular") tui.terminal.write("\x1b[?1000h\x1b[?1006h");
 
 		const closeKey = keyDisplayText("tui.select.cancel");
 		const upKey = keyDisplayText("tui.select.up");
@@ -77,6 +79,10 @@ export class ContentOverlayComponent extends Container implements Focusable {
 	private shouldCompactFrame(): boolean {
 		const maxHeight = Math.max(1, this.tui.terminal.rows - OVERLAY_MARGIN * 2);
 		return this.vinci && maxHeight < FRAME_HEIGHT + this.footer.render(this.renderWidth).length;
+	}
+
+	dispose(): void {
+		if (this.tui.mode === "regular") this.tui.terminal.write("\x1b[?1000l\x1b[?1006l");
 	}
 
 	private getVisibleBodyHeight(): number {
@@ -112,6 +118,14 @@ export class ContentOverlayComponent extends Container implements Focusable {
 	}
 
 	handleInput(data: string): void {
+		// The modal owns mouse input while open; consume only wheel packets here.
+		const keyboard = data.replace(/\x1b\[<(\d+);\d+;\d+[Mm]/g, (_packet, button: string) => {
+			if (button === "64") this.scrollBy(-3);
+			if (button === "65") this.scrollBy(3);
+			return "";
+		});
+		if (!keyboard) return;
+		data = keyboard;
 		const kb = getKeybindings();
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.onClose();

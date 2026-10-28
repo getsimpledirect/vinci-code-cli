@@ -29,6 +29,7 @@ function createModel(provider: string, id: string): Model<Api> {
 
 function createRegistry(): ModelRegistry {
 	return {
+		authStorage: { hasAuth: () => true },
 		refresh: () => {},
 		getError: () => undefined,
 		getAll: () => models,
@@ -48,6 +49,7 @@ async function renderSelector(
 	currentModel: Model<Api>,
 ): Promise<string[]> {
 	const registry = {
+		authStorage: { hasAuth: () => true },
 		refresh: () => {},
 		getError: () => undefined,
 		getAvailable: () => availableModels,

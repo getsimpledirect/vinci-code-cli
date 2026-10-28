@@ -5,6 +5,48 @@ import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint } from "./keybinding-hints.ts";
 
+const URL_CONTROL_BYTES = /[\x00-\x1f\x7f-\x9f]/;
+
+function isSupportedSignInUrl(target: unknown, allowLocalFileLinks: boolean): target is string {
+	if (
+		typeof target !== "string" ||
+		target.trim() !== target ||
+		URL_CONTROL_BYTES.test(target) ||
+		target.includes("\\")
+	)
+		return false;
+	try {
+		const parsed = new URL(target);
+		if (parsed.username || parsed.password) return false;
+		if (parsed.protocol === "https:") return /^https:\/\//i.test(target) && parsed.hostname !== "";
+		// Real provider sign-in uses HTTPS. Owned local QA fixtures may explicitly opt in to
+		// canonical local file URLs; remote authorities and UNC paths are never admitted.
+		if (!allowLocalFileLinks || parsed.protocol !== "file:" || !/^file:\/\/(?:localhost)?\//i.test(target))
+			return false;
+		if (parsed.hostname && parsed.hostname !== "localhost") return false;
+		const localPath = decodeURIComponent(parsed.pathname);
+		return (
+			localPath.startsWith("/") &&
+			!localPath.startsWith("//") &&
+			!localPath.includes("\\") &&
+			!URL_CONTROL_BYTES.test(localPath)
+		);
+	} catch {
+		return false;
+	}
+}
+
+export function loginLinkHint(
+	mode: TUI["mode"],
+	terminal = process.env.TERM_PROGRAM,
+	platform = process.platform,
+): string {
+	if (platform === "darwin" && terminal?.toLowerCase() === "ghostty" && mode === "fullscreen") {
+		return "Shift+Cmd+click to open · hold Shift to select/copy the link";
+	}
+	return platform === "darwin" ? "Cmd+click to open" : "Ctrl+click to open";
+}
+
 /**
  * Login dialog component - replaces editor during OAuth login flow
  */
@@ -16,6 +58,12 @@ export class LoginDialogComponent extends Container implements Focusable {
 	private inputResolver?: (value: string) => void;
 	private inputRejecter?: (error: Error) => void;
 	private onComplete: (success: boolean, message?: string) => void;
+	private linkUrl?: string;
+	private linkActionHint?: Text;
+	private linkActionEnabled = false;
+	private openUrl: (url: string) => void;
+	private allowLocalFileLinks: boolean;
+	private linkError = false;
 
 	// Focusable implementation - propagate to input for IME cursor positioning
 	private _focused = false;
@@ -33,10 +81,14 @@ export class LoginDialogComponent extends Container implements Focusable {
 		onComplete: (success: boolean, message?: string) => void,
 		providerNameOverride?: string,
 		titleOverride?: string,
+		openUrl: (url: string) => void = openBrowser,
+		allowLocalFileLinks = false,
 	) {
 		super();
 		this.tui = tui;
 		this.onComplete = onComplete;
+		this.openUrl = openUrl;
+		this.allowLocalFileLinks = allowLocalFileLinks;
 
 		const providerInfo = getOAuthProviders().find((p) => p.id === providerId);
 		const providerName = providerNameOverride || providerInfo?.name || providerId;
@@ -100,17 +152,18 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Called by onAuth callback - show URL and optional instructions
 	 */
 	showAuth(url: string, instructions?: string): void {
-		this.contentContainer.clear();
-		this.contentContainer.addChild(new Spacer(1));
+		if (!this.prepareLink(url)) return;
 		if (process.env.VINCI_CODE === "1") {
 			this.contentContainer.addChild(new Text("Pending: finish sign-in in your browser.", 1, 0));
 		}
 		const linkedUrl = `\x1b]8;;${url}\x07${url}\x1b]8;;\x07`;
 		this.contentContainer.addChild(new Text(theme.fg("accent", linkedUrl), 1, 0));
 
-		const clickHint = process.platform === "darwin" ? "Cmd+click to open" : "Ctrl+click to open";
+		const clickHint = loginLinkHint(this.tui.mode);
 		const hyperlink = `\x1b]8;;${url}\x07${clickHint}\x1b]8;;\x07`;
 		this.contentContainer.addChild(new Text(theme.fg("dim", hyperlink), 1, 0));
+		this.linkActionHint = new Text(keyHint("tui.select.confirm", "open link in your browser"), 1, 0);
+		this.contentContainer.addChild(this.linkActionHint);
 
 		if (instructions) {
 			this.contentContainer.addChild(new Spacer(1));
@@ -120,7 +173,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 			this.contentContainer.addChild(new Text(keyHint("tui.select.cancel", "cancel"), 1, 0));
 		}
 
-		openBrowser(url);
+		this.openLink();
 		this.tui.requestRender();
 	}
 
@@ -128,17 +181,18 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Called by onDeviceCode callback - show URL and user code.
 	 */
 	showDeviceCode(info: OAuthDeviceCodeInfo): void {
-		this.contentContainer.clear();
-		this.contentContainer.addChild(new Spacer(1));
+		if (!this.prepareLink(info.verificationUri)) return;
 		if (process.env.VINCI_CODE === "1") {
 			this.contentContainer.addChild(new Text("Pending: open the link and authorize the code.", 1, 0));
 		}
 		const linkedUrl = `\x1b]8;;${info.verificationUri}\x07${info.verificationUri}\x1b]8;;\x07`;
 		this.contentContainer.addChild(new Text(theme.fg("accent", linkedUrl), 1, 0));
 
-		const clickHint = process.platform === "darwin" ? "Cmd+click to open" : "Ctrl+click to open";
+		const clickHint = loginLinkHint(this.tui.mode);
 		const hyperlink = `\x1b]8;;${info.verificationUri}\x07${clickHint}\x1b]8;;\x07`;
 		this.contentContainer.addChild(new Text(theme.fg("dim", hyperlink), 1, 0));
+		this.linkActionHint = new Text(keyHint("tui.select.confirm", "open link in your browser"), 1, 0);
+		this.contentContainer.addChild(this.linkActionHint);
 		this.contentContainer.addChild(new Spacer(1));
 		this.contentContainer.addChild(new Text(theme.fg("warning", `Enter code: ${info.userCode}`), 1, 0));
 
@@ -149,6 +203,9 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Show input for manual code/URL entry (for callback server providers)
 	 */
 	showManualInput(prompt: string): Promise<string> {
+		this.linkError = false;
+		this.linkActionEnabled = false;
+		this.linkActionHint?.setText("If needed, select and copy the URL above into your browser.");
 		this.input.setValue("");
 		this.contentContainer.addChild(new Spacer(1));
 		this.contentContainer.addChild(new Text(theme.fg("dim", prompt), 1, 0));
@@ -167,6 +224,9 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Note: Does NOT clear content, appends to existing (preserves URL from showAuth)
 	 */
 	showPrompt(message: string, placeholder?: string): Promise<string> {
+		this.linkError = false;
+		this.linkActionEnabled = false;
+		this.linkActionHint?.setText("If needed, select and copy the URL above into your browser.");
 		this.contentContainer.addChild(new Spacer(1));
 		this.contentContainer.addChild(new Text(theme.fg("text", message), 1, 0));
 		if (placeholder) {
@@ -194,6 +254,10 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Show informational text without prompting for input.
 	 */
 	showInfo(lines: string[]): void {
+		this.linkError = false;
+		this.linkUrl = undefined;
+		this.linkActionHint = undefined;
+		this.linkActionEnabled = false;
 		this.contentContainer.clear();
 		this.contentContainer.addChild(new Spacer(1));
 		for (const line of lines) {
@@ -222,11 +286,51 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.tui.requestRender();
 	}
 
+	private prepareLink(target: unknown): target is string {
+		// Clear a previous accepted target too, so a rejected update cannot leave Enter actionable.
+		this.linkUrl = undefined;
+		this.linkActionEnabled = false;
+		this.linkActionHint = undefined;
+		this.linkError = true;
+		this.contentContainer.clear();
+		this.contentContainer.addChild(new Spacer(1));
+		if (!isSupportedSignInUrl(target, this.allowLocalFileLinks)) {
+			// Never echo the rejected value: it may contain terminal commands or credentials.
+			this.contentContainer.addChild(
+				new Text("Sign-in link is invalid or unsupported. Cancel and try signing in again.", 1, 0),
+			);
+			this.contentContainer.addChild(new Text(keyHint("tui.select.cancel", "cancel"), 1, 0));
+			this.tui.requestRender();
+			return false;
+		}
+		this.linkUrl = target;
+		this.linkActionEnabled = true;
+		this.linkError = false;
+		return true;
+	}
+
+	private openLink(): void {
+		if (!this.linkUrl || this.abortController.signal.aborted) return;
+		try {
+			this.openUrl(this.linkUrl);
+		} catch {
+			this.contentContainer.addChild(
+				new Text("Could not open the link. Select and copy the URL into your browser.", 1, 0),
+			);
+		}
+	}
+
 	handleInput(data: string): void {
 		const kb = getKeybindings();
 
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.cancel();
+			return;
+		}
+		if (this.linkError) return;
+		if (this.linkActionEnabled && !this.inputResolver && this.linkUrl && kb.matches(data, "tui.select.confirm")) {
+			this.openLink();
+			this.tui.requestRender();
 			return;
 		}
 

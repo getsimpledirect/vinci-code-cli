@@ -1,5 +1,8 @@
 import { EventEmitter } from "node:events";
+import { realpathSync } from "node:fs";
+import { isAbsolute, relative, sep } from "node:path";
 import * as undici from "undici";
+import { guardQaRequests, QaRequestGuard } from "./qa-request-allowance.ts";
 
 export const DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000;
 
@@ -13,6 +16,7 @@ export const HTTP_IDLE_TIMEOUT_CHOICES = [
 
 const originalGlobalFetch = globalThis.fetch;
 let installedGlobalFetch: typeof globalThis.fetch | undefined;
+let qaRequestGuard: QaRequestGuard | undefined;
 
 export function parseHttpIdleTimeoutMs(value: unknown): number | undefined {
 	if (typeof value === "string") {
@@ -81,6 +85,19 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 	if (normalizedTimeoutMs === undefined) {
 		throw new Error(`Invalid HTTP idle timeout: ${String(timeoutMs)}`);
 	}
+	const allowancePath = process.env.VINCI_QA_ALLOWANCE_FILE;
+	if (qaRequestGuard && allowancePath !== qaRequestGuard.path) {
+		throw new Error(
+			"QA allowance cannot be removed or replaced in a running process. Stop and review a new allowance.",
+		);
+	}
+	if (allowancePath !== undefined && !qaRequestGuard) {
+		const location = relative(realpathSync(process.cwd()), realpathSync(allowancePath));
+		if (location === "" || (!isAbsolute(location) && location !== ".." && !location.startsWith(`..${sep}`))) {
+			throw new Error("BLOCKED: keep the operator's QA allowance outside the model workspace.");
+		}
+		qaRequestGuard = new QaRequestGuard(allowancePath);
+	}
 	const dispatcher = withUndiciErrorListener(
 		new undici.EnvHttpProxyAgent({
 			allowH2: false,
@@ -90,7 +107,6 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 			factory: createUndiciOriginDispatcher,
 		}),
 	);
-	undici.setGlobalDispatcher(dispatcher);
 	// Keep fetch and the dispatcher on the same undici implementation. Node 26.0's
 	// bundled fetch can otherwise consume compressed responses through npm undici's
 	// dispatcher without decompressing them, causing response.json() failures.
@@ -99,8 +115,26 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 		installedGlobalFetch === undefined
 			? globalThis.fetch === originalGlobalFetch
 			: globalThis.fetch === installedGlobalFetch;
+	if (qaRequestGuard && !shouldInstallGlobals) {
+		void dispatcher.destroy();
+		throw new Error("QA allowance cannot protect a custom global fetch. Stop and restore the managed HTTP runtime.");
+	}
+	undici.setGlobalDispatcher(guardQaRequests(dispatcher, qaRequestGuard));
 	if (shouldInstallGlobals) {
 		undici.install?.();
 		installedGlobalFetch = globalThis.fetch;
+	}
+	if (qaRequestGuard && !Object.hasOwn(globalThis, "__vinciQaRequestGuard")) {
+		const guard = qaRequestGuard;
+		const guardedFetch = globalThis.fetch;
+		Object.defineProperty(globalThis, "__vinciQaRequestGuard", {
+			value: Object.freeze({
+				assertModel(model: { provider: string; api: string; id: string; baseUrl: string }) {
+					if (globalThis.fetch !== guardedFetch) throw new Error("BLOCKED: managed QA fetch was replaced.");
+					guard.assertModel(model);
+				},
+				close: (reason: "completed" | "revoked") => guard.close(reason),
+			}),
+		});
 	}
 }

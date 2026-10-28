@@ -39,6 +39,15 @@ function fail(message) {
 	throw new Error(message);
 }
 
+function automaticNetworkDisabled() {
+	const offline = process.env.PI_OFFLINE?.toLowerCase();
+	return offline === "1" || offline === "true" || offline === "yes" || process.env.VINCI_QA_ALLOWANCE_FILE !== undefined;
+}
+
+function requireNetworkPermission() {
+	if (automaticNetworkDisabled()) fail("Update network access is disabled by the offline or QA request policy.");
+}
+
 function parseVersion(version) {
 	if (!VERSION_PATTERN.test(version)) fail(`Invalid Vinci version: ${version}`);
 	const parts = version.split(".").map(Number);
@@ -177,6 +186,7 @@ async function verifyManifestText(text, keyPath = publicKeyPath()) {
 async function readLocation(location) {
 	const parsed = validateLocation(location, "Manifest URL");
 	if (parsed.protocol === "file:") return readFile(fileURLToPath(parsed), "utf8");
+	requireNetworkPermission();
 	const controller = new AbortController();
 	const timer = setTimeout(
 		() => controller.abort(),
@@ -196,6 +206,7 @@ async function readLocation(location) {
 
 async function downloadLocation(location, destination, maximumSize) {
 	const parsed = validateLocation(location, "Artifact URL");
+	if (parsed.protocol !== "file:") requireNetworkPermission();
 	await mkdir(dirname(destination), { recursive: true });
 	if (parsed.protocol === "file:") {
 		await copyFile(fileURLToPath(parsed), destination);
@@ -649,7 +660,7 @@ async function beforeLaunch() {
 	// exists, so a dev session must never auto-update or touch prod update state. The launcher also
 	// exports VINCI_UPDATE_DISABLED=1 for dev, but the installed shim runs this updater BEFORE the
 	// launcher — honoring VINCI_ENV here keeps the guarantee on that path too.
-	if (process.env.VINCI_UPDATE_DISABLED === "1" || process.env.VINCI_ENV === "dev") return 0;
+	if (automaticNetworkDisabled() || process.env.VINCI_UPDATE_DISABLED === "1" || process.env.VINCI_ENV === "dev") return 0;
 	const home = updaterHome();
 	const version = await currentVersion(home);
 	if (!version) fail("Vinci Code has no active version. Re-run the installer.");
@@ -799,6 +810,11 @@ function option(args, name) {
 }
 
 async function main(args) {
+	// The installed shim also normalizes this before its automatic updater invocation.
+	if (args.includes("--offline")) {
+		process.env.PI_OFFLINE = "1";
+		args = args.filter((arg) => arg !== "--offline");
+	}
 	const command = args[0] ?? "before-launch";
 	if (command === "verify-manifest") {
 		await verifyManifestText(await readFile(resolve(option(args, "--manifest")), "utf8"));
@@ -838,4 +854,4 @@ main(process.argv.slice(2))
 		process.exitCode = 1;
 	});
 
-// payload-updater-version: 0.0.42
+// payload-updater-version: 0.0.43

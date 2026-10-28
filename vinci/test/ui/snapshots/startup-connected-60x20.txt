@@ -1,4 +1,4 @@
-  Vinci v0.0.57 Code
+  Vinci v0.0.58 Code
   Vero READY · Vinci · <repo>
   ● credential saved · Ask Vero a task · /undo
 

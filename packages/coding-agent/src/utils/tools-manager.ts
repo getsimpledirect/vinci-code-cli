@@ -17,27 +17,26 @@ import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { getBinDir } from "../config.ts";
-// [vinci] offline tool bootstrap (VINCI_TOOL_BOOTSTRAP), pinned tool assets (VINCI_TOOL_PIN_*), sandboxed child env
+// [vinci] strict offline tool policy, pinned tool assets (VINCI_TOOL_PIN_*), sandboxed child env
 import { vinciSandboxChildEnv } from "../core/vinci-sandbox.ts";
 
 const TOOLS_DIR = getBinDir();
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 
-function isOfflineModeEnabled(): boolean {
-	const value = process.env.PI_OFFLINE;
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
-}
-
-/** Vinci stays offline for update/telemetry traffic but may fetch its two required search binaries. */
+/** Offline and bounded QA never authorize executable downloads, including direct callers. */
 export function shouldBootstrapTools(env: NodeJS.ProcessEnv = process.env): boolean {
+	// This also protects startup before an allowance is armed or found to be invalid.
+	// Model/auth request permission never grants permission to provision executable tools.
+	if (env.VINCI_QA_ALLOWANCE_FILE !== undefined) return false;
 	const offline = env.PI_OFFLINE;
 	const offlineEnabled = offline === "1" || offline?.toLowerCase() === "true" || offline?.toLowerCase() === "yes";
-	if (!offlineEnabled) return true;
+	if (offlineEnabled) return false;
 	const bootstrap = env.VINCI_TOOL_BOOTSTRAP;
 	return (
-		env.VINCI_CODE === "1" &&
-		(bootstrap === "1" || bootstrap?.toLowerCase() === "true" || bootstrap?.toLowerCase() === "yes")
+		bootstrap === undefined ||
+		bootstrap === "1" ||
+		bootstrap.toLowerCase() === "true" ||
+		bootstrap.toLowerCase() === "yes"
 	);
 }
 
@@ -366,6 +365,9 @@ function extractZipArchive(archivePath: string, extractDir: string, assetName: s
 // Download and install a tool from its PINNED release (see ToolConfig.pins for the bump path).
 // Exported so the integrity decision is directly testable.
 export async function downloadTool(tool: "fd" | "rg"): Promise<string> {
+	if (!shouldBootstrapTools()) {
+		throw new Error("Tool downloads are disabled by the offline or QA request policy.");
+	}
 	const config = TOOLS[tool];
 	if (!config) throw new Error(`Unknown tool: ${tool}`);
 
@@ -462,9 +464,9 @@ export async function ensureTool(tool: "fd" | "rg", silent: boolean = false): Pr
 	const config = TOOLS[tool];
 	if (!config) return undefined;
 
-	if (isOfflineModeEnabled() && !shouldBootstrapTools()) {
+	if (!shouldBootstrapTools()) {
 		if (!silent) {
-			console.log(chalk.yellow(`${config.name} not found. Offline mode enabled, skipping download.`));
+			console.log(chalk.yellow(`${config.name} not found. Tool download policy disabled, skipping download.`));
 		}
 		return undefined;
 	}

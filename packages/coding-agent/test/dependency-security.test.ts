@@ -58,6 +58,11 @@ describe("reviewed Undici version floors", () => {
 		["node_modules/@earendil-works/gondolin/node_modules/undici", "6.28.1"],
 		["node_modules/other/node_modules/undici", "7.29.1"],
 		["node_modules/zod", "4.6.5"],
+		["node_modules/source-map-js", "1.2.1"],
+		["node_modules/vite", "8.1.5"],
+		["packages/agent/node_modules/vitest", "4.1.11"],
+		["packages/ai/node_modules/@vitest/mocker", "4.1.11"],
+		["packages/agent/node_modules/@vitest/coverage-v8", "4.1.11"],
 	]) {
 		it(`refuses affected ${version} at ${path}`, () => {
 			const result = checkVersion(path, version);

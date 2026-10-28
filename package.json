@@ -61,6 +61,8 @@
 	},
 	"version": "0.0.3",
 	"overrides": {
+		"@vitest/coverage-v8": "4.1.12",
+		"@vitest/mocker": "4.1.12",
 		"@earendil-works/gondolin": {
 			"undici": "6.29.1"
 		},
@@ -69,6 +71,9 @@
 		},
 		"node-forge": "$node-forge",
 		"rimraf": "6.1.2",
+		"source-map-js": "1.2.2",
+		"vite": "8.1.6",
+		"vitest": "4.1.12",
 		"gaxios": {
 			"rimraf": "6.1.2"
 		}
