@@ -1612,7 +1612,7 @@ tls.handleServerHelloDone = function(c, record, length) {
     });
   }
 
-  if(c.serverCertificate === null) {
+  if(c.session.serverCertificate === null) {
     // no server certificate was provided
     var error = {
       message: 'No server certificate provided. Not enough security.',
@@ -1642,10 +1642,11 @@ tls.handleServerHelloDone = function(c, record, length) {
           error.alert.description = ret;
         }
       }
-
-      // send error
-      return c.error(c, error);
     }
+
+    // send error even if accepted, the RSA key exchange needs the server
+    // certificate
+    return c.error(c, error);
   }
 
   // create client certificate message if requested
@@ -2097,8 +2098,9 @@ tls.handleHeartbeat = function(c, record) {
   var payload = b.getBytes(length);
 
   if(type === tls.HeartbeatMessageType.heartbeat_request) {
-    // discard request during handshake or if length is too large
-    if(c.handshaking || length > payload.length) {
+    // discard request before the first handshake is complete, during
+    // handshake, or if length is too large
+    if(c.handshakes === 0 || c.handshaking || length > payload.length) {
       // continue
       return c.process();
     }
@@ -3917,6 +3919,8 @@ tls.createConnection = function(options) {
                   tls.Alert.Description.unexpected_message
               }
             });
+            // fatal error closed and reset the connection (no record)
+            return rval;
           }
         }
 
@@ -4018,22 +4022,22 @@ tls.createConnection = function(options) {
     }
   };
 
-  /**
-   * Called when TLS protocol data has been received from somewhere and should
-   * be processed by the TLS engine.
-   *
-   * @param data the TLS protocol data, as a string, to process.
-   *
-   * @return 0 if the data could be processed, otherwise the number of bytes
-   *         required for data to be processed.
-   */
-  c.process = function(data) {
-    var rval = 0;
+  // true while c.process() is handling records
+  var _processing = false;
+  // true when c.process() was called again while handling a record
+  var _processNext = false;
 
-    // buffer input data
-    if(data) {
-      c.input.putBytes(data);
-    }
+  /**
+   * Reads the next record and, once it is complete, passes it to its
+   * handler. Handlers call c.process() to continue with the next record.
+   *
+   * @param c the TLS connection.
+   *
+   * @return 0 if the input data could be processed, otherwise the
+   *         number of bytes required for data to be processed.
+   */
+  var _processRecord = function(c) {
+    var rval = 0;
 
     // process next record if no failure, process will be called after
     // each record is handled (since handling can be asynchronous)
@@ -4058,6 +4062,54 @@ tls.createConnection = function(options) {
       if(!c.fail && c.record !== null && c.record.ready) {
         _update(c, c.record);
       }
+    }
+
+    return rval;
+  };
+
+  /**
+   * Called when TLS protocol data has been received from somewhere and should
+   * be processed by the TLS engine.
+   *
+   * @param data the TLS protocol data, as a string, to process.
+   *
+   * @return 0 if the data could be processed, otherwise the number of bytes
+   *         required for data to be processed.
+   */
+  c.process = function(data) {
+    var rval = 0;
+
+    // buffer input data
+    if(data) {
+      c.input.putBytes(data);
+    }
+
+    // record handlers call c.process() without data to continue with the
+    // next record; while records are being processed, only flag that the
+    // loop below should continue instead of recursing, which could exhaust
+    // the call stack
+    if(_processing && typeof(data) === 'undefined') {
+      _processNext = true;
+      return rval;
+    }
+
+    // new data is processed right away, as before, even in a nested call
+    // (e.g., from a tlsDataReady handler that passes data synchronously
+    // between two connections)
+    var processing = _processing;
+    var processNext = _processNext;
+    _processing = true;
+    _processNext = false;
+    try {
+      // return value is based on the first record, as before
+      rval = _processRecord(c);
+      while(_processNext) {
+        _processNext = false;
+        _processRecord(c);
+      }
+    } finally {
+      _processing = processing;
+      _processNext = processNext;
     }
 
     return rval;

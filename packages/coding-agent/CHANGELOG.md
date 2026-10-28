@@ -23,6 +23,9 @@
 
 ### Fixed
 
+- Fixed the sandbox example's affected Zod 3 dependency with a sealed sandbox-runtime 0.0.26 consumer fork using Zod 4.6.6; configuration values and runtime policy are preserved, while Zod diagnostics and schema classes follow the new major.
+- Updated the sealed Forge source to upstream 1.4.2; signature verification now rejects noncanonical BER wrappers while preserving ordinary DER and Gondolin certificate operations.
+- Fixed affected Undici versions in the CLI and Gondolin example, retaining installed-consumer checks for bounded EventSource parsing and compressed responses.
 - Fixed Vinci guard classification gaps that let a destructive delete run with no confirmation when it was delivered through another tool's arguments: `find -delete`, `find -exec rm`, `xargs rm` (including `xargs sh -c '…rm…'`), and `shred` now land in the same confirm tiers `rm -rf` uses, with a root-targeted `find ~ … -delete` hard-blocked like `rm -rf ~`.
 - Fixed interpreter one-liners (`python3 -c "open(…,'w')"`, `node -e "fs.writeFile…"`, `ruby -e "File.open(…,'w')"` writing out of the project with no gate: an out-of-project or unresolvable write target is now blocked like `tee`/`echo` shell writes, while a literal in-project target keeps the ordinary in-project write behavior.
 - Fixed the system-settings confirm missing always-sourced or persistence rc files: `.zshenv`, `.zlogin`, `.bash_login`, `.gitconfig`, and `.inputrc` now join `.bashrc`/`.zshrc`/`.profile` in the startup-settings classification.

@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { checkForgeBackport, forgeSourcePath } from "./check-forge-backport.mjs";
+import { checkSandboxSource, sandboxArchivePath, sandboxIntegrity, sandboxVersion } from "./check-sandbox-runtime-source.mjs";
 
 const dependencySections = ["dependencies", "devDependencies", "optionalDependencies"];
 const exactVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
@@ -10,11 +11,15 @@ const lockJsonFiles = [];
 // Reviewed upstream security fix floors; include standalone example locks in the same traversal.
 // https://github.com/juliangruber/brace-expansion/security/advisories/GHSA-q2hr-2g5m-vwhr
 // https://github.com/ljharb/shell-quote/security/advisories/GHSA-pqg4-j6r4-53mv
-// https://github.com/nodejs/undici/security/advisories/GHSA-rfgv-xxqx-mfg5
+// https://github.com/nodejs/undici/security/advisories/GHSA-xjj6-f33q-929c
+// https://github.com/nodejs/undici/security/advisories/GHSA-4qv8-2p9j-2685
+// https://github.com/nodejs/undici/security/advisories/GHSA-f72v-6w45-q472
+// https://github.com/advisories/GHSA-mrhx-c7xc-m3w5
 const securityVersions = {
 	"brace-expansion": { 1: "1.1.21", 5: "5.0.12" },
 	"shell-quote": { 1: "1.11.0" },
-	undici: { 6: "6.28.1", 7: "7.29.1", 8: "8.10.2" },
+	undici: { 6: "6.29.1", 7: "7.30.1", 8: "8.12.2" },
+	zod: { 4: "4.6.6" },
 };
 
 function collectPackageJsonFiles(directory) {
@@ -58,11 +63,21 @@ try {
 } catch (error) {
 	failures.push(`${error.message} Restore the reviewed Forge source package before retrying.`);
 }
+try {
+	checkSandboxSource();
+} catch (error) {
+	failures.push(`${error.message} Restore the reviewed sandbox consumer archive before retrying.`);
+}
 
 collectPackageJsonFiles(".");
 
 for (const file of packageJsonFiles.sort()) {
 	const packageJson = JSON.parse(readFileSync(file, "utf8"));
+	if (file === "package.json" || file === "packages/coding-agent/examples/extensions/sandbox/package.json") {
+		const expected = file === "package.json" ? `file:./${sandboxArchivePath}` : `file:./vendor/sandbox-runtime/sandbox-runtime-${sandboxVersion}.tgz`;
+		const dependencies = file === "package.json" ? packageJson.devDependencies : packageJson.dependencies;
+		if (dependencies?.["@anthropic-ai/sandbox-runtime"] !== expected) failures.push(`${file}: restore the reviewed sandbox consumer dependency "${expected}".`);
+	}
 	if (file === "package.json" || file === "packages/coding-agent/examples/extensions/gondolin/package.json") {
 		const expected = file === "package.json" ? `file:./${forgeSourcePath}` : "file:./vendor/node-forge";
 		const dependencies = file === "package.json" ? packageJson.devDependencies : packageJson.dependencies;
@@ -88,16 +103,23 @@ for (const file of lockJsonFiles.sort()) {
 		continue;
 	}
 	let forgeEntries = 0;
+	let sandboxEntries = 0;
 	for (const [path, entry] of Object.entries(lock.packages)) {
 		const names = new Set([path.split("node_modules/").at(-1), entry.name]);
 		for (const name of names) {
+			if (name === "@anthropic-ai/sandbox-runtime" && path.includes("node_modules/")) {
+				sandboxEntries++;
+				const source = typeof entry.resolved === "string" ? resolve(dirname(file), entry.resolved.replace(/^file:/, "")) : undefined;
+				if (source !== resolve(sandboxArchivePath) || entry.link === true || entry.version !== sandboxVersion || entry.integrity !== sandboxIntegrity || entry.dependencies?.zod !== "4.6.6") failures.push(`${file}: ${path} does not resolve to the sealed Zod 4 sandbox consumer; regenerate and review its lock.`);
+				continue;
+			}
 			if (name === "node-forge" && path.includes("node_modules/")) {
 				forgeEntries++;
 				const expectedPath = resolve(forgeSourcePath);
 				const source = typeof entry.resolved === "string" ? resolve(dirname(file), entry.resolved.replace(/^file:/, "")) : undefined;
 				const metadata = lock.packages[entry.resolved];
-				const linked = entry.link === true && metadata?.version === "1.4.0" && metadata?.engines?.node === ">= 6.13.0";
-				const packed = entry.link !== true && entry.resolved?.startsWith("file:") && entry.version === "1.4.0" && entry.engines?.node === ">= 6.13.0";
+				const linked = entry.link === true && metadata?.version === "1.4.2" && metadata?.engines?.node === ">= 6.13.0";
+				const packed = entry.link !== true && entry.resolved?.startsWith("file:") && entry.version === "1.4.2" && entry.engines?.node === ">= 6.13.0";
 				if (source !== expectedPath || (!linked && !packed)) {
 					failures.push(`${file}: ${path} does not resolve to the reviewed Forge source; regenerate its lock with the local backport override.`);
 				}
@@ -117,6 +139,7 @@ for (const file of lockJsonFiles.sort()) {
 			}
 		}
 	}
+	if ((file === "package-lock.json" || file === "packages/coding-agent/examples/extensions/sandbox/package-lock.json") && sandboxEntries !== 1) failures.push(`${file}: the sandbox graph must include exactly one sealed Zod 4 consumer.`);
 	if ((file === "package-lock.json" || file === "packages/coding-agent/examples/extensions/gondolin/package-lock.json") && forgeEntries !== 1) {
 		failures.push(`${file}: the Gondolin graph must include exactly one reviewed Forge backport; regenerate and review the local override resolution.`);
 	}

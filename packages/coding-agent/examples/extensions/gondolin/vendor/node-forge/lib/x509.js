@@ -727,12 +727,14 @@ var _createSignatureDigest = function(options) {
  *
  * @param options:
  *   certificate the certificate or CSR to verify.
+ *   publicKey the optional public key to verify with.
  *   md the signature digest.
  *   signature the signature
  * @return a created md instance. throws if unknown oid.
  */
 var _verifySignature = function(options) {
   var cert = options.certificate;
+  var publicKey = options.publicKey || cert.publicKey;
   var scheme;
 
   switch(cert.signatureOid) {
@@ -779,7 +781,7 @@ var _verifySignature = function(options) {
   }
 
   // verify signature on cert using public key
-  return cert.publicKey.verify(
+  return publicKey.verify(
     options.md.digest().getBytes(), options.signature, scheme
   );
 };
@@ -1184,8 +1186,12 @@ pki.createCertificate = function() {
     }
 
     if(md !== null) {
+      // the padding scheme comes from the child's signature algorithm
       rval = _verifySignature({
-        certificate: cert, md: md, signature: child.signature
+        certificate: child,
+        publicKey: cert.publicKey,
+        md: md,
+        signature: child.signature
       });
     }
 
@@ -3076,10 +3082,9 @@ pki.verifyCertificateChain = function(caStore, chain, options) {
         // where an old intermediate certificate seems to have a matching parent
         // but none of the parents actually verify ... but the intermediate
         // is in the CA and it should pass this check; needs investigation
-        var parents = parent;
-        if(!forge.util.isArray(parents)) {
-          parents = [parents];
-        }
+        // copy the CA store's array so that shift() below does not remove
+        // certificates from the store
+        var parents = forge.util.isArray(parent) ? parent.slice() : [parent];
 
         // try to verify with each possible parent (typically only one)
         var verified = false;
@@ -3149,7 +3154,9 @@ pki.verifyCertificateChain = function(caStore, chain, options) {
     if(error === null &&
       (!first || (chain.length === 0 && (!parent || selfSigned)))) {
       // first check keyUsage extension and then basic constraints
-      var bcExt = cert.getExtension('basicConstraints');
+      // (by id: deprecated OIDs are also named 'basicConstraints', but only
+      // id-ce-basicConstraints 2.5.29.19 is valid, RFC 5280 4.2.1.9)
+      var bcExt = cert.getExtension({id: '2.5.29.19'});
       var keyUsageExt = cert.getExtension('keyUsage');
       if(keyUsageExt !== null) {
         // keyCertSign must be true and there must be a basic
@@ -3186,10 +3193,9 @@ pki.verifyCertificateChain = function(caStore, chain, options) {
           error: pki.certificateError.bad_certificate
         };
       }
-      // if error is not null and keyUsage is available, then we know it
-      // has keyCertSign and there is a basic constraints extension too,
-      // which means we can check pathLenConstraint (if it exists)
-      if(error === null && keyUsageExt !== null &&
+      // check pathLenConstraint (if it exists) regardless of whether the
+      // keyUsage extension is present (RFC 5280 6.1.4)
+      if(error === null && bcExt !== null &&
         'pathLenConstraint' in bcExt) {
         // pathLen is the maximum # of intermediate CA certs that can be
         // found between the current certificate and the end-entity (depth 0)

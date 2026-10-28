@@ -18,6 +18,9 @@
 		"node-forge": "file:./vendor/node-forge"
 	},
 	"overrides": {
+		"@earendil-works/gondolin": {
+			"undici": "6.29.1"
+		},
 		"node-forge": "$node-forge"
 	}
 }

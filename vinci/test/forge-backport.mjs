@@ -62,15 +62,14 @@ function accepted(bytes) {
 	catch { return false; }
 }
 
-test("PKCS#1 v1.5 preserves optional SHA NULL parameters and supported BER wrappers", () => {
+test("PKCS#1 v1.5 preserves canonical DER and optional SHA NULL parameters", () => {
 	assert.equal(accepted(digestInfo()), true);
 	assert.equal(accepted(digestInfo([])), true);
-	const der = digestInfo();
-	assert.equal(accepted("\x30\x80" + der.slice(2) + "\x00\x00"), true);
-	assert.equal(accepted("\x30\x81" + der.slice(1)), true);
 });
 
 const malformed = [
+	["indefinite-length BER wrapper", () => "\x30\x80" + digestInfo().slice(2) + "\x00\x00"],
+	["nonminimal BER length", () => "\x30\x81" + digestInfo().slice(1)],
 	["extra algorithm child after NULL", () => digestInfo([value(asn1.Type.NULL, ""), value(asn1.Type.OCTETSTRING, "local junk")])],
 	["wrong optional parameter type", () => digestInfo([value(asn1.Type.OCTETSTRING, "local junk")])],
 	["nonempty NULL parameter", () => digestInfo([value(asn1.Type.NULL, "local junk")])],
@@ -79,6 +78,31 @@ const malformed = [
 for (const [name, makeBytes] of malformed) {
 	test(`PKCS#1 v1.5 refuses ${name}`, () => assert.equal(accepted(makeBytes()), false));
 }
+
+test("PEM decoding preserves Buffer input", () => {
+	const pem = forge.pki.publicKeyToPem(keys.publicKey);
+	assert.deepEqual(forge.pem.decode(Buffer.from(pem)), forge.pem.decode(pem));
+});
+
+test("AES-GCM refuses an empty authentication tag length", () => {
+	const decipher = forge.cipher.createDecipher("AES-GCM", "k".repeat(16));
+	assert.throws(() => decipher.start({ iv: "v".repeat(12), tag: "", tagLength: 0 }), /Invalid tag length/);
+});
+
+test("AES-GCM preserves authenticated encryption and rejects a changed tag", () => {
+	const key = "k".repeat(16), iv = "v".repeat(12);
+	const cipher = forge.cipher.createCipher("AES-GCM", key);
+	cipher.start({ iv });
+	cipher.update(forge.util.createBuffer("local authenticated fixture"));
+	assert.equal(cipher.finish(), true);
+	for (const valid of [true, false]) {
+		const decipher = forge.cipher.createDecipher("AES-GCM", key);
+		decipher.start({ iv, tag: valid ? cipher.mode.tag.bytes() : "x".repeat(16) });
+		decipher.update(forge.util.createBuffer(cipher.output.bytes()));
+		assert.equal(decipher.finish(), valid);
+		if (valid) assert.equal(decipher.output.bytes(), "local authenticated fixture");
+	}
+});
 
 test("existing unknown-OID and MD5-without-NULL refusals remain", () => {
 	assert.equal(accepted(digestInfo([], asn1.oidToDer("1.2.3.4").getBytes())), false);
