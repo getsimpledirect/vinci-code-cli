@@ -1,0 +1,627 @@
+{
+  "schemaVersion": 1,
+  "origin": {
+    "url": "https://registry.npmjs.org/@anthropic-ai/sandbox-runtime/-/sandbox-runtime-0.0.26.tgz",
+    "integrity": "sha512-DYV5LSsVMnzq0lbfaYMSpxZPUMAx4+hy343dRss+pVCLIfF62qOhxpYfZ5TmOk1GTDQm5f9wPprMNSStmnsV4w=="
+  },
+  "version": "0.0.26-vinci.zod4.1",
+  "typescript": "5.9.3",
+  "changedUpstreamFiles": [
+    "dist/sandbox/sandbox-config.d.ts",
+    "dist/sandbox/sandbox-config.d.ts.map",
+    "dist/sandbox/sandbox-config.js.map",
+    "package.json"
+  ],
+  "addedFiles": [
+    "source-seal.json",
+    "src/sandbox/sandbox-config.ts"
+  ],
+  "upstreamFiles": {
+    "LICENSE": {
+      "sha256": "1210bc93eb85dd786c33192d5bcb7153a93922fa99fbc1512af6a7199cb41080",
+      "mode": 420
+    },
+    "README.md": {
+      "sha256": "a3c3c3d0c4e2755b58bfae16e730107c668ccf0c75c9e5e607ac026d20b37068",
+      "mode": 420
+    },
+    "dist/cli.d.ts": {
+      "sha256": "6f77e82bfb5dd3b1015dd92c63e427d505f9bbbdaa041cad6c704f41c553a536",
+      "mode": 420
+    },
+    "dist/cli.d.ts.map": {
+      "sha256": "07e1bab322fbea936a00ec149ad924a0d46aa4c8de79147e59c11d25bd0ca9e6",
+      "mode": 420
+    },
+    "dist/cli.js": {
+      "sha256": "b3427f6c81c0f603f315e0a75729858b680f700fd7e3ec559f103cda2d978ff4",
+      "mode": 420
+    },
+    "dist/cli.js.map": {
+      "sha256": "b78720d9ceea7b342c5b3dcdf875ef10926dd72030b9d47960074a87bfa9df3c",
+      "mode": 420
+    },
+    "dist/index.d.ts": {
+      "sha256": "4a448496b807f7d179fe3d074ec09738fe63a90089965d6787667a484e7f745b",
+      "mode": 420
+    },
+    "dist/index.d.ts.map": {
+      "sha256": "2dcfacb5acf7c86c7c90e998a95e51f0652e3dc4ab0cd4b00da9afbf2431fcd2",
+      "mode": 420
+    },
+    "dist/index.js": {
+      "sha256": "8a0417cea17a7885810069ddde3aa3e181dc33629f5c20992c6ed81201a8141b",
+      "mode": 420
+    },
+    "dist/index.js.map": {
+      "sha256": "ec30f16931077b4b1271b1219869ce3960c0d46f28fc904259bcbd2d9c1cc0aa",
+      "mode": 420
+    },
+    "dist/sandbox/generate-seccomp-filter.d.ts": {
+      "sha256": "33fcc7b13a6b78e0075bab527e5fe93f073a7b317a594e3a367612e053920113",
+      "mode": 420
+    },
+    "dist/sandbox/generate-seccomp-filter.d.ts.map": {
+      "sha256": "8a973eee00af4e55786d27aafbb6ab4600b6bda515340695afe853e5f31a72df",
+      "mode": 420
+    },
+    "dist/sandbox/generate-seccomp-filter.js": {
+      "sha256": "47fe1ce8e308fe94b99f298597207163105fc99077323a5e66b83638aa033312",
+      "mode": 420
+    },
+    "dist/sandbox/generate-seccomp-filter.js.map": {
+      "sha256": "aa956604529c17b94da1d431507c8e1b96953d3f6fe51561803ddcbafd6f44e9",
+      "mode": 420
+    },
+    "dist/sandbox/http-proxy.d.ts": {
+      "sha256": "8caa0c505e14cf363c20b1623ce878a48bfcf0911ec59aa51ab4bd4223000302",
+      "mode": 420
+    },
+    "dist/sandbox/http-proxy.d.ts.map": {
+      "sha256": "c7a341af108fed0fd88277a6421c15e9517966757f6cba0949b473a6a0c5c511",
+      "mode": 420
+    },
+    "dist/sandbox/http-proxy.js": {
+      "sha256": "81318e3b20c90130293d7ddc2d4d45efbee99fbb843ba498f1c66b66885e7cc3",
+      "mode": 420
+    },
+    "dist/sandbox/http-proxy.js.map": {
+      "sha256": "939235e83c0d8d7b963b94dd81881601ffe285cf7fb54fbb4ff114da40422e48",
+      "mode": 420
+    },
+    "dist/sandbox/linux-sandbox-utils.d.ts": {
+      "sha256": "b69ba431e108298c317e951e161444c1dae427014a6d002db35183579fb3e6c7",
+      "mode": 420
+    },
+    "dist/sandbox/linux-sandbox-utils.d.ts.map": {
+      "sha256": "74a5bdfa4c1dff9e8b6a494d955407561914ebc00aab1e555f51992ad2d9b298",
+      "mode": 420
+    },
+    "dist/sandbox/linux-sandbox-utils.js": {
+      "sha256": "f64257e65fcfb3ad1942941a48b19790ab459b63ff632b367eee10acb0b7bb1d",
+      "mode": 420
+    },
+    "dist/sandbox/linux-sandbox-utils.js.map": {
+      "sha256": "14dfb6b8283a8afc1b29739013622aa25777c382b31c9c40c4b1e00e3be1fb1f",
+      "mode": 420
+    },
+    "dist/sandbox/macos-sandbox-utils.d.ts": {
+      "sha256": "75ec54a1ffbac9429c0b4e9713e518b74634bd6be6d633f32e87cd304a2bb0bd",
+      "mode": 420
+    },
+    "dist/sandbox/macos-sandbox-utils.d.ts.map": {
+      "sha256": "4dd45a8710f1f4310ad34c353f6d86a3b1a81e6edb6ce5f28cf65054f69686dd",
+      "mode": 420
+    },
+    "dist/sandbox/macos-sandbox-utils.js": {
+      "sha256": "f52073ea526ac0771015237e9da701b315288b238b08f7543b37b7b8c8329c31",
+      "mode": 420
+    },
+    "dist/sandbox/macos-sandbox-utils.js.map": {
+      "sha256": "9fdfb9f8673c371ac10184e804ed3614e81779cd213ec609358b3c22870a1f4e",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-config.d.ts": {
+      "sha256": "0abe9ec309833e5df4344657a93349f9bbf8ec9d02a93fab45c0a4112c83db23",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-config.d.ts.map": {
+      "sha256": "ada8e5b094374773602d2f063fc43339b09fa768b6902e34f29ee21aaefaca51",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-config.js": {
+      "sha256": "e3cf12c3a058f0a1739391d2c7449828b897704218dc538b459a39376ec6f082",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-config.js.map": {
+      "sha256": "93e9c82ddf15b61a898075af2819e1305303cfb94674498450ba7e69eda413c9",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-manager.d.ts": {
+      "sha256": "d192d5bdfff99f44a54c87aaeddbfe9f76e355f85297a6e51888af211f6fe57a",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-manager.d.ts.map": {
+      "sha256": "222b723881bcb6b96aac6473e19d078c3eae8222b56bd997ba93cc13f25eb533",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-manager.js": {
+      "sha256": "a71755d69c17cfc1f138336258fa950ac18aec0900c7a1750fdfc29d53e34597",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-manager.js.map": {
+      "sha256": "a8bddf8cc969d808f870b9a5455857df784056a2c0f1dc57789ceb63c297fed0",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-schemas.d.ts": {
+      "sha256": "cf7fed4b05032b8e70b7232fdb31f6f02c0620b45a8a71d442c31985cf3de243",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-schemas.d.ts.map": {
+      "sha256": "98587428059ec8d811088085be7d4cdb1212ca2906d813b45b422b35f9620d35",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-schemas.js": {
+      "sha256": "84955dd73a6c4b48073e68a1ebaee239c762a784529d01f0f1e3558acafade04",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-schemas.js.map": {
+      "sha256": "1b34d145144d58fd914adf36bc4556c26b8347c6748df392ccc73c9504a19946",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-utils.d.ts": {
+      "sha256": "b7a1c7a56f36be2d0573a9c8c63f75482bb3de9fb6896455e0645479d6354bb5",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-utils.d.ts.map": {
+      "sha256": "aa4397ceccbdae90b4965227ef47e9a03460812690a5ba7087866aa11369fd43",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-utils.js": {
+      "sha256": "f3bc19c27c2ca5286c2f8531c37f2b52a276ce0bb93dd4addfec72472bb8ea36",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-utils.js.map": {
+      "sha256": "35bb073ebd34e07cb45dbdf194ec8501a44408e26a5afc0042bc496f3f48232b",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-violation-store.d.ts": {
+      "sha256": "abeceab37a097301a38495c7643c750f332f7f584f80cdb5bc7decf76557ec29",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-violation-store.d.ts.map": {
+      "sha256": "7494fe110c48a0751fcdb846aa3c77d7b10202da74c226b5302804417a4881e8",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-violation-store.js": {
+      "sha256": "e7cffa946893edbf2204e647201d8f853f361c4b8d8141c5b4b72d51f82eb05b",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-violation-store.js.map": {
+      "sha256": "d79f7cf502c61e637d9dc004fa8f14ba17c0cdaf946f8443d8003b3f2c20d7c5",
+      "mode": 420
+    },
+    "dist/sandbox/socks-proxy.d.ts": {
+      "sha256": "34a3d0df37af29ffa499be62ba0e2180b3fbe2a6a61731c841a43df578718661",
+      "mode": 420
+    },
+    "dist/sandbox/socks-proxy.d.ts.map": {
+      "sha256": "43bf0d7fbd108c19dc0147be0203b347d9aeddbaf74f6ff6fdaeb784adf399aa",
+      "mode": 420
+    },
+    "dist/sandbox/socks-proxy.js": {
+      "sha256": "4fafbc87b548154a0b81fe84c698b0927d40b1ebd7d32adb761c964e70870189",
+      "mode": 420
+    },
+    "dist/sandbox/socks-proxy.js.map": {
+      "sha256": "c370ec1bb8b7e5afd7bf221feee16ec321e74213aac26ccc30aa0a7be945db5d",
+      "mode": 420
+    },
+    "dist/utils/debug.d.ts": {
+      "sha256": "38a05a684f6cffe027c250007607255d9a4816c26d2c737d790fd169b284d8ae",
+      "mode": 420
+    },
+    "dist/utils/debug.d.ts.map": {
+      "sha256": "3badf33e1cd955c53daf1bc9f236d4fd506a6544e49ea1b9f82520c8c01b25b9",
+      "mode": 420
+    },
+    "dist/utils/debug.js": {
+      "sha256": "4627c2d75a97335cd99db609bb48c9d097c0d384b3cc41ac7bfef51624083265",
+      "mode": 420
+    },
+    "dist/utils/debug.js.map": {
+      "sha256": "0ab8b059a50ce9cc79b0663ca9b97525bb1a51dee2ea9ff4ea783a4ae63b0398",
+      "mode": 420
+    },
+    "dist/utils/platform.d.ts": {
+      "sha256": "085ff027a2e84ecd8da687262786334b9eade7060a2ba643eabbb315aa7d22c0",
+      "mode": 420
+    },
+    "dist/utils/platform.d.ts.map": {
+      "sha256": "e1c05275dbfc14c91795a493d4b25a5807a42a1ccf31497fa5d8968d2a49c08c",
+      "mode": 420
+    },
+    "dist/utils/platform.js": {
+      "sha256": "5b2644b8ba799cad9e027e16b67082c79c656649196beb7852ab646c59692177",
+      "mode": 420
+    },
+    "dist/utils/platform.js.map": {
+      "sha256": "46ab3bfd89e0be6766a77a326cc562abfa2f47ffcd06c286577b51ec01cfda53",
+      "mode": 420
+    },
+    "dist/utils/ripgrep.d.ts": {
+      "sha256": "af0f2352b8eff4218fc1825bdcd1835050251fdb121f0c1b442f28c3c87998cc",
+      "mode": 420
+    },
+    "dist/utils/ripgrep.d.ts.map": {
+      "sha256": "e18e096102ef3e43b9c150e3d8f874b5ebb0e50df9d2a791f83a3ea1aa06467b",
+      "mode": 420
+    },
+    "dist/utils/ripgrep.js": {
+      "sha256": "cb3eb937b404cc78888c02f5d90fb9c195f0f375ee6f8f234ca7535b4f027516",
+      "mode": 420
+    },
+    "dist/utils/ripgrep.js.map": {
+      "sha256": "89612f9bf1ef0b76ac8b6062a294c3ef67691f9202e70cfc8564f156314e5c61",
+      "mode": 420
+    },
+    "dist/vendor/seccomp-src/apply-seccomp.c": {
+      "sha256": "31f84a28900bedda396d5f6655d71b40a2febc78057d81fb7b65694396828050",
+      "mode": 420
+    },
+    "dist/vendor/seccomp-src/seccomp-unix-block.c": {
+      "sha256": "1ada76439bfa362470caf7a11792bfa7050bf3e121016c099a353be95bf032e8",
+      "mode": 420
+    },
+    "dist/vendor/seccomp/arm64/apply-seccomp": {
+      "sha256": "74ae36efaa06865de565f023b7c474668018d65715638e008f8b51bf95e1107d",
+      "mode": 493
+    },
+    "dist/vendor/seccomp/arm64/unix-block.bpf": {
+      "sha256": "439626767f5e2159b0eb1351bd5c71ce95c0c88badf0a954a527acd9e796555c",
+      "mode": 420
+    },
+    "dist/vendor/seccomp/x64/apply-seccomp": {
+      "sha256": "e70346b63797e7dbc9835da321e4f0f8aaee721fd1a58754f3d8a61bd80b98fd",
+      "mode": 493
+    },
+    "dist/vendor/seccomp/x64/unix-block.bpf": {
+      "sha256": "c4d15960d54267934db13ab39bac3938cd5045d370ab8eee7023cd9a4e868807",
+      "mode": 420
+    },
+    "package.json": {
+      "sha256": "bb23b5b36872197b9c6ff98ef5ee87ca5fd5d15e4df1094cc53724c207ff9bb2",
+      "mode": 420
+    },
+    "vendor/seccomp-src/apply-seccomp.c": {
+      "sha256": "31f84a28900bedda396d5f6655d71b40a2febc78057d81fb7b65694396828050",
+      "mode": 420
+    },
+    "vendor/seccomp-src/seccomp-unix-block.c": {
+      "sha256": "1ada76439bfa362470caf7a11792bfa7050bf3e121016c099a353be95bf032e8",
+      "mode": 420
+    },
+    "vendor/seccomp/arm64/apply-seccomp": {
+      "sha256": "74ae36efaa06865de565f023b7c474668018d65715638e008f8b51bf95e1107d",
+      "mode": 493
+    },
+    "vendor/seccomp/arm64/unix-block.bpf": {
+      "sha256": "439626767f5e2159b0eb1351bd5c71ce95c0c88badf0a954a527acd9e796555c",
+      "mode": 420
+    },
+    "vendor/seccomp/x64/apply-seccomp": {
+      "sha256": "e70346b63797e7dbc9835da321e4f0f8aaee721fd1a58754f3d8a61bd80b98fd",
+      "mode": 493
+    },
+    "vendor/seccomp/x64/unix-block.bpf": {
+      "sha256": "c4d15960d54267934db13ab39bac3938cd5045d370ab8eee7023cd9a4e868807",
+      "mode": 420
+    }
+  },
+  "files": {
+    "LICENSE": {
+      "sha256": "1210bc93eb85dd786c33192d5bcb7153a93922fa99fbc1512af6a7199cb41080",
+      "mode": 420
+    },
+    "README.md": {
+      "sha256": "a3c3c3d0c4e2755b58bfae16e730107c668ccf0c75c9e5e607ac026d20b37068",
+      "mode": 420
+    },
+    "dist/cli.d.ts": {
+      "sha256": "6f77e82bfb5dd3b1015dd92c63e427d505f9bbbdaa041cad6c704f41c553a536",
+      "mode": 420
+    },
+    "dist/cli.d.ts.map": {
+      "sha256": "07e1bab322fbea936a00ec149ad924a0d46aa4c8de79147e59c11d25bd0ca9e6",
+      "mode": 420
+    },
+    "dist/cli.js": {
+      "sha256": "b3427f6c81c0f603f315e0a75729858b680f700fd7e3ec559f103cda2d978ff4",
+      "mode": 420
+    },
+    "dist/cli.js.map": {
+      "sha256": "b78720d9ceea7b342c5b3dcdf875ef10926dd72030b9d47960074a87bfa9df3c",
+      "mode": 420
+    },
+    "dist/index.d.ts": {
+      "sha256": "4a448496b807f7d179fe3d074ec09738fe63a90089965d6787667a484e7f745b",
+      "mode": 420
+    },
+    "dist/index.d.ts.map": {
+      "sha256": "2dcfacb5acf7c86c7c90e998a95e51f0652e3dc4ab0cd4b00da9afbf2431fcd2",
+      "mode": 420
+    },
+    "dist/index.js": {
+      "sha256": "8a0417cea17a7885810069ddde3aa3e181dc33629f5c20992c6ed81201a8141b",
+      "mode": 420
+    },
+    "dist/index.js.map": {
+      "sha256": "ec30f16931077b4b1271b1219869ce3960c0d46f28fc904259bcbd2d9c1cc0aa",
+      "mode": 420
+    },
+    "dist/sandbox/generate-seccomp-filter.d.ts": {
+      "sha256": "33fcc7b13a6b78e0075bab527e5fe93f073a7b317a594e3a367612e053920113",
+      "mode": 420
+    },
+    "dist/sandbox/generate-seccomp-filter.d.ts.map": {
+      "sha256": "8a973eee00af4e55786d27aafbb6ab4600b6bda515340695afe853e5f31a72df",
+      "mode": 420
+    },
+    "dist/sandbox/generate-seccomp-filter.js": {
+      "sha256": "47fe1ce8e308fe94b99f298597207163105fc99077323a5e66b83638aa033312",
+      "mode": 420
+    },
+    "dist/sandbox/generate-seccomp-filter.js.map": {
+      "sha256": "aa956604529c17b94da1d431507c8e1b96953d3f6fe51561803ddcbafd6f44e9",
+      "mode": 420
+    },
+    "dist/sandbox/http-proxy.d.ts": {
+      "sha256": "8caa0c505e14cf363c20b1623ce878a48bfcf0911ec59aa51ab4bd4223000302",
+      "mode": 420
+    },
+    "dist/sandbox/http-proxy.d.ts.map": {
+      "sha256": "c7a341af108fed0fd88277a6421c15e9517966757f6cba0949b473a6a0c5c511",
+      "mode": 420
+    },
+    "dist/sandbox/http-proxy.js": {
+      "sha256": "81318e3b20c90130293d7ddc2d4d45efbee99fbb843ba498f1c66b66885e7cc3",
+      "mode": 420
+    },
+    "dist/sandbox/http-proxy.js.map": {
+      "sha256": "939235e83c0d8d7b963b94dd81881601ffe285cf7fb54fbb4ff114da40422e48",
+      "mode": 420
+    },
+    "dist/sandbox/linux-sandbox-utils.d.ts": {
+      "sha256": "b69ba431e108298c317e951e161444c1dae427014a6d002db35183579fb3e6c7",
+      "mode": 420
+    },
+    "dist/sandbox/linux-sandbox-utils.d.ts.map": {
+      "sha256": "74a5bdfa4c1dff9e8b6a494d955407561914ebc00aab1e555f51992ad2d9b298",
+      "mode": 420
+    },
+    "dist/sandbox/linux-sandbox-utils.js": {
+      "sha256": "f64257e65fcfb3ad1942941a48b19790ab459b63ff632b367eee10acb0b7bb1d",
+      "mode": 420
+    },
+    "dist/sandbox/linux-sandbox-utils.js.map": {
+      "sha256": "14dfb6b8283a8afc1b29739013622aa25777c382b31c9c40c4b1e00e3be1fb1f",
+      "mode": 420
+    },
+    "dist/sandbox/macos-sandbox-utils.d.ts": {
+      "sha256": "75ec54a1ffbac9429c0b4e9713e518b74634bd6be6d633f32e87cd304a2bb0bd",
+      "mode": 420
+    },
+    "dist/sandbox/macos-sandbox-utils.d.ts.map": {
+      "sha256": "4dd45a8710f1f4310ad34c353f6d86a3b1a81e6edb6ce5f28cf65054f69686dd",
+      "mode": 420
+    },
+    "dist/sandbox/macos-sandbox-utils.js": {
+      "sha256": "f52073ea526ac0771015237e9da701b315288b238b08f7543b37b7b8c8329c31",
+      "mode": 420
+    },
+    "dist/sandbox/macos-sandbox-utils.js.map": {
+      "sha256": "9fdfb9f8673c371ac10184e804ed3614e81779cd213ec609358b3c22870a1f4e",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-config.d.ts": {
+      "sha256": "95458e125c4691b1d7c9c22fe9563d39d211d6d8edc58f4e4b5d8e024a6e3170",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-config.d.ts.map": {
+      "sha256": "187c38f4a6f8233fa830698726f1ff150692d088a42092ef87f819f95dc47646",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-config.js": {
+      "sha256": "e3cf12c3a058f0a1739391d2c7449828b897704218dc538b459a39376ec6f082",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-config.js.map": {
+      "sha256": "1642efa5bd6c1bb8a0f3332e0ca09aeb51e2b6ce8599765ddd989ff47b578a45",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-manager.d.ts": {
+      "sha256": "d192d5bdfff99f44a54c87aaeddbfe9f76e355f85297a6e51888af211f6fe57a",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-manager.d.ts.map": {
+      "sha256": "222b723881bcb6b96aac6473e19d078c3eae8222b56bd997ba93cc13f25eb533",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-manager.js": {
+      "sha256": "a71755d69c17cfc1f138336258fa950ac18aec0900c7a1750fdfc29d53e34597",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-manager.js.map": {
+      "sha256": "a8bddf8cc969d808f870b9a5455857df784056a2c0f1dc57789ceb63c297fed0",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-schemas.d.ts": {
+      "sha256": "cf7fed4b05032b8e70b7232fdb31f6f02c0620b45a8a71d442c31985cf3de243",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-schemas.d.ts.map": {
+      "sha256": "98587428059ec8d811088085be7d4cdb1212ca2906d813b45b422b35f9620d35",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-schemas.js": {
+      "sha256": "84955dd73a6c4b48073e68a1ebaee239c762a784529d01f0f1e3558acafade04",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-schemas.js.map": {
+      "sha256": "1b34d145144d58fd914adf36bc4556c26b8347c6748df392ccc73c9504a19946",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-utils.d.ts": {
+      "sha256": "b7a1c7a56f36be2d0573a9c8c63f75482bb3de9fb6896455e0645479d6354bb5",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-utils.d.ts.map": {
+      "sha256": "aa4397ceccbdae90b4965227ef47e9a03460812690a5ba7087866aa11369fd43",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-utils.js": {
+      "sha256": "f3bc19c27c2ca5286c2f8531c37f2b52a276ce0bb93dd4addfec72472bb8ea36",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-utils.js.map": {
+      "sha256": "35bb073ebd34e07cb45dbdf194ec8501a44408e26a5afc0042bc496f3f48232b",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-violation-store.d.ts": {
+      "sha256": "abeceab37a097301a38495c7643c750f332f7f584f80cdb5bc7decf76557ec29",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-violation-store.d.ts.map": {
+      "sha256": "7494fe110c48a0751fcdb846aa3c77d7b10202da74c226b5302804417a4881e8",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-violation-store.js": {
+      "sha256": "e7cffa946893edbf2204e647201d8f853f361c4b8d8141c5b4b72d51f82eb05b",
+      "mode": 420
+    },
+    "dist/sandbox/sandbox-violation-store.js.map": {
+      "sha256": "d79f7cf502c61e637d9dc004fa8f14ba17c0cdaf946f8443d8003b3f2c20d7c5",
+      "mode": 420
+    },
+    "dist/sandbox/socks-proxy.d.ts": {
+      "sha256": "34a3d0df37af29ffa499be62ba0e2180b3fbe2a6a61731c841a43df578718661",
+      "mode": 420
+    },
+    "dist/sandbox/socks-proxy.d.ts.map": {
+      "sha256": "43bf0d7fbd108c19dc0147be0203b347d9aeddbaf74f6ff6fdaeb784adf399aa",
+      "mode": 420
+    },
+    "dist/sandbox/socks-proxy.js": {
+      "sha256": "4fafbc87b548154a0b81fe84c698b0927d40b1ebd7d32adb761c964e70870189",
+      "mode": 420
+    },
+    "dist/sandbox/socks-proxy.js.map": {
+      "sha256": "c370ec1bb8b7e5afd7bf221feee16ec321e74213aac26ccc30aa0a7be945db5d",
+      "mode": 420
+    },
+    "dist/utils/debug.d.ts": {
+      "sha256": "38a05a684f6cffe027c250007607255d9a4816c26d2c737d790fd169b284d8ae",
+      "mode": 420
+    },
+    "dist/utils/debug.d.ts.map": {
+      "sha256": "3badf33e1cd955c53daf1bc9f236d4fd506a6544e49ea1b9f82520c8c01b25b9",
+      "mode": 420
+    },
+    "dist/utils/debug.js": {
+      "sha256": "4627c2d75a97335cd99db609bb48c9d097c0d384b3cc41ac7bfef51624083265",
+      "mode": 420
+    },
+    "dist/utils/debug.js.map": {
+      "sha256": "0ab8b059a50ce9cc79b0663ca9b97525bb1a51dee2ea9ff4ea783a4ae63b0398",
+      "mode": 420
+    },
+    "dist/utils/platform.d.ts": {
+      "sha256": "085ff027a2e84ecd8da687262786334b9eade7060a2ba643eabbb315aa7d22c0",
+      "mode": 420
+    },
+    "dist/utils/platform.d.ts.map": {
+      "sha256": "e1c05275dbfc14c91795a493d4b25a5807a42a1ccf31497fa5d8968d2a49c08c",
+      "mode": 420
+    },
+    "dist/utils/platform.js": {
+      "sha256": "5b2644b8ba799cad9e027e16b67082c79c656649196beb7852ab646c59692177",
+      "mode": 420
+    },
+    "dist/utils/platform.js.map": {
+      "sha256": "46ab3bfd89e0be6766a77a326cc562abfa2f47ffcd06c286577b51ec01cfda53",
+      "mode": 420
+    },
+    "dist/utils/ripgrep.d.ts": {
+      "sha256": "af0f2352b8eff4218fc1825bdcd1835050251fdb121f0c1b442f28c3c87998cc",
+      "mode": 420
+    },
+    "dist/utils/ripgrep.d.ts.map": {
+      "sha256": "e18e096102ef3e43b9c150e3d8f874b5ebb0e50df9d2a791f83a3ea1aa06467b",
+      "mode": 420
+    },
+    "dist/utils/ripgrep.js": {
+      "sha256": "cb3eb937b404cc78888c02f5d90fb9c195f0f375ee6f8f234ca7535b4f027516",
+      "mode": 420
+    },
+    "dist/utils/ripgrep.js.map": {
+      "sha256": "89612f9bf1ef0b76ac8b6062a294c3ef67691f9202e70cfc8564f156314e5c61",
+      "mode": 420
+    },
+    "dist/vendor/seccomp-src/apply-seccomp.c": {
+      "sha256": "31f84a28900bedda396d5f6655d71b40a2febc78057d81fb7b65694396828050",
+      "mode": 420
+    },
+    "dist/vendor/seccomp-src/seccomp-unix-block.c": {
+      "sha256": "1ada76439bfa362470caf7a11792bfa7050bf3e121016c099a353be95bf032e8",
+      "mode": 420
+    },
+    "dist/vendor/seccomp/arm64/apply-seccomp": {
+      "sha256": "74ae36efaa06865de565f023b7c474668018d65715638e008f8b51bf95e1107d",
+      "mode": 493
+    },
+    "dist/vendor/seccomp/arm64/unix-block.bpf": {
+      "sha256": "439626767f5e2159b0eb1351bd5c71ce95c0c88badf0a954a527acd9e796555c",
+      "mode": 420
+    },
+    "dist/vendor/seccomp/x64/apply-seccomp": {
+      "sha256": "e70346b63797e7dbc9835da321e4f0f8aaee721fd1a58754f3d8a61bd80b98fd",
+      "mode": 493
+    },
+    "dist/vendor/seccomp/x64/unix-block.bpf": {
+      "sha256": "c4d15960d54267934db13ab39bac3938cd5045d370ab8eee7023cd9a4e868807",
+      "mode": 420
+    },
+    "package.json": {
+      "sha256": "7290912fa5e91fa6d62517ed2ce0cce8c616c44217435d92453404155cc998de",
+      "mode": 420
+    },
+    "src/sandbox/sandbox-config.ts": {
+      "sha256": "e6b1e57663c39037062da19225efb851c075f472151d8bf00d7031a2d4732b11",
+      "mode": 420
+    },
+    "vendor/seccomp-src/apply-seccomp.c": {
+      "sha256": "31f84a28900bedda396d5f6655d71b40a2febc78057d81fb7b65694396828050",
+      "mode": 420
+    },
+    "vendor/seccomp-src/seccomp-unix-block.c": {
+      "sha256": "1ada76439bfa362470caf7a11792bfa7050bf3e121016c099a353be95bf032e8",
+      "mode": 420
+    },
+    "vendor/seccomp/arm64/apply-seccomp": {
+      "sha256": "74ae36efaa06865de565f023b7c474668018d65715638e008f8b51bf95e1107d",
+      "mode": 493
+    },
+    "vendor/seccomp/arm64/unix-block.bpf": {
+      "sha256": "439626767f5e2159b0eb1351bd5c71ce95c0c88badf0a954a527acd9e796555c",
+      "mode": 420
+    },
+    "vendor/seccomp/x64/apply-seccomp": {
+      "sha256": "e70346b63797e7dbc9835da321e4f0f8aaee721fd1a58754f3d8a61bd80b98fd",
+      "mode": 493
+    },
+    "vendor/seccomp/x64/unix-block.bpf": {
+      "sha256": "c4d15960d54267934db13ab39bac3938cd5045d370ab8eee7023cd9a4e868807",
+      "mode": 420
+    }
+  }
+}

@@ -82,11 +82,23 @@ modes.ecb.prototype.unpad = function(output, options) {
     return false;
   }
 
-  // ensure padding byte count is valid
+  // nothing to unpad, e.g. the caller already read all output
   var len = output.length();
+  if(len === 0) {
+    return true;
+  }
+
+  // ensure padding byte count is valid
   var count = output.at(len - 1);
-  if(count > (this.blockSize << 2)) {
+  if(count === 0 || count > this.blockSize || count > len) {
     return false;
+  }
+
+  // ensure all padding bytes match the padding count (RFC 5652 6.3)
+  for(var i = 2; i <= count; ++i) {
+    if(output.at(len - i) !== count) {
+      return false;
+    }
   }
 
   // trim off padding bytes
@@ -183,11 +195,23 @@ modes.cbc.prototype.unpad = function(output, options) {
     return false;
   }
 
-  // ensure padding byte count is valid
+  // nothing to unpad, e.g. the caller already read all output
   var len = output.length();
+  if(len === 0) {
+    return true;
+  }
+
+  // ensure padding byte count is valid
   var count = output.at(len - 1);
-  if(count > (this.blockSize << 2)) {
+  if(count === 0 || count > this.blockSize || count > len) {
     return false;
+  }
+
+  // ensure all padding bytes match the padding count (RFC 5652 6.3)
+  for(var i = 2; i <= count; ++i) {
+    if(output.at(len - i) !== count) {
+      return false;
+    }
   }
 
   // trim off padding bytes
@@ -544,10 +568,14 @@ modes.gcm.prototype.start = function(options) {
   }
 
   // default tag length is 128 bits
-  if('tagLength' in options) {
-    this._tagLength = options.tagLength;
+  if(options.tagLength !== undefined && options.tagLength !== null) {
+    this._tagLength = Number(options.tagLength);
   } else {
     this._tagLength = 128;
+  }
+  // NIST SP-800-38D 5.2.1.2
+  if([128, 120, 112, 104, 96, 64, 32].indexOf(this._tagLength) === -1) {
+    throw new Error('Invalid tag length.');
   }
 
   // if tag is given, ensure tag matches tag length

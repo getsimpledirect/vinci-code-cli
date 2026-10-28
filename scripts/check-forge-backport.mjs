@@ -7,11 +7,11 @@ import { gunzipSync } from "node:zlib";
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const forgeSourcePath = "packages/coding-agent/examples/extensions/gondolin/vendor/node-forge";
 const origin = {
-	url: "https://registry.npmjs.org/node-forge/-/node-forge-1.4.0.tgz",
-	integrity: "sha512-LarFH0+6VfriEhqMMcLX2F7SwSXeWwnEAJEsYm5QKWchiVYVvJyV9v7UDvUv+w5HO23ZpQTXDv/GxdDdMyOuoQ==",
+	url: "https://registry.npmjs.org/node-forge/-/node-forge-1.4.2.tgz",
+	integrity: "sha512-rRtAR5XLJ8gCKd9du4qrKAsgCG1ObGP4gLeNJMa4vYSeq4bmBMOJk5IHkrviBV0q7uoAJlVd8HEQYQSVUb4FGQ==",
 };
 // This seal pins the reviewed file inventory as well as the local runtime delta.
-const sealHash = "5a62826b3f6c5c5aa3a7784f4ec9efee9ff32324154e33492a82146c03ebb14c";
+const sealHash = "8cbbea77b441d736c69b38b486569f1e491cdc41f00f16ba824aad2e7cdf07f3";
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const json = (value) => `${JSON.stringify(value, null, "\t")}\n`;
 
@@ -61,21 +61,10 @@ function minimalManifest(original) {
 	return {
 		...Object.fromEntries(["name", "version", "description", "license", "main", "engines", "browser"].map((key) => [key, original[key]])),
 		files: ["lib/*.js", "LICENSE", "source-seal.json"],
-		vinciSecurityBackport: { advisory: "GHSA-86w9-cpqp-85rv", revision: 1 },
+		vinciReviewedUpstream: { version: "1.4.2", runtimeChanges: false },
 	};
 }
 
-function patchRsa(bytes) {
-	let source = bytes.toString("utf8");
-	const count = "            obj.value.length !== 2) {";
-	const nullCheck = "          // special check for md2 and md5 that NULL parameters exist";
-	if (source.split(count).length !== 2 || source.split(nullCheck).length !== 2) {
-		throw new Error("Upstream RSA patch anchors changed; review the new artifact before generating its seal.");
-	}
-	source = source.replace(count, "            obj.value.length !== 2 ||\n            obj.value[0].value.length !== ('parameters' in capture ? 2 : 1) ||\n            ('parameters' in capture && capture.parameters !== '')) {");
-	source = source.replace(nullCheck, "          // Keep supported BER wrappers, but require canonical OID contents.\n          if(capture.algorithmIdentifier !== asn1.oidToDer(oid).getBytes()) {\n            throw new Error(\n              'Invalid RSASSA-PKCS1-v1_5 DigestAlgorithm identifier encoding.');\n          }\n\n" + nullCheck);
-	return Buffer.from(source);
-}
 
 // Read only the bounded, integrity-verified public archive. No archive path is extracted.
 function archiveFiles(archive) {
@@ -117,13 +106,13 @@ function generateSeal(archive) {
 	const upstreamFiles = {};
 	for (const [name, original] of [...upstream].sort(([a], [b]) => a.localeCompare(b))) {
 		upstreamFiles[name] = hash(original);
-		const expected = name === "lib/rsa.js" ? patchRsa(original) : name === "package.json" ? Buffer.from(json(minimalManifest(JSON.parse(original)))) : original;
-		if (!readFileSync(join(directory, name)).equals(expected)) throw new Error(`Forge source "${name}" is not the exact reviewed backport; restore the source before generating its seal.`);
+		const expected = name === "package.json" ? Buffer.from(json(minimalManifest(JSON.parse(original)))) : original;
+		if (!readFileSync(join(directory, name)).equals(expected)) throw new Error(`Forge source "${name}" is not the exact reviewed upstream release; restore the source before generating its seal.`);
 		files[name] = hash(expected);
 	}
 	const actual = inventory(directory).filter((name) => name !== "source-seal.json");
 	if (JSON.stringify(actual) !== JSON.stringify(Object.keys(files).sort())) throw new Error("Forge source inventory differs from the artifact; review it before generating its seal.");
-	const seal = { schemaVersion: 1, origin, backport: { advisory: "GHSA-86w9-cpqp-85rv", revision: 1, changedFiles: ["lib/rsa.js", "package.json"] }, upstreamFiles, files };
+	const seal = { schemaVersion: 2, origin, upstream: { version: "1.4.2", changedFiles: ["package.json"] }, upstreamFiles, files };
 	const output = json(seal);
 	writeFileSync(join(directory, "source-seal.json"), output);
 	console.log(`Forge source seal generated from the pinned public artifact; review and pin SHA256 "${hash(output)}" before accepting the source.`);
@@ -134,7 +123,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 		if (process.argv.length === 4 && process.argv[2] === "--seal") generateSeal(resolve(process.argv[3]));
 		else if (process.argv.length === 2) {
 			const seal = checkForgeBackport();
-			console.log(`Forge source backport seal passed for ${Object.keys(seal.files).length} runtime/license/manifest files; this checks the reviewed backport, not all cryptographic behavior.`);
+			console.log(`Forge source seal passed for ${Object.keys(seal.files).length} runtime/license/manifest files; this checks the reviewed upstream release, not all cryptographic behavior.`);
 		} else throw new Error("Unsupported checker arguments; use no arguments to check or --seal with the pinned archive to regenerate its provenance.");
 	} catch (error) {
 		console.error(`Forge backport verification failed: ${error.message} Restore the reviewed source package or obtain the pinned archive before retrying.`);
