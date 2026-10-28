@@ -206,7 +206,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y bubblewrap apparmor-profiles
+          sudo env NEEDRESTART_MODE=l apt-get install --no-install-recommends -y bubblewrap apparmor-profiles
       - name: Enable distro Bubblewrap namespace profile
         run: |
           set -euo pipefail
