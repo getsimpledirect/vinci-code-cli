@@ -1,6 +1,6 @@
 # Reviewed sandbox-runtime consumer fork
 
-This local package retains sandbox-runtime 0.0.26 and binds its existing configuration
+This local package retains the upstream release pinned in source-seal.json and binds its existing configuration
 schema to Zod 4.6.6. It addresses GHSA-mrhx-c7xc-m3w5 without upgrading the sandbox
 implementation or changing permissions, policy, defaults, OS adapters or binaries.
 All 75 upstream package files remain present. Runtime JavaScript is byte-identical.
@@ -21,7 +21,7 @@ To reproduce from the integrity-pinned public upstream archive, after installing
 the repository's pinned dependencies with lifecycle scripts disabled:
 
 ```sh
-python3 scripts/vendor-sandbox-runtime.py --archive /path/to/sandbox-runtime-0.0.26.tgz --check
+python3 scripts/vendor-sandbox-runtime.py --archive /path/to/upstream-sandbox-runtime.tgz --check
 node scripts/check-sandbox-runtime-source.mjs
 ```
 
