@@ -57,6 +57,8 @@ jobs:
       contents: read # checkout + reading the vinci-v* GitHub Release assets (the receipt)
       id-token: write # OIDC federation to the narrowly-scoped AWS release role
     env:
+      AWS_MAX_ATTEMPTS: "1"
+      AWS_RETRY_MODE: standard
       S3_BUCKET: vinci-assets
       S3_PREFIX: vinci-code
       MANIFEST_URL: https://vinci-assets.s3.ca-central-1.amazonaws.com/vinci-code/manifest-beta.json
@@ -284,12 +286,13 @@ jobs:
                --body release/manifest-beta.json --content-type application/json \
                --if-match "$LIVE_ETAG" > receipt/put-manifest.json 2> receipt/put-manifest.err; then
             cat receipt/put-manifest.json
+            printf '%s\n' '{"schemaVersion":1,"status":"WRITE_ACKNOWLEDGED_PENDING_LIVE_VERIFICATION","automaticRetries":0}' > receipt/activation-status.json
           else
             cat receipt/put-manifest.err
-            echo "::error::conditional PUT of manifest-beta.json failed (If-Match $LIVE_ETAG). The live manifest changed under us — NOT retrying; nothing was activated by this run."
-            curl -fsSL -D receipt/live-divergent.headers "$MANIFEST_URL" > receipt/live-divergent.json || true
-            node -p "const m=JSON.parse(require('fs').readFileSync('receipt/live-divergent.json','utf8')); 'live manifest now: v'+m.signed.version+' seq '+m.signed.sequence" || true
-            grep -i '^etag:' receipt/live-divergent.headers || true
+            printf '%s\n' '{"schemaVersion":1,"status":"UNRESOLVED","writeReportedSuccess":false,"automaticRetries":0,"nextAction":"Reconcile live signature, bytes and ETag before any separately authorized action; do not retry or prepare a new sequence automatically."}' > receipt/activation-status.json
+            echo "::error::Conditional rollback write failed or its response is uncertain (If-Match $LIVE_ETAG). Activation outcome is UNRESOLVED; do not retry or prepare a new sequence until the live manifest is reconciled."
+            curl -fsSL --connect-timeout 5 --max-time 15 --retry 0 -D receipt/live-divergent.headers "$MANIFEST_URL" > receipt/live-divergent.json || true
+            echo "Diagnostic snapshot, if fetched, is retained for reconciliation; it does not resolve this write outcome automatically."
             exit 1
           fi
 
@@ -303,7 +306,7 @@ jobs:
           cp live-after.json receipt/live-after.json
           aws s3api head-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/manifest-beta.json" > receipt/s3-manifest-head-after.json
           node --input-type=module <<'EOF'
-          import { readFileSync } from "node:fs";
+          import { readFileSync, writeFileSync } from "node:fs";
           import { createHash } from "node:crypto";
           const local = createHash("sha256").update(readFileSync("release/manifest-beta.json")).digest("hex");
           const live = createHash("sha256").update(readFileSync("live-after.json")).digest("hex");
@@ -312,6 +315,7 @@ jobs:
           if (m.signed.version !== process.env.VERSION) throw new Error(`live version ${m.signed.version} != ${process.env.VERSION}`);
           if (String(m.signed.sequence) !== process.env.NEXT_SEQ) throw new Error(`live sequence ${m.signed.sequence} != ${process.env.NEXT_SEQ}`);
           console.log(`live manifest is byte-identical to the signed manifest: v${m.signed.version} seq ${m.signed.sequence}`);
+          writeFileSync("receipt/activation-status.json", `${JSON.stringify({ schemaVersion: 1, status: "LIVE_BYTES_VERIFIED", manifestSha256: live, automaticRetries: 0 })}\n`);
           EOF
 
       - name: Run summary

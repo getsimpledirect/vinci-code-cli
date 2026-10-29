@@ -11,15 +11,25 @@ const lockJsonFiles = [];
 // Reviewed upstream security fix floors; include standalone example locks in the same traversal.
 // https://github.com/juliangruber/brace-expansion/security/advisories/GHSA-q2hr-2g5m-vwhr
 // https://github.com/ljharb/shell-quote/security/advisories/GHSA-pqg4-j6r4-53mv
+// https://github.com/nodejs/undici/security/advisories/GHSA-rfgv-xxqx-mfg5
 // https://github.com/nodejs/undici/security/advisories/GHSA-xjj6-f33q-929c
 // https://github.com/nodejs/undici/security/advisories/GHSA-4qv8-2p9j-2685
 // https://github.com/nodejs/undici/security/advisories/GHSA-f72v-6w45-q472
 // https://github.com/advisories/GHSA-mrhx-c7xc-m3w5
+// https://github.com/advisories/GHSA-68fv-2mgg-jv7q
+// https://github.com/advisories/GHSA-587h-7wmj-h5pm
+// https://github.com/advisories/GHSA-82fw-gwwq-j7x9
+// https://github.com/advisories/GHSA-qxg6-89mg-rqv8
 const securityVersions = {
 	"brace-expansion": { 1: "1.1.21", 5: "5.0.12" },
 	"shell-quote": { 1: "1.11.0" },
 	undici: { 6: "6.29.1", 7: "7.30.1", 8: "8.12.2" },
 	zod: { 4: "4.6.6" },
+	"source-map-js": { 1: "1.2.2" },
+	vite: { 8: "8.1.6" },
+	vitest: { 4: "4.1.12" },
+	"@vitest/mocker": { 4: "4.1.12" },
+	"@vitest/coverage-v8": { 4: "4.1.12" },
 };
 
 function collectPackageJsonFiles(directory) {

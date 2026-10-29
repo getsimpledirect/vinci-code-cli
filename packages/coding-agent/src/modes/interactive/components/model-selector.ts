@@ -309,8 +309,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 			this.listContainer.addChild(new Text(line, 0, 0));
 		}
-		if (process.env.VINCI_CODE === "1" && !this.vinciCatalogue) {
-			this.listContainer.addChild(new Text(theme.fg("muted", "model details unavailable offline"), 0, 0));
+		if (
+			process.env.VINCI_CODE === "1" &&
+			(!this.vinciCatalogue || !this.modelRegistry.authStorage.hasAuth("vinci"))
+		) {
+			const guidance = this.modelRegistry.authStorage.hasAuth("vinci")
+				? "Model details unavailable. Check your connection and try /model again."
+				: "Sign in with /login to see your Vinci models.";
+			this.listContainer.addChild(new Text(theme.fg("muted", guidance), 0, 0));
 		}
 
 		// Add scroll indicator if needed
@@ -326,9 +332,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			for (const line of errorLines) {
 				this.listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
 			}
-		} else if (this.filteredModels.length === 0) {
+		} else if (
+			this.filteredModels.length === 0 &&
+			!(process.env.VINCI_CODE === "1" && !this.modelRegistry.authStorage.hasAuth("vinci"))
+		) {
 			this.listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
-		} else {
+		} else if (this.filteredModels.length > 0) {
 			const selected = this.filteredModels[this.selectedIndex];
 			this.listContainer.addChild(new Spacer(1));
 			this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));

@@ -291,6 +291,18 @@ if [ "$VINCI_PROFILE_UNCLEAN" -ne 0 ]; then
   exit 78
 fi
 
+# Core arguments are normally parsed only after this shim's updater. Honor explicit offline
+# intent before that edge, including when a profile set a conflicting bootstrap preference.
+for VINCI_LAUNCH_ARG in "$@"; do
+  if [ "$VINCI_LAUNCH_ARG" = "--offline" ]; then export PI_OFFLINE=1; fi
+done
+VINCI_SKIP_AUTO_UPDATE=0
+case "${PI_OFFLINE:-}" in
+  1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) VINCI_SKIP_AUTO_UPDATE=1 ;;
+esac
+if [ "${VINCI_QA_ALLOWANCE_FILE+x}" = x ]; then VINCI_SKIP_AUTO_UPDATE=1; fi
+
+if [ "$VINCI_SKIP_AUTO_UPDATE" -eq 0 ]; then
 VINCI_UPDATER_TIMEOUT_MS_VALUE="${VINCI_UPDATER_TIMEOUT_MS:-330000}"
 case "$VINCI_UPDATER_TIMEOUT_MS_VALUE" in
   ''|*[!0-9]*) VINCI_UPDATER_TIMEOUT_MS_VALUE=330000 ;;
@@ -346,6 +358,7 @@ set -e
 if [ "$UPDATE_STATUS" -eq 75 ]; then exit 75; fi
 if [ "$UPDATE_STATUS" -ne 0 ]; then
   echo "Vinci's update check failed unexpectedly; continuing with the installed version." >&2
+fi
 fi
 
 PAYLOAD="$VINCI_HOME/current/vinci/bin/vinci"

@@ -278,10 +278,15 @@ run_group install-guard-integration node "${ROOT}/vinci/test/install-guard-integ
 run_group priority-integration node "${ROOT}/vinci/test/priority-integration.mjs"
 run_group update-integration node "${ROOT}/vinci/test/update-integration.mjs"
 run_group release-manifest-cas node "${ROOT}/vinci/test/release-manifest-cas.mjs"
+run_group release-candidate-gates node --test "${ROOT}/vinci/test/release-candidate-gates.mjs"
+run_group release-candidate-cli node --test "${ROOT}/vinci/test/release-candidate-cli.mjs"
+run_group release-candidate-download node --test "${ROOT}/vinci/test/release-candidate-download.mjs"
+run_group release-candidate-extract python3 -I "${ROOT}/vinci/test/release-candidate-extract.py"
 # VINCI_ENV=dev: launcher resolution (dev URLs, isolated agent dir, updates off, explicit-env-wins,
 # unknown-value rejection), updater dev gate + doctor report, shared vinci-links origin, header badge.
 run_group dev-env-integration node "${ROOT}/vinci/test/dev-env-integration.mjs"
 run_group tool-bootstrap-integration node "${ROOT}/vinci/test/tool-bootstrap-integration.mjs"
+run_group offline-download-policy node "${ROOT}/vinci/test/offline-download-policy.mjs"
 run_group advisor-integration node "${ROOT}/vinci/test/advisor-integration.mjs"
 run_group fortissimo-escalation-integration node --test --test-concurrency=1 "${ROOT}/vinci/test/fortissimo-escalation-integration.mjs"
 run_group header-hint-integration node "${ROOT}/vinci/test/header-hint-integration.mjs"
@@ -834,6 +839,7 @@ run_group coding-agent-cli-units node "${VITEST_CLI}" \
   --root "${ROOT}/packages/coding-agent" --run \
   "test/args.test.ts" "test/list-models.test.ts" "test/vinci-grader.test.ts" \
   "test/vinci-auth-ui.test.ts" "test/vinci-auth-guidance.test.ts" "test/vinci-recovery-guidance.test.ts" \
+  "test/vinci-signin-link-safety.test.ts" \
   "test/assistant-message.test.ts"
 # Remaining integrations drive the REAL modules directly (Node 23+ strips TS types at load).
 if node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>=23?0:1)'; then

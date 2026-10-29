@@ -23,6 +23,9 @@
 
 ### Fixed
 
+- Validated sign-in link targets before rendering or opening: HTTPS by default, with explicit local-file fixture opt-in; unsupported schemes, malformed targets and terminal control bytes show a non-actionable error.
+- Fixed offline fd/ripgrep downloads, including direct and lazy downloader calls, bootstrap overrides and inherited helper environments; cached and PATH tools remain available. Installed launches now honor offline intent before automatic updates.
+- Added a configurable Enter action to open sign-in links without a terminal mouse gesture, preserving manual code input and cancellation.
 - Fixed the sandbox example's affected Zod 3 dependency with a sealed sandbox-runtime 0.0.26 consumer fork using Zod 4.6.6; configuration values and runtime policy are preserved, while Zod diagnostics and schema classes follow the new major.
 - Updated the sealed Forge source to upstream 1.4.2; signature verification now rejects noncanonical BER wrappers while preserving ordinary DER and Gondolin certificate operations.
 - Fixed affected Undici versions in the CLI and Gondolin example, retaining installed-consumer checks for bounded EventSource parsing and compressed responses.
@@ -47,7 +50,6 @@
 - Fixed Vinci follow-up input to release stale automation stops immediately, bounded stopped-run summaries to one report, and required direct evidence for install and deployment claims.
 - Fixed Vinci source-ownership tracking to keep truncated shell reads pending and redirected scratch diagnostics to inline commands instead of outside-project writes.
 - Fixed Vinci's consequential confirmation dialogs to default to the safe decline option.
-- Fixed fresh Vinci installations to provision fd and ripgrep while keeping update and telemetry traffic offline.
 - Fixed Vinci advisory requests to remain read-only until implementation is explicitly authorized and blocked accidental whole-file replacement after failed edits.
 - Fixed Vinci recovery layers to honor one bounded-stop state, kept unapplied edits as sticky failure evidence, and treated installed dependency source as read-only diagnostic evidence.
 - Fixed Vinci's exploration loop guard to allow repository verification commands and treat failing tests as diagnostic evidence instead of malformed-action thrashing.

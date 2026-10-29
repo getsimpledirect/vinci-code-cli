@@ -52,6 +52,7 @@ import type {
 	StreamFunction,
 	StreamOptions,
 } from "./types.ts";
+import { assertQaModelAllowed } from "./utils/qa-request-guard.ts";
 
 /** @deprecated Static catalog read. Use `getBuiltinModel` from "@earendil-works/pi-ai/providers/all" or `Models.getModel()`. */
 export const getModel = getBuiltinModel;
@@ -98,6 +99,7 @@ function wrapStream<TApi extends Api, TOptions extends StreamOptions>(
 	stream: StreamFunction<TApi, TOptions>,
 ): ApiStreamFunction {
 	return (model, context, options) => {
+		assertQaModelAllowed(model);
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
@@ -110,6 +112,7 @@ function wrapStreamSimple<TApi extends Api>(
 	streamSimple: StreamFunction<TApi, SimpleStreamOptions>,
 ): ApiStreamSimpleFunction {
 	return (model, context, options) => {
+		assertQaModelAllowed(model);
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
@@ -239,6 +242,7 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: ProviderStreamOptions,
 ): AssistantMessageEventStream {
+	assertQaModelAllowed(model);
 	if (shouldUseBuiltinModels(model)) {
 		return compatModels.stream(model, context, options as ApiStreamOptions<TApi> | undefined);
 	}
@@ -260,6 +264,7 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	assertQaModelAllowed(model);
 	if (shouldUseBuiltinModels(model)) {
 		return compatModels.streamSimple(model, context, options);
 	}

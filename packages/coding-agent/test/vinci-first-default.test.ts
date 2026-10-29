@@ -53,6 +53,7 @@ function external(): Model<Api> {
 
 function registry(models: Model<Api>[]): ModelRegistry {
 	return {
+		authStorage: { hasAuth: () => true },
 		refresh: () => {},
 		getError: () => undefined,
 		getAvailable: () => models,
@@ -286,7 +287,7 @@ describe.sequential("Vinci-first default T0 regressions", () => {
 	});
 
 	test.each(["failure", "timeout", "malformed JSON", "malformed payload"])(
-		"T5 %s falls back to plain names and an offline note",
+		"T5 %s falls back to plain names and connection guidance",
 		async (failure) => {
 			if (failure === "timeout") vi.useFakeTimers();
 			const fetcher = vi.fn<typeof fetch>(async () => {
@@ -298,7 +299,7 @@ describe.sequential("Vinci-first default T0 regressions", () => {
 			const pending = picker(SettingsManager.inMemory(), fetcher);
 			if (failure === "timeout") await vi.advanceTimersByTimeAsync(1500);
 			const { text } = await pending;
-			expect(text).toContain("model details unavailable offline");
+			expect(text).toContain("Model details unavailable. Check your connection and try /model again.");
 			expect(text).toContain("Vinci Auto  your plan's default");
 			expect(text).toContain("Vinci Mezzo");
 			expect(text).toContain("Vinci Forte");

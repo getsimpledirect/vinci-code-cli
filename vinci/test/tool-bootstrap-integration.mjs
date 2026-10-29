@@ -21,22 +21,29 @@ const tools = await loader.import(resolve(here, "../../packages/coding-agent/src
 });
 
 assert.equal(tools.shouldBootstrapTools({}), true);
+assert.equal(tools.shouldBootstrapTools({ VINCI_TOOL_BOOTSTRAP: "0" }), false);
+assert.equal(tools.shouldBootstrapTools({ PI_OFFLINE: "0", VINCI_TOOL_BOOTSTRAP: "true" }), true);
 assert.equal(tools.shouldBootstrapTools({ PI_OFFLINE: "1" }), false);
 assert.equal(tools.shouldBootstrapTools({ PI_OFFLINE: "1", VINCI_CODE: "1" }), false);
 assert.equal(
 	tools.shouldBootstrapTools({ PI_OFFLINE: "1", VINCI_CODE: "1", VINCI_TOOL_BOOTSTRAP: "1" }),
-	true,
+	false,
 );
 assert.equal(
 	tools.shouldBootstrapTools({ PI_OFFLINE: "true", VINCI_CODE: "1", VINCI_TOOL_BOOTSTRAP: "true" }),
-	true,
+	false,
 );
 assert.equal(
 	tools.shouldBootstrapTools({ PI_OFFLINE: "1", VINCI_CODE: "1", VINCI_TOOL_BOOTSTRAP: "0" }),
 	false,
 );
+for (const allowance of ["", "/synthetic/missing-policy.json"]) {
+	for (const offline of [undefined, "1", "true", "yes"]) {
+		assert.equal(tools.shouldBootstrapTools({ PI_OFFLINE: offline, VINCI_CODE: "1", VINCI_TOOL_BOOTSTRAP: "1", VINCI_QA_ALLOWANCE_FILE: allowance }), false);
+	}
+}
 
-process.stdout.write("  tool bootstrap: Vinci can provision fd/rg without enabling update or telemetry traffic\n");
+process.stdout.write("  tool bootstrap: offline and QA policy override every bootstrap opt-in\n");
 
 // ── Pinned-release integrity (audit 2026-10-11) ────────────────────────────────────────────────
 // The bootstrap used to resolve "latest" over the network and chmod+execute whatever arrived. Now
@@ -89,7 +96,42 @@ check(
 check("a platform with no pin resolves to null (fails closed)", tools.resolvePinnedAsset("fd", "freebsd", "x64") === null);
 
 const originalFetch = globalThis.fetch;
+const environmentKeys = ["PI_OFFLINE", "VINCI_CODE", "VINCI_TOOL_BOOTSTRAP", "VINCI_QA_ALLOWANCE_FILE", "PATH"];
+const originalEnvironment = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
 try {
+	// Refuse before fetch or filesystem staging, even if a caller invokes the exported
+	// downloader directly. A missing/empty QA path cannot reopen bootstrap while startup
+	// diagnoses an invalid allowance. The negative control's fetch is inert, never real.
+	let blockedFetchCalls = 0;
+	globalThis.fetch = async () => { blockedFetchCalls++; throw new Error("inert unexpected download attempt"); };
+	process.env.PATH = join(agentRoot, "no-tools-on-path");
+	process.env.VINCI_CODE = "1";
+	process.env.VINCI_TOOL_BOOTSTRAP = "1";
+	for (const offline of [undefined, "1", "true", "yes"]) {
+		if (offline === undefined) delete process.env.PI_OFFLINE;
+		else process.env.PI_OFFLINE = offline;
+		for (const allowance of ["", join(agentRoot, "missing-policy.json")]) {
+			process.env.VINCI_QA_ALLOWANCE_FILE = allowance;
+			for (const tool of ["fd", "rg"]) {
+				assert.equal(await tools.ensureTool(tool, true), undefined);
+				await assert.rejects(tools.downloadTool(tool), /disabled by the offline or QA request policy/);
+			}
+		}
+	}
+	delete process.env.VINCI_QA_ALLOWANCE_FILE;
+	process.env.PI_OFFLINE = "1";
+	process.env.VINCI_TOOL_BOOTSTRAP = "0";
+	for (const tool of ["fd", "rg"]) {
+		assert.equal(await tools.ensureTool(tool, true), undefined);
+		await assert.rejects(tools.downloadTool(tool), /disabled by the offline or QA request policy/);
+	}
+	check("offline/QA policy blocks ensure and direct download with zero fetch calls", blockedFetchCalls === 0);
+	check("offline/QA refusal creates no tool directory or download stage", !existsSync(binDir));
+	if (originalEnvironment.PATH === undefined) delete process.env.PATH;
+	else process.env.PATH = originalEnvironment.PATH;
+	process.env.PI_OFFLINE = "0";
+	process.env.VINCI_CODE = "1";
+	process.env.VINCI_TOOL_BOOTSTRAP = "1";
 	// Digest match → the install proceeds (fetch used, binary placed, executable). The override
 	// pins the test release for THIS platform (the mock serves the bytes; tar extraction is real).
 	process.env.VINCI_TOOL_PIN_FD = `9.9.9:${cleanSha}`;
@@ -183,6 +225,10 @@ try {
 	);
 } finally {
 	globalThis.fetch = originalFetch;
+	for (const key of environmentKeys) {
+		if (originalEnvironment[key] === undefined) delete process.env[key];
+		else process.env[key] = originalEnvironment[key];
+	}
 	delete process.env.VINCI_TOOL_PIN_FD;
 	rmSync(agentRoot, { recursive: true, force: true });
 }

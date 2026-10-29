@@ -17,6 +17,7 @@ import type {
 	StreamOptions,
 	Usage,
 } from "./types.ts";
+import { assertQaModelAllowed } from "./utils/qa-request-guard.ts";
 
 export { type AuthModel, ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
 
@@ -245,6 +246,7 @@ class ModelsImpl implements MutableModels {
 		if (!auth) return { requestModel: model, requestOptions: options };
 
 		const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+		assertQaModelAllowed(requestModel);
 
 		// Explicit request options win per-field; headers/env merge per key.
 		const apiKey = options?.apiKey ?? auth.apiKey;
@@ -261,6 +263,7 @@ class ModelsImpl implements MutableModels {
 		options?: ApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
+			assertQaModelAllowed(model);
 			const provider = this.requireProvider(model);
 			const { requestModel, requestOptions } = await this.applyAuth(model, options as StreamOptions | undefined);
 			return provider.stream(requestModel as Model<TApi>, context, requestOptions as ApiStreamOptions<TApi>);
@@ -277,6 +280,7 @@ class ModelsImpl implements MutableModels {
 
 	streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
+			assertQaModelAllowed(model);
 			const provider = this.requireProvider(model);
 			const { requestModel, requestOptions } = await this.applyAuth(model, options);
 			return provider.streamSimple(requestModel, context, requestOptions);
@@ -334,6 +338,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		model: Model<Api>,
 		run: (streams: ProviderStreams) => AssistantMessageEventStream,
 	): AssistantMessageEventStream => {
+		assertQaModelAllowed(model);
 		const streams = apiFor(model);
 		if (!streams) {
 			return lazyStream(model, async () => {

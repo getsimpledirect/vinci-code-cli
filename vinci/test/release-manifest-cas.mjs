@@ -13,8 +13,10 @@ const workflow = parse(readFileSync(workflowPath, "utf8"));
 const steps = workflow.jobs.publish.steps;
 const signing = steps.find((step) => step.name?.startsWith("Sign the TESTED archive"));
 const checking = steps.find((step) => step.name?.startsWith("Verify the SIGNED manifest"));
-const publishing = steps.find((step) => step.name?.startsWith("Publish the manifest LAST"));
+const publishing = workflow.jobs.activate.steps.find((step) => step.name?.startsWith("Activate the reviewed manifest"));
 assert.ok(signing?.run && checking?.run && publishing?.run, "Keep the real release signing, verification and activation steps available to their regression test.");
+
+if (process.argv.includes("--structure-only")) { console.log("Separated real workflow step structure verified; signing fixtures not executed."); process.exit(0); }
 
 const temporary = mkdtempSync(join(root, "vinci/test/.release-cas-"));
 const fixture = join(temporary, "fixture");
@@ -69,12 +71,16 @@ function candidate() {
 	assert.equal(result.status, 0, result.stderr);
 	const checked = run(checking);
 	assert.equal(checked.status, 0, checked.stderr);
+	copyFileSync(manifestPath, join(fixture, "activation/manifest-beta.json"));
+	env.EXPECTED_MANIFEST_SHA256 = createHash("sha256").update(readFileSync(manifestPath)).digest("hex");
+	env.CANDIDATE_EXPIRES_AT = new Date(Date.now() + 3600000).toISOString();
 	return JSON.parse(readFileSync(manifestPath, "utf8"));
 }
 try {
 	writeFileSync(join(temporary, ".gitignore"), "*\n");
 	mkdirSync(bin);
 	mkdirSync(join(fixture, "release"), { recursive: true });
+	mkdirSync(join(fixture, "activation"));
 	mkdirSync(join(fixture, "vinci/scripts"), { recursive: true });
 	mkdirSync(join(fixture, "vinci/updater"), { recursive: true });
 	copyFileSync(join(root, "vinci/scripts/create-update-manifest.mjs"), join(fixture, "vinci/scripts/create-update-manifest.mjs"));

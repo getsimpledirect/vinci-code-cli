@@ -25,9 +25,9 @@ assert.match(
   new RegExp(`export ${identity.environmentFlag}=1`),
   "The launcher must enable the Vinci compatibility layer",
 );
-assert.match(launcher, /export VINCI_TOOL_BOOTSTRAP=/, "The launcher must provision Vinci's required search tools");
+assert.match(launcher, /export VINCI_TOOL_BOOTSTRAP="\$\{VINCI_TOOL_BOOTSTRAP:-0\}"/, "The launcher must default to no executable downloads");
 assert.match(launcher, /VINCI_SOURCE_CLI/, "Internal qualification must be able to run the current source tree");
-assert.match(toolsManager, /VINCI_TOOL_BOOTSTRAP/, "Offline Vinci startup no longer has a search-tool bootstrap exception");
+assert.match(toolsManager, /if \(offlineEnabled\) return false/, "Offline policy must override search-tool bootstrap");
 assert.match(launcher, new RegExp(`VINCI_PROVIDER="\\$\\{VINCI_PROVIDER:-${identity.provider}\\}"`), "The default provider changed");
 assert.match(launcher, /--provider "\$\{VINCI_PROVIDER\}"/, "The launcher must pass its explicit provider selection");
 assert.match(launcher, new RegExp(`VINCI_MODEL="\\$\\{VINCI_MODEL:-${identity.defaultModel}\\}"`), "The default model changed");
