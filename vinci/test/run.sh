@@ -264,6 +264,7 @@ run_group deepinfra-provider-integration node "${ROOT}/vinci/test/deepinfra-prov
 # BYOK: the launcher's provider-flag matrix, and proof that a BYOK session keeps every VINCI_CODE
 # guard. Both existed and passed for a while WITHOUT being listed here, so the aggregate gate was
 # green while neither ever ran — an inert guard. Wired in so a failure actually fails the release.
+run_group launcher-diagnostics node --test "${ROOT}/vinci/test/launcher-diagnostics.test.mjs"
 run_group byok-launcher-integration node "${ROOT}/vinci/test/byok-launcher-integration.mjs"
 run_group byok-guards-integration env VINCI_CODE=1 node "${ROOT}/vinci/test/byok-guards-integration.mjs"
 # Public docs must not teach an obsolete opt-in, link a repo readers cannot open, or pin a version.
