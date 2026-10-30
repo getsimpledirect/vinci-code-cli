@@ -72,6 +72,12 @@ if [ ! -f "${WORKSPACE_MAIN}" ]; then
   echo "  node_modules path and reads like a broken install." >&2
   exit 1
 fi
+SOURCE_IDENTITY="$(mktemp "${TMPDIR:-/tmp}/vinci-test-source.XXXXXX")" || exit 1
+trap 'rm -f "${SOURCE_IDENTITY}"' EXIT
+if ! cp "${ROOT}/vinci/dist/source-identity.json" "${SOURCE_IDENTITY}" || ! node "${ROOT}/vinci/scripts/build-source-identity.mjs" check "${ROOT}" "${SOURCE_IDENTITY}"; then
+  echo "run.sh: runtime/build source identity is invalid before tests; rebuild the selected inputs and retry." >&2
+  exit 1
+fi
 }
 
 GROUP_INDEX=0
@@ -208,6 +214,10 @@ run_group() {
   local started="${SECONDS}"
   supervise_group "${GROUP_TIMEOUT_SECONDS}" "$@"
   local status=$?
+  if [ -n "${SOURCE_IDENTITY:-}" ] && ! node "${ROOT}/vinci/scripts/build-source-identity.mjs" check "${ROOT}" "${SOURCE_IDENTITY}"; then
+    echo "run.sh: group \"${label}\" changed runtime/build source bytes; isolate its writes from the source tree and rebuild before retrying." >&2
+    exit 1
+  fi
   local elapsed=$((SECONDS - started))
   if [ "${status}" -eq 124 ]; then
     echo "  ✗ ${label}: TIMED OUT after ${elapsed}s (ceiling ${GROUP_TIMEOUT_SECONDS}s) — process group killed"
