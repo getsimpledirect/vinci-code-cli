@@ -42,6 +42,8 @@ any non-JSON text to a line breaks every one of those consumers at once.
   attempt's new file if its identity still matches; cleanup failures report the retained path.
   Once runtime replacement starts, the imported copy is retained on failure and its path is
   reported. Import does not lock a concurrently edited source or provide a filesystem snapshot.
+  Import does not guard the session directory against a concurrent process replacing the
+  destination between its identity check and use.
 
 ## What Is Deliberately Not Guaranteed
 
