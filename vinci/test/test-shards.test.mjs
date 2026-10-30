@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
+import { parseAllDocuments } from "yaml";
 import { checkTestShards } from "../scripts/check-test-shards.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -27,12 +28,16 @@ function shell(text, environment = {}) {
 }
 
 function parseWorkflow(source) {
-	const result = spawnSync("python3", ["-I", "-c", "import json, sys, yaml; json.dump(yaml.safe_load(sys.stdin), sys.stdout)"], {
-		input: source, encoding: "utf8", timeout: 30_000,
+	// Core YAML 1.2 keeps workflow keys such as "on" as strings; merge keys preserve safe aliases.
+	const documents = parseAllDocuments(source, {
+		uniqueKeys: true, strict: true, schema: "core", version: "1.2",
+		customTags: [], merge: true, prettyErrors: true,
 	});
-	assert.ifError(result.error);
-	assert.equal(result.status, 0, `isolated workflow YAML parse must succeed: ${result.stderr}`);
-	return JSON.parse(result.stdout);
+	if (documents.length !== 1) throw new Error("workflow YAML must contain exactly one document");
+	const document = documents[0];
+	// Unknown tags are warnings in yaml; fail closed on warnings as well as syntax errors.
+	if (document.errors.length || document.warnings.length) throw document.errors[0] ?? document.warnings[0];
+	return document.toJS({ maxAliasCount: 100 });
 }
 
 function effectiveMatrix(matrix, eventName, draft) {
@@ -284,3 +289,85 @@ printf 'record_status=%s\\nfails=%s\\n' "$status" "$fails"`, {
 		}
 	});
 }
+
+for (const [label, source] of [
+	["duplicate key", "jobs: {}\njobs: {}\n"],
+	["custom tag", "jobs: !!python/object {}\n"],
+	["multiple documents", "jobs: {}\n---\njobs: {}\n"],
+	["malformed YAML", "jobs: [offline\n"],
+]) {
+	test(`parseWorkflow rejects ${label}`, () => {
+		assert.ok(parseWorkflow(workflow).jobs.offline, "valid workflow YAML must remain reachable");
+		assert.throws(() => parseWorkflow(source), Error, `parseWorkflow must reject ${label}`);
+	});
+}
+
+test("parseWorkflow resolves safe aliases and bounds alias expansion", () => {
+	assert.deepEqual(parseWorkflow("base: &base {node: 24}\njob: {<<: *base}\n").job, { node: 24 });
+	const source = "a: &a [one, two]\nb: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n" +
+		"c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\nd: [*c, *c]\n";
+	assert.throws(() => parseWorkflow(source), /alias count/i, "parseWorkflow must bound alias expansion");
+});
+
+for (const missing of [true, false]) {
+	test(`exactly-once checker rejects ${missing ? "a missing" : "an empty"} shard record file`, () => {
+		const directory = mkdtempSync(join(tmpdir(), "test-shard-disabled-"));
+		try {
+			const artifactDir = join(directory, "artifacts");
+			assert.equal(shell(`mkdir ${quote(artifactDir)}`).status, 0);
+			const expectedPath = join(directory, "expected.txt");
+			writeFileSync(expectedPath, expected);
+			for (const [index, text] of shards.entries()) writeFileSync(join(artifactDir, `groups-${index + 1}.txt`), text);
+			const invoke = () => spawnSync(process.execPath, [resolve(root, "vinci/scripts/check-test-shards.mjs"), expectedPath, artifactDir], {
+				encoding: "utf8", timeout: 30_000,
+			});
+			const complete = invoke();
+			assert.ifError(complete.error);
+			assert.equal(complete.status, 0, "complete record files must pass the same checker CLI");
+			assert.match(complete.stdout, /4 groups ran exactly once across 3 shards/);
+			const record = join(artifactDir, "groups-3.txt");
+			if (missing) assert.equal(shell(`mv ${quote(record)} ${quote(join(directory, "disabled.txt"))}`).status, 0);
+			else writeFileSync(record, "");
+			const disabled = invoke();
+			assert.ifError(disabled.error);
+			assert.equal(disabled.status, 1, `checker CLI must reject ${missing ? "missing" : "empty"} shard record file`);
+			assert.match(disabled.stderr, missing ? /invalid shard artifacts/ : /invalid or empty group list "shard 3"/);
+		} finally {
+			assert.equal(shell(`find ${quote(directory)} -mindepth 1 -delete && rmdir ${quote(directory)}`).status, 0);
+		}
+	});
+}
+
+test("offline gate dependency step cannot be skipped", () => {
+	const steps = parseWorkflow(workflow).jobs.offline.steps.filter((step) => step.name === "Require all offline shards to succeed");
+	assert.equal(steps.length, 1, "the dependency-result step must exist once");
+	assert.ok(steps[0].if === undefined || /^(?:always\(\)|\$\{\{\s*always\(\)\s*\}\})$/.test(steps[0].if),
+		"the dependency-result step must be unconditional or always()");
+});
+
+test("offline gate dependency step cannot tolerate failure", () => {
+	const steps = parseWorkflow(workflow).jobs.offline.steps.filter((step) => step.name === "Require all offline shards to succeed");
+	assert.equal(steps.length, 1, "the dependency-result step must exist once");
+	assert.equal(steps[0]["continue-on-error"], undefined, "the dependency-result step must not continue on error");
+});
+
+test("offline gate job cannot tolerate failure", () => {
+	assert.equal(parseWorkflow(workflow).jobs.offline["continue-on-error"], undefined, "the offline gate job must not continue on error");
+});
+
+test("offline proof and its prerequisites cannot skip or tolerate failure", () => {
+	const jobs = parseWorkflow(workflow).jobs;
+	for (const name of ["offline", "offline-shard", "check"]) {
+		const job = jobs[name];
+		assert.ok(job, `the ${name} job must exist`);
+		assert.ok(job.if === undefined || /^(?:always\(\)|\$\{\{\s*always\(\)\s*\}\})$/.test(job.if),
+			`the ${name} job must be unconditional or always()`);
+		assert.equal(job["continue-on-error"], undefined, `the ${name} job must not continue on error`);
+		for (const step of job.steps) {
+			const label = step.name ?? step.uses;
+			assert.ok(step.if === undefined || /^(?:always\(\)|\$\{\{\s*always\(\)\s*\}\})$/.test(step.if),
+				`the ${name} step ${label} must be unconditional or always()`);
+			assert.equal(step["continue-on-error"], undefined, `the ${name} step ${label} must not continue on error`);
+		}
+	}
+});
