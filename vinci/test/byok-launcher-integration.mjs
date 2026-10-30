@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { availableParallelism } from "node:os";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { availableParallelism, tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { launcherDiagnostics, launcherEnvironment, launcherStatus } from "./launcher-diagnostics.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
 const launcher = resolve(root, "vinci/bin/vinci");
-const { VINCI_SHOW_OTHER_PROVIDERS: _ignored, ...inheritedEnv } = process.env;
-const baseEnv = {
-	...inheritedEnv, VINCI_SOURCE_CLI: "1", VINCI_NO_BOOTSTRAP_HEAL: "1",
-	VINCI_TOOL_BOOTSTRAP: "0", VINCI_UPDATE_DISABLED: "1", PI_OFFLINE: "1",
-};
+const home = mkdtempSync(resolve(tmpdir(), "vinci-byok-version-"));
+const baseEnv = launcherEnvironment(process.env.PATH ?? "/usr/bin:/bin", home);
+process.on("exit", () => rmSync(home, { recursive: true, force: true }));
+const timeoutMs = 60_000;
 
 const flagCases = [
 	["--provider", "openai"],
@@ -29,13 +29,17 @@ const flagCases = [
 // bounded so a small runner is not oversubscribed.
 function run(args, value) {
 	const env = value === undefined ? baseEnv : { ...baseEnv, VINCI_SHOW_OTHER_PROVIDERS: value };
+	const started = performance.now();
 	return new Promise((resolveRun) => {
 		execFile(
 			"bash",
 			[launcher, ...args, "--version"],
-			{ cwd: root, encoding: "utf8", env, timeout: 60_000 },
+			{ cwd: root, encoding: "utf8", env, timeout: timeoutMs },
 			(error, stdout, stderr) => {
-				resolveRun({ status: error ? (error.code ?? 1) : 0, stdout: stdout ?? "", stderr: stderr ?? "" });
+				resolveRun({
+					status: launcherStatus(error), stdout: stdout ?? "", stderr: stderr ?? "",
+					diagnostic: launcherDiagnostics(error, stdout, stderr, performance.now() - started, timeoutMs),
+				});
 			},
 		);
 	});
@@ -73,11 +77,11 @@ await Promise.all(
 		}
 	}),
 );
-for (const [index, { args, value }] of acceptedCases.entries()) {
+for (const [index] of acceptedCases.entries()) {
 	const result = acceptedResults[index];
-	const message = `vinci ${args.join(" ")} accepted [VINCI_SHOW_OTHER_PROVIDERS=${value}]`;
+	const message = `managed launcher case ${index + 1}: ${result.diagnostic}`;
 	assert.equal(result.status, 0, message);
-	assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+$/, `${message}: accepted Vinci flags must reach normal dispatch`);
+	assert.equal(/^\d+\.\d+\.\d+$/.test(result.stdout.trim()), true, `${message}: must reach normal dispatch`);
 }
 if (process.argv.includes("--forte-only")) {
 	process.stdout.write("byok-launcher-integration: vinci --model forte accepted\n");
@@ -89,27 +93,27 @@ assert.match(readFileSync(launcher, "utf8"), /\$\{VINCI_SHOW_OTHER_PROVIDERS:-0\
 
 // A fresh launch keeps the managed account boundary until the user opts in.
 const defaultResults = await runAll(undefined);
-for (const [i, args] of flagCases.entries()) {
+for (const [i] of flagCases.entries()) {
 	const result = defaultResults[i];
-	assert.equal(result.status, 2, `default must reject ${args[0]}`);
-	assert.match(result.stderr, /Other providers are off/);
+	assert.equal(result.status, 2, `default rejection case ${i + 1}: ${result.diagnostic}`);
+	assert.equal(/Other providers are off/.test(result.stderr), true, `default boundary case ${i + 1}: ${result.diagnostic}`);
 }
 
 // Explicit opt-in still reaches the other providers.
 const optInResults = await runAll("1");
-for (const [i, args] of flagCases.entries()) {
+for (const [i] of flagCases.entries()) {
 	const result = optInResults[i];
-	assert.equal(result.status, 0, `VINCI_SHOW_OTHER_PROVIDERS=1 must allow ${args[0]}: ${result.stderr}`);
-	assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+$/);
+	assert.equal(result.status, 0, `opt-in case ${i + 1}: ${result.diagnostic}`);
+	assert.equal(/^\d+\.\d+\.\d+$/.test(result.stdout.trim()), true, `opt-in version case ${i + 1}: ${result.diagnostic}`);
 }
 
 // Explicit opt-out restores the managed-only boundary, so a managed user cannot accidentally
 // bypass the class their account resolved.
 const optOutResults = await runAll("0");
-for (const [i, args] of flagCases.entries()) {
+for (const [i] of flagCases.entries()) {
 	const result = optOutResults[i];
-	assert.equal(result.status, 2, `VINCI_SHOW_OTHER_PROVIDERS=0 must reject ${args[0]}`);
-	assert.match(result.stderr, /Other providers are off/);
+	assert.equal(result.status, 2, `opt-out rejection case ${i + 1}: ${result.diagnostic}`);
+	assert.equal(/Other providers are off/.test(result.stderr), true, `opt-out boundary case ${i + 1}: ${result.diagnostic}`);
 }
 
 process.stdout.write(
