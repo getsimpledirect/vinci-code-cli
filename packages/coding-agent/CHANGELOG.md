@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Fixed `/import` replacing existing sessions before validation; imports now preflight the source and working directory, create noncolliding files exclusively, and retain imported copies after runtime replacement starts.
 - Validated sign-in link targets before rendering or opening: HTTPS by default, with explicit local-file fixture opt-in; unsupported schemes, malformed targets and terminal control bytes show a non-actionable error.
 - Fixed offline fd/ripgrep downloads, including direct and lazy downloader calls, bootstrap overrides and inherited helper environments; cached and PATH tools remain available. Installed launches now honor offline intent before automatic updates.
 - Added a configurable Enter action to open sign-in links without a terminal mouse gesture, preserving manual code input and cancellation.

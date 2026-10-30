@@ -7,8 +7,8 @@ was chosen on purpose.
 ## The Format
 
 One JSON object per line. The first line is the session header; every subsequent record carries a
-`__vinci_record_start` framing marker. Records are appended with `appendFileSync`; an existing
-valid session file is never rewritten in place.
+`__vinci_record_start` framing marker. Normal session records are appended with `appendFileSync`;
+imports create separate destination files exclusively as described below.
 
 **The file is strict JSONL and must stay that way.** `vinci/scripts/report-wrong.mjs`,
 `packages/coding-agent/src/migrations.ts`, HTML/JSONL export, and the process-resume tests all
@@ -30,6 +30,18 @@ any non-JSON text to a line breaks every one of those consumers at once.
   shortening was the actual user-facing defect behind #38.
 - **Fail-closed verification.** When corruption is newer than the newest valid verification
   snapshot, the shared scanner returns `terminal-unverifiable` rather than trusting stale state.
+- **Import destination preservation.** `/import` preflights the source and its working directory
+  without modifying the source, then creates a destination exclusively. It keeps the basename
+  when available and tries suffixed names on collisions, with at most 16 candidate attempts and
+  a short fallback for long names. Existing destinations are never replaced. Importing a file
+  already in the session directory, including a recognized same-file alias, resumes it without
+  copying. A missing working directory leaves no imported copy; an explicit cwd override can
+  retry the import. Existing damaged-record recovery remains available, and an external empty
+  file is initialized only in the imported copy.
+  The copy is revalidated before runtime teardown. A pre-switch failure removes only this
+  attempt's new file if its identity still matches; cleanup failures report the retained path.
+  Once runtime replacement starts, the imported copy is retained on failure and its path is
+  reported. Import does not lock a concurrently edited source or provide a filesystem snapshot.
 
 ## What Is Deliberately Not Guaranteed
 
