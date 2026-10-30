@@ -1,5 +1,19 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import {
+	type BigIntStats,
+	closeSync,
+	existsSync,
+	fstatSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readSync,
+	realpathSync,
+	statSync,
+	unlinkSync,
+	writeSync,
+} from "node:fs";
+import { basename, dirname, join, parse } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -12,7 +26,7 @@ import type {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
-import { SessionManager } from "./session-manager.ts";
+import { loadSessionFile, SessionManager } from "./session-manager.ts";
 
 /**
  * Result returned by runtime creation.
@@ -50,6 +64,42 @@ export class SessionImportFileNotFoundError extends Error {
 		super(`File not found: ${filePath}`);
 		this.name = "SessionImportFileNotFoundError";
 		this.filePath = filePath;
+	}
+}
+
+function validateImportedSession(filePath: string, cwdOverride: string | undefined, fallbackCwd: string): BigIntStats {
+	const identity = statSync(filePath, { bigint: true });
+	if (!identity.isFile()) throw new Error(`Session import requires a regular file: ${filePath}`);
+	// Opening a SessionManager can initialize an empty file. Preflight must only read the source.
+	const { entries } = loadSessionFile(filePath);
+	if (entries.length === 0 && identity.size > 0n) {
+		throw new Error(`Session file is not a valid pi session: ${filePath}`);
+	}
+	const header = entries.find((entry) => entry.type === "session");
+	const cwd = resolvePath(cwdOverride ?? header?.cwd ?? process.cwd());
+	assertSessionCwdExists({ getCwd: () => cwd, getSessionFile: () => filePath }, fallbackCwd);
+	return identity;
+}
+
+function copyImportedSession(source: string, destinationFd: number): void {
+	const sourceFd = openSync(source, "r");
+	try {
+		// Do not chase an indefinitely growing live transcript. Revalidate the resulting copy below.
+		let remaining = fstatSync(sourceFd).size;
+		const buffer = Buffer.allocUnsafe(64 * 1024);
+		while (remaining > 0) {
+			const read = readSync(sourceFd, buffer, 0, Math.min(buffer.length, remaining), null);
+			if (read === 0) break;
+			remaining -= read;
+			let offset = 0;
+			while (offset < read) {
+				const written = writeSync(destinationFd, buffer, offset, read - offset);
+				if (written === 0) throw new Error("Session import write made no progress");
+				offset += written;
+			}
+		}
+	} finally {
+		closeSync(sourceFd);
 	}
 }
 
@@ -356,35 +406,101 @@ export class AgentSessionRuntime {
 			throw new SessionImportFileNotFoundError(resolvedPath);
 		}
 
+		const sourceIdentity = validateImportedSession(resolvedPath, cwdOverride, this.cwd);
 		const sessionDir = this.session.sessionManager.getSessionDir();
-		if (!existsSync(sessionDir)) {
-			mkdirSync(sessionDir, { recursive: true });
-		}
+		const canonicalSource = realpathSync(resolvedPath);
+		const sourceInSessionDir = existsSync(sessionDir) && dirname(canonicalSource) === realpathSync(sessionDir);
+		const sourceName = basename(sourceInSessionDir ? canonicalSource : resolvedPath);
+		const { name, ext } = parse(sourceName);
+		let destinationPath = join(sessionDir, sourceName);
+		let ownedIdentity: BigIntStats | undefined;
+		let createdCopy = false;
+		let replacementStarted = false;
+		try {
+			for (let attempt = 0; attempt < 16; attempt++) {
+				if (attempt > 0) {
+					const id = randomUUID();
+					const candidate = `${name}-import-${id}${ext}`;
+					destinationPath = join(
+						sessionDir,
+						Buffer.byteLength(candidate) <= 255 ? candidate : `import-${id}.jsonl`,
+					);
+				}
+				let sameFile = false;
+				try {
+					// Do not follow a destination symlink: a link to an external source is not a session-directory file.
+					const destinationIdentity = lstatSync(destinationPath, { bigint: true });
+					sameFile =
+						destinationIdentity.dev === sourceIdentity.dev && destinationIdentity.ino === sourceIdentity.ino;
+					if (!sameFile) continue;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
 
-		const destinationPath = join(sessionDir, basename(resolvedPath));
-		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
-		if (beforeResult.cancelled) {
-			return beforeResult;
-		}
+				const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
+				if (beforeResult.cancelled) return beforeResult;
+				if (!sameFile) {
+					mkdirSync(sessionDir, { recursive: true });
+					let fd: number;
+					try {
+						fd = openSync(destinationPath, "wx", 0o600);
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+						throw error;
+					}
+					createdCopy = true;
+					try {
+						ownedIdentity = fstatSync(fd, { bigint: true });
+						copyImportedSession(resolvedPath, fd);
+					} finally {
+						closeSync(fd);
+					}
+				}
 
-		const previousSessionFile = this.session.sessionFile;
-		if (resolve(destinationPath) !== resolvedPath) {
-			copyFileSync(resolvedPath, destinationPath);
+				// Refuse a path replacement before opening it: an empty foreign file would be initialized.
+				const currentIdentity = lstatSync(destinationPath, { bigint: true });
+				const expectedIdentity = ownedIdentity ?? sourceIdentity;
+				if (currentIdentity.dev !== expectedIdentity.dev || currentIdentity.ino !== expectedIdentity.ino) {
+					throw new Error(`Session import destination changed before resume: ${destinationPath}`);
+				}
+				// The source may have changed during an asynchronous switch hook or the copy.
+				const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+				assertSessionCwdExists(sessionManager, this.cwd);
+				const previousSessionFile = this.session.sessionFile;
+				// From this point extensions or a new runtime may use the imported copy. Retain it on failure.
+				replacementStarted = true;
+				await this.teardownCurrent("resume", sessionManager.getSessionFile());
+				this.apply(
+					await this.createRuntime({
+						cwd: sessionManager.getCwd(),
+						agentDir: this.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+					}),
+				);
+				await this.finishSessionReplacement();
+				return { cancelled: false };
+			}
+			throw new Error("Could not create a noncolliding session import after 16 attempts");
+		} catch (error) {
+			if (createdCopy && (replacementStarted || !ownedIdentity)) {
+				throw new Error(`Session import failed; imported copy retained at ${destinationPath}`, { cause: error });
+			}
+			if (ownedIdentity) {
+				try {
+					const current = lstatSync(destinationPath, { bigint: true });
+					if (current.dev === ownedIdentity.dev && current.ino === ownedIdentity.ino) unlinkSync(destinationPath);
+				} catch (cleanupError) {
+					if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
+						throw new AggregateError(
+							[error, cleanupError],
+							`Session import failed; copy retained at ${destinationPath}`,
+						);
+					}
+				}
+			}
+			throw error;
 		}
-
-		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
-		this.apply(
-			await this.createRuntime({
-				cwd: sessionManager.getCwd(),
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-			}),
-		);
-		await this.finishSessionReplacement();
-		return { cancelled: false };
 	}
 
 	async dispose(): Promise<void> {
