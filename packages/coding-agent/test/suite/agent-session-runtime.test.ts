@@ -962,6 +962,22 @@ describe("session import preservation", () => {
 		expect(readFileSync(source, "utf8")).toBe("");
 	});
 
+	it("refuses a same-file path replaced by a symlink to its original during the switch hook", async () => {
+		const { runtime } = await fixture({
+			extension: (pi) =>
+				pi.on("session_before_switch", (event) => {
+					const path = event.targetSessionFile!;
+					renameSync(path, `${path}.retained`);
+					symlinkSync(`${path}.retained`, path);
+				}),
+		});
+		const source = runtime.session.sessionFile!;
+		const session = runtime.session;
+		await expect(runtime.importFromJsonl(source)).rejects.toThrow(/changed/i);
+		expect(runtime.session === session).toBe(true);
+		expect(fs.lstatSync(source).isSymbolicLink()).toBe(true);
+	});
+
 	it("refuses a foreign path replacing the copy before resume without initializing it", async () => {
 		let target = "";
 		const { runtime, incoming } = await fixture({
