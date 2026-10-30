@@ -428,7 +428,8 @@ export class AgentSessionRuntime {
 				}
 				let sameFile = false;
 				try {
-					const destinationIdentity = statSync(destinationPath, { bigint: true });
+					// Do not follow a destination symlink: a link to an external source is not a session-directory file.
+					const destinationIdentity = lstatSync(destinationPath, { bigint: true });
 					sameFile =
 						destinationIdentity.dev === sourceIdentity.dev && destinationIdentity.ino === sourceIdentity.ino;
 					if (!sameFile) continue;
@@ -457,9 +458,7 @@ export class AgentSessionRuntime {
 				}
 
 				// Refuse a path replacement before opening it: an empty foreign file would be initialized.
-				const currentIdentity = ownedIdentity
-					? lstatSync(destinationPath, { bigint: true })
-					: statSync(destinationPath, { bigint: true });
+				const currentIdentity = lstatSync(destinationPath, { bigint: true });
 				const expectedIdentity = ownedIdentity ?? sourceIdentity;
 				if (currentIdentity.dev !== expectedIdentity.dev || currentIdentity.ino !== expectedIdentity.ino) {
 					throw new Error(`Session import destination changed before resume: ${destinationPath}`);

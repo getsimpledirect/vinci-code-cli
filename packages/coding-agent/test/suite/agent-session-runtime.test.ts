@@ -753,6 +753,19 @@ describe("session import preservation", () => {
 		expect(JSON.parse(readFileSync(runtime.session.sessionFile!, "utf8").split("\n")[0]).type).toBe("session");
 	});
 
+	it("copies an external source instead of resuming a session-directory symlink to it", async () => {
+		const { runtime, incoming, sessionDir } = await fixture();
+		const source = incoming();
+		writeFileSync(source, "");
+		const link = join(sessionDir, basename(source));
+		symlinkSync(source, link);
+		await runtime.importFromJsonl(source);
+		expect(readFileSync(source, "utf8")).toBe("");
+		expect(runtime.session.sessionFile).not.toBe(link);
+		expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+		expect(JSON.parse(readFileSync(runtime.session.sessionFile!, "utf8").split("\n")[0]).type).toBe("session");
+	});
+
 	it("keeps recoverable records and parsing diagnostics without rewriting the source", async () => {
 		const { runtime, incoming } = await fixture();
 		const source = incoming();
@@ -1006,6 +1019,7 @@ describe("session import preservation", () => {
 			throw new Error("synthetic interrupted copy");
 		});
 		await expect(runtime.importFromJsonl(incoming())).rejects.toThrow("synthetic interrupted copy");
+		expect(existsSync(target)).toBe(true);
 		expect(readFileSync(target, "utf8")).toBe("foreign replacement\n");
 	});
 
