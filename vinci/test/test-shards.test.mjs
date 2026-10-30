@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { globSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -88,6 +88,10 @@ function checkMatrices(source) {
 				`draft=${draft}, event=${eventName} must yield only ${nodes.join(",")}`);
 			if (name === "offline") assert.deepEqual(rows.map((row) => `offline (${Object.values(row).join(", ")})`),
 				nodes.map((node) => `offline (${node})`), "offline gate effective matrix must produce exactly its required check names");
+			const expectedRows = name === "offline" ? nodes.map((node) => ({ node }))
+				: nodes.flatMap((node) => [1, 2, 3].map((shard) => ({ node, shard })));
+			assert.deepEqual(rows, expectedRows,
+				`${name} effective matrix must match every expected node x shard combination`);
 		}
 	}
 }
@@ -370,4 +374,95 @@ test("offline proof and its prerequisites cannot skip or tolerate failure", () =
 			assert.equal(step["continue-on-error"], undefined, `the ${name} step ${label} must not continue on error`);
 		}
 	}
+});
+
+
+test("offline execution uses the default shell at every level", () => {
+	const parsed = parseWorkflow(workflow);
+	for (const [label, scope] of [["workflow", parsed], ...["offline", "offline-shard"].map((name) => [name, parsed.jobs[name]])]) {
+		assert.equal(scope.shell, undefined, `${label} must not override shell`);
+		assert.equal(scope.defaults?.run?.shell, undefined, `${label} must not override defaults.run.shell`);
+		for (const step of scope.steps ?? []) {
+			const stepLabel = `${label} step ${step.name ?? step.uses}`;
+			assert.equal(step.shell, undefined, `${stepLabel} must not override shell`);
+			assert.equal(step.defaults?.run?.shell, undefined, `${stepLabel} must not override defaults.run.shell`);
+		}
+	}
+});
+
+test("offline proof step requires the list producer and checker", () => {
+	const steps = parseWorkflow(workflow).jobs.offline.steps.filter((step) => step.name === "Prove every group ran exactly once");
+	assert.equal(steps.length, 1, "the exactly-once proof step must exist once");
+	assert.match(steps[0].run ?? "", /^\s*VINCI_TEST_LIST_GROUPS=1 bash vinci\/test\/run\.sh >"\$\{EXPECTED_GROUPS\}"\s*$/m,
+		"the proof must invoke the list producer");
+	assert.match(steps[0].run, /^\s*node vinci\/scripts\/check-test-shards\.mjs "\$\{EXPECTED_GROUPS\}" "\$\{GROUPS_DIR\}"\s*$/m,
+		"the proof must invoke the checker with the produced list and downloaded records");
+});
+
+test("disk inventory maps offline test entrypoints to their harness groups", () => {
+	const fixture = JSON.parse(readFileSync(resolve(root, "vinci/test/shard-inventory-fixture.json"), "utf8"));
+	const files = globSync([
+		"vinci/test/*.{mjs,py}", "vinci/test/ui/*.test.mjs", "vinci/test/ec2/*-unit.mjs",
+		"vinci/containment-broker/test/*.test.mjs", "vinci/extensions/*.test.mjs",
+	], { cwd: root }).sort();
+	assert.ok(files.length > 0, "the disk inventory must discover test entrypoints");
+	for (const file of Object.keys(fixture.outsideHarness)) assert.ok(files.includes(file), `inventory exception ${file} must still exist`);
+	// Inspect command arguments, independently of the labels emitted by list mode. Join shell continuations first.
+	const commands = harness.replace(/\\\r?\n\s*/g, " ").replaceAll('"', "").match(/^\s*(?:if\s+)?run_group [^\n]+/gm) ?? [];
+	for (const file of files.filter((file) => !(file in fixture.outsideHarness))) {
+		const owners = commands.filter((command) => {
+			if (fixture.packagedReplays.includes(file) && command.includes("${packaged_dir}")) return false;
+			if (command.includes(file)) return true;
+			if (/^vinci\/test\/worker-[^/]+\.mjs$/.test(file)) return command.includes("node ${worker_test}") &&
+				harness.includes('for worker_test in "${ROOT}"/vinci/test/worker-*.mjs; do');
+			return file.startsWith("vinci/containment-broker/test/") && command.includes("vinci/containment-broker/test/*.test.mjs");
+		});
+		assert.equal(owners.length, 1, `${file} must map to exactly one run_group`);
+	}
+	for (const file of fixture.packagedReplays) assert.equal(commands.filter((command) => command.includes(file) && command.includes("${packaged_dir}")).length,
+		1, `${file} must retain its separate packaged replay`);
+});
+
+for (const [label, malformed] of [["uppercase", "Alpha"], ["underscore", "bad_label"]]) {
+	test(`checker CLI rejects ${label} record labels`, () => {
+		const directory = mkdtempSync(join(tmpdir(), "test-shard-labels-"));
+		try {
+			const artifactDir = join(directory, "artifacts");
+			assert.equal(shell(`mkdir ${quote(artifactDir)}`).status, 0);
+			const expectedPath = join(directory, "expected.txt");
+			const invoke = () => spawnSync(process.execPath, [resolve(root, "vinci/scripts/check-test-shards.mjs"), expectedPath, artifactDir], {
+				encoding: "utf8", timeout: 30_000,
+			});
+			writeFileSync(expectedPath, expected);
+			for (const [index, text] of shards.entries()) writeFileSync(join(artifactDir, `groups-${index + 1}.txt`), text);
+			const control = invoke();
+			assert.ifError(control.error);
+			assert.equal(control.status, 0, "valid labels must pass the same checker CLI");
+			assert.match(control.stdout, /4 groups ran exactly once across 3 shards/);
+			// Keep the partition identical: a permissive validator cannot rely on a missing/unexpected-label error.
+			for (const malformedExpected of [true, false]) {
+				writeFileSync(expectedPath, malformedExpected ? expected.replace("alpha", malformed) : expected);
+				writeFileSync(join(artifactDir, "groups-1.txt"), shards[0].replace("alpha", malformed));
+				const invalid = invoke();
+				assert.ifError(invalid.error);
+				assert.equal(invalid.status, 1, `checker CLI must reject ${label} labels`);
+				assert.match(invalid.stderr, new RegExp(`invalid or empty group list "${malformedExpected ? "expected" : "shard 1"}"`));
+			}
+		} finally {
+			assert.equal(shell(`find ${quote(directory)} -mindepth 1 -delete && rmdir ${quote(directory)}`).status, 0);
+		}
+	});
+}
+
+test("offline shard records are bound and missing uploads fail", () => {
+	const steps = parseWorkflow(workflow).jobs["offline-shard"].steps;
+	const harnessSteps = steps.filter((step) => step.name === "Full Vinci test harness (Node ${{ matrix.node }})");
+	assert.equal(harnessSteps.length, 1, "the shard must have exactly one harness step");
+	assert.equal(harnessSteps[0].env?.VINCI_TEST_GROUPS_FILE, "${{ runner.temp }}/groups-${{ matrix.shard }}.txt",
+		"the shard must bind VINCI_TEST_GROUPS_FILE to its artifact path");
+	const uploads = steps.filter((step) => step.name === "Upload successful group labels");
+	assert.equal(uploads.length, 1, "the shard must have exactly one record upload");
+	assert.equal(uploads[0].uses, "actions/upload-artifact@v4", "the shard must upload its records");
+	assert.equal(uploads[0].with?.path, harnessSteps[0].env.VINCI_TEST_GROUPS_FILE, "the upload must consume the bound record path");
+	assert.equal(uploads[0].with?.["if-no-files-found"], "error", "the upload must fail when its record file is absent");
 });

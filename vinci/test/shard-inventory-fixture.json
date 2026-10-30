@@ -1,0 +1,21 @@
+{
+	"outsideHarness": {
+		"vinci/test/launcher-extensions.mjs": "Shared parser imported by entrypoints; not an executable test.",
+		"vinci/test/vocabulary-assertions.mjs": "Shared assertion helper imported by vocabulary entrypoints.",
+		"vinci/test/launcher-diagnostics.mjs": "Shared launcher helper imported by integration tests.",
+		"vinci/test/test-shards.test.mjs": "Runs in the check job, outside run.sh.",
+		"vinci/test/forge-backport.mjs": "Runs in its own offline-shard step before the harness.",
+		"vinci/test/vllm-provider-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
+		"vinci/test/orchestrate-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
+		"vinci/test/model-drift-stop.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
+		"vinci/test/undo-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
+		"vinci/test/pairing-progress.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
+		"vinci/test/vinci-launcher-refusals.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
+		"vinci/test/council-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
+		"vinci/test/ui/fullscreen-journeys.test.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope."
+	},
+	"packagedReplays": [
+		"vinci/test/runtime-integration.mjs",
+		"vinci/test/non-tty-output-integration.mjs"
+	]
+}

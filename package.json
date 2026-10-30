@@ -54,7 +54,8 @@
 		"node-forge": "file:./packages/coding-agent/examples/extensions/gondolin/vendor/node-forge",
 		"shx": "0.4.0",
 		"tsx": "4.22.1",
-		"typescript": "5.9.3"
+		"typescript": "5.9.3",
+		"yaml": "2.9.0"
 	},
 	"engines": {
 		"node": ">=22.19.0"
