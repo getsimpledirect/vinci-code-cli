@@ -83,6 +83,8 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Verify release manifest conditional activation
         run: node vinci/test/release-manifest-cas.mjs
+      - name: Verify offline shard proof and draft matrix controls
+        run: node --test --test-concurrency=1 vinci/test/test-shards.test.mjs
       # `check` now type-checks vinci/extensions, which imports @earendil-works/* by package name.
       # Those resolve through each package's dist, so without a build every import fails TS2307 and
       # every imported type degrades to an implicit any — hundreds of cascade errors. ci.yml already
@@ -156,7 +158,7 @@ jobs:
       - name: Run sandbox integration
         run: node --experimental-strip-types vinci/test/sandbox-integration.mjs
 
-  offline:
+  offline-shard:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -184,6 +186,7 @@ jobs:
         # 🔴 So do NOT "fix" a stuck draft by removing `offline (22)` from the
         # required list. Pending IS the mechanism.
         node: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft == true) && '["24"]' || '["22","24"]') }}
+        shard: [1, 2, 3]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
@@ -225,6 +228,50 @@ jobs:
       - name: Full Vinci test harness (Node ${{ matrix.node }})
         env:
           VINCI_TEST_REUSE_BUILD: '1'
+          VINCI_TEST_SHARD: ${{ matrix.shard }}/3
+          VINCI_TEST_GROUPS_FILE: ${{ runner.temp }}/groups-${{ matrix.shard }}.txt
         run: |
           node vinci/scripts/build-source-identity.mjs check . vinci/dist/source-identity.json
           VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh
+      - name: Upload successful group labels
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-groups-${{ matrix.node }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/groups-${{ matrix.shard }}.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  # Keep the required names and the draft's missing (therefore pending) Node 22 context.
+  offline:
+    runs-on: ubuntu-latest
+    needs: [offline-shard]
+    if: always()
+    strategy:
+      matrix:
+        node: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft == true) && '["24"]' || '["22","24"]') }}
+      fail-fast: false
+    steps:
+      - name: Require all offline shards to succeed
+        env:
+          SHARD_RESULT: ${{ needs.offline-shard.result }}
+        run: |
+          if [ "${SHARD_RESULT}" != 'success' ]; then
+            echo "::error::Offline shards returned \"${SHARD_RESULT}\"; fix the failed or skipped shard and retry."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node == '22' && '22.19.0' || matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: offline-groups-${{ matrix.node }}-*
+          path: ${{ runner.temp }}/offline-groups
+          merge-multiple: true
+      - name: Prove every group ran exactly once
+        env:
+          GROUPS_DIR: ${{ runner.temp }}/offline-groups
+          EXPECTED_GROUPS: ${{ runner.temp }}/expected-groups.txt
+        run: |
+          VINCI_TEST_LIST_GROUPS=1 bash vinci/test/run.sh >"${EXPECTED_GROUPS}"
+          node vinci/scripts/check-test-shards.mjs "${EXPECTED_GROUPS}" "${GROUPS_DIR}"
