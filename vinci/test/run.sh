@@ -26,6 +26,7 @@ export VINCI_NO_RESUME=1
 # npm may hoist vitest to the root or nest it per-workspace depending on lockfile state (a clean
 # `npm ci --ignore-scripts` currently nests it under packages/*). vitest's exports map does not
 # expose dist/cli.js, so probe the known filesystem locations directly.
+prepare_workspace() {
 VITEST_CLI=""
 for candidate in "${ROOT}/node_modules/vitest/dist/cli.js" "${ROOT}/packages/coding-agent/node_modules/vitest/dist/cli.js"; do
   if [ -f "${candidate}" ]; then
@@ -71,6 +72,53 @@ if [ ! -f "${WORKSPACE_MAIN}" ]; then
   echo "  node_modules path and reads like a broken install." >&2
   exit 1
 fi
+SOURCE_IDENTITY="$(mktemp "${TMPDIR:-/tmp}/vinci-test-source.XXXXXX")" || exit 1
+trap 'rm -f "${SOURCE_IDENTITY}"' EXIT
+if ! cp "${ROOT}/vinci/dist/source-identity.json" "${SOURCE_IDENTITY}" || ! node "${ROOT}/vinci/scripts/build-source-identity.mjs" check "${ROOT}" "${SOURCE_IDENTITY}"; then
+  echo "run.sh: runtime/build source identity is invalid before tests; rebuild the selected inputs and retry." >&2
+  exit 1
+fi
+}
+
+GROUP_INDEX=0
+SHARD_INDEX=1
+SHARD_COUNT=1
+if [ -n "${VINCI_TEST_SHARD:-}" ]; then
+  if [[ ! "${VINCI_TEST_SHARD}" =~ ^([1-9][0-9]{0,5})/([1-9][0-9]{0,5})$ ]]; then
+    echo "run.sh: invalid shard \"${VINCI_TEST_SHARD}\"; use VINCI_TEST_SHARD=i/n with 1 <= i <= n." >&2
+    exit 1
+  fi
+  SHARD_INDEX="${BASH_REMATCH[1]}"
+  SHARD_COUNT="${BASH_REMATCH[2]}"
+  if [ "${SHARD_INDEX}" -gt "${SHARD_COUNT}" ]; then
+    echo "run.sh: invalid shard \"${VINCI_TEST_SHARD}\"; choose i <= n." >&2
+    exit 1
+  fi
+fi
+
+select_group() {
+  local label="$1"
+  # Calls arrive here only after the node-version and fixture conditions below.
+  GROUP_INDEX=$((GROUP_INDEX + 1))
+  if [ "${VINCI_TEST_LIST_GROUPS:-0}" = "1" ]; then
+    printf '%s\n' "${label}" >&3
+    return 1
+  fi
+  if [ $(((GROUP_INDEX - 1) % SHARD_COUNT)) -ne $((SHARD_INDEX - 1)) ]; then
+    echo "SKIP-SHARD ${label}"
+    return 1
+  fi
+}
+
+record_group_pass() {
+  if [ -n "${VINCI_TEST_GROUPS_FILE:-}" ]; then
+    if ! printf '%s\n' "$1" >>"${VINCI_TEST_GROUPS_FILE}"; then
+      echo "run.sh: cannot record group \"$1\" in \"${VINCI_TEST_GROUPS_FILE}\"; repair the artifact path and retry." >&2
+      fails=$((fails + 1))
+      return 1
+    fi
+  fi
+}
 
 terminate_process_group() {
   local process_group_id="$1"
@@ -162,9 +210,14 @@ GROUP_TIMEOUT_SECONDS="${VINCI_TEST_GROUP_TIMEOUT:-300}"
 run_group() {
   local label="$1"
   shift
+  select_group "${label}" || return 0
   local started="${SECONDS}"
   supervise_group "${GROUP_TIMEOUT_SECONDS}" "$@"
   local status=$?
+  if [ -n "${SOURCE_IDENTITY:-}" ] && ! node "${ROOT}/vinci/scripts/build-source-identity.mjs" check "${ROOT}" "${SOURCE_IDENTITY}"; then
+    echo "run.sh: group \"${label}\" changed runtime/build source bytes; isolate its writes from the source tree and rebuild before retrying." >&2
+    exit 1
+  fi
   local elapsed=$((SECONDS - started))
   if [ "${status}" -eq 124 ]; then
     echo "  ✗ ${label}: TIMED OUT after ${elapsed}s (ceiling ${GROUP_TIMEOUT_SECONDS}s) — process group killed"
@@ -176,6 +229,9 @@ run_group() {
     # silence was the harness, not the test.)
     echo "  ✗ ${label}: FAILED (exit ${status}) after ${elapsed}s"
     fails=$((fails + 1))
+  else
+    echo "  ✓ ${label}: passed after ${elapsed}s"
+    record_group_pass "${label}" || return 1
   fi
   return "${status}"
 }
@@ -243,6 +299,7 @@ run_cli_supervised() (
   return "${status}"
 )
 
+run_test_groups() {
 echo "── UNIT ──────────────────────────────────────────────"
 run_group canonical-sweep node "${ROOT}/vinci/test/canonical-sweep.mjs"
 run_group contracts-runtime-guard node "${ROOT}/vinci/test/contracts-runtime-guard.mjs"
@@ -882,31 +939,47 @@ echo "── PACKAGED (exact archive, offline launcher) ────────
 run_group packaged-artifact-static node "${ROOT}/vinci/test/packaged-artifact-check.test.mjs"
 run_group packaged-vocabulary env VINCI_PACKAGED_VOCABULARY_REUSE_BUILD=1 node "${ROOT}/vinci/test/packaged-vocabulary.mjs"
 run_group packaged-runtime-contract-guard bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh"
-packaged_dir="$(mktemp -d "${TMPDIR:-/tmp}/vinci-packaged-test.XXXXXX")"
+packaged_dir=""
+if [ "${VINCI_TEST_LIST_GROUPS:-0}" != "1" ]; then
+  packaged_dir="$(mktemp -d "${TMPDIR:-/tmp}/vinci-packaged-test.XXXXXX")"
+fi
 packaged_tgz="${VINCI_TEST_PACKAGED_ARTIFACT:-}"
 if [ -z "${packaged_tgz}" ]; then
-  if run_group packaged-tarball env -u VINCI_UPDATE_SIGNING_KEY -u VINCI_UPDATE_SEQUENCE -u VINCI_PACKAGE_REQUIRE_SIGNING VINCI_PACKAGE_REUSE_BUILD=1 bash "${ROOT}/vinci/package.sh" "${packaged_dir}"; then
+  packaged_command=(env -u VINCI_UPDATE_SIGNING_KEY -u VINCI_UPDATE_SEQUENCE -u VINCI_PACKAGE_REQUIRE_SIGNING VINCI_PACKAGE_REUSE_BUILD=1 bash "${ROOT}/vinci/package.sh" "${packaged_dir}")
+  if run_group packaged-tarball "${packaged_command[@]}" && [ "${VINCI_TEST_LIST_GROUPS:-0}" != "1" ]; then
     packaged_version="$(node -e 'process.stdout.write(require(process.argv[1]).version)' "${ROOT}/vinci/identity.json")"
     packaged_tgz="${packaged_dir}/vinci-code-${packaged_version}.tgz"
+    # Non-owning shards still need an archive as setup for their packaged tests.
+    # Only the owning shard records packaged-tarball as a passing test group.
+    if [ -n "${VINCI_TEST_SHARD:-}" ] && [ ! -f "${packaged_tgz}" ]; then
+      if ! supervise_group "${GROUP_TIMEOUT_SECONDS}" "${packaged_command[@]}"; then
+        echo "  ✗ packaged setup for shard \"${VINCI_TEST_SHARD}\" failed; rebuild the unsigned payload and retry."
+        fails=$((fails + 1))
+      fi
+    fi
   fi
 fi
-mkdir -p "${packaged_dir}/unpacked"
-if [ -n "${packaged_tgz}" ] && [ -f "${packaged_tgz}" ] && tar -xzf "${packaged_tgz}" -C "${packaged_dir}/unpacked"; then
+if [ "${VINCI_TEST_LIST_GROUPS:-0}" != "1" ]; then
+  mkdir -p "${packaged_dir}/unpacked"
+fi
+if [ "${VINCI_TEST_LIST_GROUPS:-0}" = "1" ] || { [ -n "${packaged_tgz}" ] && [ -f "${packaged_tgz}" ] && tar -xzf "${packaged_tgz}" -C "${packaged_dir}/unpacked"; }; then
   run_group packaged-artifact-imports node "${ROOT}/vinci/test/packaged-artifact-check.mjs" "${packaged_dir}/unpacked"
   packaged_boundary=()
-  if [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/sandbox-exec ]; then
+  if [ "${VINCI_TEST_LIST_GROUPS:-0}" != "1" ] && [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/sandbox-exec ]; then
     common_git="$(git -C "${ROOT}" rev-parse --git-common-dir)"
     case "${common_git}" in /*) ;; *) common_git="${ROOT}/${common_git}" ;; esac
     packaged_boundary=(--deny-source "${ROOT}" --deny-source "$(dirname "${common_git}")")
   fi
-  run_group packaged-launch-artifact node "${ROOT}/vinci/test/packaged-launch-check.mjs" "${packaged_dir}/unpacked" "${packaged_boundary[@]}"
+  run_group packaged-launch-artifact node "${ROOT}/vinci/test/packaged-launch-check.mjs" "${packaged_dir}/unpacked" ${packaged_boundary[@]+"${packaged_boundary[@]}"}
   run_group non-tty-output-packaged node "${ROOT}/vinci/test/non-tty-output-integration.mjs" "${packaged_dir}/unpacked"
   run_group runtime-cli-packaged node "${ROOT}/vinci/test/runtime-integration.mjs" "${packaged_dir}/unpacked"
 else
   echo "  ✗ packaged-unpack: artifact \"${packaged_tgz:-<missing>}\" is unavailable. Rebuild the owned unsigned payload before retrying."
   fails=$((fails + 1))
 fi
-find "${packaged_dir}" -mindepth 1 -delete && rmdir "${packaged_dir}"
+if [ "${VINCI_TEST_LIST_GROUPS:-0}" != "1" ]; then
+  find "${packaged_dir}" -mindepth 1 -delete && rmdir "${packaged_dir}"
+fi
 
 echo
 echo "── UI (headless xterm + faux model) ──────────────────"
@@ -946,6 +1019,9 @@ echo "── VISUAL (rendered TUI header via PTY) ──────────
 # The native recorder drives a delayed local faux provider through script(1), so this verifies both
 # active animation and the completed composer without paid calls or terminal-specific input races.
 if command -v script >/dev/null 2>&1; then
+  if select_group native-pty; then
+  visual_fails_before="${fails}"
+  visual_started="${SECONDS}"
   visual_dir="$(mktemp -d)"
   # supervise_group, not run_group: this branch already owns its own pass/fail reporting below, so a
   # timeout must come back as a plain non-zero status (124) instead of being counted twice. The PTY
@@ -969,20 +1045,26 @@ if command -v script >/dev/null 2>&1; then
     for banned in "(sub)" "(auto)"; do
       printf '%s\n%s\n%s\n' "${startup}" "${continuing}" "${complete}" | grep -qF "${banned}" && { echo "  ✗ footer leaks telemetry: ${banned}"; vfail=1; }
     done
-    [ "${vfail}" -eq 0 ] && echo "  ✓ native PTY renders working + completed Vinci frames cleanly" || fails=$((fails + 1))
+    [ "${vfail}" -eq 0 ] && echo "  ✓ native PTY renders working + completed Vinci frames cleanly after $((SECONDS - visual_started))s" || fails=$((fails + 1))
   else
     echo "  ✗ native PTY capture failed:"
     sed -n '1,12p' "${visual_dir}/capture.log" | sed 's/^/      /'
     fails=$((fails + 1))
   fi
   find "${visual_dir}" -mindepth 1 -delete && rmdir "${visual_dir}"
+  if [ "${fails}" -eq "${visual_fails_before}" ]; then
+    record_group_pass native-pty
+  fi
+  fi
 else
   echo "  ⚠ skipped — 'script' (PTY) not available on this system"
 fi
 
 echo
 echo "── SMOKE (real CLI, headless) ────────────────────────"
-if [ "${VINCI_SKIP_SMOKE:-0}" = "1" ]; then
+if [ "${VINCI_TEST_LIST_GROUPS:-0}" = "1" ]; then
+  return 0
+elif [ "${VINCI_SKIP_SMOKE:-0}" = "1" ]; then
   echo "  ⚠ skipped — VINCI_SKIP_SMOKE=1 (offline validation)."
 elif [ ! -f "${HOME}/.pi/agent/auth.json" ] || ! grep -q '"vinci"' "${HOME}/.pi/agent/auth.json" 2>/dev/null; then
   echo "  ⚠ skipped — not signed in (run 'vinci' then /login). Units still ran."
@@ -1005,6 +1087,24 @@ else
   done
   if [ "${toolok}" -eq 1 ]; then echo "  ✓ tools fire end-to-end (tool executed + correct answer)"; else echo "  ✗ tool-use failed 3× (last exit ${smoke_status}):"; echo "${out}" | tail -5 | sed 's/^/      /'; fails=$((fails + 1)); fi
 fi
+}
+
+# Listing uses the real group traversal and version conditions, with no build,
+# dependency resolution, package creation, PTY capture, or credential inspection.
+if [ "${VINCI_TEST_LIST_GROUPS:-0}" = "1" ]; then
+  VITEST_CLI=""
+  exec 3>&1
+  run_test_groups >/dev/null
+  exit "$?"
+fi
+if [ -n "${VINCI_TEST_GROUPS_FILE:-}" ]; then
+  if ! : >"${VINCI_TEST_GROUPS_FILE}"; then
+    echo "run.sh: cannot create group list \"${VINCI_TEST_GROUPS_FILE}\"; repair the artifact path and retry." >&2
+    exit 1
+  fi
+fi
+prepare_workspace
+run_test_groups
 
 echo
 if [ "${fails}" -eq 0 ]; then echo "✅ all test groups passed"; else echo "❌ ${fails} test group(s) failed"; fi

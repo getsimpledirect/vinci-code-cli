@@ -1,0 +1,468 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { globSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
+import { parseAllDocuments } from "yaml";
+import { checkTestShards } from "../scripts/check-test-shards.mjs";
+
+const root = fileURLToPath(new URL("../..", import.meta.url));
+const harness = readFileSync(resolve(root, "vinci/test/run.sh"), "utf8");
+const workflow = readFileSync(resolve(root, ".github/workflows/vinci-tests.yml"), "utf8");
+const expected = "alpha\nbeta\ngamma\ndelta\n";
+const shards = ["alpha\ndelta\n", "beta\n", "gamma\n"];
+const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
+
+function shell(text, environment = {}) {
+	const result = spawnSync("bash", ["-c", text], {
+		cwd: root,
+		env: { ...process.env, ...environment },
+		encoding: "utf8",
+		timeout: 30_000,
+	});
+	assert.ifError(result.error);
+	return result;
+}
+
+function parseWorkflow(source) {
+	// Core YAML 1.2 keeps workflow keys such as "on" as strings; merge keys preserve safe aliases.
+	const documents = parseAllDocuments(source, {
+		uniqueKeys: true, strict: true, schema: "core", version: "1.2",
+		customTags: [], merge: true, prettyErrors: true,
+	});
+	if (documents.length !== 1) throw new Error("workflow YAML must contain exactly one document");
+	const document = documents[0];
+	// Unknown tags are warnings in yaml; fail closed on warnings as well as syntax errors.
+	if (document.errors.length || document.warnings.length) throw document.errors[0] ?? document.warnings[0];
+	return document.toJS({ maxAliasCount: 100 });
+}
+
+function effectiveMatrix(matrix, eventName, draft) {
+	const evaluate = (value) => typeof value === "string" && value.startsWith("${{")
+		? runInNewContext(`(${value.slice(3, -2)})`, {
+			fromJSON: JSON.parse, github: { event_name: eventName, event: { pull_request: { draft } } },
+		}, { timeout: 1_000 }) : value;
+	const axes = Object.entries(matrix).filter(([key]) => key !== "include" && key !== "exclude");
+	let original = axes.length ? [{}] : [];
+	for (const [key, expression] of axes) {
+		const values = evaluate(expression);
+		assert.ok(Array.isArray(values), `matrix axis ${key} must evaluate to an array`);
+		original = original.flatMap((row) => values.map((value) => ({ ...row, [key]: value })));
+	}
+	const matches = (row, pattern) => Object.entries(pattern).every(([key, value]) => row[key] === value);
+	const exclude = evaluate(matrix.exclude ?? []);
+	const include = evaluate(matrix.include ?? []);
+	assert.ok(Array.isArray(exclude) && Array.isArray(include), "matrix include/exclude must be arrays");
+	original = original.filter((row) => !exclude.some((pattern) => matches(row, pattern)));
+	const expanded = original.map((row) => ({ ...row }));
+	const added = [];
+	for (const entry of include) {
+		let merged = false;
+		for (const [index, row] of original.entries()) {
+			if (Object.entries(entry).every(([key, value]) => !(key in row) || row[key] === value)) {
+				Object.assign(expanded[index], entry);
+				merged = true;
+			}
+		}
+		if (!merged) added.push({ ...entry });
+	}
+	return [...expanded, ...added];
+}
+
+function checkMatrices(source) {
+	const jobs = parseWorkflow(source).jobs;
+	for (const name of ["offline-shard", "offline"]) {
+		const matrix = jobs[name]?.strategy?.matrix;
+		assert.ok(matrix, `the ${name} matrix must exist`);
+		for (const [eventName, draft, nodes] of [
+			["pull_request", true, ["24"]],
+			["pull_request", false, ["22", "24"]],
+			["push", true, ["22", "24"]],
+			["merge_group", false, ["22", "24"]],
+		]) {
+			const rows = effectiveMatrix(matrix, eventName, draft);
+			assert.deepEqual([...new Set(rows.map((row) => row.node))], nodes,
+				`draft=${draft}, event=${eventName} must yield only ${nodes.join(",")}`);
+			if (name === "offline") assert.deepEqual(rows.map((row) => `offline (${Object.values(row).join(", ")})`),
+				nodes.map((node) => `offline (${node})`), "offline gate effective matrix must produce exactly its required check names");
+			const expectedRows = name === "offline" ? nodes.map((node) => ({ node }))
+				: nodes.flatMap((node) => [1, 2, 3].map((shard) => ({ node, shard })));
+			assert.deepEqual(rows, expectedRows,
+				`${name} effective matrix must match every expected node x shard combination`);
+		}
+	}
+}
+
+function gateStep() {
+	const gate = parseWorkflow(workflow).jobs.offline;
+	assert.ok(gate, "the required offline gate job must exist");
+	assert.deepEqual(gate.needs, ["offline-shard"], "offline gate must depend on all offline shards");
+	assert.equal(gate.if, "always()", "offline gate must run even when a shard fails");
+	assert.equal(gate.name, undefined, "offline gate must retain its automatic required-check names");
+	const rows = effectiveMatrix(gate.strategy.matrix, "pull_request", false);
+	assert.deepEqual(rows.map((row) => `offline (${Object.values(row).join(", ")})`), ["offline (22)", "offline (24)"],
+		"offline gate effective matrix must produce exactly its required check names");
+	const steps = gate.steps.filter((step) => step.name === "Require all offline shards to succeed");
+	assert.equal(steps.length, 1, "the gate job must contain exactly one dependency-result step");
+	const step = steps[0];
+	assert.equal(step.env?.SHARD_RESULT, "${{ needs.offline-shard.result }}",
+		"the gate step must bind SHARD_RESULT to its real dependency result");
+	assert.equal(typeof step.run, "string", "the gate step must execute its dependency-result script");
+	return step.run;
+}
+
+test("partition fixture passes; dropping or duplicating a group fails the same proof", () => {
+	assert.equal(checkTestShards(expected, shards), 4);
+	assert.throws(() => checkTestShards(expected, ["delta\n", ...shards.slice(1)]), /missing groups: "alpha"/);
+	assert.throws(() => checkTestShards(expected, [shards[0], "beta\nalpha\n", shards[2]]), /duplicate groups: "alpha"/);
+	assert.throws(() => checkTestShards(expected, [shards[0], shards[1], "gamma\nextra\n"]), /unexpected groups: "extra"/);
+	assert.throws(() => checkTestShards(expected, shards.slice(1)), /expected "3" shard lists/);
+	assert.throws(() => checkTestShards(expected, [shards[0], "", shards[2]]), /invalid or empty group list/);
+	assert.throws(() => checkTestShards(`${expected}alpha\n`, shards), /duplicate labels in "expected"/);
+});
+
+test("real CLI path rejects mutations and missing artifacts, while the noop stays reachable", () => {
+	const directory = mkdtempSync(join(tmpdir(), "test-shards-"));
+	try {
+		const expectedPath = join(directory, "expected.txt");
+		writeFileSync(expectedPath, expected);
+		const artifactDir = join(directory, "artifacts");
+		assert.equal(shell(`mkdir ${quote(artifactDir)}`).status, 0);
+		const invoke = () => spawnSync(process.execPath, [resolve(root, "vinci/scripts/check-test-shards.mjs"), expectedPath, artifactDir], {
+			encoding: "utf8", timeout: 30_000,
+		});
+		for (const [index, text] of shards.entries()) writeFileSync(join(artifactDir, `groups-${index + 1}.txt`), text);
+		assert.equal(invoke().status, 0);
+		writeFileSync(join(artifactDir, "groups-1.txt"), "delta\n");
+		assert.match(invoke().stderr, /missing groups: "alpha"/);
+		assert.equal(invoke().status, 1);
+		writeFileSync(join(artifactDir, "groups-1.txt"), shards[0]);
+		writeFileSync(join(artifactDir, "groups-2.txt"), "beta\nalpha\n");
+		assert.match(invoke().stderr, /duplicate groups: "alpha"/);
+		assert.equal(invoke().status, 1);
+		writeFileSync(join(artifactDir, "groups-2.txt"), shards[1]);
+		assert.equal(invoke().status, 0);
+		assert.equal(shell(`mv ${quote(join(artifactDir, "groups-3.txt"))} ${quote(join(artifactDir, "missing.txt"))}`).status, 0);
+		assert.match(invoke().stderr, /invalid shard artifacts/);
+		assert.equal(invoke().status, 1);
+	} finally {
+		assert.equal(shell(`find ${quote(directory)} -mindepth 1 -delete && rmdir ${quote(directory)}`).status, 0);
+	}
+});
+
+test("both real matrix expressions keep drafts at 24; unconditional matrix mutation fails", () => {
+	checkMatrices(workflow);
+	const mutant = workflow.replaceAll(/^        node: .+$/gm, `        node: \u0024{{ fromJSON('["22","24"]') }}`);
+	assert.throws(() => checkMatrices(mutant), /draft=true, event=pull_request must yield only 24/);
+});
+
+test("the gate's real shell step rejects failed, skipped and cancelled dependencies", () => {
+	const script = gateStep();
+	for (const result of ["success", "failure", "skipped", "cancelled"]) {
+		const run = shell(script, { SHARD_RESULT: result });
+		assert.equal(run.status, result === "success" ? 0 : 1);
+		if (result !== "success") assert.ok(run.stdout.includes(`Offline shards returned "${result}"`));
+	}
+});
+
+for (const [label, value] of [["missing", undefined], ["empty", ""], ["malformed", "success failure"], ["unknown", "unknown"]]) {
+	test(`the gate rejects ${label} dependency result`, () => {
+		const script = gateStep();
+		const run = value === undefined ? shell(`unset SHARD_RESULT\n${script}`) : shell(script, { SHARD_RESULT: value });
+		assert.equal(run.status, 1, `gate must reject ${label} dependency result`);
+		assert.ok(run.stdout.includes(`Offline shards returned "${value ?? ""}"`), `gate must diagnose ${label} dependency result`);
+		assert.equal(shell(script, { SHARD_RESULT: "success" }).status, 0, "the same gate must accept success");
+	});
+}
+
+test("run_group uses round-robin selection, times passing groups and preserves named failures", () => {
+	const helpers = harness.slice(harness.indexOf("GROUP_INDEX=0"), harness.indexOf("run_cli_supervised()"));
+	const calls = 'for label in alpha beta gamma delta epsilon; do run_group "$label" true; done';
+	const executed = [];
+	for (let shard = 1; shard <= 3; shard++) {
+		const result = shell(`set -uo pipefail\nfails=0\n${helpers}\nsupervise_group() { printf 'EXEC %s\\n' "$2"; }\n${calls}`, {
+			VINCI_TEST_SHARD: `${shard}/3`, VINCI_TEST_LIST_GROUPS: "0", VINCI_TEST_GROUPS_FILE: "",
+		});
+		assert.equal(result.status, 0, result.stderr);
+		const passed = [...result.stdout.matchAll(/✓ ([a-z]+): passed after \d+s/g)].map((match) => match[1]);
+		assert.deepEqual(passed, ["alpha", "beta", "gamma", "delta", "epsilon"].filter((_, index) => index % 3 === shard - 1));
+		executed.push(...passed);
+	}
+	assert.equal(new Set(executed).size, 5);
+	for (const [status, message] of [[9, "FAILED (exit 9)"], [124, "TIMED OUT"]]) {
+		const result = shell(`set -uo pipefail\nfails=0\n${helpers}\nsupervise_group() { return ${status}; }\nrun_group alpha true\nprintf 'fails=%s\\n' "$fails"`, {
+			VINCI_TEST_SHARD: "", VINCI_TEST_LIST_GROUPS: "0", VINCI_TEST_GROUPS_FILE: "",
+		});
+		assert.ok(result.stdout.includes(`alpha: ${message}`));
+		assert.ok(result.stdout.includes("fails=1"));
+	}
+	for (const shard of ["0/3", "4/3", "1/0", "bad", "01/3", "999999999999999999999/3"]) {
+		const result = shell(helpers, { VINCI_TEST_SHARD: shard });
+		assert.equal(result.status, 1);
+		assert.match(result.stderr, /invalid shard/);
+	}
+});
+
+test("list mode traverses the real harness before any build, package, PTY or smoke preflight", () => {
+	const result = spawnSync("bash", [resolve(root, "vinci/test/run.sh")], {
+		cwd: root,
+		env: { ...process.env, VINCI_TEST_LIST_GROUPS: "1", VINCI_TEST_SHARD: "", VINCI_TEST_GROUPS_FILE: "/unwritable/list" },
+		encoding: "utf8", timeout: 30_000,
+	});
+	assert.equal(result.status, 0, result.stderr);
+	const lines = result.stdout.trim().split("\n");
+	assert.ok(lines.includes("canonical-sweep"));
+	assert.ok(lines.includes("packaged-tarball"));
+	assert.ok(lines.includes("packaged-artifact-imports"));
+	assert.ok(lines.includes("ui-crew-status"));
+	assert.ok(lines.every((line) => /^[a-z0-9][a-z0-9-]*$/.test(line)));
+	assert.equal(lines.length, new Set(lines).size);
+});
+
+
+test("record_group_pass writes only selected successful groups and reports artifact write errors", () => {
+	const helpers = harness.slice(harness.indexOf("GROUP_INDEX=0"), harness.indexOf("run_cli_supervised()"));
+	const directory = mkdtempSync(join(tmpdir(), "test-shard-records-"));
+	try {
+		const labels = ["alpha", "beta", "gamma", "delta", "epsilon"];
+		for (let shard = 1; shard <= 3; shard++) {
+			const artifact = join(directory, `groups-${shard}.txt`);
+			writeFileSync(artifact, "");
+			const result = shell(`set -uo pipefail
+fails=0
+${helpers}
+supervise_group() { case "$3" in beta) return 9;; gamma) return 124;; esac; return 0; }
+for label in alpha beta gamma delta epsilon; do run_group "$label" true "$label"; done
+printf 'fails=%s\\n' "$fails"`, {
+				VINCI_TEST_SHARD: `${shard}/3`, VINCI_TEST_LIST_GROUPS: "0", VINCI_TEST_GROUPS_FILE: artifact,
+			});
+			assert.equal(result.status, 0, result.stderr);
+			const selected = labels.filter((_, index) => index % 3 === shard - 1);
+			const successful = selected.filter((label) => label !== "beta" && label !== "gamma");
+			assert.equal(readFileSync(artifact, "utf8"), successful.length ? `${successful.join("\n")}\n` : "",
+				`shard ${shard} must record only its successful groups`);
+			assert.ok(result.stdout.includes(`fails=${selected.length - successful.length}`),
+				"failed and timed out groups must increment the failure count");
+		}
+		const error = shell(`set -uo pipefail
+fails=0
+${helpers}
+supervise_group() { return 0; }
+run_group alpha true
+status=$?
+printf 'group_status=%s\\nfails=%s\\n' "$status" "$fails"`, {
+			VINCI_TEST_SHARD: "", VINCI_TEST_LIST_GROUPS: "0", VINCI_TEST_GROUPS_FILE: directory,
+		});
+		assert.equal(error.status, 0, error.stderr);
+		assert.match(error.stdout, /^group_status=1$/m, "artifact write errors must fail run_group");
+		assert.match(error.stdout, /^fails=1$/m, "artifact write errors must increment fails");
+		assert.ok(error.stderr.includes('cannot record group "alpha"'), "artifact write errors must name the group");
+		assert.ok(error.stderr.includes(`in "${directory}"`), "artifact write errors must name the artifact path");
+	} finally {
+		assert.equal(shell(`find ${quote(directory)} -mindepth 1 -delete && rmdir ${quote(directory)}`).status, 0);
+	}
+});
+
+for (const missingParent of [true, false]) {
+	test(`record_group_pass handles ${missingParent ? "a missing parent directory" : "an empty artifact path"}`, () => {
+		const helpers = harness.slice(harness.indexOf("GROUP_INDEX=0"), harness.indexOf("run_cli_supervised()"));
+		const directory = mkdtempSync(join(tmpdir(), "test-shard-path-"));
+		try {
+			const artifact = missingParent ? join(directory, "missing", "groups.txt") : "";
+			const run = shell(`set -uo pipefail
+fails=0
+${helpers}
+record_group_pass alpha
+status=$?
+printf 'record_status=%s\\nfails=%s\\n' "$status" "$fails"`, {
+				VINCI_TEST_SHARD: "", VINCI_TEST_LIST_GROUPS: "0", VINCI_TEST_GROUPS_FILE: artifact,
+			});
+			assert.equal(run.status, 0, run.stderr);
+			assert.match(run.stdout, new RegExp(`^record_status=${missingParent ? 1 : 0}$`, "m"),
+				missingParent ? "missing-parent artifact writes must fail" : "empty artifact path must disable recording successfully");
+			assert.match(run.stdout, new RegExp(`^fails=${missingParent ? 1 : 0}$`, "m"));
+			if (missingParent) {
+				assert.ok(run.stderr.includes('cannot record group "alpha"'));
+				assert.ok(run.stderr.includes(`in "${artifact}"`));
+			} else assert.equal(run.stderr, "", "disabled recording must not attempt an empty-path write");
+		} finally {
+			assert.equal(shell(`find ${quote(directory)} -mindepth 1 -delete && rmdir ${quote(directory)}`).status, 0);
+		}
+	});
+}
+
+for (const [label, source] of [
+	["duplicate key", "jobs: {}\njobs: {}\n"],
+	["custom tag", "jobs: !!python/object {}\n"],
+	["multiple documents", "jobs: {}\n---\njobs: {}\n"],
+	["malformed YAML", "jobs: [offline\n"],
+]) {
+	test(`parseWorkflow rejects ${label}`, () => {
+		assert.ok(parseWorkflow(workflow).jobs.offline, "valid workflow YAML must remain reachable");
+		assert.throws(() => parseWorkflow(source), Error, `parseWorkflow must reject ${label}`);
+	});
+}
+
+test("parseWorkflow resolves safe aliases and bounds alias expansion", () => {
+	assert.deepEqual(parseWorkflow("base: &base {node: 24}\njob: {<<: *base}\n").job, { node: 24 });
+	const source = "a: &a [one, two]\nb: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n" +
+		"c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\nd: [*c, *c]\n";
+	assert.throws(() => parseWorkflow(source), /alias count/i, "parseWorkflow must bound alias expansion");
+});
+
+for (const missing of [true, false]) {
+	test(`exactly-once checker rejects ${missing ? "a missing" : "an empty"} shard record file`, () => {
+		const directory = mkdtempSync(join(tmpdir(), "test-shard-disabled-"));
+		try {
+			const artifactDir = join(directory, "artifacts");
+			assert.equal(shell(`mkdir ${quote(artifactDir)}`).status, 0);
+			const expectedPath = join(directory, "expected.txt");
+			writeFileSync(expectedPath, expected);
+			for (const [index, text] of shards.entries()) writeFileSync(join(artifactDir, `groups-${index + 1}.txt`), text);
+			const invoke = () => spawnSync(process.execPath, [resolve(root, "vinci/scripts/check-test-shards.mjs"), expectedPath, artifactDir], {
+				encoding: "utf8", timeout: 30_000,
+			});
+			const complete = invoke();
+			assert.ifError(complete.error);
+			assert.equal(complete.status, 0, "complete record files must pass the same checker CLI");
+			assert.match(complete.stdout, /4 groups ran exactly once across 3 shards/);
+			const record = join(artifactDir, "groups-3.txt");
+			if (missing) assert.equal(shell(`mv ${quote(record)} ${quote(join(directory, "disabled.txt"))}`).status, 0);
+			else writeFileSync(record, "");
+			const disabled = invoke();
+			assert.ifError(disabled.error);
+			assert.equal(disabled.status, 1, `checker CLI must reject ${missing ? "missing" : "empty"} shard record file`);
+			assert.match(disabled.stderr, missing ? /invalid shard artifacts/ : /invalid or empty group list "shard 3"/);
+		} finally {
+			assert.equal(shell(`find ${quote(directory)} -mindepth 1 -delete && rmdir ${quote(directory)}`).status, 0);
+		}
+	});
+}
+
+test("offline gate dependency step cannot be skipped", () => {
+	const steps = parseWorkflow(workflow).jobs.offline.steps.filter((step) => step.name === "Require all offline shards to succeed");
+	assert.equal(steps.length, 1, "the dependency-result step must exist once");
+	assert.ok(steps[0].if === undefined || /^(?:always\(\)|\$\{\{\s*always\(\)\s*\}\})$/.test(steps[0].if),
+		"the dependency-result step must be unconditional or always()");
+});
+
+test("offline gate dependency step cannot tolerate failure", () => {
+	const steps = parseWorkflow(workflow).jobs.offline.steps.filter((step) => step.name === "Require all offline shards to succeed");
+	assert.equal(steps.length, 1, "the dependency-result step must exist once");
+	assert.equal(steps[0]["continue-on-error"], undefined, "the dependency-result step must not continue on error");
+});
+
+test("offline gate job cannot tolerate failure", () => {
+	assert.equal(parseWorkflow(workflow).jobs.offline["continue-on-error"], undefined, "the offline gate job must not continue on error");
+});
+
+test("offline proof and its prerequisites cannot skip or tolerate failure", () => {
+	const jobs = parseWorkflow(workflow).jobs;
+	for (const name of ["offline", "offline-shard", "check"]) {
+		const job = jobs[name];
+		assert.ok(job, `the ${name} job must exist`);
+		assert.ok(job.if === undefined || /^(?:always\(\)|\$\{\{\s*always\(\)\s*\}\})$/.test(job.if),
+			`the ${name} job must be unconditional or always()`);
+		assert.equal(job["continue-on-error"], undefined, `the ${name} job must not continue on error`);
+		for (const step of job.steps) {
+			const label = step.name ?? step.uses;
+			assert.ok(step.if === undefined || /^(?:always\(\)|\$\{\{\s*always\(\)\s*\}\})$/.test(step.if),
+				`the ${name} step ${label} must be unconditional or always()`);
+			assert.equal(step["continue-on-error"], undefined, `the ${name} step ${label} must not continue on error`);
+		}
+	}
+});
+
+
+test("offline execution uses the default shell at every level", () => {
+	const parsed = parseWorkflow(workflow);
+	for (const [label, scope] of [["workflow", parsed], ...["offline", "offline-shard"].map((name) => [name, parsed.jobs[name]])]) {
+		assert.equal(scope.shell, undefined, `${label} must not override shell`);
+		assert.equal(scope.defaults?.run?.shell, undefined, `${label} must not override defaults.run.shell`);
+		for (const step of scope.steps ?? []) {
+			const stepLabel = `${label} step ${step.name ?? step.uses}`;
+			assert.equal(step.shell, undefined, `${stepLabel} must not override shell`);
+			assert.equal(step.defaults?.run?.shell, undefined, `${stepLabel} must not override defaults.run.shell`);
+		}
+	}
+});
+
+test("offline proof step requires the list producer and checker", () => {
+	const steps = parseWorkflow(workflow).jobs.offline.steps.filter((step) => step.name === "Prove every group ran exactly once");
+	assert.equal(steps.length, 1, "the exactly-once proof step must exist once");
+	assert.match(steps[0].run ?? "", /^\s*VINCI_TEST_LIST_GROUPS=1 bash vinci\/test\/run\.sh >"\$\{EXPECTED_GROUPS\}"\s*$/m,
+		"the proof must invoke the list producer");
+	assert.match(steps[0].run, /^\s*node vinci\/scripts\/check-test-shards\.mjs "\$\{EXPECTED_GROUPS\}" "\$\{GROUPS_DIR\}"\s*$/m,
+		"the proof must invoke the checker with the produced list and downloaded records");
+});
+
+test("disk inventory maps offline test entrypoints to their harness groups", () => {
+	const fixture = JSON.parse(readFileSync(resolve(root, "vinci/test/shard-inventory-fixture.json"), "utf8"));
+	const files = globSync([
+		"vinci/test/*.{mjs,py}", "vinci/test/ui/*.test.mjs", "vinci/test/ec2/*-unit.mjs",
+		"vinci/containment-broker/test/*.test.mjs", "vinci/extensions/*.test.mjs",
+	], { cwd: root }).sort();
+	assert.ok(files.length > 0, "the disk inventory must discover test entrypoints");
+	for (const file of Object.keys(fixture.outsideHarness)) assert.ok(files.includes(file), `inventory exception ${file} must still exist`);
+	// Inspect command arguments, independently of the labels emitted by list mode. Join shell continuations first.
+	const commands = harness.replace(/\\\r?\n\s*/g, " ").replaceAll('"', "").match(/^\s*(?:if\s+)?run_group [^\n]+/gm) ?? [];
+	for (const file of files.filter((file) => !(file in fixture.outsideHarness))) {
+		const owners = commands.filter((command) => {
+			if (fixture.packagedReplays.includes(file) && command.includes("${packaged_dir}")) return false;
+			if (command.includes(file)) return true;
+			if (/^vinci\/test\/worker-[^/]+\.mjs$/.test(file)) return command.includes("node ${worker_test}") &&
+				harness.includes('for worker_test in "${ROOT}"/vinci/test/worker-*.mjs; do');
+			return file.startsWith("vinci/containment-broker/test/") && command.includes("vinci/containment-broker/test/*.test.mjs");
+		});
+		assert.equal(owners.length, 1, `${file} must map to exactly one run_group`);
+	}
+	for (const file of fixture.packagedReplays) assert.equal(commands.filter((command) => command.includes(file) && command.includes("${packaged_dir}")).length,
+		1, `${file} must retain its separate packaged replay`);
+});
+
+for (const [label, malformed] of [["uppercase", "Alpha"], ["underscore", "bad_label"]]) {
+	test(`checker CLI rejects ${label} record labels`, () => {
+		const directory = mkdtempSync(join(tmpdir(), "test-shard-labels-"));
+		try {
+			const artifactDir = join(directory, "artifacts");
+			assert.equal(shell(`mkdir ${quote(artifactDir)}`).status, 0);
+			const expectedPath = join(directory, "expected.txt");
+			const invoke = () => spawnSync(process.execPath, [resolve(root, "vinci/scripts/check-test-shards.mjs"), expectedPath, artifactDir], {
+				encoding: "utf8", timeout: 30_000,
+			});
+			writeFileSync(expectedPath, expected);
+			for (const [index, text] of shards.entries()) writeFileSync(join(artifactDir, `groups-${index + 1}.txt`), text);
+			const control = invoke();
+			assert.ifError(control.error);
+			assert.equal(control.status, 0, "valid labels must pass the same checker CLI");
+			assert.match(control.stdout, /4 groups ran exactly once across 3 shards/);
+			// Keep the partition identical: a permissive validator cannot rely on a missing/unexpected-label error.
+			for (const malformedExpected of [true, false]) {
+				writeFileSync(expectedPath, malformedExpected ? expected.replace("alpha", malformed) : expected);
+				writeFileSync(join(artifactDir, "groups-1.txt"), shards[0].replace("alpha", malformed));
+				const invalid = invoke();
+				assert.ifError(invalid.error);
+				assert.equal(invalid.status, 1, `checker CLI must reject ${label} labels`);
+				assert.match(invalid.stderr, new RegExp(`invalid or empty group list "${malformedExpected ? "expected" : "shard 1"}"`));
+			}
+		} finally {
+			assert.equal(shell(`find ${quote(directory)} -mindepth 1 -delete && rmdir ${quote(directory)}`).status, 0);
+		}
+	});
+}
+
+test("offline shard records are bound and missing uploads fail", () => {
+	const steps = parseWorkflow(workflow).jobs["offline-shard"].steps;
+	const harnessSteps = steps.filter((step) => step.name === "Full Vinci test harness (Node ${{ matrix.node }})");
+	assert.equal(harnessSteps.length, 1, "the shard must have exactly one harness step");
+	assert.equal(harnessSteps[0].env?.VINCI_TEST_GROUPS_FILE, "${{ runner.temp }}/groups-${{ matrix.shard }}.txt",
+		"the shard must bind VINCI_TEST_GROUPS_FILE to its artifact path");
+	const uploads = steps.filter((step) => step.name === "Upload successful group labels");
+	assert.equal(uploads.length, 1, "the shard must have exactly one record upload");
+	assert.equal(uploads[0].uses, "actions/upload-artifact@v4", "the shard must upload its records");
+	assert.equal(uploads[0].with?.path, harnessSteps[0].env.VINCI_TEST_GROUPS_FILE, "the upload must consume the bound record path");
+	assert.equal(uploads[0].with?.["if-no-files-found"], "error", "the upload must fail when its record file is absent");
+});

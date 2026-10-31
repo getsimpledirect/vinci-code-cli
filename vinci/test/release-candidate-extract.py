@@ -17,7 +17,14 @@ import zipfile
 ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('candidate_extract',ROOT/'vinci/scripts/extract-release-candidate.py')
 module=importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+# Import caches belong to this test, never beside the runtime/build source.
+with tempfile.TemporaryDirectory(prefix='vinci-candidate-import-') as cache:
+    previous_cache_prefix=sys.pycache_prefix
+    try:
+        sys.pycache_prefix=cache
+        spec.loader.exec_module(module)
+    finally:
+        sys.pycache_prefix=previous_cache_prefix
 SHA=lambda raw:hashlib.sha256(raw).hexdigest()
 
 def files(version='0.0.58',source='a'*40):
