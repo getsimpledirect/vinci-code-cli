@@ -815,6 +815,32 @@ describe("session import preservation", () => {
 		expect(readFileSync(destination, "utf8")).toBe("retained session\n");
 	});
 
+	it("rejects a missing cwd before the switch hook runs or any destination is opened", async () => {
+		const hookTargets: string[] = [];
+		const { runtime, incoming, root, sessionDir } = await fixture({
+			extension: (pi) => {
+				pi.on("session_before_switch", (event) => {
+					hookTargets.push(event.targetSessionFile!);
+				});
+			},
+		});
+		const source = incoming("incoming.jsonl", join(root, "missing-cwd"));
+		const actualOpen = fs.openSync;
+		const destinationOpens: string[] = [];
+		vi.spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+			if (typeof path === "string" && path.startsWith(sessionDir) && flags === "wx") destinationOpens.push(path);
+			return actualOpen(path, flags, mode);
+		});
+		await expect(runtime.importFromJsonl(source)).rejects.toBeInstanceOf(MissingSessionCwdError);
+		expect(hookTargets, "session_before_switch ran before cwd validation").toEqual([]);
+		expect(destinationOpens, "a destination copy was created before cwd validation").toEqual([]);
+		// Positive control: the same spies observe the hook and the exclusive create on a valid import.
+		await runtime.importFromJsonl(source, root);
+		expect(hookTargets).toHaveLength(1);
+		expect(destinationOpens).toEqual([hookTargets[0]]);
+		expect(runtime.session.sessionFile).toBe(hookTargets[0]);
+	});
+
 	it.each(["direct", "symlink", "hardlink"])("resumes a same-file %s without copying", async (kind) => {
 		const { runtime, root, sessionDir } = await fixture();
 		const source = runtime.session.sessionFile!;
