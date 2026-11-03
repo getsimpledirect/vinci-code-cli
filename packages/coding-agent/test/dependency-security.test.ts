@@ -63,6 +63,9 @@ describe("reviewed Undici version floors", () => {
 		["packages/agent/node_modules/vitest", "4.1.11"],
 		["packages/ai/node_modules/@vitest/mocker", "4.1.11"],
 		["packages/agent/node_modules/@vitest/coverage-v8", "4.1.11"],
+		["node_modules/glob", "14.0.1"],
+		["node_modules/minimatch", "11.0.0"],
+		["node_modules/other/node_modules/minimatch", "11.0.0"],
 	]) {
 		it(`refuses affected ${version} at ${path}`, () => {
 			const result = checkVersion(path, version);
@@ -71,11 +74,17 @@ describe("reviewed Undici version floors", () => {
 			expect(result.stderr).toContain(`affected version "${version}"`);
 		});
 	}
-	it("refuses the affected Zod 3 major", () => {
-		const result = checkVersion("node_modules/other/node_modules/zod", "3.25.76");
-		expect(result.status).toBe(1);
-		expect(result.stderr).toContain('unreviewed version "3.25.76"');
-	});
+	for (const [name, version] of [
+		["zod", "3.25.76"],
+		["glob", "13.0.6"],
+		["minimatch", "10.2.5"],
+	]) {
+		it(`refuses the affected ${name} major at ${version}`, () => {
+			const result = checkVersion(`node_modules/other/node_modules/${name}`, version);
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain(`unreviewed version "${version}"`);
+		});
+	}
 });
 
 // Exercise both installed consumers; the parser fixtures are bounded and use no network.
