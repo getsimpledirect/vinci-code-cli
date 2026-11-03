@@ -20,7 +20,11 @@ const lockJsonFiles = [];
 // https://github.com/advisories/GHSA-587h-7wmj-h5pm
 // https://github.com/advisories/GHSA-82fw-gwwq-j7x9
 // https://github.com/advisories/GHSA-qxg6-89mg-rqv8
+// https://github.com/advisories/GHSA-3g3m-2fjr-6pw4
+// https://github.com/advisories/GHSA-g3hv-75wg-m249
 const securityVersions = {
+	glob: { 14: "14.0.2" },
+	minimatch: { 11: "11.0.1" },
 	"brace-expansion": { 1: "1.1.21", 5: "5.0.12" },
 	"shell-quote": { 1: "1.11.0" },
 	undici: { 6: "6.29.1", 7: "7.30.1", 8: "8.12.2" },
