@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { parse } from "yaml";
+import { downloadPolicy } from "../scripts/release-candidate-download.mjs";
 import { digest, envelope, etag, makeRecord, repository, repositoryId, stageJobName, validateActivation, validatePolicy, validateProducer, workflowPath } from "../scripts/release-candidate.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -16,7 +17,7 @@ const fixtureVerifier = (_algorithm, bytes, key, signature) => key.toString() ==
 function fixture() {
   const now = Date.now(), created = now - 7200000;
   const event = { repository, repositoryId, source: "a".repeat(40), tag: "vinci-v0.0.58", ref: "refs/tags/vinci-v0.0.58", eventName: "push", operation: "candidate", runId: "101", runAttempt: "1" };
-  const policyRaw = JSON.stringify({ schemaVersion: 1, owner: "thegeorgepu", environment: "vinci-release", protectedApprovalReviewed: true, tagOidcTrustReviewed: true, stagingExposureAndCostsApproved: true, retentionApproved: true, confirmedAt: new Date(created - 60000).toISOString(), expiresAt: new Date(now + 86400000).toISOString(), maxCandidateHours: 168, maxQaHours: 1, candidateRetentionDays: 14, receiptRetentionDays: 90 });
+  const policyRaw = JSON.stringify({ schemaVersion: 1, owner: "thegeorgepu", environment: "vinci-release", protectedApprovalReviewed: true, tagOidcTrustReviewed: true, stagingExposureAndCostsApproved: true, retentionApproved: true, confirmedAt: new Date(created - 60000).toISOString(), expiresAt: new Date(now + 86400000).toISOString(), maxCandidateHours: 168, maxQaHours: 1, candidateRetentionDays: 14, receiptRetentionDays: 90, artifactDownloadHosts: ["cdn.example.invalid"] });
   const archive = Buffer.from("SYNTHETIC archive bytes, not a product package\n");
   const signed = { schemaVersion: 1, updaterSchemaVersion: 1, sequence: 44, channel: "beta", version: "0.0.58", minimumVersion: "0.0.09", mandatory: false, publishedAt: new Date(created).toISOString(), artifact: { url: "https://vinci-assets.s3.ca-central-1.amazonaws.com/vinci-code/vinci-code-0.0.58.tgz", sha256: digest(archive), size: archive.length } };
   const baseline = { ...signed, sequence: 43, version: "0.0.57" };
@@ -41,6 +42,57 @@ function changeRecord(f, change) {
 function changeQa(f, change) {
   const value = JSON.parse(f.qaBytes); change(value); f.qaBytes = buffer(value); f.inputs.qaSha256 = digest(f.qaBytes);
 }
+function preflight(policyRaw) {
+  const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8", timeout: 10000 });
+  assert.equal(head.status, 0, head.stderr);
+  return spawnSync(process.execPath, [join(root, "vinci/scripts/release-candidate.mjs"), "preflight"], {
+    cwd: root, encoding: "utf8", timeout: 10000, env: { PATH: process.env.PATH, VINCI_SIGNED_QA_POLICY: policyRaw,
+      GITHUB_SHA: head.stdout.trim(), GITHUB_REPOSITORY: repository, GITHUB_REPOSITORY_ID: repositoryId,
+      GITHUB_REF: "refs/tags/vinci-v0.0.58", GITHUB_REF_NAME: "vinci-v0.0.58", GITHUB_EVENT_NAME: "push",
+      RELEASE_OPERATION: "candidate", GITHUB_RUN_ID: "101", GITHUB_RUN_ATTEMPT: "1" },
+  });
+}
+for (const [name, hosts] of [
+  ["absence of both lists", undefined], ["empty", []], ["wildcard", ["*.example.invalid"]], ["null", null], ["wrong type", "cdn.example.invalid"],
+  ["duplicate", ["cdn.example.invalid", "cdn.example.invalid"]], ["too many", Array.from({ length: 9 }, (_, n) => `cdn${n}.example.invalid`)],
+  ["IP address", ["127.0.0.1"]], ["local host", ["cdn.local"]], ["API host", ["api.github.com"]], ["URL", ["https://cdn.example.invalid"]],
+]) test(`Policy host parity refuses ${name} host policy before signing`, () => {
+  const f = fixture(), policy = JSON.parse(f.policyRaw);
+  if (hosts === undefined) { delete policy.artifactDownloadHosts; delete policy.artifactDownloadHostPatterns; }
+  else policy.artifactDownloadHosts = hosts;
+  const raw = JSON.stringify(policy); let message;
+  assert.throws(() => validatePolicy(raw, f.now), (error) => { message = error.message; return true; }, `validatePolicy must refuse ${name} host policy`);
+  assert.throws(() => downloadPolicy(raw, f.now), (error) => error.message === message, "Downloader must use the same refusal message");
+  const result = preflight(raw);
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stderr, `Release candidate refused: ${message}\n`);
+});
+test("Policy host parity accepts valid exact hosts in both validators and real preflight", () => {
+  const f = fixture();
+  assert.deepEqual(validatePolicy(f.policyRaw, f.now), downloadPolicy(f.policyRaw, f.now));
+  const result = preflight(f.policyRaw); assert.equal(result.status, 0, result.stderr);
+  const steps = workflow.jobs.publish.steps;
+  assert.ok(steps.findIndex((s) => s.id === "policy") < steps.findIndex((s) => s.id === "sign"));
+});
+for (const upgrade of ["PASS", "FAIL"]) test(`QA receipt CLI exact bytes: upgrade ${upgrade} is ${upgrade === "PASS" ? "accepted" : "refused"} by activation`, () => {
+  const f = fixture(), fields = JSON.parse(f.qaBytes), folder = mkdtempSync(join(tmpdir(), "vinci-qa-receipt-"));
+  try {
+    const path = join(folder, "qa-receipt.json");
+    const result = spawnSync(process.execPath, [join(root, "vinci/scripts/make-qa-receipt.mjs"),
+      "--candidate-receipt-sha256", fields.candidateReceiptSha256, "--manifest-sha256", fields.manifestSha256,
+      "--archive-sha256", fields.archiveSha256, "--source", fields.source, "--artifact-id", fields.artifactId,
+      "--completed-at", fields.completedAt, "--clean-install", "PASS", "--upgrade", upgrade, "--rollback", "PASS", "--output", path],
+      { encoding: "utf8", timeout: 10000 });
+    assert.equal(result.status, 0, result.stderr);
+    const bytes = readFileSync(path), lines = result.stdout.trim().split("\n");
+    assert.deepEqual(lines, [`sha256=${digest(bytes)}`, `base64=${bytes.toString("base64")}`]);
+    assert.deepEqual(Buffer.from(lines[1].slice(7), "base64"), bytes);
+    assert.deepEqual(JSON.parse(bytes), { ...fields, results: { ...fields.results, upgrade } });
+    f.qaBytes = bytes; f.inputs.qaSha256 = digest(bytes);
+    if (upgrade === "PASS") assert.equal(validateActivation(f).qaSha256, digest(bytes));
+    else assert.throws(() => validateActivation(f), (error) => error.code === "ERR_ASSERTION" && error.actual.upgrade === "FAIL" && error.expected.upgrade === "PASS");
+  } finally { rmSync(folder, { recursive: true }); }
+});
 test("Exact reviewed synthetic candidate produces only a conditional activation plan", () => {
   const f = fixture(), before = f.files["manifest-beta.json"];
   const plan = validateActivation(f);
@@ -135,12 +187,16 @@ test("Producer selection is verified before any candidate archive is read", () =
 });
 function shellFixture() {
   const folder = mkdtempSync(join(tmpdir(), "vinci-candidate-inert-"));
+  writeFileSync(join(folder, "package.json"), '{"type":"commonjs"}\n');
   mkdirSync(join(folder, "bin")); mkdirSync(join(folder, "release")); mkdirSync(join(folder, "activation")); mkdirSync(join(folder, "candidate"));
   const f = fixture();
-  for (const [name, bytes] of Object.entries(f.files)) writeFileSync(join(folder, "release", name), bytes);
+  for (const [name, bytes] of Object.entries(f.files)) {
+    writeFileSync(join(folder, "release", name), bytes); writeFileSync(join(folder, "candidate", name), bytes);
+  }
+  writeFileSync(join(folder, "candidate/candidate.json"), f.recordBytes);
   writeFileSync(join(folder, "activation/manifest-beta.json"), f.files["manifest-beta.json"]);
   const executable = join(folder, "bin/aws");
-  writeFileSync(executable, `#!${process.execPath}\nconst fs=require('node:fs'),crypto=require('node:crypto');const a=process.argv.slice(2);const b=a.includes('--body')?fs.readFileSync(a[a.indexOf('--body')+1]):Buffer.alloc(0);fs.appendFileSync(process.env.MOCK_CALLS,JSON.stringify({args:a,bodySha256:crypto.createHash('sha256').update(b).digest('hex')})+'\\n');if(process.env.MOCK_DENY==='1'||a.includes('--if-match')&&a[a.indexOf('--if-match')+1]!==process.env.MOCK_ETAG)process.exit(1);if(a[0]!=='s3api'||a[1]!=='put-object')process.exit(99);process.stdout.write('{}\\n');\n`);
+  writeFileSync(executable, `#!${process.execPath}\nconst fs=require('node:fs'),crypto=require('node:crypto');const a=process.argv.slice(2);const b=a.includes('--body')?fs.readFileSync(a[a.indexOf('--body')+1]):Buffer.alloc(0);fs.appendFileSync(process.env.MOCK_CALLS,JSON.stringify({args:a,bodySha256:crypto.createHash('sha256').update(b).digest('hex')})+'\\n');if(process.env.MOCK_DENY==='1'||a.includes('--if-match')&&a[a.indexOf('--if-match')+1]!==process.env.MOCK_ETAG)process.exit(1);if(a[0]==='s3'&&a[1]==='cp'){if(process.env.MOCK_FAIL_COPY==='1')process.exit(1);if(!a[3].startsWith('s3://'))fs.writeFileSync(a[3],process.env.MOCK_CORRUPT_INSTALLER==='1'?'changed installer':fs.readFileSync('candidate/install.sh'));process.exit(0);}if(a[0]!=='s3api'||a[1]!=='put-object')process.exit(99);process.stdout.write('{}\\n');\n`);
   chmodSync(executable, 0o755);
   const calls = join(folder, "calls.jsonl"); writeFileSync(calls, "");
   const env = { PATH: `${join(folder, "bin")}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: folder, TMPDIR: folder,
@@ -156,6 +212,64 @@ test("Actual stage write body issues ONLY two versioned conditional puts", () =>
     const calls = f.read(); assert.equal(calls.length, 2);
     assert.deepEqual(calls.map((c) => c.args[c.args.indexOf("--key") + 1]), ["vinci-code/vinci-code-0.0.58.tgz", "vinci-code/vinci-code-0.0.58.tgz.sha256"]);
     assert.ok(calls.every((c) => c.args[c.args.indexOf("--if-none-match") + 1] === "*"));
+  } finally { rmSync(f.folder, { recursive: true }); }
+});
+for (const [name, extra, expectedExit, count] of [
+  ["verified bytes", {}, 0, 2], ["changed remote installer", { MOCK_CORRUPT_INSTALLER: "1" }, 1, 2],
+  ["refused immutable upload", { MOCK_DENY: "1" }, 1, 1],
+]) test(`Actual pre-manifest installer staging: ${name}`, () => {
+  const f = shellFixture();
+  try {
+    const step = workflow.jobs.activate.steps.find((s) => s.name?.startsWith("Stage and verify immutable installer"));
+    const result = f.run(step, extra); assert.equal(result.status, expectedExit, result.stderr);
+    const calls = f.read(); assert.equal(calls.length, count);
+    assert.equal(calls[0].args[calls[0].args.indexOf("--key") + 1], "vinci-code/install-0.0.58.sh");
+    assert.equal(calls[0].args[calls[0].args.indexOf("--if-none-match") + 1], "*");
+    assert.equal(calls[0].bodySha256, digest(f.f.files["install.sh"]));
+    assert.ok(calls.every((c) => !c.args.includes("vinci-code/manifest-beta.json")));
+    if (extra.MOCK_CORRUPT_INSTALLER) assert.match(result.stderr, /Staged installer differs from the reviewed candidate/);
+    if (expectedExit === 0) assert.match(result.stdout, /Versioned installer verified: sha256/);
+  } finally { rmSync(f.folder, { recursive: true }); }
+});
+for (const failCopy of [false, true]) test(`Actual post-manifest copies use verified versioned objects: ${failCopy ? "failure exits non-zero" : "success"}`, () => {
+  const f = shellFixture();
+  try {
+    rmSync(join(f.folder, "release"), { recursive: true });
+    const step = workflow.jobs.activate.steps.find((s) => s.name?.startsWith("Publish retained tested installer"));
+    const result = f.run(step, { MOCK_FAIL_COPY: failCopy ? "1" : "0" });
+    assert.equal(result.status, failCopy ? 1 : 0, result.stderr);
+    assert.deepEqual(f.read().map((c) => c.args), [
+      ["s3", "cp", "s3://fixture-bucket/vinci-code/vinci-code-0.0.58.tgz", "s3://fixture-bucket/vinci-code/vinci-code.tgz"],
+      ...(!failCopy ? [["s3", "cp", "s3://fixture-bucket/vinci-code/install-0.0.58.sh", "s3://fixture-bucket/vinci-code/install.sh"]] : []),
+    ]);
+  } finally { rmSync(f.folder, { recursive: true }); }
+});
+test("Post-manifest recovery catches failed steps and continued notes failure after receipt retention", () => {
+  const steps = workflow.jobs.activate.steps, stage = steps.findIndex((s) => s.name?.startsWith("Stage and verify immutable installer"));
+  const activate = steps.findIndex((s) => s.id === "activate_manifest");
+  const recovery = steps.at(-1);
+  assert.ok(stage > steps.findIndex((s) => s.id === "reviewed") && stage < activate);
+  assert.ok(steps.findIndex((s) => s.name?.startsWith("Retain sanitized")) < steps.length - 1);
+  assert.match(recovery.if, /steps\.activate_manifest\.outcome == 'success'/);
+  assert.match(recovery.if, /failure\(\) \|\| steps\.public_notes\.outcome == 'failure'/);
+  assert.equal(steps.find((s) => s.id === "public_notes")["continue-on-error"], true);
+  const result = spawnSync("bash", ["-c", recovery.run], { encoding: "utf8", timeout: 10000 });
+  assert.equal(result.status, 1); assert.match(result.stdout, /vinci-rollback\.yml/);
+});
+test("Candidate identity summary prints the record and policy deadlines", () => {
+  const f = shellFixture();
+  try {
+    const record = JSON.parse(f.f.recordBytes), policy = JSON.parse(f.f.policyRaw), path = join(f.folder, "summary.txt");
+    const step = workflow.jobs.publish.steps.find((s) => s.name?.startsWith("Candidate identity"));
+    assert.equal(step.env.CANDIDATE_EXPIRES_AT, "${{ steps.record.outputs.expires_at }}");
+    assert.equal(step.env.POLICY_EXPIRES_AT, "${{ steps.record.outputs.policy_expires_at }}");
+    const result = f.run(step, { GITHUB_STEP_SUMMARY: path, RECEIPT_SHA256: digest(f.f.recordBytes),
+      MANIFEST_SHA256: digest(f.f.files["manifest-beta.json"]), CANDIDATE_ARTIFACT_ID: "301",
+      CANDIDATE_EXPIRES_AT: record.expiresAt, POLICY_EXPIRES_AT: policy.expiresAt });
+    assert.equal(result.status, 0, result.stderr);
+    const summary = readFileSync(path, "utf8");
+    assert.ok(summary.includes(`Candidate expiresAt: ${record.expiresAt}`));
+    assert.ok(summary.includes(`Policy expiresAt: ${policy.expiresAt}`));
   } finally { rmSync(f.folder, { recursive: true }); }
 });
 for (const [name, extra, mutate, expectedExit, calls] of [

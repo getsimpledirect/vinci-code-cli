@@ -7,6 +7,7 @@ import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { compileArtifactDownloadHostPattern, validateArtifactDownloadHostExclusions } from "./release-candidate-host-policy.mjs";
 import { eventFromEnv, repository, validatePolicy, validateProducer } from "./release-candidate.mjs";
 
 export const LIMITS = Object.freeze({ archiveBytes: 64 * 1024 * 1024, metadataBytes: 2 * 1024 * 1024, catalogEntries: 100, totalMs: 60000, extractionMs: 20000 });
@@ -37,23 +38,17 @@ export function selectArtifact(context, catalog, artifact = context.artifact, no
   return value;
 }
 export function downloadPolicy(raw, now = Date.now()) {
-  const policy = validatePolicy(raw, now);
-  const hosts = policy.artifactDownloadHosts;
-  assert.ok(Array.isArray(hosts) && hosts.length >= 1 && hosts.length <= 8, "Ops-reviewed artifact redirect hosts required");
-  assert.equal(new Set(hosts).size, hosts.length);
-  for (const host of hosts) {
-    assert.equal(typeof host, "string"); assert.ok(host.length <= 253);
-    assert.match(host, /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/);
-    assert.equal(isIP(host), 0); assert.ok(!host.endsWith(".localhost") && !host.endsWith(".local") && host !== "api.github.com");
-  }
-  return policy;
+  return validatePolicy(raw, now);
 }
 export function redirectTarget(value, policy) {
   assert.equal(typeof value, "string"); assert.ok(value.length <= 16384 && !/[\u0000-\u0020\u007f-\u009f\\]/.test(value), "Unsafe archive redirect");
   let url; try { url = new URL(value); } catch { throw Error("Invalid archive redirect"); }
   assert.equal(url.protocol, "https:"); assert.equal(url.username, ""); assert.equal(url.password, ""); assert.equal(url.hash, "");
   assert.ok(url.port === "" || url.port === "443");
-  assert.ok(policy.artifactDownloadHosts.includes(url.hostname), "Unapproved archive redirect host");
+  assert.equal(isIP(url.hostname), 0, "IP-literal archive redirect refused");
+  validateArtifactDownloadHostExclusions(url.hostname);
+  const patterns = (policy.artifactDownloadHostPatterns ?? []).map(compileArtifactDownloadHostPattern);
+  assert.ok((policy.artifactDownloadHosts ?? []).includes(url.hostname) || patterns.some((pattern) => pattern.test(url.hostname)), "Unapproved archive redirect host");
   return url.href;
 }
 async function bytes(response, maximum, signal) {

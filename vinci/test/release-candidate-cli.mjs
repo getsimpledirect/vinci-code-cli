@@ -50,7 +50,7 @@ function setup(command, variant) {
     archive = syntheticArchive(folder, bytes);
   }
   const bytes = readFileSync(archive), version = "0.0.57", now = Date.now(), created = now - 1000;
-  const policyRaw = JSON.stringify({ schemaVersion: 1, owner: "thegeorgepu", environment: "vinci-release", protectedApprovalReviewed: true, tagOidcTrustReviewed: true, stagingExposureAndCostsApproved: true, retentionApproved: true, confirmedAt: new Date(now - 60000).toISOString(), expiresAt: new Date(now + 86400000).toISOString(), maxCandidateHours: 168, maxQaHours: 24, candidateRetentionDays: 14, receiptRetentionDays: 90 });
+  const policyRaw = JSON.stringify({ schemaVersion: 1, owner: "thegeorgepu", environment: "vinci-release", protectedApprovalReviewed: true, tagOidcTrustReviewed: true, stagingExposureAndCostsApproved: true, retentionApproved: true, confirmedAt: new Date(now - 60000).toISOString(), expiresAt: new Date(now + 86400000).toISOString(), maxCandidateHours: 168, maxQaHours: 24, candidateRetentionDays: 14, receiptRetentionDays: 90, artifactDownloadHosts: ["cdn.example.invalid"] });
   const event = { repository, repositoryId, source: provenance.sourceCommit, tag: `vinci-v${version}`, ref: `refs/tags/vinci-v${version}`, eventName: "push", operation: "candidate", runId: "101", runAttempt: "1" };
   const signed = { schemaVersion: 1, updaterSchemaVersion: 1, sequence: 44, channel: "beta", version, minimumVersion: "0.0.09", mandatory: false, publishedAt: new Date(created).toISOString(), artifact: { url: `https://vinci-assets.s3.ca-central-1.amazonaws.com/vinci-code/vinci-code-${version}.tgz`, sha256: digest(bytes), size: bytes.length } };
   const files = { [`vinci-code-${version}.tgz`]: bytes, [`vinci-code-${version}.tgz.sha256`]: Buffer.from(`${digest(bytes)}  vinci-code-${version}.tgz\n`), "vinci-code.tgz": bytes, "install.sh": Buffer.from("synthetic retained installer, never run\n"), "manifest-beta.json": wrap(signed), "live-before.json": wrap({ ...signed, sequence: 43, version: "0.0.56" }), "live-before.headers": Buffer.from('HTTP/2 200\r\nETag: "baseline-one"\r\n\r\n') };
@@ -84,7 +84,12 @@ for (const command of ["record", "verify-activation"]) for (const variant of ["r
       if (["realistic", "at-bound"].includes(variant)) {
         assert.equal(result.status, 0, result.stderr); assert.ok(existsSync(output));
         const value = JSON.parse(readFileSync(output));
-        if (command === "record") { assert.equal(value.source, provenance.sourceCommit); assert.equal(value.tree, provenance.sourceTree); }
+        if (command === "record") {
+          assert.equal(value.source, provenance.sourceCommit); assert.equal(value.tree, provenance.sourceTree);
+          const outputs = readFileSync(join(f.folder, "outputs.txt"), "utf8");
+          assert.ok(outputs.includes(`expires_at=${value.expiresAt}\n`));
+          assert.ok(outputs.includes(`policy_expires_at=${JSON.parse(f.env.VINCI_SIGNED_QA_POLICY).expiresAt}\n`));
+        }
         else { assert.equal(value.manifestSha256, digest(f.files["manifest-beta.json"])); assert.equal(digest(readFileSync(join(f.folder, "activation/manifest-beta.json"))), value.manifestSha256); }
       } else {
         assert.equal(result.status, 1); assert.equal(existsSync(output), false);
@@ -116,6 +121,7 @@ test("Provenance bound agrees with existing workflow, independently of envelope/
 const rollback = parse(readFileSync(join(root, ".github/workflows/vinci-rollback.yml"), "utf8"));
 function rollbackFixture(mode) {
   const folder = mkdtempSync(join(tmpdir(), "vinci-rollback-inert-"));
+  writeFileSync(join(folder, "package.json"), '{"type":"commonjs"}\n');
   for (const name of ["bin", "release", "receipt"]) mkdirSync(join(folder, name));
   const target = json({ signed: { version: "0.0.57", sequence: 44 }, signature: "INERT" });
   writeFileSync(join(folder, "release/manifest-beta.json"), target);
