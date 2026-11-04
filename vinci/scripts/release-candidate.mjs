@@ -5,6 +5,8 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateArtifactDownloadHosts } from "./release-candidate-host-policy.mjs";
+export { validateArtifactDownloadHost, validateArtifactDownloadHosts } from "./release-candidate-host-policy.mjs";
 
 export const repository = "getsimpledirect/vinci-code-cli";
 export const repositoryId = "1345288037";
@@ -42,6 +44,7 @@ export function validatePolicy(raw, now = Date.now()) {
     assert.ok(Number.isSafeInteger(policy[key]) && policy[key] >= low && policy[key] <= high, `Invalid ${key}`);
   }
   assert.ok(policy.maxCandidateHours <= policy.candidateRetentionDays * 24, "Retention shorter than candidate authorization");
+  validateArtifactDownloadHosts(policy);
   return { ...policy, sha256: digest(raw) };
 }
 export function validateEvent(event, operation) {
@@ -240,6 +243,7 @@ function main(command) {
     const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`);
     writeFileSync("candidate/candidate.json", bytes, { flag: "wx" });
     output("receipt_sha256", digest(bytes)); output("manifest_sha256", digest(files["manifest-beta.json"]));
+    output("expires_at", record.expiresAt); output("policy_expires_at", policy.expiresAt);
     return;
   }
   assert.equal(command, "verify-activation");

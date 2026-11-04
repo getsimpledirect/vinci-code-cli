@@ -355,8 +355,10 @@ jobs:
           RECEIPT_SHA256: ${{ steps.record.outputs.receipt_sha256 }}
           MANIFEST_SHA256: ${{ steps.record.outputs.manifest_sha256 }}
           CANDIDATE_ARTIFACT_ID: ${{ steps.retained.outputs.artifact-id }}
+          CANDIDATE_EXPIRES_AT: ${{ steps.record.outputs.expires_at }}
+          POLICY_EXPIRES_AT: ${{ steps.record.outputs.policy_expires_at }}
         run: |
-          printf 'Signed candidate retained. NOT ACTIVATED.\nReceipt SHA256: %s\nManifest SHA256: %s\nArtifact ID: %s\n' "$RECEIPT_SHA256" "$MANIFEST_SHA256" "$CANDIDATE_ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Signed candidate retained. NOT ACTIVATED.\nReceipt SHA256: %s\nManifest SHA256: %s\nArtifact ID: %s\nCandidate expiresAt: %s\nPolicy expiresAt: %s\n' "$RECEIPT_SHA256" "$MANIFEST_SHA256" "$CANDIDATE_ARTIFACT_ID" "$CANDIDATE_EXPIRES_AT" "$POLICY_EXPIRES_AT" >> "$GITHUB_STEP_SUMMARY"
 
   activate:
     name: Activate reviewed signed candidate
@@ -415,7 +417,25 @@ jobs:
       - name: Require exact owner-reviewed candidate, QA receipt and unchanged baseline
         id: reviewed
         run: node vinci/scripts/release-candidate.mjs verify-activation
+      - name: Stage and verify immutable installer bytes before the manifest write
+        env:
+          VERSION: ${{ steps.reviewed.outputs.version }}
+        run: |
+          set -euo pipefail
+          aws s3api put-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/install-${VERSION}.sh" \
+            --body candidate/install.sh --if-none-match "*" > activation/staged-installer-put.json
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/install-${VERSION}.sh" activation/staged-install.sh
+          node --input-type=module <<'EOF'
+          import assert from "node:assert/strict";
+          import { readFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          const record = JSON.parse(readFileSync("candidate/candidate.json"));
+          const staged = createHash("sha256").update(readFileSync("activation/staged-install.sh")).digest("hex");
+          assert.equal(staged, record.files["install.sh"], "Staged installer differs from the reviewed candidate");
+          console.log(`Versioned installer verified: sha256 ${staged}`);
+          EOF
       - name: Activate the reviewed manifest with a single conditional write
+        id: activate_manifest
         env:
           LIVE_ETAG: ${{ steps.reviewed.outputs.live_etag }}
           EXPECTED_MANIFEST_SHA256: ${{ steps.reviewed.outputs.manifest_sha256 }}
@@ -434,7 +454,7 @@ jobs:
                --body activation/manifest-beta.json --content-type application/json --if-match "$LIVE_ETAG"; then
             echo "Exact reviewed signed candidate activated."
           else
-            echo "::error::Conditional activation failed or its outcome is uncertain. Inspect the live manifest before retrying; never refresh ETag or re-sign automatically."
+            echo '::error::Conditional activation outcome is "UNRESOLVED". Inspect the live manifest before retrying; use vinci-rollback.yml for an authorized rollback if it was activated.'
             exit 1
           fi
       - name: Verify exact live bytes before publishing public entry points
@@ -449,8 +469,8 @@ jobs:
           set -euo pipefail
           mkdir release
           cp "candidate/vinci-code-${VERSION}.tgz" "candidate/vinci-code-${VERSION}.tgz.sha256" candidate/manifest-beta.json release/
-          aws s3 cp candidate/vinci-code.tgz "s3://$S3_BUCKET/$S3_PREFIX/vinci-code.tgz"
-          aws s3 cp candidate/install.sh "s3://$S3_BUCKET/$S3_PREFIX/install.sh"
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/vinci-code-${VERSION}.tgz" "s3://$S3_BUCKET/$S3_PREFIX/vinci-code.tgz"
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/install-${VERSION}.sh" "s3://$S3_BUCKET/$S3_PREFIX/install.sh"
       - name: GitHub Release with the shipped artifacts
         env:
           VERSION: ${{ steps.reviewed.outputs.version }}
@@ -472,11 +492,11 @@ jobs:
             release/manifest-beta.json
 
       # Publish user-facing notes to the PUBLIC tracker, where people who don't have access to this
-      # repository can read them. Deliberately last, and deliberately unable to fail the release: by
-      # this point the signed artifacts are uploaded and the release is cut, so a notes problem must
-      # never undo shipping. The step no-ops with an explanation when the notes file or the token is
-      # missing. See vinci/release-notes/README.md.
+      # repository can read them. A failure cannot undo the manifest write; the final recovery
+      # step makes incomplete publication fail the job even when this step continues.
+      # See vinci/release-notes/README.md.
       - name: Public release notes
+        id: public_notes
         continue-on-error: true
         env:
           VERSION: ${{ steps.reviewed.outputs.version }}
@@ -485,8 +505,8 @@ jobs:
           PUBLIC_REPO: getsimpledirect/vinci-code-releases
         run: |
           set -uo pipefail
-          # This step is continue-on-error, so failing here is LOUD but never blocks a release:
-          # the signed artifacts are already uploaded by this point. It previously exited 0 on
+          # Continue to receipt retention on failure, then fail with a recovery message.
+          # The signed artifacts are already uploaded by this point. It previously exited 0 on
           # every skip path, which made "published nothing" indistinguishable from "published".
           # Thirty releases reported success while getsimpledirect/vinci-code-releases stayed
           # empty, because PUBLIC_RELEASES_TOKEN was never configured and nobody could see that
@@ -538,3 +558,9 @@ jobs:
             candidate-artifact.json
           if-no-files-found: warn
           retention-days: ${{ steps.policy.outputs.receipt_retention_days }}
+
+      - name: Fail incomplete activation with an explicit recovery route
+        if: ${{ !cancelled() && steps.activate_manifest.outcome == 'success' && (failure() || steps.public_notes.outcome == 'failure') }}
+        run: |
+          echo '::error::Activation completion is "INCOMPLETE" after the manifest write. Inspect the live manifest and retained receipt; follow vinci/RELEASE-ACTIVATION-RISK.md and use vinci-rollback.yml for an authorized rollback before retrying.'
+          exit 1
