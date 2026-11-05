@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { getDocsPath } from "../config.ts";
+import { getSandboxRecoveryGuidance } from "./sandbox-guidance.ts";
 
 const UNKNOWN_PROVIDER = "unknown";
 
@@ -16,17 +17,8 @@ export type VinciRecoveryGuidance = {
 
 /** Observed error categories only; this guidance never starts a retry or changes provider/account. */
 export function getVinciRecoveryGuidance(errorMessage: string, provider?: string): VinciRecoveryGuidance {
-	if (
-		/scoped sandbox|no enforceable OS sandbox|sandbox(?:-| )(?:backend|startup|refus|deni|disabled)|bubblewrap cannot|\bbwrap\b.*(?:failed|error|not permitted)/i.test(
-			errorMessage,
-		)
-	) {
-		return {
-			kind: "sandbox",
-			nextStep:
-				"Check the sandbox backend and denied path. Keep confinement enabled; authorize extra scope only for an intended change.",
-		};
-	}
+	const sandbox = getSandboxRecoveryGuidance(errorMessage);
+	if (sandbox) return { kind: "sandbox", nextStep: sandbox.nextStep };
 	if (
 		/\b403\b|forbidden|access denied|permission denied|operation not permitted|\b(?:EACCES|EPERM)\b/i.test(
 			errorMessage,
@@ -101,7 +93,11 @@ export function getVinciRecoveryGuidance(errorMessage: string, provider?: string
 
 /** Preserve the failure as data and append one Vero next step; no saved-progress or success claim. */
 export function formatVinciRecoveryMessage(errorMessage: string, provider?: string): string {
-	return `${errorMessage}\n\nVero: ${getVinciRecoveryGuidance(errorMessage, provider).nextStep}`;
+	const diagnostic = errorMessage.replace(
+		"Install bubblewrap or set VINCI_NO_SANDBOX=1 as an explicit developer bypass.",
+		"Check the sandbox prerequisites before retrying.",
+	);
+	return `${diagnostic}\n\nVero: ${getVinciRecoveryGuidance(errorMessage, provider).nextStep}`;
 }
 
 export function getProviderLoginHelp(): string {
