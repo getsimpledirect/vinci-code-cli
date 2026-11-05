@@ -1,5 +1,7 @@
 # Quickstart
 
+For Vinci Code, use the repository's [installation](../../../README.md#installation) and [quick start](../../../README.md#quick-start). This page describes upstream Pi and its npm package.
+
 This page gets you from install to a useful first pi session.
 
 ## Install
