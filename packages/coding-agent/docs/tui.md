@@ -90,19 +90,22 @@ Without this propagation, typing with an IME (Chinese, Japanese, Korean, etc.) w
 
 ```typescript
 pi.on("session_start", async (_event, ctx) => {
-  const handle = ctx.ui.custom(myComponent);
-  // handle.requestRender() - trigger re-render
-  // handle.close() - restore normal UI
+  await ctx.ui.custom<void>((_tui, _theme, _keybindings, done) =>
+    new MyDialog({ onClose: () => done(undefined) })
+  );
 });
 ```
 
-**In custom tools** via `pi.ui.custom()`:
+`custom()` receives a component factory and returns a promise for its result. Wire the component's completion callback to `done(result)` to close it. The factory receives `tui`, which provides `requestRender()` for state changes.
+
+**In custom tools** via the execution context's `ctx.ui.custom()`:
 
 ```typescript
-async execute(toolCallId, params, onUpdate, ctx, signal) {
-  const handle = pi.ui.custom(myComponent);
-  // ...
-  handle.close();
+async execute(toolCallId, params, signal, onUpdate, ctx) {
+  await ctx.ui.custom<void>((_tui, _theme, _keybindings, done) =>
+    new MyDialog({ onClose: () => done(undefined) })
+  );
+  return { content: [{ type: "text", text: "Dialog closed" }] };
 }
 ```
 
@@ -376,22 +379,22 @@ pi.registerCommand("pick", {
   description: "Pick an item",
   handler: async (args, ctx) => {
     const items = ["Option A", "Option B", "Option C"];
-    const selector = new MySelector(items);
-    
-    let handle: { close: () => void; requestRender: () => void };
-    
-    await new Promise<void>((resolve) => {
-      selector.onSelect = (item) => {
-        ctx.ui.notify(`Selected: ${item}`, "info");
-        handle.close();
-        resolve();
+    const result = await ctx.ui.custom<string | undefined>((tui, _theme, _keybindings, done) => {
+      const selector = new MySelector(items);
+      selector.onSelect = (item) => done(item);
+      selector.onCancel = () => done(undefined);
+      return {
+        render: (width) => selector.render(width),
+        invalidate: () => selector.invalidate(),
+        handleInput: (data) => {
+          selector.handleInput(data);
+          tui.requestRender();
+        },
       };
-      selector.onCancel = () => {
-        handle.close();
-        resolve();
-      };
-      handle = ctx.ui.custom(selector);
     });
+    if (result !== undefined) {
+      ctx.ui.notify(`Selected: ${result}`, "info");
+    }
   }
 });
 ```
@@ -486,7 +489,7 @@ class CachedComponent {
 }
 ```
 
-Call `invalidate()` when state changes, then `handle.requestRender()` to trigger re-render.
+Call `invalidate()` when state changes, then `tui.requestRender()` using the `tui` passed to the component factory.
 
 ## Invalidation and Theme Changes
 
