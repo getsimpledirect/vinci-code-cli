@@ -8,12 +8,15 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createJiti } from "jiti/static";
+import "./blocked-status.mjs";
+import "./required-operations-integration.mjs";
+import "./plan-refusal-outcome.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ext = await import(join(here, "..", "extensions", "vinci-outcome.ts"));
 const { OUTCOME_SYSTEM, explainForUser } = ext;
 const register = ext.default;
-const loader = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
+const loader = createJiti(import.meta.url, { moduleCache: false, fsCache: false, tryNative: false });
 const receipt = await loader.import(resolve(here, "../extensions/vinci-receipt.ts"), { default: false });
 const verification = await loader.import(resolve(here, "../extensions/lib/verification-state.ts"), { default: false });
 const printMode = await loader.import(resolve(here, "../../packages/coding-agent/src/modes/print-mode.ts"), {
@@ -123,9 +126,11 @@ ok("prompt keeps it short", /under ~?60 words/i.test(OUTCOME_SYSTEM));
       assistant("The destructive command was blocked, so no files changed."),
     ]);
     assert.deepEqual(
-      [blockedBash.outcome.state, blockedBash.outcome.reason, blockedBash.exitCode],
-      ["DONE", "No files changed: the attempted change did not go through.", 0],
+      [blockedBash.outcome.state, blockedBash.exitCode],
+      ["BLOCKED", 3],
     );
+
+    assert.match(blockedBash.outcome.reason, /Required bash operation.*rm implementation\.ts.*Vinci paused this action before it ran/);
 
     const done = await run([assistant("The requested read-only task is complete.")]);
     assert.deepEqual(
@@ -147,4 +152,4 @@ ok("prompt keeps it short", /under ~?60 words/i.test(OUTCOME_SYSTEM));
 }
 
 console.log(`outcome-integration: ${pass}/${pass + fail} passed`);
-process.exit(fail ? 1 : 0);
+process.exitCode = fail || process.exitCode ? 1 : 0;

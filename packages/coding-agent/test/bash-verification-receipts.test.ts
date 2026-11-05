@@ -89,8 +89,18 @@ describe("observed Bash completion metadata", () => {
 				timeout: 10,
 			});
 			expect(result.content).toEqual([{ type: "text", text: "(no output)" }]);
-			expect(result.details?.execution).toEqual({ exitCode: 0, cwd: harness.tempDir, originalCommand: true });
-			expect(Object.keys(result.details?.execution ?? {}).sort()).toEqual(["cwd", "exitCode", "originalCommand"]);
+			expect(result.details?.execution).toEqual({
+				exitCode: 0,
+				cwd: harness.tempDir,
+				originalCommand: true,
+				nonOriginalReasons: [],
+			});
+			expect(Object.keys(result.details?.execution ?? {}).sort()).toEqual([
+				"cwd",
+				"exitCode",
+				"nonOriginalReasons",
+				"originalCommand",
+			]);
 		},
 	);
 
@@ -105,7 +115,12 @@ describe("observed Bash completion metadata", () => {
 		const harness = await fixture();
 		vi.stubEnv("VINCI_CODE", "0");
 		const result = await createBashTool(harness.tempDir).execute("signal", { command: "kill -TERM $$", timeout: 10 });
-		expect(result.details?.execution).toEqual({ exitCode: null, cwd: harness.tempDir, originalCommand: true });
+		expect(result.details?.execution).toEqual({
+			exitCode: null,
+			cwd: harness.tempDir,
+			originalCommand: true,
+			nonOriginalReasons: [],
+		});
 	});
 
 	for (const [name, options] of [
@@ -120,7 +135,7 @@ describe("observed Bash completion metadata", () => {
 				command: diffCommand,
 				timeout: 10,
 			});
-			expect(result.details?.execution).toEqual({ exitCode: 0, cwd: harness.tempDir, originalCommand: false });
+			expect(result.details?.execution).toMatchObject({ exitCode: 0, cwd: harness.tempDir, originalCommand: false });
 		});
 	}
 
@@ -131,7 +146,40 @@ describe("observed Bash completion metadata", () => {
 		const result = await createBashTool(harness.tempDir, {
 			spawnHook: (context) => ({ ...context, cwd: child }),
 		}).execute("cwd", { command: "pwd", timeout: 10 });
-		expect(result.details?.execution).toEqual({ exitCode: 0, cwd: child, originalCommand: false });
+		expect(result.details?.execution).toEqual({
+			exitCode: 0,
+			cwd: child,
+			originalCommand: false,
+			nonOriginalReasons: ["spawnHook"],
+		});
+	});
+
+	test("non-original reasons agree with the original-command flag for every condition", async () => {
+		vi.stubEnv("VINCI_CODE", "0");
+		const harness = await fixture();
+		const operations = { exec: async () => ({ exitCode: 0 }) };
+		const spawnHook = (context: Parameters<NonNullable<BashToolOptions["spawnHook"]>>[0]) => context;
+		for (const [options, reasons] of [
+			[{}, []],
+			[{ operations }, ["operations"]],
+			[{ commandPrefix: "true" }, ["commandPrefix"]],
+			[{ spawnHook }, ["spawnHook"]],
+			[{ shellPath: "/bin/bash" }, ["shellPath"]],
+			[
+				{ operations, commandPrefix: "true", spawnHook, shellPath: "/bin/bash" },
+				["operations", "commandPrefix", "spawnHook", "shellPath"],
+			],
+		] satisfies Array<[BashToolOptions, string[]]>) {
+			const result = await createBashTool(harness.tempDir, options).execute("reasons", { command: "true" });
+			const execution = result.details?.execution;
+			expect(
+				execution?.nonOriginalReasons,
+				"Every substitution condition must have exactly one ordered reason.",
+			).toEqual(reasons);
+			expect(execution?.originalCommand, "The original-command flag must agree with the absence of reasons.").toBe(
+				execution?.nonOriginalReasons.length === 0,
+			);
+		}
 	});
 });
 

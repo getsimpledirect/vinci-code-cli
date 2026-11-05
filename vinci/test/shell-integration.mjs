@@ -83,7 +83,7 @@ shell.default({
     handlers.set(eventName, handler);
   },
 });
-const emit = async (eventName, event, context) => {
+const emit = async (eventName, event, context = shellContext) => {
   const handler = handlers.get(eventName);
   assert.equal(typeof handler, "function", `${eventName} handler must be registered`);
   await handler(event, context);

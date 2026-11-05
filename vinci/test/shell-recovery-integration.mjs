@@ -1,13 +1,14 @@
 // Source fixture: actual registered shell consumer, explicit Jiti src/index alias, no provider calls.
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { TUI } from "@earendil-works/pi-tui";
 import { createJiti } from "jiti/static";
 
 const sourceIndex = fileURLToPath(new URL("../../packages/coding-agent/src/index.ts", import.meta.url));
 const loader = createJiti(import.meta.url, {
-  moduleCache: false, tryNative: false,
+  moduleCache: false, fsCache: false, tryNative: false,
   alias: { "@earendil-works/pi-coding-agent": sourceIndex },
 });
 const shell = await loader.import(fileURLToPath(new URL("../extensions/vinci-shell.ts", import.meta.url)));
@@ -23,6 +24,8 @@ const context = {
   ui: { setWorkingVisible() {}, setFooter() {}, setTitle() {}, setEditorComponent() {} },
 };
 let passed = 0;
+let toolSequence = 0;
+const toolCallId = () => `shell-tool-${++toolSequence}`;
 const check = (name, condition) => { assert.ok(condition, name); passed++; console.log(`  ✓ ${name}`); };
 const emit = async (name, event) => { await handlers.get(name)(event, context); };
 const start = async () => { state.resetVinciUiState(); await emit("session_start", {}); };
@@ -56,26 +59,45 @@ try {
   }
 
   await start();
-  const blockedWrite = { toolName: "write", input: { path: "owned.txt" }, isError: true, content: [{ type: "text", text: "Vinci could not write inside its scoped sandbox: denied path." }] };
+  const blockedWrite = { toolCallId: toolCallId(), toolName: "write", input: { path: "owned.txt", content: "owned" }, isError: true, content: [{ type: "text", text: "Vinci could not write inside its scoped sandbox: denied path." }] };
   await emit("tool_result", blockedWrite);
   await emit("agent_start", {});
   await emit("message_end", message("stop"));
   check("a provider answer and new activity cannot clear a failed sandbox write", state.getVinciUiState().blockingReason.includes("scoped sandbox"));
-  await emit("tool_result", { toolName: "write", input: { path: "other.txt" }, isError: false, content: [] });
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "write", input: { path: "other.txt", content: "owned" }, isError: false, content: [] });
   check("writing another target cannot clear the denied target", !!state.getVinciUiState().blockingReason);
-  await emit("tool_result", { toolName: "read", input: { path: "owned.txt" }, isError: false, content: [] });
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "read", input: { path: "owned.txt" }, isError: false, content: [] });
   check("reading the denied write target does not prove write remediation", !!state.getVinciUiState().blockingReason);
-  await emit("tool_result", { toolName: "write", input: { path: "owned.txt" }, isError: false, content: [] });
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "write", input: { path: "owned.txt", content: "owned" }, isError: false, content: [] });
   check("a successful write to the denied target clears its own blocker", !state.getVinciUiState().blockingReason);
 
   await start();
+  await emit("tool_result", blockedWrite);
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "write", input: { path: "owned.txt", content: "different request" }, isError: false, content: [] });
+  check("a different mutation of the same path cannot clear the required write", !!state.getVinciUiState().blockingReason);
+  await emit("tool_result", { toolName: "write", input: { path: "owned.txt", content: "owned" }, isError: false, content: [] });
+  check("a missing result ID cannot attest that the required write recovered", !!state.getVinciUiState().blockingReason);
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "write", input: { path: "owned.txt", content: "owned" }, content: [{ type: "text", text: "No changes: validation failed." }] });
+  check("a soft write failure cannot clear the required mutation", !!state.getVinciUiState().blockingReason);
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "write", input: { path: resolve(context.cwd, "owned.txt"), content: "owned" }, isError: false, content: [] });
+  check("an absolute-path equivalent retry clears a relative-path write failure", !state.getVinciUiState().blockingReason);
+
+
+  await start();
+  const repeatedId = toolCallId();
+  await emit("tool_result", { toolCallId: repeatedId, toolName: "write", input: { path: "first.txt", content: "first" }, isError: false, content: [] });
+  check("a valid first result is not blocked before an ID is reused", !state.getVinciUiState().blockingReason);
+  await emit("tool_result", { toolCallId: repeatedId, toolName: "write", input: { path: "second.txt", content: "second" }, isError: false, content: [] });
+  check("reusing a successful result ID for a different operation cannot attest its completion", !!state.getVinciUiState().blockingReason);
+
+  await start();
   const input = { command: "printf bounded-fixture" };
-  await emit("tool_result", { toolName: "bash", input, isError: true, content: [{ type: "text", text: "Sandbox backend refused the command." }] });
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "bash", input, isError: true, content: [{ type: "text", text: "Sandbox backend refused the command." }] });
   for (const execution of [undefined, { exitCode: null, originalCommand: true, cwd: context.cwd }, { exitCode: 0, originalCommand: false, cwd: context.cwd }, { exitCode: 0, originalCommand: true }]) {
-    await emit("tool_result", { toolName: "bash", input, isError: false, content: [], details: { execution } });
+    await emit("tool_result", { toolCallId: toolCallId(), toolName: "bash", input, isError: false, content: [], details: { execution } });
     check("an unknown, signalled or substituted Bash result does not clear sandbox refusal", !!state.getVinciUiState().blockingReason);
   }
-  await emit("tool_result", { toolName: "bash", input, isError: false, content: [], details: { execution: { exitCode: 0, originalCommand: true, cwd: context.cwd } } });
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "bash", input, isError: false, content: [], details: { execution: { exitCode: 0, originalCommand: true, cwd: context.cwd } } });
   check("a measured original-command Bash exit zero clears its own sandbox refusal", !state.getVinciUiState().blockingReason);
 
   await start();
@@ -110,6 +132,12 @@ try {
   };
   state.resetVinciUiState();
   await handlers.get("session_start")({}, renderContext);
+  const renderTool = async (event) => handlers.get("tool_result")(event, renderContext);
+  const renderedEditor = () => stripVTControlCharacters(editor.render(120).join("\n"));
+  await renderTool(blockedWrite);
+  check("the actual live editor displays a structured required-operation failure", renderedEditor().includes("BLOCKED"));
+  await renderTool({ toolCallId: toolCallId(), toolName: "write", input: { path: resolve(context.cwd, "owned.txt"), content: "owned" }, isError: false, content: [] });
+  check("the actual live editor clears after an equivalent absolute-path retry", !renderedEditor().includes("BLOCKED"));
   for (const [connection, label] of [
     ["signed-in", "auth saved"],
     ["connected", "connected"],

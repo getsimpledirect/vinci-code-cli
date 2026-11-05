@@ -20,6 +20,7 @@ import { vinciVerificationDisabled } from "./lib/verification-control.ts";
 import { getVinciCrewStatus } from "./lib/crew-status.ts";
 import { VINCI_BILLING_URL } from "./vinci-links.ts";
 import { closeCompletedQaAllowance } from "./lib/qa-allowance.ts";
+import { vinciCarriesOperations, type VinciRequiredOperation } from "./lib/required-operations.ts";
 import {
   buildVinciTaskOutcome,
   classifyVinciLocalTaskState,
@@ -84,7 +85,7 @@ export function getLatestRemoteVerdict(): RemoteIssuedAcceptanceVerdict | undefi
 /** Pure display decision for D10 (wave5.md decision 4): a non-staled remote
  *  verdict overrides the local outcome; a staled one adds context only. */
 export function remoteVerdictDisplay(
-  outcome: Readonly<Pick<VinciTaskOutcome, "state" | "reason" | "hardStop">>,
+  outcome: Readonly<Pick<VinciTaskOutcome, "state" | "reason" | "hardStop" | "requiredOperations">>,
   remoteVerdict?: Readonly<{ status?: string; staled?: boolean; summary?: string }>,
 ): { state: string; reason: string } {
   let displayState: string = outcome.state;
@@ -92,7 +93,7 @@ export function remoteVerdictDisplay(
   // [#5/#6, review BLOCK-5] A BLOCKED that a hard stop forced is a fact about THIS session's
   // ability to finish; a remote VERIFIED_PASS speaks to the snapshot it verified, not to the
   // commit the harness refused. The verdict may sit alongside, the state stays BLOCKED.
-  if (outcome.hardStop && outcome.state === "BLOCKED") {
+  if ((outcome.hardStop || outcome.requiredOperations?.length) && outcome.state === "BLOCKED") {
     if (remoteVerdict && !remoteVerdict.staled && remoteVerdict.summary) {
       displayReason = `${outcome.reason}\nRemote verification reported: ${remoteVerdict.summary}`;
     }
@@ -457,6 +458,12 @@ export default function (pi: ExtensionAPI) {
   let dialogStartedAt = 0;
   let dialogDurationMs = 0;
   let instrumentedUI: ExtensionContext["ui"] | undefined;
+  let continuingRequest = false;
+  let priorOperations: readonly VinciRequiredOperation[] = [];
+
+  pi.on("before_agent_start", (event, ctx) => {
+    continuingRequest = vinciCarriesOperations(event.prompt, (latestOutcome(ctx)?.requiredOperations?.length ?? 0) > 0);
+  });
 
   // Bug #7: all extension permission/select/input dialogs share this UI object. Wrapping EVERY
   // user-input primitive present on it (select/confirm/input plus editor/custom when the host exposes
@@ -522,6 +529,8 @@ export default function (pi: ExtensionAPI) {
     dialogStartedAt = 0;
     dialogDurationMs = 0;
     setVinciTaskOutcome(restored);
+    continuingRequest = true;
+    priorOperations = restored?.requiredOperations ?? [];
     if (!restored || !ctx.hasUI || !showReceipt(restored)) return;
     // Display-only downgrade (the persisted outcome record is untouched): when a later turn was
     // interrupted mid-mutation, the restored "✓ Done" belongs to the PREVIOUS turn and would sit
@@ -543,6 +552,9 @@ export default function (pi: ExtensionAPI) {
     dialogDurationMs = 0;
     instrumentDialogs(ctx);
     clear(ctx);
+    priorOperations = continuingRequest ? latestOutcome(ctx)?.requiredOperations ?? [] : [];
+    // An internal continuation has no new prompt; the next submitted request resets this flag.
+    continuingRequest = true;
     setVinciTaskOutcome(undefined);
   });
 
@@ -565,6 +577,8 @@ export default function (pi: ExtensionAPI) {
       changedFiles: changedFiles(event.messages, ctx.cwd, treeBaseline),
       verification: getVinciVerificationState(),
       activeDurationMs: priorActiveDurationMs,
+      priorOperations,
+      cwd: ctx.cwd,
     });
     // [#199] An outcome may never claim "no changes" while the SESSION's own tree delta says
     // otherwise. The outcome is rebuilt per turn but the run persists only the LAST one: a
@@ -649,7 +663,7 @@ export default function (pi: ExtensionAPI) {
     // the exit code answers a script, so it takes whichever of local and remote is more
     // conservative: a remote pass can never report success on a run whose own check failed (#22
     // laundering, #127 exit contract), and a remote block still blocks a locally-clean run.
-    const localState = classifyVinciLocalTaskState(event.messages, outcome.changedFiles, getVinciVerificationState()).state;
+    const localState = classifyVinciLocalTaskState(event.messages, outcome.changedFiles, getVinciVerificationState(), outcome.requiredOperations ?? []).state;
     const blocks = (state: string) => state === "BLOCKED" || state === "WAITING";
     if (blocks(outcome.state) || blocks(localState)) {
       ctx.declareHeadlessExitHint?.(3);

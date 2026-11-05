@@ -55,6 +55,7 @@ export interface BashToolDetails {
 		exitCode: number | null;
 		cwd: string;
 		originalCommand: boolean;
+		nonOriginalReasons: ("operations" | "commandPrefix" | "spawnHook" | "shellPath")[];
 	};
 }
 
@@ -469,6 +470,12 @@ export function createBashToolDefinition(
 							// The native sandbox wraps this same command. Extension backends/setup may
 							// substitute what ran, so their result cannot attest to the paired tool call.
 							originalCommand: !options?.operations && !commandPrefix && !spawnHook && !options?.shellPath,
+							nonOriginalReasons: [
+								...(options?.operations ? ["operations" as const] : []),
+								...(commandPrefix ? ["commandPrefix" as const] : []),
+								...(spawnHook ? ["spawnHook" as const] : []),
+								...(options?.shellPath ? ["shellPath" as const] : []),
+							],
 						},
 					},
 				};

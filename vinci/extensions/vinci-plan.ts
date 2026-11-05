@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { getVinciAutomationStop, sendVinciControl } from "./lib/control.ts";
+import { VINCI_PLAN_FILE_REFUSAL, VINCI_PLAN_HEADLESS_REFUSAL, VINCI_PLAN_CHANGE_REFUSAL } from "./lib/required-operations.ts";
 import { setVinciMode, type VinciMode } from "./lib/ui-state.ts";
 
 let mode: VinciMode = "auto";
@@ -241,7 +242,7 @@ export default function (pi: ExtensionAPI) {
         "vinci-plan-file-block",
         "Keep the plan in Vinci's plan UI. Do not create a plan file unless the user explicitly asks to save one. Continue planning and call present_plan when ready.",
       );
-      return { block: true, reason: "Plan mode keeps plans in Vinci instead of writing project files." };
+      return { block: true, reason: VINCI_PLAN_FILE_REFUSAL };
     }
     const wantsToChange =
       MUTATING_TOOLS.has(event.toolName) ||
@@ -249,7 +250,7 @@ export default function (pi: ExtensionAPI) {
     if (!wantsToChange) return undefined;
     if (!ctx.hasUI) {
       sendVinciControl(pi, "vinci-plan-headless-block", PLAN_BLOCK);
-      return { block: true, reason: "Plan mode kept the project unchanged; no approval UI is available." };
+      return { block: true, reason: VINCI_PLAN_HEADLESS_REFUSAL };
     }
     const ok = await ctx.ui.confirm("Vinci — ready to build?", "Vinci has a plan and wants to start making changes. Switch to Auto and build it now?");
     if (ok) {
@@ -260,7 +261,7 @@ export default function (pi: ExtensionAPI) {
       return undefined; // let this change through — we're in Auto now
     }
     sendVinciControl(pi, "vinci-plan-block", PLAN_BLOCK);
-    return { block: true, reason: "Plan mode kept the project unchanged." };
+    return { block: true, reason: VINCI_PLAN_CHANGE_REFUSAL };
   });
 
   // Steer the model to plan (not build) while in Plan mode.
