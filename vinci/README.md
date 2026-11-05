@@ -145,8 +145,10 @@ or rewrites the archive. Dispatching either workflow requires its own authorizat
   current state, and refuses to blindly replay an interrupted shell command. `/task-info` shows the
   current task ID and recovery status.
 - **Finishes with an explicit state and meter** — changed work ends as `DONE` only with the required
-  direct verification, `DONE-UNVERIFIED` when code changed without it, `WAITING` for a named user
-  decision, or `BLOCKED` with the concrete reason. The durable task record includes model calls,
+  direct verification, `DONE-UNVERIFIED` when code changed without it, or `WAITING` for a named user
+  decision when no required operation remains unresolved. An unresolved required operation is
+  `BLOCKED`, naming the operation and target, even when the closing reply asks for a go-ahead.
+  The durable task record includes model calls,
   active duration, input/output/cache tokens, provider/model provenance, and a clearly labeled local
   cost estimate. `/usage` shows it again; `vinci report-wrong <task-id>` records a false completion
   locally; Account → Usage in a Vinci app remains authoritative for account credits.
@@ -201,7 +203,10 @@ and report the changed files." `/agents` opens helper status and reviewed change
 Press **Escape** to abort active work. Use `/task-info` to record the task ID, then
 `vinci resume <task-id>` to reopen an interrupted task. Ctrl+C clears the editor; pressing it twice
 quits. Read the final receipt: `DONE` requires the required verification, `DONE-UNVERIFIED` records
-unverified changes, `WAITING` names a needed decision, and `BLOCKED` gives the stopping reason.
+unverified changes, and `WAITING` names a needed decision with no unresolved required operation.
+An unresolved required operation stays `BLOCKED` even if Vinci asks what to do next. The receipt
+and `/usage` show “Waiting for you” for `WAITING` and “Stopped — needs you” for `BLOCKED`; the editor
+shows the state name. See [verification states and continuation](docs/verification.md).
 
 ## Run it
 

@@ -77,7 +77,8 @@ do not invent behavioral mutation evidence.
 
 Use the existing [verification states](verification.md): `DONE` needs required
 direct verification; `DONE-UNVERIFIED` records changed code without it; `WAITING`
-names a needed decision; `BLOCKED` records a concrete stop. Failed checks stay
+names a needed decision with no unresolved required operation. An unresolved required
+operation is `BLOCKED`, even when the agent asks for a go-ahead. Failed checks stay
 failed until repaired and checked again; later edits make old evidence stale.
 Label measured facts, attributed reports, and inference separately. Unknown stays
 unknown, and a skipped check is not qualification.
