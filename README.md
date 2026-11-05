@@ -33,8 +33,8 @@ keys through `/other`.<br/>Same guard rails either way.
 **Vinci Code is a distribution of [Pi](https://pi.dev)** — a thin fork of the
 [Pi agent harness](https://github.com/badlogic/pi-mono) (MIT) by
 [Mario Zechner](https://github.com/badlogic), maintained under
-[SimpleDirect®](https://www.getsimpledirect.com) by Alpine Pacific Trading Inc. Pi's engine
-and packages are kept intact; Vinci adds an additive layer on top. Provenance, including the
+[SimpleDirect®](https://www.getsimpledirect.com) by Alpine Pacific Trading Inc. Pi's
+package structure is retained; Vinci adds extensions and integration patches. Provenance, including the
 exact upstream commit this forked from, is in [`UPSTREAM.md`](UPSTREAM.md).
 
 <div align="center">
@@ -104,7 +104,7 @@ Layout, the branch model, and the patch inventory: [`vinci/README.md`](vinci/REA
 
 ```
 vinci-code-cli/
-├── packages/           # upstream Pi — kept intact
+├── packages/           # Pi packages and Vinci integration patches
 │   ├── ai/             # unified multi-provider LLM API
 │   ├── agent/          # agent runtime: tool calling and state
 │   ├── coding-agent/   # the coding agent CLI
@@ -122,9 +122,10 @@ vinci-code-cli/
 └── .github/workflows/  # CI, tests, benchmarks, signed release
 ```
 
-Everything under `packages/` is upstream Pi. Everything Vinci adds lives in `vinci/`, plus a
-small number of `vinci-*` files inside `packages/`. That seam is what keeps upstream syncs
-cheap, and it is the first thing to know before contributing.
+`packages/` contains the Pi harness and Vinci integration patches, including changes to
+existing upstream files. Most Vinci-specific code lives in `vinci/`, with additional
+`vinci-*` modules and marked integration patches inside `packages/`. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the layer and patch conventions before contributing.
 
 Extension-by-extension detail, the patch inventory and the branch model → **[`vinci/README.md`](vinci/README.md)**
 

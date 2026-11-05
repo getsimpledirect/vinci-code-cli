@@ -16,7 +16,7 @@ Minimal terminal UI framework with differential rendering and synchronized outpu
 ## Quick Start
 
 ```typescript
-import { TUI, Text, Editor, ProcessTerminal, matchesKey } from "@earendil-works/pi-tui";
+import { TUI, Text, Editor, type EditorTheme, ProcessTerminal, matchesKey } from "@earendil-works/pi-tui";
 
 // Create terminal
 const terminal = new ProcessTerminal();
@@ -27,7 +27,18 @@ const tui = new TUI(terminal);
 // Add components
 tui.addChild(new Text("Welcome to my app!"));
 
-import { defaultEditorTheme as editorTheme } from './test/test-themes.ts';
+// A plain theme keeps this example independent of repository test helpers.
+const plain = (text: string) => text;
+const editorTheme: EditorTheme = {
+  borderColor: plain,
+  selectList: {
+    selectedPrefix: plain,
+    selectedText: plain,
+    description: plain,
+    scrollInfo: plain,
+    noMatch: plain,
+  },
+};
 const editor = new Editor(tui, editorTheme);
 editor.onSubmit = (text) => {
   console.log("Submitted:", text);
@@ -104,7 +115,7 @@ const handle = tui.showOverlay(component, {
   margin: { top: 1, right: 2, bottom: 1, left: 2 },
 
   // Responsive visibility
-  visible: (termWidth, termHeight) => termWidth >= 100  // Hide on narrow terminals
+  visible: (termWidth, termHeight) => termWidth >= 100, // Hide on narrow terminals
 
   // Focus behavior
   nonCapturing: true       // Don't auto-focus when shown
@@ -758,7 +769,7 @@ class CachedComponent implements Component {
 
 ## Example
 
-See `test/chat-simple.ts` for a complete chat interface example with:
+From `packages/tui` in a source checkout, see `test/chat-simple.ts` for a complete chat interface example with:
 - Markdown messages with custom background colors
 - Loading spinner during responses
 - Editor with autocomplete and slash commands
@@ -773,12 +784,13 @@ npx tsx test/chat-simple.ts
 
 ```bash
 # Install dependencies (from monorepo root)
-npm install
+npm install --ignore-scripts
 
 # Run type checking
 npm run check
 
-# Run the demo
+# Run the demo from the TUI package
+cd packages/tui
 npx tsx test/chat-simple.ts
 ```
 
