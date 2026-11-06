@@ -8,9 +8,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createJiti } from "jiti/static";
-import "./blocked-status.mjs";
-import "./required-operations-integration.mjs";
-import "./plan-refusal-outcome.mjs";
+await import(new URL("./blocked-status.mjs", import.meta.url));
+await import(new URL("./required-operations-integration.mjs", import.meta.url));
+await import(new URL("./plan-refusal-outcome.mjs", import.meta.url));
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ext = await import(join(here, "..", "extensions", "vinci-outcome.ts"));

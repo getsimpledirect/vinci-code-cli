@@ -399,6 +399,21 @@ test("offline proof step requires the list producer and checker", () => {
 		"the proof must invoke the checker with the produced list and downloaded records");
 });
 
+test("inventory exceptions retain their outcome imports and hotkeys spawn", () => {
+	const outcome = readFileSync(resolve(root, "vinci/test/outcome-integration.mjs"), "utf8");
+	for (const file of ["blocked-status.mjs", "required-operations-integration.mjs", "plan-refusal-outcome.mjs"]) {
+		assert.doesNotMatch(outcome, new RegExp(`^import ["']\\./${file.replaceAll(".", "\\.")}["'];$`, "m"),
+			`${file} must not retain a static sibling import in vinci/test/outcome-integration.mjs`);
+		assert.match(outcome, new RegExp(`^await import\\(new URL\\(["']\\./${file.replaceAll(".", "\\.")}["'], import\\.meta\\.url\\)\\);$`, "m"),
+			`${file} inventory exception must be awaited by vinci/test/outcome-integration.mjs`);
+	}
+	assert.doesNotMatch(outcome, /\bPromise\.all\s*\(/,
+		"outcome fixtures must be awaited sequentially without Promise.all");
+	const hotkeys = readFileSync(resolve(root, "packages/coding-agent/test/vinci-hotkeys.test.ts"), "utf8");
+	assert.match(hotkeys, /spawnSync\(\s*process\.execPath,\s*\["--test",\s*fileURLToPath\(new URL\("\.\.\/\.\.\/\.\.\/vinci\/test\/unbound-hotkeys\.mjs",\s*import\.meta\.url\)\)\],/,
+		"unbound-hotkeys.mjs inventory exception must be spawned by packages/coding-agent/test/vinci-hotkeys.test.ts");
+});
+
 test("disk inventory maps offline test entrypoints to their harness groups", () => {
 	const fixture = JSON.parse(readFileSync(resolve(root, "vinci/test/shard-inventory-fixture.json"), "utf8"));
 	const files = globSync([
