@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, vinciMaskSecrets } from "@earendil-works/pi-coding-agent";
+import { vinciCheckpointPathFromInput as pathFromInput, vinciRecoveredMutationRefusal } from "./lib/required-operations.ts";
 import {
   formatVinciTaskDuration,
   formatVinciTaskUsage,
@@ -102,12 +103,6 @@ export function mutationFingerprint(toolName: TrackedTool, input: unknown): stri
     .update(`${toolName}\0${JSON.stringify(canonicalValue(input))}`)
     .digest("hex")
     .slice(0, 24);
-}
-
-function pathFromInput(input: unknown): string | undefined {
-  const record = objectRecord(input);
-  const value = record?.path ?? record?.file_path;
-  return typeof value === "string" && value.trim() ? value.trim().slice(0, 1000) : undefined;
 }
 
 function projectPath(cwd: string, input: unknown): string | undefined {
@@ -420,7 +415,7 @@ export default function (pi: ExtensionAPI) {
     if (recoveredMutation) {
       return {
         block: true,
-        reason: `This exact ${mutationLabel(recoveredMutation)} was recovered as already completed after the session interruption. Inspect its current state and continue without replaying it.`,
+        reason: vinciRecoveredMutationRefusal(recoveredMutation.record.toolName, recoveredMutation.input),
       };
     }
 

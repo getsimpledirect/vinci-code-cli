@@ -10,6 +10,18 @@ export function isVinciPlanRefusal(text: string, details: unknown): boolean {
     [VINCI_PLAN_FILE_REFUSAL, VINCI_PLAN_HEADLESS_REFUSAL, VINCI_PLAN_CHANGE_REFUSAL].includes(text);
 }
 
+export function vinciCheckpointPathFromInput(input: unknown): string | undefined {
+  const args = record(input);
+  const value = args?.path ?? args?.file_path;
+  return typeof value === "string" && value.trim() ? value.trim().slice(0, 1000) : undefined;
+}
+
+export function vinciRecoveredMutationRefusal(tool: string, input: unknown): string {
+  const path = vinciCheckpointPathFromInput(input);
+  const label = tool === "bash" ? "shell command" : path ? `${tool} ${path}` : `${tool} call`;
+  return `This exact ${label} was recovered as already completed after the session interruption. Inspect its current state and continue without replaying it.`;
+}
+
 function boundedReason(reason: string): string {
   return reason.replace(/\s+/g, " ").trim().slice(0, 200);
 }
@@ -61,7 +73,7 @@ export function vinciRequiredOperations(
   cwd = process.cwd(),
 ): VinciRequiredOperation[] {
   const pending = new Map(prior.map((operation) => [operation.key, operation]));
-  const calls = new Map<string, { operation: VinciRequiredOperation; order: number; pendingBefore?: VinciRequiredOperation; result?: string; ambiguous?: boolean }>();
+  const calls = new Map<string, { operation: VinciRequiredOperation; input: unknown; order: number; pendingBefore?: VinciRequiredOperation; result?: string; ambiguous?: boolean }>();
   const latestAttempt = new Map<string, number>();
   let serial = 0;
   for (const value of messages) {
@@ -74,7 +86,7 @@ export function vinciRequiredOperations(
         const tool = String(part.name);
         const order = ++serial;
         const args = record(part.arguments);
-        const rawTarget = tool === "bash" ? args?.command : args?.path;
+        const rawTarget = tool === "bash" ? args?.command : args?.path ?? args?.file_path;
         const validTarget = typeof rawTarget === "string" && rawTarget.trim().length > 0;
         const target = validTarget
           ? tool === "bash" ? rawTarget : resolve(cwd, rawTarget)
@@ -92,7 +104,7 @@ export function vinciRequiredOperations(
           previous.ambiguous = true;
           continue;
         }
-        calls.set(part.id, { operation, order, pendingBefore });
+        calls.set(part.id, { operation, input: part.arguments, order, pendingBefore });
       }
     }
     if (message.role !== "toolResult" || typeof message.toolCallId !== "string" || !message.toolCallId) continue;
@@ -135,6 +147,9 @@ export function vinciRequiredOperations(
     } else if (isVinciPlanRefusal(text, details)) {
       if (call.pendingBefore) pending.set(operation.key, call.pendingBefore);
       else pending.delete(operation.key);
+    } else if ((operation.tool === "write" || operation.tool === "edit") &&
+      details?.vinciBlocked === true && text === vinciRecoveredMutationRefusal(operation.tool, call.input)) {
+      pending.delete(operation.key);
     } else if (bashExit) {
       if (call.pendingBefore) pending.set(operation.key, call.pendingBefore);
       else pending.delete(operation.key);

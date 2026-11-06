@@ -227,3 +227,181 @@ if (!measureOnly) {
     assert.ok(messages[1].content[0].text.includes(longDenied), "The raw tool diagnostic must remain complete.");
   });
 }
+
+// A completed checkpoint refuses replay while its paired required operation completes.
+{
+const checkpoint = await loader.import(modulePath("vinci-checkpoint"), { default: false });
+const printMode = await loader.import(resolve(root, "packages/coding-agent/dist/modes/print-mode.js"), { default: false });
+const control = await loader.import(modulePath("lib/control"), { default: false });
+const verificationControl = await loader.import(modulePath("lib/verification-control"), { default: false });
+const hardStop = await loader.import(modulePath("lib/hard-stop"), { default: false });
+const crew = await loader.import(modulePath("lib/crew-status"), { default: false });
+const usage = await loader.import(modulePath("lib/usage-accumulator"), { default: false });
+const uiState = await loader.import(modulePath("lib/ui-state"), { default: false });
+const receipt = await loader.import(modulePath("vinci-receipt"), { default: false });
+let sequence = 0;
+const assistant = (text, content = [{ type: "text", text }]) => ({
+  role: "assistant", provider: "vinci", model: "vinci-fort", stopReason: "stop", timestamp: ++sequence,
+  usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: { total: 0.001 } }, content,
+});
+const call = (id, name, args) => assistant("", [{ type: "toolCall", id, name, arguments: args }]);
+const failure = (id, name = "write", text = "The required write failed.") => ({
+  role: "toolResult", toolCallId: id, toolName: name, isError: true,
+  content: [{ type: "text", text }], details: { vinciBlocked: true }, timestamp: ++sequence,
+});
+const complete = () => assistant("The requested task is complete.");
+function resetRecovery() {
+  verification.resetVinciVerificationState();
+  verificationControl.setVinciVerificationDisabledForSession(false);
+  control.clearVinciAutomationStop();
+  crew.resetVinciCrewStatus();
+  hardStop.clearVinciHardStop("checkpoint-receipt");
+  usage.resetVinciTaskUsage("checkpoint-receipt");
+  uiState.resetVinciUiState();
+  outcome.setVinciTaskOutcome(undefined);
+}
+function build(messages, options = {}) {
+  return outcome.buildVinciTaskOutcome({ taskId: "checkpoint-receipt", messages, changedFiles: [], cwd,
+    verification: verification.getVinciVerificationState(), ...options });
+}
+function registered(register) {
+  const handlers = new Map();
+  const commands = new Map();
+  const branch = [];
+  const api = {
+    on(name, handler) { const entries = handlers.get(name) || []; entries.push(handler); handlers.set(name, entries); },
+    registerCommand(name, definition) { commands.set(name, definition); },
+    appendEntry(customType, data) { branch.push({ type: "custom", customType, data: JSON.parse(JSON.stringify(data)) }); },
+    async exec() { return { stdout: "", stderr: "", exitCode: 0 }; },
+  };
+  register(api);
+  return { handlers, commands, branch, api };
+}
+async function emit(host, name, event, context) {
+  const handlers = host.handlers.get(name) || [];
+  for (const handler of handlers) await handler({ type: name, ...event }, context);
+}
+function contextFor(host, taskId) {
+  let exitHint;
+  return {
+    context: { cwd, hasUI: false, mode: "print", getContextUsage: () => ({ percent: 0, tokens: 0 }),
+      declareHeadlessExitHint(value) { exitHint = value; },
+      sessionManager: { getBranch: () => host.branch, getSessionId: () => taskId },
+      ui: { setStatus() {}, notify() {}, setWidget() {}, setTitle() {}, setFooter() {}, setWorkingVisible() {} },
+    },
+    get exitHint() { return exitHint; },
+  };
+}
+async function checkpointRefusal(tool, args, recovered = true) {
+  const host = registered(checkpoint.default);
+  const state = contextFor(host, "checkpoint-recovery", false);
+  await emit(host, "session_start", {}, state.context);
+  host.branch.push({ type: "message", message: call("interrupted", tool, args) });
+  const event = { type: "tool_call", toolCallId: "interrupted", toolName: tool, input: args };
+  const handler = host.handlers.get("tool_call")[0];
+  assert.equal(await handler(event, state.context), undefined, "The original checkpointed operation must remain reachable.");
+  if (recovered) {
+    await emit(host, "tool_execution_end", {
+      toolCallId: "interrupted", toolName: tool, isError: false,
+      result: { content: [{ type: "text", text: "Successfully completed." }] },
+    }, state.context);
+  }
+  await emit(host, "session_start", {}, state.context);
+  const refusal = await handler({ ...event, toolCallId: "replay" }, state.context);
+  assert.equal(refusal?.block, true, "The restored checkpoint must refuse the exact replay.");
+  assert.ok(host.branch.some((entry) => entry.data?.event === (recovered ? "recovered" : "uncertain")), "The intended recovery branch must be reached.");
+  return refusal.reason;
+}
+async function checkpointReceipt(messages) {
+  const host = registered(receipt.default);
+  const state = contextFor(host, "checkpoint-receipt", false);
+  await emit(host, "session_start", {}, state.context);
+  await emit(host, "before_agent_start", { prompt: "Finish the requested operation." }, state.context);
+  await emit(host, "agent_start", {}, state.context);
+  await emit(host, "agent_end", { messages }, state.context);
+  const saved = outcome.getVinciTaskOutcome();
+  const exit = printMode.printModeExitCode({ mode: "text", lastMessage: messages.at(-1), submitted: ["Finish the requested operation."], headlessExitHint: state.exitHint }).exitCode;
+  return { saved, exit };
+}
+check("checkpoint-recovered-write", async () => {
+  for (const [tool, args] of [
+    ["write", { path: "recovered.txt", content: "ready" }],
+    ["edit", { path: "recovered.txt", oldText: "before", newText: "after" }],
+    ["write", { path: "  padded.txt  ", content: "ready" }],
+    ["write", { file_path: "  alias.txt  ", content: "ready" }],
+    ["write", { path: `  ${"p".repeat(1001)}  `, content: "ready" }],
+  ]) {
+    resetRecovery();
+    const text = await checkpointRefusal(tool, args);
+    assert.equal(text, operations.vinciRecoveredMutationRefusal(tool, args), "The refusal and reader must share their path rule and text builder.");
+    const messages = [call("replay", tool, args), failure("replay", tool, text), complete()];
+    const { saved, exit } = await checkpointReceipt(messages);
+    assert.equal(saved.state, "DONE", "a recovered write/edit replay must complete its required operation.");
+    assert.deepEqual(saved.requiredOperations ?? [], [], "the paired recovered operation must be cleared.");
+    assert.equal(exit, 0, "recovered completion must exit zero.");
+    assert.equal(messages[1].isError, true, "The checkpoint refusal must retain its error flag.");
+    assert.match(text, /already completed/, "The checkpoint refusal must retain its recovery guidance.");
+  }
+});
+check("checkpoint-prior-recovered-write", async () => {
+  resetRecovery();
+  const args = { path: "prior-recovered.txt", content: "ready" };
+  const prior = build([call("original", "write", args), failure("original"), complete()]);
+  assert.equal(prior.requiredOperations.length, 1, "the same operation must already be pending in prior.");
+  const text = await checkpointRefusal("write", args);
+  const saved = build([call("replay", "write", args), failure("replay", "write", text), complete()], { priorOperations: prior.requiredOperations });
+  assert.equal(saved.state, "DONE", "a prior-carried recovered operation must be deleted, never restored.");
+  assert.deepEqual(saved.requiredOperations ?? [], [], "prior must not retain the paired recovered key.");
+});
+check("checkpoint-uncertain-write", async () => {
+  resetRecovery();
+  const args = { path: "uncertain-recovery.txt", content: "ready" };
+  const text = await checkpointRefusal("write", args, false);
+  assert.match(text, /interrupted.*Read the current target file/, "The test must reach the uncertain refusal.");
+  const { saved, exit } = await checkpointReceipt([call("replay", "write", args), failure("replay", "write", text), complete()]);
+  assert.equal(saved.state, "BLOCKED", "an uncertain replay must remain BLOCKED.");
+  assert.equal(exit, 3, "an uncertain replay must exit nonzero.");
+});
+check("checkpoint-other-operation", async () => {
+  for (const samePath of [true, false]) {
+    resetRecovery();
+    const first = { path: "other-operation.txt", content: "first content" };
+    const replay = { path: samePath ? first.path : "different-operation.txt", content: "different content" };
+    const text = await checkpointRefusal("write", replay);
+    const messages = [call("pending", "write", first), call("replay", "write", replay), failure("replay", "write", text), complete()];
+    const saved = build(messages);
+    assert.equal(saved.state, "BLOCKED", "refusing another operation must retain the pending operation, including the same path with different content.");
+    assert.deepEqual(saved.requiredOperations.map((operation) => operation.key), operations.vinciRequiredOperations([call("pending", "write", first)], [], cwd).map((operation) => operation.key), "only the refused replay's full-argument key may be cleared.");
+  }
+});
+check("checkpoint-unmarked-text", async () => {
+  resetRecovery();
+  const args = { path: "unmarked-recovery.txt", content: "ready" };
+  const text = await checkpointRefusal("write", args);
+  const unmarked = failure("replay", "write", text);
+  delete unmarked.details;
+  assert.equal(build([call("replay", "write", args), unmarked, complete()]).state, "BLOCKED", "matching tool output without the structured signal must remain BLOCKED.");
+});
+check("checkpoint-malformed-signal", async () => {
+  resetRecovery();
+  const args = { path: "malformed-recovery.txt", content: "ready" };
+  const text = await checkpointRefusal("write", args);
+  for (const details of [undefined, null, {}, [], "blocked", { vinciBlocked: null }, { vinciBlocked: "true" }, { vinciBlocked: 1 }, { vinciBlocked: false }]) {
+    const refused = { ...failure("replay", "write", text), details };
+    assert.equal(build([call("replay", "write", args), refused, complete()]).state, "BLOCKED", "missing, null and wrong-type signals must remain BLOCKED.");
+  }
+  for (const wrongText of [text + " ", operations.vinciRecoveredMutationRefusal("edit", args), operations.vinciRecoveredMutationRefusal("write", { ...args, path: "another.txt" })]) {
+    assert.equal(build([call("replay", "write", args), failure("replay", "write", wrongText), complete()]).state, "BLOCKED", "the paired tool, raw path and complete refusal text must match exactly.");
+  }
+});
+check("checkpoint-recovered-bash", async () => {
+  resetRecovery();
+  const args = { command: "printf ready" };
+  const text = await checkpointRefusal("bash", args);
+  assert.match(text, /shell command.*already completed/, "The test must reach the recovered bash refusal.");
+  const { saved, exit } = await checkpointReceipt([call("replay", "bash", args), failure("replay", "bash", text), complete()]);
+  assert.equal(saved.state, "BLOCKED", "a recovered bash refusal without exit and cwd facts must remain BLOCKED.");
+  assert.equal(exit, 3, "a recovered bash refusal must exit nonzero.");
+});
+
+}
