@@ -478,7 +478,12 @@ describe("Coding Agent Tools", () => {
 			expect(getTextOutput(result)).toContain("test output");
 			expect(result.details?.truncation).toBeUndefined();
 			expect(result.details?.fullOutputPath).toBeUndefined();
-			expect(result.details?.execution).toEqual({ exitCode: 0, cwd: process.cwd(), originalCommand: true });
+			expect(result.details?.execution).toEqual({
+				exitCode: 0,
+				cwd: process.cwd(),
+				originalCommand: true,
+				nonOriginalReasons: [],
+			});
 		});
 
 		it("should handle command errors", async () => {
