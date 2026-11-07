@@ -21,6 +21,11 @@ const guard = await loader.import(resolve(here, "../extensions/vinci-guard.ts"),
 const imageInput = await loader.import(resolve(here, "../extensions/lib/images.ts"), { default: false });
 const plan = await loader.import(resolve(here, "../extensions/vinci-plan.ts"), { default: false });
 const toolDefinitions = await loader.import(resolve(here, "../../packages/coding-agent/dist/index.js"), { default: false });
+const hardStop = await loader.import(resolve(here, "../extensions/lib/hard-stop.ts"), { default: false });
+const outcomeFromGuardLoader = await loader.import(resolve(here, "../extensions/lib/task-outcome.ts"), { default: false });
+const outcomeLoader = createJiti(import.meta.url, { moduleCache: false, fsCache: false, tryNative: false });
+const taskOutcome = await outcomeLoader.import(resolve(here, "../extensions/lib/task-outcome.ts"), { default: false });
+const verificationState = await loader.import(resolve(here, "../extensions/lib/verification-state.ts"), { default: false });
 
 const handlers = {};
 const commands = {};
@@ -93,7 +98,142 @@ function regressionCheck(name, condition) {
   }
 }
 
+async function checkpointChecks(onlyCase) {
+  for (const name of ["D1", "D2", "D3", "D4", "D5", "P1", "P2", "K1", "K2", "K-F1-extension-interactive", "K-F1-extension-headless", "K-F1-streaming-interactive", "K-F1-streaming-headless", "V1", "V2"]) {
+    if (onlyCase && name !== onlyCase) continue;
+    const taskId = `p4i8-${name}`;
+    const localHandlers = {};
+    const localControls = [];
+    guard.default({
+      on(event, handler) { (localHandlers[event] ??= []).push(handler); },
+      registerCommand() {},
+      sendMessage(message) { localControls.push(message); },
+    });
+    let selectCount = 0;
+    const choice = name === "D2" ? undefined : name === "P1" ? "Yes, allow it" : "No, don't";
+    const localCtx = {
+      ...ctx,
+      hasUI: name !== "K1" && !name.endsWith("-headless"),
+      sessionManager: { getSessionId: () => taskId },
+      ui: { ...ctx.ui, async select() { selectCount++; return choice; } },
+    };
+    const emit = async (event, data) => {
+      for (const handler of localHandlers[event] ?? []) {
+        const result = await handler(data, localCtx);
+        if (event === "tool_call" && result !== undefined) return result;
+      }
+    };
+    const input = (text, extra = {}) => emit("input", { type: "input", text, source: "interactive", ...extra });
+    const commit = () => emit("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+    verificationState.resetVinciVerificationState();
+    const build = () => taskOutcome.buildVinciTaskOutcome({
+      taskId, messages: [], changedFiles: [], verification: verificationState.getVinciVerificationState(),
+      now: new Date("2026-11-06T00:00:00Z"),
+    });
+    hardStop.clearVinciHardStop(taskId);
+    await input(name === "P2" || name.startsWith("K-F1-") ? "Commit the change" : "Fix the failing test");
+    await emit("agent_start", {});
+    assert.equal(hardStop.getVinciHardStop(taskId), undefined, `${name}: clean task has no earlier stop`);
+    const baseline = build();
+
+    if (name === "D1" || name === "D2") {
+      assert.equal((await commit())?.block, true, `${name}: checkpoint is refused`);
+      assert.equal(hardStop.getVinciHardStop(taskId), undefined, `${name}: decline must not record a hard stop`);
+      const outcome = build();
+      assert.notEqual(outcome.state, "BLOCKED", `${name}: decline does not force BLOCKED`);
+      assert.deepEqual(outcome.gitCheckpointDecline, { note: "unrequested git checkpoint declined by user", count: 1 }, `${name}: decline note crosses module instances`);
+      const { gitCheckpointDecline, ...withoutNote } = outcome;
+      assert.deepEqual(withoutNote, baseline, `${name}: decline leaves state, reason and verification unchanged`);
+      assert.equal(selectCount, 1, `${name}: one prompt`);
+      assert.ok(localControls.some((message) => message.customType === "vinci-unrequested-git-block"), `${name}: private refusal remains`);
+      assert.equal(taskOutcome.isVinciTaskOutcome(outcome), true, `${name}: noted outcome validates`);
+      if (name === "D1") {
+        assert.notEqual(outcomeFromGuardLoader.recordVinciGitCheckpointDecline, taskOutcome.recordVinciGitCheckpointDecline, "D1: fresh jiti loader has a distinct module instance");
+        const otherTask = `${taskId}-cross-instance`;
+        outcomeFromGuardLoader.recordVinciGitCheckpointDecline(otherTask);
+        outcomeFromGuardLoader.recordVinciGitCheckpointDecline(otherTask);
+        const otherOutcome = taskOutcome.buildVinciTaskOutcome({ taskId: otherTask, messages: [], changedFiles: [], verification: verificationState.getVinciVerificationState() });
+        assert.equal(otherOutcome.gitCheckpointDecline?.count, 2, "D1: one instance records and the other builds the counted note");
+        assert.equal(build().gitCheckpointDecline?.count, 1, "D1: another task cannot change this task's count");
+        outcomeFromGuardLoader.clearVinciGitCheckpointDeclines(otherTask);
+      }
+    } else if (name === "D3") {
+      assert.equal((await commit())?.block, true, "D3: first commit is refused");
+      assert.equal((await commit())?.block, true, "D3: repeat commit is refused");
+      assert.equal(selectCount, 1, "D3: repeat must not prompt again");
+      assert.equal(hardStop.getVinciHardStop(taskId), undefined, "D3: repeat records no hard stop");
+      assert.equal(build().gitCheckpointDecline?.count, 1, "D3: repeat does not count as another decline");
+      // An extension or mid-stream input that asks for a commit still grants approval: base behaviour, public issue #153, not asserted here.
+      for (const extra of [{ source: "extension" }, { streamingBehavior: "steer" }]) {
+        await input("keep going", extra);
+        await emit("agent_start", {});
+        assert.equal((await commit())?.block, true, "D3: extension steer or mid-stream input cannot re-arm or approve");
+        assert.equal(selectCount, 1, "D3: non-task input does not re-arm the prompt");
+        assert.equal(build().gitCheckpointDecline?.count, 1, "D3: non-task input preserves the note");
+      }
+      await input("continue");
+      await emit("agent_start", {});
+      assert.equal(build().gitCheckpointDecline, undefined, "D3: typed continue starts a new task");
+      assert.equal((await commit())?.block, true, "D3: typed continue still requires approval");
+      assert.equal(selectCount, 2, "D3: typed continue re-arms the prompt");
+    } else if (name === "D4" || name === "D5") {
+      assert.equal((await commit())?.block, true, `${name}: task 1 declines`);
+      assert.equal(build().gitCheckpointDecline?.count, 1, `${name}: task 1 carries a note`);
+      await input(name === "D4" ? "Commit the change" : "Review the result");
+      await emit("agent_start", {});
+      if (name === "D4") {
+        assert.equal(await commit(), undefined, "D4: a newly requested commit passes");
+        assert.equal(selectCount, 1, "D4: newly requested commit does not prompt");
+      }
+      assert.equal(build().gitCheckpointDecline, undefined, `${name}: task 2 has no decline note`);
+      assert.equal(hardStop.getVinciHardStop(taskId), undefined, `${name}: no hard stop leaks`);
+    } else if (name === "P1" || name === "P2") {
+      assert.equal(await commit(), undefined, `${name}: approved or requested commit passes`);
+      assert.equal(selectCount, name === "P1" ? 1 : 0, `${name}: expected prompt count`);
+      assert.equal(hardStop.getVinciHardStop(taskId), undefined, `${name}: no hard stop`);
+      assert.equal(build().gitCheckpointDecline, undefined, `${name}: no decline note`);
+    } else if (name === "K1" || name === "K2") {
+      const result = name === "K1" ? await commit() : await emit("tool_call", { toolName: "bash", input: { command: "git add -A" } });
+      assert.equal(result?.block, true, `${name}: machine refusal remains`);
+      assert.equal(hardStop.getVinciHardStop(taskId)?.source, "guard", `${name}: refusal source is guard`);
+      assert.match(result.reason, name === "K1" ? /no UI to confirm/ : /broad git staging/, `${name}: intended refusal path`);
+      assert.equal(build().state, "BLOCKED", `${name}: machine refusal still forces BLOCKED`);
+      assert.equal(selectCount, 0, `${name}: no interactive checkpoint prompt`);
+    } else if (name.startsWith("K-F1-")) {
+      assert.equal(await commit(), undefined, `${name}: approved commit passes before input`);
+      const promptsBefore = selectCount;
+      await input("Review the result", name.startsWith("K-F1-extension-") ? { source: "extension" } : { streamingBehavior: "steer" });
+      const result = await commit();
+      assert.equal(result?.block, true, `${name}: prior approval must be cleared`);
+      assert.equal(selectCount, promptsBefore + (localCtx.hasUI ? 1 : 0), `${name}: expected prompt count after approval clears`);
+      assert.equal(hardStop.getVinciHardStop(taskId)?.source, localCtx.hasUI ? undefined : "guard", `${name}: expected refusal source`);
+      if (!localCtx.hasUI) assert.match(result.reason, /no UI to confirm/, `${name}: headless checkpoint refusal`);
+    } else if (name === "V1") {
+      assert.equal("gitCheckpointDecline" in baseline, false, "V1: old outcome has no new field");
+      assert.equal(taskOutcome.isVinciTaskOutcome(baseline), true, "V1: old outcome still validates");
+    } else if (name === "V2") {
+      for (const invalid of [null, "declined", 1, {}, { note: 1, count: 1 }, { note: "wrong", count: 1 }, ...[0, -1, 1.5, NaN, Infinity, "1"].map((count) => ({ note: "unrequested git checkpoint declined by user", count }))]) {
+        assert.equal(taskOutcome.isVinciTaskOutcome({ ...baseline, gitCheckpointDecline: invalid }), false, "V2: malformed decline note fails validation");
+      }
+    }
+    console.log(`  p4i8 ${name} passed; stop source: ${hardStop.getVinciHardStop(taskId)?.source ?? "none"}; select count: ${selectCount}`);
+    hardStop.clearVinciHardStop(taskId);
+  }
+}
+
+const checkpointCase = process.argv.find((argument) => argument.startsWith("--checkpoint-case="))?.split("=")[1];
+if (checkpointCase) {
+  try {
+    assert.ok(["D1", "D2", "D3", "D4", "D5", "P1", "P2", "K1", "K2", "K-F1-extension-interactive", "K-F1-extension-headless", "K-F1-streaming-interactive", "K-F1-streaming-headless", "V1", "V2"].includes(checkpointCase), "known checkpoint case required");
+    await checkpointChecks(checkpointCase);
+  } finally {
+    rmSync(runRoot, { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
 try {
+  await checkpointChecks();
   // Use the registered tool_call hook and the same bytes executed by a real shell. All effects are
   // confined to this test's disposable tree; a sibling directory models an outside-project target.
   const adversarialProject = join(workspace, "guard-project");

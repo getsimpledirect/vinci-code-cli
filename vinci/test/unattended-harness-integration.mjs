@@ -10,7 +10,7 @@ import { createJiti } from "jiti/static";
 //   #5 the no-progress latch told a run with no user to "wait for the user's next instruction",
 //      then the outcome record said DONE over uncommitted work;
 //   #6 the action reserve refused `git commit` six times — the deliverable itself — and exited 0.
-// Pinned here: the latch reason names an unattended stop; EVERY harness refusal of a finalization
+// Pinned here: the latch reason names an unattended stop; machine refusals of a finalization
 // step (reserve, ceiling, error streak, fixation, review pause, guard) is a hard stop that forces
 // the outcome to BLOCKED in every mode and every state, whatever the closing message or a remote
 // verdict claims; unattended, finalization-shaped git commands pass the reserve AND the ceiling
@@ -530,7 +530,8 @@ try {
     const interactiveCtx = context("task-guard-interactive", true);
     await emit(handlers, "input", { type: "input", text: "Fix the failing test", source: "interactive" }, interactiveCtx);
     const declined = await emit(handlers, "tool_call", bash("git commit -m x"), interactiveCtx);
-    check("guard: a user-declined checkpoint is a recorded hard stop too", declined?.block === true && hardStop.getVinciHardStop("task-guard-interactive")?.source === "guard");
+    const declinedOutcome = taskOutcome.buildVinciTaskOutcome({ taskId: "task-guard-interactive", messages: [assistant("Done.")], changedFiles: [], verification: verificationState.getVinciVerificationState() });
+    check("guard: a user-declined checkpoint is refused without a hard stop or forced BLOCKED outcome", declined?.block === true && hardStop.getVinciHardStop("task-guard-interactive") === undefined && declinedOutcome.state !== "BLOCKED");
     hardStop.clearVinciHardStop("task-guard-interactive");
     const okCtx = context("task-guard-ok", false);
     await emit(handlers, "input", { type: "input", text: "Fix the failing test and commit it", source: "interactive" }, okCtx);
