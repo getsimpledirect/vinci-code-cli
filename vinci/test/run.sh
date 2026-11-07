@@ -864,6 +864,7 @@ run_group automation-stop-integration node "${ROOT}/vinci/test/automation-stop-i
 run_group todo-stall-integration node "${ROOT}/vinci/test/todo-stall-integration.mjs"
 # Structural loop/safety regressions use jiti so they run on the Node 22 CI floor too.
 run_group loopbreak-integration node "${ROOT}/vinci/test/loopbreak-integration.mjs"
+run_group loopbreak-continue-grant node "${ROOT}/vinci/test/loopbreak-continue-grant.mjs"
 run_group crew-loopbreak-integration node --test "${ROOT}/vinci/test/crew-loopbreak-integration.mjs"
 # #5/#6: no harness contradictions in unattended (`vinci -p`) runs — latch wording, hard stop ⇒ BLOCKED,
 # finalization git commands exempt from the reserve (never push/network).
