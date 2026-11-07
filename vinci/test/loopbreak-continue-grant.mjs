@@ -1,8 +1,9 @@
-// Exercise the real input -> agent_start -> tool_call hooks; no model or tools execute.
+// Exercise the real input -> agent_start -> tool_call hooks; no real model or tools execute.
 import assert from "node:assert/strict";
 import { dirname, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { createJiti } from "jiti/static";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -171,6 +172,67 @@ const cases = {
     assert.equal(refused.call, 1, "N5: first call after agent_start");
     ceiling(refused, 27, "N5 rpc call 1");
     await f.finish({ event: { text: "continue", source: "rpc" }, refusedCall: 1, carriedAction: 27 });
+  },
+  async N6() {
+    const TASK_TEXT = "Repair the zebra-ledger rounding";
+    const faux = registerFauxProvider({
+      api: "faux:loopbreak-continue-grant-n6",
+      provider: "faux-loopbreak-continue-grant-n6",
+      models: [
+        { id: "auto", name: "Vinci" },
+        { id: "forte", name: "Vinci Forte" },
+        { id: "fortissimo", name: "Vinci Fortissimo" },
+      ],
+    });
+    try {
+      const handlers = {};
+      const prompts = [];
+      let calls = 0;
+      const ctx = {
+        model: faux.getModel("auto"),
+        modelRegistry: {
+          find(_provider, id) { return faux.getModel(id); },
+          async getApiKeyAndHeaders() {
+            return { ok: true, apiKey: "offline-faux-key", headers: {}, env: {} };
+          },
+        },
+        cwd: resolve(here, "../.."),
+        hasUI: true,
+        mode: "tui",
+        ui: { notify() {} },
+        sessionManager: { getSessionId: () => "loopbreak-continue-grant-n6", getBranch: () => [] },
+      };
+      faux.setResponses([(context) => {
+        calls++;
+        prompts.push(context.messages.map((message) => typeof message.content === "string"
+          ? message.content
+          : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")).join("\n"));
+        return fauxAssistantMessage("Inspect the failing branch.");
+      }]);
+      ext.default({
+        on(name, fn) { (handlers[name] ??= []).push(fn); },
+        sendMessage() {},
+        registerCommand() {},
+        registerTool() {},
+        appendEntry() {},
+      });
+      for (const text of [TASK_TEXT, "continue"]) {
+        for (const handler of handlers.input) await handler({ text, source: "interactive" }, ctx);
+        for (const handler of handlers.agent_start) await handler({}, ctx);
+      }
+      for (let repeat = 1; repeat <= 4; repeat++) {
+        for (const handler of handlers.tool_call) {
+          await handler({ toolName: "edit", input: { path: "zebra-ledger.ts", edits: [] } }, ctx);
+        }
+      }
+      assert.ok(calls > 0 && prompts.length >= 1, "N6: positive control reaches the faux escalation completion");
+      console.log(`N6: positive control passed; measured ${calls} faux completion and ${prompts.length} decoded prompt.`);
+      const prompt = prompts.join("\n");
+      assert.ok(!prompt.includes("The user's task:\ncontinue"), "N6: escalation task must not become continue after the grant");
+      assert.ok(prompt.includes("The user's task:\n" + TASK_TEXT), "N6: escalation task retains the original distinctive request after the grant");
+    } finally {
+      faux.unregister();
+    }
   },
   async P3() {
     const f = fixture("P3");
