@@ -197,6 +197,7 @@ type TaskOutcomeStore = {
   outcome?: VinciTaskOutcome;
   usageSubscriptionInstalled?: boolean;
   gitCheckpointDeclines?: Map<string, number>;
+  gitCheckpointDeclinedToolCallIds?: Map<string, Set<string>>;
 };
 const STORE_KEY = "__vinciTaskOutcomeStore" as const;
 const USAGE_STORE_KEY = "__vinciUsageAccumulatorStore" as const;
@@ -211,13 +212,22 @@ const vinciGlobal = globalThis as VinciGlobal;
 const store = vinciGlobal[STORE_KEY] ?? {};
 vinciGlobal[STORE_KEY] = store;
 const gitCheckpointDeclines = store.gitCheckpointDeclines ??= new Map<string, number>();
+const gitCheckpointDeclinedToolCallIds = store.gitCheckpointDeclinedToolCallIds ??= new Map<string, Set<string>>();
 
 export function recordVinciGitCheckpointDecline(taskId: string): void {
   gitCheckpointDeclines.set(taskId, (gitCheckpointDeclines.get(taskId) ?? 0) + 1);
 }
 
+export function recordVinciGitCheckpointDeclinedToolCall(taskId: string, toolCallId: string): void {
+  if (!toolCallId) return;
+  const calls = gitCheckpointDeclinedToolCallIds.get(taskId) ?? new Set<string>();
+  calls.add(toolCallId);
+  gitCheckpointDeclinedToolCallIds.set(taskId, calls);
+}
+
 export function clearVinciGitCheckpointDeclines(taskId: string): void {
   gitCheckpointDeclines.delete(taskId);
+  gitCheckpointDeclinedToolCallIds.delete(taskId);
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -565,7 +575,7 @@ export function classifyVinciTaskState(
 
 export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcome {
   const changedFiles = [...new Set(input.changedFiles)].sort();
-  const requiredOperations = vinciRequiredOperations(input.messages, input.priorOperations, input.cwd);
+  const requiredOperations = vinciRequiredOperations(input.messages, input.priorOperations, input.cwd, gitCheckpointDeclinedToolCallIds.get(input.taskId));
   const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification, requiredOperations);
   // [#5/#6] A hard stop (the no-progress latch, or any harness refusal of a finalization step) is
   // a machine fact that outranks the narrative: the model's closing "done" — and even a remote

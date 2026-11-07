@@ -221,6 +221,119 @@ async function checkpointChecks(onlyCase) {
   }
 }
 
+const checkpointOperationCases = ["T1", "P1", "P2", "P3", "P4", "P5"];
+
+async function checkpointOperationChecks(onlyCase) {
+  for (const name of checkpointOperationCases) {
+    if (onlyCase && name !== onlyCase) continue;
+    const taskId = `p4i8-required-${name}`;
+    const localHandlers = {};
+    let selectCount = 0;
+    guard.default({
+      on(event, handler) { (localHandlers[event] ??= []).push(handler); },
+      registerCommand() {},
+      sendMessage() {},
+    });
+    const localCtx = {
+      ...ctx,
+      sessionManager: { getSessionId: () => taskId },
+      ui: { ...ctx.ui, async select() { selectCount++; return "No, don't"; } },
+    };
+    const emit = async (event, data) => {
+      for (const handler of localHandlers[event] ?? []) {
+        const result = await handler(data, localCtx);
+        if (event === "tool_call" && result !== undefined) return result;
+      }
+    };
+    const input = (text) => emit("input", { type: "input", text, source: "interactive" });
+    const request = name === "P2" ? "Commit the change" : "Review the change";
+    const messages = [{ role: "user", content: request }];
+    const refusedBash = async (toolCallId, command, machineReason) => {
+      const args = { command };
+      const result = await emit("tool_call", { type: "tool_call", toolName: "bash", toolCallId, input: args });
+      const reason = result?.reason ?? machineReason;
+      assert.equal(typeof reason, "string", `${name}: refusal has a reason`);
+      messages.push(
+        { role: "assistant", content: [{ type: "toolCall", id: toolCallId, name: "bash", arguments: { command } }], stopReason: "toolUse" },
+        { role: "toolResult", toolCallId, toolName: "bash", isError: true, details: { vinciBlocked: true }, content: [{ type: "text", text: reason }] },
+      );
+      return result;
+    };
+    verificationState.resetVinciVerificationState();
+    const build = (id = taskId) => taskOutcome.buildVinciTaskOutcome({
+      taskId: id, messages, changedFiles: [], verification: verificationState.getVinciVerificationState(), cwd: workspace,
+      now: new Date("2026-11-06T00:00:00Z"),
+    });
+    hardStop.clearVinciHardStop(taskId);
+    await input(request);
+    await emit("agent_start", {});
+
+    if (name === "P1") {
+      assert.equal((await refusedBash(`${taskId}-machine`, "rm -rf /"))?.block, true, `${name}: non-checkpoint command is refused`);
+    } else if (name === "P2") {
+      assert.equal(await refusedBash(`${taskId}-requested`, "git commit -m x", "Machine policy refused the requested commit."), undefined, `${name}: guard allows the requested commit before a machine refusal`);
+      assert.equal(selectCount, 0, `${name}: requested commit needs no checkpoint prompt`);
+    } else if (name === "P3") {
+      assert.equal(await refusedBash(`${taskId}-spoof`, "echo checkpoint-status", "Blocked — the user did not ask Vinci to stage or commit changes."), undefined, `${name}: spoofed output has no guard decline record`);
+    } else {
+      const first = await refusedBash(`${taskId}-checkpoint-1`, "git commit -m x");
+      assert.equal(first?.block, true, `${name}: first unrequested checkpoint is refused`);
+      assert.equal(first.reason, "Blocked — the user did not ask Vinci to stage or commit changes.", `${name}: first refusal reaches the checkpoint-decline path`);
+      if (name === "P4") {
+        const broad = await refusedBash(`${taskId}-broad`, "git add .");
+        assert.equal(broad?.block, true, `${name}: different broad-staging call is refused`);
+        assert.match(broad.reason, /broad git staging/, `${name}: second call reaches the broad-staging refusal`);
+      } else if (name === "P5") {
+        const repeat = await refusedBash(`${taskId}-checkpoint-2`, "git commit -m x");
+        assert.equal(repeat?.block, true, `${name}: repeat unrequested checkpoint is refused`);
+        assert.equal(repeat.reason, first.reason, `${name}: repeat retains the checkpoint-decline reason`);
+      }
+      assert.equal(selectCount, 1, `${name}: checkpoint decline prompts only once`);
+    }
+
+    messages.push({ role: "assistant", content: [{ type: "text", text: "The requested work is complete." }], stopReason: "stop" });
+    const outcome = build();
+    if (name === "T1" || name === "P5") {
+      assert.notEqual(outcome.state, "BLOCKED", `${name}: recorded checkpoint decline does not force BLOCKED`);
+      assert.equal(outcome.requiredOperations?.length ?? 0, 0, `${name}: recorded declined calls have no requiredOperations entry`);
+      assert.deepEqual(outcome.gitCheckpointDecline, { note: "unrequested git checkpoint declined by user", count: 1 }, `${name}: decline count remains one across module instances`);
+      assert.equal(hardStop.getVinciHardStop(taskId), undefined, `${name}: checkpoint declines have no hard stop`);
+      if (name === "T1") {
+        const otherOutcome = build(`${taskId}-other`);
+        assert.equal(otherOutcome.state, "BLOCKED", `${name}: another task cannot settle the same call id`);
+        assert.equal(otherOutcome.requiredOperations?.length, 1, `${name}: another task retains the refused operation`);
+        assert.equal(otherOutcome.gitCheckpointDecline, undefined, `${name}: another task has no decline note`);
+        await input("Review the result");
+        await emit("agent_start", {});
+        const cleared = build();
+        assert.equal(cleared.state, "BLOCKED", `${name}: new-task agent_start clears the recorded call id`);
+        assert.equal(cleared.requiredOperations?.length, 1, `${name}: a cleared record cannot settle the earlier call`);
+        assert.equal(cleared.gitCheckpointDecline, undefined, `${name}: new-task agent_start clears the count too`);
+      }
+    } else {
+      assert.equal(outcome.state, "BLOCKED", `${name}: other machine refusals remain BLOCKED`);
+      assert.equal(outcome.requiredOperations?.length, 1, `${name}: the refused operation remains required`);
+      const target = name === "P1" ? "rm -rf /" : name === "P2" ? "git commit -m x" : name === "P3" ? "echo checkpoint-status" : "git add .";
+      assert.equal(outcome.requiredOperations[0].target, target, `${name}: only the unsettled call remains required`);
+      assert.equal(outcome.gitCheckpointDecline?.count, name === "P4" ? 1 : undefined, `${name}: only a real unrequested checkpoint decline is counted`);
+    }
+    console.log(`  p4i8 required-operations ${name} passed`);
+    hardStop.clearVinciHardStop(taskId);
+    outcomeFromGuardLoader.clearVinciGitCheckpointDeclines(taskId);
+  }
+}
+
+const checkpointOperationCase = process.argv.find((argument) => argument.startsWith("--checkpoint-operation-case="))?.split("=")[1];
+if (checkpointOperationCase) {
+  try {
+    assert.ok(checkpointOperationCases.includes(checkpointOperationCase), `${checkpointOperationCase}: known checkpoint operation case required`);
+    await checkpointOperationChecks(checkpointOperationCase);
+  } finally {
+    rmSync(runRoot, { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
 const checkpointCase = process.argv.find((argument) => argument.startsWith("--checkpoint-case="))?.split("=")[1];
 if (checkpointCase) {
   try {
@@ -234,6 +347,7 @@ if (checkpointCase) {
 
 try {
   await checkpointChecks();
+  await checkpointOperationChecks();
   // Use the registered tool_call hook and the same bytes executed by a real shell. All effects are
   // confined to this test's disposable tree; a sibling directory models an outside-project target.
   const adversarialProject = join(workspace, "guard-project");

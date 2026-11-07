@@ -71,6 +71,7 @@ export function vinciRequiredOperations(
   messages: readonly unknown[],
   prior: readonly VinciRequiredOperation[] = [],
   cwd = process.cwd(),
+  declinedCheckpointToolCallIds?: ReadonlySet<string>,
 ): VinciRequiredOperation[] {
   const pending = new Map(prior.map((operation) => [operation.key, operation]));
   const calls = new Map<string, { operation: VinciRequiredOperation; input: unknown; order: number; pendingBefore?: VinciRequiredOperation; result?: string; ambiguous?: boolean }>();
@@ -84,6 +85,7 @@ export function vinciRequiredOperations(
         const part = record(value);
         if (part?.type !== "toolCall" || !["write", "edit", "read", "bash"].includes(String(part.name))) continue;
         const tool = String(part.name);
+        if (tool === "bash" && typeof part.id === "string" && declinedCheckpointToolCallIds?.has(part.id)) continue;
         const order = ++serial;
         const args = record(part.arguments);
         const rawTarget = tool === "bash" ? args?.command : args?.path ?? args?.file_path;

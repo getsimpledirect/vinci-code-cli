@@ -25,7 +25,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { recordVinciConfirmationGate, sendVinciControl } from "./lib/control.ts";
 import { recordFinalizationRefusal, vinciTaskIdOf } from "./lib/hard-stop.ts";
-import { clearVinciGitCheckpointDeclines, recordVinciGitCheckpointDecline } from "./lib/task-outcome.ts";
+import { clearVinciGitCheckpointDeclines, recordVinciGitCheckpointDecline, recordVinciGitCheckpointDeclinedToolCall } from "./lib/task-outcome.ts";
 import { parseLocalGitSegment } from "./lib/unattended.ts";
 import {
   escalationReason,
@@ -2043,6 +2043,7 @@ export default function (pi: ExtensionAPI) {
           gitCheckpointApproved = true;
         } else {
           if (gitCheckpointDeclined) {
+            recordVinciGitCheckpointDeclinedToolCall(vinciTaskIdOf(ctx), event.toolCallId);
             return { block: true, reason: "Blocked — the user did not ask Vinci to stage or commit changes." };
           }
           const ok = await confirmSafely(
@@ -2053,6 +2054,7 @@ export default function (pi: ExtensionAPI) {
           if (!ok) {
             gitCheckpointDeclined = true;
             recordVinciGitCheckpointDecline(vinciTaskIdOf(ctx));
+            recordVinciGitCheckpointDeclinedToolCall(vinciTaskIdOf(ctx), event.toolCallId);
             sendVinciControl(
               pi,
               "vinci-unrequested-git-block",
