@@ -5244,7 +5244,7 @@ process.stdout.write("  deviation evidence: nonce framing, repository-root paths
 }
 process.stdout.write("  deviation disclosure: scoped to mutating turns, fires on gather failures, diff stays whole (#210)\n");
 
-// ── [#215] a headless run blocked awaiting permission is WAITING, not a read-only DONE ──────────
+// ── [#215] an unresolved refused write remains BLOCKED, not a read-only DONE ──────────
 // Found by the 0.0.47 published smoke: the workspace guard refused an out-of-folder write, the
 // model closed with "waiting on your go-ahead", and the run exited 0 with "The requested read-only
 // task completed without project changes." Both halves were wrong — it was neither done nor
@@ -5266,8 +5266,8 @@ process.stdout.write("  deviation disclosure: scoped to mutating turns, fires on
     },
   ];
   const blocked = taskOutcome.classifyVinciTaskState(refusedWrite, [], stateModule.getVinciVerificationState());
-  assert.equal(blocked.state, "WAITING", "#215 a zero-change run holding for the user is WAITING, not DONE");
-  assert.match(blocked.reason, /asks for your go-ahead/i, "#215 the reason says what it is waiting on");
+  assert.equal(blocked.state, "BLOCKED", "#215 an unresolved refused write remains BLOCKED despite a request for permission");
+  assert.match(blocked.reason, /Required write operation.*tracked\.ts.*outside the project folder/i, "#215 the blocker identifies the required operation, target, and tool refusal");
   assert.doesNotMatch(blocked.reason, /read-only/i, "#215 a refused mutation is never called a read-only task");
   // [#215 review] State-neutral about WHAT changed: the receipt's session-delta veto (#203) can add
   // files this turn never touched to the same record, and a "nothing was changed" claim would then
@@ -5275,17 +5275,17 @@ process.stdout.write("  deviation disclosure: scoped to mutating turns, fires on
   assert.doesNotMatch(
     blocked.reason,
     /nothing was changed/i,
-    "#215 the WAITING reason makes no claim the session-delta veto could contradict",
+    "#215 the structured refusal makes no claim the session-delta veto could contradict",
   );
 
-  // The same refusal WITHOUT an ask still must not claim the task was read-only.
+  // The same unresolved refusal without an ask remains blocked.
   const refusedQuietly = [
     ...refusedWrite.slice(0, 3),
     { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "That path is outside the project folder, so nothing was written." }] },
   ];
   const quiet = taskOutcome.classifyVinciTaskState(refusedQuietly, [], stateModule.getVinciVerificationState());
-  assert.equal(quiet.state, "DONE", "#215 without an ask the state is unchanged");
-  assert.match(quiet.reason, /attempted change did not go through/i, "#215 an attempted-but-failed change is reported as such");
+  assert.equal(quiet.state, "BLOCKED", "#215 an unresolved refused write remains BLOCKED without an ask");
+  assert.match(quiet.reason, /Required write operation.*tracked\.ts.*outside the project folder/i, "#215 the quiet refusal retains its required operation, target, and tool diagnostic");
 
   // A write that SUCCEEDED but landed on an excluded path (gitignored, build artifact) also shows
   // zero changed files — claiming it "did not go through" would be its own false statement.
@@ -5326,7 +5326,7 @@ process.stdout.write("  deviation disclosure: scoped to mutating turns, fires on
   assert.equal(verifiedCourtesy.state, "DONE", "#215 a verified run closing with a question stays DONE");
   stateModule.resetVinciVerificationState();
 }
-process.stdout.write("  task outcome: a blocked-on-permission run waits instead of reporting a read-only DONE (#215)\n");
+process.stdout.write("  task outcome: an unresolved refused write stays blocked instead of reporting a read-only DONE (#215)\n");
 
 // ── [#215 review round 2] the nits, pinned ─────────────────────────────────────────────────────
 {

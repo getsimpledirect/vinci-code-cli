@@ -1,6 +1,8 @@
 import { vinciBlockedStatusLine } from "./blocked-status.ts";
 import { formatDuration } from "./format-duration.ts";
 import { getVinciHardStop } from "./hard-stop.ts";
+import { isVinciPlanRefusal, isVinciRequiredOperation, vinciRequiredOperations, type VinciRequiredOperation } from "./required-operations.ts";
+export { vinciToolTextReportsFailure } from "./required-operations.ts";
 import {
   addVinciAccumulatedUsage,
   getVinciTaskUsageSnapshot,
@@ -36,18 +38,6 @@ export const VINCI_FALSE_COMPLETION_ENTRY = "vinci-false-completion-report";
 const SCHEMA_VERSION = 1;
 
 export type VinciTaskState = "DONE" | "DONE_UNVERIFIED" | "WAITING" | "BLOCKED";
-
-/**
- * Does a tool result's TEXT report a failed edit? Soft failures carry no `isError` flag, so this
- * pattern is the only signal — but it must not fire on the tool's own success sentence, which
- * echoes the path: an edit to `src/overlap.ts` succeeded and still matched the bare `overlap`
- * pattern, reading as a failure on both sides (and dropping the file from changedFiles).
- * Exported so the receipt and the outcome classifier cannot drift apart by hand-copied regex.
- */
-export function vinciToolTextReportsFailure(text: string): boolean {
-  if (/^\s*Successfully\b/i.test(text)) return false;
-  return /could not find the exact text|no changes|validation failed|overlap|must match exactly/i.test(text);
-}
 
 /** One wording for both ask branches (#199 changed-but-unverified, #215 zero-change) so they
  *  cannot drift apart — and deliberately state-neutral about WHAT changed, since the receipt's
@@ -145,6 +135,8 @@ export type VinciTaskOutcome = {
    *  record so a later display (the receipt, a resumed session) can never remap it back to a
    *  success state from a remote verdict — the registry itself is process-local. */
   hardStop?: { source: string; reason: string };
+  /** Structured unfinished work; absent on historical outcomes, which are never reclassified. */
+  requiredOperations?: VinciRequiredOperation[];
   recordedAt: string;
 };
 
@@ -194,6 +186,8 @@ type BuildOutcomeInput = {
   changedFiles: readonly string[];
   verification: Readonly<VinciVerificationState>;
   activeDurationMs?: number;
+  priorOperations?: readonly VinciRequiredOperation[];
+  cwd?: string;
   now?: Date;
 };
 
@@ -246,69 +240,12 @@ function assistantMessages(messages: readonly unknown[]): MessageLike[] {
     .filter((message): message is MessageLike => message?.role === "assistant");
 }
 
-/**
- * Did this run ATTEMPT to change files? Read from the assistant's own edit/write tool calls and
- * guard-blocked bash results, not from the resulting file list (#215): a run whose writes were
- * refused — by the workspace guard, a permission gate, a failed match — changes nothing, and
- * calling that "a read-only task" reports the shape of the OUTCOME as if it were the shape of the
- * REQUEST. A refused mutation is not a read-only request that happened to touch nothing.
- */
-function attemptedFileChange(messages: readonly unknown[]): { attempted: boolean; failed: boolean } {
-  const writeCallIds = new Set<string>();
-  const bashCallIds = new Set<string>();
-  let attemptedWithoutId = false;
-  for (const message of assistantMessages(messages)) {
-    if (!Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      const content = record(part) as { type?: unknown; name?: unknown; id?: unknown } | undefined;
-      if (content?.type !== "toolCall") continue;
-      if (content.name === "bash") {
-        if (typeof content.id === "string" && content.id) bashCallIds.add(content.id);
-        continue;
-      }
-      if (content.name !== "edit" && content.name !== "write") continue;
-      // Skip id-less calls rather than bucketing them under "": an unrelated id-less error result
-      // would otherwise be read as this call's failure.
-      if (typeof content.id === "string" && content.id) writeCallIds.add(content.id);
-      else attemptedWithoutId = true;
-    }
-  }
-  if (writeCallIds.size === 0 && bashCallIds.size === 0) {
-    return { attempted: attemptedWithoutId, failed: false };
-  }
-  // A write can also SUCCEED and still leave changedFiles empty — an edit to a gitignored or
-  // artifact-excluded path. Claiming "did not go through" there would be its own false statement,
-  // so the failure claim is made only on recorded failure evidence.
-  let failed = false;
-  for (const entry of messages) {
-    const message = record(entry) as
-      | { role?: unknown; toolCallId?: unknown; isError?: unknown; content?: unknown; details?: unknown }
-      | undefined;
-    if (message?.role !== "toolResult") continue;
-    if (typeof message.toolCallId !== "string") continue;
-    if (bashCallIds.has(message.toolCallId)) {
-      if (message.isError === true && record(message.details)?.vinciBlocked === true) {
-        return { attempted: true, failed: true };
-      }
-      continue;
-    }
-    if (!writeCallIds.has(message.toolCallId)) continue;
-    if (message.isError === true) {
-      failed = true;
-      continue;
-    }
-    // Soft failures carry no isError flag (the receipt's own failedChange predicate recognises
-    // them and drops such files from changedFiles). Keeping the two in agreement stops one from
-    // reporting "did write to a file" over what the other treats as a failure.
-    const content: readonly unknown[] = Array.isArray(message.content) ? message.content : [];
-    const text = content
-      .map((part) => record(part) as ContentLike | undefined)
-      .filter((part): part is ContentLike => part?.type === "text" && typeof part.text === "string")
-      .map((part) => String(part.text))
-      .join("\n");
-    if (vinciToolTextReportsFailure(text)) failed = true;
-  }
-  return { attempted: attemptedWithoutId || writeCallIds.size > 0, failed };
+/** Successful structured writes can target files omitted from the project change list. */
+function attemptedFileChange(messages: readonly unknown[]): boolean {
+  return assistantMessages(messages).some((message) => Array.isArray(message.content) && message.content.some((part) => {
+    const content = record(part);
+    return content?.type === "toolCall" && (content.name === "edit" || content.name === "write");
+  }));
 }
 
 function assistantText(message: MessageLike | undefined): string {
@@ -317,8 +254,7 @@ function assistantText(message: MessageLike | undefined): string {
     .map((part) => record(part) as ContentLike | undefined)
     .filter((part): part is ContentLike => part?.type === "text" && typeof part.text === "string")
     .map((part) => String(part.text))
-    .join("\n")
-    .trim();
+    .join("\n");
 }
 
 function userFacingFailure(error: string): string {
@@ -462,14 +398,23 @@ export function classifyVinciLocalTaskState(
   messages: readonly unknown[],
   changedFiles: readonly string[],
   verification: Readonly<VinciVerificationState>,
+  requiredOperations = vinciRequiredOperations(messages),
 ): { state: VinciTaskState; reason: string } {
   if (verification.variant === "terminal-unverifiable") {
     return { state: "BLOCKED", reason: verification.summary };
   }
+  if (requiredOperations.length > 0) {
+    const remaining = requiredOperations.length - 1;
+    const additional = remaining > 0
+      ? ` ${remaining} other required operation${remaining === 1 ? " remains" : "s remain"} unresolved.`
+      : "";
+    return { state: "BLOCKED", reason: `${requiredOperations[0].reason}${additional}` };
+  }
 
   const assistants = assistantMessages(messages);
   const last = assistants.at(-1);
-  const text = assistantText(last);
+  const rawText = assistantText(last);
+  const text = rawText.trim();
   const incompleteBehavioralAttempt = hasIncompleteVinciBehavioralAttempt(verification);
   const zeroCollection = hasVinciZeroCollectionAttempt(verification);
   const verificationPassed = verification.status === "passed" && !incompleteBehavioralAttempt;
@@ -497,7 +442,7 @@ export function classifyVinciLocalTaskState(
         `The attempted check (${verification.behavioralAttemptCommand || verification.command}) ran without executing tests, so nothing was verified.`,
     };
   }
-  const blockedStatus = vinciBlockedStatusLine(text);
+  const blockedStatus = vinciBlockedStatusLine(rawText);
   if (blockedStatus) return { state: "BLOCKED", reason: blockedStatus.slice(0, 240) };
   if (/^\s*WAITING:/i.test(text)) return { state: "WAITING", reason: text.split("\n")[0].slice(0, 240) };
   // #10: verification being switched off never changes the STATE — it changes what we may say
@@ -570,15 +515,18 @@ export function classifyVinciLocalTaskState(
               ? "No project check was run for this change."
               : VINCI_DOC_ONLY_REASON
           : VINCI_DOC_ONLY_REASON
-        : attemptedWrite.failed
-          // [#215] The turn tried to write and the write was refused or failed — a guard, a gate,
-          // a non-matching edit. Never call that a read-only task.
+        : messages.some((value) => {
+          const message = record(value);
+          return message?.role === "toolResult" && Array.isArray(message.content) &&
+            isVinciPlanRefusal(message.content.map((part) => {
+              const content = record(part);
+              return content?.type === "text" && typeof content.text === "string" ? content.text : "";
+            }).filter(Boolean).join("\n"), message.details);
+        })
           ? "No files changed: the attempted change did not go through."
-          : attemptedWrite.attempted
-            // Wrote without error, yet nothing is listed — a gitignored or excluded path. Report
-            // the fact rather than guessing at either "read-only" or "failed".
-            ? "No project changes are listed for this run, though the turn did write to a file."
-            : "The requested read-only task completed without project changes.",
+          : attemptedWrite
+          ? "No project changes are listed for this run, though the turn did write to a file."
+          : "The requested read-only task completed without project changes.",
   };
 }
 
@@ -592,15 +540,18 @@ export function classifyVinciTaskState(
   messages: readonly unknown[],
   changedFiles: readonly string[],
   verification: Readonly<VinciVerificationState>,
+  requiredOperations = vinciRequiredOperations(messages),
 ): { state: VinciTaskState; reason: string } {
+  if (requiredOperations.length > 0) return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations);
   const remoteVerdict = currentRemoteVerdict(verification);
   if (remoteVerdict) return remoteVerdictOutcome(remoteVerdict);
-  return classifyVinciLocalTaskState(messages, changedFiles, verification);
+  return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations);
 }
 
 export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcome {
   const changedFiles = [...new Set(input.changedFiles)].sort();
-  const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification);
+  const requiredOperations = vinciRequiredOperations(input.messages, input.priorOperations, input.cwd);
+  const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification, requiredOperations);
   // [#5/#6] A hard stop (the no-progress latch, or any harness refusal of a finalization step) is
   // a machine fact that outranks the narrative: the model's closing "done" — and even a remote
   // VERIFIED_PASS — cannot turn a frozen session into DONE or DONE_UNVERIFIED, and a closing
@@ -636,6 +587,7 @@ export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcom
     supplementalUsage,
     assistantUsage: streamUsage,
     assistantResponseKeys: [...responseKeys],
+    ...(requiredOperations.length > 0 ? { requiredOperations } : {}),
     ...(hardStop ? { hardStop: { source: hardStop.source, reason: hardStop.reason } } : {}),
     recordedAt: (input.now ?? new Date()).toISOString(),
   };
@@ -669,6 +621,8 @@ export function isVinciTaskOutcome(value: unknown): value is VinciTaskOutcome {
       (Array.isArray(candidate.assistantResponseKeys) &&
         candidate.assistantResponseKeys.every((key) => typeof key === "string"))) &&
     (candidate.assistantUsage === undefined || isTaskUsageRecord(candidate.assistantUsage))
+    && (candidate.requiredOperations === undefined ||
+      (Array.isArray(candidate.requiredOperations) && candidate.requiredOperations.every(isVinciRequiredOperation)))
   );
 }
 

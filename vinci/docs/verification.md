@@ -95,9 +95,23 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   without a repair follow-up. A completed direct behavioral check takes precedence over filesystem
   guesses that a project has no verifier; the static-project unverified note requires an observed edit.
   `vinci-receipt.ts` renders and persists the terminal contract directly: verified code is `DONE`,
-  changed code without a direct pass is `DONE-UNVERIFIED`, a named decision is `WAITING`, and a
-  provider/check/runtime stop is `BLOCKED`. The same non-context task record carries model-call,
+  changed code without a direct pass is `DONE-UNVERIFIED`, and a named decision with no unresolved
+  required operation is `WAITING`. An unresolved required read, write, or command is `BLOCKED`,
+  even when some changes landed, a check passed, or the final reply asks for a go-ahead. The reason
+  names the first unresolved operation and target, with a count of any others; successful changed
+  files remain recorded. A successful equivalent retry clears only that operation. Unrelated
+  success, a different error, or success prose cannot clear it. A remote pass remains additional
+  evidence and does not clear an unresolved local required operation. Completed read-only work
+  remains `DONE`. The receipt and `/usage` label `WAITING` “Waiting for you” and `BLOCKED`
+  “Stopped — needs you”; the editor shows `WAITING` or `BLOCKED`. Provider, check, and runtime stops
+  remain `BLOCKED`. The same non-context task record carries model-call,
   token, cache, provider/model, and locally estimated cost telemetry for `/usage` and `/task-info`.
+  A plain confirmation such as `yes` or `go ahead` carries unresolved required work into the next
+  turn until an equivalent successful result clears it. A go-ahead with additional words, or `no`,
+  counts as a new request and does not carry that operation. Without an unresolved operation,
+  confirmations keep their existing behavior. The existing closing-ask grammar can still mistake
+  a quoted or negated ask for a needed decision. These rules apply to newly recorded outcomes;
+  historical saved outcomes remain readable as recorded and are not repaired automatically.
 - **Bounded-stop ownership** — loop breaking, plan continuation, goal continuation, todo continuation,
   and verification recovery share one process-wide latch in `lib/control.ts`. Once a no-progress
   boundary is reached, no other extension can silently restart the job; only the next real user

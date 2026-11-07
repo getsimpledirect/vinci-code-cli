@@ -5,7 +5,6 @@
  * chrome: a stateful composer border, honest connection state, mode/model/project orientation, and
  * the only continuous animation on screen while work is active.
  */
-import { createHash } from "node:crypto";
 import { basename, isAbsolute, relative, sep } from "node:path";
 import {
   CustomEditor,
@@ -33,6 +32,8 @@ import {
 } from "./lib/ui-state.ts";
 import { containsVerificationCommand } from "./vinci-verification.ts";
 import { getVeroPresentation, vinciReducedMotion } from "./lib/vero-state.ts";
+import { vinciCarriesOperations, vinciRequiredOperations, type VinciRequiredOperation } from "./lib/required-operations.ts";
+import { getVinciTaskOutcome } from "./lib/task-outcome.ts";
 
 export const VINCI_PULSE_FRAMES = ["·", "•", "●", "•"] as const;
 const PULSE_INTERVAL_MS = 260;
@@ -173,12 +174,6 @@ function formatProject(cwd: string, width: number): string {
   return fromHome !== ".." && !fromHome.startsWith(`..${sep}`) && !isAbsolute(fromHome) ? `~/${fromHome}` : cwd;
 }
 
-function recoveryTarget(toolName: string, input: unknown, cwd: string): string | undefined {
-  const args = input as { path?: unknown; command?: unknown } | undefined;
-  const target = toolName === "bash" ? args?.command : ["edit", "write", "read"].includes(toolName) ? args?.path : undefined;
-  return typeof target === "string" ? createHash("sha256").update(`${cwd}\0${toolName}\0${target}`).digest("hex") : undefined;
-}
-
 class EmptyFooter implements Component {
   render(): string[] {
     return [];
@@ -219,7 +214,11 @@ export default function (pi: ExtensionAPI) {
   let unsubscribeState: (() => void) | undefined;
   const verificationToolCallIds = new Set<string>();
   let providerBlocker: { provider?: string; reason: string } | undefined;
-  let toolBlocker: { target?: string; reason: string } | undefined;
+  let toolBlocker: { reason: string } | undefined;
+  let toolMessages: unknown[] = [];
+  const toolCalls = new Map<string, string>();
+  let pendingOperations: readonly VinciRequiredOperation[] = [];
+  let priorOperations: readonly VinciRequiredOperation[] = [];
   let displayedRecovery: string | undefined;
   const publishRecovery = () => {
     const reason = toolBlocker?.reason ?? providerBlocker?.reason;
@@ -258,6 +257,10 @@ export default function (pi: ExtensionAPI) {
     resetShellUiState();
     providerBlocker = undefined;
     toolBlocker = undefined;
+    pendingOperations = getVinciTaskOutcome()?.requiredOperations ?? [];
+    priorOperations = pendingOperations;
+    toolMessages = [];
+    toolCalls.clear();
     displayedRecovery = undefined;
     stopAnimation();
     clearContinuationWatchdog();
@@ -374,7 +377,20 @@ export default function (pi: ExtensionAPI) {
     requestRender();
   });
 
+  pi.on("before_agent_start", (event) => {
+    if (vinciCarriesOperations(event.prompt, pendingOperations.length > 0)) return;
+    pendingOperations = [];
+    priorOperations = [];
+    toolMessages = [];
+    toolCalls.clear();
+    toolBlocker = undefined;
+    publishRecovery();
+  });
+
   pi.on("agent_start", () => {
+    priorOperations = pendingOperations;
+    toolMessages = [];
+    toolCalls.clear();
     publishRecovery();
     verificationToolCallIds.clear();
     clearContinuationWatchdog();
@@ -410,20 +426,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event, ctx) => {
-    const output = event.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? "";
-    const recovery = getVinciRecoveryGuidance(output);
-    if (event.isError && (recovery.kind === "sandbox" ||
-      (recovery.kind === "access" && /permission denied|operation not permitted|\b(?:EACCES|EPERM)\b/i.test(output)))) {
-      toolBlocker = { target: recoveryTarget(event.toolName, event.input, ctx.cwd), reason: formatVinciRecoveryMessage(output) };
-      publishRecovery();
-    } else if (!event.isError && toolBlocker?.target && toolBlocker.target === recoveryTarget(event.toolName, event.input, ctx.cwd)) {
-      const execution = (event.details as { execution?: { exitCode?: unknown; originalCommand?: unknown; cwd?: unknown } } | undefined)?.execution;
-      // A shell killed without a numeric exit is not proof that the denied command recovered.
-      if (event.toolName !== "bash" || (execution?.exitCode === 0 && execution.originalCommand === true && execution.cwd === ctx.cwd)) {
-        toolBlocker = undefined;
-        publishRecovery();
-      }
+    const output = Array.isArray(event.content)
+      ? event.content.flatMap((part) => part?.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n")
+      : "";
+    const signature = JSON.stringify({ toolName: event.toolName, input: event.input });
+    if (toolCalls.get(event.toolCallId) !== signature) {
+      toolMessages.push({ role: "assistant", content: [{ type: "toolCall", id: event.toolCallId, name: event.toolName, arguments: event.input }] });
+      toolCalls.set(event.toolCallId, signature);
     }
+    toolMessages.push({ role: "toolResult", toolCallId: event.toolCallId, toolName: event.toolName, content: event.content, details: event.details, isError: event.isError });
+    pendingOperations = vinciRequiredOperations(toolMessages, priorOperations, ctx.cwd);
+    toolBlocker = pendingOperations.length ? { reason: formatVinciRecoveryMessage(pendingOperations[0].reason || output) } : undefined;
+    publishRecovery();
     if (verificationToolCallIds.size > 0) return;
     setVinciActivity(vinciActivityStateAfterTool());
     setVinciWorkingLabel(vinciActivityAfterTool(event.toolName, !!event.isError));

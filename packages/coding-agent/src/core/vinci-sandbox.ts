@@ -32,6 +32,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { waitForChildProcess } from "../utils/child-process.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { getShellConfig, killProcessTree } from "../utils/shell.ts";
+import { getSandboxRecoveryGuidance } from "./sandbox-guidance.ts";
 
 export function vinciSandboxEnabled(): boolean {
 	return process.env.VINCI_CODE === "1" && process.env.VINCI_NO_SANDBOX !== "1";
@@ -409,7 +410,7 @@ function bwrapWrap(
 	const missingFile = files.find((path) => !existsSync(path));
 	if (missingFile)
 		throw new Error(
-			`Bubblewrap cannot bind a new explicit file grant "${missingFile}". Create the file yourself first, or grant an unprotected parent directory.`,
+			`Bubblewrap cannot bind a new explicit file grant "${missingFile}" because the file does not exist. Create the intended file before retrying; widening file access will not help.`,
 		);
 	const binds = roots
 		.filter((r) => existsSync(r))
@@ -479,7 +480,7 @@ export function vinciSandboxWrap(command: string, cwd: string, shellPath?: strin
 			);
 	}
 	throw new Error(
-		"Vinci disabled bash because no enforceable OS sandbox is available. Install bubblewrap or set VINCI_NO_SANDBOX=1 as an explicit developer bypass.",
+		`Vinci disabled bash because no enforceable OS sandbox is available. ${getSandboxRecoveryGuidance("no enforceable OS sandbox")!.nextStep}`,
 	);
 }
 
@@ -511,6 +512,42 @@ export function vinciSandboxChildEnv(environment: NodeJS.ProcessEnv, stripAmbien
 /** Default local structured mutations use the same native policy as bash, including filesystem
  * resolution at the actual write. Extension-supplied operations remain a trusted extension surface. */
 export async function vinciSandboxWriteFile(
+	path: string,
+	content: string,
+	cwd: string,
+	createParents: boolean,
+	signal?: AbortSignal,
+): Promise<void> {
+	try {
+		await writeSandboxedFile(path, content, cwd, createParents, signal);
+	} catch (error) {
+		if (signal?.aborted) throw error;
+		const diagnostic = error instanceof Error ? error.message : String(error);
+		const target = canonicalWritePath(path);
+		const protectedPath =
+			!!target && vinciSensitiveNoWrite(cwd).some((root) => target === root || target.startsWith(root + sep));
+		const pathScopeRefused =
+			!!target &&
+			!/^\s*(?:bwrap|bubblewrap|sandbox-exec):/im.test(diagnostic) &&
+			diagnostic
+				.split("\n")
+				.some(
+					(line) =>
+						/permission denied|operation not permitted|read-only file system|\b(?:EACCES|EPERM)\b/i.test(line) &&
+						(line.includes(`"${target}"`) || line.includes(`'${target}'`) || line.includes(`${target}:`)),
+				) &&
+			!vinciSandboxWriteGranted(cwd, path);
+		const recovery = getSandboxRecoveryGuidance(diagnostic, { sandbox: true, pathScopeRefused, protectedPath });
+		throw new Error(
+			`Vinci could not write "${path}" inside its scoped sandbox: ${diagnostic}. ${recovery!.nextStep}`,
+			{
+				cause: error,
+			},
+		);
+	}
+}
+
+async function writeSandboxedFile(
 	path: string,
 	content: string,
 	cwd: string,
@@ -551,17 +588,19 @@ export async function vinciSandboxWriteFile(
 	const stop = () => {
 		if (child.pid) killProcessTree(child.pid);
 	};
-	const timer = setTimeout(stop, 30_000);
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		stop();
+	}, 30_000);
 	signal?.addEventListener("abort", stop, { once: true });
 	try {
 		if (signal?.aborted) stop();
 		child.stdin.end(content);
 		const exitCode = await waitForChildProcess(child);
 		if (signal?.aborted) throw new Error("Operation aborted");
-		if (exitCode !== 0)
-			throw new Error(
-				`Vinci could not write "${path}" inside its scoped sandbox: ${diagnostic.trim() || "writer did not complete"}. Use /allow-directory or /allow-file for deliberate additional scope, or inspect sandbox prerequisites.`,
-			);
+		if (timedOut) throw new Error("Sandbox writer timed out after 30 seconds");
+		if (exitCode !== 0) throw new Error(diagnostic.trim() || "writer did not complete");
 	} finally {
 		clearTimeout(timer);
 		signal?.removeEventListener("abort", stop);

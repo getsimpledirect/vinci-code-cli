@@ -36,13 +36,14 @@ export function keyText(keybinding: Keybinding): string {
 }
 
 export function keyDisplayText(keybinding: Keybinding): string {
-	return formatKeys(getKeybindings().getKeys(keybinding), { capitalize: true });
+	return formatKeys(getKeybindings().getKeys(keybinding), { capitalize: true }) || "Unbound";
 }
 
 export function keyHint(keybinding: Keybinding, description: string): string {
-	return theme.fg("dim", keyText(keybinding)) + theme.fg("muted", ` ${description}`);
+	const key = keyText(keybinding);
+	return key ? theme.fg("dim", key) + theme.fg("muted", ` ${description}`) : "";
 }
 
 export function rawKeyHint(key: string, description: string): string {
-	return theme.fg("dim", formatKeyText(key)) + theme.fg("muted", ` ${description}`);
+	return key.trim() ? theme.fg("dim", formatKeyText(key)) + theme.fg("muted", ` ${description}`) : "";
 }

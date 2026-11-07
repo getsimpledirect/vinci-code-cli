@@ -15,6 +15,11 @@ Outputs all session events as JSON lines to stdout. Useful for integrating pi in
 
 Transport failures and missing prompts take precedence over an extension-declared task outcome.
 
+For Vinci tasks, scripts must receive exit `3` after a required write is refused, with or without
+a closing ask for a go-ahead. This contract changes the no-ask case from exit `0` to exit `3`;
+the ask case retains exit `3`. A question without an unresolved required operation can still be
+`WAITING`. Text mode (`-p`) follows the same task-outcome exit contract.
+
 ## Event Types
 
 Events are defined in [`AgentSessionEvent`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts#L102):

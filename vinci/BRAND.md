@@ -59,6 +59,9 @@ approval; the supplied terminal integration uses readable text when images are u
 Vero reflects activity, not proof: working means activity; review means checking or a
 human decision; blocked means an observed blocker; done means completed activity. The
 receipt carries the evidence. `DONE-UNVERIFIED`, `WAITING` and `BLOCKED` remain explicit.
+The receipt and `/usage` call `WAITING` “Waiting for you” and `BLOCKED` “Stopped — needs you”.
+`WAITING` is a needed decision without an unresolved required operation. Required work that
+remains refused or failed is `BLOCKED`, even when the final reply asks for a go-ahead.
 The poses do not certify verification, approval, safety or security.
 
 `VINCI_REDUCED_MOTION=1` keeps a static activity indicator. `NO_COLOR`, `TERM=dumb`,

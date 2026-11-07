@@ -807,6 +807,7 @@ run_group ui-state-integration node "${ROOT}/vinci/test/ui-state-integration.mjs
 run_group vero-integration node "${ROOT}/vinci/test/vero-integration.mjs"
 run_group shell-recovery-integration node "${ROOT}/vinci/test/shell-recovery-integration.mjs"
 run_group non-tty-output-integration node "${ROOT}/vinci/test/non-tty-output-integration.mjs"
+run_group headless-required-operations node "${ROOT}/vinci/test/headless-required-operations.mjs"
 # User messages submitted mid-run remain visibly queued until the agent receives them.
 run_group queue-integration node "${ROOT}/vinci/test/queue-integration.mjs"
 # Requested/resolved model identity and route pins survive session resume; route drift is visible.
