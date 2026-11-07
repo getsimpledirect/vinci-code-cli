@@ -163,6 +163,15 @@ const cases = {
       await f.finish({ malformedType: label, refusedCall: 1, carriedAction: 27 });
     }
   },
+  async N5() {
+    const f = fixture("N5");
+    await exhaust(f, "N5");
+    await f.start({ text: "continue", source: "rpc" });
+    const refused = await f.action("rpc-1");
+    assert.equal(refused.call, 1, "N5: first call after agent_start");
+    ceiling(refused, 27, "N5 rpc call 1");
+    await f.finish({ event: { text: "continue", source: "rpc" }, refusedCall: 1, carriedAction: 27 });
+  },
   async P3() {
     const f = fixture("P3");
     await exhaust(f, "P3");
