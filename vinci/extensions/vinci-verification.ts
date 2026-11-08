@@ -9,6 +9,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   classifyCompletionResult,
   complete,
@@ -33,6 +34,7 @@ import {
   hasIncompleteVinciBehavioralAttempt,
   hasVinciZeroCollectionAttempt,
   hydrateVinciVerificationState,
+  parseVinciVerificationState,
   recordVinciBehavioralVerification,
   recordVinciDiffInspection,
   recordVinciEvidenceGap,
@@ -46,6 +48,7 @@ import {
   recordVinciVerificationRecovery,
   resetVinciMutationDigestObservation,
   resetVinciVerificationState,
+  restoreVinciVerificationState,
   scanVinciVerificationStateBranch,
   vinciRequiredVerificationCommand,
   vinciVerificationCheckClass,
@@ -777,7 +780,7 @@ type ShellToken = ShellWordToken | ShellOperatorToken;
  * decodes only quote/backslash rules that are safe to reproduce as argv, and marks syntax that needs
  * a real shell so replay can refuse it.
  */
-function shellTokens(command: string): ShellToken[] | undefined {
+export function shellTokens(command: string): ShellToken[] | undefined {
   const tokens: ShellToken[] = [];
   let wordStart = -1;
   let value = "";
@@ -1088,7 +1091,7 @@ function evidenceGapSummary(): string {
 // A test command mentioned INSIDE a quoted argument is not a test run: `git commit -m "fix: make npm
 // test pass"` and `echo "run npm test"` exit 0 and must not be recorded as passing verifications
 // (sweep P1-3 — they cleared the failed/stale gate and minted "Verification passed: git commit…").
-function unquoted(command: string): string {
+export function unquoted(command: string): string {
   return command.replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, " ");
 }
 
@@ -1477,7 +1480,7 @@ export function hasNonCdContext(command: string): boolean {
 // suite ran WITHOUT the change, so it proves nothing about the work. Anything preceding the check
 // must be genuinely inert — move around, set a variable, drop a test cache. An allowlist, not a
 // blocklist, because the cost of admitting one state-changing command here is a false "verified".
-const BENIGN_PREPARATION =
+export const BENIGN_PREPARATION =
   /^\s*(?:cd(?=\s|$)|pushd(?=\s|$)|popd(?=\s|$)|export\s|unset\s|source\s|\.\s|[A-Za-z_][A-Za-z0-9_]*=|go\s+clean(?=\s|$)|(?:npm|pnpm|yarn|bun)\s+run\s+clean(?=\s|$)|cargo\s+clean(?=\s|$)|make\s+clean(?=\s|$))/;
 
 export function isExitCodeFaithfulChain(command: string): boolean {
@@ -2154,6 +2157,34 @@ function persistedVerificationState(ctx?: ExtensionContext): VinciVerificationSt
   return scanVinciVerificationStateBranch(branch);
 }
 
+// One slot holding what this extension's bash tool_call just wrote, so a later tool_call handler
+// that stops the SAME call before it runs can withdraw it. Kept on globalThis because each extension
+// is bundled separately. Cleared on every tool_call, on tool_result and at turn end.
+type VinciToolCallUndo = {
+  sessionId: string | undefined;
+  toolCallId: unknown;
+  command: string;
+  recorded: Readonly<VinciVerificationState>;
+  undo: () => boolean;
+};
+const TOOL_CALL_UNDO_KEY = Symbol.for("vinci.verification.tool-call-undo");
+const toolCallUndoGlobal = globalThis as typeof globalThis & { [TOOL_CALL_UNDO_KEY]?: VinciToolCallUndo };
+
+/**
+ * Withdraw what verification's tool_call recorded for a bash call that a later tool_call handler
+ * stopped before it ran. Applies only to the same call (session id, toolCallId and trimmed command)
+ * while the state is still exactly what that handler left; otherwise nothing changes. The slot is spent
+ * either way.
+ */
+export function undoVinciVerificationToolCall(toolCallId: unknown, command: string, sessionId: unknown): boolean {
+  const slot = toolCallUndoGlobal[TOOL_CALL_UNDO_KEY];
+  toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = undefined;
+  if (!slot || toolCallId === undefined || slot.toolCallId !== toolCallId || slot.command !== command) return false;
+  if (typeof sessionId !== "string" || slot.sessionId !== sessionId) return false;
+  if (!isDeepStrictEqual(getVinciVerificationState(), slot.recorded)) return false;
+  return slot.undo();
+}
+
 export default function (pi: ExtensionAPI) {
   let continueAfterTurn = false;
   let sandboxStartupOutput = "";
@@ -2551,17 +2582,46 @@ export default function (pi: ExtensionAPI) {
     await captureTurnMutationBaseline(ctx.cwd);
   });
 
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx) => {
+    toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = undefined;
     if (event.toolName !== "bash") return;
     const command = String((event.input as { command?: unknown }).command ?? "").trim();
+    const mutatingBashBefore = mutatingBashThisTurn;
+    const stateBefore = getVinciVerificationState();
+    const keepUndo = (recorded: boolean) => {
+      let sessionId: string | undefined;
+      try {
+        sessionId = ctx?.sessionManager?.getSessionId?.();
+      } catch {
+        sessionId = undefined; // no session id: the slot never matches, so nothing is withdrawn
+      }
+      toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = {
+        sessionId,
+        toolCallId: (event as { toolCallId?: unknown }).toolCallId,
+        command,
+        recorded: getVinciVerificationState(),
+        undo: () => {
+          // The store re-parses what it is given; a state the parser would change or reject cannot
+          // be put back exactly, so the record stays (fail closed).
+          if (recorded && !isDeepStrictEqual(parseVinciVerificationState(stateBefore), { ...stateBefore })) return false;
+          mutatingBashThisTurn = mutatingBashBefore;
+          if (!recorded) return true;
+          restoreVinciVerificationState(stateBefore);
+          persistVerificationState();
+          return true;
+        },
+      };
+    };
     if (bashLooksMutating(command)) mutatingBashThisTurn = true;
     const checkClass = classifyVerificationCommand(command);
-    if (checkClass !== "behavioral") return;
+    if (checkClass !== "behavioral") return keepUndo(false);
     recordVinciVerificationAttempt(command, checkClass);
     persistVerificationState();
+    keepUndo(true);
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = undefined;
     const output = textContent(event.content);
     if (event.toolName === "edit" || event.toolName === "write") {
       if (FAILED_CHANGE.test(output)) {
@@ -3048,6 +3108,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", async (_event, ctx) => {
+    toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = undefined;
     if (!continueAfterTurn || getVinciAutomationStop().stopped) return;
     continueAfterTurn = false;
     if (ctx.hasPendingMessages()) return;
