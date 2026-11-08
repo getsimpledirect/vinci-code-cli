@@ -768,6 +768,44 @@ export async function getUnstuck(ctx: ExtensionContext, stuckKey: string, recent
 // A whole-message "continue" (any casing/punctuation) — the nudge people type at a stalled agent.
 const CONTINUEISH = /^\s*(?:(?:ok(?:ay)?|yes|yeah|yep|sure)[,\s]+)?(?:continue|keep going|go on|carry on|resume|finish(?:\s+it)?)[\s.!…]*$/i;
 
+/** The one condition under which a continue-style message starts a fresh turn with fresh per-turn
+ *  budgets: it was typed in an interactive session and is not a mid-stream steer. Every other
+ *  continue-style message keeps the budget it already spent. Verification state is not reset. */
+export function typedContinueGrantsFreshTurn(event: { source?: unknown; streamingBehavior?: unknown }): boolean {
+  return event.source === "interactive" && !event.streamingBehavior;
+}
+
+/** Whether someone can type the continue that typedContinueGrantsFreshTurn grants. Only the
+ *  interactive terminal qualifies: rpc binds a UI (hasUI is true) but its prompts arrive as "rpc";
+ *  print and json prompts default to source "interactive" with nobody there to type one. A missing
+ *  or unknown mode counts as no. */
+export function canTypeFreshTurnContinue(ctx: { mode?: unknown }): boolean {
+  try {
+    return ctx.mode === "tui";
+  } catch {
+    return false;
+  }
+}
+
+const FRESH_TURN_REMEDY = " Type continue to start a fresh turn on the same task.";
+
+/** The plain sentence recorded on an action-limit stop (quoted to the user as "Why I stopped: …"). */
+export function actionLimitStopReason(ctx: { mode?: unknown }): string {
+  const remedy = canTypeFreshTurnContinue(ctx) ? FRESH_TURN_REMEDY : "";
+  return `Vinci reached the limit of ${TURN_CALL_CEILING} actions allowed in one turn before finishing.${remedy}`;
+}
+
+/** The plain sentence recorded on a navigation-limit stop. */
+export function navigationLimitStopReason(ctx: { mode?: unknown }): string {
+  const remedy = canTypeFreshTurnContinue(ctx) ? FRESH_TURN_REMEDY : "";
+  return `Vinci reached the limit of ${READ_ONLY_NAVIGATION_CEILING} read-only lookups allowed in one turn before finishing.${remedy}`;
+}
+
+// The UI warning shown while the turn is still running. It names the same limit as the closing
+// stop sentence; it gives no continue remedy because a continue typed mid-stream keeps the budget.
+const ACTION_LIMIT_NOTE = `Vinci reached the limit of ${TURN_CALL_CEILING} actions for this turn — telling it to stop and answer. Press Ctrl+C if you want to step in.`;
+const NAVIGATION_LIMIT_NOTE = `Vinci reached the limit of ${READ_ONLY_NAVIGATION_CEILING} read-only lookups for this turn — telling it to stop and answer. Press Ctrl+C if you want to step in.`;
+
 export default function (pi: ExtensionAPI) {
   installVinciUsageAccumulator(pi);
   let calls = 0; // total tool calls this user-turn
@@ -868,7 +906,7 @@ export default function (pi: ExtensionAPI) {
     // the navigation counter or they reset the turn and re-grant the whole budget (round-12 P0).
     const continueish = CONTINUEISH.test(text);
     carryRepeats =
-      (continueish && !(event.source === "interactive" && !event.streamingBehavior)) ||
+      (continueish && !typedContinueGrantsFreshTurn(event)) ||
       (event.source === "extension" && (calls > 0 || readOnlyNavigationCalls > 0));
     if (!continueish && !carryRepeats) task = text;
   });
@@ -1170,9 +1208,9 @@ export default function (pi: ExtensionAPI) {
       if (readOnlyNavigationCalls > READ_ONLY_NAVIGATION_CEILING) {
         return firmBlock(
           ctx,
-          "Vinci's been reading for a long time — telling it to stop and answer. Press Ctrl+C if you want to step in.",
+          NAVIGATION_LIMIT_NOTE,
           `${STOP_AND_REPORT}\n\n(Read-only call ${readOnlyNavigationCalls} this turn — over the navigation limit. Write your answer as plain text now.)`,
-          "Vinci hit its per-turn navigation limit before finishing.",
+          navigationLimitStopReason(ctx),
         );
       }
       return undefined;
@@ -1281,12 +1319,12 @@ export default function (pi: ExtensionAPI) {
         fixationAdvisorExemption = false;
         return undefined;
       }
-      if (tool === "bash") recordFinalizationRefusal(ctx, "ceiling", command, "Vinci hit its per-turn action limit before finishing.");
+      if (tool === "bash") recordFinalizationRefusal(ctx, "ceiling", command, actionLimitStopReason(ctx));
       return firmBlock(
         ctx,
-        "Vinci's been at this a while — telling it to stop and answer. Press Ctrl+C if you want to step in.",
+        ACTION_LIMIT_NOTE,
         `${STOP_AND_REPORT}\n\n(Action ${actionCalls} this turn — over the limit. Write your answer as plain text now; further non-navigation calls will also be blocked.)`,
-        "Vinci hit its per-turn action limit before finishing.",
+        actionLimitStopReason(ctx),
       );
     }
     // A stronger check is the ratchet's upgrade path. Two attempts against one recorded verifier may
@@ -1451,9 +1489,9 @@ export default function (pi: ExtensionAPI) {
       if (readOnlyNavigationCalls > READ_ONLY_NAVIGATION_CEILING) {
         return firmBlock(
           ctx,
-          "Vinci's been reading for a long time — telling it to stop and answer. Press Ctrl+C if you want to step in.",
+          NAVIGATION_LIMIT_NOTE,
           `${STOP_AND_REPORT}\n\n(Read-only call ${readOnlyNavigationCalls} this turn — over the navigation limit. Write your answer as plain text now.)`,
-          "Vinci hit its per-turn navigation limit before finishing.",
+          navigationLimitStopReason(ctx),
         );
       }
       if (readOnlyStreak >= EXPLORE_LIMIT && !exploreSteerSent) {
