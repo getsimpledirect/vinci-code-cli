@@ -551,7 +551,7 @@ export default function (pi: ExtensionAPI) {
   let errorStreak = 0; // failing tool calls in a row (catches edit/write thrashing after a self-inflicted mess)
   let hardBlocks = 0; // firm blocks issued this turn (arms the opt-in deferred turn-stop)
   let stopScheduled = false; // the deferred turn-stop fires at most once per turn
-  let carryRepeats = false; // set by a continue-ish input: keep `seen`/`interventions` across the turn boundary
+  let carryRepeats = false; // non-interactive continuations keep budget and fixation state across turns
   let silentRounds = 0; // consecutive tool rounds with no narration (drives the talk-more nudge)
   let narrationNudges = 0; // nudges sent this turn (capped — remind, don't nag)
   let exploreSteerSent = false; // one recovery steer per exploration streak (prevents duplicate answers)
@@ -577,8 +577,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   // agent_start fires once per user prompt — reset the per-turn counters (keep `task`, set on input).
-  // EXCEPTION: user continuations and extension-owned recovery turns are the same task, so their
-  // cumulative budget and convergence state carry over. Otherwise an automatic verification retry
+  // EXCEPTION: streaming continuations and extension-owned recovery turns carry their cumulative
+  // budget and convergence state over. Otherwise an automatic verification retry
   // can silently buy another full tool budget after the original turn has already exhausted it.
   pi.on("agent_start", async () => {
     stopScheduled = false;
@@ -615,10 +615,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Capture the user's request (before agent processing) so a stronger teammate knows the goal.
-  // A continue-ish message carries the repeat counters (see agent_start) and does NOT overwrite the
-  // real task — "continue" as escalation context would tell a stronger teammate nothing.
+  // A typed interactive continuation gets a fresh turn, but keeps the real task — "continue" as
+  // escalation context would tell a stronger teammate nothing. Other continuations keep the budget.
   pi.on("input", async (event, ctx) => {
-    const text = event.text?.trim();
+    if (typeof event.text !== "string") {
+      carryRepeats = true;
+      return;
+    }
+    const text = event.text.trim();
     if (!text) return;
     // Only a REAL new prompt lifts the stop: a mid-stream keystroke ("wait, what?") un-latching a
     // firm stop resumed the exact frozen loop with a fresh call budget (round-2 audit P1-4).
@@ -628,9 +632,11 @@ export default function (pi: ExtensionAPI) {
     }
     // Read-only bash calls never touch `calls`, so recovery inputs mid-navigation must also see
     // the navigation counter or they reset the turn and re-grant the whole budget (round-12 P0).
+    const continueish = CONTINUEISH.test(text);
     carryRepeats =
-      CONTINUEISH.test(text) || (event.source === "extension" && (calls > 0 || readOnlyNavigationCalls > 0));
-    if (!carryRepeats) task = text;
+      (continueish && !(event.source === "interactive" && !event.streamingBehavior)) ||
+      (event.source === "extension" && (calls > 0 || readOnlyNavigationCalls > 0));
+    if (!continueish && !carryRepeats) task = text;
   });
 
   // ── Invalid-call coach ─────────────────────────────────────────────────────────────────────────
