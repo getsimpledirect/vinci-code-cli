@@ -2161,6 +2161,7 @@ function persistedVerificationState(ctx?: ExtensionContext): VinciVerificationSt
 // that stops the SAME call before it runs can withdraw it. Kept on globalThis because each extension
 // is bundled separately. Cleared on every tool_call, on tool_result and at turn end.
 type VinciToolCallUndo = {
+  sessionId: string | undefined;
   toolCallId: unknown;
   command: string;
   recorded: Readonly<VinciVerificationState>;
@@ -2171,13 +2172,15 @@ const toolCallUndoGlobal = globalThis as typeof globalThis & { [TOOL_CALL_UNDO_K
 
 /**
  * Withdraw what verification's tool_call recorded for a bash call that a later tool_call handler
- * stopped before it ran. Applies only to the same call (toolCallId and trimmed command) while the
- * state is still exactly what that handler left; otherwise nothing changes. The slot is spent either way.
+ * stopped before it ran. Applies only to the same call (session id, toolCallId and trimmed command)
+ * while the state is still exactly what that handler left; otherwise nothing changes. The slot is spent
+ * either way.
  */
-export function undoVinciVerificationToolCall(toolCallId: unknown, command: string): boolean {
+export function undoVinciVerificationToolCall(toolCallId: unknown, command: string, sessionId: unknown): boolean {
   const slot = toolCallUndoGlobal[TOOL_CALL_UNDO_KEY];
   toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = undefined;
   if (!slot || toolCallId === undefined || slot.toolCallId !== toolCallId || slot.command !== command) return false;
+  if (typeof sessionId !== "string" || slot.sessionId !== sessionId) return false;
   if (!isDeepStrictEqual(getVinciVerificationState(), slot.recorded)) return false;
   return slot.undo();
 }
@@ -2579,14 +2582,21 @@ export default function (pi: ExtensionAPI) {
     await captureTurnMutationBaseline(ctx.cwd);
   });
 
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx) => {
     toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = undefined;
     if (event.toolName !== "bash") return;
     const command = String((event.input as { command?: unknown }).command ?? "").trim();
     const mutatingBashBefore = mutatingBashThisTurn;
     const stateBefore = getVinciVerificationState();
     const keepUndo = (recorded: boolean) => {
+      let sessionId: string | undefined;
+      try {
+        sessionId = ctx?.sessionManager?.getSessionId?.();
+      } catch {
+        sessionId = undefined; // no session id: the slot never matches, so nothing is withdrawn
+      }
       toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = {
+        sessionId,
         toolCallId: (event as { toolCallId?: unknown }).toolCallId,
         command,
         recorded: getVinciVerificationState(),

@@ -126,7 +126,11 @@ const MAX_UNCOUNTED_COMPOUND_BLOCKS = 3;
 const MAX_CONSECUTIVE_COMPOUND_BLOCKS = 2;
 const NESTED_SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 
-/** Test seam: fault injection and observation only; production code never sets these fields. */
+/**
+ * Test seam: fault injection and observation only. Production code never sets `fault` or
+ * `onReservationDecision`; it only publishes the read-only `actionCalls` getter, so tests can observe
+ * the per-turn action count. Unset, `fault` and `onReservationDecision` change nothing.
+ */
 export const vinciCompoundCheckTestSeam: {
   fault?: "evaluate" | "derive";
   onReservationDecision?: (purpose: "call" | "direct", input: VerificationReservationInput) => void;
@@ -276,9 +280,11 @@ function hasUnquotedCharacter(command: string, characters: string): boolean {
  * and it must itself be a direct verification command.
  */
 export function compoundCheckShape(command: string): CompoundShape | undefined {
-  const text = command.trim();
+  // The character test runs on the text as given: a general trim would drop NBSP, BOM, CR and other
+  // blanks that bash keeps as part of a word. Only ASCII space and tab are trimmed, afterwards.
+  if (!/^[\x20-\x7E\t]+$/.test(command)) return undefined;
+  const text = command.replace(/^[ \t]+|[ \t]+$/g, "");
   if (!text) return undefined;
-  if (!/^[\x20-\x7E\t]+$/.test(text)) return undefined;
   if (/<<|\$\(|`|<\(|>\(/.test(text)) return undefined;
   if (hasUnquotedCharacter(text, "#")) return undefined;
   if (hasUnquotedCharacter(text, "<>")) return undefined;
@@ -1225,7 +1231,11 @@ export default function (pi: ExtensionAPI) {
       compoundBlocksThisTurn += 1;
       compoundStreakBlocks += 1;
       try {
-        undoVinciVerificationToolCall((event as { toolCallId?: unknown }).toolCallId, command.trim());
+        undoVinciVerificationToolCall(
+          (event as { toolCallId?: unknown }).toolCallId,
+          command.trim(),
+          ctx.sessionManager?.getSessionId?.(),
+        );
       } catch {
         /* the attempt record stays; the stop itself stands */
       }

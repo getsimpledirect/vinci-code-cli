@@ -3,8 +3,9 @@
 //
 // Every case runs the real verification and loopbreak extensions through the real ExtensionRunner in
 // the shipped load order (verification before loopbreak, bin/vinci). "spy" counts executions of the
-// call: 0 means a tool_call handler stopped it before it ran. Each case asserts the spy first, then the
-// reason text, then state, so an earlier stop cannot answer for the one under test. No model call.
+// call: 0 means a tool_call handler stopped it before it ran. The shape cases assert the spy first,
+// then the reason text, then state, so an earlier stop cannot answer for the one under test; the
+// dispatch, undo, fail-open and grader-window cases (T8*, T9, T12, N12) say their own order. No model call.
 //
 // Run one case alone: VINCI_COMPOUND_CASE=T2b node vinci/test/verification-compound-preblock.mjs
 import assert from "node:assert/strict";
@@ -72,8 +73,9 @@ async function fixture({ withVerification = true, between } = {}) {
   extensions.push(makeExtension(loopbreakPath, loopbreak.default, entries, controls));
   let toolResults = 0;
   extensions.push({ path: "<probe>", handlers: new Map([["tool_result", [async () => { toolResults++; }]]]) });
+  let sessionId = "compound-preblock";
   const sessionManager = {
-    getSessionId: () => "compound-preblock",
+    getSessionId: () => sessionId,
     getBranch: () => entries,
     getEntries: () => entries,
     getSessionDir: () => cwd,
@@ -95,6 +97,7 @@ async function fixture({ withVerification = true, between } = {}) {
     controls,
     runner,
     get toolResults() { return toolResults; },
+    setSessionId(value) { sessionId = value; },
     async start(text = "Fix the rounding bug in money.js", source = "interactive") {
       await each("input", { type: "input", text, source });
       await each("agent_start", { type: "agent_start" });
@@ -344,6 +347,19 @@ await measure("T4e", async () => noStop("T4e", [
   "npm test ; echo x",
   "npm test　; echo x",
 ]));
+// A leading NBSP, BOM or CR is part of the first word for bash, so the original names a different
+// program than D would: the character test runs before any trim, and these fall open.
+await measure("T4g", async () => noStop("T4g", [
+  " npm test; echo done",
+  "﻿npm test; echo done",
+  "\rnpm test; echo done",
+]));
+// Positive control: leading and trailing ASCII space and tab are still trimmed, and the shape is stopped.
+await measure("T4g-control", async (make) => {
+  const f = await make();
+  await f.start();
+  assertStopped("T4g-control", await f.bash(" \tnpm test; echo done\t "), "npm test", "echo done");
+});
 // Non-string commands become String(command ?? "") at loopbreak's read, as at the base: no stop.
 await measure("T4f", async (make) => {
   const f = await make();
@@ -685,6 +701,26 @@ await measure("T8d", async (make) => {
   const state = stateModule.getVinciVerificationState();
   assert.equal(state.behavioralAttemptCommand, "npm test; echo done", "T8d: a state written in between keeps the record (fail closed)");
 });
+// The slot is bound to the session that wrote it: a stop seen under another session id withdraws
+// nothing (the stop stands and the attempt record stays). T8 is the same-session positive control.
+await measure("T8h", async (make) => {
+  let switchSession = false;
+  let f;
+  f = await make({
+    between: async (event) => {
+      if (switchSession && event.toolName === "bash") f.setSessionId("another-session");
+    },
+  });
+  await f.start();
+  await f.mutate();
+  switchSession = true;
+  const stopped = await f.bash("npm test; echo done");
+  switchSession = false;
+  f.setSessionId("compound-preblock");
+  assertStopped("T8h", stopped, "npm test", "echo done");
+  const state = stateModule.getVinciVerificationState();
+  assert.equal(state.behavioralAttemptCommand, "npm test; echo done", "T8h: a slot from another session id is not applied");
+});
 // A pre-call state the persisted-state parser would reject cannot be put back exactly: the stop
 // stands, the attempt record stays, and nothing more is persisted (fail closed).
 await measure("T8g", async (make) => {
@@ -781,6 +817,67 @@ await measure("T11", async (make) => {
   assertStopped("T11 build", await f.bash("npm run build; echo done"), "npm run build", "echo done");
   assertStopped("T11 static", await f.bash("tsc; echo done"), "tsc", "echo done");
 });
+
+// ── T12: the grader's 2000-entry request window (vinci-grader.ts:200) ────────────────────────────
+// A stop leaves two extra session entries (verification's attempt + the undo's re-persist), so the
+// window that carries the supplemental receipts closes up to two entries earlier per stop. The branch is
+// seeded with a request start, a passed direct check and one scoped `git diff --check` receipt, then
+// padded with inert entries so that branch.length - requestStart equals `distance` before the stop.
+const SUPPLEMENTAL = "\n\nSupplemental current-request formatting checks";
+async function graderEdge(make, distance) {
+  const f = await make();
+  await f.start();
+  f.entries.push({ type: "message", id: "request", message: { role: "user", content: "Fix the rounding bug", timestamp: 0 } });
+  const requestStart = f.entries.length - 1;
+  await f.mutate();
+  assert.equal((await f.bash("npm test", { output: GREEN })).spy, 1, "T12: green direct run");
+  f.entries.push({
+    type: "message",
+    id: "diff-call",
+    message: { role: "assistant", content: [{ type: "toolCall", id: "diff-1", name: "bash", arguments: { command: "git diff --check -- money.js" } }] },
+  });
+  f.entries.push({
+    type: "message",
+    id: "diff-result",
+    message: { role: "toolResult", toolCallId: "diff-1", toolName: "bash", isError: false, content: [], details: { execution: { exitCode: 0, cwd: f.cwd, originalCommand: true } } },
+  });
+  while (f.entries.length - requestStart < distance) f.entries.push({ type: "custom", customType: "compound-preblock-filler", data: {}, id: `pad${f.entries.length}` });
+  assert.equal(f.entries.length - requestStart, distance, "T12: seeded distance from the request start");
+  return f;
+}
+for (const [id, distance, open] of [["T12", 1999, false], ["T12-control", 1998, true]]) {
+  await measure(id, async (make) => {
+    const f = await graderEdge(make, distance);
+    const before = grader.verificationEvidenceFromBranch(f.entries);
+    assert.ok(before.includes(SUPPLEMENTAL), `${id}: the receipt is in the grader evidence before the stop (precondition)`);
+    const entriesBefore = f.entries.length;
+    assertStopped(id, await f.bash("npm test; echo done"), "npm test", "echo done");
+    assert.equal(f.entries.length - entriesBefore, 2, `${id}: the stop appended exactly two session entries`);
+    const after = grader.verificationEvidenceFromBranch(f.entries);
+    if (open) {
+      assert.equal(after, before, `${id}: at distance ${distance + 2} the window is still open (evidence equal)`);
+    } else {
+      assert.equal(after, before.slice(0, before.indexOf(SUPPLEMENTAL)), `${id}: at distance ${distance + 2} the window is closed (only the receipt is dropped)`);
+    }
+  });
+}
+// Measurement only (no assertion beyond the run): how many session entries the same compound adds,
+// and what the grader then reports, on whichever head this file runs against. At the base the
+// compound runs and is discarded; at the change it is stopped.
+for (const [id, seed] of [["N12-passed", "passed"], ["N12-none", "none"]]) {
+  await measure(id, async (make) => {
+    const f = await make();
+    await f.start();
+    f.entries.push({ type: "message", id: "request", message: { role: "user", content: "Fix the rounding bug", timestamp: 0 } });
+    await f.mutate();
+    if (seed === "passed") await f.bash("npm test", { output: GREEN });
+    const entriesBefore = f.entries.length;
+    const evidenceBefore = grader.verificationEvidenceFromBranch(f.entries);
+    const observation = await f.bash("npm test; echo done", { output: GREEN });
+    const evidenceAfter = grader.verificationEvidenceFromBranch(f.entries);
+    console.log(`  ${id}: spy ${observation.spy}; entries added ${f.entries.length - entriesBefore}; grader evidence ${evidenceAfter === evidenceBefore ? "unchanged" : `changed (${JSON.stringify(evidenceBefore.split("\n")[0])} -> ${JSON.stringify(evidenceAfter.split("\n")[0])})`}`);
+  });
+}
 
 console.log(`verification-compound-preblock: ${ran - failures}/${ran} passed`);
 process.exitCode = failures === 0 && ran > 0 ? 0 : 1;
