@@ -24,7 +24,8 @@ import {
   vinciWritableRoots,
 } from "@earendil-works/pi-coding-agent";
 import { recordVinciConfirmationGate, sendVinciControl } from "./lib/control.ts";
-import { recordFinalizationRefusal } from "./lib/hard-stop.ts";
+import { recordFinalizationRefusal, vinciTaskIdOf } from "./lib/hard-stop.ts";
+import { clearVinciGitCheckpointDeclines, recordVinciGitCheckpointDecline, recordVinciGitCheckpointDeclinedToolCall } from "./lib/task-outcome.ts";
 import { parseLocalGitSegment } from "./lib/unattended.ts";
 import {
   escalationReason,
@@ -1479,6 +1480,8 @@ export function isFalseGreenTestChange(path: string, proposedContent: string): b
 export default function (pi: ExtensionAPI) {
   let latestUserRequest = "";
   let gitCheckpointApproved = false;
+  let gitCheckpointDeclined = false;
+  let newTaskPending = true;
   // Build tooling asks for the internet ONCE per session (npm/pip/pod/gradle…), then ordinary dev work
   // runs without a prompt per command. Reset on session_start so a fresh session re-asks.
   let buildNetworkApprovedForSession = false;
@@ -1486,6 +1489,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("input", async (event, ctx) => {
     latestUserRequest = event.text?.trim() ?? "";
     gitCheckpointApproved = userAskedForGitCheckpoint(latestUserRequest);
+    if (event.source !== "extension" && !event.streamingBehavior && event.text?.trim()) {
+      gitCheckpointDeclined = false;
+      newTaskPending = true;
+    }
     const attached = await attachImagesFromText(event.text ?? "", ctx.cwd);
     for (const error of attached.errors) ctx.ui.notify(error, "warning");
     // The user typed this, so their secrets are vaulted to handles rather than erased — the model
@@ -1495,6 +1502,12 @@ export default function (pi: ExtensionAPI) {
     return redacted === event.text && images.length === (event.images?.length ?? 0)
       ? { action: "continue" as const }
       : { action: "transform" as const, text: redacted, images };
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    if (!newTaskPending) return;
+    clearVinciGitCheckpointDeclines(vinciTaskIdOf(ctx));
+    newTaskPending = false;
   });
 
   // /allowed — see and clear the commands you've told Vinci to always allow in this project.
@@ -2029,18 +2042,24 @@ export default function (pi: ExtensionAPI) {
           // "yes" would, and record NO finalization refusal — nothing was refused.
           gitCheckpointApproved = true;
         } else {
+          if (gitCheckpointDeclined) {
+            recordVinciGitCheckpointDeclinedToolCall(vinciTaskIdOf(ctx), event.toolCallId);
+            return { block: true, reason: "Blocked — the user did not ask Vinci to stage or commit changes." };
+          }
           const ok = await confirmSafely(
             ctx,
             "Vinci — save a git checkpoint?",
             `You didn't ask Vinci to stage or commit changes in this request:\n\n  ${displayCommand}\n\nCreate a git checkpoint now?`,
           );
           if (!ok) {
+            gitCheckpointDeclined = true;
+            recordVinciGitCheckpointDecline(vinciTaskIdOf(ctx));
+            recordVinciGitCheckpointDeclinedToolCall(vinciTaskIdOf(ctx), event.toolCallId);
             sendVinciControl(
               pi,
               "vinci-unrequested-git-block",
               "The user did not authorize a git checkpoint. Leave the working tree and index alone, report the changed files, and do not retry git add or git commit.",
             );
-            recordFinalizationRefusal(ctx, "guard", cmd, "Blocked — the user did not ask Vinci to stage or commit changes.");
             return { block: true, reason: "Blocked — the user did not ask Vinci to stage or commit changes." };
           }
           gitCheckpointApproved = true;

@@ -36,6 +36,7 @@ import {
 export const VINCI_TASK_OUTCOME_ENTRY = "vinci-task-outcome";
 export const VINCI_FALSE_COMPLETION_ENTRY = "vinci-false-completion-report";
 const SCHEMA_VERSION = 1;
+const GIT_CHECKPOINT_DECLINE_NOTE = "unrequested git checkpoint declined by user";
 
 export type VinciTaskState = "DONE" | "DONE_UNVERIFIED" | "WAITING" | "BLOCKED";
 
@@ -137,6 +138,7 @@ export type VinciTaskOutcome = {
   hardStop?: { source: string; reason: string };
   /** Structured unfinished work; absent on historical outcomes, which are never reclassified. */
   requiredOperations?: VinciRequiredOperation[];
+  gitCheckpointDecline?: { note: typeof GIT_CHECKPOINT_DECLINE_NOTE; count: number };
   recordedAt: string;
 };
 
@@ -191,7 +193,12 @@ type BuildOutcomeInput = {
   now?: Date;
 };
 
-type TaskOutcomeStore = { outcome?: VinciTaskOutcome; usageSubscriptionInstalled?: boolean };
+type TaskOutcomeStore = {
+  outcome?: VinciTaskOutcome;
+  usageSubscriptionInstalled?: boolean;
+  gitCheckpointDeclines?: Map<string, number>;
+  gitCheckpointDeclinedToolCallIds?: Map<string, Set<string>>;
+};
 const STORE_KEY = "__vinciTaskOutcomeStore" as const;
 const USAGE_STORE_KEY = "__vinciUsageAccumulatorStore" as const;
 type UsagePersistenceStore = {
@@ -204,6 +211,24 @@ type VinciGlobal = typeof globalThis & {
 const vinciGlobal = globalThis as VinciGlobal;
 const store = vinciGlobal[STORE_KEY] ?? {};
 vinciGlobal[STORE_KEY] = store;
+const gitCheckpointDeclines = store.gitCheckpointDeclines ??= new Map<string, number>();
+const gitCheckpointDeclinedToolCallIds = store.gitCheckpointDeclinedToolCallIds ??= new Map<string, Set<string>>();
+
+export function recordVinciGitCheckpointDecline(taskId: string): void {
+  gitCheckpointDeclines.set(taskId, (gitCheckpointDeclines.get(taskId) ?? 0) + 1);
+}
+
+export function recordVinciGitCheckpointDeclinedToolCall(taskId: string, toolCallId: string): void {
+  if (!toolCallId) return;
+  const calls = gitCheckpointDeclinedToolCallIds.get(taskId) ?? new Set<string>();
+  calls.add(toolCallId);
+  gitCheckpointDeclinedToolCallIds.set(taskId, calls);
+}
+
+export function clearVinciGitCheckpointDeclines(taskId: string): void {
+  gitCheckpointDeclines.delete(taskId);
+  gitCheckpointDeclinedToolCallIds.delete(taskId);
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
@@ -550,7 +575,7 @@ export function classifyVinciTaskState(
 
 export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcome {
   const changedFiles = [...new Set(input.changedFiles)].sort();
-  const requiredOperations = vinciRequiredOperations(input.messages, input.priorOperations, input.cwd);
+  const requiredOperations = vinciRequiredOperations(input.messages, input.priorOperations, input.cwd, gitCheckpointDeclinedToolCallIds.get(input.taskId));
   const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification, requiredOperations);
   // [#5/#6] A hard stop (the no-progress latch, or any harness refusal of a finalization step) is
   // a machine fact that outranks the narrative: the model's closing "done" — and even a remote
@@ -571,6 +596,7 @@ export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcom
   // If a response is accidentally reported to both, its provider + responseId matches a durable
   // assistant message and is excluded from the supplemental snapshot before totals are combined.
   const supplementalUsage = getVinciTaskUsageSnapshot(input.taskId, responseKeys);
+  const declineCount = gitCheckpointDeclines.get(input.taskId) ?? 0;
   return {
     schemaVersion: SCHEMA_VERSION,
     taskId: input.taskId,
@@ -589,12 +615,14 @@ export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcom
     assistantResponseKeys: [...responseKeys],
     ...(requiredOperations.length > 0 ? { requiredOperations } : {}),
     ...(hardStop ? { hardStop: { source: hardStop.source, reason: hardStop.reason } } : {}),
+    ...(declineCount > 0 ? { gitCheckpointDecline: { note: GIT_CHECKPOINT_DECLINE_NOTE, count: declineCount } } : {}),
     recordedAt: (input.now ?? new Date()).toISOString(),
   };
 }
 
 export function isVinciTaskOutcome(value: unknown): value is VinciTaskOutcome {
   const candidate = record(value);
+  const decline = record(candidate?.gitCheckpointDecline);
   return (
     candidate?.schemaVersion === SCHEMA_VERSION &&
     typeof candidate.taskId === "string" &&
@@ -603,6 +631,9 @@ export function isVinciTaskOutcome(value: unknown): value is VinciTaskOutcome {
       candidate.state === "WAITING" ||
       candidate.state === "BLOCKED") &&
     typeof candidate.reason === "string" &&
+    (candidate.gitCheckpointDecline === undefined ||
+      (decline?.note === GIT_CHECKPOINT_DECLINE_NOTE &&
+        typeof decline.count === "number" && Number.isSafeInteger(decline.count) && decline.count > 0)) &&
     Array.isArray(candidate.changedFiles) &&
     candidate.changedFiles.every((file) => typeof file === "string") &&
     (candidate.verificationStatus === "none" ||
