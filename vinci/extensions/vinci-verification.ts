@@ -34,6 +34,7 @@ import {
   hasIncompleteVinciBehavioralAttempt,
   hasVinciZeroCollectionAttempt,
   hydrateVinciVerificationState,
+  parseVinciVerificationState,
   recordVinciBehavioralVerification,
   recordVinciDiffInspection,
   recordVinciEvidenceGap,
@@ -2163,7 +2164,7 @@ type VinciToolCallUndo = {
   toolCallId: unknown;
   command: string;
   recorded: Readonly<VinciVerificationState>;
-  undo: () => void;
+  undo: () => boolean;
 };
 const TOOL_CALL_UNDO_KEY = Symbol.for("vinci.verification.tool-call-undo");
 const toolCallUndoGlobal = globalThis as typeof globalThis & { [TOOL_CALL_UNDO_KEY]?: VinciToolCallUndo };
@@ -2178,8 +2179,7 @@ export function undoVinciVerificationToolCall(toolCallId: unknown, command: stri
   toolCallUndoGlobal[TOOL_CALL_UNDO_KEY] = undefined;
   if (!slot || toolCallId === undefined || slot.toolCallId !== toolCallId || slot.command !== command) return false;
   if (!isDeepStrictEqual(getVinciVerificationState(), slot.recorded)) return false;
-  slot.undo();
-  return true;
+  return slot.undo();
 }
 
 export default function (pi: ExtensionAPI) {
@@ -2591,10 +2591,14 @@ export default function (pi: ExtensionAPI) {
         command,
         recorded: getVinciVerificationState(),
         undo: () => {
+          // The store re-parses what it is given; a state the parser would change or reject cannot
+          // be put back exactly, so the record stays (fail closed).
+          if (recorded && !isDeepStrictEqual(parseVinciVerificationState(stateBefore), { ...stateBefore })) return false;
           mutatingBashThisTurn = mutatingBashBefore;
-          if (!recorded) return;
+          if (!recorded) return true;
           restoreVinciVerificationState(stateBefore);
           persistVerificationState();
+          return true;
         },
       };
     };

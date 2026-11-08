@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { createJiti } from "jiti/static";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -159,9 +160,9 @@ function assertStopped(label, observation, direct, post) {
   assert.equal(observation.spy, 0, `${label}: spy 0 (stopped before execution)`);
   const dSentence = `${D_PREFIX}${direct}.`;
   assert.ok(String(observation.reason).startsWith(dSentence), `${label}: reason names D verbatim: ${dSentence}`);
+  assert.ok(!/\bfirst\b/i.test(observation.reason), `${label}: "first" absent`);
   const rest = observation.reason.slice(dSentence.length);
   assert.equal(rest, post ? ` Run ${post} separately after the check if you still need it.` : "", `${label}: POST sentence`);
-  assert.ok(!/\bfirst\b/i.test(observation.reason), `${label}: "first" absent`);
 }
 
 const only = process.env.VINCI_COMPOUND_CASE;
@@ -193,6 +194,24 @@ await measure("T1", async (make) => {
   const stopped = await f.bash("npm test; echo done");
   assertStopped("T1", stopped, "npm test", "echo done");
   assertSnapshotEqual("T1", before, snapshot(f));
+});
+// The same withdrawal over a cwd-bound red latch (the parser places commandCwd in its own order).
+await measure("T1-cwd", async (make) => {
+  const f = await make();
+  await f.start();
+  await f.mutate();
+  assert.equal((await f.bash("npm test", { output: RED, isError: true })).spy, 1, "T1-cwd: red run");
+  const before = snapshot(f);
+  const live = stateModule.getVinciVerificationState();
+  const stopped = await f.bash("npm test; echo done");
+  assertStopped("T1-cwd", stopped, "npm test", "echo done");
+  assert.ok(isDeepStrictEqual({ ...stateModule.getVinciVerificationState() }, { ...live }), "T1-cwd: in-memory state deep-equal");
+  const after = snapshot(f);
+  const deep = (a, b) => isDeepStrictEqual(JSON.parse(a), JSON.parse(b));
+  assert.ok(deep(after.lastEntry, before.lastEntry), "T1-cwd: last persisted verification entry deep-equal");
+  assert.ok(deep(after.selected, before.selected), "T1-cwd: selectSharedVinciVerificationState deep-equal");
+  assert.equal(after.evidence, before.evidence, "T1-cwd: grader verificationEvidenceFromBranch equal");
+  console.log(`  T1-cwd measured: in-memory byte-equal ${after.state === before.state}, last entry byte-equal ${after.lastEntry === before.lastEntry}`);
 });
 await measure("T2b", async (make) => {
   const f = await make();
@@ -611,11 +630,17 @@ await measure("T8", async (make) => {
   assert.equal(control, 1, "T8 positive control: the direct command executes through the same loop");
   assert.equal(f.toolResults, resultsBefore + 1, "T8 positive control: its tool_result reaches the extensions");
 });
+const parseable = () => {
+  const state = stateModule.getVinciVerificationState();
+  return isDeepStrictEqual(stateModule.parseVinciVerificationState(state), { ...state });
+};
 await measure("T8b", async (make) => {
   const f = await make();
   await f.start();
   await f.mutate();
-  stateModule.recordVinciVerification("tsc; echo done", false, COMPOUND_SUMMARY, false, "static", undefined, false, f.cwd);
+  // A static latch carrying the compound summary; the persisted-state parser keeps it unchanged.
+  stateModule.recordVinciVerification("tsc", false, COMPOUND_SUMMARY, false, "static", undefined, true, f.cwd);
+  assert.ok(parseable(), "T8b: the seeded state round-trips through the persisted-state parser");
   await f.bash("npm test -- --grep a");
   await f.bash("npm test -- --grep b");
   const observation = await f.bash("npm test; echo x");
@@ -659,6 +684,20 @@ await measure("T8d", async (make) => {
   assert.equal(stopped.spy, 0, "T8d: spy 0");
   const state = stateModule.getVinciVerificationState();
   assert.equal(state.behavioralAttemptCommand, "npm test; echo done", "T8d: a state written in between keeps the record (fail closed)");
+});
+// A pre-call state the persisted-state parser would reject cannot be put back exactly: the stop
+// stands, the attempt record stays, and nothing more is persisted (fail closed).
+await measure("T8g", async (make) => {
+  const f = await make();
+  await f.start();
+  await f.mutate();
+  stateModule.recordVinciVerification("npm test; echo done", false, COMPOUND_SUMMARY, false, "behavioral", undefined, false, f.cwd);
+  assert.ok(!parseable(), "T8g: the seeded state does not round-trip (precondition)");
+  const entriesBefore = f.entries.length;
+  assertStopped("T8g", await f.bash("npm test; echo done"), "npm test", "echo done");
+  const state = stateModule.getVinciVerificationState();
+  assert.equal(state.behavioralAttemptCompleted, false, "T8g: the attempt record stays");
+  assert.equal(f.entries.length, entriesBefore + 1, "T8g: only verification's own attempt entry was appended (no re-persist)");
 });
 // Loopbreak loaded without verification: the undo has nothing to apply and the stop still works.
 await measure("T8e", async (make) => {
