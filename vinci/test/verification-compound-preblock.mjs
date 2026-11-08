@@ -415,7 +415,7 @@ await measure("T6b-ceiling", async (make) => {
   assert.equal(fourth.reason, "Vinci stopped a repeated action before it could run again.", "T6b-ceiling: returned reason (:765)");
   const message = f.controls.slice(controlsBefore).find((entry) => entry.message.customType === "vinci-loop-stop")?.message.content ?? "";
   assert.ok(message.includes("(Action 26 this turn — over the limit. Write your answer as plain text now; further non-navigation calls will also be blocked.)"), "T6b-ceiling: control message (:1029)");
-  assert.equal(control.getVinciAutomationStop().reason, "Vinci hit its per-turn action limit before finishing.", "T6b-ceiling: humanReason (:1030)");
+  assert.equal(control.getVinciAutomationStop().reason, "Vinci reached the limit of 25 actions allowed in one turn before finishing.", "T6b-ceiling: humanReason (:1030)");
   await delay(250);
 });
 await measure("T6c", async (make) => {
