@@ -11,6 +11,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const loader = createJiti(import.meta.url, { moduleCache: false, tryNative: false, fsCache: false });
 const ext = await loader.import(resolve(here, "../extensions/vinci-loopbreak.ts"), { default: false });
 const control = await loader.import(resolve(here, "../extensions/lib/control.ts"), { default: false });
+const hardStop = await loader.import(resolve(here, "../extensions/lib/hard-stop.ts"), { default: false });
 assert.notEqual(process.env.VINCI_NO_TURNSTOP, "1", "measure with TURNSTOP enabled");
 
 // Built from the exported constants, never from the extension's own sentence helpers, so a change
@@ -38,13 +39,14 @@ const SHAPES = {
   "unknown-mode": { ctx: { hasUI: true, mode: "terminal" }, source: "interactive", remedy: false },
 };
 
-function fixture(id, shape) {
+function fixture(id, shape, extraCtx = {}) {
   const handlers = {};
   const controls = [];
   const notes = [];
   const aborts = [];
   const ctx = {
     ...shape.ctx,
+    ...extraCtx,
     ui: { notify(message, type) { notes.push({ message, type }); } },
     cwd: resolve(here, "../.."),
     abort() { aborts.push(id); },
@@ -170,11 +172,14 @@ for (const kind of Object.keys(KINDS)) {
 // typed "continue" (source "interactive", not streaming) resets both per-turn budgets, so the next
 // full budget is reachable and the limit fires again at limit + 1 (positive control). In the rpc
 // shape a continue keeps the spent budget and the first call is refused.
-assert.equal(ext.typedContinueGrantsFreshTurn({ source: "interactive" }), true, "the shared grant: typed interactive");
-assert.equal(ext.typedContinueGrantsFreshTurn({ source: "interactive", streamingBehavior: "steer" }), false, "the shared grant: not while streaming");
-assert.equal(ext.typedContinueGrantsFreshTurn({ source: "rpc" }), false, "the shared grant: not rpc");
-assert.equal(ext.typedContinueGrantsFreshTurn({ source: "extension" }), false, "the shared grant: not extension");
-assert.equal(ext.typedContinueGrantsFreshTurn({}), false, "the shared grant: not a missing source");
+await runCase("shared-grant", async () => {
+  assert.equal(typeof ext.typedContinueGrantsFreshTurn, "function", "the shared grant is exported");
+  assert.equal(ext.typedContinueGrantsFreshTurn({ source: "interactive" }), true, "the shared grant: typed interactive");
+  assert.equal(ext.typedContinueGrantsFreshTurn({ source: "interactive", streamingBehavior: "steer" }), false, "the shared grant: not while streaming");
+  assert.equal(ext.typedContinueGrantsFreshTurn({ source: "rpc" }), false, "the shared grant: not rpc");
+  assert.equal(ext.typedContinueGrantsFreshTurn({ source: "extension" }), false, "the shared grant: not extension");
+  assert.equal(ext.typedContinueGrantsFreshTurn({}), false, "the shared grant: not a missing source");
+});
 for (const kind of Object.keys(KINDS)) {
   await runCase(`tie/${kind}/tui`, async () => {
     const label = `tie/${kind}/tui`;
@@ -196,6 +201,46 @@ for (const kind of Object.keys(KINDS)) {
     const refused = await KINDS[kind].call(f, `${label}-after`, 1);
     assert.equal(refused.call, 1, `${label}: first call after the rpc continue`);
     assert.equal(refused.result?.block, true, `${label}: the rpc continue keeps the spent budget`);
+    // The refusal is the limit stop itself, still counting from the spent budget (limit + 2).
+    const loopStops = refused.controls.filter((c) => c.message.customType === "vinci-loop-stop");
+    assert.equal(loopStops.length, 1, `${label}: the post-continue refusal is one limit stop control`);
+    const carried = KINDS[kind].limit + 2;
+    assert.ok(loopStops[0].message.content.includes(KINDS[kind].marker(carried)), `${label}: the post-continue steer reports call ${carried}`);
+    await f.finish();
+  });
+}
+
+// The action ceiling refusing a bash finalization command also records a hard stop for the task
+// (recordFinalizationRefusal). Interactive shapes only: unattended (no UI) runs let a finalization
+// command pass the ceiling. The record carries the same sentence as the stop, plus the refused step.
+const FINAL_COMMAND = 'git commit -m "finish"';
+for (const shapeName of ["tui", "rpc"]) {
+  const shape = SHAPES[shapeName];
+  const label = `finalization/${shapeName}`;
+  await runCase(label, async () => {
+    const taskId = `loopbreak-stop-message-${shapeName}`;
+    const f = fixture(label, shape, { sessionManager: { getSessionId: () => taskId } });
+    await f.start(`Investigate and change ${label}`);
+    assert.equal(hardStop.getVinciHardStop(taskId), undefined, `${label}: no hard stop before the ceiling`);
+    for (let i = 1; i <= ACTIONS; i++) {
+      const r = await KINDS.action.call(f, label, i);
+      assert.notEqual(r.result?.block, true, `${label}: call ${i} of ${ACTIONS} is not blocked`);
+    }
+    const stop = await f.tool("bash", { command: FINAL_COMMAND });
+    assert.equal(stop.call, ACTIONS + 1, `${label}: the stop is observed at call ${ACTIONS + 1}`);
+    assert.equal(stop.result?.block, true, `${label}: the finalization command at call ${ACTIONS + 1} is blocked`);
+    const loopStops = stop.controls.filter((c) => c.message.customType === "vinci-loop-stop");
+    assert.equal(loopStops.length, 1, `${label}: exactly one limit stop control`);
+    assert.ok(loopStops[0].message.content.includes(KINDS.action.marker(ACTIONS + 1)), `${label}: the model-facing steer reports call ${ACTIONS + 1}`);
+    const expected = ACTION_REASON + (shape.remedy ? REMEDY : "");
+    const record = hardStop.getVinciHardStop(taskId);
+    assert.equal(record?.source, "ceiling", `${label}: the refusal is recorded as a ceiling hard stop`);
+    assert.equal(
+      record?.reason,
+      `${expected} The refused step was the finalization command \`${FINAL_COMMAND}\`.`,
+      `${label}: the recorded refusal reason is the whole expected sentence`,
+    );
+    expectTexts(stop, "action", shape, label);
     await f.finish();
   });
 }
