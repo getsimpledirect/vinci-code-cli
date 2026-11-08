@@ -136,6 +136,12 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   parser with the guard's checkpoint gate) — pass both action reserves, the action ceiling, and the
   latch, because the commit *is* the deliverable; `git push`, `gh`, and anything network-shaped stay
   reserved (the worker daemon publishes). Interactively every gate is unchanged.
+- **Per-turn limit stops** — when the action ceiling or the read-only navigation ceiling stops a
+  turn, the stop sentence names the limit it reached, with the number taken from
+  `TURN_CALL_CEILING` / `READ_ONLY_NAVIGATION_CEILING`; only in the interactive terminal (`ctx.mode`
+  `tui`) does it add that a typed `continue` starts a fresh turn, the one case where
+  `typedContinueGrantsFreshTurn` resets both budgets (the per-turn budgets and stop latches, not
+  verification state).
 - **Source ownership** — `vinci-scope.ts` treats `node_modules` as read-only diagnostic evidence,
   blocks direct edits there, and mechanically appends bounded `git grep` evidence for tracked project
   imports, wrappers, and configuration before a project-level fix. A mutation is blocked until every
