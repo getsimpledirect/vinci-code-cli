@@ -50,6 +50,8 @@ import {
 } from "./lib/usage-accumulator.ts";
 import {
   getVinciVerificationState,
+  type VinciVerificationClass,
+  type VinciVerificationState,
   vinciRequiredVerificationCommand,
   vinciVerificationCheckClass,
   vinciVerificationClassRank,
@@ -57,9 +59,14 @@ import {
   vinciVerificationMutationRevision,
 } from "./lib/verification-state.ts";
 import {
+  BENIGN_PREPARATION,
   classifyVerificationCommand,
   contextualVerificationKey,
   isDirectVerificationCommand,
+  isVerificationCommand,
+  shellTokens,
+  undoVinciVerificationToolCall,
+  unquoted,
 } from "./vinci-verification.ts";
 import {
   assertSuccessfulVinciCompletion,
@@ -110,6 +117,220 @@ const GROUNDING_TOOLS = new Set(["web_search", "web_fetch"]);
 // Dependency hydration is runway to verification, but is not itself verification evidence.
 const VERIFICATION_RUNWAY_COMMAND =
   /\b(?:npm|pnpm|yarn|bun)\s+(?:i|ci|install|add)\b|\b(?:pip|pip3|uv|poetry)\s+(?:install|sync)\b|\bbundle\s+install\b|\bgo\s+mod\s+download\b|\bcargo\s+fetch\b/i;
+
+// A compound check of one narrow, faithfully representable shape is stopped before it runs and the
+// agent is shown the equivalent direct command. At most this many such stops per turn are free;
+// later ones spend the ordinary action budget, so alternating compounds cannot loop past the ceiling.
+const MAX_UNCOUNTED_COMPOUND_BLOCKS = 3;
+// The same compound stopped twice in a row runs as before on its next identical attempt.
+const MAX_CONSECUTIVE_COMPOUND_BLOCKS = 2;
+const NESTED_SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
+
+/** Test seam: fault injection and observation only; production code never sets these fields. */
+export const vinciCompoundCheckTestSeam: {
+  fault?: "evaluate" | "derive";
+  onReservationDecision?: (purpose: "call" | "direct", input: VerificationReservationInput) => void;
+  actionCalls?: () => number;
+} = {};
+
+export type VerificationReservationInput = {
+  tool: string;
+  input: unknown;
+  cwd: string;
+  mutationSucceeded: boolean;
+  state: Readonly<VinciVerificationState>;
+  incompleteUpgradeAttempts: number;
+  upgradeVerifierFingerprint: string;
+};
+
+export type VerificationReservationDecision = {
+  checkClass: VinciVerificationClass | undefined;
+  verificationCall: boolean;
+  verifierFingerprint: string;
+  fingerprintDiffers: boolean;
+  upgradeAllowance: boolean;
+  refusal: "kept-passing" | "reserved-rerun" | undefined;
+};
+
+/**
+ * The verification reservation logic of loopbreak's tool_call, as a pure function: it reads its
+ * inputs and writes nothing. The live hook applies the side effects (fingerprint reset, upgrade
+ * increment, the refusal controls) at their usual sites; the compound check asks the same question
+ * about the direct command it would name.
+ */
+export function verificationReservationDecision({
+  tool,
+  input,
+  cwd,
+  mutationSucceeded,
+  state: verificationState,
+  incompleteUpgradeAttempts,
+  upgradeVerifierFingerprint,
+}: VerificationReservationInput): VerificationReservationDecision {
+  const command = tool === "bash" ? String((input as { command?: unknown }).command ?? "") : "";
+  const checkClass = tool === "bash" ? classifyVerificationCommand(command) : undefined;
+  const verificationCall = tool === "rerun_check" || isVerificationCall(tool, input);
+  const commandIdentity = tool === "bash" ? contextualVerificationKey(command) : "";
+  const recordedCommand = vinciVerificationCommand(verificationState);
+  const requiredCommand = vinciRequiredVerificationCommand(verificationState);
+  const recordedCommandKey =
+    verificationState.variant === "normal"
+      ? verificationState.commandKey
+      : "";
+  const requiredCommandKey =
+    verificationState.variant === "normal"
+      ? verificationState.requiredCommandKey
+      : "";
+  const recordedIdentity = contextualVerificationKey(
+    recordedCommandKey || recordedCommand,
+  );
+  const requiredIdentity = contextualVerificationKey(
+    requiredCommandKey || requiredCommand,
+  );
+  const recordedDirectoryMatch =
+    verificationState.variant !== "normal" ||
+    verificationState.commandCwd === undefined ||
+    verificationState.commandCwd === cwd;
+  const contextualIdentityMatch = Boolean(
+    checkClass &&
+    commandIdentity &&
+    recordedDirectoryMatch &&
+    ((recordedIdentity && commandIdentity === recordedIdentity) ||
+      (requiredIdentity && commandIdentity === requiredIdentity)),
+  );
+  const higherClassCheck =
+    verificationState.variant === "normal" &&
+    !contextualIdentityMatch &&
+    Boolean(checkClass && recordedCommand) &&
+    vinciVerificationClassRank(checkClass) >
+      vinciVerificationClassRank(vinciVerificationCheckClass(verificationState));
+  const verifierFingerprint = [
+    verificationState.variant,
+    vinciVerificationMutationRevision(verificationState),
+    vinciVerificationCheckClass(verificationState),
+    recordedCommandKey || recordedCommand,
+    verificationState.variant === "normal" ? verificationState.commandCwd ?? "" : "",
+  ].join("\0");
+  const fingerprintDiffers = verifierFingerprint !== upgradeVerifierFingerprint;
+  const attempts = fingerprintDiffers ? 0 : incompleteUpgradeAttempts;
+  const upgradeAllowance =
+    higherClassCheck && attempts < MAX_INCOMPLETE_UPGRADE_ATTEMPTS;
+  let refusal: VerificationReservationDecision["refusal"];
+  if (
+    mutationSucceeded &&
+    verificationState.variant === "normal" &&
+    checkClass &&
+    (verificationState.status === "passed" ||
+      verificationState.status === "stale" ||
+      (verificationState.status === "failed" && Boolean(verificationState.requiredCommand))) &&
+    tool === "bash" &&
+    vinciVerificationClassRank(checkClass) <= vinciVerificationClassRank(verificationState.checkClass) &&
+    !contextualIdentityMatch
+  ) {
+    refusal = "kept-passing";
+  } else if (
+    mutationSucceeded &&
+    verificationState.variant === "normal" &&
+    verificationState.status === "failed" &&
+    /piped or compound check cannot prove success/i.test(verificationState.summary) &&
+    tool !== "rerun_check" &&
+    !contextualIdentityMatch &&
+    verificationCall
+  ) {
+    refusal = "reserved-rerun";
+  }
+  return { checkClass, verificationCall, verifierFingerprint, fingerprintDiffers, upgradeAllowance, refusal };
+}
+
+type CompoundShape = { direct: string; post: string };
+
+// True when one of `characters` appears outside quotes and not behind a backslash escape.
+function hasUnquotedCharacter(command: string, characters: string): boolean {
+  let quote: "'" | '"' | null = null;
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index];
+    if (quote) {
+      if (character === quote) quote = null;
+      else if (character === "\\" && quote === '"') index++;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "\\") {
+      index++;
+      continue;
+    }
+    if (characters.includes(character)) return true;
+  }
+  return false;
+}
+
+/**
+ * The narrow shape the compound check may stop, or undefined (the call keeps today's path). Only a
+ * command the repo's segmenter represents faithfully qualifies: printable ASCII on one line; no
+ * here-doc, nested shell, eval, subshell, group, substitution, comment, redirect or other shell
+ * context; no empty segment; `&&` and `;` joiners only, with `&&` alone before the one check; only
+ * benign preparation before it. The direct command is the unchanged text up to the end of the check,
+ * and it must itself be a direct verification command.
+ */
+export function compoundCheckShape(command: string): CompoundShape | undefined {
+  const text = command.trim();
+  if (!text) return undefined;
+  if (!/^[\x20-\x7E\t]+$/.test(text)) return undefined;
+  if (/<<|\$\(|`|<\(|>\(/.test(text)) return undefined;
+  if (hasUnquotedCharacter(text, "#")) return undefined;
+  if (hasUnquotedCharacter(text, "<>")) return undefined;
+  if (hasUnquotedCharacter(text, "({")) return undefined;
+  if (hasUnquotedCharacter(text, ")}")) return undefined;
+  const tokens = shellTokens(text);
+  if (!tokens || tokens.length === 0) return undefined;
+  if (tokens.some((token) => token.kind === "word" && token.hasShellContext)) return undefined;
+  const segments: { start: number; end: number; words: string[] }[] = [];
+  const joiners: { value: string; start: number; end: number }[] = [];
+  let current: { start: number; end: number; words: string[] } | undefined;
+  for (const token of tokens) {
+    if (token.kind === "operator") {
+      if (!current) return undefined; // leading joiner or an empty segment
+      segments.push(current);
+      current = undefined;
+      joiners.push({ value: token.value, start: token.start, end: token.end });
+      continue;
+    }
+    if (!current) current = { start: token.start, end: token.end, words: [] };
+    current.end = token.end;
+    current.words.push(token.value);
+  }
+  if (!current) return undefined; // trailing joiner
+  segments.push(current);
+  for (const segment of segments) {
+    if (segment.words.includes("eval")) return undefined;
+    for (let index = 0; index < segment.words.length - 1; index++) {
+      const name = segment.words[index].split("/").at(-1) ?? "";
+      if (NESTED_SHELLS.has(name) && /^-[A-Za-z]*c[A-Za-z]*$/.test(segment.words[index + 1])) return undefined;
+    }
+  }
+  if (classifyVerificationCommand(text) === undefined || isDirectVerificationCommand(text)) return undefined;
+  if (joiners.some((joiner) => joiner.value !== "&&" && joiner.value !== ";")) return undefined;
+  const segmentTexts = segments.map((segment) => text.slice(segment.start, segment.end));
+  const checks = segmentTexts.flatMap((segment, index) => (isVerificationCommand(segment) ? [index] : []));
+  if (checks.length !== 1) return undefined;
+  const checkIndex = checks[0];
+  if (joiners.slice(0, checkIndex).some((joiner) => joiner.value !== "&&")) return undefined;
+  if (!segmentTexts.slice(0, checkIndex).every((segment) => BENIGN_PREPARATION.test(unquoted(segment)))) return undefined;
+  if (vinciCompoundCheckTestSeam.fault === "derive") throw new Error("injected compound-check derive fault");
+  const after = joiners[checkIndex];
+  const direct = text.slice(0, after?.start ?? text.length).trim();
+  const post = after ? text.slice(after.end).trim() : "";
+  if (!isDirectVerificationCommand(direct)) return undefined;
+  return { direct, post };
+}
+
+function compoundCheckReason({ direct, post }: CompoundShape): string {
+  const reason = `Run the check as one direct command: ${direct}.`;
+  return post ? `${reason} Run ${post} separately after the check if you still need it.` : reason;
+}
 
 function isVerificationCall(toolName: string, input: unknown): boolean {
   if (toolName !== "bash" || !input || typeof input !== "object") return false;
@@ -565,6 +786,10 @@ export default function (pi: ExtensionAPI) {
   let fixationAdvisorExemption = false; // armed by a fixation intervention: the first advisor/council call may pass the ceiling (P2-6)
   let upgradeVerifierFingerprint = "";
   let incompleteUpgradeAttempts = 0;
+  let compoundBlocksThisTurn = 0; // compound-check stops this turn (the first few are free)
+  let compoundStreakKey = ""; // the last bash command (trimmed) and how often it was stopped in a row
+  let compoundStreakBlocks = 0;
+  vinciCompoundCheckTestSeam.actionCalls = () => actionCalls;
   let task = ""; // the user's current request (for escalation context)
   const seen = new Map<string, number>(); // normalized call -> repeats since the last edit/write
   const lastResultSig = new Map<string, string>(); // normalized call -> its last RESULT text (result-aware fixation)
@@ -603,6 +828,9 @@ export default function (pi: ExtensionAPI) {
       fixationAdvisorExemption = false;
       upgradeVerifierFingerprint = "";
       incompleteUpgradeAttempts = 0;
+      compoundBlocksThisTurn = 0;
+      compoundStreakKey = "";
+      compoundStreakBlocks = 0;
       invalidTool = null;
       invalidCount = 0;
       lastCallClamped = false;
@@ -871,6 +1099,15 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event, ctx: ExtensionContext) => {
     const tool = event.toolName;
+    // The compound-check streak follows every bash call, before any early return: a different
+    // command (read-only ones included) starts a new streak; other tools leave it alone.
+    if (tool === "bash") {
+      const streakKey = String((event.input as { command?: unknown } | undefined)?.command ?? "").trim();
+      if (streakKey !== compoundStreakKey) {
+        compoundStreakKey = streakKey;
+        compoundStreakBlocks = 0;
+      }
+    }
     // ask_user hands control back to the user — the designed exit every steer prescribes. Never block
     // it (the old code counted it as exploration and, past the limits, blocked even this — leaving a
     // steered model with no legal move at all).
@@ -936,55 +1173,67 @@ export default function (pi: ExtensionAPI) {
     }
 
     const verificationState = getVinciVerificationState();
-    const checkClass = tool === "bash" ? classifyVerificationCommand(command) : undefined;
-    const verificationCall = tool === "rerun_check" || isVerificationCall(tool, event.input);
-    const commandIdentity = tool === "bash" ? contextualVerificationKey(command) : "";
-    const recordedCommand = vinciVerificationCommand(verificationState);
-    const requiredCommand = vinciRequiredVerificationCommand(verificationState);
-    const recordedCommandKey =
-      verificationState.variant === "normal"
-        ? verificationState.commandKey
-        : "";
-    const requiredCommandKey =
-      verificationState.variant === "normal"
-        ? verificationState.requiredCommandKey
-        : "";
-    const recordedIdentity = contextualVerificationKey(
-      recordedCommandKey || recordedCommand,
-    );
-    const requiredIdentity = contextualVerificationKey(
-      requiredCommandKey || requiredCommand,
-    );
-    const recordedDirectoryMatch =
-      verificationState.variant !== "normal" ||
-      verificationState.commandCwd === undefined ||
-      verificationState.commandCwd === ctx.cwd;
-    const contextualIdentityMatch = Boolean(
-      checkClass &&
-      commandIdentity &&
-      recordedDirectoryMatch &&
-      ((recordedIdentity && commandIdentity === recordedIdentity) ||
-        (requiredIdentity && commandIdentity === requiredIdentity)),
-    );
-    const higherClassCheck =
-      verificationState.variant === "normal" &&
-      !contextualIdentityMatch &&
-      Boolean(checkClass && recordedCommand) &&
-      vinciVerificationClassRank(checkClass) >
-        vinciVerificationClassRank(vinciVerificationCheckClass(verificationState));
-    const verifierFingerprint = [
-      verificationState.variant,
-      vinciVerificationMutationRevision(verificationState),
-      vinciVerificationCheckClass(verificationState),
-      recordedCommandKey || recordedCommand,
-      verificationState.variant === "normal" ? verificationState.commandCwd ?? "" : "",
-    ].join("\0");
-    if (verifierFingerprint !== upgradeVerifierFingerprint) {
-      upgradeVerifierFingerprint = verifierFingerprint;
+    const reservationInput: VerificationReservationInput = {
+      tool,
+      input: event.input,
+      cwd: ctx.cwd,
+      mutationSucceeded,
+      state: verificationState,
+      incompleteUpgradeAttempts,
+      upgradeVerifierFingerprint,
+    };
+    vinciCompoundCheckTestSeam.onReservationDecision?.("call", reservationInput);
+    const reservation = verificationReservationDecision(reservationInput);
+    const verificationCall = reservation.verificationCall;
+    if (reservation.fingerprintDiffers) {
+      upgradeVerifierFingerprint = reservation.verifierFingerprint;
       incompleteUpgradeAttempts = 0;
     }
-    const upgradeAllowance =
-      higherClassCheck && incompleteUpgradeAttempts < MAX_INCOMPLETE_UPGRADE_ATTEMPTS;
+
+    // Compound check: a non-faithful compound of the narrow shape is stopped before it runs and
+    // the agent is told the equivalent direct command. It yields to the terminal-unverifiable stop,
+    // to the reservation that would refuse the direct command, and to the per-command bound. Any
+    // internal error means no stop: the call takes the ordinary path below.
+    let compoundStop: { block: true; reason: string } | undefined;
+    if (tool === "bash" && verificationState.variant !== "terminal-unverifiable") {
+      try {
+        if (vinciCompoundCheckTestSeam.fault === "evaluate") throw new Error("injected compound-check evaluate fault");
+        const shape = compoundCheckShape(command);
+        if (shape) {
+          const directInput: VerificationReservationInput = {
+            ...reservationInput,
+            input: { command: shape.direct },
+            incompleteUpgradeAttempts,
+            upgradeVerifierFingerprint,
+          };
+          vinciCompoundCheckTestSeam.onReservationDecision?.("direct", directInput);
+          const direct = verificationReservationDecision(directInput);
+          const directRuns = direct.upgradeAllowance || direct.refusal === undefined;
+          if (directRuns) {
+            if (compoundStreakBlocks >= MAX_CONSECUTIVE_COMPOUND_BLOCKS) {
+              compoundStreakBlocks = 0;
+            } else {
+              compoundStop = { block: true, reason: compoundCheckReason(shape) };
+            }
+          }
+        }
+      } catch {
+        compoundStop = undefined;
+      }
+    }
+    const stopCompound = () => {
+      compoundBlocksThisTurn += 1;
+      compoundStreakBlocks += 1;
+      try {
+        undoVinciVerificationToolCall((event as { toolCallId?: unknown }).toolCallId, command.trim());
+      } catch {
+        /* the attempt record stays; the stop itself stands */
+      }
+      return compoundStop;
+    };
+    if (compoundStop && compoundBlocksThisTurn < MAX_UNCOUNTED_COMPOUND_BLOCKS) return stopCompound();
+
+    const upgradeAllowance = !compoundStop && reservation.upgradeAllowance;
     if (upgradeAllowance) incompleteUpgradeAttempts++;
 
     if (verificationState.variant === "terminal-unverifiable" && verificationCall) {
@@ -1033,19 +1282,12 @@ export default function (pi: ExtensionAPI) {
     // A stronger check is the ratchet's upgrade path. Two attempts against one recorded verifier may
     // bypass reservations, but they still spend the ordinary action budget above. If neither attempt
     // records a result, later attempts follow normal pacing.
+    // A compound stop past the free ones spends the action above and still stops here, before the
+    // upgrade path: a stopped call never uses an upgrade attempt.
+    if (compoundStop) return stopCompound();
     if (upgradeAllowance) return undefined;
 
-    if (
-      mutationSucceeded &&
-      verificationState.variant === "normal" &&
-      checkClass &&
-      (verificationState.status === "passed" ||
-        verificationState.status === "stale" ||
-        (verificationState.status === "failed" && Boolean(verificationState.requiredCommand))) &&
-      tool === "bash" &&
-      vinciVerificationClassRank(checkClass) <= vinciVerificationClassRank(verificationState.checkClass) &&
-      !contextualIdentityMatch
-    ) {
+    if (reservation.refusal === "kept-passing") {
       sendVinciControl(
         pi,
         "vinci-verification-complete",
@@ -1054,15 +1296,7 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason: "Vinci kept the passing focused verification as the completion evidence." };
     }
 
-    if (
-      mutationSucceeded &&
-      verificationState.variant === "normal" &&
-      verificationState.status === "failed" &&
-      /piped or compound check cannot prove success/i.test(verificationState.summary) &&
-      tool !== "rerun_check" &&
-      !contextualIdentityMatch &&
-      verificationCall
-    ) {
+    if (reservation.refusal === "reserved-rerun") {
       sendVinciControl(pi, "vinci-verification-converge", "Call rerun_check now instead of broadening or retyping the filtered command.");
       return { block: true, reason: "Vinci reserved verification for the recorded direct rerun." };
     }

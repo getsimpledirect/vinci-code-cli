@@ -866,6 +866,7 @@ run_group todo-stall-integration node "${ROOT}/vinci/test/todo-stall-integration
 run_group loopbreak-integration node "${ROOT}/vinci/test/loopbreak-integration.mjs"
 run_group loopbreak-continue-grant node "${ROOT}/vinci/test/loopbreak-continue-grant.mjs"
 run_group loopbreak-ceiling-continue node "${ROOT}/vinci/test/loopbreak-ceiling-continue.mjs"
+run_group verification-compound-preblock node "${ROOT}/vinci/test/verification-compound-preblock.mjs"
 run_group crew-loopbreak-integration node --test "${ROOT}/vinci/test/crew-loopbreak-integration.mjs"
 # #5/#6: no harness contradictions in unattended (`vinci -p`) runs — latch wording, hard stop ⇒ BLOCKED,
 # finalization git commands exempt from the reserve (never push/network).
