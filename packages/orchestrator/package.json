@@ -20,6 +20,7 @@
 		"clean": "shx rm -rf dist",
 		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
 		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",
+		"test": "vitest --run test/mailbox.test.ts --maxWorkers=1 --no-file-parallelism",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"keywords": [

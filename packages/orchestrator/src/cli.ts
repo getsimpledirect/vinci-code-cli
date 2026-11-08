@@ -8,6 +8,8 @@ import type { RpcCommand, RpcExtensionUIResponse } from "@earendil-works/pi-codi
 import { getSocketPath } from "./config.ts";
 import { sendIpcRequest } from "./ipc/client.ts";
 import { encodeMessage } from "./ipc/protocol.ts";
+import { mailboxEnabled } from "./mailbox.ts";
+import { runMailboxCommand } from "./mailbox-cli.ts";
 import { serve } from "./serve.ts";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -16,9 +18,11 @@ const packageJson = JSON.parse(readFileSync(join(__dirname, "../package.json"), 
 	version: string;
 };
 
-function printHelp(): void {
+function printHelp(registerMailbox: boolean): void {
+	// [vinci] Preserve the default command list and help bytes.
+	const mailbox = registerMailbox && mailboxEnabled() ? "  orchestrator mailbox <new|send|wait|list|run>\n" : "";
 	console.log(
-		`orchestrator v${packageJson.version}\n\nUsage:\n  orchestrator serve\n  orchestrator list\n  orchestrator spawn [--cwd <path>] [--label <label>]\n  orchestrator status <instance-id>\n  orchestrator stop <instance-id>\n  orchestrator rpc <instance-id> <json-command>\n  orchestrator rpc-stream <instance-id>\n  orchestrator --help\n  orchestrator --version\n\nRPC stream stdin expects JSONL RpcCommand or extension_ui_response messages.`,
+		`orchestrator v${packageJson.version}\n\nUsage:\n  orchestrator serve\n  orchestrator list\n  orchestrator spawn [--cwd <path>] [--label <label>]\n  orchestrator status <instance-id>\n  orchestrator stop <instance-id>\n  orchestrator rpc <instance-id> <json-command>\n  orchestrator rpc-stream <instance-id>\n${mailbox}  orchestrator --help\n  orchestrator --version\n\nRPC stream stdin expects JSONL RpcCommand or extension_ui_response messages.`,
 	);
 }
 
@@ -76,17 +80,24 @@ async function rpcStream(instanceId: string): Promise<void> {
 	});
 }
 
-async function main(): Promise<void> {
+// [vinci] The registration seam is internal; argv and env cannot set it.
+async function main(registerMailbox = true): Promise<void> {
 	const args = process.argv.slice(2);
 
 	if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
-		printHelp();
+		printHelp(registerMailbox);
 		process.exit(0);
 	}
 
 	if (args[0] === "--version" || args[0] === "-v") {
 		console.log(packageJson.version);
 		process.exit(0);
+	}
+
+	// [vinci] No command dispatch without the same explicit opt-in.
+	if (registerMailbox && mailboxEnabled() && args[0] === "mailbox") {
+		await runMailboxCommand(args.slice(1));
+		return;
 	}
 
 	if (args[0] === "serve") {
@@ -154,7 +165,7 @@ async function main(): Promise<void> {
 	}
 
 	console.error(`Unknown command: ${args[0]}`);
-	printHelp();
+	printHelp(registerMailbox);
 	process.exit(1);
 }
 
