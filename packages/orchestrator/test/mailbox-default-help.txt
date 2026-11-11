@@ -1,0 +1,14 @@
+orchestrator v{{VERSION}}
+
+Usage:
+  orchestrator serve
+  orchestrator list
+  orchestrator spawn [--cwd <path>] [--label <label>]
+  orchestrator status <instance-id>
+  orchestrator stop <instance-id>
+  orchestrator rpc <instance-id> <json-command>
+  orchestrator rpc-stream <instance-id>
+  orchestrator --help
+  orchestrator --version
+
+RPC stream stdin expects JSONL RpcCommand or extension_ui_response messages.
