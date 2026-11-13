@@ -1,5 +1,5 @@
 // Exercise refused operations through the real launcher, compiled extensions, and print modes.
-// The synthetic provider and tool-call guard finish before any native writer can run.
+// Shell writers are refused; only the recovery cases reach the structured writer.
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -14,7 +14,7 @@ const targetRoot = realpathSync(resolve(process.argv[2] ?? process.env.VINCI_TES
 const sourceRoot = realpathSync(resolve(process.argv[3] ?? process.env.VINCI_TEST_SOURCE_ROOT ?? fixtureRoot));
 const launcher = join(targetRoot, "vinci/bin/vinci");
 const cli = join(targetRoot, "packages/coding-agent/dist/cli.js");
-const selectedExtensions = ["vinci-receipt.js", "vinci-shell.js"].map((name) => join(targetRoot, "vinci/dist/extensions", name));
+const selectedExtensions = ["vinci-receipt.js", "vinci-shell.js", "vinci-guard.js"].map((name) => join(targetRoot, "vinci/dist/extensions", name));
 const compat = join(targetRoot, "packages/ai/dist/compat.js");
 const identity = join(targetRoot, "vinci/dist/source-identity.json");
 for (const path of [launcher, cli, compat, identity, ...selectedExtensions]) {
@@ -50,9 +50,14 @@ const childProcess = require("node:child_process");
 const nativeSpawn = childProcess.spawn;
 childProcess.spawn = function (command, args, options) {
   const values = [command, ...(Array.isArray(args) ? args : [])].filter((value) => typeof value === "string");
-  if (values.some((value) => value.includes("sandbox-exec") || /\\bbwrap\\b/.test(value) || value.includes(process.env.VINCI_REFUSAL_TEST_TARGET))) {
-    appendFileSync(process.env.VINCI_REFUSAL_TEST_EVENTS, JSON.stringify({ type: "unexpected_native_writer" }) + "\\n");
-    throw new Error("The scripted refusal did not stop the native writer. Inspect the guard before retrying.");
+  if (values.some((value) => value.includes("sandbox-exec") || /\\bbwrap\\b/.test(value) || value.includes(process.env.VINCI_REFUSAL_TEST_TARGET) || value.includes("requested.txt"))) {
+    const structured = process.env.VINCI_REFUSAL_TEST_STRUCTURED_WRITE === "1" &&
+      values.some((value) => value.includes("/bin/cat > ") && value.includes(process.env.VINCI_REFUSAL_TEST_TARGET));
+    if (!structured) {
+      appendFileSync(process.env.VINCI_REFUSAL_TEST_EVENTS, JSON.stringify({ type: "unexpected_native_writer" }) + "\\n");
+      throw new Error("The scripted refusal did not stop the native writer. Inspect the guard before retrying.");
+    }
+    appendFileSync(process.env.VINCI_REFUSAL_TEST_EVENTS, JSON.stringify({ type: "structured_native_writer" }) + "\\n");
   }
   return nativeSpawn.call(this, command, args, options);
 };
@@ -66,23 +71,33 @@ import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from ${JSON.
 export default function (pi) {
   const audit = (event) => appendFileSync(process.env.VINCI_REFUSAL_TEST_EVENTS, JSON.stringify(event) + "\\n");
   const target = process.env.VINCI_REFUSAL_TEST_TARGET;
-  const callId = "headless-refused-write";
+  const redirect = process.env.VINCI_REFUSAL_TEST_REDIRECT;
+  const callId = redirect ? "shell-write" : "headless-refused-write";
   const plan = process.env.VINCI_REFUSAL_TEST_PLAN === "1";
-  const reason = plan ? "Plan mode kept the project unchanged; no approval UI is available." : 'Scripted write refusal for "' + target + '": the operation did not run.';
+  const reason = redirect ? "Vinci blocked a shell-based file write; use the structured write or edit tool instead." : plan ? "Plan mode kept the project unchanged; no approval UI is available." : 'Scripted write refusal for "' + target + '": the operation did not run.';
   const registration = registerFauxProvider({ tokensPerSecond: 1000 });
   registration.setResponses([
     () => {
       audit({ type: "provider_write", callId, target });
-      return fauxAssistantMessage(fauxToolCall("write", { path: target, content: "fixture bytes\\n" }, { id: callId }), { stopReason: "toolUse" });
+      return fauxAssistantMessage(redirect
+        ? fauxToolCall("bash", { command: "printf 'fixture bytes\\\\n' > requested.txt" }, { id: callId })
+        : fauxToolCall("write", { path: target, content: "fixture bytes\\n" }, { id: callId }), { stopReason: "toolUse" });
     },
     (context) => {
       const result = context.messages.find((message) => message.role === "toolResult" && message.toolCallId === callId);
       assert.equal(result?.isError, true, "The scripted refusal must reach the provider as a correlated tool error.");
       assert.ok(result.content.some((part) => part.type === "text" && part.text.includes(reason)), "The correlated result must retain the scripted refusal reason.");
       audit({ type: "provider_close", callId });
+      if (redirect) assert.equal(result.details?.vinciBlocked, true, "The real guard must mark the shell refusal.");
+      if (redirect === "recover") return fauxAssistantMessage(fauxToolCall("write", { path: target, content: "fixture bytes\\n" }, { id: "structured-write" }), { stopReason: "toolUse" });
       return fauxAssistantMessage(process.env.VINCI_REFUSAL_TEST_ASK === "1" ? ${JSON.stringify(closingAsk)} : ${JSON.stringify(noAsk)});
     },
   ]);
+  if (redirect === "recover") registration.appendResponses([(context) => {
+    const result = context.messages.find((message) => message.role === "toolResult" && message.toolCallId === "structured-write");
+    assert.equal(result?.isError, false, "The structured recovery must complete successfully.");
+    return fauxAssistantMessage("Created requested.txt with the requested content.");
+  }]);
   if (plan) registration.appendResponses(Array.from({ length: 6 }, () =>
     fauxAssistantMessage(process.env.VINCI_REFUSAL_TEST_ASK === "1" ? ${JSON.stringify(closingAsk)} : ${JSON.stringify(noAsk)})));
   pi.registerProvider("faux", {
@@ -98,10 +113,21 @@ export default function (pi) {
   });
   pi.on("tool_call", (event, ctx) => {
     if (event.toolName !== "write" || plan) return undefined;
+    if (redirect) {
+      assert.equal(redirect, "recover", "The unresolved control must never request a write.");
+      assert.equal(event.toolCallId, "structured-write");
+      assert.equal(resolve(ctx.cwd, event.input.path), target);
+      assert.equal(event.input.content, "fixture bytes\\n");
+      process.env.VINCI_REFUSAL_TEST_STRUCTURED_WRITE = "1";
+      return undefined;
+    }
     assert.equal(event.toolCallId, callId, "Only the scripted write may reach the refusal guard.");
     assert.equal(resolve(ctx.cwd, event.input.path), target, "The refused operation must name the requested target.");
     audit({ type: "guard_refusal", callId, target, reason });
     return { block: true, reason };
+  });
+  pi.on("tool_result", (event) => {
+    if (event.toolCallId === "structured-write") delete process.env.VINCI_REFUSAL_TEST_STRUCTURED_WRITE;
   });
   pi.on("session_shutdown", () => registration.unregister());
 }
@@ -128,12 +154,13 @@ function invocation(args, environment, cwd) {
 function jsonLines(path) {
   return readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
-for (const { mode, ask, plan } of [
+for (const { mode, ask, plan, redirect } of [
   ...["text", "json"].flatMap((mode) => [false, true].map((ask) => ({ mode, ask, plan: false }))),
   ...[false, true].map((ask) => ({ mode: "json", ask, plan: true })),
+  ...["text", "json"].flatMap((mode) => ["recover", "unresolved"].map((redirect) => ({ mode, ask: false, plan: false, redirect }))),
 ]) {
-    test(`headless ${mode} ${plan ? "plan refusal" : "refused write"} ${ask ? "with a closing ask" : "without an ask"}${plan ? " preserves its outcome" : " exits 3"}`, async () => {
-      const home = join(owned, `${mode}-${plan ? "plan-" : ""}${ask ? "ask" : "no-ask"}`);
+    test(`headless ${mode} ${redirect ? `shell write ${redirect}` : plan ? "plan refusal" : "refused write"} ${ask ? "with a closing ask" : "without an ask"}${plan ? " preserves its outcome" : redirect === "recover" ? " exits 0" : " exits 3"}`, async () => {
+      const home = join(owned, `${mode}-${redirect || (plan ? "plan" : "refusal")}-${ask ? "ask" : "no-ask"}`);
       const project = join(home, "project");
       const profile = join(home, "profile");
       const sessions = join(home, "sessions");
@@ -152,12 +179,13 @@ for (const { mode, ask, plan } of [
         VINCI_REFUSAL_TEST_EVENTS: events, VINCI_REFUSAL_TEST_TARGET: target,
         VINCI_REFUSAL_TEST_ASK: ask ? "1" : "0",
         VINCI_REFUSAL_TEST_PLAN: plan ? "1" : "0",
+        VINCI_REFUSAL_TEST_REDIRECT: redirect || "",
         NODE_OPTIONS: `--require=${JSON.stringify(offlinePreload)}`, JITI_FS_CACHE: "false",
         GIT_CEILING_DIRECTORIES: owned, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0",
         TERM: "dumb", NO_COLOR: "1",
       };
       const result = await invocation([
-        "--session-dir", sessions, "--extension", providerExtension, "--tools", "write",
+        "--session-dir", sessions, "--extension", providerExtension, "--tools", redirect ? "bash,write" : "write",
         "--mode", mode, "-p", plan ? "Plan the requested change to requested.txt." : "Create requested.txt containing fixture bytes.",
       ], environment, project);
       writeFileSync(join(home, "stdout.txt"), result.stdout);
@@ -168,6 +196,7 @@ for (const { mode, ask, plan } of [
       const audit = jsonLines(events);
       assert.equal(audit.some((event) => event.type === "network_denied"), false, "The offline fixture attempted network access. Stop this check and inspect the caller.");
       assert.equal(audit.some((event) => event.type === "unexpected_native_writer"), false, "The scripted refusal reached native execution. Stop this check and inspect the guard.");
+      assert.equal(audit.filter((event) => event.type === "structured_native_writer").length, redirect === "recover" ? 1 : 0, "Only the correlated structured recovery may reach the fixed native writer.");
       const loaded = audit.find((event) => event.type === "fixture_loaded");
       assert.ok(loaded, "The real launcher did not load the scripted fixture. Inspect extension loading before retrying.");
       assert.equal(loaded.cli, cli, "The launcher selected another CLI or a source fallback. Rebuild the selected runtime before retrying.");
@@ -176,14 +205,22 @@ for (const { mode, ask, plan } of [
       for (const extension of selectedExtensions) assert.ok(loaded.extensions.includes(extension), `The launcher did not select compiled extension "${extension}". Inspect extension loading before retrying.`);
       assert.equal(loaded.extensions.some((path) => path.startsWith(join(targetRoot, "vinci/extensions"))), false, "The launcher selected a source extension fallback. Rebuild the selected runtime before retrying.");
       const refusals = audit.filter((event) => event.type === "guard_refusal");
-      assert.equal(refusals.length, plan ? 0 : 1, "An earlier guard prevented the scripted refusal. Inspect its result before counting this control.");
+      assert.equal(refusals.length, plan || redirect ? 0 : 1, "An earlier guard prevented the scripted refusal. Inspect its result before counting this control.");
       assert.equal(audit.filter((event) => event.type === "provider_write").length, 1, "The provider must request the mutation exactly once.");
       assert.equal(audit.filter((event) => event.type === "provider_close").length, 1, "The provider must receive the correlated error before closing.");
-      assert.equal(existsSync(target), false, "The refused native writer created a file. Stop this check and inspect confinement.");
+      assert.equal(existsSync(target), redirect === "recover", "Only a successful structured recovery may create the requested file.");
+      if (redirect === "recover") assert.equal(readFileSync(target, "utf8"), "fixture bytes\n");
       const sessionFiles = readdirSync(sessions).filter((name) => name.endsWith(".jsonl"));
       assert.equal(sessionFiles.length, 1, "The real invocation must persist exactly one session.");
       const entries = jsonLines(join(sessions, sessionFiles[0]));
-      assert.ok(entries.some((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === "headless-refused-write" && entry.message.isError === true), "The durable session must contain the correlated refused write.");
+      const refusal = entries.find((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === (redirect ? "shell-write" : "headless-refused-write"))?.message;
+      assert.equal(refusal?.isError, true, "The durable session must contain the correlated refused write.");
+      if (redirect) {
+        assert.deepEqual([refusal.details?.vinciBlocked, refusal.content], [true, [{ type: "text", text: "Vinci blocked a shell-based file write; use the structured write or edit tool instead." }]], "The shell write must reach the real guard's redirect refusal.");
+        const recovery = entries.find((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === "structured-write")?.message;
+        if (redirect === "recover") assert.equal(recovery?.isError, false);
+        else assert.equal(recovery, undefined, "The unresolved control must never attempt the structured write.");
+      }
       if (ask) {
         if (mode === "text") {
           const start = result.stdout.indexOf(closingAsk);
@@ -201,6 +238,20 @@ for (const { mode, ask, plan } of [
         assert.deepEqual([refusal?.details?.vinciBlocked, refusal?.content], [true, [{ type: "text", text: "Plan mode kept the project unchanged; no approval UI is available." }]], "The planning prompt must reach plan mode's own headless refusal.");
       }
       const outcome = entries.findLast((entry) => entry.type === "custom" && entry.customType === "vinci-task-outcome")?.data;
+      if (redirect) {
+        process.stdout.write(`Headless ${mode} shell write ${redirect} exited ${result.code}; saved outcome ${outcome?.state ?? "absent"}.\n`);
+        if (redirect === "recover") {
+          assert.equal(result.code, 0, "A successful structured recovery must exit 0.");
+          assert.ok(["DONE", "DONE_UNVERIFIED"].includes(outcome?.state));
+          assert.equal(outcome.requiredOperations?.length ?? 0, 0, "The recovered shell redirect must leave no required operations.");
+        } else {
+          assert.equal(result.code, 3, "An unrecovered shell redirect must exit 3.");
+          assert.equal(outcome?.state, "BLOCKED");
+          assert.equal(outcome.requiredOperations.length, 1);
+          assert.equal(outcome.requiredOperations[0].tool, "bash");
+        }
+        return;
+      }
       process.stdout.write(`Headless ${mode} refused write ${ask ? "with a closing ask" : "without an ask"} exited ${result.code}; saved outcome ${outcome?.state ?? "absent"}.\n`);
       if (plan) {
         process.stdout.write(`Plan refusal ${ask ? "ask" : "no-ask"} measurement: ${JSON.stringify({ exit: result.code, state: outcome?.state, reason: outcome?.reason })}\n`);
