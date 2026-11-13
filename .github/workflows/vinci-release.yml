@@ -469,8 +469,8 @@ jobs:
           set -euo pipefail
           mkdir release
           cp "candidate/vinci-code-${VERSION}.tgz" "candidate/vinci-code-${VERSION}.tgz.sha256" candidate/manifest-beta.json release/
-          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/vinci-code-${VERSION}.tgz" "s3://$S3_BUCKET/$S3_PREFIX/vinci-code.tgz"
-          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/install-${VERSION}.sh" "s3://$S3_BUCKET/$S3_PREFIX/install.sh"
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/vinci-code-${VERSION}.tgz" "s3://$S3_BUCKET/$S3_PREFIX/vinci-code.tgz" --copy-props metadata-directive
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/install-${VERSION}.sh" "s3://$S3_BUCKET/$S3_PREFIX/install.sh" --copy-props metadata-directive
       - name: GitHub Release with the shipped artifacts
         env:
           VERSION: ${{ steps.reviewed.outputs.version }}
