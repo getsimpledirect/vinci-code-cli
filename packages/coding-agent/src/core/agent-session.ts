@@ -307,6 +307,9 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	/** Messages of the extension agent_end that was held for a pending auto-retry; a cancelled
+	 *  retry re-emits them as the terminal agent_end for that run. */
+	private _heldRetryAgentEndMessages: AgentMessage[] | undefined = undefined;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -612,6 +615,18 @@ export class AgentSession {
 		}
 	};
 
+	/** Total tries when this run ended on a retryable error after auto-retries ran out; undefined
+	 *  otherwise (including a non-retryable error that followed a retried one). */
+	private _exhaustedRetryTries(event: Extract<AgentEvent, { type: "agent_end" }>): number | undefined {
+		if (this._retryAttempt <= 0) return undefined;
+		for (let i = event.messages.length - 1; i >= 0; i--) {
+			const message = event.messages[i];
+			if (message.role !== "assistant") continue;
+			return this._isRetryableError(message as AssistantMessage) ? this._retryAttempt + 1 : undefined;
+		}
+		return undefined;
+	}
+
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
@@ -672,11 +687,13 @@ export class AgentSession {
 		} else if (event.type === "agent_end") {
 			// Surface the pending auto-retry so extensions do not record a terminal outcome
 			// while the same turn is still going to resume after backoff.
+			const willRetry = this._willRetryAfterAgentEnd(event);
+			this._heldRetryAgentEndMessages = willRetry ? event.messages : undefined;
 			await this._extensionRunner.emit({
 				type: "agent_end",
 				messages: event.messages,
-				willRetry: this._willRetryAfterAgentEnd(event),
-				retryAttemptsUsed: this._retryAttempt,
+				willRetry,
+				exhaustedRetryTries: willRetry ? undefined : this._exhaustedRetryTries(event),
 			});
 		} else if (event.type === "turn_start") {
 			const extensionEvent: TurnStartEvent = {
@@ -2810,15 +2827,11 @@ export class AgentSession {
 				finalError: "Retry cancelled",
 			});
 			// A cancelled retry ends the turn without another agent loop, so extensions that
-			// held their outcome for the pending retry still need one terminal agent_end — with the
-			// errored message back in place (it was removed before the backoff sleep) for honest
-			// classification.
-			await this._extensionRunner.emit({
-				type: "agent_end",
-				messages: [...this.agent.state.messages, message],
-				willRetry: false,
-				retryAttemptsUsed: 0,
-			});
+			// held their outcome for the pending retry still need one terminal agent_end for the
+			// same run: re-emit the held run's messages (they still include the errored message).
+			const held = this._heldRetryAgentEndMessages ?? [message];
+			this._heldRetryAgentEndMessages = undefined;
+			await this._extensionRunner.emit({ type: "agent_end", messages: held, willRetry: false });
 			return false;
 		} finally {
 			this._retryAbortController = undefined;

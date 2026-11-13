@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { AuthStorage, createAgentSession, DefaultResourceLoader, ModelRegistry, SessionManager, SettingsManager } from "../../packages/coding-agent/dist/index.js";
 import { printModeExitCode } from "../../packages/coding-agent/dist/modes/print-mode.js";
 import { vinciFriendlyError } from "../../packages/coding-agent/dist/modes/interactive/components/assistant-message.js";
@@ -17,7 +17,7 @@ process.env.GIT_CEILING_DIRECTORIES = owned;
 const connectionError = () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." });
 const selected = process.argv.slice(2);
 
-async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true } = {}) {
+async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false } = {}) {
   const cwd = mkdtempSync(join(owned, `${mode}-`));
   const agentDir = join(cwd, "profile");
   mkdirSync(agentDir);
@@ -37,14 +37,14 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true }
   assert.deepEqual(resourceLoader.getExtensions().errors, []);
   const { session } = await createAgentSession({
     cwd, agentDir, authStorage, modelRegistry, settingsManager, resourceLoader,
-    model: faux.getModel(), sessionManager: SessionManager.inMemory(cwd), noTools: "all",
+    model: faux.getModel(), sessionManager: SessionManager.inMemory(cwd), ...(tools ? {} : { noTools: "all" }),
   });
   const events = [];
   const badges = [];
   session.subscribe((event) => events.push(event));
   await session.bindExtensions({
     mode,
-    uiContext: mode === "tui" ? {
+    uiContext: mode === "tui" || mode === "rpc" ? {
       setWidget(_key, widget) {
         if (typeof widget === "function") {
           const theme = { fg: (_color, text) => text, bold: (text) => text };
@@ -148,7 +148,42 @@ const cases = {
       assert.deepEqual(f.retryEvents().map(({ type, success, finalError }) => [type, success, finalError]), [
         ["auto_retry_start", undefined, undefined], ["auto_retry_end", false, "Retry cancelled"],
       ]);
+      assert.equal(f.outcomes().length, 1, "B4: a cancelled retry records exactly one terminal outcome");
       assert.notEqual(f.exitCode(), 0);
+    } finally { f.close(); }
+  },
+  // A failed required read before the connection error must still decide the outcome after the
+  // retry succeeds with closing prose: the retry continues the same request, it does not reset it.
+  async B7(mode) {
+    const f = await fixture(mode, { tools: true });
+    try {
+      f.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("read", { path: "missing-input.txt" }, { id: "read-missing" }), { stopReason: "toolUse" }),
+        connectionError(),
+        fauxAssistantMessage("Done."),
+      ]);
+      await f.session.prompt("Read missing-input.txt and summarize it.");
+      console.log(`B7 ${mode}: ${JSON.stringify({ retryEvents: f.retryEvents().map(({ type, success }) => [type, success]), outcomes: f.outcomes().map(({ state, reason }) => ({ state, reason })), calls: f.faux.state.callCount })}`);
+      assert.equal(f.faux.state.callCount, 3);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"], "B7 OUTCOME: the failed required read still blocks after a recovered retry");
+      assert.match(f.outcomes().at(-1).reason, /missing-input\.txt|read/i);
+      assert.notEqual(f.exitCode(), 0);
+    } finally { f.close(); }
+  },
+  // A retried connection error followed by a non-retryable error keeps that error's own guidance:
+  // the "could not reach the model" wording is only for retries exhausted on a retryable error.
+  async B8(mode) {
+    const f = await fixture(mode);
+    try {
+      f.faux.setResponses([connectionError(), fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 Unauthorized." })]);
+      await f.session.prompt("Complete the read-only task.");
+      const outcome = f.outcomes().at(-1);
+      console.log(`B8 ${mode}: ${JSON.stringify({ retryEvents: f.retryEvents().map(({ type, success }) => [type, success]), outcomes: f.outcomes().map(({ state, reason }) => ({ state, reason })), calls: f.faux.state.callCount })}`);
+      assert.equal(f.faux.state.callCount, 2);
+      assert.equal(outcome?.state, "BLOCKED");
+      assert.equal(f.outcomes().length, 1);
+      assert.doesNotMatch(outcome.reason, /could not reach the model/, "B8 OUTCOME: a non-retryable final error is not reported as exhausted connection retries");
+      assert.match(outcome.reason, /401/);
     } finally { f.close(); }
   },
 };

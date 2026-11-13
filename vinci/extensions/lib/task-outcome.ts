@@ -191,10 +191,9 @@ type BuildOutcomeInput = {
   priorOperations?: readonly VinciRequiredOperation[];
   cwd?: string;
   now?: Date;
-  // Auto-retry attempts the session already used within this turn, reported on agent_end.
-  // A positive count means the session retried a retryable provider error and exhausted its
-  // budget — the reason must then say so plainly instead of quoting the raw provider string.
-  retryAttemptsUsed?: number;
+  // Total tries, set by the session on agent_end only when the run ended on a retryable provider
+  // error after its auto-retries ran out; the reason then says so plainly.
+  exhaustedRetryTries?: number;
 };
 
 type TaskOutcomeStore = {
@@ -438,8 +437,8 @@ export function classifyVinciLocalTaskState(
   changedFiles: readonly string[],
   verification: Readonly<VinciVerificationState>,
   requiredOperations = vinciRequiredOperations(messages),
-  // Auto-retry attempts already used by the session within this turn (see BuildOutcomeInput).
-  retryAttemptsUsed?: number,
+  // Total tries when auto-retries ran out on a retryable error (see BuildOutcomeInput).
+  exhaustedRetryTries?: number,
 ): { state: VinciTaskState; reason: string } {
   if (verification.variant === "terminal-unverifiable") {
     return { state: "BLOCKED", reason: verification.summary };
@@ -475,13 +474,13 @@ export function classifyVinciLocalTaskState(
     }
     // The session exhausted its auto-retries on a retryable provider error: the stop must say
     // plainly how many tries were made (attempts used + the original call) and how to resume, not
-    // just echo the raw provider string. Gated on attempts used rather than re-deriving
-    // "retryable" here — the session only retries what its own retryable check accepted, so a
-    // positive count never widens that classification. Still BLOCKED: a typed continue resumes.
-    if (last?.stopReason === "error" && typeof retryAttemptsUsed === "number" && retryAttemptsUsed > 0) {
+    // just echo the raw provider string. The session sets the count only when the final error is
+    // one its own retryable check accepted, so a later non-retryable error (e.g. 401) keeps its
+    // own guidance. Still BLOCKED: a typed continue resumes.
+    if (last?.stopReason === "error" && typeof exhaustedRetryTries === "number" && exhaustedRetryTries > 1) {
       return {
         state: "BLOCKED",
-        reason: `Vinci could not reach the model after ${retryAttemptsUsed + 1} tries (${
+        reason: `Vinci could not reach the model after ${exhaustedRetryTries} tries (${
           error || "connection failed"
         }). Type continue to resume.`.slice(0, 240),
       };
@@ -595,18 +594,18 @@ export function classifyVinciTaskState(
   changedFiles: readonly string[],
   verification: Readonly<VinciVerificationState>,
   requiredOperations = vinciRequiredOperations(messages),
-  retryAttemptsUsed?: number,
+  exhaustedRetryTries?: number,
 ): { state: VinciTaskState; reason: string } {
-  if (requiredOperations.length > 0) return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations, retryAttemptsUsed);
+  if (requiredOperations.length > 0) return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations, exhaustedRetryTries);
   const remoteVerdict = currentRemoteVerdict(verification);
   if (remoteVerdict) return remoteVerdictOutcome(remoteVerdict);
-  return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations, retryAttemptsUsed);
+  return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations, exhaustedRetryTries);
 }
 
 export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcome {
   const changedFiles = [...new Set(input.changedFiles)].sort();
   const requiredOperations = vinciRequiredOperations(input.messages, input.priorOperations, input.cwd, gitCheckpointDeclinedToolCallIds.get(input.taskId), shellWriteRedirectToolCallIds.get(input.taskId));
-  const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification, requiredOperations, input.retryAttemptsUsed);
+  const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification, requiredOperations, input.exhaustedRetryTries);
   // [#5/#6] A hard stop (the no-progress latch, or any harness refusal of a finalization step) is
   // a machine fact that outranks the narrative: the model's closing "done" — and even a remote
   // VERIFIED_PASS — cannot turn a frozen session into DONE or DONE_UNVERIFIED, and a closing

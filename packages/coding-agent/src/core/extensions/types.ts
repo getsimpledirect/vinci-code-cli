@@ -731,9 +731,9 @@ export interface AgentEndEvent {
 	/** Auto-retry is pending: the turn ended on a retryable provider error with attempts left, and
 	 *  the same turn will resume after backoff. Extensions must not record a terminal outcome yet. */
 	willRetry?: boolean;
-	/** Auto-retry attempts already used within this turn (0 before the first retry); extensions
-	 *  use it to word the exhausted-retry outcome. */
-	retryAttemptsUsed?: number;
+	/** Set only when the run ended on a retryable provider error after auto-retries ran out: the
+	 *  total number of tries made (first call plus retries). */
+	exhaustedRetryTries?: number;
 }
 
 /** Fired at the start of each turn */
