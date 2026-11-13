@@ -421,7 +421,7 @@ async function shellWriteRouteChecks(onlyCase) {
     "echo x > out*.txt",
     "echo x > /dev/tcp/127.0.0.1/9",
     "echo x > =ls",
-
+    "echo x > /proc/self/fd/1",
     "tee '--' -a",
     "python3 -c \"open('/tmp/`printf x`','w')\"",
   ]) {
@@ -438,6 +438,7 @@ async function shellWriteRouteChecks(onlyCase) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `chdir interpreter write stays blocked: ${command}`);
     assert.equal(result.reason.includes(`"${join(project, "x")}"`), false, `chdir moves the relative target, so it is not named: ${command}`);
+    assert.ok(result.reason.includes(`"${join(realpathSync("/etc"), "y")}"`), `the absolute target is still named after a chdir: ${command}\n${result.reason}`);
   }
   // A target that carries a secret value is never echoed into the reason or the model guidance.
   const secret = "sk_live_51H8xQ2eZvKYlo2CkFmNpQrStUvWxYz01"; // pragma: allowlist secret (published vendor example vector)
