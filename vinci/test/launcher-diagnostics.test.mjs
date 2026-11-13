@@ -25,17 +25,22 @@ function execute(file, args, options = {}) {
 	});
 }
 
-function fixture(t, childSource) {
+function fixture(t, childSource, { withTsx = true } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "vinci-launcher-diagnostic-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	for (const directory of ["vinci/bin", "vinci/test", "packages/coding-agent/src", "node_modules/.bin"])
+	for (const directory of ["vinci/bin", "vinci/test", "packages/coding-agent/src", "packages/coding-agent/dist", "node_modules/.bin"])
 		mkdirSync(join(root, directory), { recursive: true });
 	copyFileSync(resolve(here, "../bin/vinci"), join(root, "vinci/bin/vinci"));
 	for (const name of ["byok-launcher-integration.mjs", "launcher-diagnostics.mjs"])
 		copyFileSync(join(here, name), join(root, "vinci/test", name));
 	writeFileSync(join(root, "vinci/identity.json"), '{"version":"0.0.58"}\n');
 	writeFileSync(join(root, "packages/coding-agent/src/cli.ts"), "// Inert fixture, never imported.\n");
-	writeFileSync(join(root, "node_modules/.bin/tsx"), `#!/usr/bin/env node\n${childSource}\n`, { mode: 0o755 });
+	if (withTsx) {
+		writeFileSync(join(root, "node_modules/.bin/tsx"), `#!/usr/bin/env node\n${childSource}\n`, { mode: 0o755 });
+	}
+	// The launcher's NORMAL dispatch (no VINCI_SOURCE_CLI override) executes the built runtime
+	// through `node dist/cli.js`; give that lane the same inert child. Plain JS, spawned via node.
+	writeFileSync(join(root, "packages/coding-agent/dist/cli.js"), `${childSource}\n`);
 	return root;
 }
 
@@ -130,7 +135,10 @@ test("real launcher with inert child: execFile timeout can produce the exact CI 
 });
 
 test("full 102-case launcher matrix uses real shell and inert child without inherited keys", async t => {
-	const root = fixture(t, 'if(process.env.OPENROUTER_API_KEY){process.stderr.write(process.env.OPENROUTER_API_KEY);process.exit(7)}process.stdout.write("0.0.58\\n")');
+	// withTsx:false is the lane control: the byok test must strip VINCI_SOURCE_CLI and dispatch
+	// through the launcher's own dist selection. If it ever goes back to forcing the tsx wrapper,
+	// the launcher here finds no tsx and refuses, and this matrix fails.
+	const root = fixture(t, 'if(process.env.OPENROUTER_API_KEY){process.stderr.write(process.env.OPENROUTER_API_KEY);process.exit(7)}process.stdout.write("0.0.58\\n")', { withTsx: false });
 	writeFileSync(join(root, ".vinci-code.env"), `printf '%s' '${canary}' >&2\nexit 78\n`);
 	const r = await execute(process.execPath, [join(root, "vinci/test/byok-launcher-integration.mjs")], {
 		env: { PATH: path, HOME: root, TMPDIR: root, OPENROUTER_API_KEY: canary }, timeout: 30_000,
