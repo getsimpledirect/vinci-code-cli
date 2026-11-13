@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +10,18 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
 const launcher = resolve(root, "vinci/bin/vinci");
 const home = mkdtempSync(resolve(tmpdir(), "vinci-byok-version-"));
+// Managed flags must reach the launcher's NORMAL dispatch, which runs the built runtime
+// (node packages/coding-agent/dist/cli.js): the path the release ships. CI and the release job
+// build it with vinci/build.sh before this suite runs; the assert below refuses to run without it,
+// so a missing build cannot silently fall back to another runtime. `launcherEnvironment` sets
+// VINCI_SOURCE_CLI=1, which forces the tsx source wrapper instead. Through tsx, about 150 launches
+// at 4-way concurrency have twice (offline-shard 24/3) printed the version and then outlived the
+// 60 s deadline; the cause is not established and did not reproduce locally. The dist path is the
+// one users run and starts about 3x faster, so this test measures it.
+assert.equal(existsSync(resolve(root, "packages/coding-agent/dist/cli.js")), true,
+	"byok-launcher-integration needs the built runtime: run bash vinci/build.sh first");
 const baseEnv = launcherEnvironment(process.env.PATH ?? "/usr/bin:/bin", home);
+delete baseEnv.VINCI_SOURCE_CLI;
 process.on("exit", () => rmSync(home, { recursive: true, force: true }));
 const timeoutMs = 60_000;
 
@@ -50,7 +61,8 @@ async function runAll(value) {
 	return Promise.all(flagCases.map((args) => run(args, value)));
 }
 
-// HOST-RUN: these accepted flags dispatch through tsx. The version path sends no prompt.
+// HOST-RUN: these accepted flags dispatch through the launcher's own runtime selection. The
+// version path sends no prompt.
 const accepted = [["--model", "forte"], ["--provider", "vinci"], ["--provider=VINCI"]];
 for (const flag of ["--model", "--models"]) {
 	for (const id of ["auto", "mezzo", "forte", "fortissimo"]) {
