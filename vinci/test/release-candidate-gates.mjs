@@ -231,17 +231,24 @@ for (const [name, extra, expectedExit, count] of [
     if (expectedExit === 0) assert.match(result.stdout, /Versioned installer verified: sha256/);
   } finally { rmSync(f.folder, { recursive: true }); }
 });
-for (const failCopy of [false, true]) test(`Actual post-manifest copies use verified versioned objects: ${failCopy ? "failure exits non-zero" : "success"}`, () => {
+for (const deny of [false, true]) test(`Actual post-manifest publish uploads the verified bytes with put-object only: ${deny ? "failure exits non-zero" : "success"}`, () => {
   const f = shellFixture();
   try {
     rmSync(join(f.folder, "release"), { recursive: true });
+    const archive = f.f.files["vinci-code-0.0.58.tgz"], installer = f.f.files["install.sh"];
+    writeFileSync(join(f.folder, "activation-staged.tgz"), archive);
+    writeFileSync(join(f.folder, "activation/staged-install.sh"), installer);
     const step = workflow.jobs.activate.steps.find((s) => s.name?.startsWith("Publish retained tested installer"));
-    const result = f.run(step, { MOCK_FAIL_COPY: failCopy ? "1" : "0" });
-    assert.equal(result.status, failCopy ? 1 : 0, result.stderr);
-    assert.deepEqual(f.read().map((c) => c.args), [
-      ["s3", "cp", "s3://fixture-bucket/vinci-code/vinci-code-0.0.58.tgz", "s3://fixture-bucket/vinci-code/vinci-code.tgz"],
-      ...(!failCopy ? [["s3", "cp", "s3://fixture-bucket/vinci-code/install-0.0.58.sh", "s3://fixture-bucket/vinci-code/install.sh"]] : []),
+    const result = f.run(step, { MOCK_DENY: deny ? "1" : "0" });
+    assert.equal(result.status, deny ? 1 : 0, result.stderr);
+    const calls = f.read();
+    assert.deepEqual(calls.map((c) => c.args), [
+      ["s3api", "put-object", "--bucket", "fixture-bucket", "--key", "vinci-code/vinci-code.tgz", "--body", "activation-staged.tgz"],
+      ...(!deny ? [["s3api", "put-object", "--bucket", "fixture-bucket", "--key", "vinci-code/install.sh", "--body", "activation/staged-install.sh"]] : []),
     ]);
+    assert.equal(calls[0].bodySha256, digest(archive));
+    if (!deny) assert.equal(calls[1].bodySha256, digest(installer));
+    assert.ok(!calls.some((c) => c.args[0] === "s3" && c.args[1] === "cp"), "no S3-to-S3 copy (needs s3:GetObjectTagging)");
   } finally { rmSync(f.folder, { recursive: true }); }
 });
 test("Post-manifest recovery catches failed steps and continued notes failure after receipt retention", () => {
