@@ -2849,9 +2849,8 @@ export class AgentSession {
 				attempt,
 				finalError: "Retry cancelled",
 			});
-			// A cancelled retry ends the turn without another agent loop, so extensions that
-			// held their outcome for the pending retry still need one terminal agent_end for the
-			// same run: re-emit the held run's messages (they still include the errored message).
+			// A cancelled retry ends the turn without another agent loop: release the held run now
+			// (idempotent; _handlePostAgentRun releases it too when this returns false).
 			await this._releaseHeldAgentEnd([message]);
 			return false;
 		} finally {
