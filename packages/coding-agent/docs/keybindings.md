@@ -22,6 +22,19 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 
 ## All Actions
 
+The tables list Pi harness defaults and note Vinci-specific differences. Vinci Code uses Shift+Tab for Auto/Plan mode and leaves the thinking-level cycle unbound by default.
+
+### Alternate Screen Viewport
+
+These bindings apply in fullscreen renderers that include the alternate-screen viewport controls.
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `tui.altScreen.pageUp` | `shift+pageUp` | Scroll viewport up one page |
+| `tui.altScreen.pageDown` | `shift+pageDown` | Scroll viewport down one page |
+| `tui.altScreen.top` | `ctrl+home` | Scroll viewport to top |
+| `tui.altScreen.bottom` | `ctrl+end` | Scroll viewport to bottom |
+
 ### TUI Editor Cursor Movement
 
 | Keybinding id | Default | Description |
@@ -111,7 +124,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.model.select` | `ctrl+l` | Open model selector |
 | `app.model.cycleForward` | `ctrl+p` | Cycle to next model |
 | `app.model.cycleBackward` | `shift+ctrl+p` | Cycle to previous model |
-| `app.thinking.cycle` | `shift+tab` | Cycle thinking level |
+| `app.thinking.cycle` | `shift+tab` in Pi; none in Vinci Code | Cycle thinking level |
 | `app.thinking.toggle` | `ctrl+t` | Collapse or expand thinking blocks |
 
 ### Display and Message Queue

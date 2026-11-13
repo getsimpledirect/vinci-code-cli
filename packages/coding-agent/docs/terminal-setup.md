@@ -124,7 +124,7 @@ If you already have an `actions` array, add the objects to it. If the old fullsc
 
 ## xfce4-terminal, terminator
 
-These terminals have limited escape sequence support. Modified Enter keys like `Ctrl+Enter` and `Shift+Enter` cannot be distinguished from plain `Enter`, preventing custom keybindings such as `submit: ["ctrl+enter"]` from working.
+These terminals have limited escape sequence support. Modified Enter keys like `Ctrl+Enter` and `Shift+Enter` cannot be distinguished from plain `Enter`, preventing custom keybindings such as `"tui.input.submit": ["ctrl+enter"]` from working.
 
 For the best experience, use a terminal that supports the Kitty keyboard protocol:
 - [Kitty](https://sw.kovidgoyal.net/kitty/)
