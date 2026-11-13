@@ -492,40 +492,36 @@ export function isShellFileWrite(command: string): boolean {
   });
 }
 
-/** Literal redirect/tee targets for wording only. Unknown shell syntax never supplies a path or
- * changes the block decision; shellWords alone would lose the quoting needed to detect expansion. */
+/** Literal redirect/tee targets for wording only; "" means "unknown, give the generic route".
+ * It never changes the block decision. It names a target only for ONE simple command whose target
+ * is a plain literal path: anything that could move the working directory or hide the real
+ * destination (several commands, cd/pushd/builtin wrappers, comments, heredocs, fd redirects,
+ * expansions, globs, unusual quoting) yields "" instead of a guessed path. */
+const PLAIN_TARGET = /^[A-Za-z0-9._\/+@%=,:-]+$/;
+const QUOTED_PLAIN_TARGET = /^(['"])([A-Za-z0-9._\/+@%=,: -]+)\1$/;
 function shellWriteTargets(command: string): string[] {
-  if (/\$\(|`/.test(command)) return [""];
   const segments = shellSegments(command);
-  const changesCwd = segments.some((segment) =>
-    /^(?:cd|pushd|popd)\b/.test(commandBody(segment)) || /\b(?:--chdir(?:=|\s)|env\s+-C\s)/.test(segment),
-  );
-  const targets: string[] = [];
-  for (const segment of segments) {
-    if (!isShellFileWrite(segment)) continue;
-    const body = commandBody(segment);
-    const tokenPattern = /(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\<>])+|>>?|</g;
-    if (body.replace(tokenPattern, "").trim()) { targets.push(""); continue; }
-    const tokens = body.match(tokenPattern) ?? [];
-    const rawTargets: string[] = [];
-    for (let index = 0; index < tokens.length; index++) {
-      if (/^>>?$/.test(tokens[index])) rawTargets.push(tokens[index + 1] ?? "");
-    }
-    if (/^tee\b/i.test(body)) {
-      for (const token of tokens.slice(1)) {
-        if (/^[<>]/.test(token)) break;
-        if (!token.startsWith("-")) rawTargets.push(token);
-      }
-    }
-    for (const raw of rawTargets) {
-      const unquoted = raw.replace(/'[^']*'/g, "");
-      const literal = raw && !/[$`\\*?\[\]{}~()#\r\n]/.test(unquoted) && !/[\r\n]/.test(raw)
-        ? shellWords(raw)[0] ?? "" : "";
-      if (literal === "/dev/null") continue;
-      targets.push(changesCwd && !isAbsolute(literal) ? "" : literal);
+  if (segments.length !== 1 || /[\r\n#`]|\$|<<|>&|&>|>\||\d>/.test(command)) return [""];
+  const body = commandBody(segments[0]);
+  if (/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs)\b/.test(body)) return [""];
+  const tokenPattern = /(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\<>])+|>>?|</g;
+  if (body.replace(tokenPattern, "").trim()) return [""];
+  const tokens = body.match(tokenPattern) ?? [];
+  const rawTargets: string[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    if (/^>>?$/.test(tokens[index])) rawTargets.push(tokens[index + 1] ?? "");
+  }
+  if (/^tee\b/i.test(body)) {
+    for (const token of tokens.slice(1)) {
+      if (/^[<>]/.test(token)) break;
+      if (!token.startsWith("-")) rawTargets.push(token);
     }
   }
-  return targets;
+  if (rawTargets.length === 0) return [""];
+  return rawTargets.flatMap((raw) => {
+    const literal = PLAIN_TARGET.test(raw) ? raw : (QUOTED_PLAIN_TARGET.exec(raw)?.[2] ?? "");
+    return literal === "/dev/null" ? [] : [literal];
+  });
 }
 
 // ── Interpreter one-liner file writes ──────────────────────────────────────────────────────────
@@ -1812,7 +1808,9 @@ export default function (pi: ExtensionAPI) {
         const route = `write and edit can create or change files under ${projectRoot ?? resolve(ctx.cwd)}; a file outside it needs your approval through the write tool.`;
         const targets = [...shellWriteTargets(cmd), ...interpreterTargets];
         const targetGuidance = targets.flatMap((target) => {
-          const abs = target ? consumerWritePath(target, ctx.cwd) : null;
+          // The command may hold rehydrated secret values: never echo a target that contains one.
+          if (!target || redactSecrets(target) !== target) return [];
+          const abs = consumerWritePath(target, ctx.cwd);
           if (abs === null || projectRoot === null) return [];
           return [abs === projectRoot || abs.startsWith(projectRoot + sep)
             ? `Target "${abs}" is inside the project; use write with that path.`

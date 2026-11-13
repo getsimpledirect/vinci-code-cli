@@ -407,6 +407,29 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.equal(existsSync(target), false, "Target classification creates no file");
     if (outside) assert.doesNotMatch(notifications.at(-1).message, /saving under/);
   }
+  // Commands whose real destination is uncertain get the generic route, never a guessed path.
+  for (const command of [
+    "builtin cd /tmp; echo x > out.txt",
+    "echo x > out.txt; echo y > other.txt",
+    "cd /tmp && echo x > out.txt",
+    `echo x > "'$OUT'"`,
+    "tee out.txt 2>/dev/null",
+    "echo x > out.txt # > other.txt",
+    "cat <<EOF > out.txt\nx\nEOF",
+    "echo x > out*.txt",
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Uncertain target stays blocked: ${command}`);
+    assert.equal(result.reason, genericReason, `Uncertain target gets only the generic route: ${command}`);
+  }
+  // A target that carries a secret value is never echoed into the reason or the model guidance.
+  const secret = "sk_live_51H8xQ2eZvKYlo2CkFmNpQrStUvWxYz01"; // pragma: allowlist secret (published vendor example vector)
+  assert.notEqual(guard.redactSecrets(`${secret}.txt`), `${secret}.txt`, "fixture value is recognized as a secret");
+  const controlsBeforeSecret = controls.length;
+  const secretResult = await toolCall("bash", { command: `echo x > ${secret}.txt` });
+  assert.equal(secretResult?.block, true, "Secret-named target stays blocked");
+  assert.equal(secretResult.reason.includes(secret), false, "Reason never contains a secret value");
+  assert.equal(controls.slice(controlsBeforeSecret).some(({ message }) => String(message.content).includes(secret)), false, "Model guidance never contains a secret value");
 }
 
 const shellWriteCase = process.argv.find((argument) => argument.startsWith("--shell-write-case="))?.split("=")[1];
