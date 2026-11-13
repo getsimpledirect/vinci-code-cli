@@ -559,6 +559,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event, ctx) => {
+    // A retryable provider error with auto-retries left is not terminal: the session resumes
+    // the same turn after backoff. Recording the outcome (and the "Stopped — needs you" receipt)
+    // from the errored assistant message here would pre-empt the retry's own normal outcome, so
+    // hold everything until the retry resolves and agent_end fires again.
+    if (event.willRetry) return;
     const messages = taskMessages(ctx, event.messages);
     const endedAt = Date.now();
     const openDialogDurationMs = dialogStartedAt > 0 ? endedAt - dialogStartedAt : 0;
@@ -579,6 +584,7 @@ export default function (pi: ExtensionAPI) {
       activeDurationMs: priorActiveDurationMs,
       priorOperations,
       cwd: ctx.cwd,
+      retryAttemptsUsed: event.retryAttemptsUsed,
     });
     // [#199] An outcome may never claim "no changes" while the SESSION's own tree delta says
     // otherwise. The outcome is rebuilt per turn but the run persists only the LAST one: a
@@ -663,7 +669,7 @@ export default function (pi: ExtensionAPI) {
     // the exit code answers a script, so it takes whichever of local and remote is more
     // conservative: a remote pass can never report success on a run whose own check failed (#22
     // laundering, #127 exit contract), and a remote block still blocks a locally-clean run.
-    const localState = classifyVinciLocalTaskState(event.messages, outcome.changedFiles, getVinciVerificationState(), outcome.requiredOperations ?? []).state;
+    const localState = classifyVinciLocalTaskState(event.messages, outcome.changedFiles, getVinciVerificationState(), outcome.requiredOperations ?? [], event.retryAttemptsUsed).state;
     const blocks = (state: string) => state === "BLOCKED" || state === "WAITING";
     if (blocks(outcome.state) || blocks(localState)) {
       ctx.declareHeadlessExitHint?.(3);

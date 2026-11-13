@@ -670,7 +670,14 @@ export class AgentSession {
 			this._turnIndex = 0;
 			await this._extensionRunner.emit({ type: "agent_start" });
 		} else if (event.type === "agent_end") {
-			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
+			// Surface the pending auto-retry so extensions do not record a terminal outcome
+			// while the same turn is still going to resume after backoff.
+			await this._extensionRunner.emit({
+				type: "agent_end",
+				messages: event.messages,
+				willRetry: this._willRetryAfterAgentEnd(event),
+				retryAttemptsUsed: this._retryAttempt,
+			});
 		} else if (event.type === "turn_start") {
 			const extensionEvent: TurnStartEvent = {
 				type: "turn_start",
@@ -2801,6 +2808,16 @@ export class AgentSession {
 				success: false,
 				attempt,
 				finalError: "Retry cancelled",
+			});
+			// A cancelled retry ends the turn without another agent loop, so extensions that
+			// held their outcome for the pending retry still need one terminal agent_end — with the
+			// errored message back in place (it was removed before the backoff sleep) for honest
+			// classification.
+			await this._extensionRunner.emit({
+				type: "agent_end",
+				messages: [...this.agent.state.messages, message],
+				willRetry: false,
+				retryAttemptsUsed: 0,
 			});
 			return false;
 		} finally {
