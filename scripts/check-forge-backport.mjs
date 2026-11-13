@@ -7,11 +7,11 @@ import { gunzipSync } from "node:zlib";
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const forgeSourcePath = "packages/coding-agent/examples/extensions/gondolin/vendor/node-forge";
 const origin = {
-	url: "https://registry.npmjs.org/node-forge/-/node-forge-1.4.2.tgz",
-	integrity: "sha512-rRtAR5XLJ8gCKd9du4qrKAsgCG1ObGP4gLeNJMa4vYSeq4bmBMOJk5IHkrviBV0q7uoAJlVd8HEQYQSVUb4FGQ==",
+	url: "https://registry.npmjs.org/node-forge/-/node-forge-1.4.3.tgz",
+	integrity: "sha512-P6wzfh6t70avmV8FrVEAd/36sOPJQ+hkaJVX1Laap9J/77m7M0eyozDvc8SwnDf4P7MP94gwbAAo0rg3YVXT+g==",
 };
 // This seal pins the reviewed file inventory as well as the local runtime delta.
-const sealHash = "8cbbea77b441d736c69b38b486569f1e491cdc41f00f16ba824aad2e7cdf07f3";
+const sealHash = "16418efa80f3341d2e5e33944fec246e22ed1a3733d6a596af4fedb253de9bbb";
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const json = (value) => `${JSON.stringify(value, null, "\t")}\n`;
 
@@ -61,7 +61,7 @@ function minimalManifest(original) {
 	return {
 		...Object.fromEntries(["name", "version", "description", "license", "main", "engines", "browser"].map((key) => [key, original[key]])),
 		files: ["lib/*.js", "LICENSE", "source-seal.json"],
-		vinciReviewedUpstream: { version: "1.4.2", runtimeChanges: false },
+		vinciReviewedUpstream: { version: "1.4.3", runtimeChanges: false },
 	};
 }
 
@@ -112,7 +112,7 @@ function generateSeal(archive) {
 	}
 	const actual = inventory(directory).filter((name) => name !== "source-seal.json");
 	if (JSON.stringify(actual) !== JSON.stringify(Object.keys(files).sort())) throw new Error("Forge source inventory differs from the artifact; review it before generating its seal.");
-	const seal = { schemaVersion: 2, origin, upstream: { version: "1.4.2", changedFiles: ["package.json"] }, upstreamFiles, files };
+	const seal = { schemaVersion: 2, origin, upstream: { version: "1.4.3", changedFiles: ["package.json"] }, upstreamFiles, files };
 	const output = json(seal);
 	writeFileSync(join(directory, "source-seal.json"), output);
 	console.log(`Forge source seal generated from the pinned public artifact; review and pin SHA256 "${hash(output)}" before accepting the source.`);

@@ -132,8 +132,8 @@ for (const file of lockJsonFiles.sort()) {
 				const expectedPath = resolve(forgeSourcePath);
 				const source = typeof entry.resolved === "string" ? resolve(dirname(file), entry.resolved.replace(/^file:/, "")) : undefined;
 				const metadata = lock.packages[entry.resolved];
-				const linked = entry.link === true && metadata?.version === "1.4.2" && metadata?.engines?.node === ">= 6.13.0";
-				const packed = entry.link !== true && entry.resolved?.startsWith("file:") && entry.version === "1.4.2" && entry.engines?.node === ">= 6.13.0";
+				const linked = entry.link === true && metadata?.version === "1.4.3" && metadata?.engines?.node === ">= 6.13.0";
+				const packed = entry.link !== true && entry.resolved?.startsWith("file:") && entry.version === "1.4.3" && entry.engines?.node === ">= 6.13.0";
 				if (source !== expectedPath || (!linked && !packed)) {
 					failures.push(`${file}: ${path} does not resolve to the reviewed Forge source; regenerate its lock with the local backport override.`);
 				}

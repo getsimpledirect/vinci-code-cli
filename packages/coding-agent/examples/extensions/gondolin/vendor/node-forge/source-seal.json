@@ -1,11 +1,11 @@
 {
 	"schemaVersion": 2,
 	"origin": {
-		"url": "https://registry.npmjs.org/node-forge/-/node-forge-1.4.2.tgz",
-		"integrity": "sha512-rRtAR5XLJ8gCKd9du4qrKAsgCG1ObGP4gLeNJMa4vYSeq4bmBMOJk5IHkrviBV0q7uoAJlVd8HEQYQSVUb4FGQ=="
+		"url": "https://registry.npmjs.org/node-forge/-/node-forge-1.4.3.tgz",
+		"integrity": "sha512-P6wzfh6t70avmV8FrVEAd/36sOPJQ+hkaJVX1Laap9J/77m7M0eyozDvc8SwnDf4P7MP94gwbAAo0rg3YVXT+g=="
 	},
 	"upstream": {
-		"version": "1.4.2",
+		"version": "1.4.3",
 		"changedFiles": [
 			"package.json"
 		]
@@ -19,11 +19,11 @@
 		"lib/cipher.js": "9dbfb9e9a02a128c9092faf78462221b9092ef0f3555da7ea1f6002aab4819a8",
 		"lib/cipherModes.js": "904c168aecdfdf07afce4e38bdc9e0a8f3a799274b8c36d0adae3439a83324a8",
 		"lib/des.js": "cb0ae63c8477e61be95c3948bf52f1b7ed02d8522791d9ed1704b6b8b8517734",
-		"lib/ed25519.js": "b0d15f1e11168a3a6de9914cdff9bf1be0c5c2fc313499e44dfeb164f5202849",
+		"lib/ed25519.js": "1b2e4cf0cd4f89647f667dc2ab77912ea2e434e57f87cdd094420afbad5b0175",
 		"lib/forge.js": "4300955cc75f3cb5b71287b0fa37ec07d3a6bb721a9f6f8b7db19328801046bf",
 		"lib/form.js": "a2f6e0fbab87d5acb02e08c8f92ea8269445f9f35ee1706fb82246ba8f5aba12",
 		"lib/hmac.js": "bab6d0f322458186f6d123cfdd208ab1298a64ab6925b478968a0dfb446a8fa9",
-		"lib/http.js": "257276e15b49964f8e5c4037e1bd6b4368aacdc1de4f6f46a45b67ca72728265",
+		"lib/http.js": "9d5ab17ac2735014373cb5dcec93a9ffc36f236843d4aff64969cff326de2b14",
 		"lib/index.all.js": "48fa7454923f3baa3dd5a5bf9475892aa5f272c4cc8b5a0ec4f3d6c2370ac631",
 		"lib/index.js": "c231851a9d065df1fae045d6e6fb17cf5688b260f9ee0db4965fe1ef3c0607ab",
 		"lib/jsbn.js": "f17e767bfef62490e22a66ec2e12444fe53aee15e838fe572b7808e75194b62d",
@@ -55,13 +55,13 @@
 		"lib/sha512.js": "d600f189d7bd22630b9301a5dea0fd49bb0ac3687f2c8feb7ecdcccd3d21c092",
 		"lib/socket.js": "689715cdeeba3274d6763ab92716a8a3dc1d24a684ea88fee9e2aca72e2dade0",
 		"lib/ssh.js": "6f27454e3fc028c8a6b1c02ae98969aace558ee0c1b6784e8fb12d4419e46d24",
-		"lib/tls.js": "3d7def7a2e1c568de50c18109d7186c0c83d0384c7f9badab4831722b6233cbe",
+		"lib/tls.js": "3250a1cc7d0017e7d3328d14c6f92945fcdc54480709c55ab418e64f90803e09",
 		"lib/tlssocket.js": "99728e72301548ee5233c16bc0417f07892022d24fd178dfb9c0a40aff541a47",
 		"lib/util.js": "a05620c922303dd687e9447754ebde42878f37e51c390a9a3aedb592434795bc",
-		"lib/x509.js": "6749ed90069312a63470cc468d434781494fa3c9d3f2cc194efb2099011f9132",
+		"lib/x509.js": "eb2088df40138b7e72f844d97ebeb1db21fd374b6dd9ec160c63071d19e2de48",
 		"lib/xhr.js": "d9abf523180b6d03b2cc99909eef3488a6b4bc1f822d7fb9d1e945abf555cb42",
 		"LICENSE": "f63ff0e4e239244aa79280da2dd4811a0469e5e201caf5cbc0d97c3a1dff8e82",
-		"package.json": "1affd5b27cff146f9f909a3d1a2a1931623585ff2b343594557608031032f6d8"
+		"package.json": "c4932ae80bd4ce50a44bec3de158477982dbac36ee2436989e940e9f95a57b82"
 	},
 	"files": {
 		"lib/aes.js": "be13b617cfff1d583f616c0ce97147cebd9bf101cf893f027cc18c3a54bd3a2f",
@@ -72,11 +72,11 @@
 		"lib/cipher.js": "9dbfb9e9a02a128c9092faf78462221b9092ef0f3555da7ea1f6002aab4819a8",
 		"lib/cipherModes.js": "904c168aecdfdf07afce4e38bdc9e0a8f3a799274b8c36d0adae3439a83324a8",
 		"lib/des.js": "cb0ae63c8477e61be95c3948bf52f1b7ed02d8522791d9ed1704b6b8b8517734",
-		"lib/ed25519.js": "b0d15f1e11168a3a6de9914cdff9bf1be0c5c2fc313499e44dfeb164f5202849",
+		"lib/ed25519.js": "1b2e4cf0cd4f89647f667dc2ab77912ea2e434e57f87cdd094420afbad5b0175",
 		"lib/forge.js": "4300955cc75f3cb5b71287b0fa37ec07d3a6bb721a9f6f8b7db19328801046bf",
 		"lib/form.js": "a2f6e0fbab87d5acb02e08c8f92ea8269445f9f35ee1706fb82246ba8f5aba12",
 		"lib/hmac.js": "bab6d0f322458186f6d123cfdd208ab1298a64ab6925b478968a0dfb446a8fa9",
-		"lib/http.js": "257276e15b49964f8e5c4037e1bd6b4368aacdc1de4f6f46a45b67ca72728265",
+		"lib/http.js": "9d5ab17ac2735014373cb5dcec93a9ffc36f236843d4aff64969cff326de2b14",
 		"lib/index.all.js": "48fa7454923f3baa3dd5a5bf9475892aa5f272c4cc8b5a0ec4f3d6c2370ac631",
 		"lib/index.js": "c231851a9d065df1fae045d6e6fb17cf5688b260f9ee0db4965fe1ef3c0607ab",
 		"lib/jsbn.js": "f17e767bfef62490e22a66ec2e12444fe53aee15e838fe572b7808e75194b62d",
@@ -108,12 +108,12 @@
 		"lib/sha512.js": "d600f189d7bd22630b9301a5dea0fd49bb0ac3687f2c8feb7ecdcccd3d21c092",
 		"lib/socket.js": "689715cdeeba3274d6763ab92716a8a3dc1d24a684ea88fee9e2aca72e2dade0",
 		"lib/ssh.js": "6f27454e3fc028c8a6b1c02ae98969aace558ee0c1b6784e8fb12d4419e46d24",
-		"lib/tls.js": "3d7def7a2e1c568de50c18109d7186c0c83d0384c7f9badab4831722b6233cbe",
+		"lib/tls.js": "3250a1cc7d0017e7d3328d14c6f92945fcdc54480709c55ab418e64f90803e09",
 		"lib/tlssocket.js": "99728e72301548ee5233c16bc0417f07892022d24fd178dfb9c0a40aff541a47",
 		"lib/util.js": "a05620c922303dd687e9447754ebde42878f37e51c390a9a3aedb592434795bc",
-		"lib/x509.js": "6749ed90069312a63470cc468d434781494fa3c9d3f2cc194efb2099011f9132",
+		"lib/x509.js": "eb2088df40138b7e72f844d97ebeb1db21fd374b6dd9ec160c63071d19e2de48",
 		"lib/xhr.js": "d9abf523180b6d03b2cc99909eef3488a6b4bc1f822d7fb9d1e945abf555cb42",
 		"LICENSE": "f63ff0e4e239244aa79280da2dd4811a0469e5e201caf5cbc0d97c3a1dff8e82",
-		"package.json": "b8ac8abda4bbe45f1abb03ef74cc93aca1ee8bbf1908f1294839a0d436d8ef92"
+		"package.json": "ebc264737a316234c5e7585a1eae8e8572503d615d6a7b19b1edcf2693e64ef9"
 	}
 }
