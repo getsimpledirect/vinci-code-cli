@@ -492,6 +492,42 @@ export function isShellFileWrite(command: string): boolean {
   });
 }
 
+/** Literal redirect/tee targets for wording only. Unknown shell syntax never supplies a path or
+ * changes the block decision; shellWords alone would lose the quoting needed to detect expansion. */
+function shellWriteTargets(command: string): string[] {
+  if (/\$\(|`/.test(command)) return [""];
+  const segments = shellSegments(command);
+  const changesCwd = segments.some((segment) =>
+    /^(?:cd|pushd|popd)\b/.test(commandBody(segment)) || /\b(?:--chdir(?:=|\s)|env\s+-C\s)/.test(segment),
+  );
+  const targets: string[] = [];
+  for (const segment of segments) {
+    if (!isShellFileWrite(segment)) continue;
+    const body = commandBody(segment);
+    const tokenPattern = /(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\<>])+|>>?|</g;
+    if (body.replace(tokenPattern, "").trim()) { targets.push(""); continue; }
+    const tokens = body.match(tokenPattern) ?? [];
+    const rawTargets: string[] = [];
+    for (let index = 0; index < tokens.length; index++) {
+      if (/^>>?$/.test(tokens[index])) rawTargets.push(tokens[index + 1] ?? "");
+    }
+    if (/^tee\b/i.test(body)) {
+      for (const token of tokens.slice(1)) {
+        if (/^[<>]/.test(token)) break;
+        if (!token.startsWith("-")) rawTargets.push(token);
+      }
+    }
+    for (const raw of rawTargets) {
+      const unquoted = raw.replace(/'[^']*'/g, "");
+      const literal = raw && !/[$`\\*?\[\]{}~()#\r\n]/.test(unquoted) && !/[\r\n]/.test(raw)
+        ? shellWords(raw)[0] ?? "" : "";
+      if (literal === "/dev/null") continue;
+      targets.push(changesCwd && !isAbsolute(literal) ? "" : literal);
+    }
+  }
+  return targets;
+}
+
 // ── Interpreter one-liner file writes ──────────────────────────────────────────────────────────
 // An interpreter one-liner is the shell channel's OTHER file writer: `python3 -c
 // "open('/Users/x/.zshenv','a').write('…')"` planted a persistence implant with no gate at all
@@ -1773,13 +1809,22 @@ export default function (pi: ExtensionAPI) {
       });
       if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
         recordVinciShellWriteRedirectToolCall(vinciTaskIdOf(ctx), event.toolCallId);
+        const route = `write and edit can create or change files under ${projectRoot ?? resolve(ctx.cwd)}; a file outside it needs your approval through the write tool.`;
+        const targets = [...shellWriteTargets(cmd), ...interpreterTargets];
+        const targetGuidance = targets.flatMap((target) => {
+          const abs = target ? consumerWritePath(target, ctx.cwd) : null;
+          if (abs === null || projectRoot === null) return [];
+          return [abs === projectRoot || abs.startsWith(projectRoot + sep)
+            ? `Target "${abs}" is inside the project; use write with that path.`
+            : `Use write with "${abs}"; write will ask for approval because this file is outside the project.`];
+        }).join(" ");
         if (ctx.hasUI) ctx.ui.notify("Vinci tried to write a file through the shell — switching to the safer file editor.", "info");
         sendVinciControl(
           pi,
           "vinci-shell-write-block",
-          "That shell command was blocked because it writes file content. Use write for a necessary project file or edit for a targeted project change, then re-read the file to verify it. For a one-off diagnostic, use an inline command or the repository's existing focused test instead of creating a scratch file inside or outside the project. Do not retry with echo, printf, tee, heredocs, sed -i, perl -pi, or interpreter one-liners (python -c open(), node -e fs.writeFile, ruby -e File.write).",
+          `That shell command was blocked because it writes file content. ${route}${targetGuidance ? ` ${targetGuidance}` : ""} Use write to save results the task asked to keep, or edit for a targeted project change, then re-read the file to verify it. For throwaway diagnostics only, use an inline command or the repository's existing focused test instead of creating a scratch file inside or outside the project. Do not retry with echo, printf, tee, heredocs, sed -i, perl -pi, or interpreter one-liners (python -c open(), node -e fs.writeFile, ruby -e File.write).`,
         );
-        return { block: true, reason: "Vinci blocked a shell-based file write; use the structured write or edit tool instead." };
+        return { block: true, reason: `Vinci blocked a shell-based file write; ${route}${targetGuidance ? ` ${targetGuidance}` : ""}` };
       }
 
       const riskText = shellRiskText(cmd);

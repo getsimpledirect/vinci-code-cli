@@ -3,7 +3,7 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -323,6 +323,103 @@ async function checkpointOperationChecks(onlyCase) {
   }
 }
 
+async function shellWriteRouteChecks(onlyCase) {
+  const project = realpathSync(workspace);
+  const route = `write and edit can create or change files under ${project}; a file outside it needs your approval through the write tool.`;
+  const genericReason = `Vinci blocked a shell-based file write; ${route}`;
+  for (const name of ["A1", "A2", "A3", "A4", "A6"]) {
+    if (onlyCase && name !== onlyCase) continue;
+    // Out-of-project targets live in this run's own temp root (outside the project), never a fixed
+    // shared /tmp path that another process may already have created.
+    const outside = join(realpathSync(runRoot), name === "A2" ? "elsewhere.txt" : "x");
+    const command = name === "A2" ? `echo x > ${outside}`
+      : name === "A6" ? `python3 -c "open('${outside}','w')"`
+      : name === "A3" ? 'echo x > "$OUT"' : "echo x > out.txt";
+    const target = name === "A2" || name === "A6" ? outside : join(project, "out.txt");
+    const promptsBefore = selections.length;
+    const controlsBefore = controls.length;
+    const noticesBefore = notifications.length;
+    assert.equal(existsSync(target), false, `${name}: target starts absent`);
+    const refusal = await toolCall("bash", { command });
+    assert.equal(refusal?.block, true, `${name}: shell write remains blocked`);
+    assert.equal(existsSync(target), false, `${name}: blocked shell write creates no file`);
+    assert.match(refusal.reason, /^Vinci blocked a shell-based file write/, `${name}: intended shell-write refusal`);
+    assert.ok(refusal.reason.includes(project), `${name}: reason names the resolved project path`);
+    assert.equal(selections.length, promptsBefore, `${name}: shell block itself needs no prompt`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.equal(control?.display, false, `${name}: model guidance stays private`);
+    const notice = notifications.slice(noticesBefore);
+    assert.equal(notice.length, 1, `${name}: exactly one user notice`);
+    assert.equal(notice[0].level, "info");
+    assert.doesNotMatch(notice[0].message, /[\r\n]/, `${name}: user notice stays one line`);
+
+    if (name === "A1" || name === "A4") {
+      assert.ok(refusal.reason.includes(target), `${name}: reason names the in-project target`);
+      assert.match(refusal.reason, /inside the project; use write with that path/, `${name}: reason gives the in-project write route`);
+      assert.ok(control.content.includes(target), `${name}: control names the in-project target`);
+      assert.ok(notice[0].message === "Vinci tried to write a file through the shell — switching to the safer file editor." || notice[0].message === `Vinci tried to write a file through the shell — switching to the safer file editor. (saving under ${project} instead)`);
+    } else if (name === "A2" || name === "A6") {
+      assert.ok(refusal.reason.includes(target), `${name}: reason names the outside target`);
+      assert.match(refusal.reason, /write will ask for approval.*outside the project/, `${name}: reason explains outside-project approval through write`);
+      assert.ok(control.content.includes(target), `${name}: control names the outside target`);
+      assert.match(control.content, /write will ask for approval.*outside the project/);
+      assert.doesNotMatch(notice[0].message, /saving under/, `${name}: outside target has no in-project saving notice`);
+    } else {
+      assert.equal(refusal.reason, genericReason, "A3: dynamic target gets only the generic route, without an invented path");
+      assert.doesNotMatch(control.content, /\$OUT|Target "/, "A3: control invents no dynamic target path");
+      assert.doesNotMatch(notice[0].message, /saving under/, "A3: unknown target has no saving notice");
+      assert.equal(existsSync(join(workspace, "$OUT")), false, "A3: no literal variable-named file created");
+      for (const dynamic of ["echo x > $OUT", 'echo x > "$(printf out.txt)"', "echo x > `printf out.txt`", "tee $OUT", "cd ..; echo x > out.txt", 'echo x > "unterminated']) {
+        const result = await toolCall("bash", { command: dynamic });
+        assert.equal(result?.block, true, `A3: dynamic write remains blocked: ${dynamic}`);
+        assert.equal(result.reason, genericReason, `A3: no invented target: ${dynamic}`);
+        assert.equal(existsSync(target), false, "A3: dynamic write creates no result file");
+      }
+    }
+    assert.ok(control.content.includes(route), `${name}: control names project scope and outside approval`);
+    assert.match(control.content, /throwaway diagnostics/i, `${name}: scratch advice is scoped to throwaway diagnostics`);
+    assert.match(control.content, /results the task asked to keep/i, `${name}: requested results may be saved`);
+    assert.match(control.content, /Do not retry with echo, printf, tee, heredocs, sed -i, perl -pi, or interpreter one-liners/, `${name}: no alternate shell writer retry`);
+    if (name === "A4") {
+      const input = { path: target, content: "requested result\n" };
+      assert.equal(await toolCall("write", input), undefined, "A4: same-session structured write is allowed");
+      assert.equal(selections.length, promptsBefore, "A4: same-session structured write needs no extra prompt");
+      const result = await toolDefinitions.createWriteToolDefinition(workspace).execute("shell-write-route-recovery", input);
+      assert.notEqual(result.isError, true, "A4: actual write tool succeeds");
+      assert.equal(readFileSync(target, "utf8"), input.content, "A4: requested result is saved on disk");
+      rmSync(target);
+    }
+    check(`Shell-write route ${name}: blocked shell write gives a reachable saving route`, true);
+  }
+  if (onlyCase) return;
+  const escaped = join(realpathSync(runRoot), "escaped.txt");
+  symlinkSync(runRoot, join(workspace, "route-link"));
+  for (const [command, target, outside] of [
+    ['echo "a > decoy.txt" >> "result file.txt"', join(project, "result file.txt"), false],
+    ["tee -a results.txt", join(project, "results.txt"), false],
+    ["echo x > route-link/escaped.txt", escaped, true],
+    ["tee local.txt route-link/escaped.txt", escaped, true],
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, "Literal redirect/tee cases remain blocked");
+    assert.ok(result.reason.includes(target), `Literal target is named: ${command}`);
+    assert.match(result.reason, outside ? /write will ask for approval.*outside the project/ : /inside the project; use write with that path/);
+    assert.equal(existsSync(target), false, "Target classification creates no file");
+    if (outside) assert.doesNotMatch(notifications.at(-1).message, /saving under/);
+  }
+}
+
+const shellWriteCase = process.argv.find((argument) => argument.startsWith("--shell-write-case="))?.split("=")[1];
+if (shellWriteCase) {
+  try {
+    assert.ok(["A1", "A2", "A3", "A4", "A6"].includes(shellWriteCase), "known shell write case required");
+    await shellWriteRouteChecks(shellWriteCase);
+  } finally {
+    rmSync(runRoot, { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
 const checkpointOperationCase = process.argv.find((argument) => argument.startsWith("--checkpoint-operation-case="))?.split("=")[1];
 if (checkpointOperationCase) {
   try {
@@ -346,6 +443,7 @@ if (checkpointCase) {
 }
 
 try {
+  await shellWriteRouteChecks();
   await checkpointChecks();
   await checkpointOperationChecks();
   // Use the registered tool_call hook and the same bytes executed by a real shell. All effects are
