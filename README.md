@@ -44,8 +44,7 @@ exact upstream commit this forked from, is in [`UPSTREAM.md`](UPSTREAM.md).
 </div>
 
 That is one unedited turn on a **user's own key** — the header reads `Anthropic: Claude Haiku 4.5`
-and `/login to connect`, because no Vinci account is involved. It ends the way every turn here
-ends: with what was actually verified, what was not, and what it cost.
+and `/login to connect`, because no Vinci account is involved. The capture shows its final report of what was verified, what was not, and the recorded cost.
 
 ## How it fits together
 
@@ -82,15 +81,18 @@ can fetch Vinci's public model details without credentials or conversation conte
 
 ## What the Vinci layer adds
 
+The table describes the current source. Check the installed version and its release notes
+for the behavior of a distributed build; source checks alone do not qualify a release.
+
 | Capability | Status | What it does |
 |---|:---:|---|
-| Command guard | Shipped | Classifies destructive operations and confirms before running them |
-| Secret redaction | Shipped | Masks credentials before the terminal, diffs, previews, and `/feedback` + `/issue` egress |
-| Honest terminal states | Shipped | A run blocked awaiting permission says so, instead of reporting a read-only success |
-| Checkpoints | Shipped | Durable recovery points you can roll back to |
-| Review / accept | Shipped | A workflow for inspecting and accepting agent output |
-| Sandbox | Shipped | Bounded execution for agent-run commands |
-| BYOK | Shipped | Any Pi-supported provider, with every guard above still active |
+| Command guard | In source | Classifies destructive operations and confirms before running them |
+| Secret redaction | In source | Masks credentials before the terminal, diffs, previews, and `/feedback` + `/issue` egress |
+| Honest terminal states | In source | A run blocked awaiting permission says so, instead of reporting a read-only success |
+| Checkpoints | In source | Durable recovery points you can roll back to |
+| Review / accept | In source | A workflow for inspecting and accepting agent output |
+| Sandbox | In source | Bounded execution for agent-run commands |
+| BYOK | In source | Any Pi-supported provider, with every guard above still active |
 
 The first row is the one worth seeing rather than taking on trust. Asked to delete a directory
 with `rm -rf`, it names the classification, prints the exact command it would run, and waits —
@@ -212,11 +214,45 @@ These are the commands `/help` lists in a session:
 The Vinci layer adds more on top of these — `/review`, `/checkpoint`, `/plan`, `/todo`,
 `/crew` and others come from the extensions in `vinci/extensions/`.
 
+### Task state, recovery and display
+
+The final receipt distinguishes `DONE`, `DONE-UNVERIFIED`, `WAITING` and `BLOCKED`.
+Read the verification and stopping reason before treating a task as complete. The usage
+meter is a local estimate; missing usage or pricing is unknown, and the account/provider
+billing surface remains authoritative.
+
+- `/agents` opens helper status and reviewed changes; `/task-info` gives the task ID.
+- Press Escape to abort active work. Reopen a saved task with `vinci resume <task-id>`.
+- `vinci report-wrong <task-id> "optional note"` records a false completion locally.
+- `vinci doctor` inspects the installed environment; `vinci update` and `vinci rollback`
+  use the signed update flow.
+
+Regular terminal mode is the default. Opt into fullscreen with `vinci --tui-mode fullscreen`
+or the `tuiMode` setting. See [terminal controls and recovery](vinci/README.md#fullscreen-opt-in)
+for selection, scrolling and the terminal-specific checks still outstanding. Plain and
+reduced-motion presentation options are documented in
+[the environment reference](vinci/docs/environment.md#terminal-presentation).
+
+### Local Work task client
+
+`vinci runtime --help` lists an optional local Work client. It requires an explicitly
+configured, owned mode-0600 `VINCI_RUNTIME_CONFIG` profile with a numeric loopback origin
+and a separately authorized Work credential. It does not reuse an inference login.
+
+The client can create an admitted saved task, inspect state/events, answer a current
+question, approve or correct an exact action, read receipts/artifacts and request
+cancellation. Creation does not launch a worker; cancellation does not prove it stopped.
+After an uncertain mutation, reconcile the original outcome before retrying.
+Task listing, worker launch/resume, hosted schedules, merging and deployment are outside
+this interface. See [configuration and limits](vinci/docs/environment.md#local-work-task-client).
+
 ### Environment variables
 
 | Variable | Effect |
 |---|---|
 | `VINCI_SHOW_OTHER_PROVIDERS` | Other providers are off by default. `1` enables them, `0` hides them; either overrides the saved `/other` preference. |
+| `VINCI_ENV` | `prod` (default) or `dev`. Dev isolates credentials/sessions and disables auto-update; inspect the effective environment with `vinci doctor`. See [the development reference](vinci/docs/environment.md). |
+| `VINCI_RUNTIME_CONFIG` | Explicit private profile for the optional local Work task client; unrelated to provider authentication. |
 | `VINCI_PROVIDER` | `vinci` (default) or `openrouter` |
 | `VINCI_MODEL` | With `VINCI_PROVIDER=vinci`: `auto` (default), `mezzo`, `forte`, or `fortissimo` (alias of Forte). `auto` resolves server-side to your account's class. With `openrouter`: a full `vendor/model` id. |
 | `VINCI_NO_SANDBOX=1` | Disable the sandbox. A development escape hatch — it removes a real safety boundary. |
@@ -236,15 +272,37 @@ Full extension list and behaviour → **[`vinci/README.md`](vinci/README.md)**
 | [`SUPPORT.md`](SUPPORT.md) | Where to take a bug, a question, or a billing issue |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Expected conduct, and how to report a concern |
 
+## Development checks
+
+Build with `bash vinci/build.sh` after the source installation above; it uses the committed
+model catalogs. Run `npm run check` for the repository checks and
+`VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh` for the offline Vinci harness. The full
+harness can make live gateway calls when authenticated, so choose that lane explicitly.
+Use [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) for focused package
+tests and dependency-install rules.
+
 ## Releases
 
 This public repository's reviewed `main` is the canonical product source and its protected
-`vinci-v*` release workflow is the sole product publisher. The workflow builds and tests an
-unsigned archive, carries those exact bytes into the protected publish job, then signs and
-stages the immutable artifact before activating the signed manifest. It binds the tested archive
-to the selected source commit and version; the installer verifies the signature and archive hash.
-Private operations and signing-key custody remain private and do not make the private product
-repository a second publisher.
+[`vinci-v*` release workflow](.github/workflows/vinci-release.yml) is the sole product
+publisher. The product version comes from [`vinci/identity.json`](vinci/identity.json),
+independently of the Pi package versions.
+
+Release preparation and activation are separate runs:
+
+1. A protected tag push, or a manual `candidate` run on that tag, builds/tests the unsigned
+   archive and carries those exact bytes into protected signing and immutable staging.
+   This phase retains a signed candidate for owner QA and ends **without activation**.
+2. A separate manual `activate` run needs the exact candidate/artifact and QA-receipt
+   identities plus a fresh protected approval. It validates the retained signed bytes,
+   policy/expiry and unchanged live baseline, then conditionally updates the manifest.
+   It does not rebuild or re-sign. Public installer and release-note publication follows
+   verification of the activated manifest.
+
+A successful candidate run does not establish that a version is available to users.
+Clients verify the signed manifest and archive hash. See
+[activation risks and recovery](vinci/RELEASE-ACTIVATION-RISK.md) before release operations.
+Private operations and signing-key custody remain private and do not create a second publisher.
 
 | What you want | Where it is |
 |---|---|
