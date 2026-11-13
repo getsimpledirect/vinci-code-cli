@@ -309,7 +309,7 @@ test("Post-manifest recovery C2: live verification failure names later steps as 
   assertRollbackRecovery(result);
   assert.match(result.stdout, /^::error::.*Verify exact live bytes before publishing public entry points \(failure\)/m);
   for (const [, , name] of postManifestSteps.slice(1, 4)) {
-    assert.ok(result.stdout.includes(`${name} (skipped)`));
+    assert.ok(result.stdout.split("\n").some((line) => line.startsWith("::error::") && line.includes(`${name} (skipped)`)));
     assert.ok(!result.stdout.includes(`${name} (failure)`));
   }
 });
@@ -324,7 +324,7 @@ test("Post-manifest recovery C4: GitHub Release failure repairs the release with
   assertLiveRecovery(result);
   assert.match(result.stdout, /^::error::.*GitHub Release with the shipped artifacts \(failure\)/m);
   assert.match(result.stdout, /Create the GitHub Release for the tag with the retained artifacts/);
-  assert.match(result.stdout, /Public release notes \(skipped\)/);
+  assert.match(result.stdout, /^::error::.*Public release notes \(skipped\)/m);
   assert.match(result.stdout, /^::error::.*Then publish the skipped public release note by hand/m);
   assert.doesNotMatch(result.stdout, /fix PUBLIC_RELEASES_TOKEN|receipt artifact was not retained/);
 });
@@ -358,9 +358,22 @@ for (const [key, , name] of postManifestSteps) for (const outcome of [undefined,
 }
 for (const key of ["VERIFY_LIVE_OUTCOME", "PUBLISH_ENTRY_POINTS_OUTCOME"]) {
   test(`Post-manifest recovery refuses to claim the release is live when ${key} is skipped`, () => {
-    assertRollbackRecovery(runRecovery({ ...successfulPostManifestOutcomes, [key]: "skipped", PUBLIC_NOTES_OUTCOME: "failure" }));
+    const result = runRecovery({ ...successfulPostManifestOutcomes, [key]: "skipped", PUBLIC_NOTES_OUTCOME: "failure" });
+    assertRollbackRecovery(result);
+    const name = postManifestSteps.find(([candidate]) => candidate === key)[2];
+    assert.ok(result.stdout.split("\n").some((line) => line.startsWith("::error::") && line.includes(`${name} (skipped)`)));
   });
 }
+// Old-head control (C7): the recovery text before this change, kept verbatim. It must fail the C1
+// assertion on its rollback guidance, which shows C1 checks the behaviour this change introduced.
+const oldRecoveryRun = `echo '::error::Activation completion is "INCOMPLETE" after the manifest write. Inspect the live manifest and retained receipt; follow vinci/RELEASE-ACTIVATION-RISK.md and use vinci-rollback.yml for an authorized rollback before retrying.'
+exit 1
+`;
+test("Post-manifest recovery C7: the previous recovery text fails C1 on its rollback guidance", () => {
+  const result = spawnSync("bash", ["-c", oldRecoveryRun], { env: { ...successfulPostManifestOutcomes, PUBLIC_NOTES_OUTCOME: "failure" }, encoding: "utf8", timeout: 10000 });
+  assertIncompleteRecovery(result);
+  assert.throws(() => assertLiveRecovery(result), (error) => error instanceof assert.AssertionError && error.message === 'A post-live-only failure must say "Do not roll back."');
+});
 test("Post-manifest recovery C6: every outcome is wired to the named step and the trigger is unchanged", () => {
   const steps = workflow.jobs.activate.steps, recovery = steps.at(-1);
   assert.equal(recovery.if, "${{ !cancelled() && steps.activate_manifest.outcome == 'success' && (failure() || steps.public_notes.outcome == 'failure') }}");
