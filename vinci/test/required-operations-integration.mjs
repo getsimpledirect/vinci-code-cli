@@ -217,6 +217,8 @@ test("shell-write-redirect", () => {
     const repeated = [...refused, call("shell-write-again", "bash", args), failure("shell-write-again", "bash"), ...recovery, complete()];
     assert.deepEqual(operations.vinciRequiredOperations(repeated, [], cwd, undefined, new Set([...redirects, "shell-write-again"])), [], "A successful structured recovery must resolve both recorded redirects.");
     assert.equal(operations.vinciRequiredOperations(repeated, [], cwd, undefined, redirects).length, 1, "A later unrecorded refusal with identical arguments must remain pending.");
+    const conflicted = [refused[0], refused[1], failure("shell-write", "bash", "Vinci blocked a different shell-based file write."), ...recovery, complete()];
+    assert.equal(operations.vinciRequiredOperations(conflicted, [], cwd, undefined, redirects).length, 1, "A redirect with conflicting tool results must remain pending despite a successful write.");
   }
 });
 test("shell-write-redirect-scope", () => {
