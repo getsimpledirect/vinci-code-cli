@@ -905,6 +905,17 @@ tls.parseHelloMessage = function(c, record, length) {
 
     // TODO: handle compression methods
     if(client) {
+      // the ClientHello only offers no compression (RFC 5246 7.4.1.3)
+      if(msg.compression_method !== tls.CompressionMethod.none) {
+        return c.error(c, {
+          message: 'Unsupported compression method.',
+          send: true,
+          alert: {
+            level: tls.Alert.Level.fatal,
+            description: tls.Alert.Description.illegal_parameter
+          }
+        });
+      }
       c.session.compressionMethod = msg.compression_method;
     } else {
       // no compression
@@ -2028,8 +2039,10 @@ tls.handleHandshake = function(c, record) {
   // restore read pointer
   b.read += 4;
 
-  // handle expected message
-  if(type in hsTable[c.entity][c.expect]) {
+  // handle expected message; a client has no session before handshake()
+  // or after the connection was closed
+  if(type in hsTable[c.entity][c.expect] &&
+    (c.session || c.entity === tls.ConnectionEnd.server)) {
     // initialize server session
     if(c.entity === tls.ConnectionEnd.server && !c.open && !c.fail) {
       c.handshaking = true;

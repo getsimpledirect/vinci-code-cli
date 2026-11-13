@@ -1633,6 +1633,19 @@ pki.certificateExtensionFromAsn1 = function(ext) {
             // unsupported
         }
       }
+    } else if(e.name === 'nameConstraints' && e.id === '2.5.29.30') {
+      // handle nameConstraints (id-ce-nameConstraints only, the deprecated
+      // 2.5.29.11 OID has a different syntax and is not parsed)
+      // (an invalid value is left unparsed; verifyCertificateChain()
+      // rejects it)
+      try {
+        var nc = _readNameConstraints(asn1.fromDer(e.value));
+        e.permittedSubtrees = nc.permittedSubtrees;
+        e.excludedSubtrees = nc.excludedSubtrees;
+        e.unsupportedSubtreeRange = nc.unsupportedSubtreeRange;
+      } catch(ex) {
+        // not parsed
+      }
     } else if(e.name === 'subjectKeyIdentifier') {
       // value is an OCTETSTRING w/the hash of the key-type specific
       // public key structure (eg: RSAPublicKey)
@@ -1642,6 +1655,96 @@ pki.certificateExtensionFromAsn1 = function(ext) {
   }
   return e;
 };
+
+/**
+ * Reads the value of a NameConstraints extension (RFC 5280 4.2.1.10).
+ *
+ * NameConstraints ::= SEQUENCE {
+ *   permittedSubtrees       [0]     GeneralSubtrees OPTIONAL,
+ *   excludedSubtrees        [1]     GeneralSubtrees OPTIONAL }
+ *
+ * GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree
+ *
+ * GeneralSubtree ::= SEQUENCE {
+ *   base                    GeneralName,
+ *   minimum         [0]     BaseDistance DEFAULT 0,
+ *   maximum         [1]     BaseDistance OPTIONAL }
+ *
+ * Each subtree is returned as an object with the GeneralName 'type' and
+ * 'value' (as for subjectAltName), 'attributes' for a directoryName base and
+ * 'minimum'/'maximum' when present.
+ *
+ * @param ev the extension value as an ASN.1 object.
+ *
+ * @return an object with permittedSubtrees, excludedSubtrees and
+ *           unsupportedSubtreeRange (true if any subtree has a minimum other
+ *           than 0 or a maximum, which RFC 5280 does not allow).
+ */
+function _readNameConstraints(ev) {
+  var rval = {
+    permittedSubtrees: [],
+    excludedSubtrees: [],
+    unsupportedSubtreeRange: false
+  };
+  if(ev.tagClass !== asn1.Class.UNIVERSAL ||
+    ev.type !== asn1.Type.SEQUENCE || !forge.util.isArray(ev.value)) {
+    throw new Error('Invalid nameConstraints extension.');
+  }
+  for(var i = 0; i < ev.value.length; ++i) {
+    var trees = ev.value[i];
+    var list;
+    if(trees.tagClass === asn1.Class.CONTEXT_SPECIFIC && trees.type === 0) {
+      list = rval.permittedSubtrees;
+    } else if(trees.tagClass === asn1.Class.CONTEXT_SPECIFIC &&
+      trees.type === 1) {
+      list = rval.excludedSubtrees;
+    } else {
+      throw new Error('Invalid nameConstraints extension.');
+    }
+    if(!forge.util.isArray(trees.value)) {
+      throw new Error('Invalid nameConstraints extension.');
+    }
+    for(var n = 0; n < trees.value.length; ++n) {
+      var subtree = trees.value[n];
+      if(subtree.type !== asn1.Type.SEQUENCE ||
+        !forge.util.isArray(subtree.value) || subtree.value.length === 0 ||
+        subtree.value[0].tagClass !== asn1.Class.CONTEXT_SPECIFIC) {
+        throw new Error('Invalid nameConstraints extension.');
+      }
+      // base GeneralName
+      var gn = subtree.value[0];
+      var base = {
+        type: gn.type,
+        value: gn.value
+      };
+      // directoryName is an EXPLICIT Name
+      if(gn.type === 4 && forge.util.isArray(gn.value) &&
+        gn.value.length === 1 &&
+        gn.value[0].type === asn1.Type.SEQUENCE &&
+        forge.util.isArray(gn.value[0].value)) {
+        base.attributes = pki.RDNAttributesAsArray(gn.value[0]);
+      }
+      // minimum and maximum
+      for(var m = 1; m < subtree.value.length; ++m) {
+        var bd = subtree.value[m];
+        if(bd.tagClass === asn1.Class.CONTEXT_SPECIFIC && bd.type === 0) {
+          base.minimum = asn1.derToInteger(bd.value);
+          if(base.minimum !== 0) {
+            rval.unsupportedSubtreeRange = true;
+          }
+        } else if(bd.tagClass === asn1.Class.CONTEXT_SPECIFIC &&
+          bd.type === 1) {
+          base.maximum = asn1.derToInteger(bd.value);
+          rval.unsupportedSubtreeRange = true;
+        } else {
+          throw new Error('Invalid nameConstraints extension.');
+        }
+      }
+      list.push(base);
+    }
+  }
+  return rval;
+}
 
 /**
  * Converts a PKCS#10 certification request (CSR) from an ASN.1 object.
@@ -2856,6 +2959,538 @@ pki.certificateError = {
   unknown_ca: 'forge.pki.UnknownCertificateAuthority'
 };
 
+// GeneralName type names, by context-specific tag
+var _generalNameTypes = {
+  0: 'otherName',
+  1: 'rfc822Name',
+  2: 'dNSName',
+  3: 'x400Address',
+  4: 'directoryName',
+  5: 'ediPartyName',
+  6: 'uniformResourceIdentifier',
+  7: 'iPAddress',
+  8: 'registeredID'
+};
+
+// the most name and subtree comparisons done for one chain, which bounds the
+// work an attacker's certificates can cause before the chain is known to be
+// trusted (OpenSSL limits names * subtrees to 2^20 too, NAME_CHECK_MAX)
+var _maxNameConstraintChecks = 1 << 20;
+
+/**
+ * Gets the name constraints from each id-ce-nameConstraints extension of a
+ * certificate, prepared for checking. The extension value is always parsed
+ * again, so this also works for extensions that were set in memory or that
+ * could not be parsed by certificateExtensionFromAsn1.
+ *
+ * @param cert the certificate.
+ *
+ * @return an array of objects with permitted and excluded subtrees or, if
+ *           the extension could not be parsed, invalid set to true.
+ */
+function _getNameConstraints(cert) {
+  var rval = [];
+  for(var i = 0; i < cert.extensions.length; ++i) {
+    var ext = cert.extensions[i];
+    if(ext.id !== '2.5.29.30') {
+      continue;
+    }
+    var nc;
+    try {
+      var value = ext.value;
+      if(typeof value === 'string') {
+        value = asn1.fromDer(value);
+      }
+      nc = _readNameConstraints(value);
+    } catch(ex) {
+      rval.push({invalid: true});
+      continue;
+    }
+    rval.push({
+      permitted: _prepareSubtrees(nc.permittedSubtrees),
+      excluded: _prepareSubtrees(nc.excludedSubtrees)
+    });
+  }
+  return rval;
+}
+
+/**
+ * Prepares subtrees for checking: lowercases host names and canonicalizes
+ * directory names once instead of on every comparison.
+ *
+ * @param subtrees the subtrees from _readNameConstraints.
+ *
+ * @return an array of {type, supported, ...} objects.
+ */
+function _prepareSubtrees(subtrees) {
+  var rval = [];
+  for(var i = 0; i < subtrees.length; ++i) {
+    var subtree = subtrees[i];
+    var st = {type: subtree.type, supported: _isSupportedSubtree(subtree)};
+    if(st.supported) {
+      switch(st.type) {
+        case 1:
+          // a mailbox (local@host), all mailboxes on a host (host or
+          // @host) or in a domain (.domain)
+          var at = subtree.value.lastIndexOf('@');
+          st.local = (at === -1) ? null : subtree.value.substr(0, at);
+          st.host = subtree.value.substr(at + 1).toLowerCase();
+          break;
+        case 2:
+        case 6:
+          st.host = subtree.value.toLowerCase();
+          break;
+        case 4:
+          st.attributes = _canonicalAttributes(subtree.attributes);
+          break;
+        case 7:
+          st.value = subtree.value;
+          break;
+      }
+    }
+    rval.push(st);
+  }
+  return rval;
+}
+
+/**
+ * Returns true if a name constraint subtree can be evaluated.
+ *
+ * @param subtree the subtree.
+ *
+ * @return true if supported, false if not.
+ */
+function _isSupportedSubtree(subtree) {
+  if((subtree.minimum && subtree.minimum !== 0) || 'maximum' in subtree) {
+    return false;
+  }
+  switch(subtree.type) {
+    case 1:
+    case 2:
+    case 6:
+      return typeof subtree.value === 'string';
+    case 4:
+      return forge.util.isArray(subtree.attributes);
+    case 7:
+      // address and mask, IPv4 or IPv6
+      return typeof subtree.value === 'string' &&
+        (subtree.value.length === 8 || subtree.value.length === 32);
+  }
+  return false;
+}
+
+/**
+ * Canonicalizes the attribute values of a distinguished name for comparison
+ * (RFC 5280 7.1; like OpenSSL): leading and trailing whitespace is removed,
+ * other runs of whitespace become one space and ASCII letters are lowercased.
+ *
+ * @param attrs the attributes.
+ *
+ * @return an array of {type, value}.
+ */
+function _canonicalAttributes(attrs) {
+  var rval = [];
+  for(var i = 0; i < attrs.length; ++i) {
+    var value = attrs[i].value;
+    if(typeof value === 'string') {
+      value = value.replace(/[ \t\n\v\f\r]+/g, ' ');
+      if(value.charAt(0) === ' ') {
+        value = value.substr(1);
+      }
+      if(value.charAt(value.length - 1) === ' ') {
+        value = value.substr(0, value.length - 1);
+      }
+      value = value.replace(/[A-Z]+/g, function(s) {
+        return s.toLowerCase();
+      });
+    }
+    rval.push({type: attrs[i].type, value: value});
+  }
+  return rval;
+}
+
+/**
+ * Returns true if a commonName value looks like a host name: letters,
+ * digits, '_', and '-' and '.' only inside labels, with at least two
+ * labels (as OpenSSL's cn2dnsid()).
+ *
+ * @param value the commonName value.
+ *
+ * @return true if the value looks like a host name.
+ */
+function _isHostName(value) {
+  if(typeof value !== 'string') {
+    return false;
+  }
+  var labels = false;
+  for(var i = 0; i < value.length; ++i) {
+    var c = value.charAt(i);
+    if(/[a-zA-Z0-9_]/.test(c)) {
+      continue;
+    }
+    if(i > 0 && i < value.length - 1) {
+      if(c === '-') {
+        continue;
+      }
+      var next = value.charAt(i + 1);
+      if(c === '.' && next !== '.' && next !== '-' &&
+        value.charAt(i - 1) !== '-') {
+        labels = true;
+        continue;
+      }
+    }
+    return false;
+  }
+  return labels;
+}
+
+/**
+ * Gets the names of a certificate's subject that name constraints apply to:
+ * the subject DN, any emailAddress attributes in the subject DN (as
+ * rfc822Name) and the subjectAltName entries. For an end-entity certificate
+ * without a dNSName subjectAltName, commonName values that look like host
+ * names are included as dNSNames, as OpenSSL does, because applications
+ * may match a host name against them.
+ *
+ * @param cert the certificate.
+ * @param leaf true if cert is the end-entity certificate.
+ *
+ * @return an object with 'names', an array of {type, value, ...},
+ *           'unsupported', a map of the GeneralName types of names that
+ *           cannot be checked, and 'types', a map of the types of all names.
+ */
+function _getConstrainedNames(cert, leaf) {
+  var rval = {names: [], unsupported: {}, types: {}};
+  var attrs = cert.subject.attributes;
+  var i;
+  if(attrs.length > 0) {
+    _addConstrainedName(rval, 4, attrs);
+  }
+  // RFC 5280 4.2.1.10: rfc822Name constraints apply to emailAddress
+  // attributes in the subject DN
+  for(i = 0; i < attrs.length; ++i) {
+    if(attrs[i].type === oids.emailAddress) {
+      _addConstrainedName(rval, 1, attrs[i].value);
+    }
+  }
+  var hasDnsName = false;
+  for(i = 0; i < cert.extensions.length; ++i) {
+    var san = cert.extensions[i];
+    if(san.id !== '2.5.29.17') {
+      continue;
+    }
+    var altNames = san.altNames || [];
+    for(var n = 0; n < altNames.length; ++n) {
+      var altName = altNames[n];
+      var value = altName.value;
+      if(altName.type === 2) {
+        hasDnsName = true;
+      }
+      switch(altName.type) {
+        case 4:
+          value = null;
+          if(forge.util.isArray(altName.value) &&
+            altName.value.length === 1 &&
+            altName.value[0].type === asn1.Type.SEQUENCE &&
+            forge.util.isArray(altName.value[0].value)) {
+            value = pki.RDNAttributesAsArray(altName.value[0]);
+          }
+          break;
+        case 7:
+          if(altName.ip) {
+            value = forge.util.bytesFromIP(altName.ip);
+          }
+          break;
+      }
+      _addConstrainedName(rval, altName.type, value);
+    }
+  }
+  if(leaf && !hasDnsName) {
+    for(i = 0; i < attrs.length; ++i) {
+      if(attrs[i].type === oids.commonName && _isHostName(attrs[i].value)) {
+        _addConstrainedName(rval, 2, attrs[i].value);
+      }
+    }
+  }
+  return rval;
+}
+
+/**
+ * Adds a name to the result of _getConstrainedNames, prepared for checking,
+ * or marks its type unsupported if it cannot be checked.
+ *
+ * @param names the result of _getConstrainedNames.
+ * @param type the GeneralName type.
+ * @param value the name.
+ */
+function _addConstrainedName(names, type, value) {
+  var name = {type: type, value: value};
+  var ok = false;
+  names.types[type] = true;
+  switch(type) {
+    case 1:
+      // must be a mailbox (local@host)
+      ok = (typeof value === 'string' && value.lastIndexOf('@') !== -1);
+      if(ok) {
+        var at = value.lastIndexOf('@');
+        name.local = value.substr(0, at);
+        name.host = value.substr(at + 1).toLowerCase();
+      }
+      break;
+    case 2:
+      ok = (typeof value === 'string');
+      if(ok) {
+        name.host = value.toLowerCase();
+      }
+      break;
+    case 4:
+      ok = forge.util.isArray(value);
+      if(ok) {
+        name.attributes = _canonicalAttributes(value);
+      }
+      break;
+    case 6:
+      // constraint applies to the host part, which must be present
+      var m = (typeof value === 'string') &&
+        /^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\/([^\/?#]*)/.exec(value);
+      if(m) {
+        var host = m[1].substr(m[1].lastIndexOf('@') + 1);
+        if(host.charAt(0) === '[') {
+          // IP literal, never within a host name subtree
+          name.host = null;
+        } else {
+          var colon = host.indexOf(':');
+          if(colon !== -1) {
+            host = host.substr(0, colon);
+          }
+          name.host = host.toLowerCase();
+        }
+        ok = (host.length > 0);
+      }
+      break;
+    case 7:
+      ok = (typeof value === 'string' &&
+        (value.length === 4 || value.length === 16));
+      break;
+  }
+  if(ok) {
+    names.names.push(name);
+  } else {
+    names.unsupported[type] = true;
+  }
+}
+
+/**
+ * Returns true if a host name is within a host constraint, as used for
+ * rfc822Name and uniformResourceIdentifier: a base that starts with a period
+ * matches any subdomain, otherwise the host must match exactly. Both must be
+ * lowercase.
+ */
+function _hostMatchesConstraint(host, base) {
+  if(base.length === 0) {
+    return true;
+  }
+  if(base.charAt(0) === '.') {
+    return host.length > base.length &&
+      host.substr(host.length - base.length) === base;
+  }
+  return host === base;
+}
+
+/**
+ * Returns true if a name is within the given name constraint subtree. The
+ * subtree must be of the same type as the name and be supported.
+ *
+ * @param name the name from _getConstrainedNames.
+ * @param subtree the subtree from _prepareSubtrees.
+ *
+ * @return true if the name is within the subtree, false if not.
+ */
+function _nameMatchesConstraint(name, subtree) {
+  var value = name.host;
+  var base = subtree.host;
+  var i;
+  switch(name.type) {
+    case 1:
+      // rfc822Name: the local part is case-sensitive, the host is not
+      if(subtree.local !== null) {
+        return (subtree.local === '' || name.local === subtree.local) &&
+          value === base;
+      }
+      return _hostMatchesConstraint(value, base);
+    case 2:
+      // dNSName: zero or more labels may be added to the left of the base
+      if(base.length === 0) {
+        return true;
+      }
+      if(base.charAt(0) === '.') {
+        return value.length > base.length &&
+          value.substr(value.length - base.length) === base;
+      }
+      return value === base || (value.length > base.length &&
+        value.substr(value.length - base.length - 1) === '.' + base);
+    case 6:
+      // uniformResourceIdentifier: constraint applies to the host part
+      return value !== null && _hostMatchesConstraint(value, base);
+    case 4:
+      // directoryName: base must be a prefix of the name
+      var battrs = subtree.attributes;
+      var attrs = name.attributes;
+      if(battrs.length > attrs.length) {
+        return false;
+      }
+      for(i = 0; i < battrs.length; ++i) {
+        if(battrs[i].type !== attrs[i].type ||
+          battrs[i].value !== attrs[i].value) {
+          return false;
+        }
+      }
+      return true;
+    case 7:
+      // iPAddress: base is address followed by mask
+      value = name.value;
+      base = subtree.value;
+      if(base.length !== value.length * 2) {
+        return false;
+      }
+      for(i = 0; i < value.length; ++i) {
+        var mask = base.charCodeAt(value.length + i);
+        if((value.charCodeAt(i) & mask) !== (base.charCodeAt(i) & mask)) {
+          return false;
+        }
+      }
+      return true;
+  }
+  return false;
+}
+
+/**
+ * Gets a printable form of a name for error reporting.
+ */
+function _nameToString(name) {
+  if(name.type === 4) {
+    var parts = [];
+    for(var i = 0; i < name.value.length; ++i) {
+      var attr = name.value[i];
+      parts.push((attr.shortName || attr.name || attr.type) + '=' +
+        attr.value);
+    }
+    return parts.join(', ');
+  }
+  if(name.type === 7) {
+    return forge.util.bytesToIP(name.value);
+  }
+  return name.value;
+}
+
+/**
+ * Checks the names of a certificate against the name constraints of the
+ * certificates above it in the chain (RFC 5280 6.1.3 (b) and (c)). Each
+ * name must be within the permitted subtrees of its type of every
+ * constraint that has such subtrees, which is the same as being within
+ * their intersection, and must not be within any excluded subtree.
+ *
+ * @param cert the certificate to check.
+ * @param constraints the name constraints from _getNameConstraints.
+ * @param count the number of constraints (from the start) that apply.
+ * @param leaf true if cert is the end-entity certificate.
+ * @param work {checks} to count the work done for the chain.
+ *
+ * @return null if the names are acceptable, otherwise an error object.
+ */
+function _checkNameConstraints(cert, constraints, count, leaf, work) {
+  if(count === 0) {
+    return null;
+  }
+  var subject = _getConstrainedNames(cert, leaf);
+  var names = subject.names;
+  var i;
+  var n;
+  var k;
+  var nc;
+  var subtree;
+  var typeName;
+
+  for(i = 0; i < count && work.checks <= _maxNameConstraintChecks; ++i) {
+    nc = constraints[i];
+    work.checks += (names.length + 1) *
+      (nc.invalid ? 1 : nc.permitted.length + nc.excluded.length + 1);
+  }
+  if(work.checks > _maxNameConstraintChecks) {
+    return {
+      message: 'Certificate name constraints require too many checks.',
+      error: pki.certificateError.unsupported_certificate
+    };
+  }
+
+  // fail closed on constraints that cannot be evaluated; a subtree only
+  // applies to names of its own type (RFC 5280 4.2.1.10)
+  for(i = 0; i < count; ++i) {
+    nc = constraints[i];
+    if(nc.invalid) {
+      return {
+        message: 'Certificate name constraint could not be parsed.',
+        error: pki.certificateError.unsupported_certificate
+      };
+    }
+    var all = nc.permitted.concat(nc.excluded);
+    for(n = 0; n < all.length; ++n) {
+      subtree = all[n];
+      if((subtree.type in subject.unsupported) ||
+        (!subtree.supported && subtree.type in subject.types)) {
+        typeName = _generalNameTypes[subtree.type] || String(subtree.type);
+        return {
+          message: 'Certificate name constraint of type ' + typeName +
+            ' is not supported.',
+          error: pki.certificateError.unsupported_certificate,
+          nameType: typeName
+        };
+      }
+    }
+  }
+
+  for(k = 0; k < names.length; ++k) {
+    var name = names[k];
+    for(i = 0; i < count; ++i) {
+      nc = constraints[i];
+      // permitted: must match one subtree of its type, if there are any
+      var found = false;
+      var matched = false;
+      for(n = 0; !matched && n < nc.permitted.length; ++n) {
+        subtree = nc.permitted[n];
+        if(subtree.type === name.type) {
+          found = true;
+          matched = _nameMatchesConstraint(name, subtree);
+        }
+      }
+      if(found && !matched) {
+        return {
+          message: 'Certificate subject name is not permitted by a name ' +
+            'constraint.',
+          error: pki.certificateError.bad_certificate,
+          nameValue: _nameToString(name),
+          nameType: _generalNameTypes[name.type]
+        };
+      }
+      // excluded: must not match any subtree of its type
+      for(n = 0; n < nc.excluded.length; ++n) {
+        subtree = nc.excluded[n];
+        if(subtree.type === name.type &&
+          _nameMatchesConstraint(name, subtree)) {
+          return {
+            message: 'Certificate subject name is excluded by a name ' +
+              'constraint.',
+            error: pki.certificateError.bad_certificate,
+            nameValue: _nameToString(name),
+            nameType: _generalNameTypes[name.type]
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Verifies a certificate chain against the given Certificate Authority store
  * with an optional custom verify callback.
@@ -2987,17 +3622,27 @@ pki.verifyCertificateChain = function(caStore, chain, options) {
        in the CA store.
     3. TODO: The certificate has not been revoked.
     4. The certificate issuer name matches the parent's subject name.
-    5. TODO: If the certificate is self-issued and not the final certificate
+    5. If the certificate is self-issued and not the final certificate
        in the chain, skip this step, otherwise verify that the subject name
        is within one of the permitted subtrees of X.500 distinguished names
        and that each of the alternative names in the subjectAltName extension
        (critical or non-critical) is within one of the permitted subtrees for
        that name type.
-    6. TODO: If the certificate is self-issued and not the final certificate
+    6. If the certificate is self-issued and not the final certificate
        in the chain, skip this step, otherwise verify that the subject name
        is not within one of the excluded subtrees for X.500 distinguished
        names and none of the subjectAltName extension names are excluded for
        that name type.
+       (Steps 5 and 6 use the nameConstraints extensions of all certificates
+       above the certificate in the chain and of a trust anchor from the CA
+       store that issued the last certificate in the chain. Supported name
+       types are rfc822Name, dNSName, directoryName,
+       uniformResourceIdentifier and iPAddress. As in OpenSSL, commonName
+       values that look like host names are checked as dNSNames when the
+       end-entity certificate has no dNSName subjectAltName. A constraint
+       that cannot be evaluated for a name of its type, or more than 2^20
+       name and subtree comparisons for the chain, cause the certificate to
+       be rejected as not supported.)
     7. The other steps in the algorithm for basic path processing involve
        handling the policy extension which is not presently supported in this
        implementation. Instead, if a critical policy extension is found, the
@@ -3034,6 +3679,42 @@ pki.verifyCertificateChain = function(caStore, chain, options) {
   // period should not be checked.
   if(typeof validityCheckDate === 'undefined') {
     validityCheckDate = new Date();
+  }
+
+  // collect the name constraints that apply to each certificate in the
+  // chain: those of the trust anchor that issued the last certificate (if
+  // it is in the CA store and not in the chain) and those of every
+  // certificate above it in the chain; the first ncCount[i] entries of
+  // ncList apply to certs[i]
+  var ncList = [];
+  var ncCount = [];
+  var ncWork = {checks: 0};
+  var last = certs[certs.length - 1];
+  if(last && !last.isIssuer(last)) {
+    var anchors = caStore.getIssuer(last);
+    anchors = anchors ?
+      (forge.util.isArray(anchors) ? anchors.slice() : [anchors]) : [];
+    for(var ai = 0; ai < anchors.length; ++ai) {
+      var anchorNc = _getNameConstraints(anchors[ai]);
+      if(anchorNc.length > 0) {
+        var anchorVerified = false;
+        try {
+          anchorVerified = anchors[ai].verify(last);
+        } catch(ex) {
+          // not the issuer
+        }
+        for(var an = 0; anchorVerified && an < anchorNc.length; ++an) {
+          ncList.push(anchorNc[an]);
+        }
+      }
+    }
+  }
+  for(var ci = certs.length - 1; ci >= 0; --ci) {
+    ncCount[ci] = ncList.length;
+    var certNc = (ci > 0) ? _getNameConstraints(certs[ci]) : [];
+    for(var cn = 0; cn < certNc.length; ++cn) {
+      ncList.push(certNc[cn]);
+    }
   }
 
   // verify each cert in the chain using its parent, where the parent
@@ -3126,20 +3807,28 @@ pki.verifyCertificateChain = function(caStore, chain, options) {
       };
     }
 
-    // 5. TODO: check names with permitted names tree
-
-    // 6. TODO: check names against excluded names tree
+    // 5. check names with permitted names tree
+    // 6. check names against excluded names tree
+    // (skipped for self-issued certificates that are not the final one)
+    if(error === null && (first || !cert.isIssuer(cert))) {
+      error = _checkNameConstraints(
+        cert, ncList, ncCount[depth], first, ncWork);
+    }
 
     // 7. check for unsupported critical extensions
     if(error === null) {
       // supported extensions
       var se = {
         keyUsage: true,
-        basicConstraints: true
+        basicConstraints: true,
+        nameConstraints: true
       };
       for(var i = 0; error === null && i < cert.extensions.length; ++i) {
         var ext = cert.extensions[i];
-        if(ext.critical && !(ext.name in se)) {
+        // only id-ce-nameConstraints (2.5.29.30) is enforced, not the
+        // deprecated 2.5.29.11 OID that has the same name
+        if(ext.critical && (!(ext.name in se) ||
+          (ext.name === 'nameConstraints' && ext.id !== '2.5.29.30'))) {
           error = {
             message:
               'Certificate has an unsupported critical extension.',
