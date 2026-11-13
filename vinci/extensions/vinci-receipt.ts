@@ -466,18 +466,9 @@ export default function (pi: ExtensionAPI) {
   let dialogDurationMs = 0;
   let instrumentedUI: ExtensionContext["ui"] | undefined;
   let continuingRequest = false;
-  // An agent_end held for a pending auto-retry: the retry's agent_start continues the same request,
-  // so it must keep this request's tree baseline, timers and operations instead of resetting them.
-  let retryPending = false;
-  // Messages of runs held for a pending auto-retry. The retry is a new agent run whose agent_end
-  // carries only its own messages, so the held runs' tool calls and results are merged back in
-  // before the request's outcome is decided.
-  let heldRunMessages: AgentMessage[] = [];
   let priorOperations: readonly VinciRequiredOperation[] = [];
 
   pi.on("before_agent_start", (event, ctx) => {
-    retryPending = false;
-    heldRunMessages = [];
     continuingRequest = vinciCarriesOperations(event.prompt, (latestOutcome(ctx)?.requiredOperations?.length ?? 0) > 0);
   });
 
@@ -559,11 +550,9 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget("vinci-receipt", receiptWidget(shown, remoteVerdict), { placement: "aboveEditor" });
   });
 
-  pi.on("agent_start", (_event, ctx) => {
-    if (retryPending) {
-      retryPending = false;
-      return;
-    }
+  pi.on("agent_start", (event, ctx) => {
+    // An auto-retry continues the same request: keep its tree baseline, timers and operations.
+    if (event.continuesRetry) return;
     agentStartedAt = Date.now();
     priorActiveDurationMs = latestOutcome(ctx)?.activeDurationMs ?? 0;
     treeBaseline = gitTreeSnapshot(ctx.cwd);
@@ -583,14 +572,10 @@ export default function (pi: ExtensionAPI) {
     // the same turn after backoff. Recording the outcome (and the "Stopped — needs you" receipt)
     // from the errored assistant message here would pre-empt the retry's own normal outcome, so
     // hold everything until the retry resolves and agent_end fires again.
-    if (event.willRetry) {
-      retryPending = true;
-      heldRunMessages = mergeRunMessages(heldRunMessages, event.messages);
-      return;
-    }
-    retryPending = false;
-    const runMessages = mergeRunMessages(heldRunMessages, event.messages);
-    heldRunMessages = [];
+    if (event.willRetry) return;
+    // The retry is a new agent run: merge the earlier held runs of this request back in so a
+    // failed operation before the connection error still decides the outcome.
+    const runMessages = mergeRunMessages(event.heldRunMessages ?? [], event.messages);
     const messages = taskMessages(ctx, runMessages);
     const endedAt = Date.now();
     const openDialogDurationMs = dialogStartedAt > 0 ? endedAt - dialogStartedAt : 0;

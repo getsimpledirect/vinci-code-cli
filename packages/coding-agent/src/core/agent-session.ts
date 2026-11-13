@@ -307,8 +307,9 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
-	/** Messages of the extension agent_end that was held for a pending auto-retry; a cancelled
-	 *  retry re-emits them as the terminal agent_end for that run. */
+	/** Messages of every extension agent_end held for a pending auto-retry in the current request.
+	 *  The terminal agent_end carries them (heldRunMessages) so extensions can decide the request's
+	 *  outcome from all of its runs, even after an extension reload during backoff. */
 	private _heldRetryAgentEndMessages: AgentMessage[] | undefined = undefined;
 
 	// Bash execution state
@@ -615,6 +616,18 @@ export class AgentSession {
 		}
 	};
 
+	/** Emit the terminal agent_end for a run that was held for a retry that will not happen. */
+	private async _releaseHeldAgentEnd(fallback: AgentMessage[]): Promise<void> {
+		const held = this._heldRetryAgentEndMessages;
+		if (!held) return;
+		this._heldRetryAgentEndMessages = undefined;
+		await this._extensionRunner.emit({
+			type: "agent_end",
+			messages: held.length > 0 ? held : fallback,
+			willRetry: false,
+		});
+	}
+
 	/** Total tries when this run ended on a retryable error after auto-retries ran out; undefined
 	 *  otherwise (including a non-retryable error that followed a retried one). */
 	private _exhaustedRetryTries(event: Extract<AgentEvent, { type: "agent_end" }>): number | undefined {
@@ -683,18 +696,25 @@ export class AgentSession {
 	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
-			await this._extensionRunner.emit({ type: "agent_start" });
+			await this._extensionRunner.emit({ type: "agent_start", continuesRetry: this._retryAttempt > 0 });
 		} else if (event.type === "agent_end") {
 			// Surface the pending auto-retry so extensions do not record a terminal outcome
 			// while the same turn is still going to resume after backoff.
 			const willRetry = this._willRetryAfterAgentEnd(event);
-			this._heldRetryAgentEndMessages = willRetry ? event.messages : undefined;
-			await this._extensionRunner.emit({
-				type: "agent_end",
-				messages: event.messages,
-				willRetry,
-				exhaustedRetryTries: willRetry ? undefined : this._exhaustedRetryTries(event),
-			});
+			const held = this._heldRetryAgentEndMessages;
+			if (willRetry) {
+				this._heldRetryAgentEndMessages = [...(held ?? []), ...event.messages];
+				await this._extensionRunner.emit({ type: "agent_end", messages: event.messages, willRetry: true });
+			} else {
+				this._heldRetryAgentEndMessages = undefined;
+				await this._extensionRunner.emit({
+					type: "agent_end",
+					messages: event.messages,
+					willRetry: false,
+					heldRunMessages: held,
+					exhaustedRetryTries: this._exhaustedRetryTries(event),
+				});
+			}
 		} else if (event.type === "turn_start") {
 			const extensionEvent: TurnStartEvent = {
 				type: "turn_start",
@@ -1217,6 +1237,9 @@ export class AgentSession {
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
 			return true;
 		}
+		// Any path that declines the pending retry (retries disabled during the wait, budget
+		// re-checked, cancellation) must still give extensions one terminal agent_end.
+		await this._releaseHeldAgentEnd([msg]);
 
 		if (msg.stopReason === "error" && this._retryAttempt > 0) {
 			this._emit({
@@ -2829,9 +2852,7 @@ export class AgentSession {
 			// A cancelled retry ends the turn without another agent loop, so extensions that
 			// held their outcome for the pending retry still need one terminal agent_end for the
 			// same run: re-emit the held run's messages (they still include the errored message).
-			const held = this._heldRetryAgentEndMessages ?? [message];
-			this._heldRetryAgentEndMessages = undefined;
-			await this._extensionRunner.emit({ type: "agent_end", messages: held, willRetry: false });
+			await this._releaseHeldAgentEnd([message]);
 			return false;
 		} finally {
 			this._retryAbortController = undefined;

@@ -170,6 +170,46 @@ const cases = {
       assert.notEqual(f.exitCode(), 0);
     } finally { f.close(); }
   },
+  // Retries switched off after the run ended with a pending retry: the held run still gets exactly
+  // one terminal outcome instead of disappearing.
+  async B9(mode) {
+    const f = await fixture(mode);
+    try {
+      f.session.subscribe((event) => {
+        if (event.type === "agent_end" && event.willRetry) f.session.setAutoRetryEnabled(false);
+      });
+      f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+      await f.session.prompt("Complete the read-only task.");
+      console.log(`B9 ${mode}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state, reason }) => ({ state, reason })), calls: f.faux.state.callCount })}`);
+      assert.equal(f.faux.state.callCount, 1);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"], "B9 OUTCOME: a declined retry still records one terminal outcome");
+    } finally { f.close(); }
+  },
+  // An extension reload during the backoff must not lose the earlier run's failed operation.
+  async B10(mode) {
+    const f = await fixture(mode, { tools: true, baseDelayMs: 300 });
+    try {
+      let reloaded;
+      f.session.subscribe((event) => {
+        if (event.type === "auto_retry_start" && !reloaded) reloaded = f.session.reload();
+      });
+      f.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("read", { path: "missing-input.txt" }, { id: "read-missing" }), { stopReason: "toolUse" }),
+        connectionError(),
+        async () => { await reloaded; return fauxAssistantMessage("Done."); },
+      ]);
+      await f.session.prompt("Read missing-input.txt and summarize it.");
+      await reloaded;
+      console.log(`B10 ${mode}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state, reason }) => ({ state, reason })), calls: f.faux.state.callCount })}`);
+      assert.ok(reloaded, "B10: the reload ran during the backoff");
+      // A reload may end the pending retry (two calls) or let it run (three); either way no outcome
+      // may claim success over the earlier failed read.
+      assert.ok([2, 3].includes(f.faux.state.callCount));
+      assert.equal(f.outcomes().some(({ state }) => state === "DONE"), false, "B10 OUTCOME: no DONE over the failed required read after a reload during backoff");
+      assert.equal(f.outcomes().at(-1)?.state, "BLOCKED", "B10 OUTCOME: the failed required read still blocks after a reload during backoff");
+      assert.match(f.outcomes().at(-1).reason, /missing-input\.txt/);
+    } finally { f.close(); }
+  },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:
   // the "could not reach the model" wording is only for retries exhausted on a retryable error.
   async B8(mode) {
