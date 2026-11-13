@@ -45,6 +45,7 @@ async function module(name) {
   return loader.import(path, { default: false });
 }
 const outcome = await module("lib/task-outcome");
+const operations = await module("lib/required-operations");
 const verification = await module("lib/verification-state");
 const control = await module("lib/control");
 const verificationControl = await module("lib/verification-control");
@@ -193,6 +194,46 @@ test("correlation", () => {
   assertRequiredFailure(build([call("write-1"), result("unrelated-id"), complete()]), "write", "no completed tool result");
   const args = { path: "output.ts", oldText: "old", newText: "new" };
   assertRequiredFailure(build([call("edit-1", "edit", args), failure("edit-1", "edit"), complete()]), "edit");
+});
+test("shell-write-redirect", () => {
+  reset();
+  const args = { command: "printf 'fixture bytes\\n' > requested.txt" };
+  const refused = [call("shell-write", "bash", args), failure("shell-write", "bash")];
+  const redirects = new Set(["shell-write"]);
+  for (const tool of ["write", "edit"]) {
+    const input = tool === "write" ? { path: "requested.txt", content: "fixture bytes\n" }
+      : { path: "requested.txt", oldText: "old", newText: "fixture bytes\n" };
+    const recovery = [call("structured-write", tool, input), result("structured-write", tool)];
+    assert.deepEqual(operations.vinciRequiredOperations([...refused, ...recovery, complete()], [], cwd, undefined, redirects), [], "A later successful structured tool must resolve a recorded shell redirect.");
+    assert.equal(operations.vinciRequiredOperations([...refused, complete()], [], cwd, undefined, redirects).length, 1, "A redirect without a structured recovery remains pending.");
+    assert.equal(operations.vinciRequiredOperations([...refused, ...recovery, complete()], [], cwd).length, 1, "An unrelated bash refusal remains pending despite a successful write.");
+    assert.equal(operations.vinciRequiredOperations([...recovery, ...refused, complete()], [], cwd, undefined, redirects).length, 1, "An earlier successful write cannot resolve a later shell redirect.");
+    assert.equal(operations.vinciRequiredOperations([...refused, recovery[0], failure("structured-write", tool), complete()], [], cwd, undefined, redirects).length, 2, "A failed structured recovery leaves both operations pending.");
+    assert.equal(operations.vinciRequiredOperations([...refused, recovery[0], result("structured-write", tool, { content: [{ type: "text", text: "No changes" }] }), complete()], [], cwd, undefined, redirects).length, 2, "A soft failure cannot resolve the redirect.");
+    assert.equal(operations.vinciRequiredOperations([...refused, ...recovery, failure("structured-write", tool), complete()], [], cwd, undefined, redirects).length, 2, "Conflicting recovery results cannot attest a successful write.");
+    assert.equal(operations.vinciRequiredOperations([refused[0], result("shell-write", "bash", { isError: true }), ...recovery, complete()], [], cwd, undefined, redirects).length, 1, "A recorded ID without vinciBlocked must retain the failed bash operation.");
+    const prior = operations.vinciRequiredOperations([call("earlier-bash", "bash", args), failure("earlier-bash", "bash")], [], cwd);
+    assert.deepEqual(operations.vinciRequiredOperations([...refused, ...recovery, complete()], prior, cwd, undefined, redirects), prior, "Resolving a redirect must restore any earlier pending operation with the same arguments.");
+    const repeated = [...refused, call("shell-write-again", "bash", args), failure("shell-write-again", "bash"), ...recovery, complete()];
+    assert.deepEqual(operations.vinciRequiredOperations(repeated, [], cwd, undefined, new Set([...redirects, "shell-write-again"])), [], "A successful structured recovery must resolve both recorded redirects.");
+    assert.equal(operations.vinciRequiredOperations(repeated, [], cwd, undefined, redirects).length, 1, "A later unrecorded refusal with identical arguments must remain pending.");
+  }
+});
+test("shell-write-redirect-scope", () => {
+  const taskId = "shell-write-redirect-scope";
+  reset(taskId);
+  outcome.clearVinciGitCheckpointDeclines(taskId);
+  const messages = [call("shell-write", "bash", { command: "printf 'fixture bytes\\n' > requested.txt" }), failure("shell-write", "bash"), call("structured-write"), result("structured-write"), complete()];
+  try {
+    assert.equal(build(messages, { taskId }).state, "BLOCKED", "The ID must first be recorded by the guard.");
+    outcome.recordVinciShellWriteRedirectToolCall(taskId, "shell-write");
+    assert.equal(build(messages, { taskId }).state, "DONE", "Recorded redirects must reach the task classifier.");
+    assert.equal(build(messages, { taskId: `${taskId}-other` }).state, "BLOCKED", "Redirect IDs must stay scoped to their task.");
+    outcome.clearVinciGitCheckpointDeclines(taskId);
+    assert.equal(build(messages, { taskId }).state, "BLOCKED", "A fresh request must clear redirect IDs with checkpoint-decline IDs.");
+  } finally {
+    outcome.clearVinciGitCheckpointDeclines(taskId);
+  }
 });
 test("required-read", () => {
   reset();

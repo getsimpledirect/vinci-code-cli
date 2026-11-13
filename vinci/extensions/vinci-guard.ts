@@ -25,7 +25,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { recordVinciConfirmationGate, sendVinciControl } from "./lib/control.ts";
 import { recordFinalizationRefusal, vinciTaskIdOf } from "./lib/hard-stop.ts";
-import { clearVinciGitCheckpointDeclines, recordVinciGitCheckpointDecline, recordVinciGitCheckpointDeclinedToolCall } from "./lib/task-outcome.ts";
+import { clearVinciGitCheckpointDeclines, recordVinciGitCheckpointDecline, recordVinciGitCheckpointDeclinedToolCall, recordVinciShellWriteRedirectToolCall } from "./lib/task-outcome.ts";
 import { parseLocalGitSegment } from "./lib/unattended.ts";
 import {
   escalationReason,
@@ -1772,6 +1772,7 @@ export default function (pi: ExtensionAPI) {
         return abs === null || !vinciSandboxWriteGranted(ctx.cwd, abs);
       });
       if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
+        recordVinciShellWriteRedirectToolCall(vinciTaskIdOf(ctx), event.toolCallId);
         if (ctx.hasUI) ctx.ui.notify("Vinci tried to write a file through the shell — switching to the safer file editor.", "info");
         sendVinciControl(
           pi,

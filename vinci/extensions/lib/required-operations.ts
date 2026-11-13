@@ -72,9 +72,20 @@ export function vinciRequiredOperations(
   prior: readonly VinciRequiredOperation[] = [],
   cwd = process.cwd(),
   declinedCheckpointToolCallIds?: ReadonlySet<string>,
+  shellWriteRedirectToolCallIds?: ReadonlySet<string>,
 ): VinciRequiredOperation[] {
   const pending = new Map(prior.map((operation) => [operation.key, operation]));
-  const calls = new Map<string, { operation: VinciRequiredOperation; input: unknown; order: number; pendingBefore?: VinciRequiredOperation; result?: string; ambiguous?: boolean }>();
+  const calls = new Map<string, {
+    operation: VinciRequiredOperation;
+    input: unknown;
+    order: number;
+    pendingBefore?: VinciRequiredOperation;
+    pendingAfter?: VinciRequiredOperation;
+    result?: string;
+    ambiguous?: boolean;
+    success?: boolean;
+    shellWriteRedirect?: boolean;
+  }>();
   const latestAttempt = new Map<string, number>();
   let serial = 0;
   for (const value of messages) {
@@ -144,6 +155,8 @@ export function vinciRequiredOperations(
     if (call.result === result) continue;
     if (call.result !== undefined && call.result !== result) call.ambiguous = true;
     call.result = result;
+    call.success = success;
+    call.shellWriteRedirect = operation.tool === "bash" && shellWriteRedirectToolCallIds?.has(message.toolCallId) === true && details?.vinciBlocked === true;
     if (call.ambiguous) {
       pending.set(operation.key, { ...operation, reason: `Required ${operation.tool} operation for "${boundedReason(operation.target)}" has conflicting tool results.` });
     } else if (isVinciPlanRefusal(text, details)) {
@@ -160,6 +173,22 @@ export function vinciRequiredOperations(
     } else if (success) {
       pending.delete(operation.key);
     }
+    call.pendingAfter = pending.get(operation.key);
+  }
+  // A shell-write redirect is recovered only by a later completed structured mutation.
+  // Wait for all results so conflicting recovery evidence cannot clear the refusal.
+  let lastSuccessfulWrite = 0;
+  for (const call of calls.values()) {
+    if (call.success && !call.ambiguous && (call.operation.tool === "write" || call.operation.tool === "edit")) {
+      lastSuccessfulWrite = Math.max(lastSuccessfulWrite, call.order);
+    }
+  }
+  // Unwind repeated redirects without erasing a newer, unrelated refusal of the same command.
+  for (const call of [...calls.values()].reverse()) {
+    if (!call.shellWriteRedirect || call.ambiguous || call.order >= lastSuccessfulWrite ||
+      !call.pendingAfter || pending.get(call.operation.key) !== call.pendingAfter) continue;
+    if (call.pendingBefore) pending.set(call.operation.key, call.pendingBefore);
+    else pending.delete(call.operation.key);
   }
   return [...pending.values()];
 }
