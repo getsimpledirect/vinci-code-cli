@@ -932,6 +932,60 @@ try {
     );
   }
 
+  // ── Clobber and stdout+stderr redirects ────────────────────────────────────────────────────
+  // `>|`, `&>`, `&>>` and a numbered `N>|` write a file exactly like `>`/`>>`, but the segment split
+  // read their `|` as a pipe and their `&` as a background operator, so `echo x >| out.txt` reached
+  // the shell unseen. Each case must be answered by the shell-write block itself (its reason and
+  // its private control), with no dialog first.
+  for (const [operator, commands] of [
+    [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF"]],
+    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt"]],
+    ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt"]],
+    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt"]],
+  ]) {
+    for (const command of commands) {
+      const selectionCount = selections.length;
+      const controlCount = controls.length;
+      const result = await toolCall("bash", { command });
+      check(`${operator} is classified as a shell file write: ${JSON.stringify(command)}`, guard.isShellFileWrite(command));
+      check(
+        `${operator} takes the shell-write block before any dialog: ${JSON.stringify(command)}`,
+        result?.block === true &&
+          /shell-based file write/i.test(result.reason) &&
+          selections.length === selectionCount &&
+          controls.slice(controlCount).some(({ message }) => message.customType === "vinci-shell-write-block"),
+      );
+    }
+  }
+
+  // Positive controls: the same operators aimed at /dev/null, descriptor duplication, pipes and a
+  // real background `&` write no file and must still run without a block or a dialog.
+  for (const command of [
+    "echo x >| /dev/null",
+    "echo x >|/dev/null",
+    "echo x &> /dev/null",
+    "echo x &>> /dev/null",
+    "echo x &>>/dev/null",
+    "echo x 2>| /dev/null",
+    "ls 2>&1 | cat",
+    "echo x >&2",
+    "echo x 2>&1",
+    "echo x &>&2",
+    "echo a | cat",
+    "echo x |& cat",
+    "sleep 1 & echo x",
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `a redirect that writes no file stays allowed: ${JSON.stringify(command)}`,
+      !guard.isShellFileWrite(command) && result === undefined && selections.length === selectionCount,
+    );
+  }
+  // Outside this change's operators, behaviour is pinned as it was (not an endorsement of either).
+  check("plain `2> file` keeps its previous classification (not a write form here)", !guard.isShellFileWrite("echo x 2> err.txt"));
+  check("`>> /dev/null` keeps its previous classification", guard.isShellFileWrite("echo x >> /dev/null"));
+
   // No SILENT auto-grant: two adversarial reviews showed a shell command can't be classified "safe to
   // network" (endpoint override, argv[0] impostor, command substitution). EVERY network command — direct
   // cloud, wrapped script, curl — takes the one-command prompt. isCloudDeployCommand only routes cloud

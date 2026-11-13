@@ -144,8 +144,11 @@ function isRecursiveForceRm(cmd: string): boolean {
   return recursiveForceRmTargets(cmd).length > 0;
 }
 
-/** Split a shell line at executable control operators, without splitting quoted data. */
-function shellSegments(command: string): string[] {
+/** Split a shell line at executable control operators, without splitting quoted data.
+ *  `keepWriteRedirects` (write detection only) keeps the `|` of `>|` and the `&` of `&>`/`&>>` inside
+ *  the segment: they are redirection operators, not a pipe or a background `&`, and splitting them
+ *  cut `echo x >| out.txt` into `echo x >` and `out.txt`, hiding the write. */
+function shellSegments(command: string, keepWriteRedirects = false): string[] {
   const segments: string[] = [];
   let current = "";
   let quote: "'" | '"' | "`" | null = null;
@@ -168,6 +171,10 @@ function shellSegments(command: string): string[] {
     }
     if (ch === "\\" && i + 1 < command.length) {
       current += ch + command[++i];
+      continue;
+    }
+    if (keepWriteRedirects && ((ch === "|" && command[i - 1] === ">") || (ch === "&" && command[i + 1] === ">"))) {
+      current += ch;
       continue;
     }
     if (ch === ";" || ch === "\n" || ch === "|" || ch === "&") {
@@ -471,7 +478,13 @@ export function destructiveFindRootTargets(command: string): string[][] {
 }
 
 const COMMAND_PREFIX = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*'))\s+)*(?:sudo\s+)?(?:command\s+)?/i;
-const FILE_REDIRECT = /(?<![0-9&>])>>?(?!\s*(?:\/dev\/null\b|&))\s*\S/;
+// A redirect that writes a file: `>`, `>>`, the clobber form `>|`, stdout+stderr `&>`/`&>>`, and a
+// numbered descriptor only in its clobber form (`2>|`; plain `2>` keeps its previous behaviour).
+// `/dev/null` targets and descriptor duplication (`>&2`, `2>&1`) are not file writes.
+// Each new operator is matched whole (no backtracking into a shorter operator), so `>| /dev/null`
+// and `&>> /dev/null` stay allowed the way `> /dev/null` and `&> /dev/null` are.
+const FILE_REDIRECT =
+  /(?:(?<![0-9&>])>>?(?!\|)|(?<![0-9&>])\d*>\|(?![>|])|&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 
 function commandBody(segment: string): string {
   return segment.replace(COMMAND_PREFIX, "").trim();
@@ -482,7 +495,7 @@ function commandBody(segment: string): string {
  * previews, overwrite protection, and edit validation. The model is never allowed to use them.
  */
 export function isShellFileWrite(command: string): boolean {
-  return shellSegments(command).some((segment) => {
+  return shellSegments(command, true).some((segment) => {
     const body = commandBody(segment);
     if (/^(?:echo|printf)\b/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^tee\b(?:\s+-[A-Za-z]+)*\s+(?!-)(?!\/dev\/null\b)\S+/i.test(body)) return true;
