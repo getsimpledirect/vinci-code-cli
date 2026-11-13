@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createJiti } from "jiti/static";
 
@@ -399,6 +399,8 @@ async function shellWriteRouteChecks(onlyCase) {
     ["tee -a results.txt", join(project, "results.txt"), false],
     ["echo x > route-link/escaped.txt", escaped, true],
     ["tee local.txt route-link/escaped.txt", escaped, true],
+    // A sibling folder whose name starts with the project's name is still outside the project.
+    [`echo x > ../${basename(project)}-sibling/x.txt`, join(dirname(project), `${basename(project)}-sibling`, "x.txt"), true],
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, "Literal redirect/tee cases remain blocked");
@@ -417,12 +419,25 @@ async function shellWriteRouteChecks(onlyCase) {
     "echo x > out.txt # > other.txt",
     "cat <<EOF > out.txt\nx\nEOF",
     "echo x > out*.txt",
+    "echo x > /dev/tcp/127.0.0.1/9",
+    "echo x > =ls",
+
     "tee '--' -a",
     "python3 -c \"open('/tmp/`printf x`','w')\"",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Uncertain target stays blocked: ${command}`);
     assert.equal(result.reason, genericReason, `Uncertain target gets only the generic route: ${command}`);
+  }
+  // A chdir inside interpreter code (with or without parentheses) moves relative targets: only the
+  // absolute target may be named, never the relative one as if it were in the project.
+  for (const command of [
+    `perl -e 'chdir "/tmp"; open(F,">","x"); open(G,">","/etc/y")'`,
+    `ruby -e 'Dir.chdir "/tmp"; File.write("x","y"); File.write("/etc/y","z")'`,
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `chdir interpreter write stays blocked: ${command}`);
+    assert.equal(result.reason.includes(`"${join(project, "x")}"`), false, `chdir moves the relative target, so it is not named: ${command}`);
   }
   // A target that carries a secret value is never echoed into the reason or the model guidance.
   const secret = "sk_live_51H8xQ2eZvKYlo2CkFmNpQrStUvWxYz01"; // pragma: allowlist secret (published vendor example vector)

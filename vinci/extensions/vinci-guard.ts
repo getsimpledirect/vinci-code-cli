@@ -1819,10 +1819,16 @@ export default function (pi: ExtensionAPI) {
         // substitution (also inside interpreter code) make the real destination unknown.
         const certainText = !carriesRestoredSecrets && !/[\r\n`]|\$/.test(cmd);
         const targets = certainText
-          ? [...shellWriteTargets(cmd), ...interpreterTargets.filter((target) => SAFE_TARGET_TEXT.test(target))]
+          ? [
+              ...shellWriteTargets(cmd),
+              // Any chdir in interpreter code (with or without parentheses) moves relative targets.
+              ...interpreterTargets.filter((target) => SAFE_TARGET_TEXT.test(target) && (isAbsolute(target) || !/chdir/i.test(cmd))),
+            ]
           : [];
         const targetGuidance = targets.flatMap((target) => {
-          if (!target || redactSecrets(target) !== target) return [];
+          // Virtual paths (sockets, devices, process files) and zsh `=cmd` expansion are not files
+          // the write tool can stand in for.
+          if (!target || /^(?:\/dev\/|\/proc\/|=)/.test(target) || redactSecrets(target) !== target) return [];
           const abs = consumerWritePath(target, ctx.cwd);
           if (abs === null || projectRoot === null) return [];
           return [abs === projectRoot || abs.startsWith(projectRoot + sep)
