@@ -417,6 +417,8 @@ async function shellWriteRouteChecks(onlyCase) {
     "echo x > out.txt # > other.txt",
     "cat <<EOF > out.txt\nx\nEOF",
     "echo x > out*.txt",
+    "tee '--' -a",
+    "python3 -c \"open('/tmp/`printf x`','w')\"",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Uncertain target stays blocked: ${command}`);
@@ -430,6 +432,18 @@ async function shellWriteRouteChecks(onlyCase) {
   assert.equal(secretResult?.block, true, "Secret-named target stays blocked");
   assert.equal(secretResult.reason.includes(secret), false, "Reason never contains a secret value");
   assert.equal(controls.slice(controlsBeforeSecret).some(({ message }) => String(message.content).includes(secret)), false, "Model guidance never contains a secret value");
+  // An opaque value the user supplied is vaulted behind a handle; once restored into the command no
+  // masker recognizes it, so a command that carried a handle names no target at all.
+  const opaque = "hunter2CorrectHorseBatteryStapleXY"; // pragma: allowlist secret (test fixture value)
+  const minted = await handlers.input.at(-1)({ type: "input", text: `password=${opaque}`, source: "interactive" }, ctx);
+  const handle = minted?.text?.match(/<vinci-secret-[0-9a-f]+>/)?.[0];
+  assert.ok(handle, "fixture value is vaulted behind a handle");
+  const controlsBeforeVault = controls.length;
+  const vaulted = await toolCall("bash", { command: `echo x > result-${handle}.txt` });
+  assert.equal(vaulted?.block, true, "Vaulted-secret target stays blocked");
+  assert.doesNotMatch(vaulted.reason, /secret-masking placeholder/, "positive control: the handle was restored, so the shell-write block answered");
+  assert.equal(vaulted.reason.includes(opaque), false, "Reason never contains a restored vaulted value");
+  assert.equal(controls.slice(controlsBeforeVault).some(({ message }) => String(message.content).includes(opaque)), false, "Model guidance never contains a restored vaulted value");
 }
 
 const shellWriteCase = process.argv.find((argument) => argument.startsWith("--shell-write-case="))?.split("=")[1];

@@ -498,6 +498,7 @@ export function isShellFileWrite(command: string): boolean {
  * destination (several commands, cd/pushd/builtin wrappers, comments, heredocs, fd redirects,
  * expansions, globs, unusual quoting) yields "" instead of a guessed path. */
 const PLAIN_TARGET = /^[A-Za-z0-9._\/+@%=,:-]+$/;
+const SAFE_TARGET_TEXT = /^[A-Za-z0-9._\/+@%=,: -]+$/;
 const QUOTED_PLAIN_TARGET = /^(['"])([A-Za-z0-9._\/+@%=,: -]+)\1$/;
 function shellWriteTargets(command: string): string[] {
   const segments = shellSegments(command);
@@ -514,7 +515,11 @@ function shellWriteTargets(command: string): string[] {
   if (/^tee\b/i.test(body)) {
     for (const token of tokens.slice(1)) {
       if (/^[<>]/.test(token)) break;
-      if (!token.startsWith("-")) rawTargets.push(token);
+      // Only plain short options and plain operands; "--", quoted options or anything else that
+      // changes how tee reads its arguments gives the generic route.
+      if (/^-[a-zA-Z]+$/.test(token)) continue;
+      if (!PLAIN_TARGET.test(token) || token.startsWith("-")) return [""];
+      rawTargets.push(token);
     }
   }
   if (rawTargets.length === 0) return [""];
@@ -1742,6 +1747,8 @@ export default function (pi: ExtensionAPI) {
       // what the always-allow store keys on — that store is written to disk, so it must never be
       // handed a restored credential.
       let cmd = String((event.input as { command?: unknown }).command ?? "");
+      // Set when live secret handles were restored into cmd: its text then holds secret values.
+      let carriesRestoredSecrets = false;
       if (!cmd.trim()) return undefined;
       const displayCommand = cmd;
 
@@ -1777,6 +1784,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         cmd = restored.text;
+        carriesRestoredSecrets = restored.resolved.length > 0;
         (event.input as { command?: unknown }).command = cmd;
         if (ctx.hasUI) {
           const which = restored.resolved.length === 1 ? "the credential" : `${restored.resolved.length} credentials`;
@@ -1806,9 +1814,14 @@ export default function (pi: ExtensionAPI) {
       if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
         recordVinciShellWriteRedirectToolCall(vinciTaskIdOf(ctx), event.toolCallId);
         const route = `write and edit can create or change files under ${projectRoot ?? resolve(ctx.cwd)}; a file outside it needs your approval through the write tool.`;
-        const targets = [...shellWriteTargets(cmd), ...interpreterTargets];
+        // Name targets only when the command text is certain and secret-free: a command that had
+        // secret handles restored holds values no masker can recognize, and expansions or command
+        // substitution (also inside interpreter code) make the real destination unknown.
+        const certainText = !carriesRestoredSecrets && !/[\r\n`]|\$/.test(cmd);
+        const targets = certainText
+          ? [...shellWriteTargets(cmd), ...interpreterTargets.filter((target) => SAFE_TARGET_TEXT.test(target))]
+          : [];
         const targetGuidance = targets.flatMap((target) => {
-          // The command may hold rehydrated secret values: never echo a target that contains one.
           if (!target || redactSecrets(target) !== target) return [];
           const abs = consumerWritePath(target, ctx.cwd);
           if (abs === null || projectRoot === null) return [];
