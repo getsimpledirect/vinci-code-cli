@@ -469,8 +469,15 @@ jobs:
           set -euo pipefail
           mkdir release
           cp "candidate/vinci-code-${VERSION}.tgz" "candidate/vinci-code-${VERSION}.tgz.sha256" candidate/manifest-beta.json release/
-          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/vinci-code-${VERSION}.tgz" "s3://$S3_BUCKET/$S3_PREFIX/vinci-code.tgz"
-          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/install-${VERSION}.sh" "s3://$S3_BUCKET/$S3_PREFIX/install.sh"
+          # Upload the bytes this job already verified (activation-staged.tgz against the signed
+          # manifest, activation/staged-install.sh against the candidate record) with the same
+          # s3:PutObject call the job uses for the versioned installer and the manifest. An S3->S3
+          # `aws s3 cp` of the multipart-sized archive needs s3:GetObjectTagging, which the release
+          # role does not have (run 43494228777).
+          aws s3api put-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/vinci-code.tgz" \
+            --body activation-staged.tgz > /dev/null
+          aws s3api put-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/install.sh" \
+            --body activation/staged-install.sh > /dev/null
       - name: GitHub Release with the shipped artifacts
         env:
           VERSION: ${{ steps.reviewed.outputs.version }}
