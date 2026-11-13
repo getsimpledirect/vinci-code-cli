@@ -458,11 +458,13 @@ jobs:
             exit 1
           fi
       - name: Verify exact live bytes before publishing public entry points
+        id: verify_live
         run: |
           set -euo pipefail
           curl -fsSL --max-time 30 "$MANIFEST_URL" > activation/live-after.json
           cmp activation/manifest-beta.json activation/live-after.json
       - name: Publish retained tested installer and compatibility bytes only after activation
+        id: publish_entry_points
         env:
           VERSION: ${{ steps.reviewed.outputs.version }}
         run: |
@@ -479,6 +481,7 @@ jobs:
           aws s3api put-object --bucket "$S3_BUCKET" --key "$S3_PREFIX/install.sh" \
             --body activation/staged-install.sh > /dev/null
       - name: GitHub Release with the shipped artifacts
+        id: github_release
         env:
           VERSION: ${{ steps.reviewed.outputs.version }}
           GH_TOKEN: ${{ github.token }}
@@ -551,6 +554,7 @@ jobs:
           echo "Published $RELEASE_TAG to $PUBLIC_REPO."
 
       - name: Retain sanitized activation or refusal receipt
+        id: retain_receipt
         if: ${{ !cancelled() && steps.policy.outcome == 'success' }}
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
@@ -568,6 +572,61 @@ jobs:
 
       - name: Fail incomplete activation with an explicit recovery route
         if: ${{ !cancelled() && steps.activate_manifest.outcome == 'success' && (failure() || steps.public_notes.outcome == 'failure') }}
+        env:
+          VERIFY_LIVE_OUTCOME: ${{ steps.verify_live.outcome }}
+          PUBLISH_ENTRY_POINTS_OUTCOME: ${{ steps.publish_entry_points.outcome }}
+          GITHUB_RELEASE_OUTCOME: ${{ steps.github_release.outcome }}
+          PUBLIC_NOTES_OUTCOME: ${{ steps.public_notes.outcome }}
+          RETAIN_RECEIPT_OUTCOME: ${{ steps.retain_receipt.outcome }}
         run: |
-          echo '::error::Activation completion is "INCOMPLETE" after the manifest write. Inspect the live manifest and retained receipt; follow vinci/RELEASE-ACTIVATION-RISK.md and use vinci-rollback.yml for an authorized rollback before retrying.'
+          set -euo pipefail
+          step_names=(
+            'Verify exact live bytes before publishing public entry points'
+            'Publish retained tested installer and compatibility bytes only after activation'
+            'GitHub Release with the shipped artifacts'
+            'Public release notes'
+            'Retain sanitized activation or refusal receipt'
+          )
+          outcomes=(
+            "${VERIFY_LIVE_OUTCOME:-}"
+            "${PUBLISH_ENTRY_POINTS_OUTCOME:-}"
+            "${GITHUB_RELEASE_OUTCOME:-}"
+            "${PUBLIC_NOTES_OUTCOME:-}"
+            "${RETAIN_RECEIPT_OUTCOME:-}"
+          )
+          incomplete_steps=()
+          rollback_required=false
+          for index in "${!outcomes[@]}"; do
+            outcome="${outcomes[$index]}"
+            if [[ "$outcome" != success ]]; then
+              incomplete_steps+=("${step_names[$index]} (${outcome:-unknown})")
+            fi
+            case "$outcome" in
+              success|failure|skipped) ;;
+              *) rollback_required=true ;;
+            esac
+          done
+          message='Activation completion is "INCOMPLETE" after the manifest write.'
+          if [[ "${#incomplete_steps[@]}" -gt 0 ]]; then
+            joined="$(printf '%s; ' "${incomplete_steps[@]}")"
+            message+=" Steps not completed successfully: ${joined%; }."
+          fi
+          message+=' '
+          if [[ "${outcomes[0]}" != success || "${outcomes[1]}" != success || "$rollback_required" == true ]]; then
+            message+='Inspect the live manifest and retained receipt; follow vinci/RELEASE-ACTIVATION-RISK.md and use vinci-rollback.yml for an authorized rollback before retrying.'
+          else
+            message+='The release is live: the live manifest matched the reviewed bytes and the archive and install script were published. Do not roll back.'
+            if [[ "${outcomes[2]}" != success ]]; then
+              message+=' Create the GitHub Release for the tag with the retained artifacts.'
+            fi
+            if [[ "${outcomes[3]}" == skipped ]]; then
+              message+=' Then publish the skipped public release note by hand (see vinci/release-notes/README.md).'
+            elif [[ "${outcomes[3]}" != success ]]; then
+              message+=' Publish the note to the public releases repository by hand or fix PUBLIC_RELEASES_TOKEN (see vinci/release-notes/README.md).'
+            fi
+            if [[ "${outcomes[4]}" != success ]]; then
+              message+=' The receipt artifact was not retained; record the run id.'
+            fi
+          fi
+          echo "::error::${message}"
           exit 1
