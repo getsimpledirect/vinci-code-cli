@@ -500,12 +500,24 @@ export function isShellFileWrite(command: string): boolean {
 const PLAIN_TARGET = /^[A-Za-z0-9._\/+@%=,:-]+$/;
 const SAFE_TARGET_TEXT = /^[A-Za-z0-9._\/+@%=,: -]+$/;
 const QUOTED_PLAIN_TARGET = /^(['"])([A-Za-z0-9._\/+@%=,: -]+)\1$/;
-function shellWriteTargets(command: string): string[] {
+
+function isSafeTargetText(text: string): boolean {
+  return SAFE_TARGET_TEXT.test(text) && redactSecrets(text) === text;
+}
+
+/** Shared wording gate for shell and interpreter writers; it never decides whether to block. */
+function shellWriteCommandBody(command: string): string | null {
   const segments = shellSegments(command);
-  if (segments.length !== 1 || /[\r\n#`]|\$|<<|>&|&>|>\||\d>/.test(command)) return [""];
-  const body = commandBody(segments[0]);
-  if (/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs)\b/.test(body)) return [""];
-  const tokenPattern = /(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\<>])+|>>?|</g;
+  if (segments.length !== 1 || /[^\t\x20-\x7e]|[#`$]|<<|>&|&>|>\||\d>/.test(command)) return null;
+  const executable = shellWords(segments[0]).find((word) => !/^[A-Za-z_]\w*=/.test(word))?.split("/").pop() ?? "";
+  if (/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs)$/.test(executable)) return null;
+  return commandBody(segments[0]);
+}
+
+function shellWriteTargets(command: string): string[] {
+  const body = shellWriteCommandBody(command);
+  if (body === null) return [""];
+  const tokenPattern = /(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^ \t'"\\<>])+|>>?|</g;
   if (body.replace(tokenPattern, "").trim()) return [""];
   const tokens = body.match(tokenPattern) ?? [];
   const rawTargets: string[] = [];
@@ -1813,11 +1825,13 @@ export default function (pi: ExtensionAPI) {
       });
       if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
         recordVinciShellWriteRedirectToolCall(vinciTaskIdOf(ctx), event.toolCallId);
-        const route = `write and edit can create or change files under ${projectRoot ?? resolve(ctx.cwd)}; a file outside it needs your approval through the write tool.`;
+        const projectPath = projectRoot ?? resolve(ctx.cwd);
+        const projectScope = isSafeTargetText(projectPath) ? `under ${projectPath}` : "in this project";
+        const route = `write and edit can create or change files ${projectScope}; a file outside it needs your approval through the write tool.`;
         // Name targets only when the command text is certain and secret-free: a command that had
         // secret handles restored holds values no masker can recognize, and expansions or command
         // substitution (also inside interpreter code) make the real destination unknown.
-        const certainText = !carriesRestoredSecrets && !/[\r\n`]|\$/.test(cmd);
+        const certainText = !carriesRestoredSecrets && shellWriteCommandBody(cmd) !== null;
         const targets = certainText
           ? [
               ...shellWriteTargets(cmd),
@@ -1830,7 +1844,7 @@ export default function (pi: ExtensionAPI) {
           // the write tool can stand in for.
           if (!target || /^(?:\/dev\/|\/proc\/|=)/.test(target) || redactSecrets(target) !== target) return [];
           const abs = consumerWritePath(target, ctx.cwd);
-          if (abs === null || projectRoot === null) return [];
+          if (abs === null || projectRoot === null || !isSafeTargetText(abs)) return [];
           return [abs === projectRoot || abs.startsWith(projectRoot + sep)
             ? `Target "${abs}" is inside the project; use write with that path.`
             : `Use write with "${abs}"; write will ask for approval because this file is outside the project.`];

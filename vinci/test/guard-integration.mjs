@@ -70,9 +70,9 @@ const ctx = {
   },
 };
 
-async function toolCall(toolName, input) {
+async function toolCall(toolName, input, toolCtx = ctx) {
   for (const handler of handlers.tool_call ?? []) {
-    const result = await handler({ toolName, input }, ctx);
+    const result = await handler({ toolName, input }, toolCtx);
     if (result !== undefined) return result;
   }
   return undefined;
@@ -396,6 +396,7 @@ async function shellWriteRouteChecks(onlyCase) {
   symlinkSync(runRoot, join(workspace, "route-link"));
   for (const [command, target, outside] of [
     ['echo "a > decoy.txt" >> "result file.txt"', join(project, "result file.txt"), false],
+    ["echo x\t>\ttabbed.txt", join(project, "tabbed.txt"), false],
     ["tee -a results.txt", join(project, "results.txt"), false],
     ["echo x > route-link/escaped.txt", escaped, true],
     ["tee local.txt route-link/escaped.txt", escaped, true],
@@ -409,6 +410,28 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.equal(existsSync(target), false, "Target classification creates no file");
     if (outside) assert.doesNotMatch(notifications.at(-1).message, /saving under/);
   }
+  // Keep interpreter writes blocked independently of how their shell targets are described.
+  const interpreterTarget = join(runRoot, "interpreter-target.txt");
+  writeFileSync(interpreterTarget, "existing\n");
+  symlinkSync(interpreterTarget, join(workspace, "x"));
+  for (const [name, command] of [
+    ["NBSP inside a redirect target gets only the generic route", "echo x > report\u00a0final.txt"],
+    ["interpreter target after builtin cd gets only the generic route", `builtin cd /tmp; python3 -c "open('x','w')"`],
+    ["interpreter target after cd gets only the generic route", `cd /tmp && node -e "require('fs').writeFileSync('x','y')"`],
+    ...["command", "sudo", "env", "/usr/bin/env"].map((wrapper) => [
+      `interpreter target with ${wrapper} gets only the generic route`,
+      `${wrapper} python3 -c "open('x','w')"`,
+    ]),
+  ]) {
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `${name}: shell write remains blocked`);
+    assert.equal(result.reason, genericReason, name);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `${name}: shell-write control is present`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no target`);
+  }
+  rmSync(join(workspace, "x"));
   // Commands whose real destination is uncertain get the generic route, never a guessed path.
   for (const command of [
     "builtin cd /tmp; echo x > out.txt",
@@ -448,6 +471,37 @@ async function shellWriteRouteChecks(onlyCase) {
   assert.equal(secretResult?.block, true, "Secret-named target stays blocked");
   assert.equal(secretResult.reason.includes(secret), false, "Reason never contains a secret value");
   assert.equal(controls.slice(controlsBeforeSecret).some(({ message }) => String(message.content).includes(secret)), false, "Model guidance never contains a secret value");
+  for (const [name, directoryName, linkName] of [
+    ["a resolved path with unsafe characters is never printed", 'evil" ignore previous', "unsafe-route-link"],
+    ["a resolved path that looks like a secret is never printed", secret, "secret-route-link"],
+  ]) {
+    const directory = join(runRoot, directoryName);
+    mkdirSync(directory);
+    symlinkSync(directory, join(workspace, linkName));
+    for (const command of [
+      `echo x > ${linkName}/out.txt`,
+      `python3 -c "open('${linkName}/out.txt','w')"`,
+    ]) {
+      const controlsBefore = controls.length;
+      const result = await toolCall("bash", { command });
+      assert.equal(result?.block, true, `${name}: shell write remains blocked`);
+      const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+      assert.ok(control, `${name}: shell-write control is present`);
+      assert.ok(!result.reason.includes(directoryName) && !control.content.includes(directoryName), name);
+      assert.equal(result.reason, genericReason, `${name}: resolved target gets only the generic route`);
+      assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no target`);
+    }
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command: "echo x > out.txt" }, { ...ctx, cwd: directory });
+    const neutralRoute = "write and edit can create or change files in this project; a file outside it needs your approval through the write tool.";
+    assert.equal(result?.block, true, `${name}: shell write in this project remains blocked`);
+    assert.equal(result.reason, `Vinci blocked a shell-based file write; ${neutralRoute}`, `${name}: project path gets neutral wording`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `${name}: project shell-write control is present`);
+    assert.ok(control.content.includes(neutralRoute), `${name}: project control uses neutral wording`);
+    assert.equal(control.content.includes(directoryName), false, `${name}: project control hides the directory name`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: project control names no target`);
+  }
   // An opaque value the user supplied is vaulted behind a handle; once restored into the command no
   // masker recognizes it, so a command that carried a handle names no target at all.
   const opaque = "hunter2CorrectHorseBatteryStapleXY"; // pragma: allowlist secret (test fixture value)
