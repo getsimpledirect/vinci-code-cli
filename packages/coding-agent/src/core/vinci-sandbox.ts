@@ -150,7 +150,9 @@ function canonicalWritePath(path: string): string | undefined {
  */
 function protectedWritePaths(path: string): string[] {
 	const out = new Set<string>();
-	let pending = unresolvedAbsolute(path).split(sep).filter((part) => part !== "");
+	let pending = unresolvedAbsolute(path)
+		.split(sep)
+		.filter((part) => part !== "");
 	let current: string = sep;
 	let links = 0;
 	for (let step = 0; step < 4096 && pending.length > 0; step++) {
