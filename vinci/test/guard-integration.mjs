@@ -418,6 +418,7 @@ async function shellWriteRouteChecks(onlyCase) {
     ["NBSP inside a redirect target gets only the generic route", "echo x > report\u00a0final.txt"],
     ["interpreter target after builtin cd gets only the generic route", `builtin cd /tmp; python3 -c "open('x','w')"`],
     ["interpreter target after cd gets only the generic route", `cd /tmp && node -e "require('fs').writeFileSync('x','y')"`],
+    ["interpreter target inside a nested shell gets only the generic route", `bash -c "builtin cd /tmp; python3 -c \\"open('x','w')\\""`],
     ...["command", "sudo", "env", "/usr/bin/env"].map((wrapper) => [
       `interpreter target with ${wrapper} gets only the generic route`,
       `${wrapper} python3 -c "open('x','w')"`,
@@ -432,6 +433,17 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no target`);
   }
   rmSync(join(workspace, "x"));
+  // A project symlink into /dev or /proc resolves to a virtual path, which is never named.
+  symlinkSync("/dev", join(workspace, "device-link"));
+  for (const command of ["echo x > device-link/null"]) {
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `symlinked virtual path stays blocked: ${command}`);
+    assert.equal(result.reason, genericReason, `a symlinked virtual path gets only the generic route: ${command}`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.doesNotMatch(control?.content ?? "", /Target "|Use write with "/, `a symlinked virtual path is not named in the control: ${command}`);
+  }
+  rmSync(join(workspace, "device-link"));
   // Commands whose real destination is uncertain get the generic route, never a guessed path.
   for (const command of [
     "builtin cd /tmp; echo x > out.txt",

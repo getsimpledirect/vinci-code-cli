@@ -510,7 +510,8 @@ function shellWriteCommandBody(command: string): string | null {
   const segments = shellSegments(command);
   if (segments.length !== 1 || /[^\t\x20-\x7e]|[#`$]|<<|>&|&>|>\||\d>/.test(command)) return null;
   const executable = shellWords(segments[0]).find((word) => !/^[A-Za-z_]\w*=/.test(word))?.split("/").pop() ?? "";
-  if (/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs)$/.test(executable)) return null;
+  // A nested shell (`bash -c '...'`) hides its own cd and wrappers from this check.
+  if (/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs|bash|sh|zsh|dash|ksh|fish)$/.test(executable)) return null;
   return commandBody(segments[0]);
 }
 
@@ -1844,7 +1845,8 @@ export default function (pi: ExtensionAPI) {
           // the write tool can stand in for.
           if (!target || /^(?:\/dev\/|\/proc\/|=)/.test(target) || redactSecrets(target) !== target) return [];
           const abs = consumerWritePath(target, ctx.cwd);
-          if (abs === null || projectRoot === null || !isSafeTargetText(abs)) return [];
+          // A symlink can lead to a virtual path too, so the resolved path is checked again.
+          if (abs === null || projectRoot === null || !isSafeTargetText(abs) || /^\/(?:dev|proc)\//.test(abs)) return [];
           return [abs === projectRoot || abs.startsWith(projectRoot + sep)
             ? `Target "${abs}" is inside the project; use write with that path.`
             : `Use write with "${abs}"; write will ask for approval because this file is outside the project.`];
