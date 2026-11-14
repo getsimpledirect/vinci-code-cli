@@ -36,12 +36,9 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"overloaded",
 	"rate.?limit",
 	"too many requests",
-	"429",
-	"500",
-	"502",
-	"503",
-	"504",
-	"524",
+	// HTTP status codes only as standalone numbers: not inside a longer digit run, a word, an id
+	// or a decimal (a timestamp or request id that contains these digits is not a status, #177).
+	"(?<![\\w.])(?:429|500|502|503|504|524)(?![\\w]|\\.\\d)",
 	// Also matches "The service is temporarily unavailable" (#10965).
 	"service.?(?:is.?)?(?:temporarily.?)?unavailable",
 	"server.?error",
