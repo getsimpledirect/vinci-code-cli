@@ -480,7 +480,10 @@ async function shellWriteRouteChecks(onlyCase) {
   // nothing (and the guard must not fail on the unresolved path).
   symlinkSync(join(realpathSync(runRoot), "missing-dir", "nothing.txt"), join(workspace, "dangling-link"));
   {
-    const result = await toolCall("bash", { command: "echo x > dangling-link" });
+    let result;
+    let thrown;
+    try { result = await toolCall("bash", { command: "echo x > dangling-link" }); } catch (error) { thrown = error; }
+    assert.equal(thrown, undefined, "Dangling-symlink target: the guard does not fail on the unresolved path");
     assert.equal(result?.block, true, "Dangling-symlink write stays blocked");
     assert.equal(result.reason, genericReason, "Dangling-symlink target is not named");
   }
