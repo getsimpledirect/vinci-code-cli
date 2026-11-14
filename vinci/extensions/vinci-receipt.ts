@@ -597,6 +597,7 @@ export default function (pi: ExtensionAPI) {
       priorOperations,
       cwd: ctx.cwd,
       exhaustedRetryTries: event.exhaustedRetryTries,
+      retryCancelled: event.retryCancelled,
     });
     // [#199] An outcome may never claim "no changes" while the SESSION's own tree delta says
     // otherwise. The outcome is rebuilt per turn but the run persists only the LAST one: a
@@ -681,7 +682,7 @@ export default function (pi: ExtensionAPI) {
     // the exit code answers a script, so it takes whichever of local and remote is more
     // conservative: a remote pass can never report success on a run whose own check failed (#22
     // laundering, #127 exit contract), and a remote block still blocks a locally-clean run.
-    const localState = classifyVinciLocalTaskState(runMessages, outcome.changedFiles, getVinciVerificationState(), outcome.requiredOperations ?? [], event.exhaustedRetryTries).state;
+    const localState = classifyVinciLocalTaskState(runMessages, outcome.changedFiles, getVinciVerificationState(), outcome.requiredOperations ?? [], event.exhaustedRetryTries, event.retryCancelled).state;
     const blocks = (state: string) => state === "BLOCKED" || state === "WAITING";
     if (blocks(outcome.state) || blocks(localState)) {
       ctx.declareHeadlessExitHint?.(3);

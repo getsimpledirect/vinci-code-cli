@@ -194,6 +194,8 @@ type BuildOutcomeInput = {
   // Total tries, set by the session on agent_end only when the run ended on a retryable provider
   // error after its auto-retries ran out; the reason then says so plainly.
   exhaustedRetryTries?: number;
+  // Set by the session on the terminal agent_end when new input cancelled a pending auto-retry.
+  retryCancelled?: VinciRetryCancelled;
 };
 
 type TaskOutcomeStore = {
@@ -432,6 +434,10 @@ export function vinciFinalMessageAsksUser(text: string): boolean {
   );
 }
 
+/** Why a pending auto-retry was cancelled before it ran (see the session's agent_end). */
+export type VinciRetryCancelled = "new-input";
+const RETRY_CANCELLED_BY_NEW_INPUT = "The retry was cancelled because new input arrived during the retry wait.";
+
 export function classifyVinciLocalTaskState(
   messages: readonly unknown[],
   changedFiles: readonly string[],
@@ -439,6 +445,7 @@ export function classifyVinciLocalTaskState(
   requiredOperations = vinciRequiredOperations(messages),
   // Total tries when auto-retries ran out on a retryable error (see BuildOutcomeInput).
   exhaustedRetryTries?: number,
+  retryCancelled?: VinciRetryCancelled,
 ): { state: VinciTaskState; reason: string } {
   if (verification.variant === "terminal-unverifiable") {
     return { state: "BLOCKED", reason: verification.summary };
@@ -485,7 +492,15 @@ export function classifyVinciLocalTaskState(
         }). Type continue to resume.`.slice(0, 240),
       };
     }
-    return { state: "BLOCKED", reason: error ? userFacingFailure(error) : "The task stopped before completion." };
+    const failure = error ? userFacingFailure(error) : "The task stopped before completion.";
+    // New input superseded the pending retry: say so, rather than present the provider error alone.
+    if (retryCancelled === "new-input") {
+      return {
+        state: "BLOCKED",
+        reason: `${failure}${/[.!?]$/.test(failure) ? "" : "."} ${RETRY_CANCELLED_BY_NEW_INPUT}`.slice(0, 240),
+      };
+    }
+    return { state: "BLOCKED", reason: failure };
   }
   if (zeroCollection && !verification.requiredCommand) {
     return {
@@ -595,17 +610,18 @@ export function classifyVinciTaskState(
   verification: Readonly<VinciVerificationState>,
   requiredOperations = vinciRequiredOperations(messages),
   exhaustedRetryTries?: number,
+  retryCancelled?: VinciRetryCancelled,
 ): { state: VinciTaskState; reason: string } {
-  if (requiredOperations.length > 0) return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations, exhaustedRetryTries);
+  if (requiredOperations.length > 0) return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations, exhaustedRetryTries, retryCancelled);
   const remoteVerdict = currentRemoteVerdict(verification);
   if (remoteVerdict) return remoteVerdictOutcome(remoteVerdict);
-  return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations, exhaustedRetryTries);
+  return classifyVinciLocalTaskState(messages, changedFiles, verification, requiredOperations, exhaustedRetryTries, retryCancelled);
 }
 
 export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcome {
   const changedFiles = [...new Set(input.changedFiles)].sort();
   const requiredOperations = vinciRequiredOperations(input.messages, input.priorOperations, input.cwd, gitCheckpointDeclinedToolCallIds.get(input.taskId), shellWriteRedirectToolCallIds.get(input.taskId));
-  const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification, requiredOperations, input.exhaustedRetryTries);
+  const classified = classifyVinciTaskState(input.messages, changedFiles, input.verification, requiredOperations, input.exhaustedRetryTries, input.retryCancelled);
   // [#5/#6] A hard stop (the no-progress latch, or any harness refusal of a finalization step) is
   // a machine fact that outranks the narrative: the model's closing "done" — and even a remote
   // VERIFIED_PASS — cannot turn a frozen session into DONE or DONE_UNVERIFIED, and a closing

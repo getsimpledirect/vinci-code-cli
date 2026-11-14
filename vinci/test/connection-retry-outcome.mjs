@@ -106,7 +106,7 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, 
     .filter((entry) => entry.type === "custom" && entry.customType === "vinci-task-outcome")
     .map((entry) => entry.data);
   return {
-    session, runtime, faux, events, extensionEvents, extensionErrors, badges, outcomes,
+    session, runtime, faux, authStorage, events, extensionEvents, extensionErrors, badges, outcomes,
     retryEvents: () => events.filter((event) => event.type.startsWith("auto_retry_")),
     exitCode: () => printModeExitCode({ mode: mode === "json" ? "json" : "text", lastMessage: session.messages.at(-1), submitted: ["Complete the read-only task."], headlessExitHint: session.extensionRunner.getHeadlessExitHint() }).exitCode,
     close() { runtime.session.dispose(); faux.unregister(); },
@@ -1418,6 +1418,168 @@ const cases = {
         openGate();
         f.session.abortRetry();
         try { await assertWithin(Promise.all([completion, disposing]), 1_500, `${name}: cleanup did not finish`); } finally { f.close(); }
+      }
+    }
+  },
+  async B33(mode) {
+    const name = "B33 new input during backoff names the cancelled retry in the held request's receipt";
+    const expected = "Connection error. The retry was cancelled because new input arrived during the retry wait.";
+    for (const row of ["handled input", "failed validation", "prompt", "steer", "followUp"]) {
+      const f = await fixture(mode, {
+        baseDelayMs: 60_000,
+        configureExtension(pi) {
+          pi.on("input", (event) => (event.text.startsWith("handled:") ? { action: "handled" } : undefined));
+        },
+      });
+      let completion;
+      try {
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        f.faux.setResponses([connectionError(), fauxAssistantMessage("Request B is complete.")]);
+        completion = f.session.prompt("Complete request A.");
+        await assertWithin(started, 3_000, `${name}: A did not enter backoff`);
+        await delay(0);
+        assert.equal(f.session.isRetrying, true);
+        assert.equal(f.session.isStreaming, false);
+        if (row === "handled input") {
+          await f.session.prompt("handled: an extension consumes this input.", { source: "interactive" });
+        } else if (row === "failed validation") {
+          f.authStorage.removeRuntimeApiKey(f.faux.getModel().provider);
+          await assert.rejects(f.session.prompt("Complete request B.", { source: "interactive" }), /API key|auth/i, `${name}: B fails model/auth validation`);
+        } else if (row === "prompt") {
+          await f.session.prompt("Complete request B.", { source: "interactive" });
+        } else {
+          await f.session[row]("Complete request B.");
+        }
+        await assertWithin(completion, 2_000, `${name}: A did not finish after ${row}`);
+        const terminal = f.extensionEvents.filter((event) => event.type === "agent_end" && !event.willRetry);
+        const a = f.outcomes()[0];
+        console.log(`${name} ${mode} ${row}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state, reason }) => ({ state, reason })), retryCancelled: terminal.map((event) => event.retryCancelled ?? null), calls: f.faux.state.callCount })}`);
+        assert.equal(terminal[0]?.retryCancelled, "new-input", `${name}: ${row}: A's terminal agent_end says new input cancelled its retry`);
+        assert.equal(a?.state, "BLOCKED", `${name}: ${row}: A stays BLOCKED`);
+        assert.equal(a.reason, expected, `${name}: ${row}: A's receipt names why its retry ended`);
+        const sentB = row === "prompt" || row === "steer" || row === "followUp";
+        assert.equal(f.outcomes().length, sentB ? 2 : 1, `${name}: ${row}: one receipt per request`);
+        assert.equal(f.faux.state.callCount, sentB ? 2 : 1, `${name}: ${row}: A is never retried`);
+        if (sentB) {
+          assert.equal(f.outcomes()[1].state, "DONE", `${name}: ${row}: B's own receipt`);
+          assert.equal(terminal[1]?.retryCancelled, undefined, `${name}: ${row}: B's agent_end carries no cancellation`);
+        }
+        assert.deepEqual(f.extensionErrors, []);
+      } finally {
+        f.session.abortRetry();
+        await completion?.catch(() => {});
+        f.close();
+      }
+    }
+  },
+  async B34(mode) {
+    const name = "B34 a retry ended without new input leaves the receipt unchanged";
+    for (const row of ["abortRetry", "settleRetry", "exhausted", "recovered"]) {
+      const f = await fixture(mode, { baseDelayMs: row === "abortRetry" || row === "settleRetry" ? 60_000 : 1 });
+      let completion;
+      try {
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        f.faux.setResponses(row === "exhausted"
+          ? [connectionError(), connectionError(), connectionError()]
+          : [connectionError(), fauxAssistantMessage("Request A is complete.")]);
+        completion = f.session.prompt("Complete request A.");
+        if (row === "abortRetry" || row === "settleRetry") {
+          await assertWithin(started, 3_000, `${name}: A did not enter backoff`);
+          await delay(0);
+          if (row === "abortRetry") f.session.abortRetry();
+          else await f.session.settleRetry();
+        }
+        await assertWithin(completion, 3_000, `${name}: A did not finish (${row})`);
+        const terminal = f.extensionEvents.filter((event) => event.type === "agent_end" && !event.willRetry);
+        const a = f.outcomes()[0];
+        console.log(`${name} ${mode} ${row}: ${JSON.stringify({ outcome: a && { state: a.state, reason: a.reason }, keys: terminal.map((event) => Object.keys(event).sort()) })}`);
+        assert.equal(terminal.length, 1);
+        assert.equal(Object.hasOwn(terminal[0], "retryCancelled"), false, `${name}: ${row}: the field is absent`);
+        assert.equal(f.outcomes().length, 1);
+        if (row === "abortRetry" || row === "settleRetry") assert.deepEqual({ state: a.state, reason: a.reason }, { state: "BLOCKED", reason: "Connection error." }, `${name}: ${row}: the raw error, as before`);
+        if (row === "exhausted") assert.match(a.reason, /^Vinci could not reach the model after 3 tries \(Connection error\.\)\. Type continue to resume\.$/, `${name}: exhausted wording unchanged`);
+        if (row === "recovered") assert.equal(a.state, "DONE");
+      } finally {
+        f.session.abortRetry();
+        await completion?.catch(() => {});
+        f.close();
+      }
+    }
+  },
+  async B35(mode) {
+    const name = "B35 input queued while the retry streams does not settle the held request";
+    for (const row of ["prompt steer", "prompt followUp", "steer", "followUp"]) {
+      const f = await fixture(mode);
+      let completion;
+      let queued;
+      let streamingAtQueue;
+      let outcomesAtQueue;
+      try {
+        f.faux.setResponses([
+          connectionError(),
+          () => {
+            streamingAtQueue = f.session.isStreaming;
+            outcomesAtQueue = f.outcomes();
+            const text = "Also mention request A's follow-up.";
+            queued = row.startsWith("prompt ")
+              ? f.session.prompt(text, { source: "interactive", streamingBehavior: row.slice("prompt ".length) })
+              : f.session[row](text);
+            return fauxAssistantMessage("Request A is complete.");
+          },
+          fauxAssistantMessage("The follow-up is noted."),
+        ]);
+        completion = f.session.prompt("Complete request A.");
+        await assertWithin(completion, 3_000, `${name}: A did not finish (${row})`);
+        await queued;
+        const terminal = f.extensionEvents.filter((event) => event.type === "agent_end" && !event.willRetry);
+        console.log(`${name} ${mode} ${row}: ${JSON.stringify({ streamingAtQueue, outcomes: f.outcomes().map(({ state, reason }) => ({ state, reason })), terminal: terminal.map((event) => ({ held: event.heldRunMessages?.length ?? 0, retryCancelled: event.retryCancelled ?? null })), calls: f.faux.state.callCount })}`);
+        assert.equal(streamingAtQueue, true, `${name}: ${row}: queued while the retry run streams`);
+        assert.deepEqual(outcomesAtQueue, []);
+        assert.equal(terminal.length, 1, `${name}: ${row}: the retried request has exactly one terminal agent_end`);
+        assert.ok(terminal[0].heldRunMessages?.length > 0, `${name}: ${row}: the terminal agent_end is the retried run's, carrying the held run`);
+        assert.equal(terminal[0].retryCancelled, undefined, `${name}: ${row}: queued input does not cancel a running retry`);
+        assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE"], `${name}: ${row}: one DONE receipt`);
+        assert.equal(f.faux.state.callCount, 3);
+        assert.deepEqual(f.extensionErrors, []);
+      } finally {
+        f.session.abortRetry();
+        await completion?.catch(() => {});
+        f.close();
+      }
+    }
+  },
+  async B36(mode) {
+    const name = "B36 teardown called from the retried run's final delivery does not wait on that delivery";
+    for (const call of ["settleRetry", "runtime dispose"]) {
+      let elapsedMs;
+      const f = await fixture(mode, {
+        captureExtensionErrors: true,
+        async firstAgentEnd(event) {
+          if (event.willRetry) return;
+          const started = Date.now();
+          if (call === "settleRetry") await f.session.settleRetry();
+          else await f.runtime.dispose();
+          elapsedMs = Date.now() - started;
+        },
+      });
+      let completion;
+      try {
+        f.faux.setResponses([connectionError(), fauxAssistantMessage("Request A is complete.")]);
+        completion = f.session.prompt("Complete request A.");
+        // The teardown bound is 5 s; allow it to elapse so a self-wait is measured, not cut short.
+        await assertWithin(completion, 8_000, `${name}: ${call}: A did not finish`);
+        console.log(`${name} ${mode} ${call}: ${JSON.stringify({ elapsedMs, outcomes: f.outcomes().map(({ state }) => state), errors: f.extensionErrors.map(({ error }) => error) })}`);
+        assert.equal(typeof elapsedMs, "number", `${name}: ${call}: the handler ran`);
+        assert.ok(elapsedMs < 1_000, `${name}: ${call}: returned in ${elapsedMs} ms; a call from inside the delivery must not wait on it`);
+        assert.ok(f.extensionEvents.find((event) => event.type === "agent_end" && !event.willRetry)?.heldRunMessages?.length > 0, `${name}: the delivery is the retried run's`);
+      } finally {
+        f.session.abortRetry();
+        await completion?.catch(() => {});
+        f.close();
       }
     }
   },

@@ -57,6 +57,7 @@ import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
+	type AgentEndEvent,
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
@@ -628,7 +629,10 @@ export class AgentSession {
 	};
 
 	/** Emit the terminal agent_end for a run that was held for a retry that will not happen. */
-	private _releaseHeldAgentEnd(fallback: AgentMessage[]): Promise<void> | undefined {
+	private _releaseHeldAgentEnd(
+		fallback: AgentMessage[],
+		retryCancelled?: AgentEndEvent["retryCancelled"],
+	): Promise<void> | undefined {
 		const held = this._heldRetryAgentEndMessages;
 		if (!held) {
 			// A run started from inside the held delivery's handlers must not wait on that delivery.
@@ -659,6 +663,8 @@ export class AgentSession {
 					type: "agent_end",
 					messages: held.length > 0 ? held : fallback,
 					willRetry: false,
+					// [vinci] Say why the pending retry ended, so the receipt names it (#166).
+					...(retryCancelled ? { retryCancelled } : {}),
 				}),
 			);
 		} catch (error) {
@@ -1393,7 +1399,7 @@ export class AgentSession {
 			// Backoff is idle: settle the held run before input handlers see the new prompt, so its
 			// terminal outcome is classified with its own state (a handler may reset per-request state).
 			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-				await this._settleIdleHeldRetry();
+				await this._settleIdleHeldRetry("new-input");
 			}
 
 			// Emit input event for extension interception (before skill/template expansion)
@@ -1461,7 +1467,7 @@ export class AgentSession {
 
 			// Backoff is idle: a submitted prompt starts a separate request.
 			if (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease) {
-				await this._settleIdleHeldRetry();
+				await this._settleIdleHeldRetry("new-input");
 			}
 
 			// Check if we need to compact before sending (catches aborted responses).
@@ -1613,7 +1619,7 @@ export class AgentSession {
 		}
 
 		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-			await this._settleIdleHeldRetry();
+			await this._settleIdleHeldRetry("new-input");
 			await this.prompt(text, { images, streamingBehavior: "steer" });
 			return;
 		}
@@ -1639,7 +1645,7 @@ export class AgentSession {
 		}
 
 		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-			await this._settleIdleHeldRetry();
+			await this._settleIdleHeldRetry("new-input");
 			await this.prompt(text, { images, streamingBehavior: "followUp" });
 			return;
 		}
@@ -3015,7 +3021,8 @@ export class AgentSession {
 		);
 	}
 
-	private async _settleIdleHeldRetry(): Promise<void> {
+	/** [vinci] `retryCancelled` names why the held request ends; set only when new input supersedes it. */
+	private async _settleIdleHeldRetry(retryCancelled?: AgentEndEvent["retryCancelled"]): Promise<void> {
 		// A terminal handler must not wait on the delivery that is awaiting that handler. Only calls
 		// made from inside that delivery skip; any other caller waits for it (bounded where public).
 		const delivery = this._heldAgentEndDelivery;
@@ -3023,7 +3030,7 @@ export class AgentSession {
 		this._retryGeneration++;
 		this.abortRetry();
 		this._retryAttempt = 0;
-		await this._releaseHeldAgentEnd([]);
+		await this._releaseHeldAgentEnd([], retryCancelled);
 	}
 
 	/** Cancel backoff and allow bounded terminal delivery before reload or runtime teardown. */

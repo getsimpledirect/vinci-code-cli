@@ -739,6 +739,10 @@ export interface AgentEndEvent {
 	/** On the terminal agent_end after auto-retries: the messages of the earlier runs of this request
 	 *  that ended with willRetry. */
 	heldRunMessages?: AgentMessage[];
+	/** [vinci] On the terminal agent_end of a request whose pending auto-retry was cancelled: why.
+	 *  "new-input" means a prompt, steer or follow-up arrived during the retry wait and superseded it.
+	 *  Absent in every other case. */
+	retryCancelled?: "new-input";
 }
 
 /** Fired at the start of each turn */

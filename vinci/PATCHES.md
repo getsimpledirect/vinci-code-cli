@@ -42,9 +42,9 @@ only patch core when there's no hook.)
 | `coding-agent/src/cli/args.ts` | Hide provider/model/BYOK controls from Vinci help; reject malformed output modes before runtime startup; disclose fullscreen copy-on-select in Vinci help | 4,6,26 |
 | `coding-agent/src/cli/list-models.ts` | Restrict Vinci's non-interactive model listing to the managed provider | 4 |
 | `coding-agent/src/cli/startup-ui.ts` | Export `isOfficialDistribution` so the upstream test suite can be made fork-aware | — |
-| `coding-agent/src/core/agent-session.ts` | Small-window compaction `keepRecentTokens`; auto-continue after threshold compaction AND after a length-cut reply; turn-end verification gate (Phase 2); default active tools incl. grep/find/ls; mask malformed tool-argument diagnostics before events and persistence | 7,8,10,13 |
+| `coding-agent/src/core/agent-session.ts` | Small-window compaction `keepRecentTokens`; auto-continue after threshold compaction AND after a length-cut reply; turn-end verification gate (Phase 2); default active tools incl. grep/find/ls; mask malformed tool-argument diagnostics before events and persistence; name a retry cancelled by new input on the terminal `agent_end` (`retryCancelled`, #166) | 7,8,10,13 |
 | `coding-agent/src/core/extensions/runner.ts` | Default the extension overlay-focus query to false outside interactive UI | — |
-| `coding-agent/src/core/extensions/types.ts` | Expose an optional overlay-focus query to extensions | — |
+| `coding-agent/src/core/extensions/types.ts` | Expose an optional overlay-focus query to extensions; optional `AgentEndEvent.retryCancelled` (#166) | — |
 | `coding-agent/src/core/vinci-grader.ts` | Shared grader core (verification system): untracked-aware diff, skeptical prompt, verdict parse, completion-claim detector — one check for core + `vinci-review`/`vinci-todo` | 8 |
 | `coding-agent/src/core/auth-guidance.ts` | Warm managed sign-in copy; selected-provider credential guidance through `/other` | 4,9 |
 | `coding-agent/src/core/slash-commands.ts` | Register the Vinci-only `/other` command for autocomplete | 4 |
