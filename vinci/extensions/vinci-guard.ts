@@ -1923,15 +1923,15 @@ export default function (pi: ExtensionAPI) {
         // route alone. shellWriteTargets already yields "" for a non-plain command.
         const targets = carriesSecret ? [] : shellWriteTargets(cmd);
         const targetGuidance = targets.flatMap((target) => {
-          // Virtual paths (sockets, devices, process files) and zsh `=cmd` expansion are not files
+          // Virtual paths (sockets, devices, process and kernel files) and zsh `=cmd` expansion are not files
           // the write tool can stand in for.
-          if (!target || /^(?:\/dev\/|\/proc\/|=)/i.test(target) || redactSecrets(target) !== target) return [];
+          if (!target || /^(?:\/dev\/|\/proc\/|\/sys\/|=)/i.test(target) || redactSecrets(target) !== target) return [];
           // The kernel resolves `..` physically (through symlinks), path resolution here lexically, so
           // a target with a `..` component is never named; nor is one that names a directory.
           if (target.split("/").includes("..") || /(?:^|\/)\.?$/.test(target)) return [];
           const abs = consumerWritePath(target, ctx.cwd);
           // A symlink can lead to a virtual path too, so the resolved path is checked again.
-          if (abs === null || projectRoot === null || !isSafeTargetText(abs) || /^\/(?:dev|proc)(?:\/|$)/i.test(abs)) return [];
+          if (abs === null || projectRoot === null || !isSafeTargetText(abs) || /^\/(?:dev|proc|sys)(?:\/|$)/i.test(abs)) return [];
           // Only a regular file, or a missing one (the usual case: the write creates it), is named. A
           // directory, FIFO, socket or device is not something the write tool can stand in for.
           try {
