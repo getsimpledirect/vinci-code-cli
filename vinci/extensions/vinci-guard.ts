@@ -669,7 +669,8 @@ function certainInlineWriteTarget(payload: string, kind: InterpreterKind): strin
     node: String.raw`require\s*\(\s*(${literal})\s*\)\s*\.\s*(?:writeFileSync|appendFileSync)\s*\(\s*(${literal})\s*,\s*(${literal})\s*\)`,
     python: String.raw`open\s*\(\s*(${literal})\s*,\s*(?:mode\s*=\s*)?(${literal})\s*\)(?:\s*\.\s*write\s*\(\s*(${literal})\s*\))?(?:\s*\.\s*close\s*\(\s*\))?`,
     ruby: String.raw`File\s*\.\s*(?:write|binwrite)\s*\(\s*(${literal})\s*,\s*(${literal})\s*\)`,
-    perl: String.raw`open\s*\(\s*(?:[A-Za-z_]\w*|my\s+\$[A-Za-z_]\w*)\s*,\s*(${literal})(?:\s*,\s*(${literal}))?\s*\)`,
+    // Three-argument form only: a two-argument open trims and parses its filename.
+    perl: String.raw`open\s*\(\s*(?:[A-Za-z_]\w*|my\s+\$[A-Za-z_]\w*)\s*,\s*(${literal})\s*,\s*(${literal})\s*\)`,
   };
   const match = new RegExp(String.raw`^${expressions[kind]}\s*;?$`).exec(payload.trim());
   if (match === null) return null;
@@ -684,7 +685,7 @@ function certainInlineWriteTarget(payload: string, kind: InterpreterKind): strin
   if (kind === "node") return values[0] === "fs" ? values[1] : null;
   if (kind === "python") return WRITABLE_MODE.test(values[1]) ? values[0] : null;
   if (kind === "ruby") return values[0];
-  return /^[>+]/.test(values[0]) ? values[1] ?? values[0].replace(/^[>+\s]+/, "") : null;
+  return /^(?:>|>>|\+>|\+<|\+>>)$/.test(values[0]) ? values[1] : null;
 }
 
 /** The inline payload of an interpreter one-liner segment — the word after -c (python) or
@@ -1861,7 +1862,8 @@ export default function (pi: ExtensionAPI) {
         // Name targets only when the command text is certain and secret-free: a command that had
         // secret handles restored holds values no masker can recognize, and expansions or command
         // substitution (also inside interpreter code) make the real destination unknown.
-        const certainText = !carriesRestoredSecrets && shellWriteCommandBody(cmd) !== null;
+        // A command with any secret-looking text names nothing: a target may repeat that value.
+        const certainText = !carriesRestoredSecrets && redactSecrets(cmd) === cmd && shellWriteCommandBody(cmd) !== null;
         // Environment assignments can preload code before the inline expression runs.
         const inline = certainText && !/^[A-Za-z_]\w*=/.test(shellWords(cmd)[0] ?? "")
           ? interpreterInlinePayload(cmd, cmd)

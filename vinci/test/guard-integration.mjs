@@ -424,7 +424,7 @@ async function shellWriteRouteChecks(onlyCase) {
     ["python literal write and close", `python3 -c "open('x','w').write('y').close()"`],
     ["python close with a trailing semicolon", `python3 -c " open('x','w').close(); "`],
     ["ruby binary write with a trailing semicolon", `ruby -e ' File.binwrite("x","y"); '`],
-    ["perl two-argument open", `perl -e 'open(F,">x")'`],
+    ["perl three-argument append open", `perl -e 'open(G,">>","x")'`],
   ]) {
     const controlsBefore = controls.length;
     const result = await toolCall("bash", { command });
@@ -450,6 +450,9 @@ async function shellWriteRouteChecks(onlyCase) {
     ["node comment gets only the generic route", `node -e "require('fs').writeFileSync('x','y') /* extra */"`],
     ["ruby extra argument gets only the generic route", `ruby -e 'File.write("x","y",0)'`],
     ["perl interpolated mode gets only the generic route", `perl -e 'open(F,">@mode","x")'`],
+    ["perl two-argument open gets only the generic route", `perl -e 'open(F,">x")'`],
+    ["perl two-argument open with a trailing space gets only the generic route", `perl -e 'open(F,">/tmp/out ")'`],
+    ["perl mode with a layer gets only the generic route", `perl -e 'open(F,">:raw","x")'`],
     ["ruby interpolated content gets only the generic route", `ruby -e 'File.write("x","@content")'`],
     // These already received generic wording and remain regression controls.
     ["python chdir gets only the generic route", `python3 -c "import os; os.chdir('/tmp'); open('x','w')"`],
@@ -536,6 +539,18 @@ async function shellWriteRouteChecks(onlyCase) {
   assert.equal(secretResult?.block, true, "Secret-named target stays blocked");
   assert.equal(secretResult.reason.includes(secret), false, "Reason never contains a secret value");
   assert.equal(controls.slice(controlsBeforeSecret).some(({ message }) => String(message.content).includes(secret)), false, "Model guidance never contains a secret value");
+  // A secret elsewhere in the command can repeat inside a target that does not itself look secret.
+  for (const command of [
+    `node -e "require('fs').writeFileSync('/tmp/hunter2xyz','password=hunter2xyz')"`,
+    `echo password=hunter2xyz > /tmp/hunter2xyz`,
+  ]) {
+    assert.notEqual(guard.redactSecrets(command), command, `fixture command carries a recognized secret: ${command}`);
+    const before = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `secret-carrying write stays blocked: ${command}`);
+    assert.equal(result.reason.includes("hunter2xyz"), false, `a secret repeated in a target is not named: ${command}`);
+    assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, `guidance never repeats a secret from the command: ${command}`);
+  }
   for (const [name, directoryName, linkName] of [
     ["a resolved path with unsafe characters is never printed", 'evil" ignore previous', "unsafe-route-link"],
     ["a resolved path that looks like a secret is never printed", secret, "secret-route-link"],
