@@ -1642,6 +1642,14 @@ const cases = {
       console.log(`${name} ${mode}: ${JSON.stringify({ firstMs, secondMs })}`);
       assert.ok(firstMs >= 4_500, `${name}: the first teardown waits the bound (${firstMs} ms)`);
       assert.ok(secondMs < 1_000, `${name}: the second teardown returned in ${secondMs} ms; the stalled delivery is already detached`);
+      // Documented limit (as B14): once detached, disposal does not wait for it, so a handler that resumes
+      // after disposal finds an invalidated context and its receipt is not recorded.
+      assert.equal(f.session.dispose(), undefined);
+      openGate();
+      await assertWithin(completion, 2_000, `${name}: A did not finish after disposal`);
+      await delay(20);
+      console.log(`${name} ${mode} after dispose: ${JSON.stringify({ outcomes: f.outcomes().length, errors: f.extensionErrors.length })}`);
+      assert.deepEqual(f.outcomes(), [], `${name}: a handler resuming after disposal of a detached delivery records no receipt (documented limit)`);
     } finally {
       openGate();
       f.session.abortRetry();
