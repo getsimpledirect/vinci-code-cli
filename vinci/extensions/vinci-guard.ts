@@ -184,6 +184,12 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
       current += ch;
       continue;
     }
+    // Write detection skips an unquoted comment (`#` starting a word) up to the end of its line;
+    // a `\` inside a comment does not continue it.
+    if (keepWriteRedirects && ch === "#" && (current === "" || /\s$/.test(current))) {
+      while (i + 1 < command.length && command[i + 1] !== "\n") i++;
+      continue;
+    }
     if (ch === "\\" && i + 1 < command.length) {
       // Write detection joins a line continuation (`\<newline>`) the way the shell does; a `\\`
       // pair is consumed here first, so an escaped backslash before a newline still ends the line.
@@ -509,7 +515,9 @@ const COMMAND_PREFIX = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*')
 const FILE_REDIRECT = /(?<![0-9&>])>>?(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 // The clobber form `>|` (also `2>|`) and stdout+stderr `&>`/`&>>`, matched as whole operators so
 // `>| /dev/null` and `&>> /dev/null` stay allowed like `> /dev/null`; `&>&2` duplicates, not writes.
-const CLOBBER_OR_BOTH_REDIRECT = /(?:>\||(?<=(?:^|[^\\])(?:\\\\)*)&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
+// It runs on text whose escaped characters are masked (see clobberOrBothRedirectWrite), so `\&>` is
+// a literal `&` and `\\&>` a real `&>`, without a lookbehind.
+const CLOBBER_OR_BOTH_REDIRECT = /(?:>\||&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 
 function commandBody(segment: string): string {
   return segment.replace(COMMAND_PREFIX, "").trim();
@@ -538,7 +546,8 @@ function clobberOrBothRedirectWrite(command: string): boolean {
   return shellSegments(command, true).some((segment) => {
     const body = commandBody(segment);
     if (!/^(?:echo|printf|tee)\b/i.test(body) && !/^cat\b[^\n]*<<-?\s*\S+/i.test(body)) return false;
-    return CLOBBER_OR_BOTH_REDIRECT.test(body);
+    // Mask each escaped character (left to right, so `\\` pairs first) in one linear pass.
+    return CLOBBER_OR_BOTH_REDIRECT.test(body.replace(/\\[\s\S]/g, "__"));
   });
 }
 
