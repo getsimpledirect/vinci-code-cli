@@ -1094,7 +1094,11 @@ try {
       symlinkSync(join(physicalRoot, "outside", "startup-real"), join(realProject, "startup-ro", "hop"));
       symlinkSync(`${realProject}/startup-ro/hop`, join(fakeHome, ".bash_logout"));
       chmodSync(join(realProject, "startup-ro"), 0o555);
-      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-ro", "hop")), "a link in a read-only directory this user owns is protected");
+      // Root (and any user the mode does not deny) can write it anyway: the row only means something when writing is denied.
+      let readOnlyDenied = false;
+      try { fs.accessSync(join(realProject, "startup-ro"), fs.constants.W_OK); } catch (error) { readOnlyDenied = error?.code === "EACCES"; }
+      if (readOnlyDenied) assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-ro", "hop")), "a link in a read-only directory this user owns is protected");
+      else console.log("guard-integration: SKIP owned read-only directory rows (mode 0555 does not deny this user, e.g. root)");
       // Negative control: a chain through a link this user neither can write nor owns (macOS /etc in root-owned /)
       // protects the destination, not that link.
       symlinkSync("/etc/hosts", join(fakeHome, ".bashrc"));
@@ -1102,6 +1106,27 @@ try {
         const throughSystem = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
         assert.ok(throughSystem.includes(realpathSync.native("/etc/hosts")), "precondition: a chain through a system link is walked to its destination");
         assert.ok(!throughSystem.includes("/etc"), "a system link this user does not own is not protected");
+        // Fail closed: when ownership cannot be established, the link is protected.
+        const getuid = process.getuid;
+        try {
+          process.getuid = undefined;
+          assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes("/etc"), "without a user id, a chain link is protected (fail closed)");
+        } finally {
+          process.getuid = getuid;
+        }
+        const statSync = fs.statSync;
+        try {
+          fs.statSync = (path, ...rest) => {
+            if (path === "/") throw Object.assign(new Error("EIO: stubbed stat failure"), { code: "EIO" });
+            return statSync(path, ...rest);
+          };
+          syncBuiltinESMExports();
+          assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes("/etc"), "when the link's directory cannot be read, the link is protected (fail closed)");
+        } finally {
+          fs.statSync = statSync;
+          syncBuiltinESMExports();
+        }
+        assert.ok(!toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes("/etc"), "the stubs are restored");
       }
       // Bubblewrap binds follow links: chain links stay out of its read-only binds, their destinations stay in.
       {
@@ -1168,8 +1193,8 @@ try {
           sandboxed(`ln -sfn ${realProject}/startup-evil startup-hop`);
           assert.equal(readlinkSync(join(realProject, "startup-hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot replace an intermediate link");
           sandboxed(`chmod u+w startup-ro && ln -sfn ${realProject}/startup-evil startup-ro/hop`);
-          assert.equal(readlinkSync(join(realProject, "startup-ro", "hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot make a read-only directory writable and replace the chain link in it");
-          assert.ok((fs.statSync(join(realProject, "startup-ro")).mode & 0o200) !== 0, "precondition: the sandboxed chmod of the read-only directory ran");
+          if (readOnlyDenied) assert.equal(readlinkSync(join(realProject, "startup-ro", "hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot make a read-only directory writable and replace the chain link in it");
+          if (readOnlyDenied) assert.ok((fs.statSync(join(realProject, "startup-ro")).mode & 0o200) !== 0, "precondition: the sandboxed chmod of the read-only directory ran");
         } finally {
           if (previousCode === undefined) delete process.env.VINCI_CODE;
           else process.env.VINCI_CODE = previousCode;
