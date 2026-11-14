@@ -356,6 +356,19 @@ async function shellWriteWrapperChecks() {
     "env -i FOO=1 bash -c 'echo x > out.txt'",
     // A valued long option whose value would otherwise read as the command word.
     "xargs --arg-file list.txt echo x > out.txt",
+    // Each wrapper before a nested shell, every listed shell (also by path and after a flag), in-place
+    // editors and a heredoc behind a wrapper.
+    "exec bash -c 'echo x > out.txt'",
+    "nohup bash -c 'echo x > out.txt'",
+    "time bash -c 'echo x > out.txt'",
+    "command bash -c 'echo x > out.txt'",
+    "xargs bash -c 'echo x > out.txt'",
+    "ksh -c 'echo x > out.txt'",
+    "fish -c 'echo x > out.txt'",
+    "/bin/bash --norc -c 'echo x > out.txt'",
+    "exec sed -i s/a/b/ out.txt",
+    "env perl -pi -e s/a/b/ out.txt",
+    "exec cat <<EOF > out.txt\nx\nEOF",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
