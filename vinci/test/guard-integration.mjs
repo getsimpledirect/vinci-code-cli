@@ -3,7 +3,7 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -1095,6 +1095,14 @@ try {
       symlinkSync(`${realProject}/startup-ro/hop`, join(fakeHome, ".bash_logout"));
       chmodSync(join(realProject, "startup-ro"), 0o555);
       assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-ro", "hop")), "a link in a read-only directory this user owns is protected");
+      // Negative control: a chain through a link this user neither can write nor owns (macOS /etc in root-owned /)
+      // protects the destination, not that link.
+      symlinkSync("/etc/hosts", join(fakeHome, ".bashrc"));
+      if (process.platform === "darwin" && process.getuid?.() !== 0 && lstatSync("/etc").isSymbolicLink()) {
+        const throughSystem = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
+        assert.ok(throughSystem.includes(realpathSync.native("/etc/hosts")), "precondition: a chain through a system link is walked to its destination");
+        assert.ok(!throughSystem.includes("/etc"), "a system link this user does not own is not protected");
+      }
       // Bubblewrap binds follow links: chain links stay out of its read-only binds, their destinations stay in.
       {
         const sandboxCore = await loader.import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"), { default: false });
