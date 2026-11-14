@@ -106,6 +106,9 @@ describe("provider retry classification", () => {
 		"Bad request after 0.429 s",
 		"Invalid schema: value 502.7 is out of range",
 		"Invalid request: field limit is 5000",
+		"Invalid trace id 8fa503c",
+		"Unknown deployment ab503 in region",
+		"Unknown deployment 503ab in region",
 	])("does not treat a status-code digit run inside other text as retryable: %s", (errorMessage) => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
 	});
@@ -122,6 +125,11 @@ describe("provider retry classification", () => {
 		"status=502",
 		"524 status code (no body)",
 		"(503)",
+		"HTTP 500",
+		"HTTP_503",
+		"error_503",
+		"ERR_502: upstream",
+		"provider status 429_too_many",
 	])("treats a standalone status code as retryable: %s", (errorMessage) => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
 	});
