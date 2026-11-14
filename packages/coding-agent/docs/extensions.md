@@ -556,7 +556,7 @@ pi.on("agent_start", async (_event, ctx) => {});
 pi.on("agent_end", async (event, ctx) => {
   // event.messages - messages from this prompt
   // event.retryCancelled - "new-input" when a pending auto-retry was cancelled because a prompt,
-  //   steer or follow-up arrived during the retry wait; absent otherwise
+  //   extension command, steer or follow-up arrived during the retry wait; absent otherwise
 });
 ```
 

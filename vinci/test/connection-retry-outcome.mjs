@@ -1424,11 +1424,12 @@ const cases = {
   async B33(mode) {
     const name = "B33 new input during backoff names the cancelled retry in the held request's receipt";
     const expected = "Connection error. The retry was cancelled because new input arrived during the retry wait.";
-    for (const row of ["handled input", "failed validation", "prompt", "steer", "followUp"]) {
+    for (const row of ["handled input", "failed validation", "extension command", "prompt", "steer", "followUp"]) {
       const f = await fixture(mode, {
         baseDelayMs: 60_000,
         configureExtension(pi) {
           pi.on("input", (event) => (event.text.startsWith("handled:") ? { action: "handled" } : undefined));
+          pi.registerCommand("retry-outcome-typed", { handler: async () => {} });
         },
       });
       let completion;
@@ -1444,6 +1445,8 @@ const cases = {
         assert.equal(f.session.isStreaming, false);
         if (row === "handled input") {
           await f.session.prompt("handled: an extension consumes this input.", { source: "interactive" });
+        } else if (row === "extension command") {
+          await f.session.prompt("/retry-outcome-typed", { source: "interactive" });
         } else if (row === "failed validation") {
           f.authStorage.removeRuntimeApiKey(f.faux.getModel().provider);
           await assert.rejects(f.session.prompt("Complete request B.", { source: "interactive" }), /API key|auth/i, `${name}: B fails model/auth validation`);

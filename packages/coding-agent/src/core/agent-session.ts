@@ -1466,6 +1466,7 @@ export class AgentSession {
 			}
 
 			// Backoff is idle: a submitted prompt starts a separate request.
+			// Usually a no-op after the settle before emitInput; it covers a held retry that an input handler started.
 			if (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease) {
 				await this._settleIdleHeldRetry("new-input");
 			}
@@ -1553,7 +1554,7 @@ export class AgentSession {
 		if (!command) return false;
 
 		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-			await this._settleIdleHeldRetry();
+			await this._settleIdleHeldRetry("new-input");
 		}
 
 		// Get command context from extension runner (includes session control methods)
