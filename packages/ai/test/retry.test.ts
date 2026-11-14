@@ -96,6 +96,44 @@ describe("provider retry classification", () => {
 		).toBe(true);
 	});
 
+	it.each([
+		"No API provider registered for api: faux:1731562502123:x7k2",
+		"No API provider registered for api: faux:1731564290000:abc",
+		"Model not found: request id req_5031af",
+		"Invalid tool arguments in call call_42900",
+		"Unknown model gpt-5240",
+		"Context too long: 15029 tokens over the limit",
+		"Bad request after 0.429 s",
+		"Invalid schema: value 502.7 is out of range",
+		"Invalid request: field limit is 5000",
+		"Invalid trace id 8fa503c",
+		"Unknown deployment ab503 in region",
+		"Unknown deployment 503ab in region",
+	])("does not treat a status-code digit run inside other text as retryable: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+
+	it.each([
+		"429",
+		"HTTP 429",
+		"status 429: slow down",
+		"Error: 500 Internal Server Error",
+		"502 Bad Gateway",
+		"HTTP/1.1 503",
+		"upstream returned 503.",
+		'{"status":504}',
+		"status=502",
+		"524 status code (no body)",
+		"(503)",
+		"HTTP 500",
+		"HTTP_503",
+		"error_503",
+		"ERR_502: upstream",
+		"provider status 429_too_many",
+	])("treats a standalone status code as retryable: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
 	it("classifies assistant error messages", () => {
 		expect(
 			isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })),
