@@ -3,7 +3,7 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -511,6 +511,27 @@ try {
     execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", physicalLocal], { cwd: spelledCwd, timeout: 5000, env: localShellEnv });
     assert.equal(readFileSync(join(deep, "p", "physical-local"), "utf8"), "inside", "physical local: real effect missing");
     check("a cwd spelled through link/.. is the physical project for roots and targets", true);
+    // The roots handed to the OS sandbox and the sandbox's own grant check are physical too.
+    const physicalDeep = realpathSync.native(deep);
+    const writableRoots = toolDefinitions.vinciWritableRoots(spelledCwd);
+    assert.ok(writableRoots.includes(join(physicalDeep, "p")), "the OS sandbox roots include the physical project");
+    assert.ok(!writableRoots.includes(join(realpathSync.native(physicalRoot), "a", "p")), "the OS sandbox roots exclude the cwd's lexical spelling");
+    assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/not-yet/../granted`), false, "the sandbox refuses a .. after a missing component");
+    assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/granted`), true, "the sandbox grants a plain in-project path");
+    // A protected startup file that is a dangling link is protected at its PHYSICAL future destination.
+    const fakeHome = join(physicalRoot, "home");
+    mkdirSync(fakeHome);
+    symlinkSync(`${join(physicalRoot, "a", "link")}/../startup-target`, join(fakeHome, ".zshenv"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      const protectedWrites = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
+      assert.ok(protectedWrites.includes(join(physicalDeep, "startup-target")), "a dangling protected link is protected at its physical destination");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+    check("sandbox roots, grants and protected link destinations are physical", true);
   }
   assert.ok(guard.segmentDestructiveDelivery("xargs env --unknown-wrapper-option rm"), "an unknown wrapper option must fail closed");
   assert.ok((await toolCall("bash", { command: "find -- ~ -name '*.log' -delete" }))?.block);
@@ -1633,6 +1654,21 @@ try {
     "a project-relative write remains allowed when cwd is under VINCI_HOME",
     storeRelativeWrite === undefined && gates().length === 0,
   );
+
+  // The same project reached through a differently cased store spelling is still under the store.
+  const casedStoreProjectCwd = join(dirname(vinciHome), basename(vinciHome).toUpperCase(), "projects", "active-project");
+  if (existsSync(casedStoreProjectCwd)) {
+    control.clearVinciConfirmationGate();
+    let casedRelativeWrite;
+    for (const handler of handlers.tool_call ?? []) {
+      casedRelativeWrite = await handler(
+        { toolName: "write", input: { path: "index.html", content: "<h1>active</h1>\n" } },
+        { cwd: casedStoreProjectCwd, hasUI: false },
+      );
+      if (casedRelativeWrite !== undefined) break;
+    }
+    check("a project-relative write stays allowed when the cwd spells the store in another case", casedRelativeWrite === undefined && gates().length === 0);
+  }
 
   // Binds the cwdIsUnderStore guard itself: when the PROJECT lives under VINCI_HOME, a write to a
   // store path OUTSIDE that project must take the normal out-of-project gate (a real approvable

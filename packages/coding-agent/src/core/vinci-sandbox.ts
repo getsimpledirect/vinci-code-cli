@@ -122,7 +122,13 @@ function canonicalWritePath(path: string, protectedPath = false, links = 0): str
 					// Grants reject dangling links. Protection must also cover their future physical
 					// destination, otherwise creating that destination would lose the default deny.
 					if (!protectedPath || links >= 32) return undefined;
-					const target = canonicalWritePath(resolve(dirname(candidate), readlinkSync(candidate)), true, links + 1);
+					// Keep the raw destination: a `..` in it must be resolved physically, after its links.
+					const destination = readlinkSync(candidate);
+					const target = canonicalWritePath(
+						isAbsolute(destination) ? destination : `${dirname(candidate)}${sep}${destination}`,
+						true,
+						links + 1,
+					);
 					return target ? resolve(target, ...missing.reverse()) : undefined;
 				}
 			} catch {
