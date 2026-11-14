@@ -415,11 +415,35 @@ async function shellWriteRouteChecks(onlyCase) {
   writeFileSync(interpreterTarget, "existing\n");
   symlinkSync(interpreterTarget, join(workspace, "x"));
   for (const [name, command] of [
+    ["ruby without preceding options", `ruby -e 'File.write("x","y")'`],
+    ["perl without preceding options", `perl -e 'open(F,">","x")'`],
+    ["node without preceding options", `node -e "require('fs').writeFileSync('x','y')"`],
+    ["python without preceding options", `python3 -c "open('x','w')"`],
+  ]) {
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `${name}: interpreter write remains blocked`);
+    assert.ok(result.reason.includes(`Use write with "${realpathSync(interpreterTarget)}"`), `${name}: reason names the certain target`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `${name}: shell-write control is present`);
+    assert.ok(control.content.includes(`Use write with "${realpathSync(interpreterTarget)}"`), `${name}: control names the certain target`);
+  }
+  for (const [name, command] of [
+    ["ruby -Cdir target gets only the generic route", `ruby -C/tmp -e 'File.write("x","y")'`],
+    ["ruby -C dir after code gets only the generic route", `ruby -e 'File.write("x","y")' -C /tmp`],
+    ["ruby -Cdir after code gets only the generic route", `ruby -e 'File.write("x","y")' -C/tmp`],
+    ["ruby option before code gets only the generic route", `ruby -w -e 'File.write("x","y")'`],
+    ["perl option before code gets only the generic route", `perl -w -e 'open(F,">","x")'`],
+    ["perl Unicode option before code gets only the generic route", `perl -C -e 'open(F,">","x")'`],
+    ["node option before code gets only the generic route", `node --no-warnings -e "require('fs').writeFileSync('x','y')"`],
+    ["python option before code gets only the generic route", `python3 -S -c "open('x','w')"`],
     ["NBSP inside a redirect target gets only the generic route", "echo x > report\u00a0final.txt"],
     ["interpreter target after builtin cd gets only the generic route", `builtin cd /tmp; python3 -c "open('x','w')"`],
-    ["interpreter target after cd gets only the generic route", `cd /tmp && node -e "require('fs').writeFileSync('x','y')"`],
+    ["regression: interpreter target after cd gets only the generic route", `cd /tmp && node -e "require('fs').writeFileSync('x','y')"`],
+    // No cwd change obscures the parsed target; naming still requires the shared single-command gate.
+    ["multiple-segment interpreter target uses the shared certainty gate", `printf ready; node -e "require('fs').writeFileSync('x','y')"`],
     ["interpreter target inside a nested shell gets only the generic route", `bash -c "builtin cd /tmp; python3 -c \\"open('x','w')\\""`],
-    ...["command", "sudo", "env", "/usr/bin/env"].map((wrapper) => [
+    ...["command", "sudo", "env", "/usr/bin/env", "env -C /tmp", "env -C/tmp", "env --chdir /tmp", "env --chdir=/tmp", "/usr/bin/env -C /tmp", "/usr/bin/env --chdir=/tmp"].map((wrapper) => [
       `interpreter target with ${wrapper} gets only the generic route`,
       `${wrapper} python3 -c "open('x','w')"`,
     ]),
@@ -435,13 +459,14 @@ async function shellWriteRouteChecks(onlyCase) {
   rmSync(join(workspace, "x"));
   // A project symlink into /dev or /proc resolves to a virtual path, which is never named.
   symlinkSync("/dev", join(workspace, "device-link"));
-  for (const command of ["echo x > device-link/null"]) {
+  for (const command of ["echo x > device-link", "echo x > device-link/null"]) {
     const controlsBefore = controls.length;
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `symlinked virtual path stays blocked: ${command}`);
     assert.equal(result.reason, genericReason, `a symlinked virtual path gets only the generic route: ${command}`);
     const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
-    assert.doesNotMatch(control?.content ?? "", /Target "|Use write with "/, `a symlinked virtual path is not named in the control: ${command}`);
+    assert.ok(control, `symlinked virtual path has a shell-write control: ${command}`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `a symlinked virtual path is not named in the control: ${command}`);
   }
   rmSync(join(workspace, "device-link"));
   // Commands whose real destination is uncertain get the generic route, never a guessed path.

@@ -512,6 +512,9 @@ function shellWriteCommandBody(command: string): string | null {
   const executable = shellWords(segments[0]).find((word) => !/^[A-Za-z_]\w*=/.test(word))?.split("/").pop() ?? "";
   // A nested shell (`bash -c '...'`) hides its own cd and wrappers from this check.
   if (/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs|bash|sh|zsh|dash|ksh|fish)$/.test(executable)) return null;
+  // Interpreter options can change cwd or load code; only a bare code flag and payload are certain.
+  const inline = interpreterInlinePayload(segments[0], command);
+  if (inline !== null && !inline.certainArguments) return null;
   return commandBody(segments[0]);
 }
 
@@ -664,7 +667,7 @@ function inlineWriteTargets(payload: string, kind: InterpreterKind): string[] {
 function interpreterInlinePayload(
   segment: string,
   command: string,
-): { kind: InterpreterKind; payload: string } | null {
+): { kind: InterpreterKind; payload: string; certainArguments: boolean } | null {
   const body = commandBody(segment);
   const words = unwrapExecutableWords(shellWords(body));
   if (words === null) return null;
@@ -686,10 +689,10 @@ function interpreterInlinePayload(
     if (word === "--") break;
     const flag = kind === "python" ? /^-c(.*)$/ : kind === "node" ? /^(?:-e|--eval=|-p|--print=)(.*)$/ : /^-e(.*)$/;
     if ((kind !== "python" && (word === "--eval" || kind === "node" && word === "--print")) || word === "-e" || word === "-c" || kind === "node" && word === "-p") {
-      if (words[index + 1] !== undefined) return { kind, payload: words[index + 1] };
+      if (words[index + 1] !== undefined) return { kind, payload: words[index + 1], certainArguments: index === 1 && words.length === 3 };
     } else {
       const attached = flag.exec(word);
-      if (attached?.[1]) return { kind, payload: attached[1] };
+      if (attached?.[1]) return { kind, payload: attached[1], certainArguments: index === 1 && words.length === 2 };
     }
     const valued = kind === "python" ? /^-[WX]$/ : kind === "node" ? /^(?:-r|--require|--import|--input-type)$/ : /^(?:-r|-I|-F)$/;
     if (valued.test(word)) index++;
@@ -708,7 +711,7 @@ function interpreterInlinePayload(
         if (line.trim() === (marker[1] ?? marker[2] ?? marker[3])) break;
         script.push(line);
       }
-      return { kind, payload: script.join("\n") };
+      return { kind, payload: script.join("\n"), certainArguments: false };
     }
   }
   return null;
@@ -1846,7 +1849,7 @@ export default function (pi: ExtensionAPI) {
           if (!target || /^(?:\/dev\/|\/proc\/|=)/.test(target) || redactSecrets(target) !== target) return [];
           const abs = consumerWritePath(target, ctx.cwd);
           // A symlink can lead to a virtual path too, so the resolved path is checked again.
-          if (abs === null || projectRoot === null || !isSafeTargetText(abs) || /^\/(?:dev|proc)\//.test(abs)) return [];
+          if (abs === null || projectRoot === null || !isSafeTargetText(abs) || /^\/(?:dev|proc)(?:\/|$)/.test(abs)) return [];
           return [abs === projectRoot || abs.startsWith(projectRoot + sep)
             ? `Target "${abs}" is inside the project; use write with that path.`
             : `Use write with "${abs}"; write will ask for approval because this file is outside the project.`];
