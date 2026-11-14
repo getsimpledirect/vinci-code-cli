@@ -918,6 +918,73 @@ const cases = {
       try { await assertWithin(Promise.resolve(completion), 1_500, `${name}: cleanup did not finish`); } finally { f.close(); }
     }
   },
+  async B23(mode) {
+    for (const via of ["prompt", "custom message"]) {
+      const name = `B23 a terminal handler that submits a new request by ${via} does not deadlock`;
+      let session;
+      let nested;
+      const f = await fixture(mode, {
+        baseDelayMs: 60_000,
+        captureExtensionErrors: true,
+        async terminalDelivery() {
+          if (nested) return;
+          nested = via === "prompt"
+            ? session.prompt("Complete request C.")
+            : session.sendCustomMessage({ customType: "follow-up", content: "Complete request C.", display: false }, { triggerTurn: true });
+          await nested;
+        },
+      });
+      session = f.session;
+      let completion;
+      let failed = false;
+      try {
+        await assertWithin((async () => {
+          const started = new Promise((resolve) => f.session.subscribe((event) => {
+            if (event.type === "auto_retry_start") resolve();
+          }));
+          f.faux.setResponses([connectionError(), fauxAssistantMessage("Request C is complete.")]);
+          completion = f.session.prompt("Complete request A.");
+          await started;
+          await delay(0);
+          f.session.abortRetry();
+          await completion;
+          await nested;
+        })(), 3_000, `${name}: the nested request and A did not finish within 3 s`);
+        console.log(`${name} ${mode}: ${JSON.stringify({ calls: f.faux.state.callCount, outcomes: f.outcomes().map(({ state }) => state) })}`);
+        assert.equal(f.faux.state.callCount, 2, `${name}: C ran once and A's retry did not`);
+        // This handler runs before the receipt's own handler, so C's outcome is written first.
+        assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE", "BLOCKED"], `${name}: C and A each keep their own terminal outcome`);
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        f.session.abortRetry();
+        // After a deadlock the cleanup cannot finish either; report the first failure, not this one.
+        try { await assertWithin(Promise.all([completion, nested]), 1_500, `${name}: cleanup did not finish`); } catch (error) { if (!failed) throw error; } finally { f.close(); }
+      }
+    }
+  },
+  async B24(mode) {
+    const name = "B24 settlement from an idle waiter before post-run handling cancels the retry";
+    const f = await fixture(mode, { baseDelayMs: 1 });
+    try {
+      let settled;
+      f.session.subscribe((event) => {
+        if (event.type === "agent_end" && event.willRetry && !settled) {
+          settled = f.session.agent.waitForIdle().then(() => f.session.settleRetry());
+        }
+      });
+      f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+      await assertWithin(f.session.prompt("Complete request A."), 3_000, `${name}: A did not finish`);
+      await settled;
+      await delay(0);
+      const ends = f.extensionEvents.filter((event) => event.type === "agent_end" && !event.willRetry);
+      console.log(`${name} ${mode}: ${JSON.stringify({ ends: ends.length, calls: f.faux.state.callCount, outcomes: f.outcomes().map(({ state }) => state) })}`);
+      assert.equal(ends.length, 1, `${name}: one terminal agent_end for A`);
+      assert.equal(f.faux.state.callCount, 1, `${name}: the settled retry does not run`);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"]);
+    } finally { f.close(); }
+  },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:
   // the "could not reach the model" wording is only for retries exhausted on a retryable error.
   async B8(mode) {

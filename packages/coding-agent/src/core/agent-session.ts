@@ -315,6 +315,8 @@ export class AgentSession {
 	/** Messages held until this request's retry finishes or is cancelled. */
 	private _heldRetryAgentEndMessages: AgentMessage[] | undefined = undefined;
 	private _heldRetryAgentEndRelease: Promise<void> | undefined = undefined;
+	/** Retry generation when the current run's agent_end was held; a later settle changes it. */
+	private _heldRetryGeneration: number | undefined = undefined;
 	/** Identifies the held terminal delivery in flight; nested calls from its handlers carry it. */
 	private _heldAgentEndDelivery: object | undefined = undefined;
 
@@ -625,7 +627,12 @@ export class AgentSession {
 	/** Emit the terminal agent_end for a run that was held for a retry that will not happen. */
 	private _releaseHeldAgentEnd(fallback: AgentMessage[]): Promise<void> | undefined {
 		const held = this._heldRetryAgentEndMessages;
-		if (!held) return this._heldRetryAgentEndRelease;
+		if (!held) {
+			// A run started from inside the held delivery's handlers must not wait on that delivery.
+			const delivery = this._heldAgentEndDelivery;
+			if (delivery !== undefined && heldAgentEndDelivery.getStore() === delivery) return undefined;
+			return this._heldRetryAgentEndRelease;
+		}
 		this._heldRetryAgentEndMessages = undefined;
 		const delivery = {};
 		this._heldAgentEndDelivery = delivery;
@@ -720,6 +727,7 @@ export class AgentSession {
 			const willRetry = this._willRetryAfterAgentEnd(event);
 			const held = this._heldRetryAgentEndMessages;
 			if (willRetry) {
+				this._heldRetryGeneration ??= this._retryGeneration;
 				this._heldRetryAgentEndMessages = [...(held ?? []), ...event.messages];
 				await this._extensionRunner.emit({ type: "agent_end", messages: event.messages, willRetry: true });
 			} else {
@@ -1266,7 +1274,15 @@ export class AgentSession {
 			return false;
 		}
 
+		// Compare against the generation at the moment the run was held, so a settle that ran
+		// between the end of the run and this point (an idle waiter) cancels the retry.
+		const heldGeneration = this._heldRetryGeneration;
+		this._heldRetryGeneration = undefined;
 		if (this._isRetryableError(msg)) {
+			if (heldGeneration !== undefined && heldGeneration !== this._retryGeneration) {
+				await this._releaseHeldAgentEnd([msg]);
+				return false;
+			}
 			const generation = this._retryGeneration;
 			const willRetry = await this._prepareRetry(msg);
 			if (generation !== this._retryGeneration) return false;
