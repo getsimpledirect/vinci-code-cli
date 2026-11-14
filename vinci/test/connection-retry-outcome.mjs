@@ -1203,6 +1203,36 @@ const cases = {
   },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:
   // the "could not reach the model" wording is only for retries exhausted on a retryable error.
+  async B29(mode) {
+    const name = "B29 disposal after a timed-out settle does not wait the bound again on the detached delivery";
+    let releaseDelivery;
+    const delivery = new Promise((resolve) => { releaseDelivery = resolve; });
+    const f = await fixture(mode, { baseDelayMs: 60_000, captureExtensionErrors: true, terminalDelivery: () => delivery });
+    let completion;
+    try {
+      const context = f.session.extensionRunner.createCommandContext();
+      const started = new Promise((resolve) => f.session.subscribe((event) => {
+        if (event.type === "auto_retry_start") resolve();
+      }));
+      f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+      completion = f.session.prompt("Complete the read-only task.");
+      await started;
+      await delay(0);
+      // The terminal handler stalls: this settle times out after its bound and detaches the delivery.
+      await assertWithin(f.session.settleRetry(), 6_000, `${name}: the settle did not return within its bound`);
+      assert.doesNotThrow(() => context.getSystemPrompt(), `${name}: the context is still live before disposal`);
+      assert.equal(f.session.dispose(), undefined, `${name}: dispose stays synchronous`);
+      await delay(500);
+      assert.throws(() => context.getSystemPrompt(), /stale/, `${name}: disposal invalidates at once instead of waiting the bound again`);
+      assert.equal(f.faux.state.callCount, 1, `${name}: the settled retry does not run`);
+    } finally {
+      releaseDelivery();
+      f.session.abortRetry();
+      try {
+        await assertWithin(completion, 1_500, `${name}: cleanup did not finish after releasing the handler`);
+      } finally { f.close(); }
+    }
+  },
   async B8(mode) {
     const f = await fixture(mode);
     try {

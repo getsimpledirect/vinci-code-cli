@@ -3025,6 +3025,8 @@ export class AgentSession {
 		// on it, and it may still finish on its own. Held state of a newer run (for example one its
 		// handler started) is kept, so that run still gets its own terminal agent_end.
 		if (timedOut) {
+			// Disposal does not wait the bound again on a delivery already detached here.
+			if (release !== undefined) this._activeHeldDeliveries.delete(release);
 			if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
 			if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
 		}
