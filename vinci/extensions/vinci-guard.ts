@@ -1932,10 +1932,12 @@ export default function (pi: ExtensionAPI) {
           const abs = consumerWritePath(target, ctx.cwd);
           // A symlink can lead to a virtual path too, so the resolved path is checked again.
           if (abs === null || projectRoot === null || !isSafeTargetText(abs) || /^\/(?:dev|proc)(?:\/|$)/i.test(abs)) return [];
+          // Only a regular file, or a missing one (the usual case: the write creates it), is named. A
+          // directory, FIFO, socket or device is not something the write tool can stand in for.
           try {
-            if (statSync(abs).isDirectory()) return [];
-          } catch {
-            // A missing file is the usual case: the write creates it.
+            if (!statSync(abs).isFile()) return [];
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") return [];
           }
           return [abs === projectRoot || abs.startsWith(projectRoot + sep)
             ? `Target "${abs}" is inside the project; use write with that path.`

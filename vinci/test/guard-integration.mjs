@@ -3,6 +3,7 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createServer } from "node:net";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -486,6 +487,36 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.equal(result?.block, true, `Unnamed-target write stays blocked: ${command}`);
     assert.deepEqual(namedTargets(result.reason), [], `No target is named: ${command}`);
   }
+  // Only a regular file (or a missing one) is named: a FIFO, socket or device is not something the
+  // write tool can stand in for, inside the project or outside it.
+  writeFileSync(join(workspace, "existing-file.txt"), "old");
+  {
+    const result = await toolCall("bash", { command: "echo x > existing-file.txt" });
+    assert.deepEqual(namedTargets(result.reason), [join(project, "existing-file.txt")], "An existing regular file is named");
+  }
+  execFileSync("mkfifo", [join(workspace, "local-fifo")]);
+  execFileSync("mkfifo", [join(realpathSync(runRoot), "outside-fifo")]);
+  for (const command of ["echo x > local-fifo", `echo x > ${join(realpathSync(runRoot), "outside-fifo")}`]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `FIFO write stays blocked: ${command}`);
+    assert.deepEqual(namedTargets(result.reason), [], `A FIFO is not named: ${command}`);
+  }
+  {
+    // Socket paths are length-limited, so the socket lives in a short temporary directory.
+    const socketDir = realpathSync(mkdtempSync("/tmp/vg-"));
+    const socketPath = join(socketDir, "s.sock");
+    const server = createServer();
+    await new Promise((resolveListen, rejectListen) => { server.once("error", rejectListen); server.listen(socketPath, resolveListen); });
+    try {
+      const result = await toolCall("bash", { command: `echo x > ${socketPath}` });
+      assert.equal(result?.block, true, "Socket write stays blocked");
+      assert.deepEqual(namedTargets(result.reason), [], "A unix socket is not named");
+    } finally {
+      await new Promise((resolveClose) => server.close(resolveClose));
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }
+  check("only a regular or missing file is named; FIFOs and sockets are not", true);
   // A dangling symlink resolves to no path: the plain command keeps the project route and names
   // nothing (and the guard must not fail on the unresolved path).
   symlinkSync(join(realpathSync(runRoot), "missing-dir", "nothing.txt"), join(workspace, "dangling-link"));
