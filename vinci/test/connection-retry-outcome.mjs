@@ -217,7 +217,8 @@ const cases = {
   // one terminal outcome instead of disappearing.
   async B9(mode) {
     for (const phase of ["before preparation", "during backoff"]) {
-      const f = await fixture(mode, { baseDelayMs: 100 });
+      // A backoff far longer than the bound: only the setter's own abortRetry() can end it in time.
+      const f = await fixture(mode, { baseDelayMs: phase === "during backoff" ? 60_000 : 100 });
       try {
         const started = new Promise((resolve) => f.session.subscribe((event) => {
           if (event.type === "auto_retry_start") resolve();
@@ -230,6 +231,10 @@ const cases = {
           await delay(0);
           assert.equal(f.session.isRetrying, true, "B9: retries are disabled during backoff");
           f.session.setAutoRetryEnabled(false);
+          await assertWithin(completion, 2_000, "B9: disabling retries during backoff cancels the wait at once");
+          assert.deepEqual(f.retryEvents().map(({ type, finalError }) => [type, finalError]), [
+            ["auto_retry_start", undefined], ["auto_retry_end", "Retry cancelled"],
+          ], "B9: the backoff ends as a cancelled retry");
         }
         await completion;
         console.log(`B9 ${mode} ${phase}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state, reason }) => ({ state, reason })), calls: f.faux.state.callCount })}`);
@@ -834,6 +839,84 @@ const cases = {
       assert.equal(f.faux.state.callCount, 2);
       assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE"]);
     } finally { f.close(); }
+  },
+  async B21(mode) {
+    const name = "B21 runtime disposal while a cancelled retry's terminal delivery runs keeps the receipt";
+    let markDeliveryStarted;
+    const deliveryStarted = new Promise((resolve) => { markDeliveryStarted = resolve; });
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      captureExtensionErrors: true,
+      async terminalDelivery() {
+        markDeliveryStarted();
+        await delay(200);
+      },
+    });
+    let completion;
+    try {
+      await assertWithin((async () => {
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+        completion = f.session.prompt("Complete request A.");
+        await started;
+        await delay(0);
+        f.session.abortRetry();
+        await deliveryStarted;
+        // An outside caller, not a handler of that delivery: it waits for the delivery (bounded).
+        await f.runtime.dispose();
+        await completion;
+      })(), 7_500, `${name}: did not finish within 7.5 s`);
+      console.log(`${name} ${mode}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state }) => state), errors: f.extensionErrors.length, calls: f.faux.state.callCount })}`);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"], `${name}: A's terminal receipt is recorded before the context is invalidated`);
+      assert.deepEqual(f.extensionErrors, [], `${name}: no handler ran on an invalidated context`);
+      assert.equal(f.faux.state.callCount, 1);
+    } finally {
+      f.session.abortRetry();
+      await completion;
+      f.close();
+    }
+  },
+  async B22(mode) {
+    const name = "B22 a prompt after a reload that timed out on a stalled terminal handler does not wait on it";
+    let releaseDelivery;
+    const delivery = new Promise((resolve) => { releaseDelivery = resolve; });
+    let stalls = 1;
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      captureExtensionErrors: true,
+      terminalDelivery() {
+        // Only A's terminal delivery stalls; later requests deliver normally.
+        if (stalls-- > 0) return delivery;
+      },
+    });
+    let completion;
+    try {
+      await assertWithin((async () => {
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        f.faux.setResponses([connectionError(), fauxAssistantMessage("Request B is complete.")]);
+        completion = f.session.prompt("Complete request A.");
+        await started;
+        await delay(0);
+        await f.session.reload();
+        await assertWithin(f.session.prompt("Complete request B."), 2_000, `${name}: request B waited on A's stalled terminal delivery`);
+      })(), 9_000, `${name}: did not finish within 9 s`);
+      console.log(`${name} ${mode}: ${JSON.stringify({ calls: f.faux.state.callCount, last: f.session.messages.at(-1)?.role, stop: f.session.messages.at(-1)?.stopReason, err: f.session.messages.at(-1)?.errorMessage })}`);
+      // Reload resets API providers, so B ends with its own provider error instead of a model call;
+      // what matters is that B finished its turn instead of waiting on A's stalled delivery.
+      const userB = f.session.messages.findIndex((message) => message.role === "user" && JSON.stringify(message.content).includes("Complete request B."));
+      assert.ok(userB >= 0, `${name}: request B was submitted`);
+      assert.equal(f.session.messages.at(-1)?.role, "assistant", `${name}: request B finished its own turn`);
+      assert.ok(f.session.messages.length - 1 > userB);
+      assert.equal(f.faux.state.callCount, 1, `${name}: A's retry did not run`);
+    } finally {
+      releaseDelivery();
+      f.session.abortRetry();
+      try { await assertWithin(Promise.resolve(completion), 1_500, `${name}: cleanup did not finish`); } finally { f.close(); }
+    }
   },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:
   // the "could not reach the model" wording is only for retries exhausted on a retryable error.

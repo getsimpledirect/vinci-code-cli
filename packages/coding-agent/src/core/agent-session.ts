@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -274,6 +275,8 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 const DISPOSE_INVALIDATION_TIMEOUT_MS = 5_000;
+/** The held terminal delivery whose handlers the current async call chain runs inside, if any. */
+const heldAgentEndDelivery = new AsyncLocalStorage<object>();
 
 // ============================================================================
 // AgentSession Class
@@ -312,7 +315,8 @@ export class AgentSession {
 	/** Messages held until this request's retry finishes or is cancelled. */
 	private _heldRetryAgentEndMessages: AgentMessage[] | undefined = undefined;
 	private _heldRetryAgentEndRelease: Promise<void> | undefined = undefined;
-	private _deliveringHeldAgentEnd = false;
+	/** Identifies the held terminal delivery in flight; nested calls from its handlers carry it. */
+	private _heldAgentEndDelivery: object | undefined = undefined;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -623,15 +627,18 @@ export class AgentSession {
 		const held = this._heldRetryAgentEndMessages;
 		if (!held) return this._heldRetryAgentEndRelease;
 		this._heldRetryAgentEndMessages = undefined;
-		this._deliveringHeldAgentEnd = true;
-		const release = this._extensionRunner
-			.emit({
-				type: "agent_end",
-				messages: held.length > 0 ? held : fallback,
-				willRetry: false,
-			})
+		const delivery = {};
+		this._heldAgentEndDelivery = delivery;
+		const release = heldAgentEndDelivery
+			.run(delivery, () =>
+				this._extensionRunner.emit({
+					type: "agent_end",
+					messages: held.length > 0 ? held : fallback,
+					willRetry: false,
+				}),
+			)
 			.finally(() => {
-				this._deliveringHeldAgentEnd = false;
+				if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
 				if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
 			});
 		this._heldRetryAgentEndRelease = release;
@@ -2934,8 +2941,10 @@ export class AgentSession {
 	}
 
 	private async _settleIdleHeldRetry(): Promise<void> {
-		// A terminal handler must not wait on the delivery that is awaiting that handler.
-		if (this._deliveringHeldAgentEnd) return;
+		// A terminal handler must not wait on the delivery that is awaiting that handler. Only calls
+		// made from inside that delivery skip; any other caller waits for it (bounded where public).
+		const delivery = this._heldAgentEndDelivery;
+		if (delivery !== undefined && heldAgentEndDelivery.getStore() === delivery) return;
 		this._retryGeneration++;
 		this.abortRetry();
 		this._retryAttempt = 0;
@@ -2947,15 +2956,26 @@ export class AgentSession {
 		// A live retry run owns its terminal agent_end and retry budget; only an idle held retry settles here.
 		if (!this._hasIdleHeldRetry()) return;
 		let timeout: ReturnType<typeof setTimeout> | undefined;
+		let timedOut = false;
 		try {
 			await Promise.race([
 				this._settleIdleHeldRetry(),
 				new Promise<void>((resolve) => {
-					timeout = setTimeout(resolve, DISPOSE_INVALIDATION_TIMEOUT_MS);
+					timeout = setTimeout(() => {
+						timedOut = true;
+						resolve();
+					}, DISPOSE_INVALIDATION_TIMEOUT_MS);
 				}),
 			]);
 		} finally {
 			clearTimeout(timeout);
+		}
+		// A stalled delivery past the bound is detached: later runs never wait on it. It may still
+		// finish on its own.
+		if (timedOut) {
+			this._heldRetryAgentEndMessages = undefined;
+			this._heldRetryAgentEndRelease = undefined;
+			this._heldAgentEndDelivery = undefined;
 		}
 	}
 
