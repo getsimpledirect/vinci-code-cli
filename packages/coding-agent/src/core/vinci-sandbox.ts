@@ -135,7 +135,8 @@ function canonicalWritePath(path: string): string | undefined {
 /**
  * Every place a write to a protected `path` can land. A dangling link is followed to its future physical
  * destination, otherwise creating that destination would lose the default deny. A `..` after a missing
- * component cannot be resolved yet: protect its lexical candidates as well, never nothing (fail closed).
+ * component cannot be resolved yet: protect its lexical destination and the missing component, never nothing
+ * (fail closed).
  */
 function protectedWritePaths(path: string, links = 0): string[] {
 	let candidate = unresolvedAbsolute(path);
@@ -143,9 +144,12 @@ function protectedWritePaths(path: string, links = 0): string[] {
 	for (let depth = 0; depth < 256; depth++) {
 		try {
 			lstatSync(candidate);
-			const physical = resolve(realpathSync.native(candidate), ...[...missing].reverse());
+			const prefix = realpathSync.native(candidate);
+			const physical = resolve(prefix, ...[...missing].reverse());
 			if (!missing.includes("..")) return [physical];
-			return [...new Set([physical, resolve(path)])];
+			// The destination once the missing directory is a real one, and that directory itself: denying
+			// its creation keeps it from becoming a link that would move the destination elsewhere.
+			return [...new Set([physical, resolve(prefix, missing[missing.length - 1]!)])];
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return [];
 			try {
