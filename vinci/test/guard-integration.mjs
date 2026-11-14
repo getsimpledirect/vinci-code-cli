@@ -939,9 +939,9 @@ try {
   // its private control), with no dialog first.
   for (const [operator, commands] of [
     // A descriptor duplication before the write (`2>&1`, `>&2`) must not split it off either.
-    [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt", "echo x >&2>|out.txt", "printf x >&2 >\\\n| out.txt", "true && echo x >| out.txt", "true \\\\\necho x >| out.txt", "true \\>| echo x >|out.txt", "echo x <&0 >| out.txt"]],
-    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt", "echo x\\ #foo &> out.txt", "echo x \\ # &> out.txt", "echo ${v:- #} &> out.txt", "true ${v:-; #}; echo x &> out.txt", "true \\\r\necho x &> out.txt", "echo x # &>out.txt", "echo x <&0 &> out.txt"]],
-    ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt", "echo x >&2 &>>out.txt", "echo x | tee -a &>> out.txt", "sleep 1 & echo x &>> out.txt", "echo x \\\\&>> out.txt", "echo x 0<&0 &>> out.txt"]],
+    [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt", "echo x >&2>|out.txt", "printf x >&2 >\\\n| out.txt", "true && echo x >| out.txt", "true \\\\\necho x >| out.txt", "true \\>| echo x >|out.txt", "echo x <&0 >| out.txt", "command echo x >|out.txt", "echo x >|./out.txt", "echo x >|-o"]],
+    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt", "echo x\\ #foo &> out.txt", "echo x \\ # &> out.txt", "echo ${v:- #} &> out.txt", "true ${v:-; #}; echo x &> out.txt", "true \\\r\necho x &> out.txt", "echo x # &>out.txt", "echo x <&0 &> out.txt", "echo x &\\\n\\\n> out.txt", "sudo echo x &>out.txt", "echo x &>../o", "echo x \\\\\\\\&> out.txt"]],
+    ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt", "echo x >&2 &>>out.txt", "echo x | tee -a &>> out.txt", "sleep 1 & echo x &>> out.txt", "echo x \\\\&>> out.txt", "echo x 0<&0 &>> out.txt", "VAR=1 echo x &>> out.txt"]],
     ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt", "echo x 2>\\\n|out.txt", "echo x <&0 2>| out.txt"]],
   ]) {
     for (const command of commands) {
@@ -1002,6 +1002,17 @@ try {
   check("`2>&1 >> /dev/null` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 >> /dev/null"));
   check("`echo >& tee out.txt` keeps its previous classification", guard.isShellFileWrite("echo >& tee out.txt"));
   check("known miss kept from main: an escaped `\\&>` (a literal `&`, then a plain `>`; shared splitter limit, out of scope)", !guard.isShellFileWrite("echo x \\&> out.txt"));
+  check("known miss kept from main: three backslashes then `&>` (an escaped `&`, then a plain `>`)", !guard.isShellFileWrite("echo x \\\\\\&> out.txt"));
+  // Quotes are not parsed either: an operator inside quotes counts as a write, exactly as main's `>`
+  // does (main also refuses `echo '>out.txt'`). Quote-aware detection for every operator is tracked
+  // separately.
+  for (const [quoted, mainAnalogue] of [
+    ["echo '&>out.txt'", "echo '>out.txt'"],
+    ['echo "a&>>b"', 'echo "a>>b"'],
+    ["printf '%s\\n' '>|out.txt'", "printf '%s\\n' '>out.txt'"],
+  ]) {
+    check(`a quoted operator is classified like main's quoted \`>\`: ${JSON.stringify(quoted)}`, guard.isShellFileWrite(quoted) && guard.isShellFileWrite(mainAnalogue));
+  }
   // Comments are not parsed (a look-alike `#` could hide a write), so an operator in comment text
   // counts as a write, as `>` already does on main.
   check("`>|` in comment text is classified as a write, like `>`", guard.isShellFileWrite("echo x # >| out.txt"));
