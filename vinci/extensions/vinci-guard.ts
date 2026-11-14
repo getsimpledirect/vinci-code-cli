@@ -561,10 +561,14 @@ const SAFE_TARGET_TEXT = /^[A-Za-z0-9._\/+@%=,: -]+$/;
  * leading VAR= assignment. Wording only; it never decides whether to block. */
 function isPlainShellCommand(command: string): boolean {
   const segments = shellSegments(command);
-  if (segments.length !== 1 || /['"\\*?\[\]{}~()<]|[^\t\x20-\x7e]|[#`$]|<<|>&|&>|>\||\d>/.test(command)) return false;
-  // A leading VAR= assignment can preload code before the visible command runs.
-  if (/^[A-Za-z_]\w*=/.test(shellWords(command)[0] ?? "")) return false;
-  const executable = shellWords(segments[0]).find((word) => !/^[A-Za-z_]\w*=/.test(word))?.split("/").pop() ?? "";
+  // Any raw |, & or ; (even one the split drops, like a trailing pipe) and any tab or other
+  // non-printable character make the command not plain.
+  if (segments.length !== 1 || /['"\\*?\[\]{}~()<|&;]|[^\x20-\x7e]|[#`$]|\d>/.test(command)) return false;
+  // The executable must be a plain word on its own: `perl>out.txt -pi ...` hides the interpreter
+  // behind an attached redirect. This also rejects a leading VAR= assignment, which can preload
+  // code before the visible command runs.
+  if (!/^[A-Za-z0-9._\/+-]+$/.test(shellWords(segments[0])[0] ?? "")) return false;
+  const executable = shellWords(segments[0])[0].split("/").pop() ?? "";
   // A nested shell (`bash -c '...'`) hides its own cd and wrappers from this check.
   return !/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs|bash|sh|zsh|dash|ksh|fish)$/.test(executable);
 }

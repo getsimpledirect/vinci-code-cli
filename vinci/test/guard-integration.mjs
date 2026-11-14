@@ -339,7 +339,7 @@ async function shellWriteRouteChecks(onlyCase) {
     const command = name === "A2" ? `echo x > ${outside}`
       : name === "A6" ? `python3 -c "open('${outside}','w')"`
       : name === "A3" ? 'echo x > "$OUT"' : "echo x > out.txt";
-    const target = name === "A2" ? outside : join(project, "out.txt");
+    const target = name === "A2" || name === "A6" ? outside : join(project, "out.txt");
     const promptsBefore = selections.length;
     const controlsBefore = controls.length;
     const noticesBefore = notifications.length;
@@ -420,13 +420,22 @@ async function shellWriteRouteChecks(onlyCase) {
     // A wrapper or a leading assignment is not plain even without quotes.
     "command echo x > out.txt",
     "X=1 echo x > out.txt",
+    // An executable with an attached redirect hides what runs.
+    "perl>out.txt -pi s/a/b/ file.txt",
+    // A raw control operator, even one the segment split drops, is not plain.
+    "echo x > out.txt |",
+    "echo x > out.txt &",
+    "echo x > out.txt ;",
+    // Tabs, like any other non-printable character, are not plain.
+    "echo x\t>\ttabbed.txt",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Non-plain write stays blocked: ${command}`);
     assert.equal(result.reason, neutralReason, `Non-plain write names nothing: ${command}`);
   }
   for (const [command, target, outside] of [
-    ["echo x\t>\ttabbed.txt", join(project, "tabbed.txt"), false],
+    ["echo x >spaced.txt", join(project, "spaced.txt"), false],
+    ["echo x>attached.txt", join(project, "attached.txt"), false],
     ["tee -a results.txt", join(project, "results.txt"), false],
     ["echo x > route-link/escaped.txt", escaped, true],
     ["tee local.txt route-link/escaped.txt", escaped, true],
@@ -439,6 +448,13 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.match(result.reason, outside ? /write will ask for approval.*outside the project/ : /inside the project; use write with that path/);
     assert.equal(existsSync(target), false, "Target classification creates no file");
     if (outside) assert.doesNotMatch(notifications.at(-1).message, /saving under/);
+  }
+  // Plain, unquoted interpreter commands pass the plain-command gate, so only the interpreter
+  // exclusion keeps their redirect target unnamed (separated and attached redirects).
+  for (const command of ["perl -pi s/a/b/ in.txt > out.txt", "perl -pi s/a/b/ in.txt>out.txt"]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Plain interpreter write stays blocked: ${command}`);
+    assert.equal(result.reason, genericReason, `Plain interpreter redirect names no target: ${command}`);
   }
   // Keep interpreter writes blocked independently of how their shell targets are described.
   const interpreterTarget = join(runRoot, "interpreter-target.txt");
