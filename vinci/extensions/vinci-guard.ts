@@ -164,15 +164,11 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
   let current = "";
   let quote: "'" | '"' | "`" | null = null;
   let afterRedirect = false; // the previous character was an unquoted, unescaped `>`
-  let wordStart = true; // the next character starts a word (line or segment start, or after an unescaped blank)
-  let sawExpansion = false; // an unquoted `$` appeared in this segment, so a later `#` may sit inside `${...}`/`$(...)`
 
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     const redirectBefore: boolean = afterRedirect;
     afterRedirect = false;
-    const wordStartBefore: boolean = wordStart;
-    wordStart = false;
     if (quote) {
       current += ch;
       if (quote !== "'" && ch === "\\" && i + 1 < command.length) {
@@ -187,20 +183,15 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
       current += ch;
       continue;
     }
-    // Write detection skips an unquoted comment (`#` starting a word) up to the end of its line;
-    // a `\` inside a comment does not continue it. After a `$` the `#` may be inside an expansion
-    // (`${v:- #}`), so it is not treated as a comment there.
-    if (keepWriteRedirects && ch === "#" && wordStartBefore && !sawExpansion) {
-      while (i + 1 < command.length && command[i + 1] !== "\n") i++;
-      continue;
-    }
+    // Comments are not skipped: this split is not a full shell parser, and a `#` that only looks
+    // like a comment (inside `${v:-; #}`, after `\ `) could hide a real write. A write operator in
+    // comment text is therefore classified as a write, as the existing `>` check already does.
     if (ch === "\\" && i + 1 < command.length) {
       // Write detection joins a line continuation (`\<newline>`, not `\<CR><LF>`) as bash does; a `\\`
       // pair is consumed here first, so an escaped backslash before a newline still ends the line.
       if (keepWriteRedirects && command[i + 1] === "\n") {
         i += 1;
         afterRedirect = redirectBefore;
-        wordStart = wordStartBefore;
         continue;
       }
       current += ch + command[++i];
@@ -214,14 +205,10 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
       if (current.trim()) segments.push(current.trim());
       current = "";
       if ((ch === "|" || ch === "&") && command[i + 1] === ch) i++;
-      wordStart = true;
-      sawExpansion = false;
       continue;
     }
     current += ch;
     afterRedirect = ch === ">";
-    wordStart = ch === " " || ch === "\t";
-    if (ch === "$") sawExpansion = true;
   }
   if (current.trim()) segments.push(current.trim());
   return segments;

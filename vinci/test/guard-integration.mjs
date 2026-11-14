@@ -940,7 +940,7 @@ try {
   for (const [operator, commands] of [
     // A descriptor duplication before the write (`2>&1`, `>&2`) must not split it off either.
     [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt", "echo x >&2>|out.txt", "printf x >&2 >\\\n| out.txt", "true && echo x >| out.txt", "true \\\\\necho x >| out.txt", "true \\>| echo x >|out.txt"]],
-    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt", "echo x\\ #foo &> out.txt", "echo x \\ # &> out.txt", "echo ${v:- #} &> out.txt", "true \\\r\necho x &> out.txt"]],
+    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt", "echo x\\ #foo &> out.txt", "echo x \\ # &> out.txt", "echo ${v:- #} &> out.txt", "true ${v:-; #}; echo x &> out.txt", "true \\\r\necho x &> out.txt", "echo x # &>out.txt"]],
     ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt", "echo x >&2 &>>out.txt", "echo x | tee -a &>> out.txt", "sleep 1 & echo x &>> out.txt", "echo x \\\\&>> out.txt"]],
     ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt", "echo x 2>\\\n|out.txt"]],
   ]) {
@@ -981,17 +981,6 @@ try {
     "tee &>> /dev/null",
     "echo \\>| cat",
     "echo x &>| /dev/null",
-    // A comment writes nothing: `#` starting a word runs to the end of its line.
-    "echo x # &>out.txt",
-    "echo x # >| out.txt",
-    "echo x #&>> out.txt \\\necho y",
-    "# &> out.txt",
-    "echo y;#c &> out.txt",
-    // The whole rest of the line is the comment, including a `;` and a writer after it.
-    "# a; echo x &> out.txt",
-    "true;# a; echo x &> out.txt",
-    // A `$` in an earlier command does not affect a comment in a later one.
-    "echo $x; echo y # &> out.txt",
   ]) {
     const selectionCount = selections.length;
     const result = await toolCall("bash", { command });
@@ -1010,7 +999,11 @@ try {
   check("`2>&1 >> /dev/null` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 >> /dev/null"));
   check("`echo >& tee out.txt` keeps its previous classification", guard.isShellFileWrite("echo >& tee out.txt"));
   check("an escaped `\\&>` keeps its previous classification (a literal `&`, then `>`)", !guard.isShellFileWrite("echo x \\&> out.txt"));
-  // Comment detection tracks word starts as it scans, so a long line with many `#` stays linear.
+  // Comments are not parsed (a look-alike `#` could hide a write), so an operator in comment text
+  // counts as a write, as `>` already does on main.
+  check("`>|` in comment text is classified as a write, like `>`", guard.isShellFileWrite("echo x # >| out.txt"));
+  check("`>` in comment text keeps its previous classification", guard.isShellFileWrite("echo x # > out.txt"));
+  // A long line with many `#` and backslashes is classified in linear time.
   {
     const long = "echo " + "a#b ".repeat(160_000);
     const started = performance.now();
