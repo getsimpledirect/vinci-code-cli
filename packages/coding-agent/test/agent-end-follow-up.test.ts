@@ -48,7 +48,8 @@ describe("follow-up request from a terminal agent_end handler (#171)", () => {
 		const run = await runWithTerminalFollowUp(["done"], "plain");
 		harness = run.harness;
 		expect(run.outcomes).toHaveLength(1);
-		expect(run.outcomes[0]).toMatch(/already processing.*followUp/);
+		// The session guard answers (it names streamingBehavior), not the Agent-level guard.
+		expect(run.outcomes[0]).toMatch(/already processing\. Specify streamingBehavior/);
 		expect(harness.faux.callCount).toBe(1);
 	});
 
@@ -71,5 +72,8 @@ describe("follow-up request from a terminal agent_end handler (#171)", () => {
 		harness = run.harness;
 		expect(run.outcomes).toEqual(["queued"]);
 		expect(harness.faux.callCount).toBe(3);
+		expect(
+			harness.session.messages.some((m) => m.role === "user" && JSON.stringify(m.content).includes("follow-up")),
+		).toBe(true);
 	});
 });

@@ -562,7 +562,7 @@ pi.on("agent_end", async (event, ctx) => {
 });
 ```
 
-`agent_end` handlers run before the run has finished streaming. To start another request from one, queue it: `pi.sendUserMessage(text, { deliverAs: "followUp" })`, or `session.prompt(text, { streamingBehavior: "followUp" })` from SDK code. A plain `prompt()` is refused with "Agent is already processing". The follow-up runs once the current run ends, including after its retries are exhausted.
+A terminal `agent_end` handler (`willRetry` false) usually runs before the run has finished streaming. To start another request from one, queue it: `pi.sendUserMessage(text, { deliverAs: "followUp" })`, or `session.prompt(text, { streamingBehavior: "followUp" })` from SDK code. A plain `prompt()` is refused there with "Agent is already processing" (by design). The queued follow-up runs once the current run ends, including after its retries are exhausted. When a held retry is settled while the session is idle (for example, cancelled by new input), the handler runs after streaming has ended and the follow-up starts at once. `sendUserMessage` does not wait for the request, so its errors are not thrown back to the handler.
 
 #### turn_start / turn_end
 
