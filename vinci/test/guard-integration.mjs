@@ -527,6 +527,21 @@ try {
     try {
       const protectedWrites = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
       assert.ok(protectedWrites.includes(join(physicalDeep, "startup-target")), "a dangling protected link is protected at its physical destination");
+      // A relative destination is resolved physically too (from the link's directory, through its links).
+      symlinkSync("../a/link/../startup-relative", join(fakeHome, ".zlogin"));
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(physicalDeep, "startup-relative")), "a relative dangling protected link is protected at its physical destination");
+      // A `..` after a missing component is unresolvable today: the lexical candidate is protected, never nothing,
+      // and the list computed now still covers where the write lands once the missing directory exists.
+      const realProject = realpathSync.native(physicalProject);
+      symlinkSync(`${realProject}/startup-newdir/../startup`, join(fakeHome, ".zprofile"));
+      const beforeNewdir = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
+      assert.ok(beforeNewdir.includes(join(realProject, "startup")), "a protected link through a missing directory and .. protects its lexical destination");
+      mkdirSync(join(realProject, "startup-newdir"));
+      assert.ok(beforeNewdir.includes(realpathSync.native(join(realProject, "startup-newdir", ".."))  + "/startup"), "the protection computed before the directory exists covers the destination after it exists");
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup")), "the destination stays protected once the missing directory exists");
+      // Positive control: protection names files, not the project; an unrelated in-project write stays granted.
+      assert.ok(!beforeNewdir.includes(realProject), "the project itself is not protected");
+      assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/unrelated-write`), true, "an unrelated in-project write stays granted");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

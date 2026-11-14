@@ -106,7 +106,7 @@ function realOrSelf(p: string): string {
 	}
 }
 
-function canonicalWritePath(path: string, protectedPath = false, links = 0): string | undefined {
+function canonicalWritePath(path: string): string | undefined {
 	let candidate = unresolvedAbsolute(path);
 	const missing: string[] = [];
 	for (let depth = 0; depth < 256; depth++) {
@@ -118,19 +118,8 @@ function canonicalWritePath(path: string, protectedPath = false, links = 0): str
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
 			try {
-				if (lstatSync(candidate).isSymbolicLink()) {
-					// Grants reject dangling links. Protection must also cover their future physical
-					// destination, otherwise creating that destination would lose the default deny.
-					if (!protectedPath || links >= 32) return undefined;
-					// Keep the raw destination: a `..` in it must be resolved physically, after its links.
-					const destination = readlinkSync(candidate);
-					const target = canonicalWritePath(
-						isAbsolute(destination) ? destination : `${dirname(candidate)}${sep}${destination}`,
-						true,
-						links + 1,
-					);
-					return target ? resolve(target, ...missing.reverse()) : undefined;
-				}
+				// Grants reject dangling links (protection follows them in protectedWritePaths).
+				if (lstatSync(candidate).isSymbolicLink()) return undefined;
 			} catch {
 				/* missing component */
 			}
@@ -141,6 +130,45 @@ function canonicalWritePath(path: string, protectedPath = false, links = 0): str
 		}
 	}
 	return undefined;
+}
+
+/**
+ * Every place a write to a protected `path` can land. A dangling link is followed to its future physical
+ * destination, otherwise creating that destination would lose the default deny. A `..` after a missing
+ * component cannot be resolved yet: protect its lexical candidates as well, never nothing (fail closed).
+ */
+function protectedWritePaths(path: string, links = 0): string[] {
+	let candidate = unresolvedAbsolute(path);
+	const missing: string[] = [];
+	for (let depth = 0; depth < 256; depth++) {
+		try {
+			lstatSync(candidate);
+			const physical = resolve(realpathSync.native(candidate), ...[...missing].reverse());
+			if (!missing.includes("..")) return [physical];
+			return [...new Set([physical, resolve(path)])];
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return [];
+			try {
+				if (lstatSync(candidate).isSymbolicLink()) {
+					if (links >= 32) return [];
+					// Keep the raw destination: a `..` in it must be resolved physically, after its links.
+					const destination = readlinkSync(candidate);
+					const rest = [...missing].reverse();
+					return protectedWritePaths(
+						isAbsolute(destination) ? destination : `${dirname(candidate)}${sep}${destination}`,
+						links + 1,
+					).map((target) => resolve(target, ...rest));
+				}
+			} catch {
+				/* missing component */
+			}
+			const parent = dirname(candidate);
+			if (parent === candidate) return [];
+			missing.push(basename(candidate));
+			candidate = parent;
+		}
+	}
+	return [];
 }
 
 function configuredPaths(name: string): string[] {
@@ -336,7 +364,7 @@ export function vinciSensitiveNoWrite(_cwd: string): string[] {
 		...new Set(
 			[...LOCKED_HOME_SECRETS, ...TOOL_CONFIG_PROTECTED_WRITES, ...STARTUP_PATHS].flatMap((entry) => {
 				const path = join(home, entry);
-				return [path, canonicalWritePath(path, true) ?? path];
+				return [path, ...protectedWritePaths(path)];
 			}),
 		),
 	];
