@@ -932,6 +932,110 @@ try {
     );
   }
 
+  // ── Clobber and stdout+stderr redirects ────────────────────────────────────────────────────
+  // `>|`, `&>`, `&>>` and a numbered `N>|` write a file exactly like `>`/`>>`, but the segment split
+  // read their `|` as a pipe and their `&` as a background operator, so `echo x >| out.txt` reached
+  // the shell unseen. Each case must be answered by the shell-write block itself (its reason and
+  // its private control), with no dialog first.
+  for (const [operator, commands] of [
+    // A descriptor duplication before the write (`2>&1`, `>&2`) must not split it off either.
+    [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt", "echo x >&2>|out.txt", "printf x >&2 >\\\n| out.txt", "true && echo x >| out.txt", "true \\\\\necho x >| out.txt", "true \\>| echo x >|out.txt", "echo x <&0 >| out.txt", "command echo x >|out.txt", "echo x >|./out.txt", "echo x >|-o"]],
+    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt", "echo x\\ #foo &> out.txt", "echo x \\ # &> out.txt", "echo ${v:- #} &> out.txt", "true ${v:-; #}; echo x &> out.txt", "true \\\r\necho x &> out.txt", "echo x # &>out.txt", "echo x <&0 &> out.txt", "echo x &\\\n\\\n> out.txt", "sudo echo x &>out.txt", "echo x &>../o", "echo x \\\\\\\\&> out.txt"]],
+    ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt", "echo x >&2 &>>out.txt", "echo x | tee -a &>> out.txt", "sleep 1 & echo x &>> out.txt", "echo x \\\\&>> out.txt", "echo x 0<&0 &>> out.txt", "VAR=1 echo x &>> out.txt"]],
+    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt", "echo x 2>\\\n|out.txt", "echo x <&0 2>| out.txt"]],
+  ]) {
+    for (const command of commands) {
+      const selectionCount = selections.length;
+      const controlCount = controls.length;
+      const result = await toolCall("bash", { command });
+      check(`${operator} is classified as a shell file write: ${JSON.stringify(command)}`, guard.isShellFileWrite(command));
+      check(
+        `${operator} takes the shell-write block before any dialog: ${JSON.stringify(command)}`,
+        result?.block === true &&
+          /shell-based file write/i.test(result.reason) &&
+          selections.length === selectionCount &&
+          controls.slice(controlCount).some(({ message }) => message.customType === "vinci-shell-write-block"),
+      );
+    }
+  }
+
+  // Positive controls: the same operators aimed at /dev/null, descriptor duplication, pipes and a
+  // real background `&` write no file and must still run without a block or a dialog.
+  for (const command of [
+    "echo x >| /dev/null",
+    "echo x >|/dev/null",
+    "echo x &> /dev/null",
+    "echo x &>> /dev/null",
+    "echo x &>>/dev/null",
+    "echo x 2>| /dev/null",
+    "ls 2>&1 | cat",
+    "echo x >&2",
+    "echo x 2>&1",
+    "echo x &>&2",
+    "echo a | cat",
+    "echo x |& cat",
+    "sleep 1 & echo x",
+    "echo x >&2 && echo y",
+    "echo x 2>&1 & echo y",
+    "tee &> /dev/null",
+    "tee &>> /dev/null",
+    "echo \\>| cat",
+    "echo x &>| /dev/null",
+    "cat <&0 | cat",
+    "echo x <&0 & echo y",
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `a redirect that writes no file stays allowed: ${JSON.stringify(command)}`,
+      !guard.isShellFileWrite(command) && result === undefined && selections.length === selectionCount,
+    );
+  }
+  // An escaped `\>` is a literal, so the `|` after it is a real pipe and the writer behind it is
+  // still its own segment. This `>` case is answered by the base pass; the `>|` list above holds the
+  // same shape aimed at a `>|` target, which only the second pass answers.
+  check("a writer behind `\\>|` (a literal `>` and a real pipe) is still a shell file write", guard.isShellFileWrite("true \\>| echo x >out.txt"));
+  // Outside this change's operators, behaviour is pinned as it was (not an endorsement of either).
+  check("plain `2> file` keeps its previous classification (not a write form here)", !guard.isShellFileWrite("echo x 2> err.txt"));
+  check("`>> /dev/null` keeps its previous classification", guard.isShellFileWrite("echo x >> /dev/null"));
+  check("known miss kept from main: a plain `>` after `2>&1` (shared splitter limit, out of scope)", !guard.isShellFileWrite("echo x 2>&1 > out.txt"));
+  check("`2>&1 >> /dev/null` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 >> /dev/null"));
+  check("`echo >& tee out.txt` keeps its previous classification", guard.isShellFileWrite("echo >& tee out.txt"));
+  check("known miss kept from main: an escaped `\\&>` (a literal `&`, then a plain `>`; shared splitter limit, out of scope)", !guard.isShellFileWrite("echo x \\&> out.txt"));
+  check("known miss kept from main: three backslashes then `&>` (an escaped `&`, then a plain `>`)", !guard.isShellFileWrite("echo x \\\\\\&> out.txt"));
+  // Quotes are not parsed either: an operator inside quotes counts as a write, exactly as main's `>`
+  // does (main also refuses `echo '>out.txt'`). Quote-aware detection for every operator is tracked
+  // separately.
+  for (const [quoted, mainAnalogue] of [
+    ["echo '&>out.txt'", "echo '>out.txt'"],
+    ['echo "a&>>b"', 'echo "a>>b"'],
+    ["printf '%s\\n' '>|out.txt'", "printf '%s\\n' '>out.txt'"],
+  ]) {
+    check(`a quoted operator is classified like main's quoted \`>\`: ${JSON.stringify(quoted)}`, guard.isShellFileWrite(quoted) && guard.isShellFileWrite(mainAnalogue));
+  }
+  // Comments are not parsed (a look-alike `#` could hide a write), so an operator in comment text
+  // counts as a write, as `>` already does on main.
+  check("`>|` in comment text is classified as a write, like `>`", guard.isShellFileWrite("echo x # >| out.txt"));
+  check("`>` in comment text keeps its previous classification", guard.isShellFileWrite("echo x # > out.txt"));
+  // A long line with many `#` and backslashes is classified in linear time.
+  {
+    const long = "echo " + "a#b ".repeat(160_000);
+    const started = performance.now();
+    guard.isShellFileWrite(long);
+    check("a long line with many `#` is classified in linear time", performance.now() - started < 2_000);
+  }
+  {
+    const long = "echo x " + "\\\n\\&".repeat(80_000) + " &> out.txt";
+    const started = performance.now();
+    const isWrite = guard.isShellFileWrite(long);
+    check("a long line of continuations and escaped `&` is classified in linear time", isWrite && performance.now() - started < 2_000);
+  }
+  // Only the writers this guard already knows (echo, printf, tee, cat heredoc) count; other commands
+  // with the new operators keep main's classification and run.
+  for (const command of ["ls &> out.txt", "git log >| out.txt", "npm test &>> build.log", "ls 2>| err.txt"]) {
+    check(`a non-writer command with a new operator stays allowed: ${JSON.stringify(command)}`, !guard.isShellFileWrite(command));
+  }
+
   // No SILENT auto-grant: two adversarial reviews showed a shell command can't be classified "safe to
   // network" (endpoint override, argv[0] impostor, command substitution). EVERY network command — direct
   // cloud, wrapped script, curl — takes the one-command prompt. isCloudDeployCommand only routes cloud
