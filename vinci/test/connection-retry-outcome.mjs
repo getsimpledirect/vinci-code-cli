@@ -16,7 +16,7 @@ process.env.GIT_CEILING_DIRECTORIES = owned;
 const connectionError = () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." });
 const selected = process.argv.slice(2);
 
-async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, captureExtensionErrors = false, terminalDelivery } = {}) {
+async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, captureExtensionErrors = false, terminalDelivery, configureExtension, compaction } = {}) {
   const cwd = mkdtempSync(join(owned, `${mode}-`));
   const agentDir = join(cwd, "profile");
   mkdirSync(agentDir);
@@ -26,7 +26,7 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, 
   const modelRegistry = ModelRegistry.inMemory(authStorage);
   const settingsManager = SettingsManager.inMemory({
     retry: { enabled, maxRetries, baseDelayMs },
-    compaction: { enabled: false },
+    compaction: { enabled: false, ...compaction },
   });
   const extensionEvents = [];
   const extensionErrors = [];
@@ -40,6 +40,7 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, 
         await terminalDelivery?.();
       }
     });
+    configureExtension?.(pi);
   }, receipt];
   const createRuntime = async ({ cwd: sessionCwd = cwd, agentDir: sessionAgentDir = agentDir, sessionManager, sessionStartEvent }) => {
     const resourceLoader = new DefaultResourceLoader({
@@ -431,6 +432,215 @@ const cases = {
       assert.equal(f.faux.state.callCount, 1);
     } finally {
       releaseDelivery();
+      f.session.abortRetry();
+      await completion;
+      f.close();
+    }
+  },
+  async B15(mode) {
+    const name = "B15 a custom message that triggers a turn during backoff settles the held run first";
+    for (const deliverAs of [undefined, "steer", "followUp"]) {
+      const f = await fixture(mode, { baseDelayMs: 60_000 });
+      let completion;
+      try {
+        let outcomesBeforeB;
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        f.faux.setResponses([
+          connectionError(),
+          () => {
+            outcomesBeforeB = f.outcomes();
+            return fauxAssistantMessage("The requested read-only task is complete.");
+          },
+        ]);
+        completion = f.session.prompt("Complete request A.");
+        await started;
+        await delay(0);
+        assert.equal(f.session.isRetrying, true);
+        assert.equal(f.session.isStreaming, false);
+        assert.deepEqual(f.outcomes(), []);
+        const held = f.extensionEvents.find((event) => event.type === "agent_end" && event.willRetry).messages;
+        await f.session.sendCustomMessage({
+          customType: "retry-outcome-request",
+          content: "Complete a separate read-only request B.",
+          display: true,
+        }, { triggerTurn: true, deliverAs });
+        assert.equal(outcomesBeforeB?.at(-1)?.state, "BLOCKED", `${name}: A is recorded before B runs`);
+        assert.equal(f.session.isRetrying, false, `${name}: A's retry is cancelled`);
+        await completion;
+        const outcomes = f.outcomes();
+        const starts = f.extensionEvents.filter((event) => event.type === "agent_start");
+        const ends = f.extensionEvents.filter((event) => event.type === "agent_end" && !event.willRetry);
+        assert.deepEqual(outcomes.map(({ state }) => state), ["BLOCKED", "DONE"]);
+        assert.equal(starts.length, 2);
+        assert.equal(starts[1].continuesRetry, false, `${name}: B starts a new request`);
+        assert.equal(ends.length, 2);
+        assert.deepEqual(ends[0].messages, held, `${name}: A has its own terminal event`);
+        assert.equal(ends[1].heldRunMessages, undefined, `${name}: B has no held messages from A`);
+        assert.equal(ends[1].messages.some((message) => held.includes(message)), false);
+        assert.deepEqual(outcomes[1].requiredOperations ?? [], []);
+        assert.doesNotMatch(outcomes[1].reason, /connect|reach/i);
+        const endAIndex = f.extensionEvents.indexOf(ends[0]);
+        assert.ok(endAIndex < f.extensionEvents.indexOf(starts[1]), `${name}: A settles before B starts`);
+        assert.deepEqual(f.retryEvents().map(({ type, success, finalError }) => [type, success, finalError]), [
+          ["auto_retry_start", undefined, undefined], ["auto_retry_end", false, "Retry cancelled"],
+        ]);
+        assert.equal(f.faux.state.callCount, 2, `${name}: A makes no further retry call`);
+        console.log(`${name} ${mode} delivery=${deliverAs ?? "default"}: ${JSON.stringify({ outcomes: outcomes.map(({ state }) => state), calls: f.faux.state.callCount })}`);
+      } finally {
+        f.session.abortRetry();
+        await completion;
+        f.close();
+      }
+    }
+  },
+  async B15b(mode) {
+    const name = "B15b a custom message appended during backoff settles the held run first";
+    const f = await fixture(mode, { baseDelayMs: 60_000 });
+    let completion;
+    try {
+      let outcomesAtAppend;
+      f.session.subscribe((event) => {
+        if (event.type === "message_start" && event.message.role === "custom") outcomesAtAppend = f.outcomes();
+      });
+      const started = new Promise((resolve) => f.session.subscribe((event) => {
+        if (event.type === "auto_retry_start") resolve();
+      }));
+      f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+      completion = f.session.prompt("Complete request A.");
+      await started;
+      await delay(0);
+      assert.equal(f.session.isRetrying, true);
+      assert.equal(f.session.isStreaming, false);
+      assert.deepEqual(f.outcomes(), []);
+      await f.session.sendCustomMessage({
+        customType: "retry-outcome-note",
+        content: "A history note after request A.",
+        display: true,
+      });
+      assert.equal(outcomesAtAppend?.at(-1)?.state, "BLOCKED", `${name}: A is recorded before the message is appended`);
+      const branch = f.session.sessionManager.getBranch();
+      const note = branch.at(-1);
+      const outcome = branch.filter((entry) => entry.type === "custom" && entry.customType === "vinci-task-outcome").at(-1);
+      assert.equal(note.type, "custom_message");
+      assert.equal(note.customType, "retry-outcome-note");
+      assert.equal(note.parentId, outcome.id, `${name}: the note follows A's terminal receipt`);
+      assert.equal(f.session.messages.at(-1)?.customType, "retry-outcome-note");
+      assert.equal(f.session.isRetrying, false);
+      await completion;
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"]);
+      assert.equal(f.faux.state.callCount, 1, `${name}: A makes no further retry call`);
+      assert.deepEqual(f.retryEvents().map(({ type, success, finalError }) => [type, success, finalError]), [
+        ["auto_retry_start", undefined, undefined], ["auto_retry_end", false, "Retry cancelled"],
+      ]);
+      console.log(`${name} ${mode}: ${JSON.stringify({ outcome: outcome.data.state, calls: f.faux.state.callCount })}`);
+    } finally {
+      f.session.abortRetry();
+      await completion;
+      f.close();
+    }
+  },
+  async B16(mode) {
+    const name = "B16 an extension command during backoff settles before creating its context";
+    let commandCalls = 0;
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      configureExtension(pi) {
+        pi.registerCommand("retry-outcome-check", {
+          handler: async () => {
+            commandCalls++;
+            pi.appendEntry("retry-command-history", { checked: true });
+          },
+        });
+      },
+    });
+    let completion;
+    try {
+      let outcomesAtContext;
+      const runner = f.session.extensionRunner;
+      const createContext = runner.createCommandContext.bind(runner);
+      runner.createCommandContext = (...args) => {
+        outcomesAtContext = f.outcomes();
+        return createContext(...args);
+      };
+      const started = new Promise((resolve) => f.session.subscribe((event) => {
+        if (event.type === "auto_retry_start") resolve();
+      }));
+      f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+      completion = f.session.prompt("Complete request A.");
+      await started;
+      await delay(0);
+      assert.equal(f.session.isRetrying, true);
+      assert.equal(f.session.isStreaming, false);
+      await f.session.prompt("/retry-outcome-check");
+      assert.equal(outcomesAtContext?.at(-1)?.state, "BLOCKED", `${name}: A is recorded before command context creation`);
+      assert.equal(commandCalls, 1);
+      const branch = f.session.sessionManager.getBranch();
+      const outcome = branch.filter((entry) => entry.type === "custom" && entry.customType === "vinci-task-outcome").at(-1);
+      assert.equal(branch.at(-1)?.customType, "retry-command-history");
+      assert.equal(branch.at(-1)?.parentId, outcome.id);
+      assert.equal(f.session.isRetrying, false);
+      await completion;
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"]);
+      assert.deepEqual(f.extensionErrors, []);
+      assert.equal(f.faux.state.callCount, 1, `${name}: the command does not resume A's retry`);
+      console.log(`${name} ${mode}: ${JSON.stringify({ outcome: outcome.data.state, calls: f.faux.state.callCount })}`);
+    } finally {
+      f.session.abortRetry();
+      await completion;
+      f.close();
+    }
+  },
+  async B17(mode) {
+    const name = "B17 manual compaction during backoff settles before rewriting history";
+    let compactionHooks = 0;
+    const summary = "The saved request is complete; request A stopped after a connection error.";
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      compaction: { keepRecentTokens: 1 },
+      configureExtension(pi) {
+        pi.on("session_before_compact", ({ preparation }) => {
+          compactionHooks++;
+          return { compaction: { summary, firstKeptEntryId: preparation.firstKeptEntryId, tokensBefore: preparation.tokensBefore } };
+        });
+      },
+    });
+    let completion;
+    try {
+      let outcomesAtCompaction;
+      f.session.subscribe((event) => {
+        if (event.type === "compaction_start") outcomesAtCompaction = f.outcomes();
+      });
+      f.faux.setResponses([
+        fauxAssistantMessage("The saved read-only task is complete."),
+        connectionError(),
+        fauxAssistantMessage("Must not be reached."),
+      ]);
+      await f.session.prompt("Complete a saved read-only request.");
+      const started = new Promise((resolve) => f.session.subscribe((event) => {
+        if (event.type === "auto_retry_start") resolve();
+      }));
+      completion = f.session.prompt("Complete request A.");
+      await started;
+      await delay(0);
+      assert.equal(f.session.isRetrying, true);
+      assert.equal(f.session.isStreaming, false);
+      const result = await f.session.compact();
+      assert.deepEqual(outcomesAtCompaction?.map(({ state }) => state), ["DONE", "BLOCKED"], `${name}: A is recorded before compaction starts`);
+      assert.equal(compactionHooks, 1);
+      assert.equal(result.summary, summary);
+      const branch = f.session.sessionManager.getBranch();
+      const outcome = branch.filter((entry) => entry.type === "custom" && entry.customType === "vinci-task-outcome").at(-1);
+      const compacted = branch.filter((entry) => entry.type === "compaction").at(-1);
+      assert.equal(compacted?.parentId, outcome.id, `${name}: compaction follows A's terminal receipt`);
+      assert.ok(f.session.messages.some((message) => message.role === "compactionSummary" && message.summary === summary));
+      assert.equal(f.session.isRetrying, false);
+      await completion;
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE", "BLOCKED"]);
+      assert.equal(f.faux.state.callCount, 2, `${name}: neither A's retry nor model compaction runs`);
+      console.log(`${name} ${mode}: ${JSON.stringify({ outcome: outcome.data.state, calls: f.faux.state.callCount })}`);
+    } finally {
       f.session.abortRetry();
       await completion;
       f.close();

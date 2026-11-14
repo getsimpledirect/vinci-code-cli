@@ -1461,6 +1461,10 @@ export class AgentSession {
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return false;
 
+		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+			await this.settleRetry();
+		}
+
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
 
@@ -1645,8 +1649,14 @@ export class AgentSession {
 				this.agent.steer(appMessage);
 			}
 		} else if (options?.triggerTurn) {
+			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+				await this.settleRetry();
+			}
 			await this._runAgentPrompt(appMessage);
 		} else {
+			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+				await this.settleRetry();
+			}
 			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
 				message.customType,
@@ -1968,6 +1978,10 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+			await this.settleRetry();
+		}
+
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
