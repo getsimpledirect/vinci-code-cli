@@ -940,9 +940,9 @@ try {
   for (const [operator, commands] of [
     // A descriptor duplication before the write (`2>&1`, `>&2`) must not split it off either.
     [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt", "echo x >&2>|out.txt", "printf x >&2 >\\\n| out.txt", "true && echo x >| out.txt", "true \\\\\necho x >| out.txt", "true \\>| echo x >|out.txt"]],
-    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo x &\\\r\n> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt"]],
+    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo x &\\\r\n> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt", "echo x\\ #foo &> out.txt"]],
     ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt", "echo x >&2 &>>out.txt", "echo x | tee -a &>> out.txt", "sleep 1 & echo x &>> out.txt", "echo x \\\\&>> out.txt"]],
-    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt", "echo x 2>\\\n|out.txt"]],
+    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt", "echo x 2>\\\n|out.txt", "echo x 2>\\\r\n|out.txt"]],
   ]) {
     for (const command of commands) {
       const selectionCount = selections.length;
@@ -985,6 +985,11 @@ try {
     "echo x # &>out.txt",
     "echo x # >| out.txt",
     "echo x #&>> out.txt \\\necho y",
+    "# &> out.txt",
+    "echo y;#c &> out.txt",
+    // The whole rest of the line is the comment, including a `;` and a writer after it.
+    "# a; echo x &> out.txt",
+    "true;# a; echo x &> out.txt",
   ]) {
     const selectionCount = selections.length;
     const result = await toolCall("bash", { command });
@@ -1003,6 +1008,13 @@ try {
   check("`2>&1 >> /dev/null` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 >> /dev/null"));
   check("`echo >& tee out.txt` keeps its previous classification", guard.isShellFileWrite("echo >& tee out.txt"));
   check("an escaped `\\&>` keeps its previous classification (a literal `&`, then `>`)", !guard.isShellFileWrite("echo x \\&> out.txt"));
+  // Comment detection tracks word starts as it scans, so a long line with many `#` stays linear.
+  {
+    const long = "echo " + "a#b ".repeat(160_000);
+    const started = performance.now();
+    guard.isShellFileWrite(long);
+    check("a long line with many `#` is classified in linear time", performance.now() - started < 2_000);
+  }
 
   // No SILENT auto-grant: two adversarial reviews showed a shell command can't be classified "safe to
   // network" (endpoint override, argv[0] impostor, command substitution). EVERY network command — direct

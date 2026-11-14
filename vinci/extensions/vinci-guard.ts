@@ -165,11 +165,14 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
   let current = "";
   let quote: "'" | '"' | "`" | null = null;
   let afterRedirect = false; // the previous character was an unquoted, unescaped `>`
+  let wordStart = true; // the next character starts a word (line or segment start, or after an unescaped blank)
 
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     const redirectBefore: boolean = afterRedirect;
     afterRedirect = false;
+    const wordStartBefore: boolean = wordStart;
+    wordStart = false;
     if (quote) {
       current += ch;
       if (quote !== "'" && ch === "\\" && i + 1 < command.length) {
@@ -186,7 +189,7 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
     }
     // Write detection skips an unquoted comment (`#` starting a word) up to the end of its line;
     // a `\` inside a comment does not continue it.
-    if (keepWriteRedirects && ch === "#" && (current === "" || /\s$/.test(current))) {
+    if (keepWriteRedirects && ch === "#" && wordStartBefore) {
       while (i + 1 < command.length && command[i + 1] !== "\n") i++;
       continue;
     }
@@ -196,11 +199,13 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
       if (keepWriteRedirects && command[i + 1] === "\n") {
         i += 1;
         afterRedirect = redirectBefore;
+        wordStart = wordStartBefore;
         continue;
       }
       if (keepWriteRedirects && command[i + 1] === "\r" && command[i + 2] === "\n") {
         i += 2;
         afterRedirect = redirectBefore;
+        wordStart = wordStartBefore;
         continue;
       }
       current += ch + command[++i];
@@ -214,10 +219,12 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
       if (current.trim()) segments.push(current.trim());
       current = "";
       if ((ch === "|" || ch === "&") && command[i + 1] === ch) i++;
+      wordStart = true;
       continue;
     }
     current += ch;
     afterRedirect = ch === ">";
+    wordStart = ch === " " || ch === "\t";
   }
   if (current.trim()) segments.push(current.trim());
   return segments;
