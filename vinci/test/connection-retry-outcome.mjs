@@ -16,7 +16,7 @@ process.env.GIT_CEILING_DIRECTORIES = owned;
 const connectionError = () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." });
 const selected = process.argv.slice(2);
 
-async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, captureExtensionErrors = false } = {}) {
+async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, captureExtensionErrors = false, terminalDelivery } = {}) {
   const cwd = mkdtempSync(join(owned, `${mode}-`));
   const agentDir = join(cwd, "profile");
   mkdirSync(agentDir);
@@ -35,7 +35,10 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, 
     pi.on("agent_start", (event) => { extensionEvents.push(event); });
     pi.on("agent_end", async (event) => {
       extensionEvents.push(event);
-      if (!event.willRetry) await delay(0);
+      if (!event.willRetry) {
+        await delay(0);
+        await terminalDelivery?.();
+      }
     });
   }, receipt];
   const createRuntime = async ({ cwd: sessionCwd = cwd, agentDir: sessionAgentDir = agentDir, sessionManager, sessionStartEvent }) => {
@@ -303,7 +306,11 @@ const cases = {
   },
   async B12(mode) {
     const name = "B12 a prompt typed during backoff does not inherit the held failure";
-    for (const [tools, streamingBehavior] of [[false, undefined], [false, "steer"], [true, "followUp"]]) {
+    for (const [tools, streamingBehavior, submission] of [
+      [false, undefined, "prompt"], [false, "steer", "prompt"], [true, "followUp", "prompt"],
+      [false, undefined, "steer"], [true, undefined, "steer"],
+      [false, undefined, "followUp"], [true, undefined, "followUp"],
+    ]) {
       const f = await fixture(mode, { tools, baseDelayMs: 60_000 });
       let completion;
       try {
@@ -325,14 +332,18 @@ const cases = {
         assert.equal(f.session.isRetrying, true);
         assert.equal(f.session.isStreaming, false);
         const held = f.extensionEvents.find((event) => event.type === "agent_end" && event.willRetry).messages;
-        await f.session.prompt("Complete a separate read-only request B.", { source: "interactive", streamingBehavior });
+        if (submission === "prompt") {
+          await f.session.prompt("Complete a separate read-only request B.", { source: "interactive", streamingBehavior });
+        } else {
+          await f.session[submission]("Complete a separate read-only request B.");
+        }
+        assert.equal(outcomesBeforeB?.at(-1)?.state, "BLOCKED", `${name}: A is recorded before B runs via ${submission}`);
         f.session.abortRetry();
         await completion;
         const outcomes = f.outcomes();
         const starts = f.extensionEvents.filter((event) => event.type === "agent_start");
         const endB = f.extensionEvents.filter((event) => event.type === "agent_end" && !event.willRetry).at(-1);
-        console.log(`${name} ${mode} tools=${tools} behavior=${streamingBehavior ?? "prompt"}: ${JSON.stringify({ outcomes: outcomes.map(({ state, reason }) => ({ state, reason })), continuesRetry: starts.map(({ continuesRetry }) => continuesRetry) })}`);
-        assert.equal(outcomesBeforeB?.at(-1)?.state, "BLOCKED", `${name}: A is recorded before B runs`);
+        console.log(`${name} ${mode} tools=${tools} submission=${submission} behavior=${streamingBehavior ?? "prompt"}: ${JSON.stringify({ outcomes: outcomes.map(({ state, reason }) => ({ state, reason })), continuesRetry: starts.map(({ continuesRetry }) => continuesRetry) })}`);
         assert.deepEqual(outcomes.map(({ state }) => state), ["BLOCKED", "DONE"]);
         assert.equal(starts.length, 2);
         assert.equal(starts[1].continuesRetry, false, `${name}: B starts a new request`);
@@ -349,6 +360,80 @@ const cases = {
         await completion;
         f.close();
       }
+    }
+  },
+  async B13(mode) {
+    const name = "B13 tree navigation during backoff records the outcome and does not resume the retry";
+    const f = await fixture(mode, { baseDelayMs: 60_000 });
+    let completion;
+    try {
+      f.faux.setResponses([
+        fauxAssistantMessage("The saved read-only task is complete."),
+        connectionError(),
+        fauxAssistantMessage("Must not be reached."),
+      ]);
+      await f.session.prompt("Complete a saved read-only request.");
+      const targetId = f.session.sessionManager.getLeafId();
+      const priorOutcomes = f.outcomes();
+      const started = new Promise((resolve) => f.session.subscribe((event) => {
+        if (event.type === "auto_retry_start") resolve();
+      }));
+      completion = f.session.prompt("Complete request A.");
+      await started;
+      await delay(0);
+      assert.equal(f.session.isRetrying, true);
+      assert.equal(f.session.isStreaming, false);
+      const oldLeafId = f.session.sessionManager.getLeafId();
+      assert.equal((await f.session.navigateTree(targetId)).cancelled, false);
+      const recorded = f.session.sessionManager.getEntries()
+        .filter((entry) => entry.type === "custom" && entry.customType === "vinci-task-outcome")
+        .at(-1);
+      assert.equal(recorded?.data?.state, "BLOCKED", `${name}: A has its own terminal receipt before navigation returns`);
+      assert.equal(recorded.parentId, oldLeafId, `${name}: A's outcome remains on its original branch`);
+      assert.equal(recorded.data.taskId, f.session.sessionId);
+      assert.match(recorded.data.reason, /connect|reach/i);
+      assert.deepEqual(f.outcomes(), priorOutcomes, `${name}: the destination branch excludes A's outcome`);
+      await completion;
+      await delay(0);
+      assert.equal(f.session.isRetrying, false);
+      assert.equal(f.session.sessionManager.getLeafId(), targetId);
+      assert.equal(f.faux.state.callCount, 2, `${name}: navigation prevents another model call`);
+      assert.deepEqual(f.retryEvents().map(({ type, success, finalError }) => [type, success, finalError]), [
+        ["auto_retry_start", undefined, undefined], ["auto_retry_end", false, "Retry cancelled"],
+      ]);
+      console.log(`${name} ${mode}: ${JSON.stringify({ outcome: recorded.data.state, calls: f.faux.state.callCount })}`);
+    } finally {
+      f.session.abortRetry();
+      await completion;
+      f.close();
+    }
+  },
+  async B14(mode) {
+    const name = "B14 dispose bounds invalidation when a terminal handler stalls";
+    let releaseDelivery;
+    const delivery = new Promise((resolve) => { releaseDelivery = resolve; });
+    const f = await fixture(mode, { baseDelayMs: 60_000, captureExtensionErrors: true, terminalDelivery: () => delivery });
+    let completion;
+    try {
+      const context = f.session.extensionRunner.createCommandContext();
+      const started = new Promise((resolve) => f.session.subscribe((event) => {
+        if (event.type === "auto_retry_start") resolve();
+      }));
+      f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+      completion = f.session.prompt("Complete the read-only task.");
+      await started;
+      await delay(0);
+      assert.equal(f.session.isRetrying, true);
+      assert.equal(f.session.dispose(), undefined, `${name}: dispose stays synchronous`);
+      assert.doesNotThrow(() => context.getSystemPrompt(), `${name}: terminal delivery gets a chance to finish`);
+      await delay(5_100);
+      assert.throws(() => context.getSystemPrompt(), /stale/, `${name}: captured APIs expire while delivery is still stalled`);
+      assert.equal(f.faux.state.callCount, 1);
+    } finally {
+      releaseDelivery();
+      f.session.abortRetry();
+      await completion;
+      f.close();
     }
   },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:

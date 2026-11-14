@@ -273,6 +273,7 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+const DISPOSE_INVALIDATION_TIMEOUT_MS = 5_000;
 
 // ============================================================================
 // AgentSession Class
@@ -859,9 +860,16 @@ export class AgentSession {
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 			);
 		};
-		// Terminal handlers may await earlier extensions before persisting their outcome.
-		if (hasHeldAgentEnd) void settled.then(invalidate, invalidate);
-		else invalidate();
+		// Allow terminal delivery before invalidation, with a limit for stalled handlers.
+		if (hasHeldAgentEnd) {
+			const timeout = setTimeout(invalidate, DISPOSE_INVALIDATION_TIMEOUT_MS);
+			timeout.unref();
+			const finishInvalidation = () => {
+				clearTimeout(timeout);
+				invalidate();
+			};
+			void settled.then(finishInvalidation, finishInvalidation);
+		} else invalidate();
 		this._disconnectFromAgent();
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
@@ -1515,6 +1523,12 @@ export class AgentSession {
 			this._throwIfExtensionCommand(text);
 		}
 
+		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+			await this.settleRetry();
+			await this.prompt(text, { images, streamingBehavior: "steer" });
+			return;
+		}
+
 		// Expand skill commands and prompt templates
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
@@ -1533,6 +1547,12 @@ export class AgentSession {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
+		}
+
+		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+			await this.settleRetry();
+			await this.prompt(text, { images, streamingBehavior: "followUp" });
+			return;
 		}
 
 		// Expand skill commands and prompt templates
@@ -3062,6 +3082,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		await this.settleRetry();
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target
