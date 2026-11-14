@@ -327,6 +327,10 @@ async function shellWriteRouteChecks(onlyCase) {
   const project = realpathSync(workspace);
   const route = `write and edit can create or change files under ${project}; a file outside it needs your approval through the write tool.`;
   const genericReason = `Vinci blocked a shell-based file write; ${route}`;
+  // Fail-closed wording: a command that is not provably plain, or carries any secret-looking text,
+  // never names a target and never echoes the project path.
+  const neutralRoute = "write and edit can create or change files in this project; a file outside it needs your approval through the write tool.";
+  const neutralReason = `Vinci blocked a shell-based file write; ${neutralRoute}`;
   for (const name of ["A1", "A2", "A3", "A4", "A6"]) {
     if (onlyCase && name !== onlyCase) continue;
     // Out-of-project targets live in this run's own temp root (outside the project), never a fixed
@@ -335,7 +339,7 @@ async function shellWriteRouteChecks(onlyCase) {
     const command = name === "A2" ? `echo x > ${outside}`
       : name === "A6" ? `python3 -c "open('${outside}','w')"`
       : name === "A3" ? 'echo x > "$OUT"' : "echo x > out.txt";
-    const target = name === "A2" || name === "A6" ? outside : join(project, "out.txt");
+    const target = name === "A2" ? outside : join(project, "out.txt");
     const promptsBefore = selections.length;
     const controlsBefore = controls.length;
     const noticesBefore = notifications.length;
@@ -344,7 +348,7 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.equal(refusal?.block, true, `${name}: shell write remains blocked`);
     assert.equal(existsSync(target), false, `${name}: blocked shell write creates no file`);
     assert.match(refusal.reason, /^Vinci blocked a shell-based file write/, `${name}: intended shell-write refusal`);
-    assert.ok(refusal.reason.includes(project), `${name}: reason names the resolved project path`);
+    if (name !== "A3" && name !== "A6") assert.ok(refusal.reason.includes(project), `${name}: reason names the resolved project path`);
     assert.equal(selections.length, promptsBefore, `${name}: shell block itself needs no prompt`);
     const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
     assert.equal(control?.display, false, `${name}: model guidance stays private`);
@@ -358,25 +362,30 @@ async function shellWriteRouteChecks(onlyCase) {
       assert.match(refusal.reason, /inside the project; use write with that path/, `${name}: reason gives the in-project write route`);
       assert.ok(control.content.includes(target), `${name}: control names the in-project target`);
       assert.ok(notice[0].message === "Vinci tried to write a file through the shell — switching to the safer file editor." || notice[0].message === `Vinci tried to write a file through the shell — switching to the safer file editor. (saving under ${project} instead)`);
-    } else if (name === "A2" || name === "A6") {
+    } else if (name === "A6") {
+      // An interpreter one-liner is never provably plain: it names no target, gets neutral wording.
+      assert.equal(refusal.reason, neutralReason, "A6: interpreter write names no target");
+      assert.doesNotMatch(refusal.reason, /Target "|Use write with "/, "A6: interpreter reason names no target");
+      assert.doesNotMatch(notice[0].message, /saving under/, "A6: outside interpreter target has no in-project saving notice");
+    } else if (name === "A2") {
       assert.ok(refusal.reason.includes(target), `${name}: reason names the outside target`);
       assert.match(refusal.reason, /write will ask for approval.*outside the project/, `${name}: reason explains outside-project approval through write`);
       assert.ok(control.content.includes(target), `${name}: control names the outside target`);
       assert.match(control.content, /write will ask for approval.*outside the project/);
       assert.doesNotMatch(notice[0].message, /saving under/, `${name}: outside target has no in-project saving notice`);
     } else {
-      assert.equal(refusal.reason, genericReason, "A3: dynamic target gets only the generic route, without an invented path");
+      assert.equal(refusal.reason, neutralReason, "A3: dynamic target gets only the generic route, without an invented path");
       assert.doesNotMatch(control.content, /\$OUT|Target "/, "A3: control invents no dynamic target path");
       assert.doesNotMatch(notice[0].message, /saving under/, "A3: unknown target has no saving notice");
       assert.equal(existsSync(join(workspace, "$OUT")), false, "A3: no literal variable-named file created");
       for (const dynamic of ["echo x > $OUT", 'echo x > "$(printf out.txt)"', "echo x > `printf out.txt`", "tee $OUT", "cd ..; echo x > out.txt", 'echo x > "unterminated']) {
         const result = await toolCall("bash", { command: dynamic });
         assert.equal(result?.block, true, `A3: dynamic write remains blocked: ${dynamic}`);
-        assert.equal(result.reason, genericReason, `A3: no invented target: ${dynamic}`);
+        assert.equal(result.reason, neutralReason, `A3: no invented target: ${dynamic}`);
         assert.equal(existsSync(target), false, "A3: dynamic write creates no result file");
       }
     }
-    assert.ok(control.content.includes(route), `${name}: control names project scope and outside approval`);
+    assert.ok(control.content.includes(name === "A3" || name === "A6" ? neutralRoute : route), `${name}: control names project scope and outside approval`);
     assert.match(control.content, /throwaway diagnostics/i, `${name}: scratch advice is scoped to throwaway diagnostics`);
     assert.match(control.content, /results the task asked to keep/i, `${name}: requested results may be saved`);
     assert.match(control.content, /Do not retry with echo, printf, tee, heredocs, sed -i, perl -pi, or interpreter one-liners/, `${name}: no alternate shell writer retry`);
@@ -394,8 +403,22 @@ async function shellWriteRouteChecks(onlyCase) {
   if (onlyCase) return;
   const escaped = join(realpathSync(runRoot), "escaped.txt");
   symlinkSync(runRoot, join(workspace, "route-link"));
+  // Positive controls above (A1 names an in-project target, A2 an outside one). Commands that are
+  // not provably plain — quoting, escapes, globs, expansions — name nothing at all.
+  for (const command of [
+    "echo x > 'out.txt'",
+    "echo x > out\\ file.txt",
+    "echo x > out*.txt",
+    "echo x > $HOME/out.txt",
+    "echo x > ~/out.txt",
+    "echo x > {a,b}.txt",
+    'echo "a > decoy.txt" >> "result file.txt"',
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Non-plain write stays blocked: ${command}`);
+    assert.equal(result.reason, neutralReason, `Non-plain write names nothing: ${command}`);
+  }
   for (const [command, target, outside] of [
-    ['echo "a > decoy.txt" >> "result file.txt"', join(project, "result file.txt"), false],
     ["echo x\t>\ttabbed.txt", join(project, "tabbed.txt"), false],
     ["tee -a results.txt", join(project, "results.txt"), false],
     ["echo x > route-link/escaped.txt", escaped, true],
@@ -429,11 +452,18 @@ async function shellWriteRouteChecks(onlyCase) {
     const controlsBefore = controls.length;
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `${name}: interpreter write remains blocked`);
-    assert.ok(result.reason.includes(`Use write with "${realpathSync(interpreterTarget)}"`), `${name}: reason names the certain target`);
+    // Interpreter writes are never provably plain: they get the neutral route and name no target.
+    assert.equal(result.reason, neutralReason, `${name}: interpreter write names no target`);
     const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
     assert.ok(control, `${name}: shell-write control is present`);
-    assert.ok(control.content.includes(`Use write with "${realpathSync(interpreterTarget)}"`), `${name}: control names the certain target`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no interpreter target`);
   }
+  // The unquoted, backslash-escaped form of the same node one-liner (the quoted form is in the
+  // list above) also stays blocked and names nothing.
+  const unquotedNode = await toolCall("bash", { command: `node -e require\\('fs'\\).writeFileSync\\('x','*'\\)` });
+  assert.equal(unquotedNode?.block, true, "unquoted node -e write remains blocked");
+  assert.equal(unquotedNode.reason, neutralReason, "unquoted node -e write names no target");
+  assert.doesNotMatch(unquotedNode.reason, /Target "|Use write with "/, "unquoted node -e reason names no target");
   for (const [name, command] of [
     // These previously named targets despite uncertain execution or extra arguments.
     ["node environment preload gets only the generic route", `NODE_OPTIONS=--require=./hook.cjs node -e "require('fs').writeFileSync('x','y')"`],
@@ -480,7 +510,7 @@ async function shellWriteRouteChecks(onlyCase) {
     const controlsBefore = controls.length;
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `${name}: shell write remains blocked`);
-    assert.equal(result.reason, genericReason, name);
+    assert.equal(result.reason, neutralReason, name);
     const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
     assert.ok(control, `${name}: shell-write control is present`);
     assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no target`);
@@ -508,11 +538,19 @@ async function shellWriteRouteChecks(onlyCase) {
     "echo x > out.txt # > other.txt",
     "cat <<EOF > out.txt\nx\nEOF",
     "echo x > out*.txt",
+    "tee '--' -a",
+    "python3 -c \"open('/tmp/`printf x`','w')\"",
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Uncertain target stays blocked: ${command}`);
+    assert.equal(result.reason, neutralReason, `Uncertain target gets only the generic route: ${command}`);
+  }
+  // Plain commands whose target the write tool cannot stand in for keep the project route but name
+  // nothing.
+  for (const command of [
     "echo x > /dev/tcp/127.0.0.1/9",
     "echo x > =ls",
     "echo x > /proc/self/fd/1",
-    "tee '--' -a",
-    "python3 -c \"open('/tmp/`printf x`','w')\"",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Uncertain target stays blocked: ${command}`);
@@ -526,7 +564,7 @@ async function shellWriteRouteChecks(onlyCase) {
     const controlsBefore = controls.length;
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `chdir interpreter write stays blocked: ${command}`);
-    assert.equal(result.reason, genericReason, `chdir statements get only the generic route: ${command}`);
+    assert.equal(result.reason, neutralReason, `chdir statements get only the generic route: ${command}`);
     const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
     assert.ok(control, `chdir interpreter write has a shell-write control: ${command}`);
     assert.doesNotMatch(control.content, /Target "|Use write with "/, `chdir statements name no target: ${command}`);
@@ -568,12 +606,13 @@ async function shellWriteRouteChecks(onlyCase) {
       const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
       assert.ok(control, `${name}: shell-write control is present`);
       assert.ok(!result.reason.includes(directoryName) && !control.content.includes(directoryName), name);
-      assert.equal(result.reason, genericReason, `${name}: resolved target gets only the generic route`);
+      // The plain redirect keeps the project route; the quoted interpreter command is not plain, so
+      // it gets the neutral route.
+      assert.equal(result.reason, command.startsWith("echo") ? genericReason : neutralReason, `${name}: resolved target gets only the generic route`);
       assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no target`);
     }
     const controlsBefore = controls.length;
     const result = await toolCall("bash", { command: "echo x > out.txt" }, { ...ctx, cwd: directory });
-    const neutralRoute = "write and edit can create or change files in this project; a file outside it needs your approval through the write tool.";
     assert.equal(result?.block, true, `${name}: shell write in this project remains blocked`);
     assert.equal(result.reason, `Vinci blocked a shell-based file write; ${neutralRoute}`, `${name}: project path gets neutral wording`);
     const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
@@ -581,6 +620,30 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.ok(control.content.includes(neutralRoute), `${name}: project control uses neutral wording`);
     assert.equal(control.content.includes(directoryName), false, `${name}: project control hides the directory name`);
     assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: project control names no target`);
+  }
+  // Quoting can hide a secret from the masker (`pass""word=` is `password=` to the shell), so a quoted
+  // command never names its target, and its route never echoes the project path.
+  {
+    const command = `echo pass""word=hunter2xyz > ${join(realpathSync(runRoot), "hunter2xyz")}`;
+    assert.equal(guard.redactSecrets(command), command, "fixture: the quoted secret is not recognized by the masker");
+    const before = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, "quoted secret write stays blocked");
+    assert.equal(result.reason, neutralReason, "quoted secret write names nothing and uses neutral wording");
+    assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, "guidance never repeats a quoted secret");
+  }
+  // A command that carries a secret gets neutral wording even when the secret value also appears in
+  // the project path (the command secret answers here; the bare directory name is not masked).
+  {
+    const directory = join(runRoot, "hunter2xyz-proj");
+    mkdirSync(directory);
+    const command = "echo password=hunter2xyz > out.txt";
+    assert.notEqual(guard.redactSecrets(command), command, "fixture command carries a recognized secret");
+    const before = controls.length;
+    const result = await toolCall("bash", { command }, { ...ctx, cwd: directory });
+    assert.equal(result?.block, true, "secret write in a secret-named project stays blocked");
+    assert.equal(result.reason, `Vinci blocked a shell-based file write; ${neutralRoute}`, "secret-carrying command gets neutral project wording");
+    assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, "guidance never repeats the secret through the project path");
   }
   // An opaque value the user supplied is vaulted behind a handle; once restored into the command no
   // masker recognizes it, so a command that carried a handle names no target at all.

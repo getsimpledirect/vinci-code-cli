@@ -493,13 +493,26 @@ export function isShellFileWrite(command: string): boolean {
 }
 
 /** Literal redirect/tee targets for wording only; "" means "unknown, give the generic route".
- * It never changes the block decision. It names a target only for ONE simple command whose target
- * is a plain literal path: anything that could move the working directory or hide the real
- * destination (several commands, cd/pushd/builtin wrappers, comments, heredocs, fd redirects,
- * expansions, globs, unusual quoting) yields "" instead of a guessed path. */
+ * It never changes the block decision. It names a target only for ONE PLAIN command whose target
+ * is a plain literal path: quoting, escapes, globs, expansions, or anything else that could hide
+ * the real destination makes the command not plain, and a non-plain command yields "" instead of
+ * a guessed path — it could also hide a secret from redactSecrets (e.g. pass""word=…). */
 const PLAIN_TARGET = /^[A-Za-z0-9._\/+@%=,:-]+$/;
 const SAFE_TARGET_TEXT = /^[A-Za-z0-9._\/+@%=,: -]+$/;
-const QUOTED_PLAIN_TARGET = /^(['"])([A-Za-z0-9._\/+@%=,: -]+)\1$/;
+
+/** A command is plain when its whole raw text is one simple command whose redirect destination
+ * cannot be obscured: no quotes, escapes, globs, expansions, or other special characters; one
+ * segment; no comment, heredoc, or fd redirects; no wrapper or nested-shell executable; and no
+ * leading VAR= assignment. Wording only; it never decides whether to block. */
+function isPlainShellCommand(command: string): boolean {
+  const segments = shellSegments(command);
+  if (segments.length !== 1 || /['"\\*?\[\]{}~]|[^\t\x20-\x7e]|[#`$]|<<|>&|&>|>\||\d>/.test(command)) return false;
+  // A leading VAR= assignment can preload code before the visible command runs.
+  if (/^[A-Za-z_]\w*=/.test(shellWords(command)[0] ?? "")) return false;
+  const executable = shellWords(segments[0]).find((word) => !/^[A-Za-z_]\w*=/.test(word))?.split("/").pop() ?? "";
+  // A nested shell (`bash -c '...'`) hides its own cd and wrappers from this check.
+  return !/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs|bash|sh|zsh|dash|ksh|fish)$/.test(executable);
+}
 
 function isSafeTargetText(text: string): boolean {
   return SAFE_TARGET_TEXT.test(text) && redactSecrets(text) === text;
@@ -507,20 +520,16 @@ function isSafeTargetText(text: string): boolean {
 
 /** Shared wording gate for shell and interpreter writers; it never decides whether to block. */
 function shellWriteCommandBody(command: string): string | null {
-  const segments = shellSegments(command);
-  if (segments.length !== 1 || /[^\t\x20-\x7e]|[#`$]|<<|>&|&>|>\||\d>/.test(command)) return null;
-  const executable = shellWords(segments[0]).find((word) => !/^[A-Za-z_]\w*=/.test(word))?.split("/").pop() ?? "";
-  // A nested shell (`bash -c '...'`) hides its own cd and wrappers from this check.
-  if (/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs|bash|sh|zsh|dash|ksh|fish)$/.test(executable)) return null;
-  // Interpreter options can change cwd or load code; only a bare code flag and payload are certain.
-  const inline = interpreterInlinePayload(segments[0], command);
-  if (inline !== null && !inline.certainArguments) return null;
-  return commandBody(segments[0]);
+  if (!isPlainShellCommand(command)) return null;
+  return commandBody(shellSegments(command)[0]);
 }
 
 function shellWriteTargets(command: string): string[] {
   const body = shellWriteCommandBody(command);
   if (body === null) return [""];
+  // An interpreter's inline code can write anywhere, so a redirect after one names nothing.
+  const executable = shellWords(body)[0]?.split("/").pop() ?? "";
+  if (/^(?:python|pypy|node|ruby|perl)\d*(?:\.\d+)?$/i.test(executable)) return [""];
   const tokenPattern = /(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^ \t'"\\<>])+|>>?|</g;
   if (body.replace(tokenPattern, "").trim()) return [""];
   const tokens = body.match(tokenPattern) ?? [];
@@ -540,7 +549,7 @@ function shellWriteTargets(command: string): string[] {
   }
   if (rawTargets.length === 0) return [""];
   return rawTargets.flatMap((raw) => {
-    const literal = PLAIN_TARGET.test(raw) ? raw : (QUOTED_PLAIN_TARGET.exec(raw)?.[2] ?? "");
+    const literal = PLAIN_TARGET.test(raw) ? raw : "";
     return literal === "/dev/null" ? [] : [literal];
   });
 }
@@ -661,40 +670,13 @@ function inlineWriteTargets(payload: string, kind: InterpreterKind): string[] {
   return targets;
 }
 
-/** Naming accepts only one complete write expression with literal arguments. */
-function certainInlineWriteTarget(payload: string, kind: InterpreterKind): string | null {
-  if (Buffer.byteLength(payload, "utf8") > 128 * 1024 || /[\r\n]/.test(payload)) return null;
-  const literal = String.raw`(?:'[^'\\]*'|"[^"\\]*")`;
-  const expressions: Record<InterpreterKind, string> = {
-    node: String.raw`require\s*\(\s*(${literal})\s*\)\s*\.\s*(?:writeFileSync|appendFileSync)\s*\(\s*(${literal})\s*,\s*(${literal})\s*\)`,
-    python: String.raw`open\s*\(\s*(${literal})\s*,\s*(?:mode\s*=\s*)?(${literal})\s*\)(?:\s*\.\s*write\s*\(\s*(${literal})\s*\))?(?:\s*\.\s*close\s*\(\s*\))?`,
-    ruby: String.raw`File\s*\.\s*(?:write|binwrite)\s*\(\s*(${literal})\s*,\s*(${literal})\s*\)`,
-    // Three-argument form only: a two-argument open trims and parses its filename.
-    perl: String.raw`open\s*\(\s*(?:[A-Za-z_]\w*|my\s+\$[A-Za-z_]\w*)\s*,\s*(${literal})\s*,\s*(${literal})\s*\)`,
-  };
-  const match = new RegExp(String.raw`^${expressions[kind]}\s*;?$`).exec(payload.trim());
-  if (match === null) return null;
-  const values: string[] = [];
-  for (const text of match.slice(1)) {
-    if (text === undefined) continue;
-    const tokens = inlineTokens(text, kind);
-    if (tokens.length !== 1 || !tokens[0].literal) return null;
-    if ((kind === "perl" || kind === "ruby") && text.startsWith('"') && text.includes("@")) return null;
-    values.push(tokens[0].value);
-  }
-  if (kind === "node") return values[0] === "fs" ? values[1] : null;
-  if (kind === "python") return WRITABLE_MODE.test(values[1]) ? values[0] : null;
-  if (kind === "ruby") return values[0];
-  return /^(?:>|>>|\+>|\+<|\+>>)$/.test(values[0]) ? values[1] : null;
-}
-
 /** The inline payload of an interpreter one-liner segment — the word after -c (python) or
  *  -e/--eval (node/ruby/perl), or the heredoc body a `<< MARKER` introduces — or null when this
  *  segment is not an interpreter one-liner. */
 function interpreterInlinePayload(
   segment: string,
   command: string,
-): { kind: InterpreterKind; payload: string; certainArguments: boolean } | null {
+): { kind: InterpreterKind; payload: string } | null {
   const body = commandBody(segment);
   const words = unwrapExecutableWords(shellWords(body));
   if (words === null) return null;
@@ -716,10 +698,10 @@ function interpreterInlinePayload(
     if (word === "--") break;
     const flag = kind === "python" ? /^-c(.*)$/ : kind === "node" ? /^(?:-e|--eval=|-p|--print=)(.*)$/ : /^-e(.*)$/;
     if ((kind !== "python" && (word === "--eval" || kind === "node" && word === "--print")) || word === "-e" || word === "-c" || kind === "node" && word === "-p") {
-      if (words[index + 1] !== undefined) return { kind, payload: words[index + 1], certainArguments: index === 1 && words.length === 3 };
+      if (words[index + 1] !== undefined) return { kind, payload: words[index + 1] };
     } else {
       const attached = flag.exec(word);
-      if (attached?.[1]) return { kind, payload: attached[1], certainArguments: index === 1 && words.length === 2 };
+      if (attached?.[1]) return { kind, payload: attached[1] };
     }
     const valued = kind === "python" ? /^-[WX]$/ : kind === "node" ? /^(?:-r|--require|--import|--input-type)$/ : /^(?:-r|-I|-F)$/;
     if (valued.test(word)) index++;
@@ -738,7 +720,7 @@ function interpreterInlinePayload(
         if (line.trim() === (marker[1] ?? marker[2] ?? marker[3])) break;
         script.push(line);
       }
-      return { kind, payload: script.join("\n"), certainArguments: false };
+      return { kind, payload: script.join("\n") };
     }
   }
   return null;
@@ -1857,25 +1839,17 @@ export default function (pi: ExtensionAPI) {
       if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
         recordVinciShellWriteRedirectToolCall(vinciTaskIdOf(ctx), event.toolCallId);
         const projectPath = projectRoot ?? resolve(ctx.cwd);
-        const projectScope = isSafeTargetText(projectPath) ? `under ${projectPath}` : "in this project";
+        // A command with any secret-looking text names nothing and gets neutral wording: a target
+        // or a project path may repeat that value. A non-plain command can hide a secret behind
+        // quoting (pass""word=…), so it never echoes a path either.
+        const carriesSecret = carriesRestoredSecrets || redactSecrets(cmd) !== cmd
+          || redactSecrets(ctx.cwd) !== ctx.cwd || redactSecrets(projectPath) !== projectPath;
+        const projectScope = !carriesSecret && isPlainShellCommand(cmd) && isSafeTargetText(projectPath)
+          ? `under ${projectPath}` : "in this project";
         const route = `write and edit can create or change files ${projectScope}; a file outside it needs your approval through the write tool.`;
-        // Name targets only when the command text is certain and secret-free: a command that had
-        // secret handles restored holds values no masker can recognize, and expansions or command
-        // substitution (also inside interpreter code) make the real destination unknown.
-        // A command with any secret-looking text names nothing: a target may repeat that value.
-        const certainText = !carriesRestoredSecrets && redactSecrets(cmd) === cmd && shellWriteCommandBody(cmd) !== null;
-        // Environment assignments can preload code before the inline expression runs.
-        const inline = certainText && !/^[A-Za-z_]\w*=/.test(shellWords(cmd)[0] ?? "")
-          ? interpreterInlinePayload(cmd, cmd)
-          : null;
-        const interpreterTarget = inline?.certainArguments ? certainInlineWriteTarget(inline.payload, inline.kind) : null;
-        const targets = certainText
-          ? [
-              ...shellWriteTargets(cmd),
-              // Any chdir in interpreter code (with or without parentheses) moves relative targets.
-              ...(interpreterTarget !== null && SAFE_TARGET_TEXT.test(interpreterTarget) && (isAbsolute(interpreterTarget) || !/chdir/i.test(cmd)) ? [interpreterTarget] : []),
-            ]
-          : [];
+        // Only a plain, secret-free command names its redirect target; everything else gets the
+        // route alone. shellWriteTargets already yields "" for a non-plain command.
+        const targets = carriesSecret ? [] : shellWriteTargets(cmd);
         const targetGuidance = targets.flatMap((target) => {
           // Virtual paths (sockets, devices, process files) and zsh `=cmd` expansion are not files
           // the write tool can stand in for.
