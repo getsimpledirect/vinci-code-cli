@@ -8,6 +8,7 @@ import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earen
 import { AgentSessionRuntime, AuthStorage, createAgentSession, DefaultResourceLoader, ModelRegistry, SessionManager, SettingsManager } from "../../packages/coding-agent/dist/index.js";
 import { printModeExitCode } from "../../packages/coding-agent/dist/modes/print-mode.js";
 import receipt from "../dist/extensions/vinci-receipt.js";
+import verification from "../dist/extensions/vinci-verification.js";
 
 process.env.VINCI_CODE = "1";
 const owned = mkdtempSync(join(tmpdir(), "connection-retry-"));
@@ -30,7 +31,7 @@ async function assertWithin(promise, timeoutMs, message) {
   }
 }
 
-async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, captureExtensionErrors = false, terminalDelivery, configureExtension, firstAgentEnd, compaction } = {}) {
+async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, verificationEnabled = false, captureExtensionErrors = false, terminalDelivery, configureExtension, firstAgentEnd, compaction } = {}) {
   const cwd = mkdtempSync(join(owned, `${mode}-`));
   const agentDir = join(cwd, "profile");
   mkdirSync(agentDir);
@@ -60,7 +61,7 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, 
       }
     });
     configureExtension?.(pi);
-  }, receipt];
+  }, ...(verificationEnabled ? [verification] : []), receipt];
   const createRuntime = async ({ cwd: sessionCwd = cwd, agentDir: sessionAgentDir = agentDir, sessionManager, sessionStartEvent }) => {
     const resourceLoader = new DefaultResourceLoader({
       cwd: sessionCwd, agentDir: sessionAgentDir, settingsManager, extensionFactories,
@@ -129,6 +130,7 @@ const cases = {
       assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE"], "B1 OUTCOME: normal evidence must decide the only final outcome");
       assert.equal(outcome.verificationStatus, "none");
       assert.equal(sameTurn, true);
+      assert.deepEqual(f.extensionEvents.filter((event) => event.type === "agent_start").map(({ continuesRetry }) => continuesRetry), [false, true], "B1: the retry starts as a continuation of the same request");
       assert.deepEqual(f.retryEvents().map(({ type, success, attempt }) => ({ type, success, attempt })), [
         { type: "auto_retry_start", success: undefined, attempt: 1 },
         { type: "auto_retry_end", success: true, attempt: 1 },
@@ -198,6 +200,9 @@ const cases = {
       ]);
       assert.equal(f.outcomes().length, 1, "B4: a cancelled retry records exactly one terminal outcome");
       assert.notEqual(f.exitCode(), 0);
+      const context = f.session.extensionRunner.createCommandContext();
+      f.session.dispose();
+      assert.throws(() => context.getSystemPrompt(), /stale/, "B4: disposal after completed delivery invalidates immediately");
     } finally { f.close(); }
   },
   // A failed required read before the connection error must still decide the outcome after the
@@ -276,7 +281,14 @@ const cases = {
   async B11(mode) {
     const name = "B11 dispose during retry backoff still records the request outcome";
     for (const path of ["dispose", "new session", "switch session"]) {
-      const f = await fixture(mode, { baseDelayMs: 60_000, captureExtensionErrors: true });
+      let outcomesAtShutdown;
+      const f = await fixture(mode, {
+        baseDelayMs: 60_000,
+        captureExtensionErrors: true,
+        configureExtension(pi) {
+          pi.on("session_shutdown", () => { outcomesAtShutdown = f.outcomes(); });
+        },
+      });
       let completion;
       try {
         const taskId = f.session.sessionId;
@@ -319,6 +331,7 @@ const cases = {
         assert.match(outcome.reason, /connect|reach/i);
         assert.doesNotMatch(outcome.reason, /after \d+ tries/);
         assert.deepEqual(outcomesAtInvalidation, [outcome], `${name}: persistence precedes invalidation`);
+        if (path !== "dispose") assert.deepEqual(outcomesAtShutdown, [outcome], `${name}: persistence precedes runtime shutdown handlers`);
         assert.deepEqual(f.extensionErrors, []);
         assert.equal(f.faux.state.callCount, 1);
         assert.equal(f.outcomes().length, 1);
@@ -1295,6 +1308,109 @@ const cases = {
       try {
         await assertWithin(completion, 1_500, `${name}: cleanup did not finish after releasing the handler`);
       } finally { f.close(); }
+    }
+  },
+  async B31(mode) {
+    const name = "B31 a new prompt preserves the held request's verification evidence";
+    let reference;
+    for (const submission of ["settle", "prompt"]) {
+      const f = await fixture(mode, { tools: true, verificationEnabled: true, baseDelayMs: 60_000 });
+      let completion;
+      try {
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        f.faux.setResponses([
+          fauxAssistantMessage(fauxToolCall("write", {
+            path: "verified.test.mjs",
+            content: 'import assert from "node:assert/strict";\nimport test from "node:test";\ntest("verified work", () => assert.equal(2 + 2, 4));\n',
+          }, { id: "write-verified" }), { stopReason: "toolUse" }),
+          fauxAssistantMessage(fauxToolCall("bash", { command: "node --test verified.test.mjs" }, { id: "check-verified" }), { stopReason: "toolUse" }),
+          connectionError(),
+          fauxAssistantMessage("Request B is complete."),
+        ]);
+        completion = f.session.prompt("Write verified.test.mjs and run its test for request A.");
+        await assertWithin(started, 3_000, `${name}: A did not enter backoff`);
+        await delay(0);
+        assert.equal(f.session.isRetrying, true);
+        assert.equal(f.session.isStreaming, false);
+        assert.deepEqual(f.outcomes(), []);
+        const evidence = f.session.sessionManager.getBranch()
+          .filter((entry) => entry.type === "custom" && entry.customType === "vinci-verification-state")
+          .at(-1)?.data;
+        assert.equal(evidence?.status, "passed", `${name}: A ran a passing check before backoff`);
+        if (submission === "settle") await f.session.settleRetry();
+        else await f.session.prompt("B is a separate read-only request.", { source: "interactive" });
+        await completion;
+        const outcome = f.outcomes()[0];
+        const classification = outcome && {
+          state: outcome.state,
+          verificationStatus: outcome.verificationStatus,
+          verificationCommand: outcome.verificationCommand,
+          // The reason quotes the check's output, including its run time.
+          reason: outcome.reason.replace(/\(\d+(?:\.\d+)?ms\)/g, "(<ms>)"),
+          changedFiles: outcome.changedFiles,
+        };
+        console.log(`${name} ${mode} ${submission}: ${JSON.stringify(classification)}`);
+        if (submission === "settle") {
+          assert.equal(outcome?.state, "DONE", `${name}: verified work survives an interrupted wrap-up`);
+          assert.equal(outcome.verificationStatus, "passed");
+          assert.deepEqual(outcome.changedFiles, ["verified.test.mjs"]);
+          reference = classification;
+        } else {
+          assert.deepEqual(classification, reference, `${name}: A's receipt matches settlement without a new prompt`);
+          assert.equal(f.outcomes().length, 2, `${name}: A and B each have one receipt`);
+          assert.equal(f.outcomes()[1].verificationStatus, "none", `${name}: B still resets its own verification state`);
+        }
+        assert.deepEqual(f.extensionErrors, []);
+        assert.equal(f.faux.state.callCount, submission === "settle" ? 3 : 4);
+      } finally {
+        f.session.abortRetry();
+        await completion;
+        f.close();
+      }
+    }
+  },
+  async B32(mode) {
+    const name = "B32 disposal during the retry's final delivery keeps the receipt";
+    for (const path of ["runtime", "session", "handler runtime", "handler session"]) {
+      let openGate;
+      const gate = new Promise((resolve) => { openGate = resolve; });
+      let markDeliveryStarted;
+      const deliveryStarted = new Promise((resolve) => { markDeliveryStarted = resolve; });
+      const f = await fixture(mode, {
+        captureExtensionErrors: true,
+        async firstAgentEnd(event) {
+          if (event.willRetry) return;
+          markDeliveryStarted();
+          await gate;
+          if (path === "handler runtime") await f.runtime.dispose();
+          if (path === "handler session") f.session.dispose();
+        },
+      });
+      let completion;
+      let disposing;
+      try {
+        f.faux.setResponses([connectionError(), fauxAssistantMessage("Request A is complete.")]);
+        completion = f.session.prompt("Complete request A.");
+        await assertWithin(deliveryStarted, 2_000, `${name}: the retry did not reach its final handler`);
+        assert.equal(f.faux.state.callCount, 2);
+        assert.deepEqual(f.outcomes(), []);
+        if (path === "runtime") disposing = f.runtime.dispose();
+        if (path === "session") assert.equal(f.session.dispose(), undefined);
+        await delay(20);
+        openGate();
+        await assertWithin(Promise.all([completion, disposing]), 2_000, `${name}: ${path} deadlocked`);
+        await delay(0);
+        console.log(`${name} ${mode} ${path}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state }) => state), errors: f.extensionErrors.map(({ error }) => error) })}`);
+        assert.deepEqual(f.extensionErrors, [], `${name}: ${path} must not invalidate a later handler's context`);
+        assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE"], `${name}: ${path} records exactly one outcome for A`);
+        assert.ok(f.extensionEvents.find((event) => event.type === "agent_end" && !event.willRetry)?.heldRunMessages?.length > 0);
+      } finally {
+        openGate();
+        f.session.abortRetry();
+        try { await assertWithin(Promise.all([completion, disposing]), 1_500, `${name}: cleanup did not finish`); } finally { f.close(); }
+      }
     }
   },
   async B8(mode) {

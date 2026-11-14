@@ -677,6 +677,24 @@ export class AgentSession {
 		return release;
 	}
 
+	/** Run a terminal delivery published as in flight before its handlers run (see _releaseHeldAgentEnd). */
+	private async _runTrackedDelivery(emit: () => Promise<unknown>): Promise<void> {
+		const delivery = {};
+		this._heldAgentEndDelivery = delivery;
+		let done!: () => void;
+		const release = new Promise<void>((resolve) => {
+			done = resolve;
+		});
+		this._activeHeldDeliveries.add(release);
+		try {
+			await heldAgentEndDelivery.run(delivery, emit);
+		} finally {
+			if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
+			this._activeHeldDeliveries.delete(release);
+			done();
+		}
+	}
+
 	/** Total tries when this run ended on a retryable error after auto-retries ran out; undefined
 	 *  otherwise (including a non-retryable error that followed a retried one). */
 	private _exhaustedRetryTries(event: Extract<AgentEvent, { type: "agent_end" }>): number | undefined {
@@ -757,13 +775,17 @@ export class AgentSession {
 				await this._extensionRunner.emit({ type: "agent_end", messages: event.messages, willRetry: true });
 			} else {
 				this._heldRetryAgentEndMessages = undefined;
-				await this._extensionRunner.emit({
-					type: "agent_end",
-					messages: event.messages,
-					willRetry: false,
-					heldRunMessages: held,
-					exhaustedRetryTries: this._exhaustedRetryTries(event),
-				});
+				const emitFinal = () =>
+					this._extensionRunner.emit({
+						type: "agent_end",
+						messages: event.messages,
+						willRetry: false,
+						heldRunMessages: held,
+						exhaustedRetryTries: this._exhaustedRetryTries(event),
+					});
+				// The final agent_end of a retried run is a held request's terminal delivery: disposal waits on it.
+				if (held === undefined) await emitFinal();
+				else await this._runTrackedDelivery(emitFinal);
 			}
 		} else if (event.type === "turn_start") {
 			const extensionEvent: TurnStartEvent = {
@@ -1366,6 +1388,12 @@ export class AgentSession {
 					preflightResult?.(true);
 					return;
 				}
+			}
+
+			// Backoff is idle: settle the held run before input handlers see the new prompt, so its
+			// terminal outcome is classified with its own state (a handler may reset per-request state).
+			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+				await this._settleIdleHeldRetry();
 			}
 
 			// Emit input event for extension interception (before skill/template expansion)
