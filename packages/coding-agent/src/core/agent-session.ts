@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -56,6 +57,7 @@ import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
+	type AgentEndEvent,
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
@@ -273,6 +275,9 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+const DISPOSE_INVALIDATION_TIMEOUT_MS = 5_000;
+/** The held terminal delivery whose handlers the current async call chain runs inside, if any. */
+const heldAgentEndDelivery = new AsyncLocalStorage<object>();
 
 // ============================================================================
 // AgentSession Class
@@ -307,6 +312,17 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _retryGeneration = 0;
+	/** Messages held until this request's retry finishes or is cancelled. */
+	private _heldRetryAgentEndMessages: AgentMessage[] | undefined = undefined;
+	private _heldRetryAgentEndRelease: Promise<void> | undefined = undefined;
+	/** Retry generation when the current run's agent_end was held; a later settle changes it. */
+	private _heldRetryGeneration: number | undefined = undefined;
+	/** Identifies the held terminal delivery in flight; nested calls from its handlers carry it. */
+	private _heldAgentEndDelivery: object | undefined = undefined;
+	/** Every held terminal delivery still running (a handler may start a nested request whose own
+	 *  delivery runs inside it); disposal waits for all of them, bounded. */
+	private _activeHeldDeliveries = new Set<Promise<void>>();
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -612,6 +628,91 @@ export class AgentSession {
 		}
 	};
 
+	/** Emit the terminal agent_end for a run that was held for a retry that will not happen. */
+	private _releaseHeldAgentEnd(
+		fallback: AgentMessage[],
+		retryCancelled?: AgentEndEvent["retryCancelled"],
+	): Promise<void> | undefined {
+		const held = this._heldRetryAgentEndMessages;
+		if (!held) {
+			// A run started from inside the held delivery's handlers must not wait on that delivery.
+			const delivery = this._heldAgentEndDelivery;
+			if (delivery !== undefined && heldAgentEndDelivery.getStore() === delivery) return undefined;
+			return this._heldRetryAgentEndRelease;
+		}
+		this._heldRetryAgentEndMessages = undefined;
+		const delivery = {};
+		this._heldAgentEndDelivery = delivery;
+		// Publish the delivery before any handler runs: a handler that disposes synchronously must
+		// still see it in flight.
+		let settle!: { resolve: () => void; reject: (error: unknown) => void };
+		const release = new Promise<void>((resolve, reject) => {
+			settle = { resolve, reject };
+		});
+		this._heldRetryAgentEndRelease = release;
+		this._activeHeldDeliveries.add(release);
+		const finish = () => {
+			if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
+			if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
+			this._activeHeldDeliveries.delete(release);
+		};
+		let emitted: Promise<unknown>;
+		try {
+			emitted = heldAgentEndDelivery.run(delivery, () =>
+				this._extensionRunner.emit({
+					type: "agent_end",
+					messages: held.length > 0 ? held : fallback,
+					willRetry: false,
+					// [vinci] Say why the pending retry ended, so the receipt names it (#166).
+					...(retryCancelled ? { retryCancelled } : {}),
+				}),
+			);
+		} catch (error) {
+			emitted = Promise.reject(error);
+		}
+		emitted.then(
+			() => {
+				finish();
+				settle.resolve();
+			},
+			(error) => {
+				finish();
+				settle.reject(error);
+			},
+		);
+		return release;
+	}
+
+	/** Run a terminal delivery published as in flight before its handlers run (see _releaseHeldAgentEnd). */
+	private async _runTrackedDelivery(emit: () => Promise<unknown>): Promise<void> {
+		const delivery = {};
+		this._heldAgentEndDelivery = delivery;
+		let done!: () => void;
+		const release = new Promise<void>((resolve) => {
+			done = resolve;
+		});
+		this._activeHeldDeliveries.add(release);
+		try {
+			await heldAgentEndDelivery.run(delivery, emit);
+		} finally {
+			if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
+			this._activeHeldDeliveries.delete(release);
+			done();
+		}
+	}
+
+	/** Total tries when this run ended on a retryable error after auto-retries ran out; undefined
+	 *  otherwise (including a non-retryable error that followed a retried one). */
+	private _exhaustedRetryTries(event: Extract<AgentEvent, { type: "agent_end" }>): number | undefined {
+		if (this._retryAttempt <= 0) return undefined;
+		for (let i = event.messages.length - 1; i >= 0; i--) {
+			const message = event.messages[i];
+			if (message.role !== "assistant") continue;
+			return this._isRetryableError(message as AssistantMessage) ? this._retryAttempt + 1 : undefined;
+		}
+		return undefined;
+	}
+
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
@@ -668,9 +769,30 @@ export class AgentSession {
 	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
-			await this._extensionRunner.emit({ type: "agent_start" });
+			await this._extensionRunner.emit({ type: "agent_start", continuesRetry: this._retryAttempt > 0 });
 		} else if (event.type === "agent_end") {
-			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
+			// Surface the pending auto-retry so extensions do not record a terminal outcome
+			// while the same turn is still going to resume after backoff.
+			const willRetry = this._willRetryAfterAgentEnd(event);
+			const held = this._heldRetryAgentEndMessages;
+			if (willRetry) {
+				this._heldRetryGeneration ??= this._retryGeneration;
+				this._heldRetryAgentEndMessages = [...(held ?? []), ...event.messages];
+				await this._extensionRunner.emit({ type: "agent_end", messages: event.messages, willRetry: true });
+			} else {
+				this._heldRetryAgentEndMessages = undefined;
+				const emitFinal = () =>
+					this._extensionRunner.emit({
+						type: "agent_end",
+						messages: event.messages,
+						willRetry: false,
+						heldRunMessages: held,
+						exhaustedRetryTries: this._exhaustedRetryTries(event),
+					});
+				// The final agent_end of a retried run is a held request's terminal delivery: disposal waits on it.
+				if (held === undefined) await emitFinal();
+				else await this._runTrackedDelivery(emitFinal);
+			}
 		} else if (event.type === "turn_start") {
 			const extensionEvent: TurnStartEvent = {
 				type: "turn_start",
@@ -791,8 +913,17 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		const runner = this._extensionRunner;
+		const hasHeldAgentEnd =
+			this._heldRetryAgentEndMessages !== undefined ||
+			this._heldRetryAgentEndRelease !== undefined ||
+			this._activeHeldDeliveries.size > 0;
+		// Called from a handler of an in-flight delivery, the settle below returns at once; the
+		// invalidation still waits (bounded) for every delivery in flight, including an outer one
+		// whose handler started the request now being delivered, so their later handlers run.
+		const inFlightDeliveries = [...this._activeHeldDeliveries];
+		const settled = Promise.allSettled([this._settleIdleHeldRetry(), ...inFlightDeliveries]);
 		try {
-			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
@@ -801,9 +932,21 @@ export class AgentSession {
 			// Dispose must succeed even if an abort hook throws.
 		}
 
-		this._extensionRunner.invalidate(
-			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
-		);
+		const invalidate = () => {
+			runner.invalidate(
+				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+			);
+		};
+		// Allow terminal delivery before invalidation, with a limit for stalled handlers.
+		if (hasHeldAgentEnd) {
+			const timeout = setTimeout(invalidate, DISPOSE_INVALIDATION_TIMEOUT_MS);
+			timeout.unref();
+			const finishInvalidation = () => {
+				clearTimeout(timeout);
+				invalidate();
+			};
+			void settled.then(finishInvalidation, finishInvalidation);
+		} else invalidate();
 		this._disconnectFromAgent();
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
@@ -1190,9 +1333,23 @@ export class AgentSession {
 			return false;
 		}
 
-		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
-			return true;
+		// Compare against the generation at the moment the run was held, so a settle that ran
+		// between the end of the run and this point (an idle waiter) cancels the retry.
+		const heldGeneration = this._heldRetryGeneration;
+		this._heldRetryGeneration = undefined;
+		if (this._isRetryableError(msg)) {
+			if (heldGeneration !== undefined && heldGeneration !== this._retryGeneration) {
+				await this._releaseHeldAgentEnd([msg]);
+				return false;
+			}
+			const generation = this._retryGeneration;
+			const willRetry = await this._prepareRetry(msg);
+			if (generation !== this._retryGeneration) return false;
+			if (willRetry) return true;
 		}
+		// Any path that declines the pending retry (retries disabled during the wait, budget
+		// re-checked, cancellation) must still give extensions one terminal agent_end.
+		await this._releaseHeldAgentEnd([msg]);
 
 		if (msg.stopReason === "error" && this._retryAttempt > 0) {
 			this._emit({
@@ -1237,6 +1394,12 @@ export class AgentSession {
 					preflightResult?.(true);
 					return;
 				}
+			}
+
+			// Backoff is idle: settle the held run before input handlers see the new prompt, so its
+			// terminal outcome is classified with its own state (a handler may reset per-request state).
+			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+				await this._settleIdleHeldRetry("new-input");
 			}
 
 			// Emit input event for extension interception (before skill/template expansion)
@@ -1300,6 +1463,12 @@ export class AgentSession {
 					);
 				}
 				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+			}
+
+			// Backoff is idle: a submitted prompt starts a separate request.
+			// Usually a no-op after the settle before emitInput; it covers a held retry that an input handler started.
+			if (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease) {
+				await this._settleIdleHeldRetry("new-input");
 			}
 
 			// Check if we need to compact before sending (catches aborted responses).
@@ -1384,6 +1553,10 @@ export class AgentSession {
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return false;
 
+		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+			await this._settleIdleHeldRetry("new-input");
+		}
+
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
 
@@ -1446,6 +1619,12 @@ export class AgentSession {
 			this._throwIfExtensionCommand(text);
 		}
 
+		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+			await this._settleIdleHeldRetry("new-input");
+			await this.prompt(text, { images, streamingBehavior: "steer" });
+			return;
+		}
+
 		// Expand skill commands and prompt templates
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
@@ -1464,6 +1643,12 @@ export class AgentSession {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
+		}
+
+		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+			await this._settleIdleHeldRetry("new-input");
+			await this.prompt(text, { images, streamingBehavior: "followUp" });
+			return;
 		}
 
 		// Expand skill commands and prompt templates
@@ -1556,8 +1741,14 @@ export class AgentSession {
 				this.agent.steer(appMessage);
 			}
 		} else if (options?.triggerTurn) {
+			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+				await this._settleIdleHeldRetry();
+			}
 			await this._runAgentPrompt(appMessage);
 		} else {
+			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+				await this._settleIdleHeldRetry();
+			}
 			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
 				message.customType,
@@ -1879,6 +2070,10 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
+			await this._settleIdleHeldRetry();
+		}
+
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -2715,6 +2910,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		await this.settleRetry();
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
@@ -2774,14 +2970,6 @@ export class AgentSession {
 
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
 
-		this._emit({
-			type: "auto_retry_start",
-			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
-			delayMs,
-			errorMessage: message.errorMessage || "Unknown error",
-		});
-
 		// Remove error message from agent state (keep in session for history)
 		const messages = this.agent.state.messages;
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
@@ -2789,25 +2977,120 @@ export class AgentSession {
 		}
 
 		// Wait with exponential backoff (abortable)
-		this._retryAbortController = new AbortController();
+		const controller = new AbortController();
+		this._retryAbortController = controller;
+		const generation = this._retryGeneration;
+		const attempt = this._retryAttempt;
+		this._emit({
+			type: "auto_retry_start",
+			attempt,
+			maxAttempts: settings.maxRetries,
+			delayMs,
+			errorMessage: message.errorMessage || "Unknown error",
+		});
 		try {
-			await sleep(delayMs, this._retryAbortController.signal);
+			await sleep(delayMs, controller.signal);
 		} catch {
 			// Aborted during sleep - emit end event so UI can clean up
-			const attempt = this._retryAttempt;
-			this._retryAttempt = 0;
+			if (generation === this._retryGeneration) this._retryAttempt = 0;
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
 				attempt,
 				finalError: "Retry cancelled",
 			});
+			// A cancelled retry ends the turn without another agent loop: release the held run now
+			// (idempotent; _handlePostAgentRun releases it too when this returns false).
+			await (generation === this._retryGeneration
+				? this._releaseHeldAgentEnd([message])
+				: this._heldRetryAgentEndRelease);
 			return false;
 		} finally {
-			this._retryAbortController = undefined;
+			if (this._retryAbortController === controller) this._retryAbortController = undefined;
 		}
 
-		return true;
+		return generation === this._retryGeneration && !controller.signal.aborted && this.autoRetryEnabled;
+	}
+
+	/** A retry is held while idle: backoff is pending or the held terminal run is still being delivered. */
+	private _hasIdleHeldRetry(): boolean {
+		return (
+			!this.isStreaming &&
+			(this._retryAbortController !== undefined ||
+				this._heldRetryAgentEndMessages !== undefined ||
+				this._heldRetryAgentEndRelease !== undefined)
+		);
+	}
+
+	/** [vinci] `retryCancelled` names why the held request ends; set only when new input supersedes it. */
+	private async _settleIdleHeldRetry(retryCancelled?: AgentEndEvent["retryCancelled"]): Promise<void> {
+		// A terminal handler must not wait on the delivery that is awaiting that handler. Only calls
+		// made from inside that delivery skip; any other caller waits for it (bounded where public).
+		const delivery = this._heldAgentEndDelivery;
+		if (delivery !== undefined && heldAgentEndDelivery.getStore() === delivery) return;
+		this._retryGeneration++;
+		this.abortRetry();
+		this._retryAttempt = 0;
+		await this._releaseHeldAgentEnd([], retryCancelled);
+	}
+
+	/** Cancel backoff and allow bounded terminal delivery before reload or runtime teardown. */
+	async settleRetry(): Promise<void> {
+		// A live retry run owns its terminal agent_end and retry budget; only an idle held retry settles here.
+		if (!this._hasIdleHeldRetry()) {
+			// A retried run's final delivery is still in flight: teardown (quit, reload, session switch) waits
+			// for it, bounded, so its receipt persists first. Calls from inside a delivery do not wait on it.
+			if (this._activeHeldDeliveries.size > 0 && heldAgentEndDelivery.getStore() === undefined) {
+				let bound: ReturnType<typeof setTimeout> | undefined;
+				let timedOut = false;
+				const awaited = [...this._activeHeldDeliveries];
+				try {
+					await Promise.race([
+						Promise.allSettled(awaited),
+						new Promise<void>((resolve) => {
+							bound = setTimeout(() => {
+								timedOut = true;
+								resolve();
+							}, DISPOSE_INVALIDATION_TIMEOUT_MS);
+						}),
+					]);
+				} finally {
+					clearTimeout(bound);
+				}
+				// As in the idle branch: deliveries still stalled past the bound are detached, so a later
+				// teardown or disposal does not wait the bound on them again.
+				if (timedOut) for (const release of awaited) this._activeHeldDeliveries.delete(release);
+			}
+			return;
+		}
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		let timedOut = false;
+		const settling = this._settleIdleHeldRetry();
+		// The delivery this call waits on (started by the settle above, or already in flight).
+		const delivery = this._heldAgentEndDelivery;
+		const release = this._heldRetryAgentEndRelease;
+		try {
+			await Promise.race([
+				settling,
+				new Promise<void>((resolve) => {
+					timeout = setTimeout(() => {
+						timedOut = true;
+						resolve();
+					}, DISPOSE_INVALIDATION_TIMEOUT_MS);
+				}),
+			]);
+		} finally {
+			clearTimeout(timeout);
+		}
+		// The stalled delivery this call waited on is detached past the bound: later runs never wait
+		// on it, and it may still finish on its own. Held state of a newer run (for example one its
+		// handler started) is kept, so that run still gets its own terminal agent_end.
+		if (timedOut) {
+			// Disposal does not wait the bound again on a delivery already detached here.
+			if (release !== undefined) this._activeHeldDeliveries.delete(release);
+			if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
+			if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
+		}
 	}
 
 	/**
@@ -2832,6 +3115,7 @@ export class AgentSession {
 	 */
 	setAutoRetryEnabled(enabled: boolean): void {
 		this.settingsManager.setRetryEnabled(enabled);
+		if (!enabled) this.abortRetry();
 	}
 
 	// =========================================================================
@@ -2977,6 +3261,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		if (this._hasIdleHeldRetry()) await this._settleIdleHeldRetry();
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target

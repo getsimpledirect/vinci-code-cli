@@ -722,12 +722,27 @@ export interface BeforeAgentStartEvent {
 /** Fired when an agent loop starts */
 export interface AgentStartEvent {
 	type: "agent_start";
+	/** This run is an auto-retry continuing the same request after a retryable provider error. */
+	continuesRetry?: boolean;
 }
 
 /** Fired when an agent loop ends */
 export interface AgentEndEvent {
 	type: "agent_end";
 	messages: AgentMessage[];
+	/** Auto-retry is pending: the turn ended on a retryable provider error with attempts left, and
+	 *  the same turn will resume after backoff. Extensions must not record a terminal outcome yet. */
+	willRetry?: boolean;
+	/** Set only when the run ended on a retryable provider error after auto-retries ran out: the
+	 *  total number of tries made (first call plus retries). */
+	exhaustedRetryTries?: number;
+	/** On the terminal agent_end after auto-retries: the messages of the earlier runs of this request
+	 *  that ended with willRetry. */
+	heldRunMessages?: AgentMessage[];
+	/** [vinci] On the terminal agent_end of a request whose pending auto-retry was cancelled: why.
+	 *  "new-input" means a prompt, extension command, steer or follow-up arrived during the retry wait and superseded it.
+	 *  Absent in every other case. */
+	retryCancelled?: "new-input";
 }
 
 /** Fired at the start of each turn */

@@ -482,7 +482,10 @@ export default function (pi: ExtensionAPI) {
     if (!providerBlocker) setVinciConnection("connected");
   });
 
-  pi.on("agent_end", () => {
+  pi.on("agent_end", (event) => {
+    // A pending auto-retry resumes the same turn after backoff: keep the working state (the
+    // reconnect indicator shows the attempt) instead of ending it here.
+    if (event.willRetry) return;
     verificationToolCallIds.clear();
     if (getVinciUiState().continuationPending) {
       if (!activeTui) {

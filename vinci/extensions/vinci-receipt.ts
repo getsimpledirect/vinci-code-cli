@@ -193,6 +193,13 @@ function taskMessages(ctx: ExtensionContext, current: readonly AgentMessage[] = 
   return messages;
 }
 
+/** Held runs' messages followed by the current run's, each message once. */
+function mergeRunMessages(held: readonly AgentMessage[], current: readonly AgentMessage[]): AgentMessage[] {
+  if (held.length === 0) return [...current];
+  const keys = new Set(held.map(messageKey));
+  return [...held, ...current.filter((message) => !keys.has(messageKey(message)))];
+}
+
 function toolChangedPaths(messages: readonly AgentMessage[], cwd: string): string[] {
   const filesByCall = new Map<string, string>();
   const files = new Set<string>();
@@ -543,7 +550,9 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget("vinci-receipt", receiptWidget(shown, remoteVerdict), { placement: "aboveEditor" });
   });
 
-  pi.on("agent_start", (_event, ctx) => {
+  pi.on("agent_start", (event, ctx) => {
+    // An auto-retry continues the same request: keep its tree baseline, timers and operations.
+    if (event.continuesRetry) return;
     agentStartedAt = Date.now();
     priorActiveDurationMs = latestOutcome(ctx)?.activeDurationMs ?? 0;
     treeBaseline = gitTreeSnapshot(ctx.cwd);
@@ -559,7 +568,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    const messages = taskMessages(ctx, event.messages);
+    // A retryable provider error with auto-retries left is not terminal: the session resumes
+    // the same turn after backoff. Recording the outcome (and the "Stopped — needs you" receipt)
+    // from the errored assistant message here would pre-empt the retry's own normal outcome, so
+    // hold everything until the retry resolves and agent_end fires again.
+    if (event.willRetry) return;
+    // The retry is a new agent run: merge the earlier held runs of this request back in so a
+    // failed operation before the connection error still decides the outcome.
+    const runMessages = mergeRunMessages(event.heldRunMessages ?? [], event.messages);
+    const messages = taskMessages(ctx, runMessages);
     const endedAt = Date.now();
     const openDialogDurationMs = dialogStartedAt > 0 ? endedAt - dialogStartedAt : 0;
     priorActiveDurationMs += agentStartedAt > 0
@@ -572,13 +589,15 @@ export default function (pi: ExtensionAPI) {
     dialogStartedAt = 0;
     let outcome = buildVinciTaskOutcome({
       taskId: ctx.sessionManager.getSessionId(),
-      messages: event.messages,
+      messages: runMessages,
       usageMessages: messages,
-      changedFiles: changedFiles(event.messages, ctx.cwd, treeBaseline),
+      changedFiles: changedFiles(runMessages, ctx.cwd, treeBaseline),
       verification: getVinciVerificationState(),
       activeDurationMs: priorActiveDurationMs,
       priorOperations,
       cwd: ctx.cwd,
+      exhaustedRetryTries: event.exhaustedRetryTries,
+      retryCancelled: event.retryCancelled,
     });
     // [#199] An outcome may never claim "no changes" while the SESSION's own tree delta says
     // otherwise. The outcome is rebuilt per turn but the run persists only the LAST one: a
@@ -599,7 +618,7 @@ export default function (pi: ExtensionAPI) {
         // closing ask for the user's go-ahead over the corrected files is WAITING (exit 3 via
         // the blocks() check below) — the exact live shape: two files fixed mid-conversation,
         // final turn "Just confirm and I'll apply it", exit 0.
-        const finalAssistant = [...event.messages].reverse().find((m) => (m as { role?: string }).role === "assistant");
+        const finalAssistant = [...runMessages].reverse().find((m) => (m as { role?: string }).role === "assistant");
         const finalText = finalAssistant ? textContent((finalAssistant as { content: readonly { type: string; text?: string }[] }).content) : "";
         outcome = {
           ...outcome,
@@ -663,7 +682,7 @@ export default function (pi: ExtensionAPI) {
     // the exit code answers a script, so it takes whichever of local and remote is more
     // conservative: a remote pass can never report success on a run whose own check failed (#22
     // laundering, #127 exit contract), and a remote block still blocks a locally-clean run.
-    const localState = classifyVinciLocalTaskState(event.messages, outcome.changedFiles, getVinciVerificationState(), outcome.requiredOperations ?? []).state;
+    const localState = classifyVinciLocalTaskState(runMessages, outcome.changedFiles, getVinciVerificationState(), outcome.requiredOperations ?? [], event.exhaustedRetryTries, event.retryCancelled).state;
     const blocks = (state: string) => state === "BLOCKED" || state === "WAITING";
     if (blocks(outcome.state) || blocks(localState)) {
       ctx.declareHeadlessExitHint?.(3);
