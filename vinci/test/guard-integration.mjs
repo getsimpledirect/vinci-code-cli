@@ -383,6 +383,13 @@ async function shellWriteWrapperChecks() {
     "bash -c -x 'echo x > out.txt'",
     "sh -c -e 'echo x > out.txt'",
     "bash -c -- 'echo x > out.txt'",
+    "bash -c - 'echo x > out.txt'",
+    "bash +c 'echo x > out.txt'",
+    "sh +ec 'echo x > out.txt'",
+    // zsh option names ignore case, `_` and a `no` prefix.
+    "zsh -n -o exec -c 'echo x > out.txt'",
+    "zsh -o noexec +o NO_EXEC -c 'echo x > out.txt'",
+    "zsh -n +o no_exec -c 'echo x > out.txt'",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
@@ -408,7 +415,7 @@ async function shellWriteWrapperChecks() {
     "command -pv echo > out.txt", "command -v bash -c 'echo x > out.txt'",
     // Syntax-check mode runs nothing.
     "bash -n -c 'echo x > out.txt'", "sh -nc 'echo x > out.txt'", "bash -o noexec -c 'echo x > out.txt'",
-    "bash -c -n 'echo x > out.txt'", "bash +n -n -c 'echo x > out.txt'",
+    "bash -c -n 'echo x > out.txt'", "bash +n -n -c 'echo x > out.txt'", "zsh -o NO_EXEC -c 'echo x > out.txt'",
     // Words after the command text are its arguments, not commands.
     "fish -c 'echo ok' 'echo x > out.txt'"]) {
     assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);

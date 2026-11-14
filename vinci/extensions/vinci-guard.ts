@@ -578,6 +578,7 @@ function nestedShellText(segment: string): string | undefined {
   if (!NESTED_SHELL.test(words[start] ?? "")) return undefined;
   // The command text is the first operand after all options (`bash -c -x 'text'`, `bash -c -- 'text'`).
   // -n and `-o noexec` only check syntax unless a later +n / `+o noexec` turns execution back on.
+  // Option names are read the zsh way (case, `_` and each `no` prefix): `+o NO_EXEC`, `-o exec`.
   let noexec = false;
   let command = false;
   for (let index = start + 1; index < words.length; index++) {
@@ -598,10 +599,19 @@ function nestedShellText(segment: string): string | undefined {
     for (const letter of letters) {
       if (letter === "o" || letter === "O") {
         values++;
-        if (letter === "o" && words[index + values] === "noexec") noexec = on;
+        if (letter === "o") {
+          let name = (words[index + values] ?? "").toLowerCase().replaceAll("_", "");
+          let set = on;
+          while (name.startsWith("no")) {
+            name = name.slice(2);
+            set = !set;
+          }
+          if (name === "exec") noexec = !set;
+        }
       } else if (letter === "n") {
         noexec = on;
-      } else if (letter === "c" && on) {
+      } else if (letter === "c") {
+        // +c selects command mode too.
         command = true;
       }
     }
