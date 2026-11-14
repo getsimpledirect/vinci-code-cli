@@ -588,7 +588,8 @@ function shellWriteTargets(command: string): string[] {
   if (body === null) return [""];
   // An interpreter's inline code can write anywhere, so a redirect after one names nothing.
   const executable = shellWords(body)[0]?.split("/").pop() ?? "";
-  if (/^(?:python|pypy|node|ruby|perl)\d*(?:\.\d+)?$/i.test(executable)) return [""];
+  // Any executable NAMED like an interpreter (perl5.34, perl-5.34, perl.pl, python3.13t) counts.
+  if (/^(?:python|pypy|node|ruby|perl)/i.test(executable)) return [""];
   const tokenPattern = /(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^ \t'"\\<>])+|>>?|</g;
   if (body.replace(tokenPattern, "").trim()) return [""];
   const tokens = body.match(tokenPattern) ?? [];
@@ -597,11 +598,16 @@ function shellWriteTargets(command: string): string[] {
     if (/^>>?$/.test(tokens[index])) rawTargets.push(tokens[index + 1] ?? "");
   }
   if (/^tee\b/i.test(body)) {
-    for (const token of tokens.slice(1)) {
-      if (/^[<>]/.test(token)) break;
-      // Only plain short options and plain operands; "--", quoted options or anything else that
-      // changes how tee reads its arguments gives the generic route.
-      if (/^-[a-zA-Z]+$/.test(token)) continue;
+    // tee may take options anywhere in its argv (GNU permutes them, even after a redirect), and an
+    // unknown one or --help means it opens no file. Name its operands only when every other word
+    // is -a or -i (or both), wherever it appears.
+    for (let index = 1; index < tokens.length; index++) {
+      const token = tokens[index];
+      if (/^>>?$/.test(token)) {
+        index++;
+        continue;
+      }
+      if (/^-[ai]+$/.test(token)) continue;
       if (!PLAIN_TARGET.test(token) || token.startsWith("-")) return [""];
       rawTargets.push(token);
     }

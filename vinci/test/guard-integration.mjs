@@ -428,6 +428,9 @@ async function shellWriteRouteChecks(onlyCase) {
     "echo x > out.txt ;",
     // Tabs, like any other non-printable character, are not plain.
     "echo x\t>\ttabbed.txt",
+    // Globs and wrappers.
+    "echo x > out?.txt",
+    "sudo echo x > out.txt",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Non-plain write stays blocked: ${command}`);
@@ -450,11 +453,24 @@ async function shellWriteRouteChecks(onlyCase) {
     if (outside) assert.doesNotMatch(notifications.at(-1).message, /saving under/);
   }
   // Plain, unquoted interpreter commands pass the plain-command gate, so only the interpreter
-  // exclusion keeps their redirect target unnamed (separated and attached redirects).
-  for (const command of ["perl -pi s/a/b/ in.txt > out.txt", "perl -pi s/a/b/ in.txt>out.txt"]) {
+  // exclusion keeps their redirect target unnamed (separated and attached redirects, and
+  // interpreter-named executables).
+  for (const command of ["perl -pi s/a/b/ in.txt > out.txt", "perl -pi s/a/b/ in.txt>out.txt", "perl-5.34 -pi s/a/b/ in.txt > out.txt", "perl.pl -pi s/a/b/ in.txt > out.txt"]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Plain interpreter write stays blocked: ${command}`);
     assert.equal(result.reason, genericReason, `Plain interpreter redirect names no target: ${command}`);
+  }
+  // tee reads options anywhere in its argv: with --help, an unknown option or "--" it may open no
+  // file at all, so none of its operands is named (the plain command keeps the project route).
+  for (const command of ["tee out.txt > actual.txt --help", "tee -z out.txt > actual.txt", "tee out.txt -- other.txt", "tee out.txt -p"]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `tee write stays blocked: ${command}`);
+    assert.equal(result.reason, genericReason, `tee with other options names no operand: ${command}`);
+  }
+  // -a and -i are fine anywhere, including after a redirect.
+  {
+    const result = await toolCall("bash", { command: "tee kept.txt > piped.txt -a" });
+    assert.ok(result?.reason.includes(join(project, "kept.txt")) && result.reason.includes(join(project, "piped.txt")), "tee -a after a redirect names both targets");
   }
   // Keep interpreter writes blocked independently of how their shell targets are described.
   const interpreterTarget = join(runRoot, "interpreter-target.txt");
