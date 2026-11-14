@@ -863,7 +863,10 @@ export class AgentSession {
 		const runner = this._extensionRunner;
 		const hasHeldAgentEnd =
 			this._heldRetryAgentEndMessages !== undefined || this._heldRetryAgentEndRelease !== undefined;
-		const settled = this._settleIdleHeldRetry();
+		// Called from a handler of the in-flight delivery, the settle below returns at once; the
+		// invalidation still waits (bounded) for that delivery itself, so its later handlers run.
+		const inFlightDelivery = this._heldRetryAgentEndRelease;
+		const settled = Promise.allSettled([this._settleIdleHeldRetry(), inFlightDelivery]);
 		try {
 			this.abortCompaction();
 			this.abortBranchSummary();
@@ -2973,9 +2976,13 @@ export class AgentSession {
 		if (!this._hasIdleHeldRetry()) return;
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		let timedOut = false;
+		const settling = this._settleIdleHeldRetry();
+		// The delivery this call waits on (started by the settle above, or already in flight).
+		const delivery = this._heldAgentEndDelivery;
+		const release = this._heldRetryAgentEndRelease;
 		try {
 			await Promise.race([
-				this._settleIdleHeldRetry(),
+				settling,
 				new Promise<void>((resolve) => {
 					timeout = setTimeout(() => {
 						timedOut = true;
@@ -2986,12 +2993,12 @@ export class AgentSession {
 		} finally {
 			clearTimeout(timeout);
 		}
-		// A stalled delivery past the bound is detached: later runs never wait on it. It may still
-		// finish on its own.
+		// The stalled delivery this call waited on is detached past the bound: later runs never wait
+		// on it, and it may still finish on its own. Held state of a newer run (for example one its
+		// handler started) is kept, so that run still gets its own terminal agent_end.
 		if (timedOut) {
-			this._heldRetryAgentEndMessages = undefined;
-			this._heldRetryAgentEndRelease = undefined;
-			this._heldAgentEndDelivery = undefined;
+			if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
+			if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
 		}
 	}
 

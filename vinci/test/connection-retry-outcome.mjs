@@ -985,6 +985,121 @@ const cases = {
       assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"]);
     } finally { f.close(); }
   },
+  async B25(mode) {
+    const name = "B25 a settle that times out on a terminal handler keeps the held retry of the request that handler started";
+    let markDeliveryStarted;
+    const deliveryStarted = new Promise((resolve) => { markDeliveryStarted = resolve; });
+    let openGate;
+    const gate = new Promise((resolve) => { openGate = resolve; });
+    let session;
+    let nested;
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      captureExtensionErrors: true,
+      async terminalDelivery() {
+        if (nested) return;
+        markDeliveryStarted();
+        await gate;
+        // A's handler starts request B and waits for it; B enters its own long backoff.
+        nested = session.prompt("Complete request B.");
+        await nested;
+      },
+    });
+    session = f.session;
+    let completion;
+    let failed = false;
+    try {
+      await assertWithin((async () => {
+        let backoffs = 0;
+        let markSecondBackoff;
+        const secondBackoff = new Promise((resolve) => { markSecondBackoff = resolve; });
+        let markFirstBackoff;
+        const firstBackoff = new Promise((resolve) => { markFirstBackoff = resolve; });
+        f.session.subscribe((event) => {
+          if (event.type !== "auto_retry_start") return;
+          backoffs++;
+          if (backoffs === 1) markFirstBackoff();
+          if (backoffs === 2) markSecondBackoff();
+        });
+        f.faux.setResponses([connectionError(), connectionError(), fauxAssistantMessage("Must not be reached.")]);
+        completion = f.session.prompt("Complete request A.");
+        await firstBackoff;
+        await delay(0);
+        f.session.abortRetry();
+        await deliveryStarted;
+        // An outside settle starts while A's delivery runs, then times out because A's handler waits on B.
+        const timedOut = f.session.settleRetry();
+        openGate();
+        await secondBackoff;
+        await timedOut;
+        // A later settle cancels B's backoff: B must still get its own terminal agent_end.
+        await f.session.settleRetry();
+        await nested;
+        await completion;
+      })(), 9_000, `${name}: did not finish within 9 s`);
+      const ends = f.extensionEvents.filter((event) => event.type === "agent_end" && !event.willRetry);
+      const endsFor = (text) => ends.filter((event) => JSON.stringify(event.messages).includes(text)).length;
+      console.log(`${name} ${mode}: ${JSON.stringify({ ends: ends.length, a: endsFor("Complete request A."), b: endsFor("Complete request B."), calls: f.faux.state.callCount, outcomes: f.outcomes().map(({ state }) => state) })}`);
+      assert.equal(endsFor("Complete request B."), 1, `${name}: B's cancelled retry delivers one terminal agent_end`);
+      assert.equal(endsFor("Complete request A."), 1, `${name}: A delivers one terminal agent_end`);
+      assert.equal(f.faux.state.callCount, 2, `${name}: neither retry ran`);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED", "BLOCKED"], `${name}: A and B each keep a terminal outcome`);
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      openGate();
+      f.session.abortRetry();
+      try { await assertWithin(Promise.all([completion, nested]), 1_500, `${name}: cleanup did not finish`); } catch (error) { if (!failed) throw error; } finally { f.close(); }
+    }
+  },
+  async B26(mode) {
+    for (const via of ["direct call", "extension command"]) {
+      const name = `B26 runtime disposal from a terminal handler by ${via} keeps the receipt`;
+      let runtime;
+      let session;
+      let disposed;
+      const f = await fixture(mode, {
+        baseDelayMs: 60_000,
+        captureExtensionErrors: true,
+        configureExtension(pi) {
+          pi.registerCommand("retry-outcome-quit", { handler: async () => { await runtime.dispose(); } });
+        },
+        async terminalDelivery() {
+          if (disposed) return;
+          // This handler runs before the receipt's own handler, which must still record A.
+          disposed = via === "direct call" ? runtime.dispose() : session.prompt("/retry-outcome-quit");
+          await disposed;
+        },
+      });
+      runtime = f.runtime;
+      session = f.session;
+      let completion;
+      try {
+        await assertWithin((async () => {
+          const started = new Promise((resolve) => f.session.subscribe((event) => {
+            if (event.type === "auto_retry_start") resolve();
+          }));
+          f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+          completion = f.session.prompt("Complete request A.");
+          await started;
+          await delay(0);
+          f.session.abortRetry();
+          await completion;
+          await disposed;
+        })(), 3_000, `${name}: did not finish within 3 s`);
+        await delay(0);
+        console.log(`${name} ${mode}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state }) => state), errors: f.extensionErrors.map(({ error }) => String(error).slice(0, 80)), calls: f.faux.state.callCount })}`);
+        assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"], `${name}: A's terminal receipt is recorded before the context is invalidated`);
+        assert.deepEqual(f.extensionErrors, [], `${name}: no handler ran on an invalidated context`);
+        assert.equal(f.faux.state.callCount, 1);
+      } finally {
+        f.session.abortRetry();
+        await completion;
+        f.close();
+      }
+    }
+  },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:
   // the "could not reach the model" wording is only for retries exhausted on a retryable error.
   async B8(mode) {
