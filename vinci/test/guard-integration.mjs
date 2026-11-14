@@ -3,8 +3,9 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -910,6 +911,263 @@ try {
     execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", command], { cwd: adversarialProject, timeout: 5000, env: localShellEnv });
   }
   check("actual-byte benign local writes and wrapped reads remain allowed", true);
+
+  // Write targets resolve physically: `link/..` is the link target's parent, not the project.
+  // The real shell runs each command inside a disposable tree to prove where the bytes land.
+  {
+    const physicalRoot = join(runRoot, "physical");
+    const physicalProject = join(physicalRoot, "project");
+    const deep = join(physicalRoot, "outside", "deep");
+    mkdirSync(join(physicalProject, "inner"), { recursive: true });
+    mkdirSync(join(deep, "dir"), { recursive: true });
+    symlinkSync(join(deep, "dir"), join(physicalProject, "lnk"));
+    symlinkSync(join(physicalProject, "inner"), join(physicalProject, "inlnk"));
+    writeFileSync(join(deep, "existing-parent"), "before");
+    const physicalSelections = [];
+    const physicalCtx = {
+      ...ctx,
+      cwd: physicalProject,
+      ui: { ...ctx.ui, async select(title) { physicalSelections.push(title); return "No, don't"; } },
+    };
+    const physicalCall = async (input, toolName = "bash") => {
+      for (const handler of handlers.tool_call ?? []) {
+        const result = await handler({ toolName, input }, physicalCtx);
+        if (result !== undefined) return result;
+      }
+      return undefined;
+    };
+    const physicalFailures = [];
+    for (const [label, command, effect] of [
+      ["python link-parent write", `python3 -c "open('lnk/../py-parent','w').write('outside')"`, join(deep, "py-parent")],
+      ["node link-parent write", `node -e "require('fs').writeFileSync('lnk/../node-parent','outside')"`, join(deep, "node-parent")],
+      ["python link-parent existing target", `python3 -c "open('lnk/../existing-parent','w').write('outside')"`, join(deep, "existing-parent")],
+      ["node absolute link-parent write", `node -e "require('fs').writeFileSync('${join(physicalProject, "lnk")}/../abs-parent','outside')"`, join(deep, "abs-parent")],
+      ["node link made in the same command", `node -e "const fs=require('fs');fs.symlinkSync('${join(deep, "dir")}','made');fs.writeFileSync('made/../made-parent','outside')"`, join(deep, "made-parent")],
+    ]) {
+      const selectionsBefore = physicalSelections.length;
+      const result = await physicalCall({ command });
+      execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", command], { cwd: physicalProject, timeout: 5000, env: localShellEnv });
+      assert.equal(readFileSync(effect, "utf8"), "outside", `${label}: real effect missing`);
+      if (result?.block !== true && physicalSelections.length === selectionsBefore) physicalFailures.push(`${label}: allowed an outside write with no prompt`);
+    }
+    assert.deepEqual(physicalFailures, [], `Physical write-target regressions failed:\n${physicalFailures.join("\n")}`);
+    check("interpreter writes through a link's parent are treated as outside the project", true);
+
+    for (const [label, command, effect] of [
+      ["in-project python write", `python3 -c "open('in-project','w').write('inside')"`, join(physicalProject, "in-project")],
+      ["in-project link write", `node -e "require('fs').writeFileSync('inlnk/in-link','inside')"`, join(physicalProject, "inner", "in-link")],
+      ["in-project link parent", `node -e "require('fs').writeFileSync('inlnk/../in-link-parent','inside')"`, join(physicalProject, "in-link-parent")],
+    ]) {
+      const selectionsBefore = physicalSelections.length;
+      assert.equal(await physicalCall({ command }), undefined, `${label}: in-project write refused`);
+      assert.equal(physicalSelections.length, selectionsBefore, `${label}: in-project write prompted`);
+      execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", command], { cwd: physicalProject, timeout: 5000, env: localShellEnv });
+      assert.equal(readFileSync(effect, "utf8"), "inside", `${label}: real effect missing`);
+    }
+    check("in-project writes, including through an in-project link, stay allowed", true);
+
+    // A `..` after a missing component cannot be resolved physically: it is treated as outside.
+    {
+      const selectionsBefore = physicalSelections.length;
+      const result = await physicalCall({ command: `node -e "require('fs').writeFileSync('not-yet/../pending','inside')"` });
+      assert.ok(result?.block === true || physicalSelections.length !== selectionsBefore, "a .. after a missing component is not classified as in-project");
+    }
+    // The write/edit tools resolve lexically themselves (resolveToCwd), so `lnk/../x` is the project's x there.
+    for (const toolName of ["write", "edit"]) {
+      assert.equal(await physicalCall({ path: "lnk/../structured-in", content: "inside", oldText: "a", newText: "b" }, toolName), undefined, `${toolName} of lnk/../x (lexically in the project) refused`);
+    }
+    check("unresolvable .. fails closed; structured tools keep their lexical in-project route", true);
+
+    // An SDK-supplied cwd spelled through `link/..` is the link target's sibling physically. The project
+    // root, its grants and write targets are compared physically: the lexical sibling is outside.
+    mkdirSync(join(physicalRoot, "a", "p"), { recursive: true });
+    mkdirSync(join(deep, "p"), { recursive: true });
+    symlinkSync(join(deep, "dir"), join(physicalRoot, "a", "link"));
+    const spelledCwd = `${join(physicalRoot, "a", "link")}/../p`;
+    const spelledSelections = [];
+    const spelledCtx = { ...ctx, cwd: spelledCwd, ui: { ...ctx.ui, async select(title) { spelledSelections.push(title); return "No, don't"; } } };
+    const spelledCall = async (command) => {
+      for (const handler of handlers.tool_call ?? []) {
+        const result = await handler({ toolName: "bash", input: { command } }, spelledCtx);
+        if (result !== undefined) return result;
+      }
+      return undefined;
+    };
+    const lexicalSibling = `node -e "require('fs').writeFileSync('${join(physicalRoot, "a", "p", "lexical-sibling")}','outside')"`;
+    const lexicalResult = await spelledCall(lexicalSibling);
+    execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", lexicalSibling], { cwd: spelledCwd, timeout: 5000, env: localShellEnv });
+    assert.equal(readFileSync(join(physicalRoot, "a", "p", "lexical-sibling"), "utf8"), "outside", "lexical sibling: real effect missing");
+    assert.ok(lexicalResult?.block === true || spelledSelections.length > 0, "a write to the cwd's lexical spelling (outside the physical project) is not classified as in-project");
+    const spelledSelectionsBefore = spelledSelections.length;
+    const physicalLocal = `node -e "require('fs').writeFileSync('physical-local','inside')"`;
+    assert.equal(await spelledCall(physicalLocal), undefined, "a local write in a cwd spelled through link/.. was refused");
+    assert.equal(spelledSelections.length, spelledSelectionsBefore, "a local write in a cwd spelled through link/.. prompted");
+    execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", physicalLocal], { cwd: spelledCwd, timeout: 5000, env: localShellEnv });
+    assert.equal(readFileSync(join(deep, "p", "physical-local"), "utf8"), "inside", "physical local: real effect missing");
+    check("a cwd spelled through link/.. is the physical project for roots and targets", true);
+    // The roots handed to the OS sandbox and the sandbox's own grant check are physical too.
+    const physicalDeep = realpathSync.native(deep);
+    const writableRoots = toolDefinitions.vinciWritableRoots(spelledCwd);
+    assert.ok(writableRoots.includes(join(physicalDeep, "p")), "the OS sandbox roots include the physical project");
+    assert.ok(!writableRoots.includes(join(realpathSync.native(physicalRoot), "a", "p")), "the OS sandbox roots exclude the cwd's lexical spelling");
+    assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/not-yet/../granted`), false, "the sandbox refuses a .. after a missing component");
+    assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/granted`), true, "the sandbox grants a plain in-project path");
+    // A protected startup file that is a dangling link is protected at its PHYSICAL future destination.
+    const readlinkSafe = (path) => { try { return readlinkSync(path); } catch { return undefined; } };
+    const fakeHome = join(physicalRoot, "home");
+    mkdirSync(fakeHome);
+    symlinkSync(`${join(physicalRoot, "a", "link")}/../startup-target`, join(fakeHome, ".zshenv"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      const protectedWrites = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
+      assert.ok(protectedWrites.includes(join(physicalDeep, "startup-target")), "a dangling protected link is protected at its physical destination");
+      // A relative destination is resolved physically too (from the link's directory, through its links).
+      symlinkSync("../a/link/../startup-relative", join(fakeHome, ".zlogin"));
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(physicalDeep, "startup-relative")), "a relative dangling protected link is protected at its physical destination");
+      // A `..` after a missing component is unresolvable today: the lexical candidate is protected, never nothing,
+      // and the list computed now still covers where the write lands once the missing directory exists.
+      const realProject = realpathSync.native(physicalProject);
+      symlinkSync(`${realProject}/startup-newdir/../startup`, join(fakeHome, ".zprofile"));
+      const beforeNewdir = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
+      assert.ok(beforeNewdir.includes(join(realProject, "startup")), "a protected link through a missing directory and .. protects its lexical destination");
+      assert.ok(beforeNewdir.includes(join(realProject, "startup-newdir")), "a protected link through a missing directory and .. denies creating that directory");
+      mkdirSync(join(realProject, "startup-newdir"));
+      assert.ok(beforeNewdir.includes(realpathSync.native(join(realProject, "startup-newdir", ".."))  + "/startup"), "the protection computed before the directory exists covers the destination after it exists");
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup")), "the destination stays protected once the missing directory exists");
+      // Positive control: protection names files, not the project; an unrelated in-project write stays granted.
+      assert.ok(!beforeNewdir.includes(realProject), "the project itself is not protected");
+      assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/unrelated-write`), true, "an unrelated in-project write stays granted");
+      // Everything the protected path depends on is protected: a missing directory without any `..`, each link on
+      // the way that could be replaced, and a missing directory reached through such a link (never with the
+      // rest of the path appended to it). System links this user cannot replace (/var, /tmp) are not protected.
+      symlinkSync(`${realProject}/startup-plain-new/rc`, join(fakeHome, ".zlogout"));
+      symlinkSync(`${realProject}/startup-alias/rc`, join(fakeHome, ".profile"));
+      symlinkSync(`${realProject}/startup-alias-new/../config`, join(realProject, "startup-alias"));
+      writeFileSync(join(physicalRoot, "outside", "startup-real"), "real");
+      symlinkSync(join(physicalRoot, "outside", "startup-real"), join(realProject, "startup-hop"));
+      symlinkSync(`${realProject}/startup-hop`, join(fakeHome, ".inputrc"));
+      const dependencies = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
+      assert.ok(dependencies.includes(join(realProject, "startup-plain-new")), "a protected link into a missing directory denies creating that directory");
+      assert.ok(dependencies.includes(join(realProject, "startup-alias")), "a replaceable link inside a protected chain is protected");
+      assert.ok(dependencies.includes(join(realProject, "startup-alias-new")), "a missing directory reached through a chain link is protected as itself");
+      assert.ok(!dependencies.includes(join(realProject, "startup-alias-new", "rc")), "the rest of the path is not appended to a missing directory");
+      assert.ok(dependencies.includes(join(realProject, "startup-hop")), "an intermediate link to an existing file is protected");
+      assert.ok(dependencies.includes(realpathSync.native(join(physicalRoot, "outside", "startup-real"))), "the final destination of a resolvable chain is protected");
+      for (const systemLink of ["/var", "/tmp", "/etc"]) assert.ok(!dependencies.includes(systemLink), `the system link ${systemLink} is not protected`);
+      assert.ok(!dependencies.some((entry) => realProject === entry || realProject.startsWith(`${entry}/`)), "neither the project nor any of its ancestors is protected");
+      // A long chain of links padded with `./` (each link well under the OS path limit) is still walked to its end.
+      mkdirSync(join(realProject, "startup-dots"));
+      for (let index = 0; index < 12; index++) {
+        const next = index === 11 ? `${realProject}/startup-dots-target` : `${"./".repeat(450)}l${index + 1}`;
+        symlinkSync(next, join(realProject, "startup-dots", `l${index}`));
+      }
+      symlinkSync(`${realProject}/startup-dots/l0`, join(fakeHome, ".bash_profile"));
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-dots-target")), "a long padded link chain is walked to its destination");
+      // A 32-link chain (counting the protected entry) still resolves and is protected at its destination.
+      mkdirSync(join(realProject, "startup-b32"));
+      writeFileSync(join(realProject, "startup-b32-target"), "target");
+      for (let index = 0; index < 31; index++) {
+        symlinkSync(index === 30 ? `${realProject}/startup-b32-target` : `${realProject}/startup-b32/b${index + 1}`, join(realProject, "startup-b32", `b${index}`));
+      }
+      symlinkSync(`${realProject}/startup-b32/b0`, join(fakeHome, ".gitconfig"));
+      symlinkSync(join(fakeHome, ".gitconfig"), join(realProject, "startup-b33"));
+      assert.equal(realpathSync.native(join(fakeHome, ".gitconfig")), join(realProject, "startup-b32-target"), "precondition: the OS resolves a 32-link chain");
+      // macOS stops at 32 links; Linux allows 40, where the walk's 32-link bound is the documented limit (#176).
+      if (process.platform === "darwin") assert.throws(() => realpathSync.native(join(realProject, "startup-b33")), { code: "ELOOP" }, "precondition: macOS refuses a 33-link chain");
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-b32-target")), "a 32-link protected chain (the OS limit) is protected at its destination");
+      // An unreadable component is protected itself (fail closed).
+      mkdirSync(join(realProject, "startup-locked", "inner"), { recursive: true });
+      symlinkSync(`${realProject}/startup-locked/inner/rc`, join(fakeHome, ".bash_login"));
+      chmodSync(join(realProject, "startup-locked"), 0o000);
+      try {
+        // Root (and any user the mode does not lock out) can still read it: the row only means something when it is unreadable.
+        let locked = false;
+        try { readdirSync(join(realProject, "startup-locked")); } catch (error) { locked = error?.code === "EACCES"; }
+        if (locked) assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-locked", "inner")), "an unreadable component of a protected chain is protected itself");
+        else console.log("guard-integration: SKIP unreadable-component row (mode 000 does not deny this user, e.g. root)");
+      } finally {
+        chmodSync(join(realProject, "startup-locked"), 0o755);
+      }
+      // Bubblewrap binds follow links: chain links stay out of its read-only binds, their destinations stay in.
+      {
+        const sandboxCore = await loader.import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"), { default: false });
+        const binds = sandboxCore.vinciBwrapReadOnlyPaths(physicalProject);
+        assert.ok(!binds.includes(join(realProject, "startup-hop")) && !binds.includes(join(realProject, "startup-alias")), "bubblewrap does not bind a chain link (it would make the link's destination read-only)");
+        assert.ok(binds.includes(realpathSync.native(join(physicalRoot, "outside", "startup-real"))), "bubblewrap binds the chain's final destination");
+        assert.ok(binds.includes(join(realpathSync.native(fakeHome), ".inputrc")), "bubblewrap still binds the protected entry itself");
+        // The wrapper itself emits those binds: drive the Linux branch of vinciSandboxWrap with bubblewrap reported
+        // present (every path reported existing, so absent-path refusals do not answer first) and read its argv.
+        const platform = Object.getOwnPropertyDescriptor(process, "platform");
+        const realExists = fs.existsSync;
+        const previousCode = process.env.VINCI_CODE;
+        const previousNoSandbox = process.env.VINCI_NO_SANDBOX;
+        let wrapped;
+        try {
+          process.env.VINCI_CODE = "1";
+          delete process.env.VINCI_NO_SANDBOX;
+          Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+          fs.existsSync = () => true;
+          syncBuiltinESMExports();
+          wrapped = sandboxCore.vinciSandboxWrap("true", realProject);
+        } finally {
+          fs.existsSync = realExists;
+          syncBuiltinESMExports();
+          Object.defineProperty(process, "platform", platform);
+          if (previousCode === undefined) delete process.env.VINCI_CODE; else process.env.VINCI_CODE = previousCode;
+          if (previousNoSandbox === undefined) delete process.env.VINCI_NO_SANDBOX; else process.env.VINCI_NO_SANDBOX = previousNoSandbox;
+        }
+        assert.match(wrapped, /^\/usr\/bin\/bwrap /, "the Linux branch produced a bubblewrap command");
+        const roBound = [...wrapped.matchAll(/--ro-bind '([^']*)' '\1'/g)].map((match) => match[1]);
+        assert.ok(!roBound.includes(join(realProject, "startup-hop")) && !roBound.includes(join(realProject, "startup-alias")), "the bubblewrap command does not --ro-bind a chain link");
+        assert.ok(roBound.includes(realpathSync.native(join(physicalRoot, "outside", "startup-real"))), "the bubblewrap command --ro-binds the chain's final destination");
+        assert.ok(roBound.includes(join(realpathSync.native(fakeHome), ".inputrc")), "the bubblewrap command --ro-binds the protected entry itself");
+      }
+      // The real OS sandbox enforces it (macOS): no sandboxed command can create the missing directories or replace
+      // the links, while an ordinary project write succeeds.
+      if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) {
+        const sandbox = await loader.import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"), { default: false });
+        const previousCode = process.env.VINCI_CODE;
+        const previousNoSandbox = process.env.VINCI_NO_SANDBOX;
+        process.env.VINCI_CODE = "1";
+        delete process.env.VINCI_NO_SANDBOX;
+        const sandboxed = (command) => {
+          try {
+            execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", sandbox.vinciSandboxWrap(command, realProject)], { cwd: realProject, timeout: 10000, env: { ...localShellEnv, HOME: fakeHome }, stdio: "pipe" });
+            return true;
+          } catch {
+            return false;
+          }
+        };
+        try {
+          mkdirSync(join(realProject, "startup-evil"));
+          assert.equal(sandboxed("echo ok > sandboxed-ordinary.txt"), true, "an ordinary sandboxed project write succeeds");
+          assert.equal(readFileSync(join(realProject, "sandboxed-ordinary.txt"), "utf8"), "ok\n", "the ordinary sandboxed write landed");
+          sandboxed("mkdir startup-plain-new");
+          sandboxed(`ln -s ${realProject}/startup-evil startup-plain-new`);
+          assert.ok(!existsSync(join(realProject, "startup-plain-new")) && !readlinkSafe(join(realProject, "startup-plain-new")), "the sandbox cannot create the missing directory of a protected destination");
+          sandboxed(`ln -sfn ${realProject}/startup-evil startup-alias`);
+          sandboxed("rm -f startup-alias");
+          assert.equal(readlinkSync(join(realProject, "startup-alias")), `${realProject}/startup-alias-new/../config`, "the sandbox cannot replace a link inside a protected chain");
+          sandboxed("mkdir startup-alias-new");
+          assert.ok(!existsSync(join(realProject, "startup-alias-new")), "the sandbox cannot create a missing directory reached through a chain link");
+          sandboxed(`ln -sfn ${realProject}/startup-evil startup-hop`);
+          assert.equal(readlinkSync(join(realProject, "startup-hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot replace an intermediate link");
+        } finally {
+          if (previousCode === undefined) delete process.env.VINCI_CODE;
+          else process.env.VINCI_CODE = previousCode;
+          if (previousNoSandbox !== undefined) process.env.VINCI_NO_SANDBOX = previousNoSandbox;
+        }
+      }
+      // A grant never follows a dangling link out of the project.
+      symlinkSync(join(physicalRoot, "outside", "grant-target"), join(physicalProject, "dangling-out"));
+      assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/dangling-out`), false, "the sandbox refuses a write through a dangling link");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+    check("sandbox roots, grants and protected link destinations are physical", true);
+  }
   assert.ok(guard.segmentDestructiveDelivery("xargs env --unknown-wrapper-option rm"), "an unknown wrapper option must fail closed");
   assert.ok((await toolCall("bash", { command: "find -- ~ -name '*.log' -delete" }))?.block);
 
@@ -1993,6 +2251,19 @@ try {
     controls.some(({ message }) => message.customType === "vinci-store-path-block" && /internal bookkeeping mirror/i.test(message.content)),
   );
 
+  // On a case-insensitive filesystem a VINCI_HOME spelled in another case is the same store: the
+  // store check compares physical paths, as the write target is.
+  const casedVinciHome = join(dirname(vinciHome), basename(vinciHome).toUpperCase());
+  if (existsSync(casedVinciHome)) {
+    process.env.VINCI_HOME = casedVinciHome;
+    try {
+      const casedStoreWrite = await headlessCall("write", { path: mirrorFile, content: "<h1>project</h1>\n" });
+      check("a VINCI_HOME spelled in another case still steers store writes", casedStoreWrite?.block === true && /internal bookkeeping mirror/i.test(casedStoreWrite.reason));
+    } finally {
+      process.env.VINCI_HOME = vinciHome;
+    }
+  }
+
   const desktopWrite = await headlessCall("write", {
     path: join(homedir(), "Desktop", "vinci-guard-headless-x.txt"),
     content: "x",
@@ -2018,6 +2289,32 @@ try {
     "a project-relative write remains allowed when cwd is under VINCI_HOME",
     storeRelativeWrite === undefined && gates().length === 0,
   );
+
+  // The same project reached through a differently cased store spelling is still under the store.
+  const casedStoreProjectCwd = join(dirname(vinciHome), basename(vinciHome).toUpperCase(), "projects", "active-project");
+  if (existsSync(casedStoreProjectCwd)) {
+    control.clearVinciConfirmationGate();
+    let casedRelativeWrite;
+    for (const handler of handlers.tool_call ?? []) {
+      casedRelativeWrite = await handler(
+        { toolName: "write", input: { path: "index.html", content: "<h1>active</h1>\n" } },
+        { cwd: casedStoreProjectCwd, hasUI: false },
+      );
+      if (casedRelativeWrite !== undefined) break;
+    }
+    check("a project-relative write stays allowed when the cwd spells the store in another case", casedRelativeWrite === undefined && gates().length === 0);
+    // The cwd is still recognised as under the store: a sibling store write takes the gate, not the steer.
+    control.clearVinciConfirmationGate();
+    let casedSiblingWrite;
+    for (const handler of handlers.tool_call ?? []) {
+      casedSiblingWrite = await handler(
+        { toolName: "write", input: { path: join(vinciHome, "projects", "other-project", "y.html"), content: "y" } },
+        { cwd: casedStoreProjectCwd, hasUI: false },
+      );
+      if (casedSiblingWrite !== undefined) break;
+    }
+    check("a cwd spelling the store in another case is still under the store (gate, not steer)", casedSiblingWrite?.block === true && /go-ahead/.test(casedSiblingWrite.reason) && !/bookkeeping mirror/i.test(casedSiblingWrite.reason));
+  }
 
   // Binds the cwdIsUnderStore guard itself: when the PROJECT lives under VINCI_HOME, a write to a
   // store path OUTSIDE that project must take the normal out-of-project gate (a real approvable

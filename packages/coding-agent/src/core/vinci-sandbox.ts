@@ -26,7 +26,17 @@
 
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, mkdtempSync, readlinkSync, realpathSync, rmSync, statSync } from "node:fs";
+import {
+	accessSync,
+	existsSync,
+	constants as fsConstants,
+	lstatSync,
+	mkdtempSync,
+	readlinkSync,
+	realpathSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { waitForChildProcess } from "../utils/child-process.ts";
@@ -92,31 +102,34 @@ export function vinciSensitiveNoRead(cwd: string): string[] {
 	return [...new Set(paths.map(realOrSelf).filter((entry) => existsSync(entry)))];
 }
 
+/** An absolute spelling of `p` without lexical `..` collapse: `link/..` must reach the OS as written. */
+function unresolvedAbsolute(p: string): string {
+	return isAbsolute(p) ? p : `${process.cwd()}${sep}${p}`;
+}
+
+/** Physical path (the OS realpath follows `link/..` through the link; the JS one collapses it first). */
 function realOrSelf(p: string): string {
 	try {
-		return realpathSync(p);
+		return realpathSync.native(unresolvedAbsolute(p));
 	} catch {
-		return p;
+		return resolve(p);
 	}
 }
 
-function canonicalWritePath(path: string, protectedPath = false, links = 0): string | undefined {
-	let candidate = resolve(path);
+function canonicalWritePath(path: string): string | undefined {
+	let candidate = unresolvedAbsolute(path);
 	const missing: string[] = [];
 	for (let depth = 0; depth < 256; depth++) {
 		try {
 			lstatSync(candidate);
-			return resolve(realpathSync(candidate), ...missing.reverse());
+			// A `..` after a missing component cannot be resolved physically yet: refuse it.
+			if (missing.includes("..")) return undefined;
+			return resolve(realpathSync.native(candidate), ...missing.reverse());
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
 			try {
-				if (lstatSync(candidate).isSymbolicLink()) {
-					// Grants reject dangling links. Protection must also cover their future physical
-					// destination, otherwise creating that destination would lose the default deny.
-					if (!protectedPath || links >= 32) return undefined;
-					const target = canonicalWritePath(resolve(dirname(candidate), readlinkSync(candidate)), true, links + 1);
-					return target ? resolve(target, ...missing.reverse()) : undefined;
-				}
+				// Grants reject dangling links (protection follows them in protectedWritePaths).
+				if (lstatSync(candidate).isSymbolicLink()) return undefined;
 			} catch {
 				/* missing component */
 			}
@@ -127,6 +140,65 @@ function canonicalWritePath(path: string, protectedPath = false, links = 0): str
 		}
 	}
 	return undefined;
+}
+
+/**
+ * Every path a protected `path` depends on, walked component by component with links followed by hand: each
+ * link on the way that this user could replace, the first missing component (creating it, as a directory or as
+ * a link, would decide where the path lands), the destination that component would give, and the final physical
+ * path. Fail closed: an unreadable component is protected itself.
+ */
+function protectedWritePaths(path: string): string[] {
+	const out = new Set<string>();
+	let pending = unresolvedAbsolute(path)
+		.split(sep)
+		.filter((part) => part !== "");
+	let current: string = sep;
+	let links = 0;
+	let steps = 0;
+	while (pending.length > 0) {
+		const part = pending.shift()!;
+		if (part === ".") continue;
+		// 33 links of at most PATH_MAX each stay far below this; past it, refuse rather than protect less.
+		if (++steps > 65536)
+			throw new Error(`Vinci cannot resolve the protected path ${path}. Shorten its link chain to re-enable bash.`);
+		if (part === "..") {
+			// `current` holds no links, so its parent is the physical parent.
+			current = dirname(current);
+			continue;
+		}
+		const next = join(current, part);
+		let isLink: boolean;
+		try {
+			isLink = lstatSync(next).isSymbolicLink();
+		} catch (error) {
+			out.add(next);
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") out.add(resolve(next, ...pending));
+			return [...out];
+		}
+		if (isLink) {
+			if (userCanReplace(next)) out.add(next);
+			// The OS refuses to resolve more than 32 links (ELOOP), so a longer chain cannot be written through.
+			if (++links > 32) return [...out];
+			const destination = readlinkSync(next);
+			pending = [...destination.split(sep).filter((piece) => piece !== ""), ...pending];
+			if (isAbsolute(destination)) current = sep;
+			continue;
+		}
+		current = realOrSelf(next);
+	}
+	out.add(current);
+	return [...out];
+}
+
+/** Whether this user (and so a sandboxed child) could replace the entry `path` names. */
+function userCanReplace(path: string): boolean {
+	try {
+		accessSync(dirname(path), fsConstants.W_OK);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function configuredPaths(name: string): string[] {
@@ -170,7 +242,7 @@ function configuredPaths(name: string): string[] {
 }
 
 function scopedPaths(cwd: string, files = false): string[] {
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const grants = (files ? fileGrants : directoryGrants).get(project) ?? [];
 	// Pin approvals to physical destinations. Retargeting a granted path does not widen its grant.
 	return [
@@ -197,7 +269,7 @@ export function vinciGrantWriteDirectory(cwd: string, path: string): string {
 		);
 	if (existsSync(canonical) && !statSync(canonical).isDirectory())
 		throw new Error("The write grant requires a directory. Use /allow-file for one file.");
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const grants = directoryGrants.get(project) ?? new Set<string>();
 	grants.add(canonical);
 	directoryGrants.set(project, grants);
@@ -209,7 +281,7 @@ export function vinciGrantWriteFile(cwd: string, path: string): string {
 	if (!canonical || canonical === sep || (existsSync(canonical) && !statSync(canonical).isFile())) {
 		throw new Error("The write grant requires a resolvable file path. Choose a regular file.");
 	}
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const grants = fileGrants.get(project) ?? new Set<string>();
 	grants.add(canonical);
 	fileGrants.set(project, grants);
@@ -227,7 +299,7 @@ export function vinciResetSandboxPermissions(): void {
 export function vinciSandboxWriteGranted(cwd: string, path: string): boolean {
 	const target = canonicalWritePath(path);
 	if (!target) return false;
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const directories = scopedPaths(cwd);
 	if (implicitProjectAllowed(project)) directories.push(project);
 	return (
@@ -262,7 +334,7 @@ const BUILD_CACHES = [
 /** No implicit HOME, sibling-parent, external-drive or shared-temp-container write authority. */
 export function vinciWritableRoots(cwd: string): string[] {
 	const home = realOrSelf(homedir());
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const roots = new Set(scopedPaths(cwd));
 	if (implicitProjectAllowed(project)) roots.add(project);
 	roots.add(processTemp());
@@ -316,16 +388,32 @@ const STARTUP_PATHS = [
 	"Library/LaunchAgents",
 ];
 
-export function vinciSensitiveNoWrite(_cwd: string): string[] {
+function protectedEntryPaths(): string[] {
 	const home = realOrSelf(homedir());
-	return [
-		...new Set(
-			[...LOCKED_HOME_SECRETS, ...TOOL_CONFIG_PROTECTED_WRITES, ...STARTUP_PATHS].flatMap((entry) => {
-				const path = join(home, entry);
-				return [path, canonicalWritePath(path, true) ?? path];
-			}),
-		),
-	];
+	return [...LOCKED_HOME_SECRETS, ...TOOL_CONFIG_PROTECTED_WRITES, ...STARTUP_PATHS].map((entry) => join(home, entry));
+}
+
+export function vinciSensitiveNoWrite(_cwd: string): string[] {
+	return [...new Set(protectedEntryPaths().flatMap((path) => [path, ...protectedWritePaths(path)]))];
+}
+
+/**
+ * Protected paths bubblewrap binds read-only. Bind mounts follow links, so a chain link would make its whole
+ * destination read-only; its destination is listed on its own. Chain links are protected by the macOS profile only.
+ */
+export function vinciBwrapReadOnlyPaths(cwd: string): string[] {
+	const entries = new Set(protectedEntryPaths());
+	return vinciSensitiveNoWrite(cwd).filter((r) => existsSync(r) && !isProtectedChainLink(r, entries));
+}
+
+/** A link inside a protected chain (not a protected entry itself): a bind mount would follow it. */
+function isProtectedChainLink(path: string, entries: Set<string>): boolean {
+	if (entries.has(path)) return false;
+	try {
+		return lstatSync(path).isSymbolicLink();
+	} catch {
+		return false;
+	}
 }
 
 const SEATBELT = "/usr/bin/sandbox-exec";
@@ -418,8 +506,7 @@ function bwrapWrap(
 		.join(" ");
 	// Re-bind the credential dirs READ-ONLY after the rw binds (later binds win) so ~/.ssh etc. stay
 	// unwritable even when a writable root (e.g. $HOME as cwd) covers them.
-	const roBinds = vinciSensitiveNoWrite(cwd)
-		.filter((r) => existsSync(r))
+	const roBinds = vinciBwrapReadOnlyPaths(cwd)
 		.map((r) => `--ro-bind ${sq(r)} ${sq(r)}`)
 		.join(" ");
 	const hiddenReads = sensitiveReadAllowed
