@@ -1089,6 +1089,12 @@ try {
       } finally {
         chmodSync(join(realProject, "startup-locked"), 0o755);
       }
+      // A link in a directory this user owns but has made read-only (0555) is still replaceable after one chmod.
+      mkdirSync(join(realProject, "startup-ro"));
+      symlinkSync(join(physicalRoot, "outside", "startup-real"), join(realProject, "startup-ro", "hop"));
+      symlinkSync(`${realProject}/startup-ro/hop`, join(fakeHome, ".bash_logout"));
+      chmodSync(join(realProject, "startup-ro"), 0o555);
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-ro", "hop")), "a link in a read-only directory this user owns is protected");
       // Bubblewrap binds follow links: chain links stay out of its read-only binds, their destinations stay in.
       {
         const sandboxCore = await loader.import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"), { default: false });
@@ -1153,6 +1159,9 @@ try {
           assert.ok(!existsSync(join(realProject, "startup-alias-new")), "the sandbox cannot create a missing directory reached through a chain link");
           sandboxed(`ln -sfn ${realProject}/startup-evil startup-hop`);
           assert.equal(readlinkSync(join(realProject, "startup-hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot replace an intermediate link");
+          sandboxed(`chmod u+w startup-ro && ln -sfn ${realProject}/startup-evil startup-ro/hop`);
+          assert.equal(readlinkSync(join(realProject, "startup-ro", "hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot make a read-only directory writable and replace the chain link in it");
+          assert.ok((fs.statSync(join(realProject, "startup-ro")).mode & 0o200) !== 0, "precondition: the sandboxed chmod of the read-only directory ran");
         } finally {
           if (previousCode === undefined) delete process.env.VINCI_CODE;
           else process.env.VINCI_CODE = previousCode;
@@ -1163,6 +1172,7 @@ try {
       symlinkSync(join(physicalRoot, "outside", "grant-target"), join(physicalProject, "dangling-out"));
       assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/dangling-out`), false, "the sandbox refuses a write through a dangling link");
     } finally {
+      try { chmodSync(join(realpathSync.native(physicalProject), "startup-ro"), 0o755); } catch {}
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
     }
