@@ -452,6 +452,38 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.equal(existsSync(target), false, "Target classification creates no file");
     if (outside) assert.doesNotMatch(notifications.at(-1).message, /saving under/);
   }
+  // The named targets are exactly the shell's write targets: no extra path (e.g. the tee
+  // executable itself) and none missing.
+  const namedTargets = (reason) => [...reason.matchAll(/(?:Target|Use write with) "([^"]+)"/g)].map((match) => match[1]).sort();
+  for (const [command, expected] of [
+    ["echo x > out.txt", [join(project, "out.txt")]],
+    ["tee -a results.txt", [join(project, "results.txt")]],
+    ["tee local.txt route-link/escaped.txt", [join(project, "local.txt"), escaped]],
+    ["tee kept.txt > piped.txt -a", [join(project, "kept.txt"), join(project, "piped.txt")]],
+    ["tee -i interrupt.txt", [join(project, "interrupt.txt")]],
+    ["tee both.txt -ai", [join(project, "both.txt")]],
+    // Only an exact `tee` reads operands (case-sensitive filesystems have no TEE); its redirect is
+    // still a real target.
+    ["TEE upper.txt > actual.txt", [join(project, "actual.txt")]],
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Exact-target write stays blocked: ${command}`);
+    assert.deepEqual(namedTargets(result.reason), [...expected].sort(), `Named targets are exactly the write targets: ${command}`);
+  }
+  // A redirect without a plain word after it is a shell syntax error, so nothing is opened or named.
+  for (const command of ["tee out.txt >", "echo x > > out.txt", "tee out.txt >> < in.txt"]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Broken redirect stays blocked: ${command}`);
+    assert.deepEqual(namedTargets(result.reason), [], `Broken redirect names nothing: ${command}`);
+  }
+  // A dangling symlink resolves to no path: the plain command keeps the project route and names
+  // nothing (and the guard must not fail on the unresolved path).
+  symlinkSync(join(realpathSync(runRoot), "missing-dir", "nothing.txt"), join(workspace, "dangling-link"));
+  {
+    const result = await toolCall("bash", { command: "echo x > dangling-link" });
+    assert.equal(result?.block, true, "Dangling-symlink write stays blocked");
+    assert.equal(result.reason, genericReason, "Dangling-symlink target is not named");
+  }
   // Plain, unquoted interpreter commands pass the plain-command gate, so only the interpreter
   // exclusion keeps their redirect target unnamed (separated and attached redirects, and
   // interpreter-named executables).
@@ -683,6 +715,34 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.equal(result?.block, true, "secret write in a secret-named project stays blocked");
     assert.equal(result.reason, `Vinci blocked a shell-based file write; ${neutralRoute}`, "secret-carrying command gets neutral project wording");
     assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, "guidance never repeats the secret through the project path");
+  }
+  // The secret value can sit in the cwd (a link named password=…) or in the resolved project path,
+  // and an absolute target may repeat it while the command itself carries nothing recognizable.
+  {
+    const root = realpathSync(runRoot);
+    const outsideTarget = join(root, "hunter2xyz");
+    mkdirSync(join(root, "hunter2xyz-project"));
+    symlinkSync(join(root, "hunter2xyz-project"), join(root, "password=hunter2xyz"));
+    mkdirSync(join(root, "password=hunter2xyz-real"));
+    symlinkSync(join(root, "password=hunter2xyz-real"), join(root, "plain-project-link"));
+    for (const [label, cwd] of [["secret in the cwd", join(root, "password=hunter2xyz")], ["secret in the resolved project", join(root, "plain-project-link")]]) {
+      const command = `echo x > ${outsideTarget}`;
+      assert.equal(guard.redactSecrets(command), command, `fixture (${label}): the command itself carries no recognized secret`);
+      const before = controls.length;
+      const result = await toolCall("bash", { command }, { ...ctx, cwd });
+      assert.equal(result?.block, true, `${label}: write stays blocked`);
+      assert.equal(result.reason, neutralReason, `${label}: neutral wording, no target`);
+      assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, `${label}: guidance never repeats the secret value`);
+    }
+  }
+  // A project path that does not resolve (a symlink loop) is never echoed.
+  {
+    const root = realpathSync(runRoot);
+    symlinkSync(join(root, "loop-b"), join(root, "loop-a"));
+    symlinkSync(join(root, "loop-a"), join(root, "loop-b"));
+    const result = await toolCall("bash", { command: "echo x > out.txt" }, { ...ctx, cwd: join(root, "loop-a") });
+    assert.equal(result?.block, true, "unresolvable project: write stays blocked");
+    assert.equal(result.reason, neutralReason, "unresolvable project: neutral wording, no target");
   }
   // An opaque value the user supplied is vaulted behind a handle; once restored into the command no
   // masker recognizes it, so a command that carried a handle names no target at all.

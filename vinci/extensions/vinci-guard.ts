@@ -595,9 +595,15 @@ function shellWriteTargets(command: string): string[] {
   const tokens = body.match(tokenPattern) ?? [];
   const rawTargets: string[] = [];
   for (let index = 0; index < tokens.length; index++) {
-    if (/^>>?$/.test(tokens[index])) rawTargets.push(tokens[index + 1] ?? "");
+    if (!/^>>?$/.test(tokens[index])) continue;
+    // A redirect without a plain word after it is a syntax error: the shell opens nothing at all.
+    const next = tokens[index + 1];
+    if (next === undefined || /^[<>]/.test(next)) return [""];
+    rawTargets.push(next);
   }
-  if (/^tee\b/i.test(body)) {
+  // tee's operands count only when the executable is tee itself, spelled exactly (case-sensitive
+  // filesystems have no TEE).
+  if (executable === "tee") {
     // tee may take options anywhere in its argv (GNU permutes them, even after a redirect), and an
     // unknown one or --help means it opens no file. Name its operands only when every other word
     // is -a or -i (or both), wherever it appears.
@@ -1909,7 +1915,8 @@ export default function (pi: ExtensionAPI) {
         // quoting (pass""word=…), so it never echoes a path either.
         const carriesSecret = carriesRestoredSecrets || redactSecrets(cmd) !== cmd
           || redactSecrets(ctx.cwd) !== ctx.cwd || redactSecrets(projectPath) !== projectPath;
-        const projectScope = !carriesSecret && isPlainShellCommand(cmd) && isSafeTargetText(projectPath)
+        // An unresolvable project (e.g. a symlink loop) is never echoed: projectPath is then unresolved.
+        const projectScope = !carriesSecret && projectRoot !== null && isPlainShellCommand(cmd) && isSafeTargetText(projectPath)
           ? `under ${projectPath}` : "in this project";
         const route = `write and edit can create or change files ${projectScope}; a file outside it needs your approval through the write tool.`;
         // Only a plain, secret-free command names its redirect target; everything else gets the
