@@ -3,7 +3,8 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -570,12 +571,28 @@ try {
       }
       symlinkSync(`${realProject}/startup-dots/l0`, join(fakeHome, ".bash_profile"));
       assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-dots-target")), "a long padded link chain is walked to its destination");
+      // The walk follows exactly as many links as the OS does: a 32-link chain (counting the protected entry) still
+      // resolves and is protected at its destination; one more link and the OS itself refuses to resolve it (ELOOP).
+      mkdirSync(join(realProject, "startup-b32"));
+      writeFileSync(join(realProject, "startup-b32-target"), "target");
+      for (let index = 0; index < 31; index++) {
+        symlinkSync(index === 30 ? `${realProject}/startup-b32-target` : `${realProject}/startup-b32/b${index + 1}`, join(realProject, "startup-b32", `b${index}`));
+      }
+      symlinkSync(`${realProject}/startup-b32/b0`, join(fakeHome, ".gitconfig"));
+      symlinkSync(join(fakeHome, ".gitconfig"), join(realProject, "startup-b33"));
+      assert.equal(realpathSync.native(join(fakeHome, ".gitconfig")), join(realProject, "startup-b32-target"), "precondition: the OS resolves a 32-link chain");
+      assert.throws(() => realpathSync.native(join(realProject, "startup-b33")), { code: "ELOOP" }, "precondition: the OS refuses a 33-link chain");
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-b32-target")), "a 32-link protected chain (the OS limit) is protected at its destination");
       // An unreadable component is protected itself (fail closed).
       mkdirSync(join(realProject, "startup-locked", "inner"), { recursive: true });
       symlinkSync(`${realProject}/startup-locked/inner/rc`, join(fakeHome, ".bash_login"));
       chmodSync(join(realProject, "startup-locked"), 0o000);
       try {
-        assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-locked", "inner")), "an unreadable component of a protected chain is protected itself");
+        // Root (and any user the mode does not lock out) can still read it: the row only means something when it is unreadable.
+        let locked = false;
+        try { readdirSync(join(realProject, "startup-locked")); } catch (error) { locked = error?.code === "EACCES"; }
+        if (locked) assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-locked", "inner")), "an unreadable component of a protected chain is protected itself");
+        else console.log("guard-integration: SKIP unreadable-component row (mode 000 does not deny this user, e.g. root)");
       } finally {
         chmodSync(join(realProject, "startup-locked"), 0o755);
       }
@@ -586,6 +603,32 @@ try {
         assert.ok(!binds.includes(join(realProject, "startup-hop")) && !binds.includes(join(realProject, "startup-alias")), "bubblewrap does not bind a chain link (it would make the link's destination read-only)");
         assert.ok(binds.includes(realpathSync.native(join(physicalRoot, "outside", "startup-real"))), "bubblewrap binds the chain's final destination");
         assert.ok(binds.includes(join(realpathSync.native(fakeHome), ".inputrc")), "bubblewrap still binds the protected entry itself");
+        // The wrapper itself emits those binds: drive the Linux branch of vinciSandboxWrap with bubblewrap reported
+        // present (every path reported existing, so absent-path refusals do not answer first) and read its argv.
+        const platform = Object.getOwnPropertyDescriptor(process, "platform");
+        const realExists = fs.existsSync;
+        const previousCode = process.env.VINCI_CODE;
+        const previousNoSandbox = process.env.VINCI_NO_SANDBOX;
+        let wrapped;
+        try {
+          process.env.VINCI_CODE = "1";
+          delete process.env.VINCI_NO_SANDBOX;
+          Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+          fs.existsSync = () => true;
+          syncBuiltinESMExports();
+          wrapped = sandboxCore.vinciSandboxWrap("true", realProject);
+        } finally {
+          fs.existsSync = realExists;
+          syncBuiltinESMExports();
+          Object.defineProperty(process, "platform", platform);
+          if (previousCode === undefined) delete process.env.VINCI_CODE; else process.env.VINCI_CODE = previousCode;
+          if (previousNoSandbox === undefined) delete process.env.VINCI_NO_SANDBOX; else process.env.VINCI_NO_SANDBOX = previousNoSandbox;
+        }
+        assert.match(wrapped, /^\/usr\/bin\/bwrap /, "the Linux branch produced a bubblewrap command");
+        const roBound = [...wrapped.matchAll(/--ro-bind '([^']*)' '\1'/g)].map((match) => match[1]);
+        assert.ok(!roBound.includes(join(realProject, "startup-hop")) && !roBound.includes(join(realProject, "startup-alias")), "the bubblewrap command does not --ro-bind a chain link");
+        assert.ok(roBound.includes(realpathSync.native(join(physicalRoot, "outside", "startup-real"))), "the bubblewrap command --ro-binds the chain's final destination");
+        assert.ok(roBound.includes(join(realpathSync.native(fakeHome), ".inputrc")), "the bubblewrap command --ro-binds the protected entry itself");
       }
       // The real OS sandbox enforces it (macOS): no sandboxed command can create the missing directories or replace
       // the links, while an ordinary project write succeeds.
