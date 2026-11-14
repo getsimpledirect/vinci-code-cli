@@ -193,7 +193,7 @@ describe("Crew result delivery through the real extension runtime", () => {
 		assert.equal(ui.core.faux.callCount, 1);
 		// #170: the automatic result turn is its own request, so the receipt does not carry the previous one's operations.
 		const starts = emit.mock.calls.map(([event]) => event).filter((event) => event.type === "agent_start");
-		assert.deepEqual(starts, [{ type: "agent_start", newRequest: true }], "the automatic result turn starts a new request");
+		assert.deepEqual(starts, [{ type: "agent_start", continuesRetry: false, newRequest: true }], "the automatic result turn starts a new request");
 		await waitUntil(() => latestHelper(ui, helperId)?.deliveredAt, "live result acknowledgement");
 		assert.equal(typeof latestHelper(ui, helperId).deliveredAt, "number");
 	});

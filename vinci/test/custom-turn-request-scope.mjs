@@ -12,7 +12,7 @@ const owned = mkdtempSync(join(tmpdir(), "custom-turn-scope-"));
 const previousCeiling = process.env.GIT_CEILING_DIRECTORIES;
 process.env.GIT_CEILING_DIRECTORIES = owned;
 
-async function fixture(mode) {
+async function fixture(mode, { retry = false } = {}) {
   const cwd = mkdtempSync(join(owned, `${mode}-`));
   const agentDir = join(cwd, "profile");
   mkdirSync(agentDir);
@@ -20,7 +20,7 @@ async function fixture(mode) {
   const authStorage = AuthStorage.inMemory();
   authStorage.setRuntimeApiKey(faux.getModel().provider, "offline-faux-key");
   const modelRegistry = ModelRegistry.inMemory(authStorage);
-  const settingsManager = SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
+  const settingsManager = SettingsManager.inMemory({ retry: { enabled: retry, maxRetries: 2, baseDelayMs: 1 }, compaction: { enabled: false } });
   const extensionEvents = [];
   const extensionFactories = [(pi) => {
     pi.on("before_agent_start", (event) => { extensionEvents.push(event); });
@@ -86,6 +86,35 @@ try {
         console.error(`FAIL ${mode} ${row}: ${error.message.split("\n")[0]}`);
       } finally { f.close(); }
     }
+  }
+  // A retry inside a new-request custom turn continues that request: the flag is consumed once.
+  for (const mode of ["tui", "print", "json", "rpc"]) {
+    const f = await fixture(mode, { retry: true });
+    try {
+      f.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("read", { path: "missing-input.txt" }, { id: "read-missing" }), { stopReason: "toolUse" }),
+        fauxAssistantMessage("I could not read it."),
+        fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." }),
+        fauxAssistantMessage("The separate read-only request is complete."),
+      ]);
+      await f.session.prompt("Read missing-input.txt and summarize it.");
+      assert.equal(f.outcomes().at(-1)?.state, "BLOCKED");
+      const before = f.extensionEvents.filter((event) => event.type === "agent_start").length;
+      await f.session.sendCustomMessage(
+        { customType: "custom-turn-scope-request", content: "Complete a separate read-only request B.", display: true },
+        { triggerTurn: true, newRequest: true },
+      );
+      const bStarts = f.extensionEvents.filter((event) => event.type === "agent_start").slice(before);
+      console.log(`${mode} newRequest retry: ${JSON.stringify({ states: f.outcomes().map(({ state }) => state), starts: bStarts })}`);
+      assert.deepEqual(bStarts, [{ type: "agent_start", continuesRetry: false, newRequest: true }, { type: "agent_start", continuesRetry: true }],
+        "the retry's agent_start continues B and does not carry newRequest again");
+      assert.equal(f.outcomes().at(-1)?.state, "DONE", "B's retry keeps B's fresh scope");
+      assert.deepEqual(f.outcomes().at(-1)?.requiredOperations ?? [], [], "B lists none of A's operations after its retry");
+      console.log(`PASS ${mode} newRequest retry`);
+    } catch (error) {
+      failures++;
+      console.error(`FAIL ${mode} newRequest retry: ${error.message.split("\n")[0]}`);
+    } finally { f.close(); }
   }
 } finally {
   if (previousCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
