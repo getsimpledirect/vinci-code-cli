@@ -565,7 +565,7 @@ function nestedShellText(segment: string): string | undefined {
   for (let depth = 0; depth < 8; depth++) {
     while (start < words.length && /^[A-Za-z_]\w*=/.test(words[start])) start++;
     const executable = words[start] ?? "";
-    if (/^eval$/i.test(executable)) return words.slice(start + 1).join(" ");
+    if (/^eval$/i.test(executable)) return words.slice(words[start + 1] === "--" ? start + 2 : start + 1).join(" ");
     if (!/^(?:builtin|exec|command|sudo|env|nohup|time|xargs)$/i.test(executable)) break;
     let index = start + 1;
     while (index < words.length && (words[index].startsWith("-") || /^[A-Za-z_]\w*=/.test(words[index]))) {
@@ -579,6 +579,13 @@ function nestedShellText(segment: string): string | undefined {
   for (let index = start + 1; index < words.length; index++) {
     const word = words[index];
     if (!word.startsWith("-") || word === "-" || word === "--") return undefined;
+    // -n (also in a cluster) only checks syntax: nothing runs.
+    if (/^-[A-Za-z]*n[A-Za-z]*$/.test(word) && !word.startsWith("--")) return undefined;
+    // Shell options that take the next word as their value.
+    if (/^(?:[-+][oO]|--(?:rcfile|init-file))$/.test(word)) {
+      index++;
+      continue;
+    }
     if (/^-[A-Za-z]*c[A-Za-z]*$/.test(word)) return words[index + 1];
   }
   return undefined;

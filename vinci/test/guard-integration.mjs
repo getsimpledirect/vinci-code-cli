@@ -369,6 +369,10 @@ async function shellWriteWrapperChecks() {
     "exec sed -i s/a/b/ out.txt",
     "env perl -pi -e s/a/b/ out.txt",
     "exec cat <<EOF > out.txt\nx\nEOF",
+    // Valued shell options before -c, and eval's option terminator.
+    "bash -o pipefail -c 'echo x > out.txt'",
+    "bash --rcfile rc.sh -c 'echo x > out.txt'",
+    "eval -- 'echo x > out.txt'",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
@@ -387,7 +391,9 @@ async function shellWriteWrapperChecks() {
   // Positive controls: commands that run no content writer keep their old classification.
   for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo", "command -v echo > out.txt", "bash -c 'ls' > out.txt", "bash -c 'echo ok' > /dev/null", "git ls-files | xargs sed -i 's/a/b/'",
     // A lookup (also with grouped options) writes nothing, even of a shell.
-    "command -pv echo > out.txt", "command -v bash -c 'echo x > out.txt'"]) {
+    "command -pv echo > out.txt", "command -v bash -c 'echo x > out.txt'",
+    // Syntax-check mode runs nothing.
+    "bash -n -c 'echo x > out.txt'", "sh -nc 'echo x > out.txt'"]) {
     assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);
     const result = await toolCall("bash", { command });
     assert.ok(!result?.block || !/^Vinci blocked a shell-based file write/.test(result.reason), `No shell-write refusal: ${command}`);
