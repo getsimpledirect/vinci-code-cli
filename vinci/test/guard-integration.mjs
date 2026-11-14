@@ -417,6 +417,61 @@ try {
     execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", command], { cwd: adversarialProject, timeout: 5000, env: localShellEnv });
   }
   check("actual-byte benign local writes and wrapped reads remain allowed", true);
+
+  // Write targets resolve physically: `link/..` is the link target's parent, not the project.
+  // The real shell runs each command inside a disposable tree to prove where the bytes land.
+  {
+    const physicalRoot = join(runRoot, "physical");
+    const physicalProject = join(physicalRoot, "project");
+    const deep = join(physicalRoot, "outside", "deep");
+    mkdirSync(join(physicalProject, "inner"), { recursive: true });
+    mkdirSync(join(deep, "dir"), { recursive: true });
+    symlinkSync(join(deep, "dir"), join(physicalProject, "lnk"));
+    symlinkSync(join(physicalProject, "inner"), join(physicalProject, "inlnk"));
+    writeFileSync(join(deep, "existing-parent"), "before");
+    const physicalSelections = [];
+    const physicalCtx = {
+      ...ctx,
+      cwd: physicalProject,
+      ui: { ...ctx.ui, async select(title) { physicalSelections.push(title); return "No, don't"; } },
+    };
+    const physicalCall = async (input, toolName = "bash") => {
+      for (const handler of handlers.tool_call ?? []) {
+        const result = await handler({ toolName, input }, physicalCtx);
+        if (result !== undefined) return result;
+      }
+      return undefined;
+    };
+    const physicalFailures = [];
+    for (const [label, command, effect] of [
+      ["python link-parent write", `python3 -c "open('lnk/../py-parent','w').write('outside')"`, join(deep, "py-parent")],
+      ["node link-parent write", `node -e "require('fs').writeFileSync('lnk/../node-parent','outside')"`, join(deep, "node-parent")],
+      ["python link-parent existing target", `python3 -c "open('lnk/../existing-parent','w').write('outside')"`, join(deep, "existing-parent")],
+      ["node absolute link-parent write", `node -e "require('fs').writeFileSync('${join(physicalProject, "lnk")}/../abs-parent','outside')"`, join(deep, "abs-parent")],
+      ["node link made in the same command", `node -e "const fs=require('fs');fs.symlinkSync('${join(deep, "dir")}','made');fs.writeFileSync('made/../made-parent','outside')"`, join(deep, "made-parent")],
+    ]) {
+      const selectionsBefore = physicalSelections.length;
+      const result = await physicalCall({ command });
+      execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", command], { cwd: physicalProject, timeout: 5000, env: localShellEnv });
+      assert.equal(readFileSync(effect, "utf8"), "outside", `${label}: real effect missing`);
+      if (result?.block !== true && physicalSelections.length === selectionsBefore) physicalFailures.push(`${label}: allowed an outside write with no prompt`);
+    }
+    assert.deepEqual(physicalFailures, [], `Physical write-target regressions failed:\n${physicalFailures.join("\n")}`);
+    check("interpreter writes through a link's parent are treated as outside the project", true);
+
+    for (const [label, command, effect] of [
+      ["in-project python write", `python3 -c "open('in-project','w').write('inside')"`, join(physicalProject, "in-project")],
+      ["in-project link write", `node -e "require('fs').writeFileSync('inlnk/in-link','inside')"`, join(physicalProject, "inner", "in-link")],
+      ["in-project link parent", `node -e "require('fs').writeFileSync('inlnk/../in-link-parent','inside')"`, join(physicalProject, "in-link-parent")],
+    ]) {
+      const selectionsBefore = physicalSelections.length;
+      assert.equal(await physicalCall({ command }), undefined, `${label}: in-project write refused`);
+      assert.equal(physicalSelections.length, selectionsBefore, `${label}: in-project write prompted`);
+      execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", command], { cwd: physicalProject, timeout: 5000, env: localShellEnv });
+      assert.equal(readFileSync(effect, "utf8"), "inside", `${label}: real effect missing`);
+    }
+    check("in-project writes, including through an in-project link, stay allowed", true);
+  }
   assert.ok(guard.segmentDestructiveDelivery("xargs env --unknown-wrapper-option rm"), "an unknown wrapper option must fail closed");
   assert.ok((await toolCall("bash", { command: "find -- ~ -name '*.log' -delete" }))?.block);
 

@@ -765,14 +765,18 @@ function structuredWritePath(path: string, cwd: string): string | null {
 }
 
 /** Resolve existing symlink ancestors exactly as file creation does. Missing descendants can be
- * appended only after resolving their existing parent; a dangling link/unreadable ancestor refuses. */
+ * appended only after resolving their existing parent; a dangling link/unreadable ancestor refuses.
+ * Resolution is physical: the OS realpath follows `link/..` through the link, while the JS realpath
+ * collapses it lexically first. A `..` after a missing component cannot be resolved physically yet,
+ * so it refuses too. */
 function consumerWritePath(path: string, cwd: string): string | null {
   let candidate = isAbsolute(path) ? path : `${cwd}${sep}${path}`;
   const missing: string[] = [];
   for (let depth = 0; depth < 256; depth++) {
     try {
       lstatSync(candidate);
-      return resolve(realpathSync(candidate), ...missing.reverse());
+      if (missing.includes("..")) return null;
+      return resolve(realpathSync.native(candidate), ...missing.reverse());
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
       // lstat succeeds on dangling links, but realpath fails: never treat one as a missing component.
