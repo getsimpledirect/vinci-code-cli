@@ -419,6 +419,12 @@ async function shellWriteRouteChecks(onlyCase) {
     ["perl without preceding options", `perl -e 'open(F,">","x")'`],
     ["node without preceding options", `node -e "require('fs').writeFileSync('x','y')"`],
     ["python without preceding options", `python3 -c "open('x','w')"`],
+    ["node append with whitespace and a trailing semicolon", `node -e "  require ( 'fs' ) . appendFileSync ( 'x' , 'y' ) ;  "`],
+    ["python keyword mode and literal write", `python3 -c "open('x',mode='w').write('y')"`],
+    ["python literal write and close", `python3 -c "open('x','w').write('y').close()"`],
+    ["python close with a trailing semicolon", `python3 -c " open('x','w').close(); "`],
+    ["ruby binary write with a trailing semicolon", `ruby -e ' File.binwrite("x","y"); '`],
+    ["perl two-argument open", `perl -e 'open(F,">x")'`],
   ]) {
     const controlsBefore = controls.length;
     const result = await toolCall("bash", { command });
@@ -429,6 +435,26 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.ok(control.content.includes(`Use write with "${realpathSync(interpreterTarget)}"`), `${name}: control names the certain target`);
   }
   for (const [name, command] of [
+    // These previously named targets despite uncertain execution or extra arguments.
+    ["node environment preload gets only the generic route", `NODE_OPTIONS=--require=./hook.cjs node -e "require('fs').writeFileSync('x','y')"`],
+    ["python custom opener gets only the generic route", `python3 -c "import os; open('x','w',opener=lambda p,f: os.open('/tmp/y',f))"`],
+    ["python startup assignment gets only the generic route", `PYTHONSTARTUP=x python3 -c "open('x','w')"`],
+    ["an arbitrary environment assignment gets only the generic route", `EXAMPLE=x ruby -e 'File.write("x","y")'`],
+    ["two python writes get only the generic route", `python3 -c "open('x','w'); open('z','w')"`],
+    ["python opener without an import gets only the generic route", `python3 -c "open('x','w',opener=custom)"`],
+    ["python encoding keyword gets only the generic route", `python3 -c "open('x',mode='w',encoding='utf-8')"`],
+    ["python extra positional argument gets only the generic route", `python3 -c "open('x','w',1)"`],
+    ["python dynamic write content gets only the generic route", `python3 -c "open('x','w').write(content)"`],
+    ["node write options get only the generic route", `node -e "require('fs').writeFileSync('x','y','utf8')"`],
+    ["node asynchronous write gets only the generic route", `node -e "require('fs').writeFile('x','y',callback)"`],
+    ["node comment gets only the generic route", `node -e "require('fs').writeFileSync('x','y') /* extra */"`],
+    ["ruby extra argument gets only the generic route", `ruby -e 'File.write("x","y",0)'`],
+    ["perl interpolated mode gets only the generic route", `perl -e 'open(F,">@mode","x")'`],
+    ["ruby interpolated content gets only the generic route", `ruby -e 'File.write("x","@content")'`],
+    // These already received generic wording and remain regression controls.
+    ["python chdir gets only the generic route", `python3 -c "import os; os.chdir('/tmp'); open('x','w')"`],
+    ["node chdir expression gets only the generic route", `node -e "process.chdir('/tmp')||require('fs').writeFileSync('x','y')"`],
+    ["ruby interpolated target gets only the generic route", `ruby -e 'File.write("#{d}x","y")'`],
     ["ruby -Cdir target gets only the generic route", `ruby -C/tmp -e 'File.write("x","y")'`],
     ["ruby -C dir after code gets only the generic route", `ruby -e 'File.write("x","y")' -C /tmp`],
     ["ruby -Cdir after code gets only the generic route", `ruby -e 'File.write("x","y")' -C/tmp`],
@@ -489,16 +515,18 @@ async function shellWriteRouteChecks(onlyCase) {
     assert.equal(result?.block, true, `Uncertain target stays blocked: ${command}`);
     assert.equal(result.reason, genericReason, `Uncertain target gets only the generic route: ${command}`);
   }
-  // A chdir inside interpreter code (with or without parentheses) moves relative targets: only the
-  // absolute target may be named, never the relative one as if it were in the project.
+  // Multiple statements stay uncertain even when one target is absolute.
   for (const command of [
     `perl -e 'chdir "/tmp"; open(F,">","x"); open(G,">","/etc/y")'`,
     `ruby -e 'Dir.chdir "/tmp"; File.write("x","y"); File.write("/etc/y","z")'`,
   ]) {
+    const controlsBefore = controls.length;
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `chdir interpreter write stays blocked: ${command}`);
-    assert.equal(result.reason.includes(`"${join(project, "x")}"`), false, `chdir moves the relative target, so it is not named: ${command}`);
-    assert.ok(result.reason.includes(`"${join(realpathSync("/etc"), "y")}"`), `the absolute target is still named after a chdir: ${command}\n${result.reason}`);
+    assert.equal(result.reason, genericReason, `chdir statements get only the generic route: ${command}`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `chdir interpreter write has a shell-write control: ${command}`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `chdir statements name no target: ${command}`);
   }
   // A target that carries a secret value is never echoed into the reason or the model guidance.
   const secret = "sk_live_51H8xQ2eZvKYlo2CkFmNpQrStUvWxYz01"; // pragma: allowlist secret (published vendor example vector)

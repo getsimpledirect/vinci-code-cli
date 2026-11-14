@@ -661,6 +661,32 @@ function inlineWriteTargets(payload: string, kind: InterpreterKind): string[] {
   return targets;
 }
 
+/** Naming accepts only one complete write expression with literal arguments. */
+function certainInlineWriteTarget(payload: string, kind: InterpreterKind): string | null {
+  if (Buffer.byteLength(payload, "utf8") > 128 * 1024 || /[\r\n]/.test(payload)) return null;
+  const literal = String.raw`(?:'[^'\\]*'|"[^"\\]*")`;
+  const expressions: Record<InterpreterKind, string> = {
+    node: String.raw`require\s*\(\s*(${literal})\s*\)\s*\.\s*(?:writeFileSync|appendFileSync)\s*\(\s*(${literal})\s*,\s*(${literal})\s*\)`,
+    python: String.raw`open\s*\(\s*(${literal})\s*,\s*(?:mode\s*=\s*)?(${literal})\s*\)(?:\s*\.\s*write\s*\(\s*(${literal})\s*\))?(?:\s*\.\s*close\s*\(\s*\))?`,
+    ruby: String.raw`File\s*\.\s*(?:write|binwrite)\s*\(\s*(${literal})\s*,\s*(${literal})\s*\)`,
+    perl: String.raw`open\s*\(\s*(?:[A-Za-z_]\w*|my\s+\$[A-Za-z_]\w*)\s*,\s*(${literal})(?:\s*,\s*(${literal}))?\s*\)`,
+  };
+  const match = new RegExp(String.raw`^${expressions[kind]}\s*;?$`).exec(payload.trim());
+  if (match === null) return null;
+  const values: string[] = [];
+  for (const text of match.slice(1)) {
+    if (text === undefined) continue;
+    const tokens = inlineTokens(text, kind);
+    if (tokens.length !== 1 || !tokens[0].literal) return null;
+    if ((kind === "perl" || kind === "ruby") && text.startsWith('"') && text.includes("@")) return null;
+    values.push(tokens[0].value);
+  }
+  if (kind === "node") return values[0] === "fs" ? values[1] : null;
+  if (kind === "python") return WRITABLE_MODE.test(values[1]) ? values[0] : null;
+  if (kind === "ruby") return values[0];
+  return /^[>+]/.test(values[0]) ? values[1] ?? values[0].replace(/^[>+\s]+/, "") : null;
+}
+
 /** The inline payload of an interpreter one-liner segment — the word after -c (python) or
  *  -e/--eval (node/ruby/perl), or the heredoc body a `<< MARKER` introduces — or null when this
  *  segment is not an interpreter one-liner. */
@@ -1836,11 +1862,16 @@ export default function (pi: ExtensionAPI) {
         // secret handles restored holds values no masker can recognize, and expansions or command
         // substitution (also inside interpreter code) make the real destination unknown.
         const certainText = !carriesRestoredSecrets && shellWriteCommandBody(cmd) !== null;
+        // Environment assignments can preload code before the inline expression runs.
+        const inline = certainText && !/^[A-Za-z_]\w*=/.test(shellWords(cmd)[0] ?? "")
+          ? interpreterInlinePayload(cmd, cmd)
+          : null;
+        const interpreterTarget = inline?.certainArguments ? certainInlineWriteTarget(inline.payload, inline.kind) : null;
         const targets = certainText
           ? [
               ...shellWriteTargets(cmd),
               // Any chdir in interpreter code (with or without parentheses) moves relative targets.
-              ...interpreterTargets.filter((target) => SAFE_TARGET_TEXT.test(target) && (isAbsolute(target) || !/chdir/i.test(cmd))),
+              ...(interpreterTarget !== null && SAFE_TARGET_TEXT.test(interpreterTarget) && (isAbsolute(interpreterTarget) || !/chdir/i.test(cmd)) ? [interpreterTarget] : []),
             ]
           : [];
         const targetGuidance = targets.flatMap((target) => {
