@@ -30,7 +30,7 @@ async function assertWithin(promise, timeoutMs, message) {
   }
 }
 
-async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, captureExtensionErrors = false, terminalDelivery, configureExtension, compaction } = {}) {
+async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, captureExtensionErrors = false, terminalDelivery, configureExtension, firstAgentEnd, compaction } = {}) {
   const cwd = mkdtempSync(join(owned, `${mode}-`));
   const agentDir = join(cwd, "profile");
   mkdirSync(agentDir);
@@ -45,6 +45,8 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, 
   const extensionEvents = [];
   const extensionErrors = [];
   const extensionFactories = [(pi) => {
+    // Runs before every other agent_end handler (none of which has awaited yet).
+    if (firstAgentEnd) pi.on("agent_end", firstAgentEnd);
     pi.on("before_agent_start", (event) => { extensionEvents.push(event); });
     pi.on("agent_start", (event) => { extensionEvents.push(event); });
     pi.on("agent_end", async (event, ctx) => {
@@ -1098,6 +1100,105 @@ const cases = {
         await completion;
         f.close();
       }
+    }
+  },
+  async B27(mode) {
+    const name = "B27 a session disposed synchronously by the first terminal handler keeps the receipt";
+    let session;
+    let disposed = false;
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      captureExtensionErrors: true,
+      firstAgentEnd(event) {
+        if (event.willRetry || disposed) return;
+        disposed = true;
+        session.dispose();
+      },
+    });
+    session = f.session;
+    let completion;
+    try {
+      await assertWithin((async () => {
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+        completion = f.session.prompt("Complete request A.");
+        await started;
+        await delay(0);
+        f.session.abortRetry();
+        await completion;
+      })(), 3_000, `${name}: did not finish within 3 s`);
+      await delay(0);
+      console.log(`${name} ${mode}: ${JSON.stringify({ disposed, outcomes: f.outcomes().map(({ state }) => state), errors: f.extensionErrors.map(({ error }) => String(error).slice(0, 80)) })}`);
+      assert.equal(disposed, true);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED"], `${name}: A's terminal receipt is recorded before the context is invalidated`);
+      assert.deepEqual(f.extensionErrors, [], `${name}: no handler ran on an invalidated context`);
+    } finally {
+      f.session.abortRetry();
+      await completion;
+      f.faux.unregister();
+    }
+  },
+  async B28(mode) {
+    const name = "B28 disposal from the terminal handler of a request started by another terminal handler keeps both receipts";
+    let session;
+    let runtime;
+    let nested;
+    let disposing;
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      captureExtensionErrors: true,
+      async terminalDelivery() {
+        if (!nested) {
+          // A's handler starts request B and waits for it.
+          nested = session.prompt("Complete request B.");
+          await nested;
+          return;
+        }
+        if (!disposing) {
+          // B's handler disposes the runtime while A's delivery still waits on B.
+          disposing = runtime.dispose();
+          await disposing;
+        }
+      },
+    });
+    session = f.session;
+    runtime = f.runtime;
+    let completion;
+    try {
+      await assertWithin((async () => {
+        let backoffs = 0;
+        let markFirst;
+        let markSecond;
+        const first = new Promise((resolve) => { markFirst = resolve; });
+        const second = new Promise((resolve) => { markSecond = resolve; });
+        f.session.subscribe((event) => {
+          if (event.type !== "auto_retry_start") return;
+          backoffs++;
+          if (backoffs === 1) markFirst();
+          if (backoffs === 2) markSecond();
+        });
+        f.faux.setResponses([connectionError(), connectionError(), fauxAssistantMessage("Must not be reached.")]);
+        completion = f.session.prompt("Complete request A.");
+        await first;
+        await delay(0);
+        f.session.abortRetry();
+        await second;
+        await delay(0);
+        f.session.abortRetry();
+        await nested;
+        await completion;
+        await disposing;
+      })(), 4_000, `${name}: did not finish within 4 s`);
+      await delay(0);
+      console.log(`${name} ${mode}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state }) => state), errors: f.extensionErrors.map(({ error }) => String(error).slice(0, 80)), calls: f.faux.state.callCount })}`);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED", "BLOCKED"], `${name}: A and B each keep a terminal receipt`);
+      assert.deepEqual(f.extensionErrors, [], `${name}: no handler ran on an invalidated context`);
+      assert.equal(f.faux.state.callCount, 2, `${name}: neither retry ran`);
+    } finally {
+      f.session.abortRetry();
+      try { await assertWithin(Promise.all([completion, nested, disposing]), 1_500, `${name}: cleanup did not finish`); } finally { f.faux.unregister(); }
     }
   },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:

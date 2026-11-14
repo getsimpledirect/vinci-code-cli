@@ -319,6 +319,9 @@ export class AgentSession {
 	private _heldRetryGeneration: number | undefined = undefined;
 	/** Identifies the held terminal delivery in flight; nested calls from its handlers carry it. */
 	private _heldAgentEndDelivery: object | undefined = undefined;
+	/** Every held terminal delivery still running (a handler may start a nested request whose own
+	 *  delivery runs inside it); disposal waits for all of them, bounded. */
+	private _activeHeldDeliveries = new Set<Promise<void>>();
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -636,19 +639,41 @@ export class AgentSession {
 		this._heldRetryAgentEndMessages = undefined;
 		const delivery = {};
 		this._heldAgentEndDelivery = delivery;
-		const release = heldAgentEndDelivery
-			.run(delivery, () =>
+		// Publish the delivery before any handler runs: a handler that disposes synchronously must
+		// still see it in flight.
+		let settle!: { resolve: () => void; reject: (error: unknown) => void };
+		const release = new Promise<void>((resolve, reject) => {
+			settle = { resolve, reject };
+		});
+		this._heldRetryAgentEndRelease = release;
+		this._activeHeldDeliveries.add(release);
+		const finish = () => {
+			if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
+			if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
+			this._activeHeldDeliveries.delete(release);
+		};
+		let emitted: Promise<unknown>;
+		try {
+			emitted = heldAgentEndDelivery.run(delivery, () =>
 				this._extensionRunner.emit({
 					type: "agent_end",
 					messages: held.length > 0 ? held : fallback,
 					willRetry: false,
 				}),
-			)
-			.finally(() => {
-				if (this._heldAgentEndDelivery === delivery) this._heldAgentEndDelivery = undefined;
-				if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
-			});
-		this._heldRetryAgentEndRelease = release;
+			);
+		} catch (error) {
+			emitted = Promise.reject(error);
+		}
+		emitted.then(
+			() => {
+				finish();
+				settle.resolve();
+			},
+			(error) => {
+				finish();
+				settle.reject(error);
+			},
+		);
 		return release;
 	}
 
@@ -862,11 +887,14 @@ export class AgentSession {
 	dispose(): void {
 		const runner = this._extensionRunner;
 		const hasHeldAgentEnd =
-			this._heldRetryAgentEndMessages !== undefined || this._heldRetryAgentEndRelease !== undefined;
-		// Called from a handler of the in-flight delivery, the settle below returns at once; the
-		// invalidation still waits (bounded) for that delivery itself, so its later handlers run.
-		const inFlightDelivery = this._heldRetryAgentEndRelease;
-		const settled = Promise.allSettled([this._settleIdleHeldRetry(), inFlightDelivery]);
+			this._heldRetryAgentEndMessages !== undefined ||
+			this._heldRetryAgentEndRelease !== undefined ||
+			this._activeHeldDeliveries.size > 0;
+		// Called from a handler of an in-flight delivery, the settle below returns at once; the
+		// invalidation still waits (bounded) for every delivery in flight, including an outer one
+		// whose handler started the request now being delivered, so their later handlers run.
+		const inFlightDeliveries = [...this._activeHeldDeliveries];
+		const settled = Promise.allSettled([this._settleIdleHeldRetry(), ...inFlightDeliveries]);
 		try {
 			this.abortCompaction();
 			this.abortBranchSummary();
