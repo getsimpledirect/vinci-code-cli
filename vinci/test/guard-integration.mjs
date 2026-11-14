@@ -482,7 +482,7 @@ async function shellWriteRouteChecks(onlyCase) {
   symlinkSync(join(realpathSync(runRoot), "deep", "dir"), join(workspace, "outside-dir-link"));
   mkdirSync(join(realpathSync(runRoot), "deep", "dir"), { recursive: true });
   mkdirSync(join(workspace, "existing-dir"));
-  for (const command of ["echo x > outside-dir-link/../y.txt", "echo x > ../y.txt", "echo x > .", "echo x > existing-dir/", "echo x > existing-dir", "echo x > missing-dir/", "echo x > missing-dir/.", "tee .", "echo x > /Dev/null"]) {
+  for (const command of ["echo x > outside-dir-link/../y.txt", "echo x > ../y.txt", "echo x > .", "echo x > existing-dir/", "echo x > existing-dir", "echo x > missing-dir/", "echo x > missing-dir/.", "tee .", "echo x > /Dev/null", "PERL -pi -e 1 file.txt > out.txt"]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Unnamed-target write stays blocked: ${command}`);
     assert.deepEqual(namedTargets(result.reason), [], `No target is named: ${command}`);
