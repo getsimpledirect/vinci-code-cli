@@ -443,7 +443,7 @@ async function shellWriteRouteChecks(onlyCase) {
     ["echo x > route-link/escaped.txt", escaped, true],
     ["tee local.txt route-link/escaped.txt", escaped, true],
     // A sibling folder whose name starts with the project's name is still outside the project.
-    [`echo x > ../${basename(project)}-sibling/x.txt`, join(dirname(project), `${basename(project)}-sibling`, "x.txt"), true],
+    [`echo x > ${join(dirname(project), `${basename(project)}-sibling`, "x.txt")}`, join(dirname(project), `${basename(project)}-sibling`, "x.txt"), true],
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, "Literal redirect/tee cases remain blocked");
@@ -475,6 +475,16 @@ async function shellWriteRouteChecks(onlyCase) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Broken redirect stays blocked: ${command}`);
     assert.deepEqual(namedTargets(result.reason), [], `Broken redirect names nothing: ${command}`);
+  }
+  // `..` is resolved physically by the kernel (through a symlink it can leave the project), so a
+  // target with a `..` component is never named; a directory is never named either.
+  symlinkSync(join(realpathSync(runRoot), "deep", "dir"), join(workspace, "outside-dir-link"));
+  mkdirSync(join(realpathSync(runRoot), "deep", "dir"), { recursive: true });
+  mkdirSync(join(workspace, "existing-dir"));
+  for (const command of ["echo x > outside-dir-link/../y.txt", "echo x > ../y.txt", "echo x > .", "echo x > existing-dir/", "echo x > existing-dir", "echo x > missing-dir/", "tee .", "echo x > /Dev/null"]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Unnamed-target write stays blocked: ${command}`);
+    assert.deepEqual(namedTargets(result.reason), [], `No target is named: ${command}`);
   }
   // A dangling symlink resolves to no path: the plain command keeps the project route and names
   // nothing (and the guard must not fail on the unresolved path).
@@ -743,9 +753,11 @@ async function shellWriteRouteChecks(onlyCase) {
     const root = realpathSync(runRoot);
     symlinkSync(join(root, "loop-b"), join(root, "loop-a"));
     symlinkSync(join(root, "loop-a"), join(root, "loop-b"));
-    const result = await toolCall("bash", { command: "echo x > out.txt" }, { ...ctx, cwd: join(root, "loop-a") });
-    assert.equal(result?.block, true, "unresolvable project: write stays blocked");
-    assert.equal(result.reason, neutralReason, "unresolvable project: neutral wording, no target");
+    for (const command of ["echo x > out.txt", `echo x > ${join(root, "absolute-target.txt")}`]) {
+      const result = await toolCall("bash", { command }, { ...ctx, cwd: join(root, "loop-a") });
+      assert.equal(result?.block, true, `unresolvable project: write stays blocked: ${command}`);
+      assert.equal(result.reason, neutralReason, `unresolvable project: neutral wording, no target: ${command}`);
+    }
   }
   // An opaque value the user supplied is vaulted behind a handle; once restored into the command no
   // masker recognizes it, so a command that carried a handle names no target at all.
