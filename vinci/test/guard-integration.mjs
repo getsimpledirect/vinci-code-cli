@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
+import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -71,9 +72,9 @@ const ctx = {
   },
 };
 
-async function toolCall(toolName, input) {
+async function toolCall(toolName, input, toolCtx = ctx) {
   for (const handler of handlers.tool_call ?? []) {
-    const result = await handler({ toolName, input }, ctx);
+    const result = await handler({ toolName, input }, toolCtx);
     if (result !== undefined) return result;
   }
   return undefined;
@@ -324,6 +325,497 @@ async function checkpointOperationChecks(onlyCase) {
   }
 }
 
+async function shellWriteRouteChecks(onlyCase) {
+  const project = realpathSync(workspace);
+  const route = `write and edit can create or change files under ${project}; a file outside it needs your approval through the write tool.`;
+  const genericReason = `Vinci blocked a shell-based file write; ${route}`;
+  // Fail-closed wording: a command that is not provably plain, or carries any secret-looking text,
+  // never names a target and never echoes the project path.
+  const neutralRoute = "write and edit can create or change files in this project; a file outside it needs your approval through the write tool.";
+  const neutralReason = `Vinci blocked a shell-based file write; ${neutralRoute}`;
+  for (const name of ["A1", "A2", "A3", "A4", "A6"]) {
+    if (onlyCase && name !== onlyCase) continue;
+    // Out-of-project targets live in this run's own temp root (outside the project), never a fixed
+    // shared /tmp path that another process may already have created.
+    const outside = join(realpathSync(runRoot), name === "A2" ? "elsewhere.txt" : "x");
+    const command = name === "A2" ? `echo x > ${outside}`
+      : name === "A6" ? `python3 -c "open('${outside}','w')"`
+      : name === "A3" ? 'echo x > "$OUT"' : "echo x > out.txt";
+    const target = name === "A2" || name === "A6" ? outside : join(project, "out.txt");
+    const promptsBefore = selections.length;
+    const controlsBefore = controls.length;
+    const noticesBefore = notifications.length;
+    assert.equal(existsSync(target), false, `${name}: target starts absent`);
+    const refusal = await toolCall("bash", { command });
+    assert.equal(refusal?.block, true, `${name}: shell write remains blocked`);
+    assert.equal(existsSync(target), false, `${name}: blocked shell write creates no file`);
+    assert.match(refusal.reason, /^Vinci blocked a shell-based file write/, `${name}: intended shell-write refusal`);
+    if (name !== "A3" && name !== "A6") assert.ok(refusal.reason.includes(project), `${name}: reason names the resolved project path`);
+    assert.equal(selections.length, promptsBefore, `${name}: shell block itself needs no prompt`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.equal(control?.display, false, `${name}: model guidance stays private`);
+    const notice = notifications.slice(noticesBefore);
+    assert.equal(notice.length, 1, `${name}: exactly one user notice`);
+    assert.equal(notice[0].level, "info");
+    assert.doesNotMatch(notice[0].message, /[\r\n]/, `${name}: user notice stays one line`);
+
+    if (name === "A1" || name === "A4") {
+      assert.ok(refusal.reason.includes(target), `${name}: reason names the in-project target`);
+      assert.match(refusal.reason, /inside the project; use write with that path/, `${name}: reason gives the in-project write route`);
+      assert.ok(control.content.includes(target), `${name}: control names the in-project target`);
+      assert.ok(notice[0].message === "Vinci tried to write a file through the shell — switching to the safer file editor." || notice[0].message === `Vinci tried to write a file through the shell — switching to the safer file editor. (saving under ${project} instead)`);
+    } else if (name === "A6") {
+      // An interpreter one-liner is never provably plain: it names no target, gets neutral wording.
+      assert.equal(refusal.reason, neutralReason, "A6: interpreter write names no target");
+      assert.doesNotMatch(refusal.reason, /Target "|Use write with "/, "A6: interpreter reason names no target");
+      assert.doesNotMatch(notice[0].message, /saving under/, "A6: outside interpreter target has no in-project saving notice");
+    } else if (name === "A2") {
+      assert.ok(refusal.reason.includes(target), `${name}: reason names the outside target`);
+      assert.match(refusal.reason, /write will ask for approval.*outside the project/, `${name}: reason explains outside-project approval through write`);
+      assert.ok(control.content.includes(target), `${name}: control names the outside target`);
+      assert.match(control.content, /write will ask for approval.*outside the project/);
+      assert.doesNotMatch(notice[0].message, /saving under/, `${name}: outside target has no in-project saving notice`);
+    } else {
+      assert.equal(refusal.reason, neutralReason, "A3: dynamic target gets only the generic route, without an invented path");
+      assert.doesNotMatch(control.content, /\$OUT|Target "/, "A3: control invents no dynamic target path");
+      assert.doesNotMatch(notice[0].message, /saving under/, "A3: unknown target has no saving notice");
+      assert.equal(existsSync(join(workspace, "$OUT")), false, "A3: no literal variable-named file created");
+      for (const dynamic of ["echo x > $OUT", 'echo x > "$(printf out.txt)"', "echo x > `printf out.txt`", "tee $OUT", "cd ..; echo x > out.txt", 'echo x > "unterminated']) {
+        const result = await toolCall("bash", { command: dynamic });
+        assert.equal(result?.block, true, `A3: dynamic write remains blocked: ${dynamic}`);
+        assert.equal(result.reason, neutralReason, `A3: no invented target: ${dynamic}`);
+        assert.equal(existsSync(target), false, "A3: dynamic write creates no result file");
+      }
+    }
+    assert.ok(control.content.includes(name === "A3" || name === "A6" ? neutralRoute : route), `${name}: control names project scope and outside approval`);
+    assert.match(control.content, /throwaway diagnostics/i, `${name}: scratch advice is scoped to throwaway diagnostics`);
+    assert.match(control.content, /results the task asked to keep/i, `${name}: requested results may be saved`);
+    assert.match(control.content, /Do not retry with echo, printf, tee, heredocs, sed -i, perl -pi, or interpreter one-liners/, `${name}: no alternate shell writer retry`);
+    if (name === "A4") {
+      const input = { path: target, content: "requested result\n" };
+      assert.equal(await toolCall("write", input), undefined, "A4: same-session structured write is allowed");
+      assert.equal(selections.length, promptsBefore, "A4: same-session structured write needs no extra prompt");
+      const result = await toolDefinitions.createWriteToolDefinition(workspace).execute("shell-write-route-recovery", input);
+      assert.notEqual(result.isError, true, "A4: actual write tool succeeds");
+      assert.equal(readFileSync(target, "utf8"), input.content, "A4: requested result is saved on disk");
+      rmSync(target);
+    }
+    check(`Shell-write route ${name}: blocked shell write gives a reachable saving route`, true);
+  }
+  if (onlyCase) return;
+  const escaped = join(realpathSync(runRoot), "escaped.txt");
+  symlinkSync(runRoot, join(workspace, "route-link"));
+  // Positive controls above (A1 names an in-project target, A2 an outside one). Commands that are
+  // not provably plain — quoting, escapes, globs, expansions — name nothing at all.
+  for (const command of [
+    "echo x > 'out.txt'",
+    "echo x > out\\ file.txt",
+    "echo x > out*.txt",
+    "echo x > $HOME/out.txt",
+    "echo x > ~/out.txt",
+    "echo x > {a,b}.txt",
+    'echo "a > decoy.txt" >> "result file.txt"',
+    // Process substitution and input redirects run or read more than the plain write.
+    "echo x > out.txt <(sh)",
+    "echo x > out.txt >(sh)",
+    "echo x > out.txt < in.txt",
+    // A wrapper or a leading assignment is not plain even without quotes.
+    "command echo x > out.txt",
+    "X=1 echo x > out.txt",
+    // An executable with an attached redirect hides what runs.
+    "perl>out.txt -pi s/a/b/ file.txt",
+    // A raw control operator, even one the segment split drops, is not plain.
+    "echo x > out.txt |",
+    "echo x > out.txt &",
+    "echo x > out.txt ;",
+    // Tabs, like any other non-printable character, are not plain.
+    "echo x\t>\ttabbed.txt",
+    // Globs and wrappers.
+    "echo x > out?.txt",
+    "sudo echo x > out.txt",
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Non-plain write stays blocked: ${command}`);
+    assert.equal(result.reason, neutralReason, `Non-plain write names nothing: ${command}`);
+  }
+  for (const [command, target, outside] of [
+    ["echo x >spaced.txt", join(project, "spaced.txt"), false],
+    ["echo x>attached.txt", join(project, "attached.txt"), false],
+    ["tee -a results.txt", join(project, "results.txt"), false],
+    ["echo x > route-link/escaped.txt", escaped, true],
+    ["tee local.txt route-link/escaped.txt", escaped, true],
+    // A sibling folder whose name starts with the project's name is still outside the project.
+    [`echo x > ${join(dirname(project), `${basename(project)}-sibling`, "x.txt")}`, join(dirname(project), `${basename(project)}-sibling`, "x.txt"), true],
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, "Literal redirect/tee cases remain blocked");
+    assert.ok(result.reason.includes(target), `Literal target is named: ${command}`);
+    assert.match(result.reason, outside ? /write will ask for approval.*outside the project/ : /inside the project; use write with that path/);
+    assert.equal(existsSync(target), false, "Target classification creates no file");
+    if (outside) assert.doesNotMatch(notifications.at(-1).message, /saving under/);
+  }
+  // The named targets are exactly the shell's write targets: no extra path (e.g. the tee
+  // executable itself) and none missing.
+  const namedTargets = (reason) => [...reason.matchAll(/(?:Target|Use write with) "([^"]+)"/g)].map((match) => match[1]).sort();
+  for (const [command, expected] of [
+    ["echo x > out.txt", [join(project, "out.txt")]],
+    ["tee -a results.txt", [join(project, "results.txt")]],
+    ["tee local.txt route-link/escaped.txt", [join(project, "local.txt"), escaped]],
+    ["tee kept.txt > piped.txt -a", [join(project, "kept.txt"), join(project, "piped.txt")]],
+    ["tee -i interrupt.txt", [join(project, "interrupt.txt")]],
+    ["tee both.txt -ai", [join(project, "both.txt")]],
+    // Only an exact `tee` reads operands (case-sensitive filesystems have no TEE); its redirect is
+    // still a real target.
+    ["TEE upper.txt > actual.txt", [join(project, "actual.txt")]],
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Exact-target write stays blocked: ${command}`);
+    assert.deepEqual(namedTargets(result.reason), [...expected].sort(), `Named targets are exactly the write targets: ${command}`);
+  }
+  // A redirect without a plain word after it is a shell syntax error, so nothing is opened or named.
+  for (const command of ["tee out.txt >", "echo x > > out.txt", "tee out.txt >> < in.txt"]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Broken redirect stays blocked: ${command}`);
+    assert.deepEqual(namedTargets(result.reason), [], `Broken redirect names nothing: ${command}`);
+  }
+  // `..` is resolved physically by the kernel (through a symlink it can leave the project), so a
+  // target with a `..` component is never named; a directory is never named either.
+  symlinkSync(join(realpathSync(runRoot), "deep", "dir"), join(workspace, "outside-dir-link"));
+  mkdirSync(join(realpathSync(runRoot), "deep", "dir"), { recursive: true });
+  mkdirSync(join(workspace, "existing-dir"));
+  for (const command of ["echo x > outside-dir-link/../y.txt", "echo x > ../y.txt", "echo x > .", "echo x > existing-dir/", "echo x > existing-dir", "echo x > missing-dir/", "echo x > missing-dir/.", "tee .", "echo x > /Dev/null", "PERL -pi -e 1 file.txt > out.txt", "echo x > /sys/kernel/uevent_helper", "echo x > /SYS/power/state"]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Unnamed-target write stays blocked: ${command}`);
+    assert.deepEqual(namedTargets(result.reason), [], `No target is named: ${command}`);
+  }
+  // Only a regular file (or a missing one) is named: a FIFO, socket or device is not something the
+  // write tool can stand in for, inside the project or outside it.
+  writeFileSync(join(workspace, "existing-file.txt"), "old");
+  {
+    const result = await toolCall("bash", { command: "echo x > existing-file.txt" });
+    assert.deepEqual(namedTargets(result.reason), [join(project, "existing-file.txt")], "An existing regular file is named");
+  }
+  execFileSync("mkfifo", [join(workspace, "local-fifo")]);
+  execFileSync("mkfifo", [join(realpathSync(runRoot), "outside-fifo")]);
+  for (const command of ["echo x > local-fifo", `echo x > ${join(realpathSync(runRoot), "outside-fifo")}`]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `FIFO write stays blocked: ${command}`);
+    assert.deepEqual(namedTargets(result.reason), [], `A FIFO is not named: ${command}`);
+  }
+  {
+    // Socket paths are length-limited, so the socket lives in a short temporary directory.
+    const socketDir = realpathSync(mkdtempSync("/tmp/vg-"));
+    const socketPath = join(socketDir, "s.sock");
+    const server = createServer();
+    await new Promise((resolveListen, rejectListen) => { server.once("error", rejectListen); server.listen(socketPath, resolveListen); });
+    try {
+      const result = await toolCall("bash", { command: `echo x > ${socketPath}` });
+      assert.equal(result?.block, true, "Socket write stays blocked");
+      assert.deepEqual(namedTargets(result.reason), [], "A unix socket is not named");
+    } finally {
+      await new Promise((resolveClose) => server.close(resolveClose));
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }
+  check("only a regular or missing file is named; FIFOs and sockets are not", true);
+  // A dangling symlink resolves to no path: the plain command keeps the project route and names
+  // nothing (and the guard must not fail on the unresolved path).
+  symlinkSync(join(realpathSync(runRoot), "missing-dir", "nothing.txt"), join(workspace, "dangling-link"));
+  {
+    let result;
+    let thrown;
+    try { result = await toolCall("bash", { command: "echo x > dangling-link" }); } catch (error) { thrown = error; }
+    assert.equal(thrown, undefined, "Dangling-symlink target: the guard does not fail on the unresolved path");
+    assert.equal(result?.block, true, "Dangling-symlink write stays blocked");
+    assert.equal(result.reason, genericReason, "Dangling-symlink target is not named");
+  }
+  // Plain, unquoted interpreter commands pass the plain-command gate, so only the interpreter
+  // exclusion keeps their redirect target unnamed (separated and attached redirects, and
+  // interpreter-named executables).
+  for (const command of ["perl -pi s/a/b/ in.txt > out.txt", "perl -pi s/a/b/ in.txt>out.txt", "perl-5.34 -pi s/a/b/ in.txt > out.txt", "perl.pl -pi s/a/b/ in.txt > out.txt"]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Plain interpreter write stays blocked: ${command}`);
+    assert.equal(result.reason, genericReason, `Plain interpreter redirect names no target: ${command}`);
+  }
+  // tee reads options anywhere in its argv: with --help, an unknown option or "--" it may open no
+  // file at all, so none of its operands is named (the plain command keeps the project route).
+  for (const command of ["tee out.txt > actual.txt --help", "tee -z out.txt > actual.txt", "tee out.txt -- other.txt", "tee out.txt -p"]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `tee write stays blocked: ${command}`);
+    assert.equal(result.reason, genericReason, `tee with other options names no operand: ${command}`);
+  }
+  // -a and -i are fine anywhere, including after a redirect.
+  {
+    const result = await toolCall("bash", { command: "tee kept.txt > piped.txt -a" });
+    assert.ok(result?.reason.includes(join(project, "kept.txt")) && result.reason.includes(join(project, "piped.txt")), "tee -a after a redirect names both targets");
+  }
+  // Keep interpreter writes blocked independently of how their shell targets are described.
+  const interpreterTarget = join(runRoot, "interpreter-target.txt");
+  writeFileSync(interpreterTarget, "existing\n");
+  symlinkSync(interpreterTarget, join(workspace, "x"));
+  for (const [name, command] of [
+    ["ruby without preceding options", `ruby -e 'File.write("x","y")'`],
+    ["perl without preceding options", `perl -e 'open(F,">","x")'`],
+    ["node without preceding options", `node -e "require('fs').writeFileSync('x','y')"`],
+    ["python without preceding options", `python3 -c "open('x','w')"`],
+    ["node append with whitespace and a trailing semicolon", `node -e "  require ( 'fs' ) . appendFileSync ( 'x' , 'y' ) ;  "`],
+    ["python keyword mode and literal write", `python3 -c "open('x',mode='w').write('y')"`],
+    ["python literal write and close", `python3 -c "open('x','w').write('y').close()"`],
+    ["python close with a trailing semicolon", `python3 -c " open('x','w').close(); "`],
+    ["ruby binary write with a trailing semicolon", `ruby -e ' File.binwrite("x","y"); '`],
+    ["perl three-argument append open", `perl -e 'open(G,">>","x")'`],
+  ]) {
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `${name}: interpreter write remains blocked`);
+    // Interpreter writes are never provably plain: they get the neutral route and name no target.
+    assert.equal(result.reason, neutralReason, `${name}: interpreter write names no target`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `${name}: shell-write control is present`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no interpreter target`);
+  }
+  // The unquoted, backslash-escaped form of the same node one-liner (the quoted form is in the
+  // list above) also stays blocked and names nothing.
+  const unquotedNode = await toolCall("bash", { command: `node -e require\\('fs'\\).writeFileSync\\('x','*'\\)` });
+  assert.equal(unquotedNode?.block, true, "unquoted node -e write remains blocked");
+  assert.equal(unquotedNode.reason, neutralReason, "unquoted node -e write names no target");
+  assert.doesNotMatch(unquotedNode.reason, /Target "|Use write with "/, "unquoted node -e reason names no target");
+  for (const [name, command] of [
+    // These previously named targets despite uncertain execution or extra arguments.
+    ["node environment preload gets only the generic route", `NODE_OPTIONS=--require=./hook.cjs node -e "require('fs').writeFileSync('x','y')"`],
+    ["python custom opener gets only the generic route", `python3 -c "import os; open('x','w',opener=lambda p,f: os.open('/tmp/y',f))"`],
+    ["python startup assignment gets only the generic route", `PYTHONSTARTUP=x python3 -c "open('x','w')"`],
+    ["an arbitrary environment assignment gets only the generic route", `EXAMPLE=x ruby -e 'File.write("x","y")'`],
+    ["two python writes get only the generic route", `python3 -c "open('x','w'); open('z','w')"`],
+    ["python opener without an import gets only the generic route", `python3 -c "open('x','w',opener=custom)"`],
+    ["python encoding keyword gets only the generic route", `python3 -c "open('x',mode='w',encoding='utf-8')"`],
+    ["python extra positional argument gets only the generic route", `python3 -c "open('x','w',1)"`],
+    ["python dynamic write content gets only the generic route", `python3 -c "open('x','w').write(content)"`],
+    ["node write options get only the generic route", `node -e "require('fs').writeFileSync('x','y','utf8')"`],
+    ["node asynchronous write gets only the generic route", `node -e "require('fs').writeFile('x','y',callback)"`],
+    ["node comment gets only the generic route", `node -e "require('fs').writeFileSync('x','y') /* extra */"`],
+    ["ruby extra argument gets only the generic route", `ruby -e 'File.write("x","y",0)'`],
+    ["perl interpolated mode gets only the generic route", `perl -e 'open(F,">@mode","x")'`],
+    ["perl two-argument open gets only the generic route", `perl -e 'open(F,">x")'`],
+    ["perl two-argument open with a trailing space gets only the generic route", `perl -e 'open(F,">/tmp/out ")'`],
+    ["perl mode with a layer gets only the generic route", `perl -e 'open(F,">:raw","x")'`],
+    ["ruby interpolated content gets only the generic route", `ruby -e 'File.write("x","@content")'`],
+    // These already received generic wording and remain regression controls.
+    ["python chdir gets only the generic route", `python3 -c "import os; os.chdir('/tmp'); open('x','w')"`],
+    ["node chdir expression gets only the generic route", `node -e "process.chdir('/tmp')||require('fs').writeFileSync('x','y')"`],
+    ["ruby interpolated target gets only the generic route", `ruby -e 'File.write("#{d}x","y")'`],
+    ["ruby -Cdir target gets only the generic route", `ruby -C/tmp -e 'File.write("x","y")'`],
+    ["ruby -C dir after code gets only the generic route", `ruby -e 'File.write("x","y")' -C /tmp`],
+    ["ruby -Cdir after code gets only the generic route", `ruby -e 'File.write("x","y")' -C/tmp`],
+    ["ruby option before code gets only the generic route", `ruby -w -e 'File.write("x","y")'`],
+    ["perl option before code gets only the generic route", `perl -w -e 'open(F,">","x")'`],
+    ["perl Unicode option before code gets only the generic route", `perl -C -e 'open(F,">","x")'`],
+    ["node option before code gets only the generic route", `node --no-warnings -e "require('fs').writeFileSync('x','y')"`],
+    ["python option before code gets only the generic route", `python3 -S -c "open('x','w')"`],
+    ["NBSP inside a redirect target gets only the generic route", "echo x > report\u00a0final.txt"],
+    ["interpreter target after builtin cd gets only the generic route", `builtin cd /tmp; python3 -c "open('x','w')"`],
+    ["regression: interpreter target after cd gets only the generic route", `cd /tmp && node -e "require('fs').writeFileSync('x','y')"`],
+    // No cwd change obscures the parsed target; naming still requires the shared single-command gate.
+    ["multiple-segment interpreter target uses the shared certainty gate", `printf ready; node -e "require('fs').writeFileSync('x','y')"`],
+    ["interpreter target inside a nested shell gets only the generic route", `bash -c "builtin cd /tmp; python3 -c \\"open('x','w')\\""`],
+    ...["command", "sudo", "env", "/usr/bin/env", "env -C /tmp", "env -C/tmp", "env --chdir /tmp", "env --chdir=/tmp", "/usr/bin/env -C /tmp", "/usr/bin/env --chdir=/tmp"].map((wrapper) => [
+      `interpreter target with ${wrapper} gets only the generic route`,
+      `${wrapper} python3 -c "open('x','w')"`,
+    ]),
+  ]) {
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `${name}: shell write remains blocked`);
+    assert.equal(result.reason, neutralReason, name);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `${name}: shell-write control is present`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no target`);
+  }
+  rmSync(join(workspace, "x"));
+  // A project symlink into /dev or /proc resolves to a virtual path, which is never named.
+  symlinkSync("/dev", join(workspace, "device-link"));
+  for (const command of ["echo x > device-link", "echo x > device-link/null"]) {
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `symlinked virtual path stays blocked: ${command}`);
+    assert.equal(result.reason, genericReason, `a symlinked virtual path gets only the generic route: ${command}`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `symlinked virtual path has a shell-write control: ${command}`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `a symlinked virtual path is not named in the control: ${command}`);
+  }
+  rmSync(join(workspace, "device-link"));
+  // Commands whose real destination is uncertain get the generic route, never a guessed path.
+  for (const command of [
+    "builtin cd /tmp; echo x > out.txt",
+    "echo x > out.txt; echo y > other.txt",
+    "cd /tmp && echo x > out.txt",
+    `echo x > "'$OUT'"`,
+    "tee out.txt 2>/dev/null",
+    "echo x > out.txt # > other.txt",
+    "cat <<EOF > out.txt\nx\nEOF",
+    "echo x > out*.txt",
+    "tee '--' -a",
+    "python3 -c \"open('/tmp/`printf x`','w')\"",
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Uncertain target stays blocked: ${command}`);
+    assert.equal(result.reason, neutralReason, `Uncertain target gets only the generic route: ${command}`);
+  }
+  // Plain commands whose target the write tool cannot stand in for keep the project route but name
+  // nothing.
+  for (const command of [
+    "echo x > /dev/tcp/127.0.0.1/9",
+    "echo x > =ls",
+    "echo x > /proc/self/fd/1",
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Uncertain target stays blocked: ${command}`);
+    assert.equal(result.reason, genericReason, `Uncertain target gets only the generic route: ${command}`);
+  }
+  // Multiple statements stay uncertain even when one target is absolute.
+  for (const command of [
+    `perl -e 'chdir "/tmp"; open(F,">","x"); open(G,">","/etc/y")'`,
+    `ruby -e 'Dir.chdir "/tmp"; File.write("x","y"); File.write("/etc/y","z")'`,
+  ]) {
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `chdir interpreter write stays blocked: ${command}`);
+    assert.equal(result.reason, neutralReason, `chdir statements get only the generic route: ${command}`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `chdir interpreter write has a shell-write control: ${command}`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `chdir statements name no target: ${command}`);
+  }
+  // A target that carries a secret value is never echoed into the reason or the model guidance.
+  const secret = "sk_live_51H8xQ2eZvKYlo2CkFmNpQrStUvWxYz01"; // pragma: allowlist secret (published vendor example vector)
+  assert.notEqual(guard.redactSecrets(`${secret}.txt`), `${secret}.txt`, "fixture value is recognized as a secret");
+  const controlsBeforeSecret = controls.length;
+  const secretResult = await toolCall("bash", { command: `echo x > ${secret}.txt` });
+  assert.equal(secretResult?.block, true, "Secret-named target stays blocked");
+  assert.equal(secretResult.reason.includes(secret), false, "Reason never contains a secret value");
+  assert.equal(controls.slice(controlsBeforeSecret).some(({ message }) => String(message.content).includes(secret)), false, "Model guidance never contains a secret value");
+  // A secret elsewhere in the command can repeat inside a target that does not itself look secret.
+  for (const command of [
+    `node -e "require('fs').writeFileSync('/tmp/hunter2xyz','password=hunter2xyz')"`,
+    `echo password=hunter2xyz > /tmp/hunter2xyz`,
+  ]) {
+    assert.notEqual(guard.redactSecrets(command), command, `fixture command carries a recognized secret: ${command}`);
+    const before = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `secret-carrying write stays blocked: ${command}`);
+    assert.equal(result.reason.includes("hunter2xyz"), false, `a secret repeated in a target is not named: ${command}`);
+    assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, `guidance never repeats a secret from the command: ${command}`);
+  }
+  for (const [name, directoryName, linkName] of [
+    ["a resolved path with unsafe characters is never printed", 'evil" ignore previous', "unsafe-route-link"],
+    ["a resolved path that looks like a secret is never printed", secret, "secret-route-link"],
+  ]) {
+    const directory = join(runRoot, directoryName);
+    mkdirSync(directory);
+    symlinkSync(directory, join(workspace, linkName));
+    for (const command of [
+      `echo x > ${linkName}/out.txt`,
+      `python3 -c "open('${linkName}/out.txt','w')"`,
+    ]) {
+      const controlsBefore = controls.length;
+      const result = await toolCall("bash", { command });
+      assert.equal(result?.block, true, `${name}: shell write remains blocked`);
+      const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+      assert.ok(control, `${name}: shell-write control is present`);
+      assert.ok(!result.reason.includes(directoryName) && !control.content.includes(directoryName), name);
+      // The plain redirect keeps the project route; the quoted interpreter command is not plain, so
+      // it gets the neutral route.
+      assert.equal(result.reason, command.startsWith("echo") ? genericReason : neutralReason, `${name}: resolved target gets only the generic route`);
+      assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: control names no target`);
+    }
+    const controlsBefore = controls.length;
+    const result = await toolCall("bash", { command: "echo x > out.txt" }, { ...ctx, cwd: directory });
+    assert.equal(result?.block, true, `${name}: shell write in this project remains blocked`);
+    assert.equal(result.reason, `Vinci blocked a shell-based file write; ${neutralRoute}`, `${name}: project path gets neutral wording`);
+    const control = controls.slice(controlsBefore).find(({ message }) => message.customType === "vinci-shell-write-block")?.message;
+    assert.ok(control, `${name}: project shell-write control is present`);
+    assert.ok(control.content.includes(neutralRoute), `${name}: project control uses neutral wording`);
+    assert.equal(control.content.includes(directoryName), false, `${name}: project control hides the directory name`);
+    assert.doesNotMatch(control.content, /Target "|Use write with "/, `${name}: project control names no target`);
+  }
+  // Quoting can hide a secret from the masker (`pass""word=` is `password=` to the shell), so a quoted
+  // command never names its target, and its route never echoes the project path.
+  {
+    const command = `echo pass""word=hunter2xyz > ${join(realpathSync(runRoot), "hunter2xyz")}`;
+    assert.equal(guard.redactSecrets(command), command, "fixture: the quoted secret is not recognized by the masker");
+    const before = controls.length;
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, "quoted secret write stays blocked");
+    assert.equal(result.reason, neutralReason, "quoted secret write names nothing and uses neutral wording");
+    assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, "guidance never repeats a quoted secret");
+  }
+  // A command that carries a secret gets neutral wording even when the secret value also appears in
+  // the project path (the command secret answers here; the bare directory name is not masked).
+  {
+    const directory = join(runRoot, "hunter2xyz-proj");
+    mkdirSync(directory);
+    const command = "echo password=hunter2xyz > out.txt";
+    assert.notEqual(guard.redactSecrets(command), command, "fixture command carries a recognized secret");
+    const before = controls.length;
+    const result = await toolCall("bash", { command }, { ...ctx, cwd: directory });
+    assert.equal(result?.block, true, "secret write in a secret-named project stays blocked");
+    assert.equal(result.reason, `Vinci blocked a shell-based file write; ${neutralRoute}`, "secret-carrying command gets neutral project wording");
+    assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, "guidance never repeats the secret through the project path");
+  }
+  // The secret value can sit in the cwd (a link named password=…) or in the resolved project path,
+  // and an absolute target may repeat it while the command itself carries nothing recognizable.
+  {
+    const root = realpathSync(runRoot);
+    const outsideTarget = join(root, "hunter2xyz");
+    mkdirSync(join(root, "hunter2xyz-project"));
+    symlinkSync(join(root, "hunter2xyz-project"), join(root, "password=hunter2xyz"));
+    mkdirSync(join(root, "password=hunter2xyz-real"));
+    symlinkSync(join(root, "password=hunter2xyz-real"), join(root, "plain-project-link"));
+    for (const [label, cwd] of [["secret in the cwd", join(root, "password=hunter2xyz")], ["secret in the resolved project", join(root, "plain-project-link")]]) {
+      const command = `echo x > ${outsideTarget}`;
+      assert.equal(guard.redactSecrets(command), command, `fixture (${label}): the command itself carries no recognized secret`);
+      const before = controls.length;
+      const result = await toolCall("bash", { command }, { ...ctx, cwd });
+      assert.equal(result?.block, true, `${label}: write stays blocked`);
+      assert.equal(result.reason, neutralReason, `${label}: neutral wording, no target`);
+      assert.equal(controls.slice(before).some(({ message }) => String(message.content).includes("hunter2xyz")), false, `${label}: guidance never repeats the secret value`);
+    }
+  }
+  // A project path that does not resolve (a symlink loop) is never echoed.
+  {
+    const root = realpathSync(runRoot);
+    symlinkSync(join(root, "loop-b"), join(root, "loop-a"));
+    symlinkSync(join(root, "loop-a"), join(root, "loop-b"));
+    for (const command of ["echo x > out.txt", `echo x > ${join(root, "absolute-target.txt")}`]) {
+      const result = await toolCall("bash", { command }, { ...ctx, cwd: join(root, "loop-a") });
+      assert.equal(result?.block, true, `unresolvable project: write stays blocked: ${command}`);
+      assert.equal(result.reason, neutralReason, `unresolvable project: neutral wording, no target: ${command}`);
+    }
+  }
+  // An opaque value the user supplied is vaulted behind a handle; once restored into the command no
+  // masker recognizes it, so a command that carried a handle names no target at all.
+  const opaque = "hunter2CorrectHorseBatteryStapleXY"; // pragma: allowlist secret (test fixture value)
+  const minted = await handlers.input.at(-1)({ type: "input", text: `password=${opaque}`, source: "interactive" }, ctx);
+  const handle = minted?.text?.match(/<vinci-secret-[0-9a-f]+>/)?.[0];
+  assert.ok(handle, "fixture value is vaulted behind a handle");
+  const controlsBeforeVault = controls.length;
+  const vaulted = await toolCall("bash", { command: `echo x > result-${handle}.txt` });
+  assert.equal(vaulted?.block, true, "Vaulted-secret target stays blocked");
+  assert.doesNotMatch(vaulted.reason, /secret-masking placeholder/, "positive control: the handle was restored, so the shell-write block answered");
+  assert.equal(vaulted.reason.includes(opaque), false, "Reason never contains a restored vaulted value");
+  assert.equal(controls.slice(controlsBeforeVault).some(({ message }) => String(message.content).includes(opaque)), false, "Model guidance never contains a restored vaulted value");
+}
+
+const shellWriteCase = process.argv.find((argument) => argument.startsWith("--shell-write-case="))?.split("=")[1];
+if (shellWriteCase) {
+  try {
+    assert.ok(["A1", "A2", "A3", "A4", "A6"].includes(shellWriteCase), "known shell write case required");
+    await shellWriteRouteChecks(shellWriteCase);
+  } finally {
+    rmSync(runRoot, { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
 const checkpointOperationCase = process.argv.find((argument) => argument.startsWith("--checkpoint-operation-case="))?.split("=")[1];
 if (checkpointOperationCase) {
   try {
@@ -347,6 +839,7 @@ if (checkpointCase) {
 }
 
 try {
+  await shellWriteRouteChecks();
   await checkpointChecks();
   await checkpointOperationChecks();
   // Use the registered tool_call hook and the same bytes executed by a real shell. All effects are

@@ -547,6 +547,84 @@ function clobberOrBothRedirectWrite(command: string): boolean {
   });
 }
 
+/** Literal redirect/tee targets for wording only; "" means "unknown, give the generic route".
+ * It never changes the block decision. It names a target only for ONE PLAIN command whose target
+ * is a plain literal path: quoting, escapes, globs, expansions, or anything else that could hide
+ * the real destination makes the command not plain, and a non-plain command yields "" instead of
+ * a guessed path — it could also hide a secret from redactSecrets (e.g. pass""word=…). */
+const PLAIN_TARGET = /^[A-Za-z0-9._\/+@%=,:-]+$/;
+const SAFE_TARGET_TEXT = /^[A-Za-z0-9._\/+@%=,: -]+$/;
+
+/** A command is plain when its whole raw text is one simple command whose redirect destination
+ * cannot be obscured: no quotes, escapes, globs, expansions, or other special characters; one
+ * segment; no comment, heredoc, or fd redirects; no wrapper or nested-shell executable; and no
+ * leading VAR= assignment. Wording only; it never decides whether to block. */
+function isPlainShellCommand(command: string): boolean {
+  const segments = shellSegments(command);
+  // Any raw |, & or ; (even one the split drops, like a trailing pipe) and any tab or other
+  // non-printable character make the command not plain.
+  if (segments.length !== 1 || /['"\\*?\[\]{}~()<|&;]|[^\x20-\x7e]|[#`$]|\d>/.test(command)) return false;
+  // The executable must be a plain word on its own: `perl>out.txt -pi ...` hides the interpreter
+  // behind an attached redirect. This also rejects a leading VAR= assignment, which can preload
+  // code before the visible command runs.
+  if (!/^[A-Za-z0-9._\/+-]+$/.test(shellWords(segments[0])[0] ?? "")) return false;
+  const executable = shellWords(segments[0])[0].split("/").pop() ?? "";
+  // A nested shell (`bash -c '...'`) hides its own cd and wrappers from this check.
+  return !/^(?:builtin|command|exec|env|cd|pushd|popd|eval|sudo|xargs|bash|sh|zsh|dash|ksh|fish)$/.test(executable);
+}
+
+function isSafeTargetText(text: string): boolean {
+  return SAFE_TARGET_TEXT.test(text) && redactSecrets(text) === text;
+}
+
+/** Shared wording gate for shell and interpreter writers; it never decides whether to block. */
+function shellWriteCommandBody(command: string): string | null {
+  if (!isPlainShellCommand(command)) return null;
+  return commandBody(shellSegments(command)[0]);
+}
+
+function shellWriteTargets(command: string): string[] {
+  const body = shellWriteCommandBody(command);
+  if (body === null) return [""];
+  // An interpreter's inline code can write anywhere, so a redirect after one names nothing.
+  const executable = shellWords(body)[0]?.split("/").pop() ?? "";
+  // Any executable NAMED like an interpreter (perl5.34, perl-5.34, perl.pl, python3.13t) counts.
+  if (/^(?:python|pypy|node|ruby|perl)/i.test(executable)) return [""];
+  const tokenPattern = /(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^ \t'"\\<>])+|>>?|</g;
+  if (body.replace(tokenPattern, "").trim()) return [""];
+  const tokens = body.match(tokenPattern) ?? [];
+  const rawTargets: string[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    if (!/^>>?$/.test(tokens[index])) continue;
+    // A redirect without a plain word after it is a syntax error: the shell opens nothing at all.
+    const next = tokens[index + 1];
+    if (next === undefined || /^[<>]/.test(next)) return [""];
+    rawTargets.push(next);
+  }
+  // tee's operands count only when the executable is tee itself, spelled exactly (case-sensitive
+  // filesystems have no TEE).
+  if (executable === "tee") {
+    // tee may take options anywhere in its argv (GNU permutes them, even after a redirect), and an
+    // unknown one or --help means it opens no file. Name its operands only when every other word
+    // is -a or -i (or both), wherever it appears.
+    for (let index = 1; index < tokens.length; index++) {
+      const token = tokens[index];
+      if (/^>>?$/.test(token)) {
+        index++;
+        continue;
+      }
+      if (/^-[ai]+$/.test(token)) continue;
+      if (!PLAIN_TARGET.test(token) || token.startsWith("-")) return [""];
+      rawTargets.push(token);
+    }
+  }
+  if (rawTargets.length === 0) return [""];
+  return rawTargets.flatMap((raw) => {
+    const literal = PLAIN_TARGET.test(raw) ? raw : "";
+    return literal === "/dev/null" ? [] : [literal];
+  });
+}
+
 // ── Interpreter one-liner file writes ──────────────────────────────────────────────────────────
 // An interpreter one-liner is the shell channel's OTHER file writer: `python3 -c
 // "open('/Users/x/.zshenv','a').write('…')"` planted a persistence implant with no gate at all
@@ -1769,6 +1847,8 @@ export default function (pi: ExtensionAPI) {
       // what the always-allow store keys on — that store is written to disk, so it must never be
       // handed a restored credential.
       let cmd = String((event.input as { command?: unknown }).command ?? "");
+      // Set when live secret handles were restored into cmd: its text then holds secret values.
+      let carriesRestoredSecrets = false;
       if (!cmd.trim()) return undefined;
       const displayCommand = cmd;
 
@@ -1804,6 +1884,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         cmd = restored.text;
+        carriesRestoredSecrets = restored.resolved.length > 0;
         (event.input as { command?: unknown }).command = cmd;
         if (ctx.hasUI) {
           const which = restored.resolved.length === 1 ? "the credential" : `${restored.resolved.length} credentials`;
@@ -1832,13 +1913,47 @@ export default function (pi: ExtensionAPI) {
       });
       if (isShellFileWrite(cmd) || interpreterOutsideWrite) {
         recordVinciShellWriteRedirectToolCall(vinciTaskIdOf(ctx), event.toolCallId);
+        const projectPath = projectRoot ?? resolve(ctx.cwd);
+        // A command with any secret-looking text names nothing and gets neutral wording: a target
+        // or a project path may repeat that value. A non-plain command can hide a secret behind
+        // quoting (pass""word=…), so it never echoes a path either.
+        const carriesSecret = carriesRestoredSecrets || redactSecrets(cmd) !== cmd
+          || redactSecrets(ctx.cwd) !== ctx.cwd || redactSecrets(projectPath) !== projectPath;
+        // An unresolvable project (e.g. a symlink loop) is never echoed: projectPath is then unresolved.
+        const projectScope = !carriesSecret && projectRoot !== null && isPlainShellCommand(cmd) && isSafeTargetText(projectPath)
+          ? `under ${projectPath}` : "in this project";
+        const route = `write and edit can create or change files ${projectScope}; a file outside it needs your approval through the write tool.`;
+        // Only a plain, secret-free command names its redirect target; everything else gets the
+        // route alone. shellWriteTargets already yields "" for a non-plain command.
+        const targets = carriesSecret ? [] : shellWriteTargets(cmd);
+        const targetGuidance = targets.flatMap((target) => {
+          // Virtual paths (sockets, devices, process and kernel files) and zsh `=cmd` expansion are not files
+          // the write tool can stand in for.
+          if (!target || /^(?:\/dev\/|\/proc\/|\/sys\/|=)/i.test(target) || redactSecrets(target) !== target) return [];
+          // The kernel resolves `..` physically (through symlinks), path resolution here lexically, so
+          // a target with a `..` component is never named; nor is one that names a directory.
+          if (target.split("/").includes("..") || /(?:^|\/)\.?$/.test(target)) return [];
+          const abs = consumerWritePath(target, ctx.cwd);
+          // A symlink can lead to a virtual path too, so the resolved path is checked again.
+          if (abs === null || projectRoot === null || !isSafeTargetText(abs) || /^\/(?:dev|proc|sys)(?:\/|$)/i.test(abs)) return [];
+          // Only a regular file, or a missing one (the usual case: the write creates it), is named. A
+          // directory, FIFO, socket or device is not something the write tool can stand in for.
+          try {
+            if (!statSync(abs).isFile()) return [];
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") return [];
+          }
+          return [abs === projectRoot || abs.startsWith(projectRoot + sep)
+            ? `Target "${abs}" is inside the project; use write with that path.`
+            : `Use write with "${abs}"; write will ask for approval because this file is outside the project.`];
+        }).join(" ");
         if (ctx.hasUI) ctx.ui.notify("Vinci tried to write a file through the shell — switching to the safer file editor.", "info");
         sendVinciControl(
           pi,
           "vinci-shell-write-block",
-          "That shell command was blocked because it writes file content. Use write for a necessary project file or edit for a targeted project change, then re-read the file to verify it. For a one-off diagnostic, use an inline command or the repository's existing focused test instead of creating a scratch file inside or outside the project. Do not retry with echo, printf, tee, heredocs, sed -i, perl -pi, or interpreter one-liners (python -c open(), node -e fs.writeFile, ruby -e File.write).",
+          `That shell command was blocked because it writes file content. ${route}${targetGuidance ? ` ${targetGuidance}` : ""} Use write to save results the task asked to keep, or edit for a targeted project change, then re-read the file to verify it. For throwaway diagnostics only, use an inline command or the repository's existing focused test instead of creating a scratch file inside or outside the project. Do not retry with echo, printf, tee, heredocs, sed -i, perl -pi, or interpreter one-liners (python -c open(), node -e fs.writeFile, ruby -e File.write).`,
         );
-        return { block: true, reason: "Vinci blocked a shell-based file write; use the structured write or edit tool instead." };
+        return { block: true, reason: `Vinci blocked a shell-based file write; ${route}${targetGuidance ? ` ${targetGuidance}` : ""}` };
       }
 
       const riskText = shellRiskText(cmd);

@@ -74,7 +74,7 @@ export default function (pi) {
   const redirect = process.env.VINCI_REFUSAL_TEST_REDIRECT;
   const callId = redirect ? "shell-write" : "headless-refused-write";
   const plan = process.env.VINCI_REFUSAL_TEST_PLAN === "1";
-  const reason = redirect ? "Vinci blocked a shell-based file write; use the structured write or edit tool instead." : plan ? "Plan mode kept the project unchanged; no approval UI is available." : 'Scripted write refusal for "' + target + '": the operation did not run.';
+  const reason = redirect ? 'Vinci blocked a shell-based file write; write and edit can create or change files in this project; a file outside it needs your approval through the write tool.' : plan ? "Plan mode kept the project unchanged; no approval UI is available." : 'Scripted write refusal for "' + target + '": the operation did not run.';
   const registration = registerFauxProvider({ tokensPerSecond: 1000 });
   registration.setResponses([
     () => {
@@ -166,7 +166,7 @@ for (const { mode, ask, plan, redirect } of [
       const sessions = join(home, "sessions");
       const temporary = join(home, "temp");
       for (const path of [project, profile, sessions, temporary]) mkdirSync(path, { recursive: true });
-      const target = join(project, "requested.txt");
+      const target = join(realpathSync(project), "requested.txt");
       const events = join(home, "events.jsonl");
       writeFileSync(events, "");
       writeFileSync(join(profile, "trust.json"), JSON.stringify({ [project]: true }));
@@ -216,7 +216,9 @@ for (const { mode, ask, plan, redirect } of [
       const refusal = entries.find((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === (redirect ? "shell-write" : "headless-refused-write"))?.message;
       assert.equal(refusal?.isError, true, "The durable session must contain the correlated refused write.");
       if (redirect) {
-        assert.deepEqual([refusal.details?.vinciBlocked, refusal.content], [true, [{ type: "text", text: "Vinci blocked a shell-based file write; use the structured write or edit tool instead." }]], "The shell write must reach the real guard's redirect refusal.");
+        assert.deepEqual([refusal.details?.vinciBlocked, refusal.content], [true, [{ type: "text", text: `Vinci blocked a shell-based file write; write and edit can create or change files in this project; a file outside it needs your approval through the write tool.` }]], "The shell write must reach the real guard's redirect refusal with the neutral route.");
+        const shellCalls = entries.filter((entry) => entry.type === "message" && entry.message.role === "assistant").flatMap((entry) => entry.message.content.filter((part) => part.type === "toolCall" && part.name === "bash"));
+        assert.deepEqual(shellCalls.map((call) => call.id), ["shell-write"], "The session must not retry through another shell writer.");
         const recovery = entries.find((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === "structured-write")?.message;
         if (redirect === "recover") assert.equal(recovery?.isError, false);
         else assert.equal(recovery, undefined, "The unresolved control must never attempt the structured write.");

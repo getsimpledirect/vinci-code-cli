@@ -56,6 +56,7 @@ const uiState = await module("lib/ui-state");
 const vero = await module("lib/vero-state");
 const receipt = await module("vinci-receipt");
 const shell = await module("vinci-shell");
+const guard = await module("vinci-guard");
 const themeModule = await loader.import(resolve(root, "packages/coding-agent/dist/modes/interactive/theme/theme.js"), { default: false });
 const keybindingsPath = realpathSync(resolve(root, "packages/coding-agent/dist/core/keybindings.js"));
 console.log(`Resolved keybindings module: ${keybindingsPath}`);
@@ -236,6 +237,36 @@ test("shell-write-redirect-scope", () => {
   } finally {
     outcome.clearVinciGitCheckpointDeclines(taskId);
   }
+});
+test("shell-write-notice-receipt", async () => {
+  const taskId = "shell-write-notice-receipt";
+  reset(taskId);
+  const host = registered((api) => { guard.default({ ...api, sendMessage() {} }); receipt.default(api); });
+  const state = contextFor(host, taskId);
+  await emit(host, "session_start", {}, state.context);
+  await emit(host, "before_agent_start", { prompt: "Save the requested result in out.txt." }, state.context);
+  await emit(host, "agent_start", {}, state.context);
+  const args = { command: "echo x > out.txt" };
+  const noticesBefore = state.notifications.length;
+  let refusal;
+  for (const handler of host.handlers.get("tool_call") || []) {
+    refusal = await handler({ type: "tool_call", toolName: "bash", toolCallId: "notice-shell-write", input: args }, state.context);
+    if (refusal !== undefined) break;
+  }
+  assert.equal(refusal?.block, true);
+  const notices = state.notifications.slice(noticesBefore);
+  assert.equal(notices.length, 1, "The shell redirect emits one user notice beside the receipt.");
+  assert.doesNotMatch(notices[0].text, /[\r\n]/, "The user notice stays one line.");
+  assert.match(notices[0].text, /^Vinci tried to write a file through the shell — switching to the safer file editor\./);
+  const messages = [call("notice-shell-write", "bash", args), failure("notice-shell-write", "bash", refusal.reason), assistant("The result was not saved because the shell write was blocked.")];
+  messages.forEach((message) => host.branch.push({ type: "message", message }));
+  await emit(host, "agent_end", { messages }, state.context);
+  assert.equal(outcome.getVinciTaskOutcome().state, "BLOCKED", "An unrecovered shell write still reports honestly.");
+  const shown = state.renderReceipt().replace(/\s+/g, " ");
+  assert.match(shown, /Stopped — needs you/);
+  // Receipt reasons are capped at 240 characters, so a long project path may be cut; the route
+  // itself must still reach the receipt.
+  assert.match(shown, /Vinci blocked a shell-based file write; write and edit can create or change files under \//, "The blocked receipt retains the project saving route.");
 });
 test("required-read", () => {
   reset();
