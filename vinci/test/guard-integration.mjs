@@ -373,6 +373,8 @@ async function shellWriteWrapperChecks() {
     "bash -o pipefail -c 'echo x > out.txt'",
     "bash --rcfile rc.sh -c 'echo x > out.txt'",
     "eval -- 'echo x > out.txt'",
+    "bash +O extglob -c 'echo x > out.txt'",
+    "bash -oc pipefail 'echo x > out.txt'",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
@@ -388,12 +390,16 @@ async function shellWriteWrapperChecks() {
   const longStarted = Date.now();
   guard.isShellFileWrite(`${"A=1 ".repeat(50000)}bash -c 'ls'`);
   assert.ok(Date.now() - longStarted < 5000, "a long assignment run is classified quickly");
+  const clusterStarted = Date.now();
+  guard.isShellFileWrite(`bash -${"n".repeat(50000)}1 -c 'ls'`);
+  guard.isShellFileWrite(`bash -${"c".repeat(50000)}1 'ls'`);
+  assert.ok(Date.now() - clusterStarted < 2000, "a long option cluster is classified quickly");
   // Positive controls: commands that run no content writer keep their old classification.
   for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo", "command -v echo > out.txt", "bash -c 'ls' > out.txt", "bash -c 'echo ok' > /dev/null", "git ls-files | xargs sed -i 's/a/b/'",
     // A lookup (also with grouped options) writes nothing, even of a shell.
     "command -pv echo > out.txt", "command -v bash -c 'echo x > out.txt'",
     // Syntax-check mode runs nothing.
-    "bash -n -c 'echo x > out.txt'", "sh -nc 'echo x > out.txt'"]) {
+    "bash -n -c 'echo x > out.txt'", "sh -nc 'echo x > out.txt'", "bash -o noexec -c 'echo x > out.txt'"]) {
     assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);
     const result = await toolCall("bash", { command });
     assert.ok(!result?.block || !/^Vinci blocked a shell-based file write/.test(result.reason), `No shell-write refusal: ${command}`);

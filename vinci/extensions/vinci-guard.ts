@@ -578,15 +578,26 @@ function nestedShellText(segment: string): string | undefined {
   if (!NESTED_SHELL.test(words[start] ?? "")) return undefined;
   for (let index = start + 1; index < words.length; index++) {
     const word = words[index];
-    if (!word.startsWith("-") || word === "-" || word === "--") return undefined;
-    // -n (also in a cluster) only checks syntax: nothing runs.
-    if (/^-[A-Za-z]*n[A-Za-z]*$/.test(word) && !word.startsWith("--")) return undefined;
-    // Shell options that take the next word as their value.
-    if (/^(?:[-+][oO]|--(?:rcfile|init-file))$/.test(word)) {
-      index++;
+    if (word === "-" || word === "--" || !/^[-+]/.test(word)) return undefined;
+    if (word.startsWith("--")) {
+      // Long options; --rcfile/--init-file take the next word.
+      if (word === "--rcfile" || word === "--init-file") index++;
       continue;
     }
-    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(word)) return words[index + 1];
+    // A short-option cluster (`-lc`, `-oc pipefail`, `+O extglob`): letters checked one by one (linear).
+    const letters = word.slice(1);
+    if (!/^[A-Za-z]+$/.test(letters)) return undefined;
+    // o/O letters each take the next word as their value; -n and `-o noexec` only check syntax.
+    let values = 0;
+    for (const letter of letters) {
+      if (letter === "o" || letter === "O") {
+        values++;
+        if (letter === "o" && word.startsWith("-") && words[index + values] === "noexec") return undefined;
+      }
+    }
+    if (word.startsWith("-") && letters.includes("n")) return undefined;
+    if (word.startsWith("-") && letters.includes("c")) return words[index + values + 1];
+    index += values;
   }
   return undefined;
 }
