@@ -312,6 +312,7 @@ export class AgentSession {
 	/** Messages held until this request's retry finishes or is cancelled. */
 	private _heldRetryAgentEndMessages: AgentMessage[] | undefined = undefined;
 	private _heldRetryAgentEndRelease: Promise<void> | undefined = undefined;
+	private _deliveringHeldAgentEnd = false;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -622,6 +623,7 @@ export class AgentSession {
 		const held = this._heldRetryAgentEndMessages;
 		if (!held) return this._heldRetryAgentEndRelease;
 		this._heldRetryAgentEndMessages = undefined;
+		this._deliveringHeldAgentEnd = true;
 		const release = this._extensionRunner
 			.emit({
 				type: "agent_end",
@@ -629,6 +631,7 @@ export class AgentSession {
 				willRetry: false,
 			})
 			.finally(() => {
+				this._deliveringHeldAgentEnd = false;
 				if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
 			});
 		this._heldRetryAgentEndRelease = release;
@@ -845,7 +848,7 @@ export class AgentSession {
 		const runner = this._extensionRunner;
 		const hasHeldAgentEnd =
 			this._heldRetryAgentEndMessages !== undefined || this._heldRetryAgentEndRelease !== undefined;
-		const settled = this.settleRetry();
+		const settled = this._settleIdleHeldRetry();
 		try {
 			this.abortCompaction();
 			this.abortBranchSummary();
@@ -1376,7 +1379,7 @@ export class AgentSession {
 
 			// Backoff is idle: a submitted prompt starts a separate request.
 			if (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease) {
-				await this.settleRetry();
+				await this._settleIdleHeldRetry();
 			}
 
 			// Check if we need to compact before sending (catches aborted responses).
@@ -1462,7 +1465,7 @@ export class AgentSession {
 		if (!command) return false;
 
 		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-			await this.settleRetry();
+			await this._settleIdleHeldRetry();
 		}
 
 		// Get command context from extension runner (includes session control methods)
@@ -1528,7 +1531,7 @@ export class AgentSession {
 		}
 
 		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-			await this.settleRetry();
+			await this._settleIdleHeldRetry();
 			await this.prompt(text, { images, streamingBehavior: "steer" });
 			return;
 		}
@@ -1554,7 +1557,7 @@ export class AgentSession {
 		}
 
 		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-			await this.settleRetry();
+			await this._settleIdleHeldRetry();
 			await this.prompt(text, { images, streamingBehavior: "followUp" });
 			return;
 		}
@@ -1650,12 +1653,12 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-				await this.settleRetry();
+				await this._settleIdleHeldRetry();
 			}
 			await this._runAgentPrompt(appMessage);
 		} else {
 			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-				await this.settleRetry();
+				await this._settleIdleHeldRetry();
 			}
 			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
@@ -1979,7 +1982,7 @@ export class AgentSession {
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
-			await this.settleRetry();
+			await this._settleIdleHeldRetry();
 		}
 
 		this._disconnectFromAgent();
@@ -2920,12 +2923,28 @@ export class AgentSession {
 		return generation === this._retryGeneration && !controller.signal.aborted && this.autoRetryEnabled;
 	}
 
-	/** Cancel backoff and finish its terminal extension event before replacing the request or runtime. */
-	async settleRetry(): Promise<void> {
+	private async _settleIdleHeldRetry(): Promise<void> {
+		// A terminal handler must not wait on the delivery that is awaiting that handler.
+		if (this._deliveringHeldAgentEnd) return;
 		this._retryGeneration++;
 		this.abortRetry();
 		this._retryAttempt = 0;
 		await this._releaseHeldAgentEnd([]);
+	}
+
+	/** Cancel backoff and allow bounded terminal delivery before reload or runtime teardown. */
+	async settleRetry(): Promise<void> {
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				this._settleIdleHeldRetry(),
+				new Promise<void>((resolve) => {
+					timeout = setTimeout(resolve, DISPOSE_INVALIDATION_TIMEOUT_MS);
+				}),
+			]);
+		} finally {
+			clearTimeout(timeout);
+		}
 	}
 
 	/**
@@ -3096,7 +3115,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
-		await this.settleRetry();
+		await this._settleIdleHeldRetry();
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target

@@ -16,6 +16,20 @@ process.env.GIT_CEILING_DIRECTORIES = owned;
 const connectionError = () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." });
 const selected = process.argv.slice(2);
 
+async function assertWithin(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new assert.AssertionError({ message })), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, tools = false, captureExtensionErrors = false, terminalDelivery, configureExtension, compaction } = {}) {
   const cwd = mkdtempSync(join(owned, `${mode}-`));
   const agentDir = join(cwd, "profile");
@@ -33,11 +47,11 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, 
   const extensionFactories = [(pi) => {
     pi.on("before_agent_start", (event) => { extensionEvents.push(event); });
     pi.on("agent_start", (event) => { extensionEvents.push(event); });
-    pi.on("agent_end", async (event) => {
+    pi.on("agent_end", async (event, ctx) => {
       extensionEvents.push(event);
       if (!event.willRetry) {
         await delay(0);
-        await terminalDelivery?.();
+        await terminalDelivery?.(event, ctx);
       }
     });
     configureExtension?.(pi);
@@ -339,7 +353,7 @@ const cases = {
           await f.session[submission]("Complete a separate read-only request B.");
         }
         assert.equal(outcomesBeforeB?.at(-1)?.state, "BLOCKED", `${name}: A is recorded before B runs via ${submission}`);
-        f.session.abortRetry();
+        assert.equal(f.session.isRetrying, false, `${name}: A's retry is cancelled before cleanup`);
         await completion;
         const outcomes = f.outcomes();
         const starts = f.extensionEvents.filter((event) => event.type === "agent_start");
@@ -356,6 +370,8 @@ const cases = {
         const beforeBIndex = f.extensionEvents.findIndex((event) => event.type === "before_agent_start" && event.prompt.includes("request B"));
         assert.ok(endAIndex < beforeBIndex, `${name}: A settles before B's extension preflight`);
         assert.equal(f.faux.state.callCount, tools ? 3 : 2);
+        await delay(0);
+        assert.equal(f.faux.state.callCount, tools ? 3 : 2, `${name}: A makes no further retry call before cleanup`);
       } finally {
         f.session.abortRetry();
         await completion;
@@ -430,11 +446,19 @@ const cases = {
       await delay(5_100);
       assert.throws(() => context.getSystemPrompt(), /stale/, `${name}: captured APIs expire while delivery is still stalled`);
       assert.equal(f.faux.state.callCount, 1);
+      releaseDelivery();
+      await assertWithin(completion, 1_500, `${name}: released terminal delivery did not finish within 1.5 s`);
+      // The 5 s invalidation expires the receipt's context; late delivery loses A's receipt.
+      assert.deepEqual(f.outcomes(), [], `${name}: the late receipt is not persisted`);
+      assert.equal(f.extensionErrors.length, 1);
+      assert.equal(f.extensionErrors[0].event, "agent_end");
+      assert.match(f.extensionErrors[0].error, /stale/);
     } finally {
       releaseDelivery();
       f.session.abortRetry();
-      await completion;
-      f.close();
+      try {
+        await assertWithin(completion, 1_500, `${name}: cleanup did not finish after releasing the handler`);
+      } finally { f.close(); }
     }
   },
   async B15(mode) {
@@ -541,6 +565,32 @@ const cases = {
       f.close();
     }
   },
+  async B15c(mode) {
+    const name = "B15c custom turns carry failed required operations even without retries";
+    const f = await fixture(mode, { tools: true, enabled: false });
+    try {
+      f.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("read", { path: "missing-input.txt" }, { id: "read-missing" }), { stopReason: "toolUse" }),
+        connectionError(),
+        fauxAssistantMessage("The unrelated read-only task is complete."),
+      ]);
+      await f.session.prompt("Read missing-input.txt and summarize it.");
+      const outcomeA = f.outcomes().at(-1);
+      assert.equal(outcomeA?.state, "BLOCKED");
+      assert.ok(outcomeA.requiredOperations?.length > 0);
+      assert.deepEqual(f.retryEvents(), [], `${name}: the baseline never schedules or settles a retry`);
+      await f.session.sendCustomMessage({
+        customType: "retry-outcome-request",
+        content: "Complete a separate read-only request B.",
+        display: true,
+      }, { triggerTurn: true });
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED", "BLOCKED"]);
+      assert.deepEqual(f.outcomes()[1].requiredOperations, outcomeA.requiredOperations);
+      assert.equal(f.extensionEvents.filter((event) => event.type === "before_agent_start").length, 1);
+      assert.deepEqual(f.extensionEvents.filter((event) => event.type === "agent_start").map(({ continuesRetry }) => continuesRetry), [false, false]);
+      assert.equal(f.faux.state.callCount, 3);
+    } finally { f.close(); }
+  },
   async B16(mode) {
     const name = "B16 an extension command during backoff settles before creating its context";
     let commandCalls = 0;
@@ -644,6 +694,117 @@ const cases = {
       f.session.abortRetry();
       await completion;
       f.close();
+    }
+  },
+  async B18(mode) {
+    const name = "B18 a terminal handler that compacts during settlement does not deadlock";
+    let compactions = 0;
+    const summary = "The saved request is complete; request A stopped after a connection error.";
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      compaction: { keepRecentTokens: 1 },
+      async terminalDelivery(event, ctx) {
+        if (!event.messages.some((message) => message.role === "assistant" && message.stopReason === "error")) return;
+        const result = await new Promise((resolve, reject) => {
+          ctx.compact({ onComplete: resolve, onError: reject });
+        });
+        assert.equal(result.summary, summary);
+        compactions++;
+      },
+      configureExtension(pi) {
+        pi.on("session_before_compact", ({ preparation }) => ({
+          compaction: { summary, firstKeptEntryId: preparation.firstKeptEntryId, tokensBefore: preparation.tokensBefore },
+        }));
+      },
+    });
+    try {
+      await assertWithin((async () => {
+        let outcomesBeforeB;
+        f.faux.setResponses([
+          fauxAssistantMessage("The saved read-only task is complete."),
+          connectionError(),
+          () => {
+            outcomesBeforeB = f.outcomes();
+            return fauxAssistantMessage("The unrelated read-only task is complete.");
+          },
+        ]);
+        await f.session.prompt("Complete a saved read-only request.");
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        const completion = f.session.prompt("Complete request A.");
+        await started;
+        await delay(0);
+        assert.equal(f.session.isRetrying, true);
+        assert.equal(f.session.isStreaming, false);
+        const held = f.extensionEvents.find((event) => event.type === "agent_end" && event.willRetry).messages;
+        await f.session.prompt("Complete a separate read-only request B.");
+        await completion;
+        assert.equal(compactions, 1);
+        assert.deepEqual(outcomesBeforeB?.map(({ state }) => state), ["DONE", "BLOCKED"]);
+        assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE", "BLOCKED", "DONE"], `${name}: A is recorded once and B completes`);
+        const ends = f.extensionEvents.filter((event) => event.type === "agent_end" && !event.willRetry);
+        assert.equal(ends.length, 3);
+        assert.deepEqual(ends[1].messages, held);
+        assert.equal(ends[2].heldRunMessages, undefined);
+        assert.equal(ends[2].messages.some((message) => held.includes(message)), false);
+        assert.equal(f.extensionEvents.filter((event) => event.type === "agent_start").at(-1).continuesRetry, false);
+        assert.equal(f.session.isRetrying, false);
+        assert.equal(f.faux.state.callCount, 3);
+        assert.deepEqual(f.extensionErrors, []);
+      })(), 1_500, `${name}: nested compaction and request B did not finish within 1.5 s`);
+    } finally {
+      // Do not await a deadlocked submission if the bound assertion failed.
+      f.session.abortRetry();
+      f.close();
+    }
+  },
+  async B19(mode) {
+    const name = "B19 runtime disposal with a stalled terminal handler completes within the bound";
+    let releaseDelivery;
+    let markDeliveryStarted;
+    const delivery = new Promise((resolve) => { releaseDelivery = resolve; });
+    const deliveryStarted = new Promise((resolve) => { markDeliveryStarted = resolve; });
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      captureExtensionErrors: true,
+      terminalDelivery() {
+        markDeliveryStarted();
+        return delivery;
+      },
+    });
+    let completion;
+    let disposing;
+    let teardownReached = false;
+    f.runtime.setBeforeSessionInvalidate(() => { teardownReached = true; });
+    try {
+      await assertWithin((async () => {
+        const started = new Promise((resolve) => f.session.subscribe((event) => {
+          if (event.type === "auto_retry_start") resolve();
+        }));
+        f.faux.setResponses([connectionError(), fauxAssistantMessage("Must not be reached.")]);
+        completion = f.session.prompt("Complete request A.");
+        await started;
+        await delay(0);
+        assert.equal(f.session.isRetrying, true);
+        disposing = f.runtime.dispose();
+        await deliveryStarted;
+        await disposing;
+        assert.equal(teardownReached, true, `${name}: teardown continues while the handler is stalled`);
+        assert.deepEqual(f.outcomes(), []);
+        assert.equal(f.faux.state.callCount, 1);
+        assert.deepEqual(f.retryEvents().map(({ type, finalError }) => [type, finalError]), [
+          ["auto_retry_start", undefined], ["auto_retry_end", "Retry cancelled"],
+        ]);
+        releaseDelivery();
+        await completion;
+      })(), 7_500, `${name}: runtime disposal did not finish within 7.5 s while terminal delivery was stalled`);
+    } finally {
+      releaseDelivery();
+      f.session.abortRetry();
+      try {
+        await assertWithin(Promise.all([completion, disposing]), 1_500, `${name}: cleanup did not finish after releasing the handler`);
+      } finally { f.close(); }
     }
   },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:
