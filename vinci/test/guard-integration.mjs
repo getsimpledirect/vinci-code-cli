@@ -992,15 +992,16 @@ try {
     );
   }
   // An escaped `\>` is a literal, so the `|` after it is a real pipe and the writer behind it is
-  // still its own segment.
+  // still its own segment. This `>` case is answered by the base pass; the `>|` list above holds the
+  // same shape aimed at a `>|` target, which only the second pass answers.
   check("a writer behind `\\>|` (a literal `>` and a real pipe) is still a shell file write", guard.isShellFileWrite("true \\>| echo x >out.txt"));
   // Outside this change's operators, behaviour is pinned as it was (not an endorsement of either).
   check("plain `2> file` keeps its previous classification (not a write form here)", !guard.isShellFileWrite("echo x 2> err.txt"));
   check("`>> /dev/null` keeps its previous classification", guard.isShellFileWrite("echo x >> /dev/null"));
-  check("a plain `>` after `2>&1` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 > out.txt"));
+  check("known miss kept from main: a plain `>` after `2>&1` (shared splitter limit, out of scope)", !guard.isShellFileWrite("echo x 2>&1 > out.txt"));
   check("`2>&1 >> /dev/null` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 >> /dev/null"));
   check("`echo >& tee out.txt` keeps its previous classification", guard.isShellFileWrite("echo >& tee out.txt"));
-  check("an escaped `\\&>` keeps its previous classification (a literal `&`, then `>`)", !guard.isShellFileWrite("echo x \\&> out.txt"));
+  check("known miss kept from main: an escaped `\\&>` (a literal `&`, then a plain `>`; shared splitter limit, out of scope)", !guard.isShellFileWrite("echo x \\&> out.txt"));
   // Comments are not parsed (a look-alike `#` could hide a write), so an operator in comment text
   // counts as a write, as `>` already does on main.
   check("`>|` in comment text is classified as a write, like `>`", guard.isShellFileWrite("echo x # >| out.txt"));
@@ -1011,6 +1012,17 @@ try {
     const started = performance.now();
     guard.isShellFileWrite(long);
     check("a long line with many `#` is classified in linear time", performance.now() - started < 2_000);
+  }
+  {
+    const long = "echo x " + "\\\n\\&".repeat(80_000) + " &> out.txt";
+    const started = performance.now();
+    const isWrite = guard.isShellFileWrite(long);
+    check("a long line of continuations and escaped `&` is classified in linear time", isWrite && performance.now() - started < 2_000);
+  }
+  // Only the writers this guard already knows (echo, printf, tee, cat heredoc) count; other commands
+  // with the new operators keep main's classification and run.
+  for (const command of ["ls &> out.txt", "git log >| out.txt", "npm test &>> build.log", "ls 2>| err.txt"]) {
+    check(`a non-writer command with a new operator stays allowed: ${JSON.stringify(command)}`, !guard.isShellFileWrite(command));
   }
 
   // No SILENT auto-grant: two adversarial reviews showed a shell command can't be classified "safe to
