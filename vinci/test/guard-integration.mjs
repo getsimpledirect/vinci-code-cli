@@ -3,7 +3,7 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -519,6 +519,7 @@ try {
     assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/not-yet/../granted`), false, "the sandbox refuses a .. after a missing component");
     assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/granted`), true, "the sandbox grants a plain in-project path");
     // A protected startup file that is a dangling link is protected at its PHYSICAL future destination.
+    const readlinkSafe = (path) => { try { return readlinkSync(path); } catch { return undefined; } };
     const fakeHome = join(physicalRoot, "home");
     mkdirSync(fakeHome);
     symlinkSync(`${join(physicalRoot, "a", "link")}/../startup-target`, join(fakeHome, ".zshenv"));
@@ -543,6 +544,60 @@ try {
       // Positive control: protection names files, not the project; an unrelated in-project write stays granted.
       assert.ok(!beforeNewdir.includes(realProject), "the project itself is not protected");
       assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/unrelated-write`), true, "an unrelated in-project write stays granted");
+      // Everything the protected path depends on is protected: a missing directory without any `..`, each link on
+      // the way that could be replaced, and a missing directory reached through such a link (never with the
+      // rest of the path appended to it). System links this user cannot replace (/var, /tmp) are not protected.
+      symlinkSync(`${realProject}/startup-plain-new/rc`, join(fakeHome, ".zlogout"));
+      symlinkSync(`${realProject}/startup-alias/rc`, join(fakeHome, ".profile"));
+      symlinkSync(`${realProject}/startup-alias-new/../config`, join(realProject, "startup-alias"));
+      writeFileSync(join(physicalRoot, "outside", "startup-real"), "real");
+      symlinkSync(join(physicalRoot, "outside", "startup-real"), join(realProject, "startup-hop"));
+      symlinkSync(`${realProject}/startup-hop`, join(fakeHome, ".inputrc"));
+      const dependencies = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
+      assert.ok(dependencies.includes(join(realProject, "startup-plain-new")), "a protected link into a missing directory denies creating that directory");
+      assert.ok(dependencies.includes(join(realProject, "startup-alias")), "a replaceable link inside a protected chain is protected");
+      assert.ok(dependencies.includes(join(realProject, "startup-alias-new")), "a missing directory reached through a chain link is protected as itself");
+      assert.ok(!dependencies.includes(join(realProject, "startup-alias-new", "rc")), "the rest of the path is not appended to a missing directory");
+      assert.ok(dependencies.includes(join(realProject, "startup-hop")), "an intermediate link to an existing file is protected");
+      assert.ok(dependencies.includes(realpathSync.native(join(physicalRoot, "outside", "startup-real"))), "the final destination of a resolvable chain is protected");
+      for (const systemLink of ["/var", "/tmp", "/etc"]) assert.ok(!dependencies.includes(systemLink), `the system link ${systemLink} is not protected`);
+      assert.ok(!dependencies.some((entry) => realProject === entry || realProject.startsWith(`${entry}/`)), "neither the project nor any of its ancestors is protected");
+      // The real OS sandbox enforces it (macOS): no sandboxed command can create the missing directories or replace
+      // the links, while an ordinary project write succeeds.
+      if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) {
+        const sandbox = await loader.import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"), { default: false });
+        const previousCode = process.env.VINCI_CODE;
+        const previousNoSandbox = process.env.VINCI_NO_SANDBOX;
+        process.env.VINCI_CODE = "1";
+        delete process.env.VINCI_NO_SANDBOX;
+        const sandboxed = (command) => {
+          try {
+            execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", sandbox.vinciSandboxWrap(command, realProject)], { cwd: realProject, timeout: 10000, env: { ...localShellEnv, HOME: fakeHome }, stdio: "pipe" });
+            return true;
+          } catch {
+            return false;
+          }
+        };
+        try {
+          mkdirSync(join(realProject, "startup-evil"));
+          assert.equal(sandboxed("echo ok > sandboxed-ordinary.txt"), true, "an ordinary sandboxed project write succeeds");
+          assert.equal(readFileSync(join(realProject, "sandboxed-ordinary.txt"), "utf8"), "ok\n", "the ordinary sandboxed write landed");
+          sandboxed("mkdir startup-plain-new");
+          sandboxed(`ln -s ${realProject}/startup-evil startup-plain-new`);
+          assert.ok(!existsSync(join(realProject, "startup-plain-new")) && !readlinkSafe(join(realProject, "startup-plain-new")), "the sandbox cannot create the missing directory of a protected destination");
+          sandboxed(`ln -sfn ${realProject}/startup-evil startup-alias`);
+          sandboxed("rm -f startup-alias");
+          assert.equal(readlinkSync(join(realProject, "startup-alias")), `${realProject}/startup-alias-new/../config`, "the sandbox cannot replace a link inside a protected chain");
+          sandboxed("mkdir startup-alias-new");
+          assert.ok(!existsSync(join(realProject, "startup-alias-new")), "the sandbox cannot create a missing directory reached through a chain link");
+          sandboxed(`ln -sfn ${realProject}/startup-evil startup-hop`);
+          assert.equal(readlinkSync(join(realProject, "startup-hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot replace an intermediate link");
+        } finally {
+          if (previousCode === undefined) delete process.env.VINCI_CODE;
+          else process.env.VINCI_CODE = previousCode;
+          if (previousNoSandbox !== undefined) process.env.VINCI_NO_SANDBOX = previousNoSandbox;
+        }
+      }
       // A grant never follows a dangling link out of the project.
       symlinkSync(join(physicalRoot, "outside", "grant-target"), join(physicalProject, "dangling-out"));
       assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/dangling-out`), false, "the sandbox refuses a write through a dangling link");

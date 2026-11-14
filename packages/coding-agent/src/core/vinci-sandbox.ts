@@ -26,7 +26,17 @@
 
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, mkdtempSync, readlinkSync, realpathSync, rmSync, statSync } from "node:fs";
+import {
+	accessSync,
+	existsSync,
+	constants as fsConstants,
+	lstatSync,
+	mkdtempSync,
+	readlinkSync,
+	realpathSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { waitForChildProcess } from "../utils/child-process.ts";
@@ -133,46 +143,55 @@ function canonicalWritePath(path: string): string | undefined {
 }
 
 /**
- * Every place a write to a protected `path` can land. A dangling link is followed to its future physical
- * destination, otherwise creating that destination would lose the default deny. A `..` after a missing
- * component cannot be resolved yet: protect its lexical destination and the missing component, never nothing
- * (fail closed).
+ * Every path a protected `path` depends on, walked component by component with links followed by hand: each
+ * link on the way that this user could replace, the first missing component (creating it, as a directory or as
+ * a link, would decide where the path lands), the destination that component would give, and the final physical
+ * path. Fail closed: an unreadable component is protected itself.
  */
-function protectedWritePaths(path: string, links = 0): string[] {
-	let candidate = unresolvedAbsolute(path);
-	const missing: string[] = [];
-	for (let depth = 0; depth < 256; depth++) {
-		try {
-			lstatSync(candidate);
-			const prefix = realpathSync.native(candidate);
-			const physical = resolve(prefix, ...[...missing].reverse());
-			if (!missing.includes("..")) return [physical];
-			// The destination once the missing directory is a real one, and that directory itself: denying
-			// its creation keeps it from becoming a link that would move the destination elsewhere.
-			return [...new Set([physical, resolve(prefix, missing[missing.length - 1]!)])];
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return [];
-			try {
-				if (lstatSync(candidate).isSymbolicLink()) {
-					if (links >= 32) return [];
-					// Keep the raw destination: a `..` in it must be resolved physically, after its links.
-					const destination = readlinkSync(candidate);
-					const rest = [...missing].reverse();
-					return protectedWritePaths(
-						isAbsolute(destination) ? destination : `${dirname(candidate)}${sep}${destination}`,
-						links + 1,
-					).map((target) => resolve(target, ...rest));
-				}
-			} catch {
-				/* missing component */
-			}
-			const parent = dirname(candidate);
-			if (parent === candidate) return [];
-			missing.push(basename(candidate));
-			candidate = parent;
+function protectedWritePaths(path: string): string[] {
+	const out = new Set<string>();
+	let pending = unresolvedAbsolute(path).split(sep).filter((part) => part !== "");
+	let current: string = sep;
+	let links = 0;
+	for (let step = 0; step < 4096 && pending.length > 0; step++) {
+		const part = pending.shift()!;
+		if (part === ".") continue;
+		if (part === "..") {
+			// `current` holds no links, so its parent is the physical parent.
+			current = dirname(current);
+			continue;
 		}
+		const next = join(current, part);
+		let isLink: boolean;
+		try {
+			isLink = lstatSync(next).isSymbolicLink();
+		} catch (error) {
+			out.add(next);
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") out.add(resolve(next, ...pending));
+			return [...out];
+		}
+		if (isLink) {
+			if (userCanReplace(next)) out.add(next);
+			if (++links > 32) return [...out];
+			const destination = readlinkSync(next);
+			pending = [...destination.split(sep).filter((piece) => piece !== ""), ...pending];
+			if (isAbsolute(destination)) current = sep;
+			continue;
+		}
+		current = realOrSelf(next);
 	}
-	return [];
+	if (pending.length === 0) out.add(current);
+	return [...out];
+}
+
+/** Whether this user (and so a sandboxed child) could replace the entry `path` names. */
+function userCanReplace(path: string): boolean {
+	try {
+		accessSync(dirname(path), fsConstants.W_OK);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function configuredPaths(name: string): string[] {
