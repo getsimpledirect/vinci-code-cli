@@ -509,7 +509,7 @@ const COMMAND_PREFIX = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*')
 const FILE_REDIRECT = /(?<![0-9&>])>>?(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 // The clobber form `>|` (also `2>|`) and stdout+stderr `&>`/`&>>`, matched as whole operators so
 // `>| /dev/null` and `&>> /dev/null` stay allowed like `> /dev/null`; `&>&2` duplicates, not writes.
-const CLOBBER_OR_BOTH_REDIRECT = /(?:>\||(?<!\\)&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
+const CLOBBER_OR_BOTH_REDIRECT = /(?:>\||(?<=(?:^|[^\\])(?:\\\\)*)&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 
 function commandBody(segment: string): string {
   return segment.replace(COMMAND_PREFIX, "").trim();
