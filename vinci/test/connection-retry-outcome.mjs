@@ -807,6 +807,34 @@ const cases = {
       } finally { f.close(); }
     }
   },
+  async B20(mode) {
+    const name = "B20 tree navigation and retry settlement during the live retry run leave that run alone";
+    const f = await fixture(mode);
+    try {
+      let probed = false;
+      f.faux.setResponses([
+        connectionError(),
+        async () => {
+          assert.equal(f.session.isStreaming, true, `${name}: the probe runs inside the live retry run`);
+          await f.session.navigateTree(f.session.sessionManager.getLeafId());
+          await f.session.settleRetry();
+          probed = true;
+          return fauxAssistantMessage("Request A is complete.");
+        },
+      ]);
+      await f.session.prompt("Complete request A.");
+      await delay(0);
+      const ends = f.extensionEvents.filter((event) => event.type === "agent_end");
+      console.log(`${name} ${mode}: ${JSON.stringify({ ends: ends.map(({ willRetry }) => willRetry), retryEvents: f.retryEvents().map(({ type, success, attempt }) => [type, success, attempt]), outcomes: f.outcomes().map(({ state }) => state), calls: f.faux.state.callCount })}`);
+      assert.equal(probed, true);
+      assert.equal(ends.filter((event) => !event.willRetry).length, 1, `${name}: one terminal agent_end for request A`);
+      assert.deepEqual(f.retryEvents().map(({ type, success, attempt }) => [type, success, attempt]), [
+        ["auto_retry_start", undefined, 1], ["auto_retry_end", true, 1],
+      ], `${name}: the retry budget is not reset during the live retry run`);
+      assert.equal(f.faux.state.callCount, 2);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE"]);
+    } finally { f.close(); }
+  },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:
   // the "could not reach the model" wording is only for retries exhausted on a retryable error.
   async B8(mode) {

@@ -2923,6 +2923,16 @@ export class AgentSession {
 		return generation === this._retryGeneration && !controller.signal.aborted && this.autoRetryEnabled;
 	}
 
+	/** A retry is held while idle: backoff is pending or the held terminal run is still being delivered. */
+	private _hasIdleHeldRetry(): boolean {
+		return (
+			!this.isStreaming &&
+			(this._retryAbortController !== undefined ||
+				this._heldRetryAgentEndMessages !== undefined ||
+				this._heldRetryAgentEndRelease !== undefined)
+		);
+	}
+
 	private async _settleIdleHeldRetry(): Promise<void> {
 		// A terminal handler must not wait on the delivery that is awaiting that handler.
 		if (this._deliveringHeldAgentEnd) return;
@@ -2934,6 +2944,8 @@ export class AgentSession {
 
 	/** Cancel backoff and allow bounded terminal delivery before reload or runtime teardown. */
 	async settleRetry(): Promise<void> {
+		// A live retry run owns its terminal agent_end and retry budget; only an idle held retry settles here.
+		if (!this._hasIdleHeldRetry()) return;
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		try {
 			await Promise.race([
@@ -3115,7 +3127,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
-		await this._settleIdleHeldRetry();
+		if (this._hasIdleHeldRetry()) await this._settleIdleHeldRetry();
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target
