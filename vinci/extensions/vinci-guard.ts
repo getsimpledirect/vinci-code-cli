@@ -163,12 +163,15 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
   const segments: string[] = [];
   let current = "";
   let quote: "'" | '"' | "`" | null = null;
-  let afterRedirect = false; // the previous character was an unquoted, unescaped `>`
+  let afterRedirect = false; // the previous character was an unquoted, unescaped `>` (or `<`, for `&` only)
+  let afterInputRedirect = false;
 
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     const redirectBefore: boolean = afterRedirect;
+    const inputRedirectBefore: boolean = afterInputRedirect;
     afterRedirect = false;
+    afterInputRedirect = false;
     if (quote) {
       current += ch;
       if (quote !== "'" && ch === "\\" && i + 1 < command.length) {
@@ -192,12 +195,13 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
       if (keepWriteRedirects && command[i + 1] === "\n") {
         i += 1;
         afterRedirect = redirectBefore;
+        afterInputRedirect = inputRedirectBefore;
         continue;
       }
       current += ch + command[++i];
       continue;
     }
-    if (keepWriteRedirects && ((ch === "|" && redirectBefore) || (ch === "&" && (redirectBefore || command[afterContinuations(command, i + 1)] === ">")))) {
+    if (keepWriteRedirects && ((ch === "|" && redirectBefore) || (ch === "&" && (redirectBefore || inputRedirectBefore || command[afterContinuations(command, i + 1)] === ">")))) {
       current += ch;
       continue;
     }
@@ -209,6 +213,7 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
     }
     current += ch;
     afterRedirect = ch === ">";
+    afterInputRedirect = ch === "<"; // `<&0` duplicates a descriptor; its `&` is not a separator
   }
   if (current.trim()) segments.push(current.trim());
   return segments;
