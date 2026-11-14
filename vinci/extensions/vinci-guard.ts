@@ -484,13 +484,14 @@ export function destructiveFindRootTargets(command: string): string[][] {
 }
 
 const COMMAND_PREFIX = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*'))\s+)*(?:sudo\s+)?(?:command\s+)?/i;
-// A redirect that writes a file: `>`, `>>`, the clobber form `>|`, stdout+stderr `&>`/`&>>`, and a
-// numbered descriptor only in its clobber form (`2>|`; plain `2>` keeps its previous behaviour).
+// A redirect that writes a file: `>`, `>>`, the clobber form `>|` with or without a descriptor
+// number (`2>|`, also straight after `2>&1`), and stdout+stderr `&>`/`&>>`. Plain `2>` keeps its
+// previous behaviour.
 // `/dev/null` targets and descriptor duplication (`>&2`, `2>&1`) are not file writes.
 // Each new operator is matched whole (no backtracking into a shorter operator), so `>| /dev/null`
 // and `&>> /dev/null` stay allowed the way `> /dev/null` and `&> /dev/null` are.
 const FILE_REDIRECT =
-  /(?:(?<![0-9&>])>>?(?!\|)|(?<![0-9&>])\d*>\||&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
+  /(?:(?<![0-9&>])>>?(?!\|)|>\||&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 
 function commandBody(segment: string): string {
   return segment.replace(COMMAND_PREFIX, "").trim();
@@ -504,8 +505,10 @@ export function isShellFileWrite(command: string): boolean {
   return shellSegments(command, true).some((segment) => {
     const body = commandBody(segment);
     if (/^(?:echo|printf)\b/i.test(body) && FILE_REDIRECT.test(body)) return true;
-    // A tee operand never starts with `&`: `tee &> /dev/null` is a redirect, not a file named `&>`.
+    // A tee operand never starts with `&`: `tee &> /dev/null` is a redirect, not a file named `&>`;
+    // tee's own redirects are judged like echo's, so `tee &> out.txt` is still a write.
     if (/^tee\b(?:\s+-[A-Za-z]+)*\s+(?![-&])(?!\/dev\/null\b)\S+/i.test(body)) return true;
+    if (/^tee\b/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i[A-Za-z]*\b)/i.test(body)) return true;
     return false;
