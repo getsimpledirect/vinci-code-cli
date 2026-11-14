@@ -375,6 +375,14 @@ async function shellWriteWrapperChecks() {
     "eval -- 'echo x > out.txt'",
     "bash +O extglob -c 'echo x > out.txt'",
     "bash -oc pipefail 'echo x > out.txt'",
+    // A later +n / +o noexec turns execution back on.
+    "bash -n +n -c 'echo x > out.txt'",
+    "bash -o noexec +o noexec -c 'echo x > out.txt'",
+    "sh -n +n -c 'echo x > out.txt'",
+    // The command text is the first operand after all options.
+    "bash -c -x 'echo x > out.txt'",
+    "sh -c -e 'echo x > out.txt'",
+    "bash -c -- 'echo x > out.txt'",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
@@ -399,7 +407,10 @@ async function shellWriteWrapperChecks() {
     // A lookup (also with grouped options) writes nothing, even of a shell.
     "command -pv echo > out.txt", "command -v bash -c 'echo x > out.txt'",
     // Syntax-check mode runs nothing.
-    "bash -n -c 'echo x > out.txt'", "sh -nc 'echo x > out.txt'", "bash -o noexec -c 'echo x > out.txt'"]) {
+    "bash -n -c 'echo x > out.txt'", "sh -nc 'echo x > out.txt'", "bash -o noexec -c 'echo x > out.txt'",
+    "bash -c -n 'echo x > out.txt'", "bash +n -n -c 'echo x > out.txt'",
+    // Words after the command text are its arguments, not commands.
+    "fish -c 'echo ok' 'echo x > out.txt'"]) {
     assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);
     const result = await toolCall("bash", { command });
     assert.ok(!result?.block || !/^Vinci blocked a shell-based file write/.test(result.reason), `No shell-write refusal: ${command}`);

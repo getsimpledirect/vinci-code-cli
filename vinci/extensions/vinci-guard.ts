@@ -576,9 +576,14 @@ function nestedShellText(segment: string): string | undefined {
     start = index;
   }
   if (!NESTED_SHELL.test(words[start] ?? "")) return undefined;
+  // The command text is the first operand after all options (`bash -c -x 'text'`, `bash -c -- 'text'`).
+  // -n and `-o noexec` only check syntax unless a later +n / `+o noexec` turns execution back on.
+  let noexec = false;
+  let command = false;
   for (let index = start + 1; index < words.length; index++) {
     const word = words[index];
-    if (word === "-" || word === "--" || !/^[-+]/.test(word)) return undefined;
+    if (word === "-" || word === "--") return command && !noexec ? words[index + 1] : undefined;
+    if (!/^[-+]/.test(word)) return command && !noexec ? word : undefined;
     if (word.startsWith("--")) {
       // Long options; --rcfile/--init-file take the next word.
       if (word === "--rcfile" || word === "--init-file") index++;
@@ -587,16 +592,19 @@ function nestedShellText(segment: string): string | undefined {
     // A short-option cluster (`-lc`, `-oc pipefail`, `+O extglob`): letters checked one by one (linear).
     const letters = word.slice(1);
     if (!/^[A-Za-z]+$/.test(letters)) return undefined;
-    // o/O letters each take the next word as their value; -n and `-o noexec` only check syntax.
+    const on = word.startsWith("-");
+    // o/O letters each take the next word as their value.
     let values = 0;
     for (const letter of letters) {
       if (letter === "o" || letter === "O") {
         values++;
-        if (letter === "o" && word.startsWith("-") && words[index + values] === "noexec") return undefined;
+        if (letter === "o" && words[index + values] === "noexec") noexec = on;
+      } else if (letter === "n") {
+        noexec = on;
+      } else if (letter === "c" && on) {
+        command = true;
       }
     }
-    if (word.startsWith("-") && letters.includes("n")) return undefined;
-    if (word.startsWith("-") && letters.includes("c")) return words[index + values + 1];
     index += values;
   }
   return undefined;
