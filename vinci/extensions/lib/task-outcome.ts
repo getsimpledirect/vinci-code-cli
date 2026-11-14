@@ -494,10 +494,13 @@ export function classifyVinciLocalTaskState(
     }
     const failure = error ? userFacingFailure(error) : "The task stopped before completion.";
     // New input superseded the pending retry: say so, rather than present the provider error alone.
+    // The 240-character bound shortens the provider text, never the cancellation sentence.
     if (retryCancelled === "new-input") {
+      const lead = `${failure}${/[.!?]$/.test(failure) ? "" : "."}`;
+      const room = 240 - RETRY_CANCELLED_BY_NEW_INPUT.length - 1;
       return {
         state: "BLOCKED",
-        reason: `${failure}${/[.!?]$/.test(failure) ? "" : "."} ${RETRY_CANCELLED_BY_NEW_INPUT}`.slice(0, 240),
+        reason: `${lead.length > room ? `${lead.slice(0, room - 1)}…` : lead} ${RETRY_CANCELLED_BY_NEW_INPUT}`,
       };
     }
     return { state: "BLOCKED", reason: failure };

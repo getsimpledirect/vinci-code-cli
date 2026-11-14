@@ -1583,6 +1583,34 @@ const cases = {
       }
     }
   },
+  async B37(mode) {
+    const name = "B37 a long provider error keeps the cancellation sentence";
+    const suffix = "The retry was cancelled because new input arrived during the retry wait.";
+    const longError = `Connection error. ${"upstream detail ".repeat(20).trim()}`;
+    const f = await fixture(mode, { baseDelayMs: 60_000 });
+    let completion;
+    try {
+      const started = new Promise((resolve) => f.session.subscribe((event) => {
+        if (event.type === "auto_retry_start") resolve();
+      }));
+      f.faux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: longError }), fauxAssistantMessage("Request B is complete.")]);
+      completion = f.session.prompt("Complete request A.");
+      await assertWithin(started, 3_000, `${name}: A did not enter backoff`);
+      await delay(0);
+      await f.session.prompt("Complete request B.", { source: "interactive" });
+      await assertWithin(completion, 2_000, `${name}: A did not finish`);
+      const a = f.outcomes()[0];
+      console.log(`${name} ${mode}: ${JSON.stringify({ state: a?.state, length: a?.reason.length, reason: a?.reason })}`);
+      assert.equal(a?.state, "BLOCKED");
+      assert.ok(a.reason.endsWith(` ${suffix}`), `${name}: the reason still says why the retry ended`);
+      assert.ok(a.reason.length <= 240, `${name}: the reason stays within 240 characters`);
+      assert.ok(a.reason.startsWith("Connection error. upstream detail"), `${name}: the provider text leads`);
+    } finally {
+      f.session.abortRetry();
+      await completion?.catch(() => {});
+      f.close();
+    }
+  },
   async B8(mode) {
     const f = await fixture(mode);
     try {
