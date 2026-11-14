@@ -531,7 +531,7 @@ const WRAPPER_VALUED: Record<string, RegExp> = {
   exec: /^-a$/,
   sudo: /^(?:-[ughprtCTRD]|--(?:user|group|host|prompt|role|type|close-from|command-timeout|chroot|chdir))$/,
   env: /^(?:-[uC]|--(?:unset|chdir))$/,
-  xargs: /^(?:-[IndLPsEa]|--(?:max-args|max-lines|max-procs|max-chars|delimiter|arg-file|eof))$/,
+  xargs: /^(?:-[IndLPsEa]|--(?:max-args|max-lines|max-procs|max-chars|delimiter|arg-file))$/,
 };
 const wrapperTakesValue = (wrapper: string, option: string) => WRAPPER_VALUED[wrapper.toLowerCase()]?.test(option) ?? false;
 const LEADING_ASSIGNMENTS = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*'))\s+)*/;
@@ -548,7 +548,7 @@ function writerBody(segment: string, peelXargs = true): string {
     let rest = body.slice(wrapper[0].length);
     for (let argument = WRAPPER_ARGUMENT.exec(rest); argument; argument = WRAPPER_ARGUMENT.exec(rest)) {
       const option = argument[0].trim();
-      if (/^command$/i.test(wrapper[0]) && /^-[vV]$/.test(option)) return "";
+      if (/^command$/i.test(wrapper[0]) && /^-p*[vV][pvV]*$/.test(option)) return "";
       rest = rest.slice(argument[0].length);
       if (wrapperTakesValue(wrapper[0], option)) rest = rest.replace(/^\s+\S+(?=\s)/, "");
     }
@@ -569,7 +569,7 @@ function nestedShellText(segment: string): string | undefined {
     if (!/^(?:builtin|exec|command|sudo|env|nohup|time|xargs)$/i.test(executable)) break;
     let index = start + 1;
     while (index < words.length && (words[index].startsWith("-") || /^[A-Za-z_]\w*=/.test(words[index]))) {
-      if (/^command$/i.test(executable) && /^-[vV]$/.test(words[index])) return undefined;
+      if (/^command$/i.test(executable) && /^-p*[vV][pvV]*$/.test(words[index])) return undefined;
       if (wrapperTakesValue(executable, words[index])) index++;
       index++;
     }
@@ -582,24 +582,6 @@ function nestedShellText(segment: string): string | undefined {
     if (/^-[A-Za-z]*c[A-Za-z]*$/.test(word)) return words[index + 1];
   }
   return undefined;
-}
-
-/** Whether nested shell text starts a content writer whose output the OUTER segment's redirect
- * captures: `sh -c 'echo x' > f` writes f. */
-function nestedWriterOutput(nested: string): boolean {
-  const segments = shellSegments(nested);
-  // A writer piped into another command does not reach the outer redirect: with a pipe in the text,
-  // only the last stage is read (a writer in an earlier list item then goes unseen; fail open).
-  const piped = /(?<![|>])\|(?!\|)/.test(outerText(nested));
-  return (piped ? segments.slice(-1) : segments).some((segment) => {
-    const body = writerBody(segment);
-    return /^(?:echo|printf)\b/i.test(body) || /^cat\b[^\n]*<<-?\s*\S+/i.test(body);
-  });
-}
-
-/** The segment with quoted text blanked, so a redirect check sees only the outer shell's operators. */
-function outerText(segment: string): string {
-  return segment.replace(/'[^']*'|"(?:[^"\\]|\\[\s\S])*"/g, "''");
 }
 
 /**
@@ -621,18 +603,7 @@ function shellFileWriteAt(command: string, depth: number): boolean {
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i[A-Za-z]*\b)/i.test(writerBody(segment, false))) return true;
     return false;
-  }) || clobberOrBothRedirectWrite(command) || outerRedirectOfNestedWriter(command);
-}
-
-/** An outer redirect (`>`, `>>`, `>|`, `&>`, `&>>`) that captures a writer inside sh -c or eval text:
- * `sh -c 'echo x' > f` writes f. Split keeping the write operators, so `&>` and `>|` reach the check. */
-function outerRedirectOfNestedWriter(command: string): boolean {
-  return shellSegments(command, true).some((segment) => {
-    const nested = nestedShellText(segment);
-    if (nested === undefined || !nestedWriterOutput(nested)) return false;
-    const outer = outerText(writerBody(segment));
-    return FILE_REDIRECT.test(outer) || CLOBBER_OR_BOTH_REDIRECT.test(outer);
-  });
+  }) || clobberOrBothRedirectWrite(command);
 }
 
 /** `>|`, `N>|`, `&>` and `&>>` writes, which the split above cuts off from their targets (it reads
