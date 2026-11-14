@@ -938,10 +938,11 @@ try {
   // the shell unseen. Each case must be answered by the shell-write block itself (its reason and
   // its private control), with no dialog first.
   for (const [operator, commands] of [
-    [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF"]],
-    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt"]],
-    ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt"]],
-    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt"]],
+    // A descriptor duplication before the write (`2>&1`, `>&2`) must not split it off either.
+    [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt"]],
+    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt"]],
+    ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt", "echo x >&2 &>>out.txt"]],
+    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt"]],
   ]) {
     for (const command of commands) {
       const selectionCount = selections.length;
@@ -974,6 +975,10 @@ try {
     "echo a | cat",
     "echo x |& cat",
     "sleep 1 & echo x",
+    "echo x >&2 && echo y",
+    "echo x 2>&1 & echo y",
+    "tee &> /dev/null",
+    "tee &>> /dev/null",
   ]) {
     const selectionCount = selections.length;
     const result = await toolCall("bash", { command });
@@ -982,6 +987,11 @@ try {
       !guard.isShellFileWrite(command) && result === undefined && selections.length === selectionCount,
     );
   }
+  // An escaped `\>` is a literal, so the `|` after it is a real pipe and the writer behind it is
+  // still its own segment.
+  check("a writer behind `\\>|` (a literal `>` and a real pipe) is still a shell file write", guard.isShellFileWrite("true \\>| echo x >out.txt"));
+  // Keeping `>&` whole also stops it hiding a plain `>` write after it (missed before this change).
+  check("a plain `>` write after a descriptor duplication is a shell file write", guard.isShellFileWrite("echo x 2>&1 > out.txt"));
   // Outside this change's operators, behaviour is pinned as it was (not an endorsement of either).
   check("plain `2> file` keeps its previous classification (not a write form here)", !guard.isShellFileWrite("echo x 2> err.txt"));
   check("`>> /dev/null` keeps its previous classification", guard.isShellFileWrite("echo x >> /dev/null"));
