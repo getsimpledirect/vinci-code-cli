@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createJiti } from "jiti/static";
 
@@ -471,6 +471,46 @@ try {
       assert.equal(readFileSync(effect, "utf8"), "inside", `${label}: real effect missing`);
     }
     check("in-project writes, including through an in-project link, stay allowed", true);
+
+    // A `..` after a missing component cannot be resolved physically: it is treated as outside.
+    {
+      const selectionsBefore = physicalSelections.length;
+      const result = await physicalCall({ command: `node -e "require('fs').writeFileSync('not-yet/../pending','inside')"` });
+      assert.ok(result?.block === true || physicalSelections.length !== selectionsBefore, "a .. after a missing component is not classified as in-project");
+    }
+    // The write/edit tools resolve lexically themselves (resolveToCwd), so `lnk/../x` is the project's x there.
+    for (const toolName of ["write", "edit"]) {
+      assert.equal(await physicalCall({ path: "lnk/../structured-in", content: "inside", oldText: "a", newText: "b" }, toolName), undefined, `${toolName} of lnk/../x (lexically in the project) refused`);
+    }
+    check("unresolvable .. fails closed; structured tools keep their lexical in-project route", true);
+
+    // An SDK-supplied cwd spelled through `link/..` is the link target's sibling physically. The project
+    // root, its grants and write targets are compared physically: the lexical sibling is outside.
+    mkdirSync(join(physicalRoot, "a", "p"), { recursive: true });
+    mkdirSync(join(deep, "p"), { recursive: true });
+    symlinkSync(join(deep, "dir"), join(physicalRoot, "a", "link"));
+    const spelledCwd = `${join(physicalRoot, "a", "link")}/../p`;
+    const spelledSelections = [];
+    const spelledCtx = { ...ctx, cwd: spelledCwd, ui: { ...ctx.ui, async select(title) { spelledSelections.push(title); return "No, don't"; } } };
+    const spelledCall = async (command) => {
+      for (const handler of handlers.tool_call ?? []) {
+        const result = await handler({ toolName: "bash", input: { command } }, spelledCtx);
+        if (result !== undefined) return result;
+      }
+      return undefined;
+    };
+    const lexicalSibling = `node -e "require('fs').writeFileSync('${join(physicalRoot, "a", "p", "lexical-sibling")}','outside')"`;
+    const lexicalResult = await spelledCall(lexicalSibling);
+    execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", lexicalSibling], { cwd: spelledCwd, timeout: 5000, env: localShellEnv });
+    assert.equal(readFileSync(join(physicalRoot, "a", "p", "lexical-sibling"), "utf8"), "outside", "lexical sibling: real effect missing");
+    assert.ok(lexicalResult?.block === true || spelledSelections.length > 0, "a write to the cwd's lexical spelling (outside the physical project) is not classified as in-project");
+    const spelledSelectionsBefore = spelledSelections.length;
+    const physicalLocal = `node -e "require('fs').writeFileSync('physical-local','inside')"`;
+    assert.equal(await spelledCall(physicalLocal), undefined, "a local write in a cwd spelled through link/.. was refused");
+    assert.equal(spelledSelections.length, spelledSelectionsBefore, "a local write in a cwd spelled through link/.. prompted");
+    execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", physicalLocal], { cwd: spelledCwd, timeout: 5000, env: localShellEnv });
+    assert.equal(readFileSync(join(deep, "p", "physical-local"), "utf8"), "inside", "physical local: real effect missing");
+    check("a cwd spelled through link/.. is the physical project for roots and targets", true);
   }
   assert.ok(guard.segmentDestructiveDelivery("xargs env --unknown-wrapper-option rm"), "an unknown wrapper option must fail closed");
   assert.ok((await toolCall("bash", { command: "find -- ~ -name '*.log' -delete" }))?.block);
@@ -1554,6 +1594,19 @@ try {
     "the Vinci-store write sends a private steer instead of a confirmation handoff",
     controls.some(({ message }) => message.customType === "vinci-store-path-block" && /internal bookkeeping mirror/i.test(message.content)),
   );
+
+  // On a case-insensitive filesystem a VINCI_HOME spelled in another case is the same store: the
+  // store check compares physical paths, as the write target is.
+  const casedVinciHome = join(dirname(vinciHome), basename(vinciHome).toUpperCase());
+  if (existsSync(casedVinciHome)) {
+    process.env.VINCI_HOME = casedVinciHome;
+    try {
+      const casedStoreWrite = await headlessCall("write", { path: mirrorFile, content: "<h1>project</h1>\n" });
+      check("a VINCI_HOME spelled in another case still steers store writes", casedStoreWrite?.block === true && /internal bookkeeping mirror/i.test(casedStoreWrite.reason));
+    } finally {
+      process.env.VINCI_HOME = vinciHome;
+    }
+  }
 
   const desktopWrite = await headlessCall("write", {
     path: join(homedir(), "Desktop", "vinci-guard-headless-x.txt"),

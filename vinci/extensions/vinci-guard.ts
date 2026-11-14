@@ -2392,9 +2392,9 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const vinciHome = resolve(getVinciHome());
-        const storeRoot = existsSync(vinciHome) ? realpathSync(vinciHome) : vinciHome;
-        const resolvedAbs = existsSync(abs) ? realpathSync(abs) : abs;
-        const resolvedCwd = existsSync(ctx.cwd) ? realpathSync(ctx.cwd) : resolve(ctx.cwd);
+        const storeRoot = existsSync(vinciHome) ? realpathSync.native(vinciHome) : vinciHome;
+        const resolvedAbs = existsSync(abs) ? realpathSync.native(abs) : abs;
+        const resolvedCwd = existsSync(ctx.cwd) ? realpathSync.native(ctx.cwd) : resolve(ctx.cwd);
         const cwdIsUnderStore = resolvedCwd === storeRoot || resolvedCwd.startsWith(storeRoot + sep);
         if (
           !cwdIsUnderStore &&

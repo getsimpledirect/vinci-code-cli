@@ -92,21 +92,29 @@ export function vinciSensitiveNoRead(cwd: string): string[] {
 	return [...new Set(paths.map(realOrSelf).filter((entry) => existsSync(entry)))];
 }
 
+/** An absolute spelling of `p` without lexical `..` collapse: `link/..` must reach the OS as written. */
+function unresolvedAbsolute(p: string): string {
+	return isAbsolute(p) ? p : `${process.cwd()}${sep}${p}`;
+}
+
+/** Physical path (the OS realpath follows `link/..` through the link; the JS one collapses it first). */
 function realOrSelf(p: string): string {
 	try {
-		return realpathSync(p);
+		return realpathSync.native(unresolvedAbsolute(p));
 	} catch {
-		return p;
+		return resolve(p);
 	}
 }
 
 function canonicalWritePath(path: string, protectedPath = false, links = 0): string | undefined {
-	let candidate = resolve(path);
+	let candidate = unresolvedAbsolute(path);
 	const missing: string[] = [];
 	for (let depth = 0; depth < 256; depth++) {
 		try {
 			lstatSync(candidate);
-			return resolve(realpathSync(candidate), ...missing.reverse());
+			// A `..` after a missing component cannot be resolved physically yet: refuse it.
+			if (missing.includes("..")) return undefined;
+			return resolve(realpathSync.native(candidate), ...missing.reverse());
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
 			try {
@@ -170,7 +178,7 @@ function configuredPaths(name: string): string[] {
 }
 
 function scopedPaths(cwd: string, files = false): string[] {
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const grants = (files ? fileGrants : directoryGrants).get(project) ?? [];
 	// Pin approvals to physical destinations. Retargeting a granted path does not widen its grant.
 	return [
@@ -197,7 +205,7 @@ export function vinciGrantWriteDirectory(cwd: string, path: string): string {
 		);
 	if (existsSync(canonical) && !statSync(canonical).isDirectory())
 		throw new Error("The write grant requires a directory. Use /allow-file for one file.");
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const grants = directoryGrants.get(project) ?? new Set<string>();
 	grants.add(canonical);
 	directoryGrants.set(project, grants);
@@ -209,7 +217,7 @@ export function vinciGrantWriteFile(cwd: string, path: string): string {
 	if (!canonical || canonical === sep || (existsSync(canonical) && !statSync(canonical).isFile())) {
 		throw new Error("The write grant requires a resolvable file path. Choose a regular file.");
 	}
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const grants = fileGrants.get(project) ?? new Set<string>();
 	grants.add(canonical);
 	fileGrants.set(project, grants);
@@ -227,7 +235,7 @@ export function vinciResetSandboxPermissions(): void {
 export function vinciSandboxWriteGranted(cwd: string, path: string): boolean {
 	const target = canonicalWritePath(path);
 	if (!target) return false;
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const directories = scopedPaths(cwd);
 	if (implicitProjectAllowed(project)) directories.push(project);
 	return (
@@ -262,7 +270,7 @@ const BUILD_CACHES = [
 /** No implicit HOME, sibling-parent, external-drive or shared-temp-container write authority. */
 export function vinciWritableRoots(cwd: string): string[] {
 	const home = realOrSelf(homedir());
-	const project = realOrSelf(resolve(cwd));
+	const project = realOrSelf(cwd);
 	const roots = new Set(scopedPaths(cwd));
 	if (implicitProjectAllowed(project)) roots.add(project);
 	roots.add(processTemp());
