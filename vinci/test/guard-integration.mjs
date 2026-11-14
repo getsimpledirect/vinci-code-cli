@@ -3,7 +3,7 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -562,6 +562,31 @@ try {
       assert.ok(dependencies.includes(realpathSync.native(join(physicalRoot, "outside", "startup-real"))), "the final destination of a resolvable chain is protected");
       for (const systemLink of ["/var", "/tmp", "/etc"]) assert.ok(!dependencies.includes(systemLink), `the system link ${systemLink} is not protected`);
       assert.ok(!dependencies.some((entry) => realProject === entry || realProject.startsWith(`${entry}/`)), "neither the project nor any of its ancestors is protected");
+      // A long chain of links padded with `./` (each link well under the OS path limit) is still walked to its end.
+      mkdirSync(join(realProject, "startup-dots"));
+      for (let index = 0; index < 12; index++) {
+        const next = index === 11 ? `${realProject}/startup-dots-target` : `${"./".repeat(450)}l${index + 1}`;
+        symlinkSync(next, join(realProject, "startup-dots", `l${index}`));
+      }
+      symlinkSync(`${realProject}/startup-dots/l0`, join(fakeHome, ".bash_profile"));
+      assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-dots-target")), "a long padded link chain is walked to its destination");
+      // An unreadable component is protected itself (fail closed).
+      mkdirSync(join(realProject, "startup-locked", "inner"), { recursive: true });
+      symlinkSync(`${realProject}/startup-locked/inner/rc`, join(fakeHome, ".bash_login"));
+      chmodSync(join(realProject, "startup-locked"), 0o000);
+      try {
+        assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-locked", "inner")), "an unreadable component of a protected chain is protected itself");
+      } finally {
+        chmodSync(join(realProject, "startup-locked"), 0o755);
+      }
+      // Bubblewrap binds follow links: chain links stay out of its read-only binds, their destinations stay in.
+      {
+        const sandboxCore = await loader.import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"), { default: false });
+        const binds = sandboxCore.vinciBwrapReadOnlyPaths(physicalProject);
+        assert.ok(!binds.includes(join(realProject, "startup-hop")) && !binds.includes(join(realProject, "startup-alias")), "bubblewrap does not bind a chain link (it would make the link's destination read-only)");
+        assert.ok(binds.includes(realpathSync.native(join(physicalRoot, "outside", "startup-real"))), "bubblewrap binds the chain's final destination");
+        assert.ok(binds.includes(join(realpathSync.native(fakeHome), ".inputrc")), "bubblewrap still binds the protected entry itself");
+      }
       // The real OS sandbox enforces it (macOS): no sandboxed command can create the missing directories or replace
       // the links, while an ordinary project write succeeds.
       if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) {

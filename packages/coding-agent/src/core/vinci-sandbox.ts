@@ -155,9 +155,13 @@ function protectedWritePaths(path: string): string[] {
 		.filter((part) => part !== "");
 	let current: string = sep;
 	let links = 0;
-	for (let step = 0; step < 4096 && pending.length > 0; step++) {
+	let steps = 0;
+	while (pending.length > 0) {
 		const part = pending.shift()!;
 		if (part === ".") continue;
+		// 33 links of at most PATH_MAX each stay far below this; past it, refuse rather than protect less.
+		if (++steps > 65536)
+			throw new Error(`Vinci cannot resolve the protected path ${path}. Shorten its link chain to re-enable bash.`);
 		if (part === "..") {
 			// `current` holds no links, so its parent is the physical parent.
 			current = dirname(current);
@@ -174,6 +178,7 @@ function protectedWritePaths(path: string): string[] {
 		}
 		if (isLink) {
 			if (userCanReplace(next)) out.add(next);
+			// The OS refuses to resolve more than 32 links (ELOOP), so a longer chain cannot be written through.
 			if (++links > 32) return [...out];
 			const destination = readlinkSync(next);
 			pending = [...destination.split(sep).filter((piece) => piece !== ""), ...pending];
@@ -182,7 +187,7 @@ function protectedWritePaths(path: string): string[] {
 		}
 		current = realOrSelf(next);
 	}
-	if (pending.length === 0) out.add(current);
+	out.add(current);
 	return [...out];
 }
 
@@ -383,16 +388,32 @@ const STARTUP_PATHS = [
 	"Library/LaunchAgents",
 ];
 
-export function vinciSensitiveNoWrite(_cwd: string): string[] {
+function protectedEntryPaths(): string[] {
 	const home = realOrSelf(homedir());
-	return [
-		...new Set(
-			[...LOCKED_HOME_SECRETS, ...TOOL_CONFIG_PROTECTED_WRITES, ...STARTUP_PATHS].flatMap((entry) => {
-				const path = join(home, entry);
-				return [path, ...protectedWritePaths(path)];
-			}),
-		),
-	];
+	return [...LOCKED_HOME_SECRETS, ...TOOL_CONFIG_PROTECTED_WRITES, ...STARTUP_PATHS].map((entry) => join(home, entry));
+}
+
+export function vinciSensitiveNoWrite(_cwd: string): string[] {
+	return [...new Set(protectedEntryPaths().flatMap((path) => [path, ...protectedWritePaths(path)]))];
+}
+
+/**
+ * Protected paths bubblewrap binds read-only. Bind mounts follow links, so a chain link would make its whole
+ * destination read-only; its destination is listed on its own. Chain links are protected by the macOS profile only.
+ */
+export function vinciBwrapReadOnlyPaths(cwd: string): string[] {
+	const entries = new Set(protectedEntryPaths());
+	return vinciSensitiveNoWrite(cwd).filter((r) => existsSync(r) && !isProtectedChainLink(r, entries));
+}
+
+/** A link inside a protected chain (not a protected entry itself): a bind mount would follow it. */
+function isProtectedChainLink(path: string, entries: Set<string>): boolean {
+	if (entries.has(path)) return false;
+	try {
+		return lstatSync(path).isSymbolicLink();
+	} catch {
+		return false;
+	}
 }
 
 const SEATBELT = "/usr/bin/sandbox-exec";
@@ -485,8 +506,7 @@ function bwrapWrap(
 		.join(" ");
 	// Re-bind the credential dirs READ-ONLY after the rw binds (later binds win) so ~/.ssh etc. stay
 	// unwritable even when a writable root (e.g. $HOME as cwd) covers them.
-	const roBinds = vinciSensitiveNoWrite(cwd)
-		.filter((r) => existsSync(r))
+	const roBinds = vinciBwrapReadOnlyPaths(cwd)
 		.map((r) => `--ro-bind ${sq(r)} ${sq(r)}`)
 		.join(" ");
 	const hiddenReads = sensitiveReadAllowed
