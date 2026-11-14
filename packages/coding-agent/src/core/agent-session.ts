@@ -3029,7 +3029,24 @@ export class AgentSession {
 	/** Cancel backoff and allow bounded terminal delivery before reload or runtime teardown. */
 	async settleRetry(): Promise<void> {
 		// A live retry run owns its terminal agent_end and retry budget; only an idle held retry settles here.
-		if (!this._hasIdleHeldRetry()) return;
+		if (!this._hasIdleHeldRetry()) {
+			// A retried run's final delivery is still in flight: teardown (quit, reload, session switch) waits
+			// for it, bounded, so its receipt persists first. Calls from inside a delivery do not wait on it.
+			if (this._activeHeldDeliveries.size > 0 && heldAgentEndDelivery.getStore() === undefined) {
+				let bound: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						Promise.allSettled([...this._activeHeldDeliveries]),
+						new Promise<void>((resolve) => {
+							bound = setTimeout(resolve, DISPOSE_INVALIDATION_TIMEOUT_MS);
+						}),
+					]);
+				} finally {
+					clearTimeout(bound);
+				}
+			}
+			return;
+		}
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		let timedOut = false;
 		const settling = this._settleIdleHeldRetry();

@@ -1378,8 +1378,12 @@ const cases = {
       const gate = new Promise((resolve) => { openGate = resolve; });
       let markDeliveryStarted;
       const deliveryStarted = new Promise((resolve) => { markDeliveryStarted = resolve; });
+      let outcomesAtShutdown;
       const f = await fixture(mode, {
         captureExtensionErrors: true,
+        configureExtension(pi) {
+          pi.on("session_shutdown", () => { outcomesAtShutdown ??= f.outcomes(); });
+        },
         async firstAgentEnd(event) {
           if (event.willRetry) return;
           markDeliveryStarted();
@@ -1396,15 +1400,19 @@ const cases = {
         await assertWithin(deliveryStarted, 2_000, `${name}: the retry did not reach its final handler`);
         assert.equal(f.faux.state.callCount, 2);
         assert.deepEqual(f.outcomes(), []);
-        if (path === "runtime") disposing = f.runtime.dispose();
+        let disposed = false;
+        if (path === "runtime") disposing = f.runtime.dispose().then(() => { disposed = true; });
         if (path === "session") assert.equal(f.session.dispose(), undefined);
         await delay(20);
+        // Runtime teardown (quit) waits for the delivery: the process must not exit before its receipt.
+        if (path === "runtime") assert.equal(disposed, false, `${name}: runtime teardown waits for the retried run's final delivery`);
         openGate();
         await assertWithin(Promise.all([completion, disposing]), 2_000, `${name}: ${path} deadlocked`);
         await delay(0);
         console.log(`${name} ${mode} ${path}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state }) => state), errors: f.extensionErrors.map(({ error }) => error) })}`);
         assert.deepEqual(f.extensionErrors, [], `${name}: ${path} must not invalidate a later handler's context`);
         assert.deepEqual(f.outcomes().map(({ state }) => state), ["DONE"], `${name}: ${path} records exactly one outcome for A`);
+        if (path === "runtime") assert.deepEqual(outcomesAtShutdown?.map(({ state }) => state), ["DONE"], `${name}: the receipt persists before runtime shutdown handlers`);
         assert.ok(f.extensionEvents.find((event) => event.type === "agent_end" && !event.willRetry)?.heldRunMessages?.length > 0);
       } finally {
         openGate();
