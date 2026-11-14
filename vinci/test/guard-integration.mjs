@@ -940,9 +940,9 @@ try {
   for (const [operator, commands] of [
     // A descriptor duplication before the write (`2>&1`, `>&2`) must not split it off either.
     [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt", "echo x >&2>|out.txt", "printf x >&2 >\\\n| out.txt", "true && echo x >| out.txt", "true \\\\\necho x >| out.txt", "true \\>| echo x >|out.txt"]],
-    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo x &\\\r\n> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt", "echo x\\ #foo &> out.txt"]],
+    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt", "true &&echo x &> out.txt", "echo x \\\\&> out.txt", "echo 'a # b' &> out.txt", "echo x# &> out.txt", "echo x # note\necho y &> out.txt", "true # note\necho y &> out.txt", "echo x\\ #foo &> out.txt", "echo x \\ # &> out.txt", "echo ${v:- #} &> out.txt", "true \\\r\necho x &> out.txt"]],
     ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt", "echo x >&2 &>>out.txt", "echo x | tee -a &>> out.txt", "sleep 1 & echo x &>> out.txt", "echo x \\\\&>> out.txt"]],
-    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt", "echo x 2>\\\n|out.txt", "echo x 2>\\\r\n|out.txt"]],
+    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt", "echo x 2>\\\n|out.txt"]],
   ]) {
     for (const command of commands) {
       const selectionCount = selections.length;
@@ -990,6 +990,8 @@ try {
     // The whole rest of the line is the comment, including a `;` and a writer after it.
     "# a; echo x &> out.txt",
     "true;# a; echo x &> out.txt",
+    // A `$` in an earlier command does not affect a comment in a later one.
+    "echo $x; echo y # &> out.txt",
   ]) {
     const selectionCount = selections.length;
     const result = await toolCall("bash", { command });
