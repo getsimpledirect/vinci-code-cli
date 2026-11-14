@@ -519,13 +519,79 @@ function commandBody(segment: string): string {
   return segment.replace(COMMAND_PREFIX, "").trim();
 }
 
+/** Words that run the rest of the segment as the command while the OUTER shell still performs its
+ * redirects, so `exec echo x > f` writes f exactly like `echo x > f`. Each may carry dash options
+ * and (env) assignments before the command word. */
+const WRITER_WRAPPER = /^(?:builtin|exec|eval|command|sudo|env|nohup|time|xargs)(?=\s)/i;
+const WRAPPER_ARGUMENT = /^\s+(?:-\S*|[A-Za-z_][A-Za-z0-9_]*=(?:[^\s"']+|"[^"]*"|'[^']*'))(?=\s)/;
+const NESTED_SHELL = /^(?:[^\s]*\/)?(?:sh|bash|zsh|dash|ksh|fish)$/i;
+const MAX_WRITER_DEPTH = 4;
+/** Wrapper options that take the NEXT word as their value. */
+const WRAPPER_VALUED: Record<string, RegExp> = {
+  exec: /^-a$/,
+  sudo: /^(?:-[ughprtCTRD]|--(?:user|group|host|prompt|role|type|close-from|command-timeout|chroot|chdir))$/,
+  env: /^(?:-[uC]|--(?:unset|chdir))$/,
+  xargs: /^-[IndLPsEa]$/,
+};
+const wrapperTakesValue = (wrapper: string, option: string) => WRAPPER_VALUED[wrapper.toLowerCase()]?.test(option) ?? false;
+const LEADING_ASSIGNMENTS = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*'))\s+)*/;
+
+/** The segment body with leading wrapper words (and their options) peeled, raw text kept so the
+ * redirect checks still see the redirect. Only for the shell-write routing checks. */
+function writerBody(segment: string): string {
+  let body = segment.trim().replace(LEADING_ASSIGNMENTS, "");
+  for (let depth = 0; depth < 8; depth++) {
+    const wrapper = WRITER_WRAPPER.exec(body);
+    if (!wrapper) break;
+    let rest = body.slice(wrapper[0].length);
+    for (let argument = WRAPPER_ARGUMENT.exec(rest); argument; argument = WRAPPER_ARGUMENT.exec(rest)) {
+      rest = rest.slice(argument[0].length);
+      if (wrapperTakesValue(wrapper[0], argument[0].trim())) rest = rest.replace(/^\s+\S+(?=\s)/, "");
+    }
+    body = rest.trim().replace(LEADING_ASSIGNMENTS, "");
+  }
+  return body;
+}
+
+/** The text a segment hands to another shell parser: `sh -c '<text>'` (also -lc, -ec, …) or the
+ * arguments of `eval`, after wrapper peeling. undefined when the segment runs no such text. */
+function nestedShellText(segment: string): string | undefined {
+  let words = shellWords(segment);
+  for (let depth = 0; depth < 8; depth++) {
+    while (/^[A-Za-z_]\w*=/.test(words[0] ?? "")) words = words.slice(1);
+    const executable = words[0] ?? "";
+    if (/^eval$/i.test(executable)) return words.slice(1).join(" ");
+    if (!/^(?:builtin|exec|command|sudo|env|nohup|time|xargs)$/i.test(executable)) break;
+    let index = 1;
+    while (index < words.length && (words[index].startsWith("-") || /^[A-Za-z_]\w*=/.test(words[index]))) {
+      if (wrapperTakesValue(executable, words[index])) index++;
+      index++;
+    }
+    words = words.slice(index);
+  }
+  if (!NESTED_SHELL.test(words[0] ?? "")) return undefined;
+  for (let index = 1; index < words.length; index++) {
+    const word = words[index];
+    if (!word.startsWith("-") || word === "-" || word === "--") return undefined;
+    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(word)) return words[index + 1];
+  }
+  return undefined;
+}
+
 /**
  * Shell content writers are less reliable than the structured write/edit tools: they bypass file
  * previews, overwrite protection, and edit validation. The model is never allowed to use them.
  */
 export function isShellFileWrite(command: string): boolean {
+  return shellFileWriteAt(command, 0);
+}
+
+function shellFileWriteAt(command: string, depth: number): boolean {
+  if (depth > MAX_WRITER_DEPTH) return false;
   return shellSegments(command).some((segment) => {
-    const body = commandBody(segment);
+    const nested = nestedShellText(segment);
+    if (nested !== undefined && shellFileWriteAt(nested, depth + 1)) return true;
+    const body = writerBody(segment);
     if (/^(?:echo|printf)\b/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^tee\b(?:\s+-[A-Za-z]+)*\s+(?!-)(?!\/dev\/null\b)\S+/i.test(body)) return true;
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
@@ -540,7 +606,7 @@ export function isShellFileWrite(command: string): boolean {
  *  continuations: `echo x &\<newline>> out.txt` is the same write. */
 function clobberOrBothRedirectWrite(command: string): boolean {
   return shellSegments(command, true).some((segment) => {
-    const body = commandBody(segment);
+    const body = writerBody(segment);
     if (!/^(?:echo|printf|tee)\b/i.test(body) && !/^cat\b[^\n]*<<-?\s*\S+/i.test(body)) return false;
     // Mask each escaped character (left to right, so `\\` pairs first) in one linear pass.
     return CLOBBER_OR_BOTH_REDIRECT.test(body.replace(/\\[\s\S]/g, "__"));

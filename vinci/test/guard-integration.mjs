@@ -325,6 +325,45 @@ async function checkpointOperationChecks(onlyCase) {
   }
 }
 
+async function shellWriteWrapperChecks() {
+  const project = realpathSync(workspace);
+  // #174: the outer shell performs the redirect whatever word runs first, so a content writer behind any
+  // wrapper word, or inside text another shell parses (sh -c, eval), takes the same shell-write refusal.
+  for (const command of [
+    "builtin echo x > out.txt",
+    "exec echo x > out.txt",
+    "exec -a name echo x > out.txt",
+    "eval echo x > out.txt",
+    "eval 'echo x > out.txt'",
+    "xargs echo x > out.txt",
+    "xargs -n 1 echo > out.txt",
+    "nohup echo x > out.txt",
+    "time echo x > out.txt",
+    "sudo -u root echo x > out.txt",
+    "bash -c 'echo x > out.txt'",
+    "sh -c \"printf y > out.txt\"",
+    "zsh -lc 'tee out.txt'",
+    "dash -c 'echo x >| out.txt'",
+    "sudo -n bash -c 'sh -c \"echo x > out.txt\"'",
+  ]) {
+    const result = await toolCall("bash", { command });
+    assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
+    assert.match(result.reason, /^Vinci blocked a shell-based file write; /, `Wrapped shell write takes the shell-write refusal: ${command}`);
+    assert.equal(existsSync(join(project, "out.txt")), false, `Wrapped shell write creates no file: ${command}`);
+  }
+  // env is refused earlier by the credential-read guard through the hook, so its routing is pinned on the classifier.
+  for (const command of ["env echo x > out.txt", "env -u HOME printf y > out.txt", "env -i FOO=1 bash -c 'echo x > out.txt'"]) {
+    assert.equal(guard.isShellFileWrite(command), true, `env-wrapped shell write is a shell write: ${command}`);
+  }
+  // Positive controls: commands that run no content writer keep their old classification.
+  for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo"]) {
+    assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);
+    const result = await toolCall("bash", { command });
+    assert.ok(!result?.block || !/^Vinci blocked a shell-based file write/.test(result.reason), `No shell-write refusal: ${command}`);
+  }
+  console.log("  ✓ #174 wrapped shell writes take the shell-write refusal");
+}
+
 async function shellWriteRouteChecks(onlyCase) {
   const project = realpathSync(workspace);
   const route = `write and edit can create or change files under ${project}; a file outside it needs your approval through the write tool.`;
@@ -805,6 +844,15 @@ async function shellWriteRouteChecks(onlyCase) {
   assert.equal(controls.slice(controlsBeforeVault).some(({ message }) => String(message.content).includes(opaque)), false, "Model guidance never contains a restored vaulted value");
 }
 
+if (process.argv.includes("--shell-write-wrappers")) {
+  try {
+    await shellWriteWrapperChecks();
+  } finally {
+    rmSync(runRoot, { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
 const shellWriteCase = process.argv.find((argument) => argument.startsWith("--shell-write-case="))?.split("=")[1];
 if (shellWriteCase) {
   try {
@@ -840,6 +888,7 @@ if (checkpointCase) {
 
 try {
   await shellWriteRouteChecks();
+  await shellWriteWrapperChecks();
   await checkpointChecks();
   await checkpointOperationChecks();
   // Use the registered tool_call hook and the same bytes executed by a real shell. All effects are
