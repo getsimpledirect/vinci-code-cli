@@ -215,6 +215,7 @@ export class AgentSessionRuntime {
 	}
 
 	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
+		await this.session.settleRetry();
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason,
@@ -374,6 +375,7 @@ export class AgentSessionRuntime {
 			return { cancelled: false, selectedText };
 		}
 
+		await this.session.settleRetry();
 		const sessionManager = this.session.sessionManager;
 		if (!targetLeafId) {
 			sessionManager.newSession({ parentSession: this.session.sessionFile });
@@ -504,6 +506,7 @@ export class AgentSessionRuntime {
 	}
 
 	async dispose(): Promise<void> {
+		await this.session.settleRetry();
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason: "quit",

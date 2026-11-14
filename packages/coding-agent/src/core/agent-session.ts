@@ -307,10 +307,10 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
-	/** Messages of every extension agent_end held for a pending auto-retry in the current request.
-	 *  The terminal agent_end carries them (heldRunMessages) so extensions can decide the request's
-	 *  outcome from all of its runs, even after an extension reload during backoff. */
+	private _retryGeneration = 0;
+	/** Messages held until this request's retry finishes or is cancelled. */
 	private _heldRetryAgentEndMessages: AgentMessage[] | undefined = undefined;
+	private _heldRetryAgentEndRelease: Promise<void> | undefined = undefined;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -617,15 +617,21 @@ export class AgentSession {
 	};
 
 	/** Emit the terminal agent_end for a run that was held for a retry that will not happen. */
-	private async _releaseHeldAgentEnd(fallback: AgentMessage[]): Promise<void> {
+	private _releaseHeldAgentEnd(fallback: AgentMessage[]): Promise<void> | undefined {
 		const held = this._heldRetryAgentEndMessages;
-		if (!held) return;
+		if (!held) return this._heldRetryAgentEndRelease;
 		this._heldRetryAgentEndMessages = undefined;
-		await this._extensionRunner.emit({
-			type: "agent_end",
-			messages: held.length > 0 ? held : fallback,
-			willRetry: false,
-		});
+		const release = this._extensionRunner
+			.emit({
+				type: "agent_end",
+				messages: held.length > 0 ? held : fallback,
+				willRetry: false,
+			})
+			.finally(() => {
+				if (this._heldRetryAgentEndRelease === release) this._heldRetryAgentEndRelease = undefined;
+			});
+		this._heldRetryAgentEndRelease = release;
+		return release;
 	}
 
 	/** Total tries when this run ended on a retryable error after auto-retries ran out; undefined
@@ -835,8 +841,11 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		const runner = this._extensionRunner;
+		const hasHeldAgentEnd =
+			this._heldRetryAgentEndMessages !== undefined || this._heldRetryAgentEndRelease !== undefined;
+		const settled = this.settleRetry();
 		try {
-			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
@@ -845,9 +854,14 @@ export class AgentSession {
 			// Dispose must succeed even if an abort hook throws.
 		}
 
-		this._extensionRunner.invalidate(
-			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
-		);
+		const invalidate = () => {
+			runner.invalidate(
+				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+			);
+		};
+		// Terminal handlers may await earlier extensions before persisting their outcome.
+		if (hasHeldAgentEnd) void settled.then(invalidate, invalidate);
+		else invalidate();
 		this._disconnectFromAgent();
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
@@ -1234,8 +1248,11 @@ export class AgentSession {
 			return false;
 		}
 
-		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
-			return true;
+		if (this._isRetryableError(msg)) {
+			const generation = this._retryGeneration;
+			const willRetry = await this._prepareRetry(msg);
+			if (generation !== this._retryGeneration) return false;
+			if (willRetry) return true;
 		}
 		// Any path that declines the pending retry (retries disabled during the wait, budget
 		// re-checked, cancellation) must still give extensions one terminal agent_end.
@@ -1347,6 +1364,11 @@ export class AgentSession {
 					);
 				}
 				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+			}
+
+			// Backoff is idle: a submitted prompt starts a separate request.
+			if (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease) {
+				await this.settleRetry();
 			}
 
 			// Check if we need to compact before sending (catches aborted responses).
@@ -2762,6 +2784,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		await this.settleRetry();
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
@@ -2821,14 +2844,6 @@ export class AgentSession {
 
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
 
-		this._emit({
-			type: "auto_retry_start",
-			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
-			delayMs,
-			errorMessage: message.errorMessage || "Unknown error",
-		});
-
 		// Remove error message from agent state (keep in session for history)
 		const messages = this.agent.state.messages;
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
@@ -2836,13 +2851,22 @@ export class AgentSession {
 		}
 
 		// Wait with exponential backoff (abortable)
-		this._retryAbortController = new AbortController();
+		const controller = new AbortController();
+		this._retryAbortController = controller;
+		const generation = this._retryGeneration;
+		const attempt = this._retryAttempt;
+		this._emit({
+			type: "auto_retry_start",
+			attempt,
+			maxAttempts: settings.maxRetries,
+			delayMs,
+			errorMessage: message.errorMessage || "Unknown error",
+		});
 		try {
-			await sleep(delayMs, this._retryAbortController.signal);
+			await sleep(delayMs, controller.signal);
 		} catch {
 			// Aborted during sleep - emit end event so UI can clean up
-			const attempt = this._retryAttempt;
-			this._retryAttempt = 0;
+			if (generation === this._retryGeneration) this._retryAttempt = 0;
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
@@ -2851,13 +2875,23 @@ export class AgentSession {
 			});
 			// A cancelled retry ends the turn without another agent loop: release the held run now
 			// (idempotent; _handlePostAgentRun releases it too when this returns false).
-			await this._releaseHeldAgentEnd([message]);
+			await (generation === this._retryGeneration
+				? this._releaseHeldAgentEnd([message])
+				: this._heldRetryAgentEndRelease);
 			return false;
 		} finally {
-			this._retryAbortController = undefined;
+			if (this._retryAbortController === controller) this._retryAbortController = undefined;
 		}
 
-		return true;
+		return generation === this._retryGeneration && !controller.signal.aborted && this.autoRetryEnabled;
+	}
+
+	/** Cancel backoff and finish its terminal extension event before replacing the request or runtime. */
+	async settleRetry(): Promise<void> {
+		this._retryGeneration++;
+		this.abortRetry();
+		this._retryAttempt = 0;
+		await this._releaseHeldAgentEnd([]);
 	}
 
 	/**
@@ -2882,6 +2916,7 @@ export class AgentSession {
 	 */
 	setAutoRetryEnabled(enabled: boolean): void {
 		this.settingsManager.setRetryEnabled(enabled);
+		if (!enabled) this.abortRetry();
 	}
 
 	// =========================================================================
