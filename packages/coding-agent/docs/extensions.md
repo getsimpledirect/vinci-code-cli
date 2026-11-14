@@ -562,6 +562,8 @@ pi.on("agent_end", async (event, ctx) => {
 });
 ```
 
+`agent_end` handlers run before the run has finished streaming. To start another request from one, queue it: `pi.sendUserMessage(text, { deliverAs: "followUp" })`, or `session.prompt(text, { streamingBehavior: "followUp" })` from SDK code. A plain `prompt()` is refused with "Agent is already processing". The follow-up runs once the current run ends, including after its retries are exhausted.
+
 #### turn_start / turn_end
 
 Fired for each turn (one LLM response + tool calls).
