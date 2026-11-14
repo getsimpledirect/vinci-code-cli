@@ -3041,16 +3041,24 @@ export class AgentSession {
 			// for it, bounded, so its receipt persists first. Calls from inside a delivery do not wait on it.
 			if (this._activeHeldDeliveries.size > 0 && heldAgentEndDelivery.getStore() === undefined) {
 				let bound: ReturnType<typeof setTimeout> | undefined;
+				let timedOut = false;
+				const awaited = [...this._activeHeldDeliveries];
 				try {
 					await Promise.race([
-						Promise.allSettled([...this._activeHeldDeliveries]),
+						Promise.allSettled(awaited),
 						new Promise<void>((resolve) => {
-							bound = setTimeout(resolve, DISPOSE_INVALIDATION_TIMEOUT_MS);
+							bound = setTimeout(() => {
+								timedOut = true;
+								resolve();
+							}, DISPOSE_INVALIDATION_TIMEOUT_MS);
 						}),
 					]);
 				} finally {
 					clearTimeout(bound);
 				}
+				// As in the idle branch: deliveries still stalled past the bound are detached, so a later
+				// teardown or disposal does not wait the bound on them again.
+				if (timedOut) for (const release of awaited) this._activeHeldDeliveries.delete(release);
 			}
 			return;
 		}

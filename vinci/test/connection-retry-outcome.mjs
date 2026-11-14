@@ -1611,6 +1611,40 @@ const cases = {
       f.close();
     }
   },
+  async B38(mode) {
+    const name = "B38 a teardown that timed out on a retried run's final delivery does not wait the bound on it again";
+    let openGate;
+    const gate = new Promise((resolve) => { openGate = resolve; });
+    let markDeliveryStarted;
+    const deliveryStarted = new Promise((resolve) => { markDeliveryStarted = resolve; });
+    const f = await fixture(mode, {
+      captureExtensionErrors: true,
+      async firstAgentEnd(event) {
+        if (event.willRetry) return;
+        markDeliveryStarted();
+        await gate;
+      },
+    });
+    let completion;
+    try {
+      f.faux.setResponses([connectionError(), fauxAssistantMessage("Request A is complete.")]);
+      completion = f.session.prompt("Complete request A.");
+      await assertWithin(deliveryStarted, 2_000, `${name}: the retry did not reach its final handler`);
+      const firstStarted = Date.now();
+      await assertWithin(f.session.settleRetry(), 8_000, `${name}: the first teardown wait is unbounded`);
+      const firstMs = Date.now() - firstStarted;
+      const secondStarted = Date.now();
+      await assertWithin(f.session.settleRetry(), 8_000, `${name}: the second teardown wait is unbounded`);
+      const secondMs = Date.now() - secondStarted;
+      console.log(`${name} ${mode}: ${JSON.stringify({ firstMs, secondMs })}`);
+      assert.ok(firstMs >= 4_500, `${name}: the first teardown waits the bound (${firstMs} ms)`);
+      assert.ok(secondMs < 1_000, `${name}: the second teardown returned in ${secondMs} ms; the stalled delivery is already detached`);
+    } finally {
+      openGate();
+      f.session.abortRetry();
+      try { await assertWithin(completion, 2_000, `${name}: cleanup did not finish`); } finally { f.close(); }
+    }
+  },
   async B8(mode) {
     const f = await fixture(mode);
     try {
