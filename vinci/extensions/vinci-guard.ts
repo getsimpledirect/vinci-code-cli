@@ -168,7 +168,7 @@ function shellSegments(command: string, keepWriteRedirects = false): string[] {
 
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
-    const redirectBefore = afterRedirect;
+    const redirectBefore: boolean = afterRedirect;
     afterRedirect = false;
     if (quote) {
       current += ch;
