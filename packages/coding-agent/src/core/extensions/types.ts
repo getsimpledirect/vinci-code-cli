@@ -396,7 +396,7 @@ export interface ExtensionCommandContext extends ExtensionContext {
 export interface ReplacedSessionContext extends ExtensionCommandContext {
 	sendMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; newRequest?: boolean },
 	): Promise<void>;
 
 	sendUserMessage(
@@ -724,6 +724,9 @@ export interface AgentStartEvent {
 	type: "agent_start";
 	/** This run is an auto-retry continuing the same request after a retryable provider error. */
 	continuesRetry?: boolean;
+	/** [vinci] Set when the turn was started by sendMessage(..., { triggerTurn: true, newRequest: true }):
+	 *  a separate request, not a continuation of the previous one. Absent otherwise. */
+	newRequest?: boolean;
 }
 
 /** Fired when an agent loop ends */
@@ -1296,10 +1299,14 @@ export interface ExtensionAPI {
 	// Actions
 	// =========================================================================
 
-	/** Send a custom message to the session. */
+	/**
+	 * Send a custom message to the session.
+	 * [vinci] `newRequest` (with `triggerTurn`, while idle): the triggered turn is a separate request, and its
+	 * `agent_start` carries `newRequest: true`. Default: the turn continues the previous request.
+	 */
 	sendMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; newRequest?: boolean },
 	): void;
 
 	/**
@@ -1536,7 +1543,7 @@ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 export type SendMessageHandler = <T = unknown>(
 	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; newRequest?: boolean },
 ) => void;
 
 export type SendUserMessageHandler = (

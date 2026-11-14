@@ -553,6 +553,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", (event, ctx) => {
     // An auto-retry continues the same request: keep its tree baseline, timers and operations.
     if (event.continuesRetry) return;
+    // A custom turn sent as a new request skips before_agent_start: start a fresh request scope (#170).
+    if (event.newRequest) continuingRequest = false;
     agentStartedAt = Date.now();
     priorActiveDurationMs = latestOutcome(ctx)?.activeDurationMs ?? 0;
     treeBaseline = gitTreeSnapshot(ctx.cwd);
