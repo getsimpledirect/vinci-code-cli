@@ -345,6 +345,15 @@ async function shellWriteWrapperChecks() {
     "zsh -lc 'tee out.txt'",
     "dash -c 'echo x >| out.txt'",
     "sudo -n bash -c 'sh -c \"echo x > out.txt\"'",
+    // The clobber and both-streams forms behind a wrapper, a valued option before a nested shell, and
+    // an assignment before a wrapper.
+    "exec echo x >| out.txt",
+    "builtin echo x &> out.txt",
+    "sudo -u root bash -c 'echo x > out.txt'",
+    "FOO=1 exec echo x > out.txt",
+    // The outer shell's redirect captures a writer that runs inside nested text.
+    "sh -c 'echo x' > out.txt",
+    "eval 'printf y' >> out.txt",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
@@ -355,8 +364,17 @@ async function shellWriteWrapperChecks() {
   for (const command of ["env echo x > out.txt", "env -u HOME printf y > out.txt", "env -i FOO=1 bash -c 'echo x > out.txt'"]) {
     assert.equal(guard.isShellFileWrite(command), true, `env-wrapped shell write is a shell write: ${command}`);
   }
+  // Nesting is bounded at four parsers; four levels of sh -c are still read.
+  const shQuote = (text) => `'${text.replace(/'/g, "'\\''")}'`;
+  let nestedFour = "echo x > out.txt";
+  for (let level = 0; level < 4; level++) nestedFour = `sh -c ${shQuote(nestedFour)}`;
+  assert.equal(guard.isShellFileWrite(nestedFour), true, "four nested shells are read");
+  // Adversarial input stays linear enough: a long run of assignments before a nested shell.
+  const longStarted = Date.now();
+  guard.isShellFileWrite(`${"A=1 ".repeat(50000)}bash -c 'ls'`);
+  assert.ok(Date.now() - longStarted < 5000, "a long assignment run is classified quickly");
   // Positive controls: commands that run no content writer keep their old classification.
-  for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo"]) {
+  for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo", "command -v echo > out.txt", "bash -c 'ls' > out.txt", "bash -c 'echo ok' > /dev/null", "git ls-files | xargs sed -i 's/a/b/'"]) {
     assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);
     const result = await toolCall("bash", { command });
     assert.ok(!result?.block || !/^Vinci blocked a shell-based file write/.test(result.reason), `No shell-write refusal: ${command}`);
