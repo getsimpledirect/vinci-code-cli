@@ -354,6 +354,10 @@ async function shellWriteWrapperChecks() {
     // The outer shell's redirect captures a writer that runs inside nested text.
     "sh -c 'echo x' > out.txt",
     "eval 'printf y' >> out.txt",
+    "sh -c 'echo x' &> out.txt",
+    "sudo sh -c 'printf y' >| out.txt",
+    // A valued long option whose value would otherwise read as the command word.
+    "xargs --arg-file list.txt echo x > out.txt",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
@@ -374,7 +378,9 @@ async function shellWriteWrapperChecks() {
   guard.isShellFileWrite(`${"A=1 ".repeat(50000)}bash -c 'ls'`);
   assert.ok(Date.now() - longStarted < 5000, "a long assignment run is classified quickly");
   // Positive controls: commands that run no content writer keep their old classification.
-  for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo", "command -v echo > out.txt", "bash -c 'ls' > out.txt", "bash -c 'echo ok' > /dev/null", "git ls-files | xargs sed -i 's/a/b/'"]) {
+  for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo", "command -v echo > out.txt", "bash -c 'ls' > out.txt", "bash -c 'echo ok' > /dev/null", "git ls-files | xargs sed -i 's/a/b/'",
+    // A writer piped onward, a quoted `>` that is an argument, and a lookup of a shell all write nothing.
+    "bash -c 'echo hi | wc -l' > count.txt", "sh -c 'echo \"$1\"' _ 'a > b'", "command -v bash -c 'echo x > out.txt'"]) {
     assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);
     const result = await toolCall("bash", { command });
     assert.ok(!result?.block || !/^Vinci blocked a shell-based file write/.test(result.reason), `No shell-write refusal: ${command}`);

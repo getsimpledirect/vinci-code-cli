@@ -587,7 +587,11 @@ function nestedShellText(segment: string): string | undefined {
 /** Whether nested shell text starts a content writer whose output the OUTER segment's redirect
  * captures: `sh -c 'echo x' > f` writes f. */
 function nestedWriterOutput(nested: string): boolean {
-  return shellSegments(nested).some((segment) => {
+  const segments = shellSegments(nested);
+  // A writer piped into another command does not reach the outer redirect: with a pipe in the text,
+  // only the last stage is read (a writer in an earlier list item then goes unseen; fail open).
+  const piped = /(?<![|>])\|(?!\|)/.test(outerText(nested));
+  return (piped ? segments.slice(-1) : segments).some((segment) => {
     const body = writerBody(segment);
     return /^(?:echo|printf)\b/i.test(body) || /^cat\b[^\n]*<<-?\s*\S+/i.test(body);
   });
@@ -610,18 +614,25 @@ function shellFileWriteAt(command: string, depth: number): boolean {
   if (depth > MAX_WRITER_DEPTH) return false;
   return shellSegments(command).some((segment) => {
     const nested = nestedShellText(segment);
-    if (nested !== undefined) {
-      if (shellFileWriteAt(nested, depth + 1)) return true;
-      const outer = outerText(writerBody(segment));
-      if (nestedWriterOutput(nested) && (FILE_REDIRECT.test(outer) || CLOBBER_OR_BOTH_REDIRECT.test(outer))) return true;
-    }
+    if (nested !== undefined && shellFileWriteAt(nested, depth + 1)) return true;
     const body = writerBody(segment);
     if (/^(?:echo|printf)\b/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^tee\b(?:\s+-[A-Za-z]+)*\s+(?!-)(?!\/dev\/null\b)\S+/i.test(body)) return true;
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i[A-Za-z]*\b)/i.test(writerBody(segment, false))) return true;
     return false;
-  }) || clobberOrBothRedirectWrite(command);
+  }) || clobberOrBothRedirectWrite(command) || outerRedirectOfNestedWriter(command);
+}
+
+/** An outer redirect (`>`, `>>`, `>|`, `&>`, `&>>`) that captures a writer inside sh -c or eval text:
+ * `sh -c 'echo x' > f` writes f. Split keeping the write operators, so `&>` and `>|` reach the check. */
+function outerRedirectOfNestedWriter(command: string): boolean {
+  return shellSegments(command, true).some((segment) => {
+    const nested = nestedShellText(segment);
+    if (nested === undefined || !nestedWriterOutput(nested)) return false;
+    const outer = outerText(writerBody(segment));
+    return FILE_REDIRECT.test(outer) || CLOBBER_OR_BOTH_REDIRECT.test(outer);
+  });
 }
 
 /** `>|`, `N>|`, `&>` and `&>>` writes, which the split above cuts off from their targets (it reads
