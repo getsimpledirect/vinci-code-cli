@@ -144,14 +144,34 @@ function isRecursiveForceRm(cmd: string): boolean {
   return recursiveForceRmTargets(cmd).length > 0;
 }
 
-/** Split a shell line at executable control operators, without splitting quoted data. */
-function shellSegments(command: string): string[] {
+/** Index of the first character at or after `index` that is not part of a line continuation. */
+function afterContinuations(command: string, index: number): number {
+  while (command[index] === "\\") {
+    if (command[index + 1] === "\n") index += 2;
+    else break;
+  }
+  return index;
+}
+
+/** Split a shell line at executable control operators, without splitting quoted data.
+ *  `keepWriteRedirects` (write detection only) keeps the `|` of `>|`, the `&` of `&>`/`&>>` and the
+ *  `&` of a descriptor duplication (`>&2`, `2>&1`) inside the segment: they are redirection
+ *  operators, not a pipe or a background `&`, and splitting them cut `echo x >| out.txt` into
+ *  `echo x >` and `out.txt`, hiding the write. Only an unquoted, unescaped `>` counts, so `\>|` is
+ *  still a literal `>` followed by a real pipe. */
+function shellSegments(command: string, keepWriteRedirects = false): string[] {
   const segments: string[] = [];
   let current = "";
   let quote: "'" | '"' | "`" | null = null;
+  let afterRedirect = false; // the previous character was an unquoted, unescaped `>` (or `<`, for `&` only)
+  let afterInputRedirect = false;
 
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
+    const redirectBefore: boolean = afterRedirect;
+    const inputRedirectBefore: boolean = afterInputRedirect;
+    afterRedirect = false;
+    afterInputRedirect = false;
     if (quote) {
       current += ch;
       if (quote !== "'" && ch === "\\" && i + 1 < command.length) {
@@ -166,8 +186,23 @@ function shellSegments(command: string): string[] {
       current += ch;
       continue;
     }
+    // Comments are not skipped: this split is not a full shell parser, and a `#` that only looks
+    // like a comment (inside `${v:-; #}`, after `\ `) could hide a real write. A write operator in
+    // comment text is therefore classified as a write, as the existing `>` check already does.
     if (ch === "\\" && i + 1 < command.length) {
+      // Write detection joins a line continuation (`\<newline>`, not `\<CR><LF>`) as bash does; a `\\`
+      // pair is consumed here first, so an escaped backslash before a newline still ends the line.
+      if (keepWriteRedirects && command[i + 1] === "\n") {
+        i += 1;
+        afterRedirect = redirectBefore;
+        afterInputRedirect = inputRedirectBefore;
+        continue;
+      }
       current += ch + command[++i];
+      continue;
+    }
+    if (keepWriteRedirects && ((ch === "|" && redirectBefore) || (ch === "&" && (redirectBefore || inputRedirectBefore || command[afterContinuations(command, i + 1)] === ">")))) {
+      current += ch;
       continue;
     }
     if (ch === ";" || ch === "\n" || ch === "|" || ch === "&") {
@@ -177,6 +212,8 @@ function shellSegments(command: string): string[] {
       continue;
     }
     current += ch;
+    afterRedirect = ch === ">";
+    afterInputRedirect = ch === "<"; // `<&0` duplicates a descriptor; its `&` is not a separator
   }
   if (current.trim()) segments.push(current.trim());
   return segments;
@@ -472,6 +509,11 @@ export function destructiveFindRootTargets(command: string): string[][] {
 
 const COMMAND_PREFIX = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*'))\s+)*(?:sudo\s+)?(?:command\s+)?/i;
 const FILE_REDIRECT = /(?<![0-9&>])>>?(?!\s*(?:\/dev\/null\b|&))\s*\S/;
+// The clobber form `>|` (also `2>|`) and stdout+stderr `&>`/`&>>`, matched as whole operators so
+// `>| /dev/null` and `&>> /dev/null` stay allowed like `> /dev/null`; `&>&2` duplicates, not writes.
+// It runs on text whose escaped characters are masked (see clobberOrBothRedirectWrite), so `\&>` is
+// a literal `&` and `\\&>` a real `&>`, without a lookbehind.
+const CLOBBER_OR_BOTH_REDIRECT = /(?:>\||&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 
 function commandBody(segment: string): string {
   return segment.replace(COMMAND_PREFIX, "").trim();
@@ -489,6 +531,19 @@ export function isShellFileWrite(command: string): boolean {
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i[A-Za-z]*\b)/i.test(body)) return true;
     return false;
+  }) || clobberOrBothRedirectWrite(command);
+}
+
+/** `>|`, `N>|`, `&>` and `&>>` writes, which the split above cuts off from their targets (it reads
+ *  their `|` as a pipe and their `&` as a background operator). A second pass that only ADDS these
+ *  operators, so every other classification stays exactly as above. Its split also joins line
+ *  continuations: `echo x &\<newline>> out.txt` is the same write. */
+function clobberOrBothRedirectWrite(command: string): boolean {
+  return shellSegments(command, true).some((segment) => {
+    const body = commandBody(segment);
+    if (!/^(?:echo|printf|tee)\b/i.test(body) && !/^cat\b[^\n]*<<-?\s*\S+/i.test(body)) return false;
+    // Mask each escaped character (left to right, so `\\` pairs first) in one linear pass.
+    return CLOBBER_OR_BOTH_REDIRECT.test(body.replace(/\\[\s\S]/g, "__"));
   });
 }
 
