@@ -260,8 +260,129 @@ test("Post-manifest recovery catches failed steps and continued notes failure af
   assert.match(recovery.if, /steps\.activate_manifest\.outcome == 'success'/);
   assert.match(recovery.if, /failure\(\) \|\| steps\.public_notes\.outcome == 'failure'/);
   assert.equal(steps.find((s) => s.id === "public_notes")["continue-on-error"], true);
-  const result = spawnSync("bash", ["-c", recovery.run], { encoding: "utf8", timeout: 10000 });
+  const result = spawnSync("bash", ["-c", recovery.run], { env: {}, encoding: "utf8", timeout: 10000 });
   assert.equal(result.status, 1); assert.match(result.stdout, /vinci-rollback\.yml/);
+});
+const postManifestSteps = [
+  ["VERIFY_LIVE_OUTCOME", "verify_live", "Verify exact live bytes before publishing public entry points"],
+  ["PUBLISH_ENTRY_POINTS_OUTCOME", "publish_entry_points", "Publish retained tested installer and compatibility bytes only after activation"],
+  ["GITHUB_RELEASE_OUTCOME", "github_release", "GitHub Release with the shipped artifacts"],
+  ["PUBLIC_NOTES_OUTCOME", "public_notes", "Public release notes"],
+  ["RETAIN_RECEIPT_OUTCOME", "retain_receipt", "Retain sanitized activation or refusal receipt"],
+];
+const successfulPostManifestOutcomes = Object.fromEntries(postManifestSteps.map(([key]) => [key, "success"]));
+function runRecovery(outcomes) {
+  return spawnSync("bash", ["-c", workflow.jobs.activate.steps.at(-1).run], { env: outcomes, encoding: "utf8", timeout: 10000 });
+}
+function assertIncompleteRecovery(result) {
+  assert.ifError(result.error);
+  assert.equal(result.signal, null);
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stderr, "");
+  assert.match(result.stdout, /^::error::Activation completion is "INCOMPLETE".*$/m);
+}
+function assertLiveRecovery(result) {
+  assertIncompleteRecovery(result);
+  assert.match(result.stdout, /^::error::.*Do not roll back\./m, 'A post-live-only failure must say "Do not roll back."');
+  assert.doesNotMatch(result.stdout, /vinci-rollback\.yml/, "A post-live-only failure must not route to rollback");
+  assert.match(result.stdout, /release is live.*live manifest matched the reviewed bytes.*archive and install script were published/);
+}
+function assertRollbackRecovery(result) {
+  assertIncompleteRecovery(result);
+  assert.match(result.stdout, /Inspect the live manifest and retained receipt/);
+  assert.match(result.stdout, /vinci\/RELEASE-ACTIVATION-RISK\.md/);
+  assert.match(result.stdout, /^::error::.*vinci-rollback\.yml for an authorized rollback before retrying/m);
+  assert.doesNotMatch(result.stdout, /Do not roll back|release is live/);
+}
+test("Post-manifest recovery C1: notes failure repairs publication without rollback", () => {
+  const result = runRecovery({ ...successfulPostManifestOutcomes, PUBLIC_NOTES_OUTCOME: "failure" });
+  assertLiveRecovery(result);
+  assert.match(result.stdout, /^::error::.*Public release notes \(failure\)/m);
+  assert.match(result.stdout, /publish the note to the public releases repository by hand/i);
+  assert.match(result.stdout, /fix PUBLIC_RELEASES_TOKEN/);
+  assert.match(result.stdout, /vinci\/release-notes\/README\.md/);
+  assert.doesNotMatch(result.stdout, /Create the GitHub Release|receipt artifact was not retained/);
+});
+test("Post-manifest recovery C2: live verification failure names later steps as skipped", () => {
+  const result = runRecovery({ VERIFY_LIVE_OUTCOME: "failure", PUBLISH_ENTRY_POINTS_OUTCOME: "skipped",
+    GITHUB_RELEASE_OUTCOME: "skipped", PUBLIC_NOTES_OUTCOME: "skipped", RETAIN_RECEIPT_OUTCOME: "success" });
+  assertRollbackRecovery(result);
+  assert.match(result.stdout, /^::error::.*Verify exact live bytes before publishing public entry points \(failure\)/m);
+  for (const [, , name] of postManifestSteps.slice(1, 4)) {
+    assert.ok(result.stdout.split("\n").some((line) => line.startsWith("::error::") && line.includes(`${name} (skipped)`)));
+    assert.ok(!result.stdout.includes(`${name} (failure)`));
+  }
+});
+test("Post-manifest recovery C3: entry point publication failure requires live-path recovery", () => {
+  const result = runRecovery({ ...successfulPostManifestOutcomes, PUBLISH_ENTRY_POINTS_OUTCOME: "failure",
+    GITHUB_RELEASE_OUTCOME: "skipped", PUBLIC_NOTES_OUTCOME: "skipped" });
+  assertRollbackRecovery(result);
+  assert.match(result.stdout, /^::error::.*Publish retained tested installer and compatibility bytes only after activation \(failure\)/m);
+});
+test("Post-manifest recovery C4: GitHub Release failure repairs the release without rollback", () => {
+  const result = runRecovery({ ...successfulPostManifestOutcomes, GITHUB_RELEASE_OUTCOME: "failure", PUBLIC_NOTES_OUTCOME: "skipped" });
+  assertLiveRecovery(result);
+  assert.match(result.stdout, /^::error::.*GitHub Release with the shipped artifacts \(failure\)/m);
+  assert.match(result.stdout, /Create the GitHub Release for the tag with the retained artifacts/);
+  assert.match(result.stdout, /^::error::.*Public release notes \(skipped\)/m);
+  assert.match(result.stdout, /^::error::.*Then publish the skipped public release note by hand/m);
+  assert.doesNotMatch(result.stdout, /fix PUBLIC_RELEASES_TOKEN|receipt artifact was not retained/);
+});
+test("Post-manifest recovery repairs missing receipt retention without rollback", () => {
+  const result = runRecovery({ ...successfulPostManifestOutcomes, RETAIN_RECEIPT_OUTCOME: "failure" });
+  assertLiveRecovery(result);
+  assert.match(result.stdout, /^::error::.*Retain sanitized activation or refusal receipt \(failure\)/m);
+  assert.match(result.stdout, /receipt artifact was not retained; record the run id/);
+  assert.doesNotMatch(result.stdout, /fix PUBLIC_RELEASES_TOKEN|Create the GitHub Release/);
+});
+test("Post-manifest recovery names and repairs every post-live failure", () => {
+  const result = runRecovery({ ...successfulPostManifestOutcomes, GITHUB_RELEASE_OUTCOME: "failure",
+    PUBLIC_NOTES_OUTCOME: "failure", RETAIN_RECEIPT_OUTCOME: "failure" });
+  assertLiveRecovery(result);
+  for (const [, , name] of postManifestSteps.slice(2)) {
+    assert.ok(result.stdout.split("\n").some((line) => line.startsWith("::error::") && line.includes(`${name} (failure)`)));
+  }
+  assert.match(result.stdout, /Create the GitHub Release for the tag with the retained artifacts/);
+  assert.match(result.stdout, /fix PUBLIC_RELEASES_TOKEN/);
+  assert.match(result.stdout, /receipt artifact was not retained; record the run id/);
+});
+for (const [key, , name] of postManifestSteps) for (const outcome of [undefined, "", "cancelled", "unexpected"]) {
+  test(`Post-manifest recovery C5: ${key} ${outcome === undefined ? "unset" : JSON.stringify(outcome)} fails safe`, () => {
+    const outcomes = { ...successfulPostManifestOutcomes, PUBLIC_NOTES_OUTCOME: "failure" };
+    if (outcome === undefined) delete outcomes[key];
+    else outcomes[key] = outcome;
+    const result = runRecovery(outcomes);
+    assertRollbackRecovery(result);
+    assert.ok(result.stdout.split("\n").some((line) => line.startsWith("::error::") && line.includes(`${name} (${outcome || "unknown"})`)));
+  });
+}
+for (const key of ["VERIFY_LIVE_OUTCOME", "PUBLISH_ENTRY_POINTS_OUTCOME"]) {
+  test(`Post-manifest recovery refuses to claim the release is live when ${key} is skipped`, () => {
+    const result = runRecovery({ ...successfulPostManifestOutcomes, [key]: "skipped", PUBLIC_NOTES_OUTCOME: "failure" });
+    assertRollbackRecovery(result);
+    const name = postManifestSteps.find(([candidate]) => candidate === key)[2];
+    assert.ok(result.stdout.split("\n").some((line) => line.startsWith("::error::") && line.includes(`${name} (skipped)`)));
+  });
+}
+// Old-head control (C7): the recovery text before this change, kept verbatim. It must fail the C1
+// assertion on its rollback guidance, which shows C1 checks the behaviour this change introduced.
+const oldRecoveryRun = `echo '::error::Activation completion is "INCOMPLETE" after the manifest write. Inspect the live manifest and retained receipt; follow vinci/RELEASE-ACTIVATION-RISK.md and use vinci-rollback.yml for an authorized rollback before retrying.'
+exit 1
+`;
+test("Post-manifest recovery C7: the previous recovery text fails C1 on its rollback guidance", () => {
+  const result = spawnSync("bash", ["-c", oldRecoveryRun], { env: { ...successfulPostManifestOutcomes, PUBLIC_NOTES_OUTCOME: "failure" }, encoding: "utf8", timeout: 10000 });
+  assertIncompleteRecovery(result);
+  assert.throws(() => assertLiveRecovery(result), (error) => error instanceof assert.AssertionError && error.message === 'A post-live-only failure must say "Do not roll back."');
+});
+test("Post-manifest recovery C6: every outcome is wired to the named step and the trigger is unchanged", () => {
+  const steps = workflow.jobs.activate.steps, recovery = steps.at(-1);
+  assert.equal(recovery.if, "${{ !cancelled() && steps.activate_manifest.outcome == 'success' && (failure() || steps.public_notes.outcome == 'failure') }}");
+  assert.deepEqual(recovery.env, Object.fromEntries(postManifestSteps.map(([key, id]) => [key, `\${{ steps.${id}.outcome }}`])));
+  const reads = [...new Set([...recovery.run.matchAll(/\$(?:\{)?([A-Z][A-Z0-9_]*)/g)].map((match) => match[1]))];
+  assert.deepEqual(reads.sort(), Object.keys(recovery.env).sort());
+  const activate = steps.findIndex((step) => step.id === "activate_manifest");
+  assert.deepEqual(steps.slice(activate + 1, -1).map((step) => [step.id, step.name]), postManifestSteps.map(([, id, name]) => [id, name]));
+  assert.equal(steps.find((step) => step.id === "retain_receipt").if, "${{ !cancelled() && steps.policy.outcome == 'success' }}");
 });
 test("Candidate identity summary prints the record and policy deadlines", () => {
   const f = shellFixture();
