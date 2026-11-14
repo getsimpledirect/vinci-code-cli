@@ -1668,6 +1668,17 @@ try {
       if (casedRelativeWrite !== undefined) break;
     }
     check("a project-relative write stays allowed when the cwd spells the store in another case", casedRelativeWrite === undefined && gates().length === 0);
+    // The cwd is still recognised as under the store: a sibling store write takes the gate, not the steer.
+    control.clearVinciConfirmationGate();
+    let casedSiblingWrite;
+    for (const handler of handlers.tool_call ?? []) {
+      casedSiblingWrite = await handler(
+        { toolName: "write", input: { path: join(vinciHome, "projects", "other-project", "y.html"), content: "y" } },
+        { cwd: casedStoreProjectCwd, hasUI: false },
+      );
+      if (casedSiblingWrite !== undefined) break;
+    }
+    check("a cwd spelling the store in another case is still under the store (gate, not steer)", casedSiblingWrite?.block === true && /go-ahead/.test(casedSiblingWrite.reason) && !/bookkeeping mirror/i.test(casedSiblingWrite.reason));
   }
 
   // Binds the cwdIsUnderStore guard itself: when the PROJECT lives under VINCI_HOME, a write to a
