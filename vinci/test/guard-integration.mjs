@@ -939,10 +939,10 @@ try {
   // its private control), with no dialog first.
   for (const [operator, commands] of [
     // A descriptor duplication before the write (`2>&1`, `>&2`) must not split it off either.
-    [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt", "echo x >&2>|out.txt"]],
-    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt"]],
+    [">|", ["echo x >| out.txt", "echo x >|out.txt", "echo x>|out.txt", "cat <<'EOF' >| out.txt\nx\nEOF", "printf x >&2 >|out.txt", "echo x >&2>|out.txt", "echo x >\\\n| out.txt"]],
+    ["&>", ["echo x &> out.txt", "echo x &>out.txt", "printf x&>out.txt", "echo x 2>&1 &>out.txt", "tee &> out.txt", "echo x &\\\n> out.txt"]],
     ["&>>", ["echo x &>> out.txt", "echo x &>>out.txt", "echo x >&2 &>>out.txt", "echo x | tee -a &>> out.txt"]],
-    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt"]],
+    ["N>|", ["echo x 2>| out.txt", "printf x 2>|out.txt", "echo x 12>|out.txt", "echo x 2>&1 2>|out.txt", "echo x 2>&1>|out.txt", "echo x 2>\\\n|out.txt"]],
   ]) {
     for (const command of commands) {
       const selectionCount = selections.length;
@@ -979,6 +979,7 @@ try {
     "echo x 2>&1 & echo y",
     "tee &> /dev/null",
     "tee &>> /dev/null",
+    "echo \\>| cat",
   ]) {
     const selectionCount = selections.length;
     const result = await toolCall("bash", { command });
@@ -990,11 +991,12 @@ try {
   // An escaped `\>` is a literal, so the `|` after it is a real pipe and the writer behind it is
   // still its own segment.
   check("a writer behind `\\>|` (a literal `>` and a real pipe) is still a shell file write", guard.isShellFileWrite("true \\>| echo x >out.txt"));
-  // Keeping `>&` whole also stops it hiding a plain `>` write after it (missed before this change).
-  check("a plain `>` write after a descriptor duplication is a shell file write", guard.isShellFileWrite("echo x 2>&1 > out.txt"));
   // Outside this change's operators, behaviour is pinned as it was (not an endorsement of either).
   check("plain `2> file` keeps its previous classification (not a write form here)", !guard.isShellFileWrite("echo x 2> err.txt"));
   check("`>> /dev/null` keeps its previous classification", guard.isShellFileWrite("echo x >> /dev/null"));
+  check("a plain `>` after `2>&1` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 > out.txt"));
+  check("`2>&1 >> /dev/null` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 >> /dev/null"));
+  check("`echo >& tee out.txt` keeps its previous classification", guard.isShellFileWrite("echo >& tee out.txt"));
 
   // No SILENT auto-grant: two adversarial reviews showed a shell command can't be classified "safe to
   // network" (endpoint override, argv[0] impostor, command substitution). EVERY network command — direct

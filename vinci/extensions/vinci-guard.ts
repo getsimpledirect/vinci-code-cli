@@ -484,14 +484,10 @@ export function destructiveFindRootTargets(command: string): string[][] {
 }
 
 const COMMAND_PREFIX = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:[^\s]+|"[^"]*"|'[^']*'))\s+)*(?:sudo\s+)?(?:command\s+)?/i;
-// A redirect that writes a file: `>`, `>>`, the clobber form `>|` with or without a descriptor
-// number (`2>|`, also straight after `2>&1`), and stdout+stderr `&>`/`&>>`. Plain `2>` keeps its
-// previous behaviour.
-// `/dev/null` targets and descriptor duplication (`>&2`, `2>&1`) are not file writes.
-// Each new operator is matched whole (no backtracking into a shorter operator), so `>| /dev/null`
-// and `&>> /dev/null` stay allowed the way `> /dev/null` and `&> /dev/null` are.
-const FILE_REDIRECT =
-  /(?:(?<![0-9&>])>>?(?!\|)|>\||&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
+const FILE_REDIRECT = /(?<![0-9&>])>>?(?!\s*(?:\/dev\/null\b|&))\s*\S/;
+// The clobber form `>|` (also `2>|`) and stdout+stderr `&>`/`&>>`, matched as whole operators so
+// `>| /dev/null` and `&>> /dev/null` stay allowed like `> /dev/null`; `&>&2` duplicates, not writes.
+const CLOBBER_OR_BOTH_REDIRECT = /(?:>\||&>>?(?![>|]))(?!\s*(?:\/dev\/null\b|&))\s*\S/;
 
 function commandBody(segment: string): string {
   return segment.replace(COMMAND_PREFIX, "").trim();
@@ -502,16 +498,25 @@ function commandBody(segment: string): string {
  * previews, overwrite protection, and edit validation. The model is never allowed to use them.
  */
 export function isShellFileWrite(command: string): boolean {
-  return shellSegments(command, true).some((segment) => {
+  return shellSegments(command).some((segment) => {
     const body = commandBody(segment);
     if (/^(?:echo|printf)\b/i.test(body) && FILE_REDIRECT.test(body)) return true;
-    // A tee operand never starts with `&`: `tee &> /dev/null` is a redirect, not a file named `&>`;
-    // tee's own redirects are judged like echo's, so `tee &> out.txt` is still a write.
-    if (/^tee\b(?:\s+-[A-Za-z]+)*\s+(?![-&])(?!\/dev\/null\b)\S+/i.test(body)) return true;
-    if (/^tee\b/i.test(body) && FILE_REDIRECT.test(body)) return true;
+    if (/^tee\b(?:\s+-[A-Za-z]+)*\s+(?!-)(?!\/dev\/null\b)\S+/i.test(body)) return true;
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i[A-Za-z]*\b)/i.test(body)) return true;
     return false;
+  }) || clobberOrBothRedirectWrite(command);
+}
+
+/** `>|`, `N>|`, `&>` and `&>>` writes, which the split above cuts off from their targets (it reads
+ *  their `|` as a pipe and their `&` as a background operator). A second pass that only ADDS these
+ *  operators, so every other classification stays exactly as above. Line continuations are joined
+ *  first: `echo x &\<newline>> out.txt` is the same write. */
+function clobberOrBothRedirectWrite(command: string): boolean {
+  return shellSegments(command.replace(/\\\r?\n/g, ""), true).some((segment) => {
+    const body = commandBody(segment);
+    if (!/^(?:echo|printf|tee)\b/i.test(body) && !/^cat\b[^\n]*<<-?\s*\S+/i.test(body)) return false;
+    return CLOBBER_OR_BOTH_REDIRECT.test(body);
   });
 }
 
