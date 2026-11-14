@@ -34,7 +34,10 @@ async function fixture(mode, { maxRetries = 2, baseDelayMs = 1, enabled = true, 
   const cwd = mkdtempSync(join(owned, `${mode}-`));
   const agentDir = join(cwd, "profile");
   mkdirSync(agentDir);
-  const faux = registerFauxProvider({ tokensPerSecond: 100_000 });
+  // A digit-free api id: the default id embeds Date.now(), and an error text that names it could
+  // contain 429/5xx digits, which the retryable-error pattern matches as substrings (#177).
+  const fauxApi = `faux:retry-outcome-${mode}-${Math.random().toString(36).replace(/[^a-z]/g, "").slice(0, 8)}`;
+  const faux = registerFauxProvider({ tokensPerSecond: 100_000, api: fauxApi });
   const authStorage = AuthStorage.inMemory();
   authStorage.setRuntimeApiKey(faux.getModel().provider, "offline-faux-key");
   const modelRegistry = ModelRegistry.inMemory(authStorage);
@@ -1203,6 +1206,67 @@ const cases = {
   },
   // A retried connection error followed by a non-retryable error keeps that error's own guidance:
   // the "could not reach the model" wording is only for retries exhausted on a retryable error.
+  async B30(mode) {
+    const name = "B30 disposal after a nested request's delivery cleared the delivery pointers keeps the outer receipt";
+    let session;
+    let nested;
+    let openGate;
+    const gate = new Promise((resolve) => { openGate = resolve; });
+    let markNestedDone;
+    const nestedDone = new Promise((resolve) => { markNestedDone = resolve; });
+    const f = await fixture(mode, {
+      baseDelayMs: 60_000,
+      captureExtensionErrors: true,
+      async terminalDelivery() {
+        if (nested) return;
+        // A's handler starts request B and waits until B's own terminal delivery has finished, then stalls.
+        nested = session.prompt("Complete request B.");
+        await nested;
+        markNestedDone();
+        await gate;
+      },
+    });
+    session = f.session;
+    let completion;
+    try {
+      await assertWithin((async () => {
+        let backoffs = 0;
+        let markFirst;
+        let markSecond;
+        const first = new Promise((resolve) => { markFirst = resolve; });
+        const second = new Promise((resolve) => { markSecond = resolve; });
+        f.session.subscribe((event) => {
+          if (event.type !== "auto_retry_start") return;
+          backoffs++;
+          if (backoffs === 1) markFirst();
+          if (backoffs === 2) markSecond();
+        });
+        f.faux.setResponses([connectionError(), connectionError(), fauxAssistantMessage("Must not be reached.")]);
+        completion = f.session.prompt("Complete request A.");
+        await first;
+        await delay(0);
+        f.session.abortRetry();
+        await second;
+        await delay(0);
+        f.session.abortRetry();
+        await nestedDone;
+        // B's delivery is done and cleared the delivery pointers; A's delivery is still running.
+        f.runtime.dispose();
+        await delay(50);
+        openGate();
+        await completion;
+      })(), 4_000, `${name}: did not finish within 4 s`);
+      await delay(50);
+      console.log(`${name} ${mode}: ${JSON.stringify({ outcomes: f.outcomes().map(({ state }) => state), errors: f.extensionErrors.map(({ error }) => String(error).slice(0, 80)), calls: f.faux.state.callCount })}`);
+      assert.deepEqual(f.extensionErrors, [], `${name}: A's later handlers did not run on an invalidated context`);
+      assert.deepEqual(f.outcomes().map(({ state }) => state), ["BLOCKED", "BLOCKED"], `${name}: A and B each keep a terminal receipt`);
+      assert.equal(f.faux.state.callCount, 2, `${name}: neither retry ran`);
+    } finally {
+      openGate();
+      f.session.abortRetry();
+      try { await assertWithin(Promise.all([completion, nested]), 1_500, `${name}: cleanup did not finish`); } finally { f.faux.unregister(); }
+    }
+  },
   async B29(mode) {
     const name = "B29 disposal after a timed-out settle does not wait the bound again on the detached delivery";
     let releaseDelivery;
