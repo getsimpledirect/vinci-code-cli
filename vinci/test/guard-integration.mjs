@@ -413,6 +413,13 @@ async function shellWriteRouteChecks(onlyCase) {
     "echo x > ~/out.txt",
     "echo x > {a,b}.txt",
     'echo "a > decoy.txt" >> "result file.txt"',
+    // Process substitution and input redirects run or read more than the plain write.
+    "echo x > out.txt <(sh)",
+    "echo x > out.txt >(sh)",
+    "echo x > out.txt < in.txt",
+    // A wrapper or a leading assignment is not plain even without quotes.
+    "command echo x > out.txt",
+    "X=1 echo x > out.txt",
   ]) {
     const result = await toolCall("bash", { command });
     assert.equal(result?.block, true, `Non-plain write stays blocked: ${command}`);

@@ -506,7 +506,7 @@ const SAFE_TARGET_TEXT = /^[A-Za-z0-9._\/+@%=,: -]+$/;
  * leading VAR= assignment. Wording only; it never decides whether to block. */
 function isPlainShellCommand(command: string): boolean {
   const segments = shellSegments(command);
-  if (segments.length !== 1 || /['"\\*?\[\]{}~]|[^\t\x20-\x7e]|[#`$]|<<|>&|&>|>\||\d>/.test(command)) return false;
+  if (segments.length !== 1 || /['"\\*?\[\]{}~()<]|[^\t\x20-\x7e]|[#`$]|<<|>&|&>|>\||\d>/.test(command)) return false;
   // A leading VAR= assignment can preload code before the visible command runs.
   if (/^[A-Za-z_]\w*=/.test(shellWords(command)[0] ?? "")) return false;
   const executable = shellWords(segments[0]).find((word) => !/^[A-Za-z_]\w*=/.test(word))?.split("/").pop() ?? "";
