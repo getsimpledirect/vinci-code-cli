@@ -571,8 +571,7 @@ try {
       }
       symlinkSync(`${realProject}/startup-dots/l0`, join(fakeHome, ".bash_profile"));
       assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-dots-target")), "a long padded link chain is walked to its destination");
-      // The walk follows exactly as many links as the OS does: a 32-link chain (counting the protected entry) still
-      // resolves and is protected at its destination; one more link and the OS itself refuses to resolve it (ELOOP).
+      // A 32-link chain (counting the protected entry) still resolves and is protected at its destination.
       mkdirSync(join(realProject, "startup-b32"));
       writeFileSync(join(realProject, "startup-b32-target"), "target");
       for (let index = 0; index < 31; index++) {
@@ -581,7 +580,8 @@ try {
       symlinkSync(`${realProject}/startup-b32/b0`, join(fakeHome, ".gitconfig"));
       symlinkSync(join(fakeHome, ".gitconfig"), join(realProject, "startup-b33"));
       assert.equal(realpathSync.native(join(fakeHome, ".gitconfig")), join(realProject, "startup-b32-target"), "precondition: the OS resolves a 32-link chain");
-      assert.throws(() => realpathSync.native(join(realProject, "startup-b33")), { code: "ELOOP" }, "precondition: the OS refuses a 33-link chain");
+      // macOS stops at 32 links; Linux allows 40, where the walk's 32-link bound is the documented limit (#176).
+      if (process.platform === "darwin") assert.throws(() => realpathSync.native(join(realProject, "startup-b33")), { code: "ELOOP" }, "precondition: macOS refuses a 33-link chain");
       assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-b32-target")), "a 32-link protected chain (the OS limit) is protected at its destination");
       // An unreadable component is protected itself (fail closed).
       mkdirSync(join(realProject, "startup-locked", "inner"), { recursive: true });
