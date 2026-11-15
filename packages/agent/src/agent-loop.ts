@@ -139,7 +139,7 @@ async function* withVinciStreamWatchdog<T>(source: AsyncIterable<T>, controller:
  */
 export function vinciCanonicalToolName(name: string): string {
 	const key = name.toLowerCase();
-	return Object.prototype.hasOwnProperty.call(VINCI_TOOL_SYNONYMS, key) ? VINCI_TOOL_SYNONYMS[key] : name;
+	return Object.hasOwn(VINCI_TOOL_SYNONYMS, key) ? VINCI_TOOL_SYNONYMS[key] : name;
 }
 
 export function vinciNormalizeToolName(name: string, tools: readonly AgentTool[] | undefined): string {

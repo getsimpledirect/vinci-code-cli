@@ -90,7 +90,6 @@ interface ToolCallState {
  */
 const VIEW_MASKED_TOOLS = new Set(["bash", "read", "grep", "find", "ls", "edit", "write"]);
 
-// biome-ignore lint/suspicious/noExplicitAny: events are opaque JSON-shaped values here.
 type Json = any;
 
 /** Whether a tool call's name is known: a non-empty string. */
@@ -177,7 +176,9 @@ function namesToolCall(source: Json, content: Json[], index: number): boolean {
 
 /** A tool call that still carries its streaming argument text. */
 function isStreamingCall(block: Json): boolean {
-	return block?.type === "toolCall" && (typeof block.partialJson === "string" || typeof block.partialArgs === "string");
+	return (
+		block?.type === "toolCall" && (typeof block.partialJson === "string" || typeof block.partialArgs === "string")
+	);
 }
 
 /**
@@ -662,7 +663,9 @@ export class VinciStreamMask {
 				: -1;
 		const ending = type === "text_end" || type === "thinking_end" ? streamedIndex : -1;
 		const isTool = type === "toolcall_start" || type === "toolcall_delta" || type === "toolcall_end";
-		const toolIndex = isTool ? blockIndexOf(source, message.content, (block) => block?.type === "toolCall", true, TOOL_FALLBACK) : -1;
+		const toolIndex = isTool
+			? blockIndexOf(source, message.content, (block) => block?.type === "toolCall", true, TOOL_FALLBACK)
+			: -1;
 		const toolGuessed = toolIndex >= 0 && !namesToolCall(source, message.content, toolIndex);
 		if (isTool && (toolIndex < 0 || toolGuessed)) this.fallback = true;
 		let toolAdded = "";
@@ -677,7 +680,10 @@ export class VinciStreamMask {
 			if (type === "toolcall_end") {
 				const id = source.toolCall?.id ?? message.content[toolIndex]?.id;
 				if (typeof id === "string") this.interruptedIds.delete(id);
-				toolAdded = this.releaseTool(toolState, source.toolCall?.arguments ?? message.content[toolIndex]?.arguments);
+				toolAdded = this.releaseTool(
+					toolState,
+					source.toolCall?.arguments ?? message.content[toolIndex]?.arguments,
+				);
 			}
 		}
 		// A stream-ending source event (`done` / `error`) ends every call still held: they are interrupted.
@@ -713,7 +719,8 @@ export class VinciStreamMask {
 			if ((toolState || this.fallback) && source.type === "toolcall_delta") rewritten.delta = "";
 			if (type === "done" && final) rewritten.message = this.maskFinal(final);
 			if (type === "error" && final) rewritten.error = this.maskFinal(final);
-			if (type === "toolcall_end" && source.toolCall) rewritten.toolCall = this.fallback ? maskCutCall(source.toolCall) : maskCompletedPartial(source.toolCall);
+			if (type === "toolcall_end" && source.toolCall)
+				rewritten.toolCall = this.fallback ? maskCutCall(source.toolCall) : maskCompletedPartial(source.toolCall);
 			if (ending >= 0 && added.has(ending)) {
 				const block = content[ending];
 				rewritten.content = block[streamedKind(block) as StreamedKind];
@@ -736,7 +743,11 @@ export class VinciStreamMask {
 			const block = message.content[index];
 			// A name that arrived only now and names a tool the view does not mask: released unchanged.
 			const unmasked = block?.type === "toolCall" && !viewMasksCall(block);
-			const text = !unmasked ? this.releaseTool(state, undefined) : state.guessed ? this.dropGuessed(state) : this.releaseUnchanged(state, block);
+			const text = !unmasked
+				? this.releaseTool(state, undefined)
+				: state.guessed
+					? this.dropGuessed(state)
+					: this.releaseUnchanged(state, block);
 			if (text) toolAdded.set(index, text);
 		}
 		const content = message.content.map((block: Json, index: number) => {
@@ -783,7 +794,6 @@ export class VinciStreamMask {
 		};
 	}
 }
-
 
 // ---------------------------------------------------------------------------------------------------
 // RPC scope: exactly what the interactive view masks.
@@ -912,7 +922,10 @@ export function vinciMaskViewEvent(event: Json): Json {
 				toolResults: Array.isArray(event.toolResults) ? event.toolResults.map(maskMessage) : event.toolResults,
 			};
 		case "agent_end":
-			return { ...event, messages: Array.isArray(event.messages) ? event.messages.map(maskMessage) : event.messages };
+			return {
+				...event,
+				messages: Array.isArray(event.messages) ? event.messages.map(maskMessage) : event.messages,
+			};
 		case "tool_execution_start":
 		case "tool_execution_update":
 		case "tool_execution_end": {

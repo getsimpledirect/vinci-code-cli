@@ -650,14 +650,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					entries = entries.slice(sinceIndex + 1);
 				}
 				// [vinci] message entries masked in the get_messages scope; ids and structure unchanged
-				const shownEntries = vinciMaskEnabled() ? entries.map((entry) => vinciMaskViewEntry(entry, streamMask)) : entries;
+				const shownEntries = vinciMaskEnabled()
+					? entries.map((entry) => vinciMaskViewEntry(entry, streamMask))
+					: entries;
 				return success(id, "get_entries", { entries: shownEntries, leafId: sessionManager.getLeafId() });
 			}
 
 			case "get_tree": {
 				const sessionManager = session.sessionManager;
 				// [vinci] each node's entry masked in the get_messages scope; nodes and structure unchanged
-				const tree = vinciMaskEnabled() ? vinciMaskViewTree(sessionManager.getTree(), streamMask) : sessionManager.getTree();
+				const tree = vinciMaskEnabled()
+					? vinciMaskViewTree(sessionManager.getTree(), streamMask)
+					: sessionManager.getTree();
 				return success(id, "get_tree", { tree, leafId: sessionManager.getLeafId() });
 			}
 

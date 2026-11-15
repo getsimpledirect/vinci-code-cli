@@ -303,9 +303,10 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			process.exit(code);
 			return;
 		}
-		void Promise.race([flushRawStdout().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1000))]).finally(
-			() => process.exit(code),
-		);
+		void Promise.race([
+			flushRawStdout().catch(() => {}),
+			new Promise((resolve) => setTimeout(resolve, 1000)),
+		]).finally(() => process.exit(code));
 	};
 
 	const cancelPrestreamWatchdog = (): void => {
