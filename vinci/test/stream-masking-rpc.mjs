@@ -1118,6 +1118,20 @@ for (const [label, index] of [
 	});
 }
 
+// The fallback's last step: no call carries streaming text and none is one the view masks, so the text
+// belongs to a call the view does not mask and passes through as that call's (the over-mask side holds
+// whenever any call in the message is one the view masks).
+test("rpc positive control: an out-of-range content index with only calls the view does not mask is not held", async () => {
+	const token = inlineToken();
+	const json = JSON.stringify({ query: `find ${token}` });
+	const after = [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }];
+	const { events } = toolCallEvents("shell_helper", splitAcross(json, token, 0), { id: "call-1", index: 5, after, before: [block("text", "Running it.\n")] });
+	const stripped = JSON.parse(JSON.stringify(events, (key, value) => (key === "partialJson" ? undefined : value)));
+	assert.ok(!JSON.stringify(stripped).includes("partialJson"), "fixture sanity: no block carries streaming text");
+	const out = await runRpc(stripped);
+	assert.equal(out.stdout, stripped.map((event) => serializeJsonLine(event)).join(""), "passed through as calls the view does not mask");
+});
+
 
 // Masking consistency for streamed tool arguments: a call streamed under a tool-name synonym of a built-in
 // tool (the agent loop folds the name onto the tool only when the stream ends) is masked as that tool from
