@@ -327,6 +327,10 @@ async function checkpointOperationChecks(onlyCase) {
 
 async function shellWriteWrapperChecks() {
   const project = realpathSync(workspace);
+  // These rows keep their dialogs to themselves: a positive control may still take an unrelated
+  // prompt (`sh -nc` reads as a network command), and later rows count the shared dialog list.
+  const wrapperDialogs = [];
+  const wrapperCtx = { ...ctx, ui: { ...ctx.ui, async select(title) { wrapperDialogs.push(title); return "No, don't"; } } };
   // #174: the outer shell performs the redirect whatever word runs first, so a content writer behind any
   // wrapper word, or inside text another shell parses (sh -c, eval), takes the same shell-write refusal.
   for (const command of [
@@ -391,9 +395,11 @@ async function shellWriteWrapperChecks() {
     "zsh -o noexec +o NO_EXEC -c 'echo x > out.txt'",
     "zsh -n +o no_exec -c 'echo x > out.txt'",
   ]) {
-    const result = await toolCall("bash", { command });
+    const dialogsBefore = wrapperDialogs.length;
+    const result = await toolCall("bash", { command }, wrapperCtx);
     assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
     assert.match(result.reason, /^Vinci blocked a shell-based file write; /, `Wrapped shell write takes the shell-write refusal: ${command}`);
+    assert.equal(wrapperDialogs.length, dialogsBefore, `Wrapped shell write is refused before any dialog: ${command}`);
     assert.equal(existsSync(join(project, "out.txt")), false, `Wrapped shell write creates no file: ${command}`);
   }
   // Nesting is bounded at four parsers; four levels of sh -c are still read.
@@ -419,9 +425,16 @@ async function shellWriteWrapperChecks() {
     // Words after the command text are its arguments, not commands.
     "fish -c 'echo ok' 'echo x > out.txt'"]) {
     assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);
-    const result = await toolCall("bash", { command });
+    const result = await toolCall("bash", { command }, wrapperCtx);
     assert.ok(!result?.block || !/^Vinci blocked a shell-based file write/.test(result.reason), `No shell-write refusal: ${command}`);
   }
+  // Records today's behaviour: the network check reads `-nc` as a network command, so this syntax
+  // check takes exactly one network dialog. A change to that check shows up here.
+  const syntaxCheckDialogs = [];
+  const syntaxCheckCtx = { ...ctx, ui: { ...ctx.ui, async select(title) { syntaxCheckDialogs.push(title); return "No, don't"; } } };
+  await toolCall("bash", { command: "sh -nc 'echo x > out.txt'" }, syntaxCheckCtx);
+  assert.equal(syntaxCheckDialogs.length, 1, "A grouped -n -c syntax check takes one dialog today");
+  assert.match(syntaxCheckDialogs[0] ?? "", /allow this network command once|let builds reach the internet/i, "That one dialog is the network dialog");
   console.log("  ✓ #174 wrapped shell writes take the shell-write refusal");
 }
 
@@ -1441,6 +1454,22 @@ try {
         message.customType === "vinci-shell-write-block" && /inline command/i.test(message.content) && /outside the project/i.test(message.content),
     ),
   );
+
+  // The same documentation write behind each wrapper word, and inside text another shell parses, is
+  // still refused as a shell write before any destructive-command dialog.
+  for (const command of [
+    ...["exec", "env", "command", "builtin", "nohup", "time", "sudo"].map((wrapper) => `${wrapper} ${documentationWrite}`),
+    `bash -c "${documentationWrite}"`,
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `wrapped shell documentation write is blocked before any destructive-command dialog: ${command.split(" ")[0]}`,
+      result?.block === true && /^Vinci blocked a shell-based file write; /.test(result.reason) && selections.length === selectionCount,
+    );
+  }
+  const benignListing = await toolCall("bash", { command: "ls" });
+  check("a benign listing runs without a block or a dialog", benignListing === undefined && selections.length === 0);
 
   const literalOutput = await toolCall("bash", { command: "echo 'npx prisma migrate reset'" });
   check("printing quoted migration documentation is not treated as executing it", literalOutput === undefined && selections.length === 0);
