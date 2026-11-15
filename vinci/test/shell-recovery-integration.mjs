@@ -71,6 +71,29 @@ try {
   await emit("tool_result", { toolCallId: toolCallId(), toolName: "write", input: { path: "owned.txt", content: "owned" }, isError: false, content: [] });
   check("a successful write to the denied target clears its own blocker", !state.getVinciUiState().blockingReason);
 
+  // A custom turn sent as a new request (#170) skips before_agent_start, so agent_start must start its own scope.
+  await start();
+  await emit("tool_result", { ...blockedWrite, toolCallId: toolCallId() });
+  check("precondition: request A's failed write blocks", (state.getVinciUiState().blockingReason ?? "").includes("scoped sandbox"));
+  await emit("agent_start", { newRequest: true });
+  check("a new-request turn does not show request A's recovery blocker", !state.getVinciUiState().blockingReason);
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "read", input: { path: "unrelated.txt" }, isError: false, content: [] });
+  check("a new-request turn does not carry request A's required operations", !state.getVinciUiState().blockingReason);
+
+  await start();
+  await emit("tool_result", { ...blockedWrite, toolCallId: toolCallId() });
+  await emit("agent_start", { continuesRetry: true });
+  check("a retry without newRequest keeps request A's recovery blocker", (state.getVinciUiState().blockingReason ?? "").includes("scoped sandbox"));
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "read", input: { path: "unrelated.txt" }, isError: false, content: [] });
+  check("a retry without newRequest still carries request A's required operations", (state.getVinciUiState().blockingReason ?? "").includes("scoped sandbox"));
+
+  await start();
+  await emit("tool_result", { ...blockedWrite, toolCallId: toolCallId() });
+  await emit("agent_start", { newRequest: true, continuesRetry: true });
+  check("a retry flag takes precedence over newRequest: request A's blocker stays", (state.getVinciUiState().blockingReason ?? "").includes("scoped sandbox"));
+  await emit("tool_result", { toolCallId: toolCallId(), toolName: "read", input: { path: "unrelated.txt" }, isError: false, content: [] });
+  check("a retry flag takes precedence over newRequest: request A's required operations stay", (state.getVinciUiState().blockingReason ?? "").includes("scoped sandbox"));
+
   await start();
   await emit("tool_result", blockedWrite);
   await emit("tool_result", { toolCallId: toolCallId(), toolName: "write", input: { path: "owned.txt", content: "different request" }, isError: false, content: [] });
