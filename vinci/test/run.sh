@@ -837,6 +837,7 @@ run_group fact-grounding-integration node "${ROOT}/vinci/test/fact-grounding-int
 # Completion cards render the verifier state rather than inferring success from tool exit alone.
 run_group receipt-integration node "${ROOT}/vinci/test/receipt-integration.mjs"
 run_group connection-retry-outcome node "${ROOT}/vinci/test/connection-retry-outcome.mjs"
+run_group custom-turn-request-scope node "${ROOT}/vinci/test/custom-turn-request-scope.mjs"
 run_group b2receipt-regression node "${ROOT}/vinci/test/b2receipt-regression.mjs"
 run_group completion-receipt-integration node "${ROOT}/vinci/test/completion-receipt-integration.mjs"
 # Durable project memory never changes a repository unless the user explicitly requested it.
