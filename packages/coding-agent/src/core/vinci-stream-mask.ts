@@ -22,13 +22,16 @@
  * `arguments` are `{}`. A call whose name has not arrived yet is held the same way: a non-built-in name
  * releases the held text unchanged, and a call that ends with no name is released masked. A tool-name
  * synonym of a built-in tool (which the agent loop folds onto the tool only when the stream ends) is
- * classified as that tool from the moment the name is known.
+ * classified as that tool from the moment the name is known. A completed call that still carries partial
+ * argument text (in its `toolcall_end` call or a final message) carries the masked JSON of its arguments there.
  *
  * An interrupted call is a held call released without its `toolcall_end` (by `message_end`, `agent_end`,
  * the next `message_start`, a stream-ending source event or an exit path). In the final events that
  * carry it (`message_end`, `turn_end`, `agent_end`, a source `error`/`done` message) and in the
  * transcript responses, each string value of its arguments keeps only the lines the hold-back would
- * have released; from the first line it would still hold to the value's end, it is the placeholder.
+ * have released; from the first line it would still hold to the value's end, it is the placeholder. Any
+ * partial argument text the call still carries there is the placeholder. A tool-call event whose content
+ * index names no tool-call block is taken to be about the call with its id, else the last tool call.
  *
  * `vinciMaskViewEvent` masks an RPC event in exactly the scope the interactive view masks.
  */
@@ -110,12 +113,13 @@ function contentIndexOf(source: Json): number {
 }
 
 /**
- * The content block a streamed event is about: its content index, or, when that is missing, the block
- * with the event's tool-call id, else the last block of the event's kind (the one being streamed).
+ * The content block a streamed event is about: its content index, or, when that is missing (or, with
+ * `checkKind`, names no block of the event's kind), the block with the event's tool-call id, else the
+ * last block of the event's kind (the one being streamed).
  */
-function blockIndexOf(source: Json, content: Json[], matches: (block: Json) => boolean): number {
+function blockIndexOf(source: Json, content: Json[], matches: (block: Json) => boolean, checkKind = false): number {
 	const index = contentIndexOf(source);
-	if (index >= 0) return index;
+	if (index >= 0 && (!checkKind || matches(content[index]))) return index;
 	const id = source?.toolCall?.id;
 	if (typeof id === "string" && id !== "") {
 		const at = content.findIndex((block) => block?.type === "toolCall" && block.id === id);
@@ -148,6 +152,35 @@ function overMaskArguments(value: unknown): unknown {
 		return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, overMaskArguments(entry)]));
 	}
 	return value;
+}
+
+/**
+ * A completed built-in call's retained partial argument text (`partialJson` / `partialArgs`, a non-empty
+ * string): the masked JSON of its arguments, the text its released delta carries. Other blocks, an empty
+ * text and an interrupted call's placeholder are kept as given (the same object when nothing changes).
+ */
+function maskCompletedPartial(block: Json): Json {
+	if (block?.type !== "toolCall" || !viewMasksCall(block)) return block;
+	let shown = block;
+	for (const field of ["partialJson", "partialArgs"]) {
+		const text = block[field];
+		if (typeof text !== "string" || text === "" || text === UNPARSED_ARGUMENTS) continue;
+		if (shown === block) shown = { ...block };
+		shown[field] = JSON.stringify(vinciMaskJson(block.arguments ?? {}));
+	}
+	return shown;
+}
+
+/** `message` with each block through maskCompletedPartial (the same object when nothing changes). */
+function maskCompletedPartials(message: Json): Json {
+	if (!isAssistant(message)) return message;
+	let changed = false;
+	const content = message.content.map((block: Json) => {
+		const shown = maskCompletedPartial(block);
+		if (shown !== block) changed = true;
+		return shown;
+	});
+	return changed ? { ...message, content } : message;
 }
 
 function streamedKind(block: Json): StreamedKind | undefined {
@@ -343,24 +376,30 @@ export class VinciStreamMask {
 				return [this.withMessage(event, "message")];
 			case "agent_end": {
 				const held = this.flush();
-				if (!this.anyInterrupted || !Array.isArray(event.messages)) return [...held, event];
-				return [...held, { ...event, messages: event.messages.map((message: Json) => this.maskInterrupted(message)) }];
+				if (!Array.isArray(event.messages)) return [...held, event];
+				return [...held, { ...event, messages: event.messages.map((message: Json) => this.maskFinal(message)) }];
 			}
 			default:
 				return [event];
 		}
 	}
 
-	/** `event` with its `field` message through maskInterrupted (the same object when nothing changes). */
+	/** `event` with its `field` message through maskFinal (the same object when nothing changes). */
 	private withMessage(event: Json, field: string): Json {
 		const message = event[field];
-		const shown = this.maskInterrupted(message);
+		const shown = this.maskFinal(message);
 		return shown === message ? event : { ...event, [field]: shown };
+	}
+
+	/** A final message: maskInterrupted, then maskCompletedPartials (the same object when nothing changes). */
+	private maskFinal(message: Json): Json {
+		return maskCompletedPartials(this.maskInterrupted(message));
 	}
 
 	/**
 	 * `message` with the arguments of every interrupted tool call over-masked (vinciOverMaskHeldValue on
-	 * each string value). Messages with no interrupted call are returned as given.
+	 * each string value) and any partial argument text it still carries replaced by the placeholder.
+	 * Messages with no interrupted call are returned as given.
 	 */
 	maskInterrupted(message: Json): Json {
 		if (!this.anyInterrupted || !isAssistant(message)) return message;
@@ -368,7 +407,11 @@ export class VinciStreamMask {
 		const content = message.content.map((block: Json) => {
 			if (!this.isInterrupted(block)) return block;
 			changed = true;
-			return { ...block, arguments: overMaskArguments(block.arguments) };
+			const shown: Json = { ...block, arguments: overMaskArguments(block.arguments) };
+			for (const field of ["partialJson", "partialArgs"]) {
+				if (typeof block[field] === "string" && block[field] !== "") shown[field] = UNPARSED_ARGUMENTS;
+			}
+			return shown;
 		});
 		return changed ? { ...message, content } : message;
 	}
@@ -519,7 +562,7 @@ export class VinciStreamMask {
 		const ending = type === "text_end" || type === "thinking_end" ? streamedIndex : -1;
 		const toolIndex =
 			type === "toolcall_start" || type === "toolcall_delta" || type === "toolcall_end"
-				? blockIndexOf(source, message.content, (block) => block?.type === "toolCall")
+				? blockIndexOf(source, message.content, (block) => block?.type === "toolCall", true)
 				: -1;
 		let toolAdded = "";
 		let passedThrough = "";
@@ -564,8 +607,9 @@ export class VinciStreamMask {
 				rewritten.delta = added.get(streamedIndex) ?? "";
 			}
 			if (toolState && source.type === "toolcall_delta") rewritten.delta = "";
-			if (type === "done" && final) rewritten.message = this.maskInterrupted(final);
-			if (type === "error" && final) rewritten.error = this.maskInterrupted(final);
+			if (type === "done" && final) rewritten.message = this.maskFinal(final);
+			if (type === "error" && final) rewritten.error = this.maskFinal(final);
+			if (type === "toolcall_end" && source.toolCall) rewritten.toolCall = maskCompletedPartial(source.toolCall);
 			if (ending >= 0 && added.has(ending)) {
 				const block = content[ending];
 				rewritten.content = block[streamedKind(block) as StreamedKind];
@@ -661,7 +705,7 @@ function maskAssistantMessage(message: Json): Json {
 		const kind = streamedKind(block);
 		if (kind) return { ...block, [kind]: vinciMaskSecrets(block[kind]) };
 		if (block?.type === "toolCall" && viewMasksCall(block)) {
-			return { ...block, arguments: vinciMaskJson(block.arguments) };
+			return { ...maskCompletedPartial(block), arguments: vinciMaskJson(block.arguments) };
 		}
 		return block;
 	});

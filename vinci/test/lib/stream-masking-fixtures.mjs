@@ -125,8 +125,10 @@ function partialArguments(json) {
  * abort, an error or a cut stream writes it, with the best-effort parse of the text so far), or "none".
  * `partialOnEnd`: the message_end block keeps its partial text field. `nameFrom`: the block's name is ""
  * until the `nameFrom`-th partial block (toolcall_start is the 0th); `name: undefined` leaves the name out
- * everywhere. `index`: "string" sends each event's content index as a numeric string, "missing" leaves it out.
- * `finals`: message_end is followed by turn_end and agent_end carrying the same message.
+ * everywhere. `index`: "string" sends each event's content index as a numeric string, "missing" leaves it out,
+ * and a number sends that number whatever the call's position. `after`: content blocks behind the tool call.
+ * `finals`: message_end is followed by turn_end and agent_end carrying the same message. `keepPartialOnEnd`:
+ * the completed call (the toolcall_end call, its partial and the final message) keeps its raw text field.
  */
 export function toolCallEvents(
 	name,
@@ -134,6 +136,7 @@ export function toolCallEvents(
 	{
 		id = "call-1",
 		before = [],
+		after = [],
 		start = true,
 		ending = "end",
 		stopReason,
@@ -142,18 +145,26 @@ export function toolCallEvents(
 		nameFrom = 0,
 		index: indexForm = "number",
 		finals = false,
+		keepPartialOnEnd = false,
 	} = {},
 ) {
 	const index = before.length;
-	const at = indexForm === "string" ? { contentIndex: String(index) } : indexForm === "missing" ? {} : { contentIndex: index };
+	const at =
+		typeof indexForm === "number"
+			? { contentIndex: indexForm }
+			: indexForm === "string"
+				? { contentIndex: String(index) }
+				: indexForm === "missing"
+					? {}
+					: { contentIndex: index };
 	const events = start ? [{ type: "message_start", message: assistant([]) }] : [];
 	let step = 0;
 	const named = () => (name === undefined ? {} : { name: step >= nameFrom ? name : "" });
 	const call = (json, done) =>
 		done
-			? { type: "toolCall", id, ...named(), arguments: JSON.parse(json) }
+			? { type: "toolCall", id, ...named(), arguments: JSON.parse(json), ...(keepPartialOnEnd ? { [field]: json } : {}) }
 			: { type: "toolCall", id, ...named(), arguments: partialArguments(json), [field]: json };
-	const message = (json, done, reason) => assistant([...before, call(json, done)], reason ?? (done ? "toolUse" : "stop"));
+	const message = (json, done, reason) => assistant([...before, call(json, done), ...after], reason ?? (done ? "toolUse" : "stop"));
 	let json = "";
 	const first = message(json, false);
 	events.push({ type: "message_update", message: first, assistantMessageEvent: { type: "toolcall_start", ...at, partial: first } });
@@ -322,4 +333,26 @@ export function multiLineArguments(tool, lines) {
 	if (tool === "write" || tool === "bash") return multiLineToolCalls(lines)[tool];
 	if (tool === "edit") return { path: "notes/out.txt", oldText: "old block", newText: `Updated block:\n${text}\nend of block.` };
 	return { path: `notes/\n${text}\nend` };
+}
+
+/**
+ * Each built-in call of multiLineToolCalls, for every secret shape, cut inside its secret value (five
+ * characters into the run's middle line): `{ label, tool, json, secret }`, `json` the cut argument text.
+ */
+export function cutToolCalls() {
+	return Object.values(secretRuns()).flatMap((run, n) =>
+		Object.entries(multiLineToolCalls(run.lines)).map(([tool, args]) => {
+			const json = JSON.stringify(args);
+			const cut = json.indexOf(run.secret[Math.floor(run.secret.length / 2)]) + 5;
+			return { label: `${tool}, case ${n + 1}`, tool, json: json.slice(0, cut), secret: run.secret };
+		}),
+	);
+}
+
+/** `events` with a stream-ending source event (`done` or `error`) that carries `final`, just before message_end. */
+export function withSourceEnd(events, kind, final) {
+	const at = events.findIndex((event) => event.type === "message_end");
+	assert.ok(at >= 0, "fixture sanity: message_end is there");
+	const source = kind === "done" ? { type: "done", reason: "stop", message: final } : { type: "error", reason: "aborted", error: final };
+	return [...events.slice(0, at), { type: "message_update", message: final, assistantMessageEvent: source }, ...events.slice(at)];
 }
