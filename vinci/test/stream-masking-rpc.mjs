@@ -39,7 +39,7 @@ const { serializeJsonLine } = await import(resolve(packages, "coding-agent/src/m
 const { vinciMaskJson, vinciMaskSecrets } = await import(resolve(packages, "coding-agent/src/core/vinci-mask-secrets.ts"));
 const { waitForRawStdoutBackpressure } = await import(resolve(packages, "coding-agent/src/core/output-guard.ts"));
 const { RpcProcessInstance } = await import(resolve(packages, "orchestrator/src/rpc-process.ts"));
-const { vinciMaskViewEvent, vinciMaskViewMessage } = await import(resolve(packages, "coding-agent/src/core/vinci-stream-mask.ts"));
+const { vinciMaskViewEvent, vinciMaskViewMessage, vinciOverMaskHeldValue } = await import(resolve(packages, "coding-agent/src/core/vinci-stream-mask.ts"));
 
 // One capturing writer for the whole file: the RPC mode binds its raw stdout writer to it on first use.
 const realWrite = process.stdout.write;
@@ -1078,6 +1078,37 @@ for (const stopReason of ["aborted", "error"]) {
 				assert.ok(line.includes(PLACEHOLDER), `${label}: ${where}: the placeholder is written`);
 			}
 			assertNoSecretBytes(out.stdout, secret, `${label}: whole stdout`);
+		}
+	});
+}
+
+// A live message that ended early (aborted or failed) and carries a call that completed: its toolcall_end
+// shows the masked arguments; its final events show the call over-masked like an interrupted call.
+const overMaskValues = (value) =>
+	typeof value === "string"
+		? vinciOverMaskHeldValue(value)
+		: Array.isArray(value)
+			? value.map(overMaskValues)
+			: value && typeof value === "object"
+				? Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, overMaskValues(entry)]))
+				: value;
+for (const stopReason of ["aborted", "error"]) {
+	test(`rpc: masking consistency for streamed tool arguments, a completed call in a message that ended ${stopReason} is over-masked in its final events`, async () => {
+		for (const { label, tool, args, secret } of multiLineCases()) {
+			const { events } = toolCallEvents(tool, fragmentsOf(JSON.stringify(args), toolFragment), { stopReason, finals: true });
+			const overMasked = vinciMaskJson(overMaskValues(args));
+			assert.notDeepEqual(overMasked, vinciMaskJson(args), `${label}: fixture sanity: the over-mask differs from the mask`);
+			const out = await runRpc(events);
+			assertNoSecretBytes(out.stdout, secret, `${label}: whole stdout`);
+			const end = out.events.find((event) => event.assistantMessageEvent?.type === "toolcall_end");
+			assert.deepEqual(end?.assistantMessageEvent?.toolCall?.arguments, vinciMaskJson(args), `${label}: toolcall_end shows the masked arguments`);
+			const finals = finalEventsOf(out.events);
+			assert.deepEqual(finals.map((event) => event.type), ["message_end", "turn_end", "agent_end"], `${label}: the final events are written`);
+			for (const event of finals) {
+				const message = event.type === "agent_end" ? event.messages[0] : event.message;
+				assert.equal(message.stopReason, stopReason, `${label}: ${event.type}: fixture sanity: the message ended ${stopReason}`);
+				assert.deepEqual(message.content[0].arguments, overMasked, `${label}: ${event.type}: the call is over-masked`);
+			}
 		}
 	});
 }
