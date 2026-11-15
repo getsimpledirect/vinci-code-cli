@@ -187,9 +187,13 @@ describe("Crew result delivery through the real extension runtime", () => {
 		const helperId = ui.session.sessionManager.getBranch().filter(
 			(entry) => entry.type === "custom" && entry.customType === "vinci-crew-helper",
 		).at(-1).data.id;
+		const emit = vi.spyOn(runner, "emit");
 		rpcFixture.instances.at(-1).complete();
 		await waitUntil(() => resultEntries(ui).length === 1 && !ui.session.isStreaming, "automatic result turn");
 		assert.equal(ui.core.faux.callCount, 1);
+		// #170: the automatic result turn is its own request, so the receipt does not carry the previous one's operations.
+		const starts = emit.mock.calls.map(([event]) => event).filter((event) => event.type === "agent_start");
+		assert.deepEqual(starts, [{ type: "agent_start", continuesRetry: false, newRequest: true }], "the automatic result turn starts a new request");
 		await waitUntil(() => latestHelper(ui, helperId)?.deliveredAt, "live result acknowledgement");
 		assert.equal(typeof latestHelper(ui, helperId).deliveredAt, "number");
 	});

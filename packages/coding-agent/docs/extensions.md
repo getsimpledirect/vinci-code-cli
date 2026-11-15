@@ -551,7 +551,9 @@ Inside `before_agent_start`, `event.systemPrompt` and `ctx.getSystemPrompt()` bo
 Fired once per user prompt.
 
 ```typescript
-pi.on("agent_start", async (_event, ctx) => {});
+pi.on("agent_start", async (event, ctx) => {
+  // event.newRequest - true when sendMessage(..., { triggerTurn: true, newRequest: true }) started this turn
+});
 
 pi.on("agent_end", async (event, ctx) => {
   // event.messages - messages from this prompt
@@ -1394,6 +1396,7 @@ pi.sendMessage({
   - `"followUp"` - Waits for agent to finish. Delivered only when agent has no more tool calls.
   - `"nextTurn"` - Queued for next user prompt. Does not interrupt or trigger anything.
 - `triggerTurn: true` - If agent is idle, trigger an LLM response immediately. Only applies to `"steer"` and `"followUp"` modes (ignored for `"nextTurn"`).
+- `newRequest: true` - With `triggerTurn` while idle: the turn is a separate request, not a continuation of the previous one. Its `agent_start` event carries `newRequest: true` (Vinci's receipt then starts a fresh request scope). Default: a triggered turn continues the previous request.
 
 ### pi.sendUserMessage(content, options?)
 

@@ -387,7 +387,12 @@ export default function (pi: ExtensionAPI) {
     publishRecovery();
   });
 
-  pi.on("agent_start", () => {
+  pi.on("agent_start", (event) => {
+    // A custom turn sent as a new request skips before_agent_start: start a fresh request scope (#170).
+    if (event?.newRequest && !event.continuesRetry) {
+      pendingOperations = [];
+      toolBlocker = undefined;
+    }
     priorOperations = pendingOperations;
     toolMessages = [];
     toolCalls.clear();

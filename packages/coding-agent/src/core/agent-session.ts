@@ -285,6 +285,8 @@ const heldAgentEndDelivery = new AsyncLocalStorage<object>();
 
 export class AgentSession {
 	readonly agent: Agent;
+	/** [vinci] The next agent_start begins a separate request (sendCustomMessage newRequest, #170). */
+	private _nextAgentStartNewRequest = false;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 
@@ -769,7 +771,14 @@ export class AgentSession {
 	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
-			await this._extensionRunner.emit({ type: "agent_start", continuesRetry: this._retryAttempt > 0 });
+			// [vinci] A custom turn sent with newRequest starts a separate request (#170).
+			const newRequest = this._nextAgentStartNewRequest;
+			this._nextAgentStartNewRequest = false;
+			await this._extensionRunner.emit({
+				type: "agent_start",
+				continuesRetry: this._retryAttempt > 0,
+				...(newRequest ? { newRequest: true } : {}),
+			});
 		} else if (event.type === "agent_end") {
 			// Surface the pending auto-retry so extensions do not record a terminal outcome
 			// while the same turn is still going to resume after backoff.
@@ -1721,7 +1730,7 @@ export class AgentSession {
 	 */
 	async sendCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; newRequest?: boolean },
 	): Promise<void> {
 		const appMessage = {
 			role: "custom" as const,
@@ -1744,7 +1753,12 @@ export class AgentSession {
 			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
 				await this._settleIdleHeldRetry();
 			}
-			await this._runAgentPrompt(appMessage);
+			this._nextAgentStartNewRequest = options.newRequest === true;
+			try {
+				await this._runAgentPrompt(appMessage);
+			} finally {
+				this._nextAgentStartNewRequest = false;
+			}
 		} else {
 			if (!this.isStreaming && (this._heldRetryAgentEndMessages || this._heldRetryAgentEndRelease)) {
 				await this._settleIdleHeldRetry();

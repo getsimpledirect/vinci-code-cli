@@ -2207,6 +2207,8 @@ export function finalizeHelper(
         // turn races the CLI's initial stdin prompt before session_start has finished binding.
         {
           triggerTurn: delivery === "automatic" && !holdTurn,
+          // An automatic delivery that starts a turn is its own request, not the previous one's continuation (#170).
+          newRequest: delivery === "automatic" && !holdTurn,
           deliverAs: delivery === "nextTurn" || (holdTurn && !idle) ? "nextTurn" : "followUp",
         },
       );
