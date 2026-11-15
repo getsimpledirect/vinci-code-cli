@@ -451,10 +451,12 @@ execution events and tool results under such a name are masked the same way. A c
 (`message_end`, `turn_end`, `agent_end`) and in the transcript responses, each string value of its
 arguments keeps only the lines the hold-back would have released and is the placeholder from the first
 line it would still hold to the value's end; any partial argument text it still carries there is the
-placeholder. A tool-call event whose content index names no tool-call block is taken to be about the
-call with its id, else the last tool call. A completed built-in call that still carries partial argument
-text (in its `toolcall_end` call, a final event or a transcript response) carries the masked JSON of its
-arguments there. A block end,
+placeholder. A call whose partial argument text is not complete JSON (a transcript the stream never
+saw) is shown the same way. A tool-call event whose content index names no tool-call block is taken to
+be about the call with its id, else the last call still carrying streaming argument text, else the last
+call the view masks, else the last tool call. A completed built-in call that still carries partial
+argument text (in its `toolcall_end` call, a final event or a transcript response) carries the masked
+JSON of its arguments there; an empty text or the placeholder is kept as given. A block end,
 `message_end`, `agent_end`, a new assistant `message_start`, a rebind and the exit paths flush what is
 held. The RPC event path masks exactly what the interactive view masks (assistant text, thinking and
 error text; built-in tool arguments and output) and leaves the rest unchanged; the `get_messages`,

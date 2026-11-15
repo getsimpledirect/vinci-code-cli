@@ -667,16 +667,42 @@ for (const index of ["string", "missing"]) {
 for (const kind of ["done", "error"]) {
 	test(`json: masking consistency for streamed tool arguments, a cut call carried by a source ${kind} event`, async () => {
 		for (const { label, tool, json, secret } of cutToolCalls()) {
-			const built = toolCallEvents(tool, fragmentsOf(json, toolFragment), { ending: "message_end", finals: true });
+			const built = toolCallEvents(tool, fragmentsOf(json, toolFragment), { ending: "message_end", finals: true, partialOnEnd: true });
+			assert.equal(built.final?.content?.[0]?.partialJson, json, `${label}: fixture sanity: the final message keeps the raw text`);
 			assert.ok(secret.some((line) => JSON.stringify(built.final).includes(line.slice(0, 12))), `${label}: fixture sanity: the cut call carries secret bytes`);
 			const out = await runJson(withSourceEnd(built.events, kind, built.final));
 			const source = out.events.filter((event) => event.assistantMessageEvent?.type === kind);
 			assert.equal(source.length, 1, `${label}: the ${kind} event is written`);
 			assertNoSecretBytes(JSON.stringify(source[0]), secret, `${label}: the ${kind} event`);
 			assert.ok(JSON.stringify(source[0]).includes(PLACEHOLDER), `${label}: the ${kind} event carries the placeholder`);
+			const sourceTexts = partialArgumentTexts([source[0].assistantMessageEvent]);
+			assert.ok(sourceTexts.length > 0, `${label}: the ${kind} event's message keeps its partial text`);
+			for (const text of sourceTexts) assert.equal(text, PLACEHOLDER, `${label}: the ${kind} event's partial text is the placeholder`);
 			const finals = finalEventsOf(out.events);
 			assert.equal(finals.length, 3, `${label}: message_end, turn_end and agent_end are written`);
 			for (const event of finals) assertNoSecretBytes(JSON.stringify(event), secret, `${label}: ${event.type}`);
+		}
+	});
+}
+
+// A completed call that keeps its partial argument text, carried by a stream-ending source event: the
+// `done` / `error` event's message carries the masked JSON of the arguments, not the raw text.
+for (const kind of ["done", "error"]) {
+	test(`json: masking consistency for streamed tool arguments, a completed call that keeps its partial argument text, carried by a source ${kind} event`, async () => {
+		for (const { label, tool, args, secret } of multiLineCases()) {
+			const json = JSON.stringify(args);
+			const built = toolCallEvents(tool, fragmentsOf(json, toolFragment), { finals: true, keepPartialOnEnd: true });
+			assert.equal(built.final?.content?.[0]?.partialJson, json, `${label}: fixture sanity: the final message keeps the raw text`);
+			assert.ok(secret.some((line) => JSON.stringify(built.final).includes(line.slice(0, 12))), `${label}: fixture sanity: the raw final carries secret bytes`);
+			const out = await runJson(withSourceEnd(built.events, kind, built.final));
+			const masked = JSON.stringify(vinciMaskJson(args));
+			const source = out.events.filter((event) => event?.assistantMessageEvent?.type === kind);
+			assert.equal(source.length, 1, `${label}: the ${kind} event is written`);
+			assertNoSecretBytes(JSON.stringify(source[0]), secret, `${label}: the ${kind} event`);
+			const texts = partialArgumentTexts(source);
+			assert.ok(texts.length > 0, `${label}: the ${kind} event's message keeps its partialJson`);
+			for (const text of texts) assert.equal(text, masked, `${label}: the ${kind} event's partialJson is the masked JSON of the arguments`);
+			assertNoSecretBytes(out.stdout, secret, `${label}: whole stdout`);
 		}
 	});
 }
@@ -700,23 +726,81 @@ for (const field of ["partialJson", "partialArgs"]) {
 	});
 }
 
+// A cut call with an empty id whose final message keeps its partial text: its interruption is still found
+// after message_end rebuilds the block.
+for (const field of ["partialJson", "partialArgs"]) {
+	test(`json: masking consistency for streamed tool arguments, a cut call with an empty id whose final message keeps its ${field}`, async () => {
+		for (const { label, tool, json, secret } of cutToolCalls()) {
+			const { events, final } = toolCallEvents(tool, fragmentsOf(json, toolFragment), { id: "", ending: "message_end", finals: true, field, partialOnEnd: true });
+			assert.equal(final.content[0][field], json, `${label}: fixture sanity: the final message keeps the raw text`);
+			assert.ok(secret.some((line) => JSON.stringify(final).includes(line.slice(0, 12))), `${label}: fixture sanity: the cut call carries secret bytes`);
+			const out = await runJson(events);
+			const finals = finalEventsOf(out.events);
+			assert.deepEqual(finals.map((event) => event.type), ["message_end", "turn_end", "agent_end"], `${label}: the final events are written`);
+			for (const event of finals) {
+				assertNoSecretBytes(JSON.stringify(event), secret, `${label}: ${event.type}`);
+				const texts = partialArgumentTexts([event]);
+				assert.ok(texts.length > 0, `${label}: ${event.type}: fixture sanity: ${field} is there`);
+				for (const text of texts) assert.equal(text, PLACEHOLDER, `${label}: ${event.type}: ${field} is the placeholder`);
+			}
+			assertNoSecretBytes(out.stdout, secret, `${label}: whole stdout`);
+		}
+	});
+}
+
+// A completed call whose final message carries an empty partial text or the placeholder: kept as given.
+for (const [what, kept] of [["an empty", ""], ["the placeholder as its", PLACEHOLDER]]) {
+	for (const field of ["partialJson", "partialArgs"]) {
+		test(`json: masking consistency for streamed tool arguments, a completed call whose final message carries ${what} ${field} keeps it`, async () => {
+			const run = secretRuns()["a multi-line hex secret"];
+			const args = multiLineToolCalls(run.lines).bash;
+			const { events, final } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { field, finals: true, keepPartialOnEnd: true });
+			final.content[0][field] = kept;
+			const out = await runJson(events);
+			assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+			const finals = finalEventsOf(out.events);
+			assert.deepEqual(finals.map((event) => event.type), ["message_end", "turn_end", "agent_end"], "the final events are written");
+			for (const event of finals) assert.deepEqual(partialArgumentTexts([event]), [kept], `${event.type}: ${field} is kept as given`);
+		});
+	}
+}
+
 // A content index that names no tool-call block (out of range, or the text block ahead of the call) falls
 // back to the call's id, else the last tool-call block; a numeric-string index is read as its number even
 // where that fallback would pick another block.
-for (const [label, index, after] of [
-	["an out-of-range content index", 5, []],
-	["a content index naming a text block", 0, []],
-	["a numeric-string content index with a later tool call", "string", [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }]],
+for (const [label, index, after, id] of [
+	["an out-of-range content index with a later tool call", 5, [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }], "call-1"],
+	["a content index naming a text block with a later tool call", 0, [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }], "call-1"],
+	["a numeric-string content index with a later tool call", "string", [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }], ""],
 ]) {
 	test(`json: masking consistency for streamed tool arguments, ${label} still holds the call`, async () => {
 		const run = secretRuns()["a multi-line hex secret"];
 		const args = multiLineToolCalls(run.lines).bash;
-		const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id: "", index, after, before: [block("text", "Running it.\n")], finals: true });
+		const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id, index, after, before: [block("text", "Running it.\n")], finals: true });
 		const out = await runJson(events);
 		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
 		const deltas = deltasOf(out.events, "toolcall");
 		assertMasked(deltas, run.secret, "joined deltas");
 		assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "released as the call's masked arguments");
+	});
+}
+
+// The same fallback when no call carries streaming argument text (a provider that sends only parsed
+// arguments): the deltas are held as a masked call's, never passed through to the later call.
+for (const [label, index] of [
+	["an out-of-range content index", 5],
+	["a content index naming a text block", 0],
+]) {
+	test(`json: masking consistency for streamed tool arguments, ${label} with a later tool call and no streaming text still holds the call`, async () => {
+		const run = secretRuns()["a multi-line hex secret"];
+		const args = multiLineToolCalls(run.lines).bash;
+		const after = [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }];
+		const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id: "call-1", index, after, before: [block("text", "Running it.\n")], finals: true });
+		const stripped = JSON.parse(JSON.stringify(events, (key, value) => (key === "partialJson" ? undefined : value)));
+		assert.ok(!JSON.stringify(stripped).includes("partialJson"), "fixture sanity: no block carries streaming text");
+		const out = await runJson(stripped);
+		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+		assertMasked(deltasOf(out.events, "toolcall"), run.secret, "joined deltas");
 	});
 }
 
