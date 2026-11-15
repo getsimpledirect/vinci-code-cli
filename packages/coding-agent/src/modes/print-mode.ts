@@ -12,6 +12,7 @@ import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { emitSessionBeforeExitEvent } from "../core/extensions/runner.ts";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.ts";
 import { vinciMaskEnabled, vinciMaskJson, vinciMaskSecrets } from "../core/vinci-mask-secrets.ts";
+import { VinciStreamMask } from "../core/vinci-stream-mask.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 
 // The 180000ms default is deliberately generous to avoid false kills during slow provider activity;
@@ -282,6 +283,15 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	const signalCleanupHandlers: Array<() => void> = [];
 	const timeoutMs = printModePrestreamTimeoutMs();
 	let prestreamWatchdog: PrintModeLivenessWatchdog | undefined;
+	// [vinci] --mode json: streamed text the mask may still change is held back, then written masked.
+	const streamMask = new VinciStreamMask();
+	const writeJsonEvent = (event: object): void => {
+		writeRawStdout(`${JSON.stringify(vinciMaskJson(event))}\n`);
+	};
+	// [vinci] Every end path writes what the stream still holds, masked: nothing held is dropped unwritten.
+	const flushHeldJson = (): void => {
+		if (mode === "json" && vinciMaskEnabled()) for (const event of streamMask.flush()) writeJsonEvent(event);
+	};
 
 	const cancelPrestreamWatchdog = (): void => {
 		prestreamWatchdog?.cancel();
@@ -336,6 +346,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				process.exitCode = signalExitCode;
 				cancelPrestreamWatchdog();
 				cancelStartupLivenessWatchdog();
+				flushHeldJson(); // [vinci]
 				killTrackedDetachedChildren();
 				// Bound the signal-triggered dispose: a stalled shutdown handler must not hang the exit.
 				void Promise.race([
@@ -397,6 +408,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		});
 
 		unsubscribe?.();
+		flushHeldJson(); // [vinci] a rebind ends the previous stream
 		unsubscribe = session.subscribe((event) => {
 			// Tool execution windows suspend the liveness timer — a long quiet local build is not a wedge.
 			// Hooks run with the timer armed, and tool/boundary events are handled exclusively (not
@@ -417,8 +429,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				// carry keys). Mask the structured event before serialization so redaction can never consume
 				// JSON punctuation or turn numeric telemetry into invalid syntax. Same "piped to a log never
 				// emits a live key" intent as the text path below — json includes raw tool output.
-				const line = JSON.stringify(vinciMaskEnabled() ? vinciMaskJson(event) : event);
-				writeRawStdout(`${line}\n`);
+				// Streamed text and thinking hold back what a later line could still unmask (VinciStreamMask).
+				if (vinciMaskEnabled()) {
+					for (const out of streamMask.process(event)) writeJsonEvent(out);
+				} else {
+					writeRawStdout(`${JSON.stringify(event)}\n`);
+				}
 			}
 		});
 	};
@@ -508,6 +524,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		for (const cleanup of signalCleanupHandlers) {
 			cleanup();
 		}
+		flushHeldJson(); // [vinci] an error path still writes what the stream held, masked
 		await disposeRuntime();
 		await flushRawStdout();
 	}

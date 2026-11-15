@@ -25,6 +25,8 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import { vinciMaskEnabled } from "../../core/vinci-mask-secrets.ts";
+import { VinciStreamMask, vinciMaskViewEvent } from "../../core/vinci-stream-mask.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -58,6 +60,21 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeRawStdout(serializeJsonLine(obj));
+	};
+
+	// [vinci] Session events are masked in the scope the interactive view masks; streamed text the mask
+	// may still change is held back, then written masked. Unchanged when masking is off.
+	const streamMask = new VinciStreamMask();
+	const outputEvent = (event: object) => {
+		if (!vinciMaskEnabled()) {
+			output(event);
+			return;
+		}
+		for (const out of streamMask.process(event)) output(vinciMaskViewEvent(out));
+	};
+	// [vinci] Every end path writes what the stream still holds, masked: nothing held is dropped unwritten.
+	const flushHeldEvents = () => {
+		if (vinciMaskEnabled()) for (const out of streamMask.flush()) output(vinciMaskViewEvent(out));
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -353,8 +370,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
+		flushHeldEvents(); // [vinci] a rebind ends the previous stream
 		unsubscribe = session.subscribe((event) => {
-			output(event);
+			outputEvent(event); // [vinci]
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
 			await waitForRawStdoutBackpressure();
@@ -711,6 +729,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
+		flushHeldEvents(); // [vinci]
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();

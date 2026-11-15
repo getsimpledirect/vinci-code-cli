@@ -69,8 +69,8 @@ only patch core when there's no hook.)
 | `coding-agent/src/modes/interactive/components/tool-execution.ts` | Tight tool spacing, semantic fallback rows for custom tools, and private display handling for blocked control guidance | 17,23 |
 | `coding-agent/src/modes/interactive/interactive-mode.ts` | `/login`→vinci, Ctrl+C window, clean launch, `/model` filter, lean `/` menu; injectable terminal/process-handler seam for offline UI tests; expose active overlay focus to extensions; post-login ecosystem pointer; fullscreen copy policy, selection-only copy, restart notice, LINE padding option, custom-modal mouse policy, first-copy disclosure and route-aware `/copy` status | 1–6,22,25 |
 | `coding-agent/src/modes/rpc/rpc-client.ts` | Settle `waitForIdle`/`collectEvents` (and release their timers) when the agent process dies or is stopped — a pure upstream bugfix, not env-gated | — |
-| `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists | — |
-| `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output; preserve verification-blocked exit 3 for a truncated final response | 13 |
+| `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists; mask streamed session events in the scope the interactive view masks, holding back streamed text the mask may still change and flushing it masked on every end path | 13 |
+| `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output (streamed text held back until the mask can decide it, flushed masked on every end path); preserve verification-blocked exit 3 for a truncated final response | 13 |
 | `coding-agent/src/core/compaction/branch-summarization.ts`, `compaction.ts` | Optional `__vinciRecordTaskCall` hook so Vinci can record summarization/compaction calls (no-op when absent) | — |
 | `coding-agent/src/core/model-resolver.ts` | Managed-class aliases (Fortissimo resolves to Forte) for provider `vinci` only | — |
 | `coding-agent/src/core/session-manager.ts` | Shared verification-state entries and record framing for the turn-end verification gate | 8 |
@@ -435,6 +435,14 @@ so a handful of upstream render paths get a one-line `[vinci]` call under `VINCI
 the `vinci-render` extension can mask expanded (ctrl+o) tool output. **Display-only in all cases** —
 the value written to disk and the value the model sees are never masked, so edits still land
 byte-for-byte and the model can still match the real key. Kill switch: unset `VINCI_CODE`.
+
+Streamed output (`--mode json` and `--mode rpc`) goes through the new file
+`core/vinci-stream-mask.ts`: the text and thinking fields of a streaming assistant message hold back
+trailing lines a later line could still change (an END-only key body, multi-line base64, hex across
+line breaks, an open `${`), then release them masked; a block end, `message_end`, `agent_end`, a
+rebind and the exit paths flush what is held. The RPC event path masks exactly what the interactive
+view masks (assistant text, thinking and error text; built-in tool arguments and output) and leaves
+the rest unchanged. With `VINCI_CODE` unset both streams are byte-identical to upstream.
 
 Malformed completed tool calls are the diagnostic exception: `agent-session.ts` masks their
 `argumentsError` before emitting or persisting it, also masking the validation error returned to
