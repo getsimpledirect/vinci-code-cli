@@ -192,7 +192,6 @@ function maskCompletedPartial(block: Json): Json {
 	return shown;
 }
 
-/** `message` with each block through maskCompletedPartial (the same object when nothing changes). */
 /** A call whose partial argument text is not complete JSON: the stream was cut inside it. */
 function isCutCall(block: Json): boolean {
 	return ["partialJson", "partialArgs"].some((field) => {
@@ -216,6 +215,7 @@ function maskCutCall(block: Json): Json {
 	return shown;
 }
 
+/** `message` with each block through maskCompletedPartial (the same object when nothing changes). */
 function maskCompletedPartials(message: Json): Json {
 	if (!isAssistant(message)) return message;
 	let changed = false;
@@ -742,12 +742,18 @@ function maskToolOutput(result: Json): Json {
 	return masked;
 }
 
+/** A message the stream ended early (aborted or failed): its built-in calls may have been cut. */
+function endedEarly(message: Json): boolean {
+	return message?.stopReason === "aborted" || message?.stopReason === "error";
+}
+
 function maskAssistantMessage(message: Json): Json {
+	const early = endedEarly(message);
 	const content = message.content.map((block: Json) => {
 		const kind = streamedKind(block);
 		if (kind) return { ...block, [kind]: vinciMaskSecrets(block[kind]) };
 		if (block?.type === "toolCall" && viewMasksCall(block)) {
-			const shown = maskCompletedPartial(block);
+			const shown = early ? maskCutCall(block) : maskCompletedPartial(block);
 			return { ...shown, arguments: vinciMaskJson(shown.arguments) };
 		}
 		return block;

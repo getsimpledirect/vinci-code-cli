@@ -811,11 +811,23 @@ test("json positive control: an out-of-range content index with only calls the v
 	const token = inlineToken();
 	const json = JSON.stringify({ query: `find ${token}` });
 	const after = [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }];
-	const { events } = toolCallEvents("shell_helper", splitAcross(json, token, 0), { id: "call-1", index: 5, after, before: [block("text", "Running it.\n")] });
+	const { events } = toolCallEvents("shell_helper", splitAcross(json, token, 0), { id: "call-1", index: 5, after });
 	const stripped = JSON.parse(JSON.stringify(events, (key, value) => (key === "partialJson" ? undefined : value)));
 	assert.ok(!JSON.stringify(stripped).includes("partialJson"), "fixture sanity: no block carries streaming text");
 	const out = await runJson(stripped);
 	assert.equal(out.stdout, stripped.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "passed through as calls the view does not mask");
+});
+
+// The fallback order: a call still carrying streaming text is taken before a later call the view masks
+// that carries none, so a streaming call the view does not mask passes through.
+test("json positive control: an out-of-range content index takes the streaming call before a later masked call", async () => {
+	const token = inlineToken();
+	const json = JSON.stringify({ query: `find ${token}` });
+	const after = [{ type: "toolCall", id: "call-2", name: "bash", arguments: { command: "ls" } }];
+	const { events } = toolCallEvents("shell_helper", splitAcross(json, token, 0), { id: "call-1", index: 5, after });
+	assert.ok(events.every((event) => event.message?.content?.[1]?.partialJson === undefined), "fixture sanity: the later call carries no streaming text");
+	const out = await runJson(events);
+	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "the streaming call passes through unchanged");
 });
 
 test("json: masking consistency for streamed tool arguments, an edit call's multi-line new text", async () => {
