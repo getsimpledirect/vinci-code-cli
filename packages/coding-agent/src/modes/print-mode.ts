@@ -289,8 +289,23 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		writeRawStdout(`${JSON.stringify(vinciMaskJson(event))}\n`);
 	};
 	// [vinci] Every end path writes what the stream still holds, masked: nothing held is dropped unwritten.
-	const flushHeldJson = (): void => {
-		if (mode === "json" && vinciMaskEnabled()) for (const event of streamMask.flush()) writeJsonEvent(event);
+	// Returns whether anything was written.
+	const flushHeldJson = (): boolean => {
+		if (mode !== "json" || !vinciMaskEnabled()) return false;
+		const held = streamMask.flush();
+		for (const event of held) writeJsonEvent(event);
+		return held.length > 0;
+	};
+	// [vinci] An exit path that flushed held text lets stdout drain (bounded) before exiting; otherwise the
+	// exit is immediate, as before.
+	const exitAfterFlush = (flushed: boolean, code: number | undefined): void => {
+		if (!flushed) {
+			process.exit(code);
+			return;
+		}
+		void Promise.race([flushRawStdout().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1000))]).finally(
+			() => process.exit(code),
+		);
 	};
 
 	const cancelPrestreamWatchdog = (): void => {
@@ -308,7 +323,8 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				`BLOCKED: The provider stopped responding (no activity for ${timeoutMs}ms); the print-mode run was stopped.\n`,
 			);
 			killTrackedDetachedChildren();
-			process.exit(1);
+			// [vinci] the watchdog exit still writes what the stream held, masked
+			exitAfterFlush(flushHeldJson(), 1);
 		}, timeoutMs);
 		prestreamWatchdog = watchdog;
 		try {
@@ -346,13 +362,13 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				process.exitCode = signalExitCode;
 				cancelPrestreamWatchdog();
 				cancelStartupLivenessWatchdog();
-				flushHeldJson(); // [vinci]
+				const flushed = flushHeldJson(); // [vinci]
 				killTrackedDetachedChildren();
 				// Bound the signal-triggered dispose: a stalled shutdown handler must not hang the exit.
 				void Promise.race([
 					disposeRuntime().catch(() => {}),
 					new Promise((resolve) => setTimeout(resolve, 5000)),
-				]).finally(() => process.exit(signalExitCode));
+				]).finally(() => exitAfterFlush(flushed, signalExitCode)); // [vinci]
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));

@@ -25,8 +25,8 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
-import { vinciMaskEnabled } from "../../core/vinci-mask-secrets.ts";
-import { VinciStreamMask, vinciMaskViewEvent } from "../../core/vinci-stream-mask.ts";
+import { vinciMaskEnabled, vinciMaskSecrets } from "../../core/vinci-mask-secrets.ts";
+import { VinciStreamMask, vinciMaskViewEvent, vinciMaskViewMessage } from "../../core/vinci-stream-mask.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -649,7 +649,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "get_last_assistant_text": {
 				const text = session.getLastAssistantText();
-				return success(id, "get_last_assistant_text", { text });
+				// [vinci] the same text the event path masks, masked the same way
+				return success(id, "get_last_assistant_text", {
+					text: vinciMaskEnabled() && typeof text === "string" ? vinciMaskSecrets(text) : text,
+				});
 			}
 
 			case "set_session_name": {
@@ -666,7 +669,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "get_messages": {
-				return success(id, "get_messages", { messages: session.messages });
+				// [vinci] masked in the scope the interactive view masks, like the event path
+				const messages = vinciMaskEnabled() ? session.messages.map(vinciMaskViewMessage) : session.messages;
+				return success(id, "get_messages", { messages });
 			}
 
 			// =================================================================

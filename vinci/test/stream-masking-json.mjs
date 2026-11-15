@@ -5,18 +5,33 @@ import assert from "node:assert/strict";
 import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { secretRuns, assertMasked, PLACEHOLDER, streamEvents, assistant, block } from "./lib/stream-masking-fixtures.mjs";
+import {
+	assertMasked,
+	assertNeverRewritten,
+	assistant,
+	block,
+	deltasOf,
+	inlineToken,
+	keyMarkers,
+	PLACEHOLDER,
+	secretRuns,
+	splitAcross,
+	streamEvents,
+	toolCallEvents,
+} from "./lib/stream-masking-fixtures.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = resolve(here, "../../packages/coding-agent/src");
 const { runPrintMode, setPrintModeTerminatingForTest } = await import(resolve(src, "modes/print-mode.ts"));
-const { vinciMaskJson } = await import(resolve(src, "core/vinci-mask-secrets.ts"));
+const { vinciMaskJson, vinciMaskSecrets } = await import(resolve(src, "core/vinci-mask-secrets.ts"));
+const { waitForRawStdoutBackpressure } = await import(resolve(src, "core/output-guard.ts"));
 
 const realWrite = process.stdout.write;
 
 /**
- * Run runPrintMode in json mode over `events`, emitted from the session's prompt. `during(listener)` runs
- * after the events, still inside the prompt; `final` is the run's last assistant message.
+ * Run runPrintMode in json mode over `events`, emitted from the session's prompt. `during(ctx)` runs after
+ * the events, still inside the prompt, with `ctx.listener`, `ctx.stdout()` (everything written so far)
+ * and `ctx.rebind()` (the runtime's rebind callback); `final` is the run's last assistant message.
  */
 async function runJson(events, { masking = true, during, final } = {}) {
 	const saved = process.env.VINCI_CODE;
@@ -38,13 +53,16 @@ async function runJson(events, { masking = true, during, final } = {}) {
 		},
 		prompt: async () => {
 			for (const event of events) listener?.(event);
-			if (during) await during(listener);
+			if (during) await during({ listener, stdout: () => chunks.join(""), rebind: () => rebind() });
 			messages.push(final ?? assistant([block("text", "done.")]));
 		},
 	};
+	let rebind;
 	const runtime = {
 		session,
-		setRebindSession() {},
+		setRebindSession(fn) {
+			rebind = fn;
+		},
 		dispose: async () => {},
 		newSession: async () => ({ cancelled: false }),
 		fork: async () => ({ cancelled: false }),
@@ -77,11 +95,11 @@ async function runJson(events, { masking = true, during, final } = {}) {
 	return { stdout, events: parsed, exitCode };
 }
 
-const deltasOf = (events, kind = "text") =>
-	events
-		.filter((event) => event.type === "message_update" && event.assistantMessageEvent?.type === `${kind}_delta`)
-		.map((event) => event.assistantMessageEvent.delta)
-		.join("");
+const parseLines = (stdout) =>
+	stdout
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
 
 const fieldOf = (message, kind = "text") => message.content.find((part) => part.type === kind)?.[kind];
 
@@ -125,14 +143,19 @@ test("json: an aborted answer (message_end, no text_end) flushes the held run ma
 });
 
 test("json: agent_end with no message_end flushes the held run masked", async () => {
-	const run = secretRuns()["an END-only private-key body"];
+	// The base64 run ends in run characters, so it is still held when agent_end arrives.
+	const run = secretRuns()["a multi-line base64 secret"];
 	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, withEnd: false });
 	events.push({ type: "agent_end", messages: [] });
 	const out = await runJson(events);
 	assertMasked(out.stdout, run.secret, "agent_end");
 	const agentEnd = out.events.findIndex((event) => event.type === "agent_end");
-	assert.equal(out.events[agentEnd - 1].type, "message_update", "a flushed delta precedes agent_end");
-	assert.ok(deltasOf(out.events).includes(PLACEHOLDER), "the deltas hold the placeholder");
+	assert.ok(agentEnd > 0, "agent_end is written");
+	// Without the agent_end flush the run stays held past agent_end (only the final flush would write it).
+	const before = deltasOf(out.events.slice(0, agentEnd));
+	assert.ok(before.includes(PLACEHOLDER), "the held run is written, masked, before agent_end");
+	assert.equal(before, vinciMaskSecrets(["Here it is:", ...run.lines, ""].join("\n")), "all of it, before agent_end");
+	assert.equal(deltasOf(out.events.slice(agentEnd)), "", "nothing is left to write after agent_end");
 });
 
 test("json: an error mid-stream still writes the held run masked", async () => {
@@ -153,16 +176,21 @@ test("json: a termination signal mid-stream writes the held run masked before ex
 	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, withEnd: false });
 	const realExit = process.exit;
 	let exited;
+	let atExit;
+	let stdoutNow;
 	const exitCalled = new Promise((resolveExit) => {
 		process.exit = (code) => {
 			exited = code;
+			// What had reached stdout when the process would have stopped: the final flush has not run.
+			atExit = stdoutNow();
 			resolveExit();
 		};
 	});
 	let out;
 	try {
 		out = await runJson(events, {
-			during: async () => {
+			during: async ({ stdout }) => {
+				stdoutNow = stdout;
 				process.emit("SIGTERM");
 				await Promise.race([exitCalled, new Promise((r) => setTimeout(r, 6000))]);
 			},
@@ -173,8 +201,75 @@ test("json: a termination signal mid-stream writes the held run masked before ex
 		process.exitCode = undefined;
 	}
 	assert.equal(exited, 143, "the signal path exits 143");
+	assertMasked(atExit, run.secret, "signal: written before exit");
+	assert.ok(deltasOf(parseLines(atExit)).includes(PLACEHOLDER), "the signal flush wrote the held run, masked, before exit");
 	assertMasked(out.stdout, run.secret, "signal");
-	assert.ok(deltasOf(out.events).includes(PLACEHOLDER), "the deltas hold the placeholder");
+});
+
+test("json: the liveness-watchdog exit writes the held run masked before exit", async () => {
+	const run = secretRuns()["a multi-line base64 secret"];
+	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, withEnd: false });
+	const realExit = process.exit;
+	const savedTimeout = process.env.VINCI_PRESTREAM_TIMEOUT_MS;
+	process.env.VINCI_PRESTREAM_TIMEOUT_MS = "40";
+	let exited;
+	let atExit;
+	let stdoutNow;
+	const exitCalled = new Promise((resolveExit) => {
+		process.exit = (code) => {
+			exited = code;
+			atExit = stdoutNow();
+			resolveExit();
+		};
+	});
+	try {
+		await runJson(events, {
+			during: async ({ stdout }) => {
+				stdoutNow = stdout;
+				await Promise.race([exitCalled, new Promise((r) => setTimeout(r, 3000))]);
+			},
+		});
+	} finally {
+		process.exit = realExit;
+		if (savedTimeout === undefined) delete process.env.VINCI_PRESTREAM_TIMEOUT_MS;
+		else process.env.VINCI_PRESTREAM_TIMEOUT_MS = savedTimeout;
+	}
+	assert.equal(exited, 1, "the watchdog exits 1");
+	assertMasked(atExit, run.secret, "watchdog: written before exit");
+	assert.ok(deltasOf(parseLines(atExit)).includes(PLACEHOLDER), "the watchdog flush wrote the held run, masked, before exit");
+});
+
+test("json: a rebind writes the held run masked at once", async () => {
+	const run = secretRuns()["a multi-line hex secret"];
+	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, withEnd: false });
+	let beforeRebind;
+	let afterRebind;
+	// Recorded inside the prompt and asserted after the run: runPrintMode catches what the prompt throws.
+	await runJson(events, {
+		during: async ({ stdout, rebind }) => {
+			await waitForRawStdoutBackpressure();
+			beforeRebind = stdout();
+			await rebind();
+			// Let the queued writes land; nothing else writes until the stream ends.
+			await waitForRawStdoutBackpressure();
+			afterRebind = stdout();
+		},
+	});
+	assert.ok(beforeRebind.includes("Here it is:"), "the stream so far is written");
+	assert.ok(!deltasOf(parseLines(beforeRebind)).includes(PLACEHOLDER), "held before the rebind");
+	assertMasked(afterRebind, run.secret, "rebind");
+	assert.ok(deltasOf(parseLines(afterRebind)).includes(PLACEHOLDER), "the rebind flush wrote the held run, masked");
+});
+
+test("json: a new assistant message_start writes the previous message's held run first, masked", async () => {
+	const run = secretRuns()["a multi-line base64 secret"];
+	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, withEnd: false });
+	const next = streamEvents(["Next answer."]).events;
+	const out = await runJson([...events, ...next]);
+	assertMasked(out.stdout, run.secret, "message_start");
+	const starts = out.events.flatMap((event, index) => (event.type === "message_start" ? [index] : []));
+	assert.equal(starts.length, 2, "two assistant messages");
+	assert.ok(deltasOf(out.events.slice(0, starts[1])).includes(PLACEHOLDER), "the held run is written before the next message_start");
 });
 
 test("json positive control: prose lines are each written when they complete, byte-identical", async () => {
@@ -198,4 +293,146 @@ test("json with masking off: the stream is byte-identical to the events", async 
 	const { events } = streamEvents(["Here it is:", ...run.lines, "That is all."]);
 	const out = await runJson(events, { masking: false });
 	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(event)}\n`).join(""));
+});
+
+// Tool-call argument deltas of the tools whose arguments the view masks are held back per tool call.
+for (const [label, step] of [
+	["two deltas", 0],
+	["five deltas", 9],
+]) {
+	test(`json: a value split across ${label} of a bash call never reaches stdout; the placeholder does`, async () => {
+		const token = inlineToken();
+		const json = JSON.stringify({ command: `echo ${token}` });
+		const fragments = splitAcross(json, token, step);
+		assert.ok(fragments.length >= (step ? 3 : 2), "fixture sanity: the value spans the fragments");
+		const { events } = toolCallEvents("bash", fragments);
+		const out = await runJson(events);
+		const deltas = deltasOf(out.events, "toolcall");
+		assertMasked(deltas, [token], "concatenated deltas");
+		assertMasked(out.stdout, [token], "whole stdout");
+	});
+}
+
+test("json positive control: non-secret bash arguments arrive byte-identical once the deltas are joined", async () => {
+	const json = JSON.stringify({ command: "ls -la src/components", timeout: 30 });
+	const fragments = [json.slice(0, 7), json.slice(7, 19), json.slice(19)];
+	const { events } = toolCallEvents("bash", fragments);
+	const out = await runJson(events);
+	assert.equal(deltasOf(out.events, "toolcall"), json, "the joined deltas equal the raw argument text");
+	const end = out.events.find((event) => event.type === "message_end");
+	assert.deepEqual(end.message.content[0].arguments, JSON.parse(json));
+});
+
+test("json: a tool the view does not mask keeps its old per-event masking of argument deltas", async () => {
+	const token = inlineToken();
+	const json = JSON.stringify({ query: `find ${token}` });
+	const { events } = toolCallEvents("extension_tool", splitAcross(json, token, 0));
+	const out = await runJson(events);
+	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "as before this change");
+});
+
+test("json: an open `${` holds its lines until it closes, so released text is never rewritten", async () => {
+	const lines = ["Run this:", "cd ${PWD:-", "/srv/app};", "Done."];
+	const { events } = streamEvents(lines);
+	const out = await runJson(events);
+	const end = out.events.find((event) => event.type === "message_end");
+	assert.ok(fieldOf(end.message).includes(PLACEHOLDER), "fixture sanity: the closed value is masked");
+	assertNeverRewritten(out.events, fieldOf(end.message));
+	assert.equal(deltasOf(out.events), fieldOf(end.message), "the deltas add up to the message_end text");
+});
+
+test("json: an unclosed `${` holds at most its line cap, then releases", async () => {
+	const items = Array.from({ length: 24 }, (_, i) => `item ${i + 1};`);
+	const { events } = streamEvents(["Run this:", "echo ${HOME:-", ...items, "Done."], { end: false, withEnd: false });
+	events.push({ type: "message_end", message: assistant([block("text", events.at(-1).message.content[0].text)]) });
+	const out = await runJson(events);
+	const endIndex = out.events.findIndex((event) => event.type === "message_end");
+	assert.ok(deltasOf(out.events.slice(0, endIndex - 1)).includes("item 1;"), "the capped run is released before the end");
+});
+
+test("json: a BEGIN-line private key, streamed one line per update, never reaches stdout", async () => {
+	const { begin, end: endMarker } = keyMarkers();
+	const body = secretRuns()["an END-only private-key body"].secret;
+	const { events } = streamEvents(["Here it is:", begin, ...body, endMarker, "That is all."]);
+	const out = await runJson(events);
+	assertMasked(out.stdout, body, "BEGIN block");
+	const end = out.events.find((event) => event.type === "message_end");
+	assertNeverRewritten(out.events, fieldOf(end.message));
+	assert.equal(deltasOf(out.events), fieldOf(end.message), "the deltas add up to the message_end text");
+});
+
+for (const name of ["a multi-line base64 secret", "a multi-line hex secret"]) {
+	test(`json: CRLF lines (${name}) never reach stdout and no released prefix ends in a stray carriage return`, async () => {
+		const run = secretRuns()[name];
+		const { events } = streamEvents(["Here it is:", ...run.lines, "That is all."], { eol: "\r\n" });
+		const out = await runJson(events);
+		assertMasked(out.stdout, run.secret, `CRLF ${name}`);
+		const end = out.events.find((event) => event.type === "message_end");
+		assertNeverRewritten(out.events, fieldOf(end.message));
+		for (const event of out.events) {
+			if (event.assistantMessageEvent?.type !== "text_delta") continue;
+			const shown = event.message.content[0].text;
+			if (shown !== fieldOf(end.message)) assert.ok(!shown.endsWith("\r"), "a released prefix does not end in a carriage return");
+		}
+		assert.equal(deltasOf(out.events), fieldOf(end.message), "the deltas add up to the message_end text");
+	});
+}
+
+test("json: two text blocks each hold back and mask on their own", async () => {
+	const runs = secretRuns();
+	const a = ["First:", ...runs["a multi-line base64 secret"].lines, "Ok."];
+	const b = ["Second:", ...runs["a multi-line hex secret"].lines, "Ok."];
+	const events = [{ type: "message_start", message: assistant([]) }];
+	const texts = ["", ""];
+	const push = (type, index, extra = {}) => {
+		const message = assistant(texts.filter((_, i) => i <= index || texts[i]).map((text) => block("text", text)));
+		events.push({ type: "message_update", message, assistantMessageEvent: { type, contentIndex: index, partial: message, ...extra } });
+	};
+	for (const [index, lines] of [a, b].entries()) {
+		push("text_start", index);
+		for (const line of lines) {
+			texts[index] += `${line}\n`;
+			push("text_delta", index, { delta: `${line}\n` });
+		}
+		push("text_end", index, { content: texts[index] });
+	}
+	events.push({ type: "message_end", message: assistant(texts.map((text) => block("text", text))) });
+	const out = await runJson(events);
+	assertMasked(out.stdout, runs["a multi-line base64 secret"].secret, "block 0");
+	assertMasked(out.stdout, runs["a multi-line hex secret"].secret, "block 1");
+	const end = out.events.find((event) => event.type === "message_end");
+	for (const index of [0, 1]) {
+		assert.equal(deltasOf(out.events, "text", index), end.message.content[index].text, `block ${index}: the deltas add up`);
+	}
+});
+
+test("json: a tool call after a held run leaves the run held, then writes it masked", async () => {
+	const run = secretRuns()["a multi-line base64 secret"];
+	const lines = ["Here it is:", ...run.lines];
+	const text = lines.map((line) => `${line}\n`).join("");
+	const { events: textEvents } = streamEvents(lines, { end: false, withEnd: false });
+	const json = JSON.stringify({ command: "ls" });
+	const { events: toolEvents } = toolCallEvents("bash", [json.slice(0, 5), json.slice(5)], {
+		before: [block("text", text)],
+		start: false,
+	});
+	const out = await runJson([...textEvents, ...toolEvents]);
+	assertMasked(out.stdout, run.secret, "tool call after a held run");
+	const end = out.events.find((event) => event.type === "message_end");
+	assert.equal(deltasOf(out.events), fieldOf(end.message), "the text deltas add up to the message_end text");
+	assert.equal(deltasOf(out.events, "toolcall"), json, "the tool-call deltas add up to its argument text");
+});
+
+test("json idempotence through the writer: already-masked text comes out unchanged", async () => {
+	const values = Object.entries(secretRuns()).map(([name, run]) => [name, ["Here it is:", ...run.lines, "That is all."]]);
+	values.push(["a single-line value", [`TOKEN=${inlineToken()}`]]);
+	for (const [name, lines] of values) {
+		const masked = vinciMaskSecrets(lines.map((line) => `${line}\n`).join(""));
+		assert.ok(masked.includes(PLACEHOLDER), `${name}: fixture sanity: masked once`);
+		const { events } = streamEvents(masked.split("\n").slice(0, -1));
+		const out = await runJson(events);
+		const end = out.events.find((event) => event.type === "message_end");
+		assert.equal(fieldOf(end.message), masked, `${name}: message_end is unchanged`);
+		assert.equal(deltasOf(out.events), masked, `${name}: the deltas are unchanged`);
+	}
 });

@@ -13,6 +13,11 @@
  * (`text_end` / `thinking_end`), `message_end`, `agent_end` and every exit path release everything,
  * masked the same way. This is the decision rule of the interactive screen-reader writer.
  *
+ * The argument text of a tool call whose arguments the interactive view masks (the built-in tools)
+ * is held back the same way, over the joined `toolcall_delta` text of each tool call, so the
+ * concatenated deltas never carry a value split across fragments. Until a tool call's text is
+ * released, its partial `arguments` stay at the last value seen while nothing was held.
+ *
  * `vinciMaskViewEvent` masks an RPC event in exactly the scope the interactive view masks.
  */
 
@@ -23,8 +28,7 @@ const INTERPOLATION_HOLD_LINES = 20;
 
 type StreamedKind = "text" | "thinking";
 
-interface BlockState {
-	kind: StreamedKind;
+interface HoldState {
 	/** Raw lines released so far. */
 	released: number;
 	/** The masked text emitted so far for this block. */
@@ -32,6 +36,24 @@ interface BlockState {
 	/** The block's end event was seen: everything is released. */
 	done: boolean;
 }
+
+interface BlockState extends HoldState {
+	kind: StreamedKind;
+}
+
+interface ToolCallState extends HoldState {
+	/** The joined raw argument text of every `toolcall_delta` so far. */
+	raw: string;
+	/** The partial arguments last seen while nothing was held. */
+	arguments: unknown;
+}
+
+/**
+ * The built-in tools whose call header, preview, diff and output the interactive view masks
+ * (tools/bash.ts output, tools/write.ts preview, components/diff.ts, and the vinci-render wrappers of
+ * bash/read/grep/find/ls/edit/write). Arguments and results of other tools are rendered unmasked.
+ */
+const VIEW_MASKED_TOOLS = new Set(["bash", "read", "grep", "find", "ls", "edit", "write"]);
 
 // biome-ignore lint/suspicious/noExplicitAny: events are opaque JSON-shaped values here.
 type Json = any;
@@ -110,6 +132,7 @@ function addedText(before: string, next: string): string {
 
 export class VinciStreamMask {
 	private blocks = new Map<number, BlockState>();
+	private tools = new Map<number, ToolCallState>();
 	private latest: Json = undefined;
 	private readonly mask: (text: string) => string;
 
@@ -120,15 +143,17 @@ export class VinciStreamMask {
 	/**
 	 * The events to write in place of `event`. Text and thinking fields of a streaming assistant
 	 * message hold only their released, masked text; a delta holds the masked text it releases (empty
-	 * while held). A block's end, `message_end` and `agent_end` are preceded by one synthesized delta
-	 * per block that still had held text. Every other event passes through unchanged.
+	 * while held). A block's end, `message_end`, `agent_end` and a new assistant `message_start` are
+	 * preceded by one synthesized delta per block that still had held text. Every other event passes
+	 * through unchanged.
 	 */
 	process(event: Json): Json[] {
 		switch (event?.type) {
 			case "message_start":
 				if (isAssistant(event.message)) {
-					this.reset();
+					const held = this.flush();
 					this.latest = event.message;
+					return [...held, event];
 				}
 				return [event];
 			case "message_update":
@@ -150,18 +175,19 @@ export class VinciStreamMask {
 
 	/** Release whatever the streaming message still holds, masked (exit paths call this). */
 	flush(): Json[] {
-		const held = this.latest && this.blocks.size > 0 ? this.release(this.latest) : [];
+		const held = this.latest && (this.blocks.size > 0 || this.tools.size > 0) ? this.release(this.latest) : [];
 		this.reset();
 		return held;
 	}
 
 	private reset(): void {
 		this.blocks.clear();
+		this.tools.clear();
 		this.latest = undefined;
 	}
 
 	/** Advance `state` over `raw` and return the block's masked released text. */
-	private advance(state: BlockState, raw: string): string {
+	private advance(state: HoldState, raw: string): string {
 		const lines = raw.split("\n");
 		let release = state.done ? lines.length : state.released;
 		if (!state.done) {
@@ -174,8 +200,38 @@ export class VinciStreamMask {
 		}
 		state.released = release;
 		const shown = this.mask(lines.slice(0, release).join("\n"));
-		// A later key body's END scan may still take the trailing whitespace of a released line.
-		return state.done ? shown : shown.replace(/[ \t]+$/, "");
+		// A later key body's END scan or a line-spanning run may still take the trailing whitespace
+		// (including the `\r` of a CRLF line) of a released line.
+		return state.done ? shown : shown.replace(/[ \t\r]+$/, "");
+	}
+
+	/** Whether `raw` still has text past what `state` released. */
+	private holds(state: HoldState, raw: string): boolean {
+		return !state.done && raw.split("\n").slice(state.released).join("\n") !== "";
+	}
+
+	private toolStateFor(index: number, block: Json): ToolCallState | undefined {
+		if (block?.type !== "toolCall" || !VIEW_MASKED_TOOLS.has(block.name)) return undefined;
+		let state = this.tools.get(index);
+		if (!state) {
+			state = { raw: "", released: 0, shown: "", done: false, arguments: {} };
+			this.tools.set(index, state);
+		}
+		return state;
+	}
+
+	/**
+	 * A streaming tool call shows only what was released: its raw partial argument text is replaced by the
+	 * released, masked text, and while text is held its arguments stay at the last value seen unheld.
+	 */
+	private toolBlock(block: Json, state: ToolCallState): Json {
+		const shown: Json = { ...block };
+		for (const field of ["partialJson", "partialArgs"]) {
+			if (typeof block[field] === "string") shown[field] = state.shown;
+		}
+		if (this.holds(state, state.raw)) shown.arguments = state.arguments;
+		else state.arguments = block.arguments;
+		return shown;
 	}
 
 	private stateFor(index: number, kind: StreamedKind): BlockState {
@@ -193,10 +249,26 @@ export class VinciStreamMask {
 		const source = event.assistantMessageEvent;
 		const ending =
 			source?.type === "text_end" || source?.type === "thinking_end" ? (source.contentIndex as number) : -1;
+		const toolIndex =
+			source?.type === "toolcall_start" || source?.type === "toolcall_delta" || source?.type === "toolcall_end"
+				? (source.contentIndex as number)
+				: -1;
+		let toolAdded = "";
+		const toolState = toolIndex >= 0 ? this.toolStateFor(toolIndex, message.content[toolIndex]) : undefined;
+		if (toolState) {
+			if (source.type === "toolcall_delta" && typeof source.delta === "string") toolState.raw += source.delta;
+			if (source.type === "toolcall_end") toolState.done = true;
+			const shown = this.advance(toolState, toolState.raw);
+			toolAdded = addedText(toolState.shown, shown);
+			toolState.shown = shown;
+		}
 		const added = new Map<number, string>();
 		const content = message.content.map((block: Json, index: number) => {
 			const kind = streamedKind(block);
-			if (!kind) return block;
+			if (!kind) {
+				const tool = block?.type === "toolCall" ? this.tools.get(index) : undefined;
+				return tool ? this.toolBlock(block, tool) : block;
+			}
 			const state = this.stateFor(index, kind);
 			if (index === ending) state.done = true;
 			const shown = this.advance(state, block[kind]);
@@ -208,6 +280,7 @@ export class VinciStreamMask {
 		const out: Json[] = [];
 		const endingAdded = added.get(ending);
 		if (endingAdded) out.push(this.delta(masked, ending, endingAdded));
+		if (toolState && source.type === "toolcall_end" && toolAdded) out.push(this.toolDelta(masked, toolIndex, toolAdded));
 		let rewritten = source;
 		if (source && typeof source === "object") {
 			rewritten = { ...source };
@@ -215,6 +288,7 @@ export class VinciStreamMask {
 			if (source.type === "text_delta" || source.type === "thinking_delta") {
 				rewritten.delta = added.get(source.contentIndex) ?? "";
 			}
+			if (toolState && source.type === "toolcall_delta") rewritten.delta = toolAdded;
 			if (ending >= 0 && added.has(ending)) {
 				const block = content[ending];
 				rewritten.content = block[streamedKind(block) as StreamedKind];
@@ -226,8 +300,17 @@ export class VinciStreamMask {
 
 	/** One synthesized delta per block of `message` that still held text, all of it released and masked. */
 	private release(message: Json): Json[] {
-		if (this.blocks.size === 0 || !isAssistant(message)) return [];
+		if ((this.blocks.size === 0 && this.tools.size === 0) || !isAssistant(message)) return [];
 		const added = new Map<number, string>();
+		const toolAdded = new Map<number, string>();
+		for (const [index, state] of this.tools) {
+			if (state.done) continue;
+			state.done = true;
+			const shown = this.advance(state, state.raw);
+			const text = addedText(state.shown, shown);
+			if (text) toolAdded.set(index, text);
+			state.shown = shown;
+		}
 		const content = message.content.map((block: Json, index: number) => {
 			const kind = streamedKind(block);
 			if (!kind) return block;
@@ -241,7 +324,18 @@ export class VinciStreamMask {
 			return { ...block, [kind]: shown };
 		});
 		const masked = { ...message, content };
-		return [...added].map(([index, text]) => this.delta(masked, index, text));
+		return [
+			...[...added].map(([index, text]) => this.delta(masked, index, text)),
+			...[...toolAdded].map(([index, text]) => this.toolDelta(masked, index, text)),
+		];
+	}
+
+	private toolDelta(masked: Json, index: number, text: string): Json {
+		return {
+			type: "message_update",
+			message: masked,
+			assistantMessageEvent: { type: "toolcall_delta", contentIndex: index, delta: text, partial: masked },
+		};
 	}
 
 	private delta(masked: Json, index: number, text: string): Json {
@@ -262,13 +356,6 @@ export class VinciStreamMask {
 // ---------------------------------------------------------------------------------------------------
 // RPC scope: exactly what the interactive view masks.
 // ---------------------------------------------------------------------------------------------------
-
-/**
- * The built-in tools whose call header, preview, diff and output the interactive view masks
- * (tools/bash.ts output, tools/write.ts preview, components/diff.ts, and the vinci-render wrappers of
- * bash/read/grep/find/ls/edit/write). Results of other tools are rendered unmasked by the view.
- */
-const VIEW_MASKED_TOOLS = new Set(["bash", "read", "grep", "find", "ls", "edit", "write"]);
 
 function maskText(value: unknown): unknown {
 	return typeof value === "string" ? vinciMaskSecrets(value) : value;
@@ -302,6 +389,14 @@ function maskAssistantMessage(message: Json): Json {
 	return masked;
 }
 
+/**
+ * Mask one session message in the scope the interactive view masks: assistant text, thinking and
+ * error text, built-in tool call arguments and built-in tool results. Other messages are unchanged.
+ */
+export function vinciMaskViewMessage(message: Json): Json {
+	return maskMessage(message);
+}
+
 function maskMessage(message: Json): Json {
 	if (isAssistant(message)) return maskAssistantMessage(message);
 	if (message?.role === "toolResult" && VIEW_MASKED_TOOLS.has(message.toolName)) return maskToolOutput(message);
@@ -318,11 +413,8 @@ function maskAssistantEvent(source: Json): Json {
 	if (source.type === "toolcall_end" && source.toolCall && VIEW_MASKED_TOOLS.has(source.toolCall.name)) {
 		masked.toolCall = { ...source.toolCall, arguments: vinciMaskJson(source.toolCall.arguments) };
 	}
-	if (source.type === "toolcall_delta") {
-		const call = source.partial?.content?.[source.contentIndex];
-		if (call?.type === "toolCall" && VIEW_MASKED_TOOLS.has(call.name)) masked.delta = maskText(source.delta);
-	}
-	// text_delta / thinking_delta already carry released, masked text (VinciStreamMask).
+	// text_delta / thinking_delta and a built-in tool's toolcall_delta already carry released, masked
+	// text (VinciStreamMask); other tools' deltas pass through, as the view leaves their arguments unmasked.
 	return masked;
 }
 
