@@ -159,8 +159,8 @@ const TOOL_FALLBACK = [
  * A streaming message's block with no tool-call state: a call the view masks shows no arguments and empty
  * partial text, as a held call does (its own events went to another call); any other block is unchanged.
  */
-function untrackedCallBlock(block: Json): Json {
-	if (block?.type !== "toolCall" || !viewMasksCall(block)) return block;
+function untrackedCallBlock(block: Json, held = false): Json {
+	if (block?.type !== "toolCall" || (!held && !viewMasksCall(block))) return block;
 	const shown: Json = { ...block, arguments: {} };
 	for (const field of ["partialJson", "partialArgs"]) {
 		if (typeof block[field] === "string") shown[field] = "";
@@ -407,6 +407,11 @@ export class VinciStreamMask {
 	private interruptedIds = new Set<string>();
 	private interruptedBlocks = new WeakSet<object>();
 	private anyInterrupted = false;
+	/**
+	 * A tool event of the streaming message named no call (no usable content index, no id): every tool call of
+	 * that message is held from then on, releases nothing, and is shown as interrupted in its final events.
+	 */
+	private fallback = false;
 	private latest: Json = undefined;
 	private readonly mask: (text: string) => string;
 	private readonly work = { chars: 0 };
@@ -488,7 +493,7 @@ export class VinciStreamMask {
 	}
 
 	private isInterrupted(block: Json): boolean {
-		if (block?.type !== "toolCall" || !viewMasksCall(block)) return false;
+		if (block?.type !== "toolCall") return false;
 		if (this.interruptedBlocks.has(block)) return true;
 		return typeof block.id === "string" && block.id !== "" && this.interruptedIds.has(block.id);
 	}
@@ -497,10 +502,11 @@ export class VinciStreamMask {
 	private markInterrupted(message: Json): void {
 		if (!isAssistant(message)) return;
 		message.content.forEach((block: Json, index: number) => {
-			if (block?.type !== "toolCall" || !viewMasksCall(block)) return;
+			if (block?.type !== "toolCall" || (!this.fallback && !viewMasksCall(block))) return;
 			const state = this.tools.get(index);
-			// A built-in call with no state of its own, or whose state took fallback text, is interrupted too.
-			if (state && state.released && !state.guessed) return;
+			// A built-in call with no state of its own, or whose state took fallback text, is interrupted too;
+			// after a tool event that named no call, every call of the message is.
+			if (!this.fallback && state && state.released && !state.guessed) return;
 			this.interruptedBlocks.add(block);
 			if (typeof block.id === "string" && block.id !== "") this.interruptedIds.add(block.id);
 			this.anyInterrupted = true;
@@ -518,6 +524,7 @@ export class VinciStreamMask {
 		this.blocks.clear();
 		this.tools.clear();
 		this.latest = undefined;
+		this.fallback = false;
 	}
 
 	/** Advance `state` over `raw` and return the block's masked released text. */
@@ -581,6 +588,11 @@ export class VinciStreamMask {
 	 * and the call shows no arguments and empty partial text until the final events, which over-mask a
 	 * built-in call and carry a call the view does not mask with its own arguments.
 	 */
+	/** After a tool event that named no call, every tracked call of the message is held as taken by the fallback. */
+	private holdAllAfterFallback(): void {
+		if (this.fallback) for (const state of this.tools.values()) state.guessed = true;
+	}
+
 	private dropGuessed(state: ToolCallState): string {
 		state.released = true;
 		state.shown = "";
@@ -652,11 +664,14 @@ export class VinciStreamMask {
 		const isTool = type === "toolcall_start" || type === "toolcall_delta" || type === "toolcall_end";
 		const toolIndex = isTool ? blockIndexOf(source, message.content, (block) => block?.type === "toolCall", true, TOOL_FALLBACK) : -1;
 		const toolGuessed = toolIndex >= 0 && !namesToolCall(source, message.content, toolIndex);
+		if (isTool && (toolIndex < 0 || toolGuessed)) this.fallback = true;
 		let toolAdded = "";
 		let passedThrough = "";
+		this.holdAllAfterFallback();
 		if (toolIndex >= 0) passedThrough = this.unholdNamed(toolIndex, message.content[toolIndex]);
 		const toolState = toolIndex >= 0 ? this.toolStateFor(toolIndex, message.content[toolIndex]) : undefined;
 		if (toolState && toolGuessed) toolState.guessed = true;
+		this.holdAllAfterFallback();
 		if (toolState) {
 			if (type === "toolcall_delta" && typeof source.delta === "string") toolState.raw += source.delta;
 			if (type === "toolcall_end") {
@@ -673,7 +688,7 @@ export class VinciStreamMask {
 			const kind = streamedKind(block);
 			if (!kind) {
 				const tool = block?.type === "toolCall" ? this.tools.get(index) : undefined;
-				return tool ? this.toolBlock(block, tool) : untrackedCallBlock(block);
+				return tool ? this.toolBlock(block, tool) : untrackedCallBlock(block, this.fallback);
 			}
 			const state = this.stateFor(index, kind);
 			if (index === ending) state.done = true;
@@ -695,10 +710,10 @@ export class VinciStreamMask {
 			if (source.type === "text_delta" || source.type === "thinking_delta") {
 				rewritten.delta = added.get(streamedIndex) ?? "";
 			}
-			if (toolState && source.type === "toolcall_delta") rewritten.delta = "";
+			if ((toolState || this.fallback) && source.type === "toolcall_delta") rewritten.delta = "";
 			if (type === "done" && final) rewritten.message = this.maskFinal(final);
 			if (type === "error" && final) rewritten.error = this.maskFinal(final);
-			if (type === "toolcall_end" && source.toolCall) rewritten.toolCall = maskCompletedPartial(source.toolCall);
+			if (type === "toolcall_end" && source.toolCall) rewritten.toolCall = this.fallback ? maskCutCall(source.toolCall) : maskCompletedPartial(source.toolCall);
 			if (ending >= 0 && added.has(ending)) {
 				const block = content[ending];
 				rewritten.content = block[streamedKind(block) as StreamedKind];
@@ -710,10 +725,13 @@ export class VinciStreamMask {
 
 	/** One synthesized delta per block of `message` that still held text, all of it released and masked. */
 	private release(message: Json): Json[] {
-		if ((this.blocks.size === 0 && this.tools.size === 0) || !isAssistant(message)) return [];
+		if (!isAssistant(message)) return [];
+		// A built-in call with no state of its own is interrupted even when nothing else was streamed.
+		this.markInterrupted(message);
+		if (this.blocks.size === 0 && this.tools.size === 0) return [];
+		this.holdAllAfterFallback();
 		const added = new Map<number, string>();
 		const toolAdded = new Map<number, string>();
-		this.markInterrupted(message);
 		for (const [index, state] of this.tools) {
 			const block = message.content[index];
 			// A name that arrived only now and names a tool the view does not mask: released unchanged.
@@ -725,7 +743,7 @@ export class VinciStreamMask {
 			const kind = streamedKind(block);
 			if (!kind) {
 				const tool = block?.type === "toolCall" ? this.tools.get(index) : undefined;
-				return tool ? this.toolBlock(block, tool) : untrackedCallBlock(block);
+				return tool ? this.toolBlock(block, tool) : untrackedCallBlock(block, this.fallback);
 			}
 			const state = this.blocks.get(index);
 			if (!state || state.kind !== kind) return { ...block, [kind]: this.mask(block[kind]) };

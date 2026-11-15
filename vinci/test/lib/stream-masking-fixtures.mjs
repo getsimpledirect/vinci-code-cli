@@ -364,7 +364,9 @@ export function withSourceEnd(events, kind, final) {
  *    the call a tool the view does not mask;
  * 2. a built-in call that never gets state of its own (the fallback picks a nameless call) ends cut;
  * 3. a cut call's later fragment (a password value) is taken into a later call and parses alone;
- * 4. a later call's `toolcall_end` ends the streaming cut call, which keeps its incomplete partial text.
+ * 4. a later call's `toolcall_end` ends the streaming cut call, which keeps its incomplete partial text;
+ * 5. tool-call deltas arrive while the message holds no tool call;
+ * 6. a cut built-in call reaches the final events with no events of its own and nothing else streamed.
  */
 export function fallbackCases() {
 	const at = { contentIndex: 99 };
@@ -438,6 +440,22 @@ export function fallbackCases() {
 		events.push(update([a(text), done], { type: "toolcall_end", ...at, toolCall: done }));
 		events.push(...ends(assistant([a(text), done], "stop")));
 		cases["another call's end taken by a streaming cut call"] = { events, secret: [cut] };
+	}
+	{
+		const text = [block("text", "Working on it.")];
+		const half = token.length / 2;
+		const events = [
+			{ type: "message_start", message: assistant([]) },
+			update(text, { type: "toolcall_delta", contentIndex: 0, delta: `{"command":"${token.slice(0, half)}` }),
+			update(text, { type: "toolcall_delta", contentIndex: 0, delta: `${token.slice(half)}"}` }),
+		];
+		events.push(...ends(assistant(text, "stop")));
+		cases["tool-call deltas while the message holds no tool call"] = { events, secret: [token] };
+	}
+	for (const stopReason of ["stop", "aborted"]) {
+		const final = assistant([{ type: "toolCall", id: "x", name: "bash", arguments: { command: cut } }], stopReason);
+		const events = [{ type: "message_start", message: assistant([]) }, ...ends(final)];
+		cases[`a built-in call with no events of its own and nothing streamed, in a message that ended ${stopReason}`] = { events, secret: [cut] };
 	}
 	return cases;
 }

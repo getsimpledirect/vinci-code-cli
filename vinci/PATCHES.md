@@ -457,10 +457,11 @@ shown the same way in its final events and transcript responses, including calls
 every built-in call of a message cut at its length limit. A tool-call event whose content index names no tool-call block is taken to
 be about the call with its id, else the last call the view masks that still carries streaming argument
 text, else the last call the view masks, else the last call still carrying streaming text, else the last
-tool call: an unidentified call's text is held whenever any call in the message is one the view masks. Text
-taken that way is never released: the call it went to shows no arguments and empty partial text until the
-final events, where a built-in call is shown as interrupted. While a message streams, a built-in call with
-no state of its own shows no arguments and empty partial text, and its final events show it as interrupted. A completed built-in call that still carries partial
+tool call: an unidentified call's text is held whenever any call in the message is one the view masks. Once
+any tool event of a message names no call (no usable content index and no id), every tool call of that
+message is held from then on: no argument text is released, each call shows no arguments and empty partial
+text, and its final events show it as interrupted. A built-in call with no state of its own shows no
+arguments and empty partial text while the message streams, and its final events show it as interrupted. A completed built-in call that still carries partial
 argument text (in its `toolcall_end` call, a final event or a transcript response) carries the masked
 JSON of its arguments there; an empty text or the placeholder is kept as given. A block end,
 `message_end`, `agent_end`, a new assistant `message_start`, a rebind and the exit paths flush what is

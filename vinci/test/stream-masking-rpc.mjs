@@ -1179,10 +1179,10 @@ for (const [label, index] of [
 	});
 }
 
-// The fallback's last step: no call carries streaming text and none is one the view masks, so the text
-// belongs to a call the view does not mask and passes through as that call's (the over-mask side holds
-// whenever any call in the message is one the view masks).
-test("rpc positive control: an out-of-range content index with only calls the view does not mask is not held", async () => {
+// The fallback's last step: no call carries streaming text and none is one the view masks. The event names
+// no call, so every tool call of the message is held and over-masked in its final events, even calls the
+// view does not mask.
+test("rpc: an out-of-range content index with only calls the view does not mask: the message's tool text is held", async () => {
 	const token = inlineToken();
 	const json = JSON.stringify({ query: `find ${token}` });
 	const after = [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }];
@@ -1190,7 +1190,8 @@ test("rpc positive control: an out-of-range content index with only calls the vi
 	const stripped = JSON.parse(JSON.stringify(events, (key, value) => (key === "partialJson" ? undefined : value)));
 	assert.ok(!JSON.stringify(stripped).includes("partialJson"), "fixture sanity: no block carries streaming text");
 	const out = await runRpc(stripped);
-	assert.equal(out.stdout, stripped.map((event) => serializeJsonLine(event)).join(""), "passed through as calls the view does not mask");
+	assert.equal(deltasOf(out.events, "toolcall"), "", "nothing is released after an event that names no call");
+	assert.ok(!out.stdout.includes(token), "the final events over-mask the calls");
 });
 
 // The fallback order: when any call is one the view masks, an unidentified call's text is held as a masked
@@ -1263,7 +1264,11 @@ test("rpc positive control: a call named late as a tool the view does not mask, 
 	const { events } = toolCallEvents("extension_tool", fragmentsOf(json, 5), { id: "call-2", nameFrom: 3, before });
 	const out = await runRpc(events);
 	assert.equal(deltasOf(out.events, "toolcall"), json, "the joined deltas equal the raw argument text");
-	assert.ok(!out.stdout.includes(PLACEHOLDER));
+	assert.ok(!deltasOf(out.events, "toolcall").includes(PLACEHOLDER));
+	// The built-in call ahead of it has no events of its own: its final events show it as interrupted.
+	const end = out.events.find((event) => event.type === "message_end");
+	assert.deepEqual(end.message.content[1].arguments, JSON.parse(json), "the named call's own arguments are unchanged");
+	assert.equal(end.message.content[0].arguments.command, PLACEHOLDER, "the call with no events of its own is over-masked");
 });
 
 test("rpc positive control: a tracked built-in call's streaming message shows its masked arguments once released, not the held empty arguments", async () => {
@@ -1468,11 +1473,12 @@ test("rpc command census: every command in the rpc-mode switch has a masking ver
 	}
 });
 
-// Events that name no call (an out-of-range content index, no usable id): text the fallback took is never
-// released, and a built-in call the stream could not follow is shown as interrupted in its final events.
+// Events that name no call (an out-of-range content index, no usable id): every tool call of that message is
+// held and shown as interrupted in its final events; so is a built-in call the stream could not follow.
 for (const [label, { events, secret }] of Object.entries(fallbackCases())) {
 	test(`rpc: masking consistency for streamed tool arguments, events that name no call: ${label}`, async () => {
-		assert.ok(JSON.stringify(events).includes(secret[0]), "fixture sanity: the events carry the value");
+		const deltas = events.map((event) => event.assistantMessageEvent?.delta ?? "").join("");
+		assert.ok(JSON.stringify(events).includes(secret[0]) || deltas.includes(secret[0]), "fixture sanity: the events carry the value");
 		const out = await runRpc(events);
 		assertNoSecretBytes(out.stdout, secret, "whole stdout");
 	});
