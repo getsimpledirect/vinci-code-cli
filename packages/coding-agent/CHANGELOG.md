@@ -20,9 +20,11 @@
 ### Changed
 
 - Changed Vinci to collapse model thinking by default while preserving the configurable thinking-visibility toggle.
+- Changed `--mode json` and `--mode rpc` with secret masking on (`VINCI_CODE=1`): streamed bodies now arrive at block or result end. Intermediate text, thinking and tool-call argument deltas are empty, one delta carries the whole masked body before the block's end event, and `tool_execution_update` partial results are empty until `tool_execution_end`. Masking-off output is unchanged.
 
 ### Fixed
 
+- Fixed `--mode json` and `--mode rpc` with secret masking on writing secret bytes the interactive view masks: a value split across streamed lines, tool output whose parts join into a secret, a cumulative tool update, an ANSI escape sequence (CSI, or OSC with its terminator) or carriage return inside a value, and RPC fields outside the old allowlist (edit patches, truncated output, diagnostics, transcript responses). Every string written is now normalised (ANSI escape sequences stripped, carriage returns removed), then masked.
 - Fixed `/import` replacing existing sessions before validation; imports now preflight the source and working directory, create noncolliding files exclusively, and retain imported copies after runtime replacement starts.
 - Validated sign-in link targets before rendering or opening: HTTPS by default, with explicit local-file fixture opt-in; unsupported schemes, malformed targets and terminal control bytes show a non-actionable error.
 - Fixed offline fd/ripgrep downloads, including direct and lazy downloader calls, bootstrap overrides and inherited helper environments; cached and PATH tools remain available. Installed launches now honor offline intent before automatic updates.

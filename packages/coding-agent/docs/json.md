@@ -92,6 +92,10 @@ Followed by events as they occur:
 {"type":"agent_end","messages":[...]}
 ```
 
+### Secret masking
+
+With secret masking on (`VINCI_CODE=1`, as every Vinci run sets it), every string in the stream is masked, after terminal control sequences and carriage returns are removed as the interactive view removes them. Bodies arrive at block or result end: intermediate `text_delta` and `thinking_delta` events carry an empty `delta`, the partial message keeps each text or thinking block at its last released state (empty until the block ends), and one delta carrying the whole masked body precedes `text_end` / `thinking_end`. Tool-call argument deltas are released in one delta when the call ends. `tool_execution_update` events are still emitted with an empty `partialResult`; the masked output arrives in `tool_execution_end`. With masking off, events are written as they occur.
+
 ## Example
 
 ```bash

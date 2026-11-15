@@ -28,6 +28,7 @@ import {
 import { vinciMaskEnabled, vinciMaskSecrets } from "../../core/vinci-mask-secrets.ts";
 import {
 	VinciStreamMask,
+	vinciMaskStreamJson,
 	vinciMaskViewEntry,
 	vinciMaskViewEvent,
 	vinciMaskViewMessage,
@@ -64,12 +65,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
 
+	// [vinci] With masking on, everything written (events, command responses, extension UI requests and
+	// errors) goes through the whole-object masker: every string normalised, then masked. Unchanged
+	// (byte-identical) when masking is off.
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		writeRawStdout(serializeJsonLine(obj));
+		writeRawStdout(serializeJsonLine(vinciMaskEnabled() ? vinciMaskStreamJson(obj) : obj));
 	};
 
-	// [vinci] Session events are masked in the scope the interactive view masks; streamed text the mask
-	// may still change is held back, then written masked. Unchanged when masking is off.
+	// [vinci] Session events: streamed bodies (text, thinking, tool-call arguments, tool output) are held
+	// whole until their block or result ends, then written once, masked. Unchanged when masking is off.
 	const streamMask = new VinciStreamMask();
 	const outputEvent = (event: object) => {
 		if (!vinciMaskEnabled()) {
@@ -649,7 +653,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					}
 					entries = entries.slice(sinceIndex + 1);
 				}
-				// [vinci] message entries masked in the get_messages scope; ids and structure unchanged
+				// [vinci] entries masked like get_messages (and output masks every string); ids and structure unchanged
 				const shownEntries = vinciMaskEnabled()
 					? entries.map((entry) => vinciMaskViewEntry(entry, streamMask))
 					: entries;
@@ -658,7 +662,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "get_tree": {
 				const sessionManager = session.sessionManager;
-				// [vinci] each node's entry masked in the get_messages scope; nodes and structure unchanged
+				// [vinci] each node's entry masked like get_messages; nodes and structure unchanged
 				const tree = vinciMaskEnabled()
 					? vinciMaskViewTree(sessionManager.getTree(), streamMask)
 					: sessionManager.getTree();
@@ -687,7 +691,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "get_messages": {
-				// [vinci] masked in the scope the interactive view masks, like the event path (interrupted calls included)
+				// [vinci] masked like the event path (interrupted calls included); output masks every string
 				const messages = vinciMaskEnabled()
 					? session.messages.map((message) => vinciMaskViewMessage(message, streamMask))
 					: session.messages;

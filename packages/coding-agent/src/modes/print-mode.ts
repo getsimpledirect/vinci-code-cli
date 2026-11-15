@@ -11,8 +11,8 @@ import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { emitSessionBeforeExitEvent } from "../core/extensions/runner.ts";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.ts";
-import { vinciMaskEnabled, vinciMaskJson, vinciMaskSecrets } from "../core/vinci-mask-secrets.ts";
-import { VinciStreamMask } from "../core/vinci-stream-mask.ts";
+import { vinciMaskEnabled, vinciMaskSecrets } from "../core/vinci-mask-secrets.ts";
+import { VinciStreamMask, vinciMaskStreamJson } from "../core/vinci-stream-mask.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 
 // The 180000ms default is deliberately generous to avoid false kills during slow provider activity;
@@ -283,10 +283,11 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	const signalCleanupHandlers: Array<() => void> = [];
 	const timeoutMs = printModePrestreamTimeoutMs();
 	let prestreamWatchdog: PrintModeLivenessWatchdog | undefined;
-	// [vinci] --mode json: streamed text the mask may still change is held back, then written masked.
+	// [vinci] --mode json with masking on: streamed bodies (text, thinking, tool-call arguments, tool output)
+	// are held whole until their block or result ends, then written once, normalised and masked.
 	const streamMask = new VinciStreamMask();
 	const writeJsonEvent = (event: object): void => {
-		writeRawStdout(`${JSON.stringify(vinciMaskJson(event))}\n`);
+		writeRawStdout(`${JSON.stringify(vinciMaskStreamJson(event))}\n`);
 	};
 	// [vinci] Every end path writes what the stream still holds, masked: nothing held is dropped unwritten.
 	// Returns whether anything was written.
@@ -446,7 +447,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				// carry keys). Mask the structured event before serialization so redaction can never consume
 				// JSON punctuation or turn numeric telemetry into invalid syntax. Same "piped to a log never
 				// emits a live key" intent as the text path below — json includes raw tool output.
-				// Streamed text and thinking hold back what a later line could still unmask (VinciStreamMask).
+				// Streamed bodies are held whole until their block or result ends (VinciStreamMask).
 				if (vinciMaskEnabled()) {
 					for (const out of streamMask.process(event)) writeJsonEvent(out);
 				} else {

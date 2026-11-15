@@ -2,18 +2,23 @@
 // stand-in that emits assistant stream events (one completed line per update); every byte written to
 // stdout is recorded. Secret values are synthetic and built at runtime.
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+	ansiSecretCases,
 	assertMasked,
 	assertNeverRewritten,
+	assertNoRawSecret,
 	assertNoSecretBytes,
 	assistant,
 	block,
+	crossLineCases,
 	cutPoints,
 	cutToolCalls,
 	deltasOf,
+	fakeSecret,
 	fallbackCases,
 	finalEventsOf,
 	fragmentsOf,
@@ -24,8 +29,12 @@ import {
 	multiLineToolCalls,
 	PLACEHOLDER,
 	partialArgumentTexts,
+	probeBashCallEvents,
+	probeCumulativeEvents,
+	probeToolResultEvents,
 	secretRuns,
 	splitAcross,
+	splitKeyResult,
 	streamEvents,
 	toolCallEvents,
 	toolNameSynonyms,
@@ -148,7 +157,8 @@ test("json: an aborted answer (message_end, no text_end) flushes the held run ma
 	const endIndex = out.events.findIndex((event) => event.type === "message_end");
 	assert.ok(endIndex > 0, "message_end is written");
 	const before = out.events.slice(0, endIndex - 1);
-	assert.equal(deltasOf(before), "Here it is:", "the run is held while it may still change");
+	// 206q (timing): with masking on the whole body is held until the message ends; every earlier delta is empty.
+	assert.equal(deltasOf(before), "", "the body is held until the message ends");
 	const flushed = out.events[endIndex - 1];
 	assert.equal(flushed.type, "message_update", "a flushed delta precedes message_end");
 	assert.ok(flushed.assistantMessageEvent.delta.includes(PLACEHOLDER), "the flushed delta is masked");
@@ -268,8 +278,9 @@ test("json: a rebind writes the held run masked at once", async () => {
 			afterRebind = stdout();
 		},
 	});
-	assert.ok(beforeRebind.includes("Here it is:"), "the stream so far is written");
-	assert.ok(!deltasOf(parseLines(beforeRebind)).includes(PLACEHOLDER), "held before the rebind");
+	// 206q (timing): the stream so far is written, its text deltas empty (the body is held whole).
+	assert.ok(parseLines(beforeRebind).some((event) => event.assistantMessageEvent?.type === "text_delta"), "the stream so far is written");
+	assert.equal(deltasOf(parseLines(beforeRebind)), "", "held before the rebind");
 	assertMasked(afterRebind, run.secret, "rebind");
 	assert.ok(deltasOf(parseLines(afterRebind)).includes(PLACEHOLDER), "the rebind flush wrote the held run, masked");
 });
@@ -285,15 +296,16 @@ test("json: a new assistant message_start writes the previous message's held run
 	assert.ok(deltasOf(out.events.slice(0, starts[1])).includes(PLACEHOLDER), "the held run is written before the next message_start");
 });
 
-test("json positive control: prose lines are each written when they complete, byte-identical", async () => {
+test("json positive control: prose lines are held, then written whole once at text_end, byte-identical", async () => {
 	const lines = ["First line.", "Second line, with a comma;", "Third (and last)."];
 	const { events, text } = streamEvents(lines);
 	const out = await runJson(events);
 	const updates = out.events.filter((event) => event.assistantMessageEvent?.type === "text_delta");
+	// 206q (timing): each streamed delta is written empty; one synthesized delta carries the whole body at text_end.
 	assert.deepEqual(
 		updates.map((event) => event.assistantMessageEvent.delta),
-		["First line.", "\nSecond line, with a comma;", "\nThird (and last).", "\n"],
-		"each line is released at the update that completes it; the trailing newline at the end",
+		["", "", "", text],
+		"every streamed delta is empty; the whole text is released once, at the block's end",
 	);
 	assert.equal(deltasOf(out.events), text, "the deltas add up to the raw text");
 	const end = out.events.find((event) => event.type === "message_end");
@@ -336,12 +348,21 @@ test("json positive control: non-secret bash arguments arrive byte-identical onc
 	assert.deepEqual(end.message.content[0].arguments, JSON.parse(json));
 });
 
-test("json: a tool the view does not mask keeps its old per-event masking of argument deltas", async () => {
+// 206q (scope, r2 Q4): a tool the view does not mask is held too (fail closed): its argument text is released
+// once, at the call's end. 206r (F1, more masking): released as the masked JSON of the parsed arguments.
+test("json: a tool the view does not mask holds its argument deltas and releases them once, masked", async () => {
 	const token = inlineToken();
 	const json = JSON.stringify({ query: `find ${token}` });
 	const { events } = toolCallEvents("extension_tool", splitAcross(json, token, 0));
 	const out = await runJson(events);
-	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "as before this change");
+	const released = out.events.filter((event) => event.assistantMessageEvent?.type === "toolcall_delta" && event.assistantMessageEvent.delta);
+	assert.equal(released.length, 1, "one release, at the call's end");
+	// 206r (F1, more masking): the release is the masked JSON of the parsed arguments, not the text masked whole.
+	assert.equal(deltasOf(out.events, "toolcall"), JSON.stringify(vinciMaskJson(JSON.parse(json))), "the masked JSON of the arguments");
+	assertMasked(out.stdout, [token], "whole stdout");
+	const end = out.events.find((event) => event.type === "message_end");
+	const rawEnd = events.find((event) => event.type === "message_end");
+	assert.deepEqual(end, JSON.parse(JSON.stringify(vinciMaskJson(rawEnd))), "message_end is masked as before");
 });
 
 const toolFragment = 9;
@@ -578,14 +599,25 @@ for (const field of ["partialJson", "partialArgs"]) {
 	});
 }
 
-test("json positive control: a completed call of a tool the view does not mask keeps its partial argument text, byte-identical", async () => {
+// 206r (F1, more masking): the retained partial argument text of a call of a tool the view does not mask is the
+// masked JSON of its arguments (the spaced JSON shows the rewrite); everything else in its end events is as before.
+test("json positive control: a completed call of a tool the view does not mask keeps its partial argument text as the masked JSON of its arguments", async () => {
 	const token = inlineToken();
 	// Spaced JSON: a rewrite to the JSON of the parsed arguments would show.
 	const json = `{"query": "find ${token}", "limit": 20}`;
 	const { events, final } = toolCallEvents("extension_tool", splitAcross(json, token, 0), { finals: true, keepPartialOnEnd: true });
 	assert.equal(final?.content?.[0]?.partialJson, json, "fixture sanity: the final message keeps the raw text");
 	const out = await runJson(events);
-	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "as before this change");
+	const masked = JSON.stringify(vinciMaskJson(JSON.parse(json)));
+	const withMasked = (event) => JSON.parse(JSON.stringify(event, (key, value) => (key === "partialJson" && value === json ? masked : value)));
+	// 206q (timing, r2 Q4): the call is held while it streams, so only its end events are as before this change.
+	const ends = (lines) => lines.filter((line) => /^\{"type":"(message_end|turn_end|agent_end)"/.test(line) || line.includes('"type":"toolcall_end"'));
+	assert.deepEqual(
+		ends(out.stdout.split("\n").filter(Boolean)),
+		ends(events.map((event) => JSON.stringify(vinciMaskJson(withMasked(event))))),
+		"the end events are the masked events, their partial argument text the masked JSON of the arguments",
+	);
+	assert.equal(deltasOf(out.events, "toolcall"), masked, "released once, as the masked JSON of the arguments");
 });
 
 test("json: a built-in call's streaming partial text is unchanged by the completed-call scrub", async () => {
@@ -985,13 +1017,21 @@ for (const [name, tool] of synonymCases()) {
 	});
 }
 
-test("json positive control: a name that is neither a built-in tool nor a synonym of one is not held", async () => {
+test("json positive control: a name that is neither a built-in tool nor a synonym of one is not masked as a built-in", async () => {
 	const token = inlineToken();
 	const json = JSON.stringify({ query: `find ${token}` });
 	for (const name of ["constructor", "toString", "shell_helper", "Edit"]) {
 		const { events } = toolCallEvents(name, splitAcross(json, token, 0));
 		const out = await runJson(events);
-		assert.equal(out.stdout, events.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), `${name}: as a tool the view does not mask`);
+		// 206q (timing, r2 Q4): every call is held while it streams, and its end events are as before.
+		// 206r (F1, more masking): a tool the view does not mask releases the masked JSON of its arguments at its end.
+		const ends = (lines) => lines.filter((line) => /^\{"type":"(message_end|turn_end|agent_end)"/.test(line) || line.includes('"type":"toolcall_end"'));
+		assert.deepEqual(
+			ends(out.stdout.split("\n").filter(Boolean)),
+			ends(events.map((event) => JSON.stringify(vinciMaskJson(event)))),
+			`${name}: end events as a tool the view does not mask`,
+		);
+		assert.equal(deltasOf(out.events, "toolcall"), JSON.stringify(vinciMaskJson(JSON.parse(json))), `${name}: released as the masked JSON of its arguments`);
 	}
 });
 
@@ -1026,13 +1066,15 @@ test("json: an open `${` holds its lines until it closes, so released text is ne
 	assert.equal(deltasOf(out.events), fieldOf(end.message), "the deltas add up to the message_end text");
 });
 
-test("json: an unclosed `${` holds at most its line cap, then releases", async () => {
+test("json: an unclosed `${` is held with the rest of the body and released once, at the end", async () => {
 	const items = Array.from({ length: 24 }, (_, i) => `item ${i + 1};`);
 	const { events } = streamEvents(["Run this:", "echo ${HOME:-", ...items, "Done."], { end: false, withEnd: false });
 	events.push({ type: "message_end", message: assistant([block("text", events.at(-1).message.content[0].text)]) });
 	const out = await runJson(events);
 	const endIndex = out.events.findIndex((event) => event.type === "message_end");
-	assert.ok(deltasOf(out.events.slice(0, endIndex - 1)).includes("item 1;"), "the capped run is released before the end");
+	// 206q (timing): nothing is released line by line any more; the whole body goes out once, just before message_end.
+	assert.equal(deltasOf(out.events.slice(0, endIndex - 1)), "", "nothing is released before the end");
+	assert.ok(out.events[endIndex - 1]?.assistantMessageEvent?.delta?.includes("item 1;"), "the whole body is released once, before message_end");
 });
 
 test("json: a BEGIN-line private key, streamed one line per update, never reaches stdout", async () => {
@@ -1132,3 +1174,348 @@ for (const [label, { events, secret }] of Object.entries(fallbackCases())) {
 		assertNoSecretBytes(out.stdout, secret, "whole stdout");
 	});
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Review findings R221-01..05 through runPrintMode: with masking on, no raw secret byte reaches stdout.
+// ---------------------------------------------------------------------------------------------------
+
+/** No written event carries the raw `secret` (each named by its type), nor the whole stdout. */
+function assertNoRawSecretInEvents(out, secret, where) {
+	for (const event of out.events) assertNoRawSecret(JSON.stringify(event), secret, `${where}: ${event?.type} event`);
+	assertNoRawSecret(out.stdout, secret, `${where}: whole stdout`);
+}
+
+// 206r (C4): the run completed: runPrintMode returned 0 and each expected terminal event was written (a run that
+// failed part-way, its output cut short, would otherwise pass an absence check).
+function assertCompleted(out, terminals, where) {
+	assert.equal(out.exitCode, 0, `${where}: the run exits 0`);
+	for (const type of terminals) assert.ok(out.events.some((event) => event?.type === type), `${where}: ${type} is written`);
+}
+
+// R221-01: a value the masker finds only once a later chunk arrives is never released raw.
+for (const kind of ["text", "thinking"]) {
+	for (const { label, chunks, secret } of crossLineCases()) {
+		test(`json R221-01: ${kind}, ${label}: no raw secret byte reaches stdout`, async () => {
+			const { events, text } = streamEvents(chunks, { kind, eol: "" });
+			assert.ok(text.includes(secret), "fixture sanity: the raw stream holds the secret");
+			assert.ok(!vinciMaskSecrets(text).includes(secret), "fixture sanity: the mask of the joined body hides the secret");
+			const out = await runJson(events);
+			assertNoRawSecret(out.stdout, secret, `R221-01 (json, ${kind}, ${label})`);
+			assertCompleted(out, ["message_end"], `R221-01 (json, ${kind}, ${label})`); // 206r (C4)
+		});
+	}
+}
+
+// R221-05: bash output is masked as the view masks it, on the joined and final body, not per fragment. Inputs
+// are the review probe's.
+test("json R221-05: a bash result whose text parts join into a key block: no raw key byte reaches stdout", async () => {
+	const { parts, hidden, details } = splitKeyResult();
+	assert.ok(vinciMaskSecrets(parts[0]).includes(hidden), "fixture sanity: the first part alone is not masked");
+	assert.ok(!vinciMaskSecrets(parts.join("\n")).includes(hidden), "fixture sanity: the mask of the joined body hides the body");
+	const events = probeToolResultEvents(
+		parts.map((text) => ({ type: "text", text })),
+		details,
+	);
+	const out = await runJson(events);
+	assertNoRawSecretInEvents(out, hidden, "R221-05 (json, parts join)");
+	assertCompleted(out, ["tool_execution_end"], "R221-05 (json, parts join)"); // 206r (C4)
+});
+
+test("json R221-05: a cumulative bash update that ends before the END line: no raw key byte reaches stdout", async () => {
+	const { cumulative, final, hidden } = splitKeyResult();
+	assert.ok(vinciMaskSecrets(cumulative).includes(hidden), "fixture sanity: the first update alone is not masked");
+	assert.ok(!vinciMaskSecrets(final).includes(hidden), "fixture sanity: the mask of the final body hides the body");
+	const out = await runJson(probeCumulativeEvents(cumulative, final));
+	assertNoRawSecretInEvents(out, hidden, "R221-05 (json, cumulative update)");
+	assertCompleted(out, ["tool_execution_end"], "R221-05 (json, cumulative update)"); // 206r (C4)
+});
+
+// R221-02 [S3]: a terminal control sequence (or a carriage return) inside an assignment, as the review probe built
+// it. These rows are S3's: when S3 is scoped out as a Known limit, run with VINCI_STREAM_MASK_S3_ROWS=0 and they
+// are skipped with that reason.
+const s3Rows = { skip: process.env.VINCI_STREAM_MASK_S3_ROWS === "0" ? "S3 scoped out (Known limit: control-sequence-split secrets)" : false };
+
+test("json R221-02 [S3]: a control sequence inside an assignment in streamed bash arguments: no raw secret byte reaches stdout", s3Rows, async () => {
+	const { secret, command } = ansiSecretCases();
+	const out = await runJson(probeBashCallEvents(command));
+	assertNoRawSecret(out.stdout, secret, "R221-02 (json, bash arguments)");
+	assertCompleted(out, ["message_end", "agent_end"], "R221-02 (json, bash arguments)"); // 206r (C4)
+});
+
+for (const [label, field] of [
+	["a control sequence", "ansiOutput"],
+	["a carriage return", "crOutput"],
+]) {
+	test(`json R221-02 [S3]: ${label} inside an assignment in bash output: no raw secret byte reaches stdout`, s3Rows, async () => {
+		const cases = ansiSecretCases();
+		const { details } = splitKeyResult();
+		const out = await runJson(probeToolResultEvents([{ type: "text", text: cases[field] }], details));
+		assertNoRawSecret(out.stdout, cases.secret, `R221-02 (json, bash output, ${label})`);
+		assertCompleted(out, ["tool_execution_end"], `R221-02 (json, bash output, ${label})`); // 206r (C4)
+	});
+}
+
+test("json R221-02 [S3]: a control sequence inside an assignment in an assistant error message: no raw secret byte reaches stdout", s3Rows, async () => {
+	const { secret, errorMessage } = ansiSecretCases();
+	const message = { role: "assistant", content: [], stopReason: "error", errorMessage };
+	const out = await runJson([{ type: "message_end", message }]);
+	assertNoRawSecret(out.stdout, secret, "R221-02 (json, assistant error message)");
+	// 206r (C4): this row's input is message_end alone (no agent_end by design): message_end is its terminal event.
+	assertCompleted(out, ["message_end"], "R221-02 (json, assistant error message)");
+});
+
+// Append-only consumer (scripts/session-transcripts.ts): non-empty text deltas are appended to a buffer, which is
+// printed and cleared at tool_execution_start and turn_end. There it must hold the full masked answer.
+test("json consumer control (session transcripts): text deltas alone rebuild each masked answer by tool start and turn end", async () => {
+	const runs = secretRuns();
+	const answer = (run, intro) => [`${intro}\n`, ...run.lines.map((line) => `${line}\n`), "That is all."];
+	const first = streamEvents(answer(runs["a multi-line base64 secret"], "Here it is:"), { eol: "" });
+	const second = streamEvents(answer(runs["a multi-line hex secret"], "And this:"), { eol: "" });
+	const events = [
+		...first.events,
+		{ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: { path: "notes.txt" } },
+		{ type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: { content: [{ type: "text", text: "notes\n" }] }, isError: false },
+		...second.events,
+		{ type: "turn_end", message: second.events.at(-1).message, toolResults: [] },
+	];
+	const out = await runJson(events);
+	const printed = [];
+	let buffer = "";
+	for (const event of out.events) {
+		const source = event?.assistantMessageEvent;
+		if (event?.type === "message_update" && source) {
+			if (source.type === "text_delta" && source.delta) buffer += source.delta;
+		} else if (event?.type === "tool_execution_start" && event.toolName) {
+			if (buffer.trim()) {
+				printed.push(buffer);
+				buffer = "";
+			}
+		} else if (event?.type === "turn_end") {
+			if (buffer.trim()) printed.push(buffer);
+			buffer = "";
+		}
+	}
+	const answers = out.events
+		.filter((event) => event?.type === "message_end" && event.message?.role === "assistant" && Array.isArray(event.message.content))
+		.map((event) => fieldOf(event.message));
+	assert.equal(answers.length, 2, "two answers are written");
+	for (const text of answers) assert.ok(typeof text === "string" && text.includes(PLACEHOLDER), "each written answer is masked");
+	assert.deepEqual(printed, answers, "the consumer prints each full masked answer");
+	assertMasked(printed.join("\n"), runs["a multi-line base64 secret"].secret, "consumer, first answer");
+	assertMasked(printed.join("\n"), runs["a multi-line hex secret"].secret, "consumer, second answer");
+});
+
+test("json positive control (206q): ordinary prose arrives whole by text_end and the deltas rebuild the final text", async () => {
+	const { events, text } = streamEvents(["First line.\n", "Second line, with a comma;\n", "Third (and last)."], { eol: "" });
+	const out = await runJson(events);
+	const endAt = out.events.findIndex((event) => event?.assistantMessageEvent?.type === "text_end");
+	assert.ok(endAt > 0, "text_end is written");
+	assert.equal(deltasOf(out.events.slice(0, endAt)), text, "the deltas before text_end rebuild the raw text");
+	assert.equal(out.events[endAt].assistantMessageEvent.content, text, "text_end carries the raw text");
+	const end = out.events.find((event) => event?.type === "message_end");
+	assert.equal(end?.message?.content ? fieldOf(end.message) : undefined, text, "message_end carries the raw text");
+	assert.ok(!out.stdout.includes(PLACEHOLDER), "nothing is masked");
+});
+
+test("json positive control (206q): ordinary bash output arrives whole at tool_execution_end", async () => {
+	const content = [
+		{ type: "text", text: "line one" },
+		{ type: "text", text: "line two" },
+	];
+	const result = { role: "toolResult", toolCallId: "call-1", toolName: "bash", content, isError: false, timestamp: 1 };
+	const events = [
+		{ type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: { command: "ls" } },
+		{ type: "tool_execution_update", toolCallId: "call-1", toolName: "bash", args: { command: "ls" }, partialResult: { content: [content[0]], details: {} } },
+		{ type: "tool_execution_end", toolCallId: "call-1", toolName: "bash", result: { content }, isError: false },
+		{ type: "message_end", message: result },
+	];
+	const out = await runJson(events);
+	const joined = (parts) => (Array.isArray(parts) ? parts.filter((part) => part?.type === "text").map((part) => part.text).join("\n") : undefined);
+	const end = out.events.find((event) => event?.type === "tool_execution_end");
+	assert.equal(joined(end?.result?.content), "line one\nline two", "tool_execution_end carries the whole output");
+	const message = out.events.find((event) => event?.type === "message_end");
+	assert.equal(joined(message?.message?.content), "line one\nline two", "the tool result message carries the whole output");
+	assert.ok(!out.stdout.includes(PLACEHOLDER), "nothing is masked");
+});
+
+// Masking off is byte-identical to main: one fixed run against a golden captured on main by the host.
+const maskingOffGolden = resolve(here, "fixtures/stream-masking-off-golden.json");
+
+test("json with masking off: one fixed run's stdout is byte-identical to the golden captured on main", async () => {
+	assert.ok(existsSync(maskingOffGolden), `the masking-off golden is at ${maskingOffGolden}`);
+	const golden = JSON.parse(readFileSync(maskingOffGolden, "utf8"));
+	assert.ok(Array.isArray(golden?.fixture?.events) && golden.fixture.events.length > 0, "fixture sanity: the golden holds its events");
+	assert.equal(typeof golden?.json, "string", "fixture sanity: the golden holds the json stdout");
+	const out = await runJson(golden.fixture.events, { masking: false });
+	assert.equal(out.stdout, golden.json, "masking off: stdout is byte-identical to main");
+});
+
+// ---------------------------------------------------------------------------------------------------
+// 206r: a tool the view does not mask, replayed signatures and serialization hooks, through runPrintMode.
+// ---------------------------------------------------------------------------------------------------
+
+// 206r (F1): obviously fake values under names the property masker knows and the text masker misses in quoted
+// JSON (Authorization, access, refresh, key), at top level and nested.
+function f1Arguments() {
+	const values = {
+		Authorization: ["Qv7Lx2Nm", "8Rt4Pz6Wk"].join("-"),
+		access: ["Hb3Jd9Fs", "5Gq1Mc7Yt"].join("-"),
+		refresh: ["Ze6Wn4Kp", "2Xu8Vr3Lb"].join("-"),
+		key: ["Tm5Ca1Hy", "7Do9Es4Ui"].join("-"),
+		"headers.Authorization": ["Pw2Ri8Oe", "6Su3Ya5Bn"].join("-"),
+	};
+	const args = {
+		path: "notes/out.txt",
+		Authorization: values.Authorization,
+		access: values.access,
+		refresh: values.refresh,
+		key: values.key,
+		headers: { Authorization: values["headers.Authorization"] },
+	};
+	return { args, values };
+}
+
+/** The stdout line of the first written event that `matches`. */
+const lineOf = (stdout, matches) => stdout.split("\n").find((line) => line !== "" && matches(JSON.parse(line)));
+
+// 206r (F1): a call of a tool the view does not mask releases the masked JSON of its arguments, so no value
+// under a secret name reaches a toolcall_delta, the toolcall_end event, message_end or anything else.
+test("json 206r (F1): a call of a tool the view does not mask: no value under a secret name reaches its deltas, toolcall_end or message_end", async () => {
+	const { args, values } = f1Arguments();
+	const json = JSON.stringify(args);
+	const fragments = fragmentsOf(json, 7);
+	for (const value of Object.values(values)) {
+		assert.ok(!fragments.some((fragment) => fragment.includes(value)), `fixture sanity: ${value} is split across deltas`);
+	}
+	const { events, final } = toolCallEvents("mytool", fragments, { finals: true, keepPartialOnEnd: true });
+	assert.equal(final?.content?.[0]?.partialJson, json, "fixture sanity: the final message keeps the raw text");
+	const out = await runJson(events);
+	assertCompleted(out, ["message_end", "agent_end"], "206r (F1, json)");
+	const deltas = out.events.filter((event) => event?.assistantMessageEvent?.type === "toolcall_delta");
+	assert.ok(deltas.length >= fragments.length, "fixture sanity: the toolcall_delta events are written");
+	const toolcallEnd = lineOf(out.stdout, (event) => event?.assistantMessageEvent?.type === "toolcall_end");
+	const messageEnd = lineOf(out.stdout, (event) => event?.type === "message_end");
+	assert.ok(toolcallEnd && messageEnd, "the toolcall_end and message_end events are written");
+	for (const [name, value] of Object.entries(values)) {
+		deltas.forEach((event, n) => assertNoRawSecret(event.assistantMessageEvent.delta, value, `206r (F1, json): ${name}: toolcall_delta ${n}`));
+		assertNoRawSecret(toolcallEnd, value, `206r (F1, json): ${name}: the toolcall_end event`);
+		assertNoRawSecret(messageEnd, value, `206r (F1, json): ${name}: the message_end event`);
+		assertNoRawSecret(out.stdout, value, `206r (F1, json): ${name}: whole stdout`);
+	}
+	assert.equal(deltasOf(out.events, "toolcall"), JSON.stringify(vinciMaskJson(args)), "the release is the masked JSON of the arguments");
+});
+
+// 206r (C2): an OpenAI Responses reasoning item kept as the thinking block's signature (JSON.stringify of the item).
+function reasoningSignature(summaryText) {
+	const encrypted = Buffer.from("opaque reasoning state, a stand-in value only. ".repeat(4)).toString("base64");
+	return JSON.stringify({ id: "rs_fake0001", type: "reasoning", summary: [{ type: "summary_text", text: summaryText }], encrypted_content: encrypted });
+}
+
+/** Thinking stream events whose end events carry `signature` as the block's thinkingSignature, then turn_end and agent_end. */
+function signedThinkingEvents(lines, signature) {
+	const { events, text } = streamEvents(lines, { kind: "thinking" });
+	const signed = (message) =>
+		message?.content ? { ...message, content: message.content.map((part) => (part?.type === "thinking" ? { ...part, thinkingSignature: signature } : part)) } : message;
+	const shown = events.map((event) => {
+		if (event.type !== "message_end" && event.assistantMessageEvent?.type !== "thinking_end") return event;
+		const copy = { ...event, message: signed(event.message) };
+		if (event.assistantMessageEvent?.partial) copy.assistantMessageEvent = { ...event.assistantMessageEvent, partial: copy.message };
+		return copy;
+	});
+	const final = shown.at(-1).message;
+	return { events: [...shown, { type: "turn_end", message: final, toolResults: [] }, { type: "agent_end", messages: [final] }], text };
+}
+
+/** Every thinkingSignature string anywhere in `value`. */
+function signaturesIn(value) {
+	const found = [];
+	const walk = (entry) => {
+		if (Array.isArray(entry)) entry.forEach(walk);
+		else if (entry && typeof entry === "object") {
+			for (const [key, inner] of Object.entries(entry)) {
+				if (key === "thinkingSignature" && typeof inner === "string") found.push(inner);
+				else walk(inner);
+			}
+		}
+	};
+	walk(value);
+	return found;
+}
+
+test("json 206r (C2): a private-key body inside a reasoning item's summary kept as thinkingSignature: no raw key byte reaches stdout", async () => {
+	const run = secretRuns()["an END-only private-key body"];
+	const lines = ["Checking the deploy key:", ...run.lines, "Done."];
+	const signature = reasoningSignature(`${lines.join("\n")}\n`);
+	assert.ok(signature.includes(run.secret[0].slice(0, 12)), "fixture sanity: the signature carries the key body");
+	// 206r (C2 fixture): the opaque fields share no window with the key body, so a red row means the summary text leaked.
+	const { summary: _summary, ...opaque } = JSON.parse(signature);
+	assertNoSecretBytes(JSON.stringify(opaque), run.secret, "fixture sanity: the signature outside its summary");
+	const { events } = signedThinkingEvents(lines, signature);
+	const out = await runJson(events);
+	assertCompleted(out, ["message_end", "agent_end"], "206r (C2, json)");
+	for (const event of out.events) assertNoSecretBytes(JSON.stringify(event), run.secret, `206r (C2, json): ${eventName(event)} event`);
+	assertNoSecretBytes(out.stdout, run.secret, "206r (C2, json): whole stdout");
+	const written = signaturesIn(out.events.find((event) => event?.type === "message_end"));
+	assert.equal(written.length, 1, "message_end carries the signature");
+	assert.ok(JSON.parse(written[0]).summary[0].text.includes(PLACEHOLDER), "the signature is masked decoded: its summary text holds the placeholder");
+});
+
+test("json positive control 206r (C2): a reasoning item with no secret, kept as thinkingSignature, is written byte-identical", async () => {
+	const lines = ["Looked at the repository layout.", "Planned a small edit to the parser."];
+	const signature = reasoningSignature(`${lines.join("\n")}\n`);
+	const { events } = signedThinkingEvents(lines, signature);
+	const out = await runJson(events);
+	assertCompleted(out, ["message_end", "agent_end"], "206r (C2 control, json)");
+	const written = signaturesIn(out.events);
+	assert.ok(written.length >= 4, "fixture sanity: thinking_end, message_end, turn_end and agent_end carry the signature");
+	for (const text of written) assert.equal(text, signature, "the written thinkingSignature is the input string, byte for byte");
+});
+
+// 206r (C3): a value whose toJSON returns an object with its own toJSON, `depth` levels deep, the last returning text.
+function hookChain(depth, text) {
+	let value = text;
+	for (let level = 0; level < depth; level++) {
+		const inner = value;
+		value = { toJSON: () => inner };
+	}
+	return value;
+}
+
+/** A tool result whose details are `details`: tool_execution_start, tool_execution_end and the tool result message. */
+function detailsEvents(details) {
+	const result = { content: [{ type: "text", text: "done" }], details };
+	const message = { role: "toolResult", toolCallId: "call-1", toolName: "extension_tool", ...result, isError: false, timestamp: 1 };
+	return [
+		{ type: "tool_execution_start", toolCallId: "call-1", toolName: "extension_tool", args: {} },
+		{ type: "tool_execution_end", toolCallId: "call-1", toolName: "extension_tool", result, isError: false },
+		{ type: "message_start", message },
+		{ type: "message_end", message },
+	];
+}
+
+test("json 206r (C3): details whose toJSON returns an object with its own toJSON: no raw secret reaches stdout", async () => {
+	const secret = fakeSecret();
+	for (const depth of [2, 3]) {
+		const details = hookChain(depth, `password=${secret}`);
+		let reached = details;
+		for (let level = 0; level < depth; level++) reached = reached.toJSON();
+		assert.equal(reached, `password=${secret}`, `fixture sanity: depth ${depth}: the hooks end in the secret`);
+		const out = await runJson(detailsEvents(details));
+		assertCompleted(out, ["tool_execution_end", "message_end"], `206r (C3, json, depth ${depth})`);
+		assertNoRawSecret(out.stdout, secret, `206r (C3, json, depth ${depth}): whole stdout`);
+		const end = out.events.find((event) => event?.type === "tool_execution_end");
+		assert.deepEqual(end?.result?.details, JSON.parse(JSON.stringify(details)), `depth ${depth}: details serialise as JSON.stringify serialises them`);
+	}
+});
+
+test("json positive control 206r (C3): ordinary toJSON values and function-valued properties serialise as JSON.stringify serialises them", async () => {
+	const details = { when: new Date(0), info: { toJSON: () => ({ note: "plain text" }) }, list: [1, () => 1, "x"], hook: () => 1 };
+	const out = await runJson(detailsEvents(details));
+	assertCompleted(out, ["tool_execution_end", "message_end"], "206r (C3 control, json)");
+	const expected = JSON.parse(JSON.stringify(details));
+	assert.deepEqual(expected, { when: "1970-01-01T00:00:00.000Z", info: { note: "plain text" }, list: [1, null, "x"] }, "fixture sanity");
+	const end = out.events.find((event) => event?.type === "tool_execution_end");
+	assert.deepEqual(end?.result?.details, expected, "tool_execution_end details are unchanged");
+	const message = out.events.find((event) => event?.type === "message_end");
+	assert.deepEqual(message?.message?.details, expected, "the tool result message's details are unchanged");
+});

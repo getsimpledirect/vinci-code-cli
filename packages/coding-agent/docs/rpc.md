@@ -872,6 +872,8 @@ Emitted when a message begins and completes. The `message` field contains an `Ag
 
 Emitted during streaming of assistant messages. Contains both the partial message and a streaming delta event.
 
+With secret masking on (`VINCI_CODE=1`, as every Vinci run sets it), bodies arrive at block end: each intermediate `text_delta` and `thinking_delta` carries an empty `delta`, and the partial message keeps each text or thinking block at its last released state (empty until the block ends). When the block ends, one `text_delta` / `thinking_delta` carries the whole masked body, then `text_end` / `thinking_end` carries the same text. A client that appends deltas still has the whole answer before the end event. Tool-call argument deltas are held the same way and released in one delta when the call ends. With masking off, deltas stream as they arrive.
+
 ```json
 {
   "type": "message_update",
@@ -923,7 +925,7 @@ Emitted when a tool begins, streams progress, and completes execution.
 }
 ```
 
-During execution, `tool_execution_update` events stream partial results (e.g., bash output as it arrives):
+During execution, `tool_execution_update` events stream partial results (e.g., bash output as it arrives). With secret masking on (`VINCI_CODE=1`), bodies arrive at result end: each `tool_execution_update` is still emitted, but its `partialResult` content and details are empty, and the masked output arrives in `tool_execution_end`.
 
 ```json
 {
@@ -953,7 +955,9 @@ When complete:
 }
 ```
 
-Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update.
+Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update. With secret masking on (`VINCI_CODE=1`), it is empty until the result ends; use `tool_execution_end` for the output.
+
+With secret masking on, every string the RPC mode writes (events, command responses, extension UI requests and errors) is masked: terminal control sequences and carriage returns are removed first, as the interactive view removes them, and the written text is the normalised, masked text.
 
 ### queue_update
 

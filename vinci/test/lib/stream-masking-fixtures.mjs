@@ -459,3 +459,112 @@ export function fallbackCases() {
 	}
 	return cases;
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Rows for review findings R221-01..05: values are obviously fake and built at runtime.
+// ---------------------------------------------------------------------------------------------------
+
+/** An obviously fake secret value. */
+export function fakeSecret() {
+	return ["leaked", "S3cret!"].join("");
+}
+
+/** `secret` (a raw value, not a window) appears nowhere in `text`; the message names the finding and the place. */
+export function assertNoRawSecret(text, secret, where) {
+	assert.ok(typeof text === "string", `${where}: fixture sanity: there is text to search`);
+	assert.ok(!text.includes(secret), `${where}: the raw secret ${JSON.stringify(secret)} reached stdout`);
+}
+
+/**
+ * R221-01: chunk sequences whose secret the masker finds only once a later chunk arrives (its assignment
+ * value crosses a line break, or a code reference is continued on the next line). Each chunk is one delta.
+ */
+export function crossLineCases() {
+	const secret = fakeSecret();
+	return [
+		{ label: "LF, an angle-bracket value", chunks: ["password=<\n", `${secret}\n`, ">\n"] },
+		{ label: "CRLF, an angle-bracket value", chunks: ["password=<\r\n", `${secret}\r\n`, ">\r\n"] },
+		{ label: "U+2028 before LF, an angle-bracket value", chunks: [`password=<\u2028${secret}\n`, ">\n"] },
+		{ label: "a code reference continued on the next line", chunks: [`password=process.env['${secret}'];\n`, ".trim()\n"] },
+	].map((entry) => ({ ...entry, secret }));
+}
+
+/** The secret value of the review probes, byte for byte ("uN1que!42"). */
+export function probeSecret() {
+	return ["uN1", "que!42"].join("");
+}
+
+/**
+ * R221-05, as the review probe built it: a bash result whose two text parts join (with "\n", as the view joins
+ * them) into an END-only key block, and cumulative updates whose first ends before the END line. `hidden`: the
+ * body, which only the joined (or final) body masks. `details`: the probe's result details.
+ */
+export function splitKeyResult() {
+	const body = ["abcdefgh", "ijklmnop", "qrstuvwx"].join("");
+	const end = ["-----", "END PRIVATE", " KEY-----"].join("");
+	return {
+		parts: [body, end],
+		hidden: body,
+		cumulative: `${body}\n`,
+		final: `${body}\n${end}\n`,
+		details: { diff: `password=${probeSecret()}`, fullOutputPath: "/synthetic/output.log" },
+	};
+}
+
+/** R221-02, as the review probe built it: an assignment split by a control sequence (or a carriage return). */
+export function ansiSecretCases() {
+	const secret = probeSecret();
+	return {
+		secret,
+		ansiOutput: `password\u001b[31m=${secret}`,
+		crOutput: `pass\rword=${secret}`,
+		command: `password\u001b[31m=${secret}`,
+		errorMessage: `unexpected provider failure: password\u001b[31m=${secret}`,
+	};
+}
+
+/**
+ * The review probe's event sequence for one bash result: update, end, the tool result message's start and end,
+ * turn_end and agent_end, with the probe's minimal message shapes.
+ */
+export function probeToolResultEvents(content, details) {
+	const result = { content, details };
+	const toolResult = { role: "toolResult", toolName: "bash", toolCallId: "a", ...result };
+	const done = { role: "assistant", content: [], stopReason: "stop" };
+	return [
+		{ type: "tool_execution_update", toolName: "bash", toolCallId: "a", args: { command: "printf" }, partialResult: result },
+		{ type: "tool_execution_end", toolName: "bash", toolCallId: "a", result, isError: false },
+		{ type: "message_start", message: toolResult },
+		{ type: "message_end", message: toolResult },
+		{ type: "turn_end", message: done, toolResults: [toolResult] },
+		{ type: "agent_end", messages: [toolResult] },
+	];
+}
+
+/** The review probe's cumulative bash updates: the body alone, then the body with its END line, then the end. */
+export function probeCumulativeEvents(cumulative, final) {
+	const first = { content: [{ type: "text", text: cumulative }] };
+	const last = { content: [{ type: "text", text: final }] };
+	return [
+		{ type: "tool_execution_update", toolName: "bash", toolCallId: "a", args: { command: "printf" }, partialResult: first },
+		{ type: "tool_execution_update", toolName: "bash", toolCallId: "a", args: { command: "printf" }, partialResult: last },
+		{ type: "tool_execution_end", toolName: "bash", toolCallId: "a", result: last, isError: false },
+	];
+}
+
+/** The review probe's streamed bash call: toolcall_start, one toolcall_delta of the whole argument JSON, completion. */
+export function probeBashCallEvents(command) {
+	const args = { command };
+	const call = { type: "toolCall", id: "a", name: "bash", arguments: args };
+	const message = { role: "assistant", content: [call], stopReason: "toolUse" };
+	const partial = { ...message, content: [{ ...call, arguments: {} }] };
+	return [
+		{ type: "message_start", message: { ...message, content: [] } },
+		{ type: "message_update", message: partial, assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial } },
+		{ type: "message_update", message, assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(args), partial: message } },
+		{ type: "message_update", message, assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: call, partial: message } },
+		{ type: "message_end", message },
+		{ type: "turn_end", message, toolResults: [] },
+		{ type: "agent_end", messages: [message] },
+	];
+}

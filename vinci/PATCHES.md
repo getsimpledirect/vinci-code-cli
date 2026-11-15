@@ -69,8 +69,8 @@ only patch core when there's no hook.)
 | `coding-agent/src/modes/interactive/components/tool-execution.ts` | Tight tool spacing, semantic fallback rows for custom tools, and private display handling for blocked control guidance | 17,23 |
 | `coding-agent/src/modes/interactive/interactive-mode.ts` | `/login`→vinci, Ctrl+C window, clean launch, `/model` filter, lean `/` menu; injectable terminal/process-handler seam for offline UI tests; expose active overlay focus to extensions; post-login ecosystem pointer; fullscreen copy policy, selection-only copy, restart notice, LINE padding option, custom-modal mouse policy, first-copy disclosure and route-aware `/copy` status | 1–6,22,25 |
 | `coding-agent/src/modes/rpc/rpc-client.ts` | Settle `waitForIdle`/`collectEvents` (and release their timers) when the agent process dies or is stopped — a pure upstream bugfix, not env-gated | — |
-| `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists; mask streamed session events in the scope the interactive view masks, holding back streamed text the mask may still change and the argument text of built-in tool calls (masking consistency for streamed tool arguments), released masked at the call's end or on every other end path (a call whose name has not arrived is held the same way); an interrupted call's arguments are over-masked from the first held line of each value in its final events and in the transcript responses; a SIGTERM exit after such a release drains stdout (bounded at 1s); mask the `get_messages`, `get_last_assistant_text`, `get_entries` and `get_tree` responses in the same scope (ids and tree structure unchanged) | 13 |
-| `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output (streamed text held back until the mask can decide it and built-in tool-call argument text held for the whole call, both released masked on every end path, including the liveness-watchdog exit; an interrupted call's arguments over-masked in its final events); preserve verification-blocked exit 3 for a truncated final response | 13 |
+| `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists; mask every string the RPC mode writes (events, command responses, extension UI requests and errors), normalised then masked; hold each streamed body whole (text and thinking until the block ends, every tool call's argument text until the call ends, tool output until `tool_execution_end`), released once, masked, at its end or on every other end path (a call whose name has not arrived is held the same way); an interrupted call's arguments are over-masked from the first held line of each value in its final events and in the transcript responses; a SIGTERM exit after such a release drains stdout (bounded at 1s); mask the `get_messages`, `get_last_assistant_text`, `get_entries` and `get_tree` responses the same way (ids and tree structure unchanged) | 13 |
+| `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output (each streamed body held whole until its block, call or tool result ends, then written once, normalised and masked, on every end path, including the liveness-watchdog exit; an interrupted call's arguments over-masked in its final events); preserve verification-blocked exit 3 for a truncated final response | 13 |
 | `coding-agent/src/core/compaction/branch-summarization.ts`, `compaction.ts` | Optional `__vinciRecordTaskCall` hook so Vinci can record summarization/compaction calls (no-op when absent) | — |
 | `coding-agent/src/core/model-resolver.ts` | Managed-class aliases (Fortissimo resolves to Forte) for provider `vinci` only | — |
 | `coding-agent/src/core/session-manager.ts` | Shared verification-state entries and record framing for the turn-end verification gate | 8 |
@@ -437,14 +437,18 @@ the value written to disk and the value the model sees are never masked, so edit
 byte-for-byte and the model can still match the real key. Kill switch: unset `VINCI_CODE`.
 
 Streamed output (`--mode json` and `--mode rpc`) goes through the new file
-`core/vinci-stream-mask.ts`: the text and thinking fields of a streaming assistant message hold back
-trailing lines a later line could still change, then release them masked; each completed line is
-scanned once. Masking consistency for streamed tool arguments: the argument text of a built-in tool
-call (the tools whose arguments the view masks) is held for the whole call; its end releases one
-delta, the masked JSON of the parsed arguments, and any other end releases the masked JSON of the
-text when it parses, else only the placeholder. A call whose name has not arrived is held like a
-built-in one: a non-built-in name releases the held text unchanged, and a call that ends nameless is
-released masked. A tool-name synonym of a built-in tool (folded onto the tool by `agent-loop.ts` only
+`core/vinci-stream-mask.ts`: each text and thinking block of a streaming assistant message is held
+whole (its deltas are written empty) and released once, at the block's end or any other end of its
+message, as one delta carrying the whole body, normalised (terminal control sequences stripped,
+carriage returns removed) and masked, before the end event. Tool output is held the same way: a
+`tool_execution_update` carries an empty partial result, and the output, joined as the view joins it
+and masked, goes out at `tool_execution_end`. Masking consistency for streamed tool arguments: the
+argument text of every tool call is held for the whole call. A built-in call's (the tools whose
+arguments the view masks) end releases one delta, the masked JSON of the parsed arguments, and any
+other end releases the masked JSON of the text when it parses, else only the placeholder; a call of any
+other tool releases one delta at its end too, the masked JSON of its held text when that text parses
+(each value masked under its property name), else only the placeholder. A call whose name has
+not arrived is held the same way, and a call that ends nameless is released masked. A tool-name synonym of a built-in tool (folded onto the tool by `agent-loop.ts` only
 when the stream ends) is treated as that tool from the moment the name is known, through the
 `vinciCanonicalToolName` lookup exported beside the synonym table, whatever tools the turn has; tool
 execution events and tool results under such a name are masked the same way. A call released without its `toolcall_end` is interrupted: in its final events
@@ -461,16 +465,20 @@ tool call: an unidentified call's text is held whenever any call in the message 
 any tool event of a message names no call (no usable content index and no id), every tool call of that
 message is held from then on: no argument text is released, each call shows no arguments and empty partial
 text, and its final events show it as interrupted. A built-in call with no state of its own shows no
-arguments and empty partial text while the message streams, and its final events show it as interrupted. A completed built-in call that still carries partial
+arguments and empty partial text while the message streams, and its final events show it as interrupted. A completed call of any tool that still carries partial
 argument text (in its `toolcall_end` call, a final event or a transcript response) carries the masked
-JSON of its arguments there; an empty text or the placeholder is kept as given. A block end,
+JSON of its arguments there (a call of a tool the view does not mask whose text does not parse carries the
+placeholder); an empty text or the placeholder is kept as given. A block end,
 `message_end`, `agent_end`, a new assistant `message_start`, a rebind and the exit paths flush what is
-held. The RPC event path masks exactly what the interactive view masks (assistant text, thinking and
-error text; built-in tool arguments and output) and leaves the rest unchanged; the `get_messages`,
-`get_last_assistant_text`, `get_entries` and `get_tree` responses are masked in the same scope, with
-ids, parent ids, timestamps and the tree's shape unchanged (user messages, user shell commands, the
-`bash` command response, compaction and branch summaries and extension entries stay unmasked, as the
-view shows them). With `VINCI_CODE` unset both
+held. Everything both writers put out goes through `vinciMaskStreamJson`: every string normalised,
+then masked (keys, numbers and structure unchanged, as JSON.stringify writes them: function-valued
+properties are dropped); a `thinkingSignature` / `textSignature` string that is the JSON of an object or
+array (a provider's replay item) is masked decoded and written as its JSON, and kept byte-identical when
+masking and normalisation change nothing (compact provider JSON with no secret). In RPC that covers the events, every command
+response (including the `get_messages`, `get_last_assistant_text`, `get_entries` and `get_tree`
+responses, with ids, parent ids, timestamps and the tree's shape unchanged), extension UI requests and
+errors: user messages, user shell commands, the `bash` command response, compaction and branch
+summaries and extension entries are masked too. With `VINCI_CODE` unset both
 streams and all responses are byte-identical to upstream.
 
 Malformed completed tool calls are the diagnostic exception: `agent-session.ts` masks their
