@@ -325,6 +325,119 @@ async function checkpointOperationChecks(onlyCase) {
   }
 }
 
+async function shellWriteWrapperChecks() {
+  const project = realpathSync(workspace);
+  // These rows keep their dialogs to themselves: a positive control may still take an unrelated
+  // prompt (`sh -nc` reads as a network command), and later rows count the shared dialog list.
+  const wrapperDialogs = [];
+  const wrapperCtx = { ...ctx, ui: { ...ctx.ui, async select(title) { wrapperDialogs.push(title); return "No, don't"; } } };
+  // #174: the outer shell performs the redirect whatever word runs first, so a content writer behind any
+  // wrapper word, or inside text another shell parses (sh -c, eval), takes the same shell-write refusal.
+  for (const command of [
+    "builtin echo x > out.txt",
+    "exec echo x > out.txt",
+    "exec -a name echo x > out.txt",
+    "eval echo x > out.txt",
+    "eval 'echo x > out.txt'",
+    "xargs echo x > out.txt",
+    "xargs -n 1 echo > out.txt",
+    "nohup echo x > out.txt",
+    "time echo x > out.txt",
+    "sudo -u root echo x > out.txt",
+    "bash -c 'echo x > out.txt'",
+    "sh -c \"printf y > out.txt\"",
+    "zsh -lc 'tee out.txt'",
+    "dash -c 'echo x >| out.txt'",
+    "sudo -n bash -c 'sh -c \"echo x > out.txt\"'",
+    // The clobber and both-streams forms behind a wrapper, a valued option before a nested shell, and
+    // an assignment before a wrapper.
+    "exec echo x >| out.txt",
+    "builtin echo x &> out.txt",
+    "sudo -u root bash -c 'echo x > out.txt'",
+    "FOO=1 exec echo x > out.txt",
+    "env echo x > out.txt",
+    "env -u HOME printf y > out.txt",
+    "env -i FOO=1 bash -c 'echo x > out.txt'",
+    // A valued long option whose value would otherwise read as the command word.
+    "xargs --arg-file list.txt echo x > out.txt",
+    // Each wrapper before a nested shell, every listed shell (also by path and after a flag), in-place
+    // editors and a heredoc behind a wrapper.
+    "exec bash -c 'echo x > out.txt'",
+    "nohup bash -c 'echo x > out.txt'",
+    "time bash -c 'echo x > out.txt'",
+    "command bash -c 'echo x > out.txt'",
+    "xargs bash -c 'echo x > out.txt'",
+    "ksh -c 'echo x > out.txt'",
+    "fish -c 'echo x > out.txt'",
+    "/bin/bash --norc -c 'echo x > out.txt'",
+    "exec sed -i s/a/b/ out.txt",
+    "env perl -pi -e s/a/b/ out.txt",
+    "exec cat <<EOF > out.txt\nx\nEOF",
+    // Valued shell options before -c, and eval's option terminator.
+    "bash -o pipefail -c 'echo x > out.txt'",
+    "bash --rcfile rc.sh -c 'echo x > out.txt'",
+    "eval -- 'echo x > out.txt'",
+    "bash +O extglob -c 'echo x > out.txt'",
+    "bash -oc pipefail 'echo x > out.txt'",
+    // A later +n / +o noexec turns execution back on.
+    "bash -n +n -c 'echo x > out.txt'",
+    "bash -o noexec +o noexec -c 'echo x > out.txt'",
+    "sh -n +n -c 'echo x > out.txt'",
+    // The command text is the first operand after all options.
+    "bash -c -x 'echo x > out.txt'",
+    "sh -c -e 'echo x > out.txt'",
+    "bash -c -- 'echo x > out.txt'",
+    "bash -c - 'echo x > out.txt'",
+    "bash +c 'echo x > out.txt'",
+    "sh +ec 'echo x > out.txt'",
+    // zsh option names ignore case, `_` and a `no` prefix.
+    "zsh -n -o exec -c 'echo x > out.txt'",
+    "zsh -o noexec +o NO_EXEC -c 'echo x > out.txt'",
+    "zsh -n +o no_exec -c 'echo x > out.txt'",
+  ]) {
+    const dialogsBefore = wrapperDialogs.length;
+    const result = await toolCall("bash", { command }, wrapperCtx);
+    assert.equal(result?.block, true, `Wrapped shell write is blocked: ${command}`);
+    assert.match(result.reason, /^Vinci blocked a shell-based file write; /, `Wrapped shell write takes the shell-write refusal: ${command}`);
+    assert.equal(wrapperDialogs.length, dialogsBefore, `Wrapped shell write is refused before any dialog: ${command}`);
+    assert.equal(existsSync(join(project, "out.txt")), false, `Wrapped shell write creates no file: ${command}`);
+  }
+  // Nesting is bounded at four parsers; four levels of sh -c are still read.
+  const shQuote = (text) => `'${text.replace(/'/g, "'\\''")}'`;
+  let nestedFour = "echo x > out.txt";
+  for (let level = 0; level < 4; level++) nestedFour = `sh -c ${shQuote(nestedFour)}`;
+  assert.equal(guard.isShellFileWrite(nestedFour), true, "four nested shells are read");
+  // Adversarial input stays linear enough: a long run of assignments before a nested shell.
+  const longStarted = Date.now();
+  guard.isShellFileWrite(`${"A=1 ".repeat(50000)}bash -c 'ls'`);
+  assert.ok(Date.now() - longStarted < 5000, "a long assignment run is classified quickly");
+  const clusterStarted = Date.now();
+  guard.isShellFileWrite(`bash -${"n".repeat(50000)}1 -c 'ls'`);
+  guard.isShellFileWrite(`bash -${"c".repeat(50000)}1 'ls'`);
+  assert.ok(Date.now() - clusterStarted < 2000, "a long option cluster is classified quickly");
+  // Positive controls: commands that run no content writer keep their old classification.
+  for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo", "command -v echo > out.txt", "bash -c 'ls' > out.txt", "bash -c 'echo ok' > /dev/null", "git ls-files | xargs sed -i 's/a/b/'",
+    // A lookup (also with grouped options) writes nothing, even of a shell.
+    "command -pv echo > out.txt", "command -v bash -c 'echo x > out.txt'",
+    // Syntax-check mode runs nothing.
+    "bash -n -c 'echo x > out.txt'", "sh -nc 'echo x > out.txt'", "bash -o noexec -c 'echo x > out.txt'",
+    "bash -c -n 'echo x > out.txt'", "bash +n -n -c 'echo x > out.txt'", "zsh -o NO_EXEC -c 'echo x > out.txt'",
+    // Words after the command text are its arguments, not commands.
+    "fish -c 'echo ok' 'echo x > out.txt'"]) {
+    assert.equal(guard.isShellFileWrite(command), false, `No content writer, no shell write: ${command}`);
+    const result = await toolCall("bash", { command }, wrapperCtx);
+    assert.ok(!result?.block || !/^Vinci blocked a shell-based file write/.test(result.reason), `No shell-write refusal: ${command}`);
+  }
+  // Records today's behaviour: the network check reads `-nc` as a network command, so this syntax
+  // check takes exactly one network dialog. A change to that check shows up here.
+  const syntaxCheckDialogs = [];
+  const syntaxCheckCtx = { ...ctx, ui: { ...ctx.ui, async select(title) { syntaxCheckDialogs.push(title); return "No, don't"; } } };
+  await toolCall("bash", { command: "sh -nc 'echo x > out.txt'" }, syntaxCheckCtx);
+  assert.equal(syntaxCheckDialogs.length, 1, "A grouped -n -c syntax check takes one dialog today");
+  assert.match(syntaxCheckDialogs[0] ?? "", /allow this network command once|let builds reach the internet/i, "That one dialog is the network dialog");
+  console.log("  ✓ #174 wrapped shell writes take the shell-write refusal");
+}
+
 async function shellWriteRouteChecks(onlyCase) {
   const project = realpathSync(workspace);
   const route = `write and edit can create or change files under ${project}; a file outside it needs your approval through the write tool.`;
@@ -805,6 +918,15 @@ async function shellWriteRouteChecks(onlyCase) {
   assert.equal(controls.slice(controlsBeforeVault).some(({ message }) => String(message.content).includes(opaque)), false, "Model guidance never contains a restored vaulted value");
 }
 
+if (process.argv.includes("--shell-write-wrappers")) {
+  try {
+    await shellWriteWrapperChecks();
+  } finally {
+    rmSync(runRoot, { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
 const shellWriteCase = process.argv.find((argument) => argument.startsWith("--shell-write-case="))?.split("=")[1];
 if (shellWriteCase) {
   try {
@@ -840,6 +962,7 @@ if (checkpointCase) {
 
 try {
   await shellWriteRouteChecks();
+  await shellWriteWrapperChecks();
   await checkpointChecks();
   await checkpointOperationChecks();
   // Use the registered tool_call hook and the same bytes executed by a real shell. All effects are
@@ -1331,6 +1454,22 @@ try {
         message.customType === "vinci-shell-write-block" && /inline command/i.test(message.content) && /outside the project/i.test(message.content),
     ),
   );
+
+  // The same documentation write behind each wrapper word, and inside text another shell parses, is
+  // still refused as a shell write before any destructive-command dialog.
+  for (const command of [
+    ...["exec", "env", "command", "builtin", "nohup", "time", "sudo"].map((wrapper) => `${wrapper} ${documentationWrite}`),
+    `bash -c "${documentationWrite}"`,
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      `wrapped shell documentation write is blocked before any destructive-command dialog: ${command.split(" ")[0]}`,
+      result?.block === true && /^Vinci blocked a shell-based file write; /.test(result.reason) && selections.length === selectionCount,
+    );
+  }
+  const benignListing = await toolCall("bash", { command: "ls" });
+  check("a benign listing runs without a block or a dialog", benignListing === undefined && selections.length === 0);
 
   const literalOutput = await toolCall("bash", { command: "echo 'npx prisma migrate reset'" });
   check("printing quoted migration documentation is not treated as executing it", literalOutput === undefined && selections.length === 0);
