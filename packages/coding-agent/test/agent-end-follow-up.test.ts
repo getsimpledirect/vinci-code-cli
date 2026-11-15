@@ -9,7 +9,7 @@ import { createHarnessWithExtensions, type Harness } from "./test-harness.ts";
 type Delivery = "plain" | "followUp";
 
 async function runWithTerminalFollowUp(
-	responses: Parameters<typeof createHarnessWithExtensions>[0]["responses"],
+	responses: NonNullable<Parameters<typeof createHarnessWithExtensions>[0]>["responses"],
 	delivery: Delivery,
 	retry = { enabled: false, maxRetries: 0, baseDelayMs: 1 },
 ) {
