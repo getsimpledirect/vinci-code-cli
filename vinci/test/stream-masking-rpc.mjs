@@ -13,8 +13,11 @@ import {
 	assertNoSecretBytes,
 	assistant,
 	block,
+	cutPoints,
 	deltasOf,
+	finalEventsOf,
 	fragmentsOf,
+	heldWindows,
 	inlineToken,
 	multiLineToolCalls,
 	PLACEHOLDER,
@@ -32,6 +35,7 @@ const { serializeJsonLine } = await import(resolve(packages, "coding-agent/src/m
 const { vinciMaskJson, vinciMaskSecrets } = await import(resolve(packages, "coding-agent/src/core/vinci-mask-secrets.ts"));
 const { waitForRawStdoutBackpressure } = await import(resolve(packages, "coding-agent/src/core/output-guard.ts"));
 const { RpcProcessInstance } = await import(resolve(packages, "orchestrator/src/rpc-process.ts"));
+const { vinciMaskViewEvent, vinciMaskViewMessage } = await import(resolve(packages, "coding-agent/src/core/vinci-stream-mask.ts"));
 
 // One capturing writer for the whole file: the RPC mode binds its raw stdout writer to it on first use.
 const realWrite = process.stdout.write;
@@ -747,6 +751,173 @@ test("rpc get_entries and get_tree with masking off: byte-identical data", async
 	assert.equal(lines[1], serializeJsonLine({ id: "q2", type: "response", command: "get_tree", success: true, data: data[1] }).trimEnd());
 });
 
+// Interrupted calls: in the final events (message_end, turn_end, agent_end) and in the transcript responses
+// (get_messages, get_entries, get_tree) each argument value keeps only the lines the hold-back would have
+// released; from the first held line to the value's end it is the placeholder.
+const hasStringValue = (value) =>
+	typeof value === "string" ? value !== "" : value && typeof value === "object" ? Object.values(value).some(hasStringValue) : false;
+
+/** The transcript of one assistant message, as the session manager hands it back. */
+function transcriptState(message) {
+	const entry = { type: "message", id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message };
+	const sessionManager = { getEntries: () => [entry], getTree: () => [{ entry, children: [] }], getLeafId: () => "e1" };
+	return { messages: [message], sessionManager };
+}
+
+/** Run the call's events, then ask for the transcript three ways; the final events and the three response lines. */
+async function interruptedRun(events, final) {
+	const got = {};
+	const out = await runRpc(events, {
+		state: transcriptState(final),
+		during: async ({ send }) => {
+			for (const type of ["get_messages", "get_entries", "get_tree"]) got[type] = (await send({ type })).line;
+		},
+	});
+	return { finals: finalEventsOf(out.events), responses: got, out };
+}
+
+for (const { label, tool, args, secret } of multiLineCases()) {
+	test(`rpc: masking consistency for streamed tool arguments, an interrupted call's final events and transcript carry none of its held lines (${label})`, async () => {
+		const json = JSON.stringify(args);
+		let carried = 0;
+		for (const cut of cutPoints(json, secret)) {
+			const { events, final } = toolCallEvents(tool, fragmentsOf(json.slice(0, cut), toolFragment), { ending: "message_end", finals: true });
+			const raw = JSON.stringify(final);
+			if (secret.some((line) => raw.includes(line.slice(0, 12)))) carried++;
+			const { finals, responses } = await interruptedRun(events, final);
+			assert.equal(finals.length, 3, `cut ${cut}: message_end, turn_end and agent_end are written`);
+			const placeholder = hasStringValue(final.content[0].arguments);
+			for (const [where, text] of [["final events", JSON.stringify(finals)], ...Object.entries(responses)]) {
+				assertNoSecretBytes(text, secret, `cut ${cut}: ${where}`);
+				if (placeholder) assert.ok(text.includes(PLACEHOLDER), `cut ${cut}: ${where}: the placeholder is written`);
+			}
+		}
+		assert.ok(carried > 0, "fixture sanity: the raw final arguments carry secret lines");
+	});
+}
+
+test("rpc: masking consistency for streamed tool arguments, no raw held argument text reaches an interrupted call's final events or transcript", async () => {
+	for (const { label, tool, args, secret } of multiLineCases()) {
+		const json = JSON.stringify(args);
+		for (const cut of cutPoints(json, secret)) {
+			const { events, final } = toolCallEvents(tool, fragmentsOf(json.slice(0, cut), toolFragment), { ending: "message_end", finals: true });
+			const { finals, responses } = await interruptedRun(events, final);
+			const text = [JSON.stringify(finals), ...Object.values(responses)].join("\n");
+			for (const window of heldWindows(json, secret, cut)) {
+				assert.ok(!text.includes(window), `${label}, cut ${cut}: raw held text ${JSON.stringify(window)} reached a final event or response`);
+			}
+		}
+	}
+});
+
+test("rpc positive control: a completed call's final events and transcript are masked exactly as before", async () => {
+	for (const { label, tool, args } of multiLineCases()) {
+		const { events, final } = toolCallEvents(tool, fragmentsOf(JSON.stringify(args), toolFragment), { finals: true });
+		const { responses, out } = await interruptedRun(events, final);
+		const lines = out.stdout.split("\n").filter((line) => /^\{"type":"(message_end|turn_end|agent_end)"/.test(line));
+		assert.deepEqual(
+			lines.map((line) => `${line}\n`),
+			finalEventsOf(events).map((event) => serializeJsonLine(vinciMaskViewEvent(event))),
+			`${label}: final events byte-identical to the view-masked events`,
+		);
+		assert.deepEqual(JSON.parse(responses.get_messages).data.messages, [vinciMaskViewMessage(final)], `${label}: get_messages as before`);
+	}
+});
+
+// A tool call whose name arrives late is held like a built-in until it does.
+test("rpc: masking consistency for streamed tool arguments, a built-in name that arrives late", async () => {
+	const run = secretRuns()["a multi-line hex secret"];
+	const args = multiLineToolCalls(run.lines).write;
+	const fragments = fragmentsOf(JSON.stringify(args), toolFragment);
+	// The name arrives two deltas before the end: the secret run streams before it.
+	const { events } = toolCallEvents("write", fragments, { nameFrom: fragments.length - 2 });
+	const nameless = events.filter((event) => event.message?.content?.[0]?.name === "").map((event) => event.assistantMessageEvent.delta ?? "").join("");
+	assert.ok(run.secret.every((line) => nameless.includes(line)), "fixture sanity: the secret run streams before the name");
+	const out = await runRpc(events);
+	const deltas = deltasOf(out.events, "toolcall");
+	assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+	assertMasked(deltas, run.secret, "joined deltas");
+	assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "the release is the masked JSON of the parsed arguments");
+});
+
+for (const ending of ["end", "message_end"]) {
+	test(`rpc: masking consistency for streamed tool arguments, a call with no name to the end is released masked (${ending})`, async () => {
+		const run = secretRuns()["a multi-line base64 secret"];
+		const args = multiLineToolCalls(run.lines).write;
+		const { events } = toolCallEvents(undefined, fragmentsOf(JSON.stringify(args), toolFragment), { ending, stopReason: ending === "end" ? undefined : "aborted" });
+		const out = await runRpc(events);
+		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+		const deltas = deltasOf(out.events, "toolcall");
+		assertMasked(deltas, run.secret, "joined deltas");
+		assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "released as a built-in call would be");
+	});
+}
+
+test("rpc positive control: a late name that names a tool the view does not mask releases the held text unchanged", async () => {
+	const json = JSON.stringify({ query: "list the open files", limit: 20 });
+	const { events } = toolCallEvents("extension_tool", fragmentsOf(json, 5), { nameFrom: 3 });
+	const out = await runRpc(events);
+	assert.equal(deltasOf(out.events, "toolcall"), json, "the joined deltas equal the raw argument text");
+	const end = out.events.find((event) => event.type === "message_end");
+	assert.deepEqual(end.message.content[0].arguments, JSON.parse(json));
+	assert.ok(!out.stdout.includes(PLACEHOLDER));
+});
+
+for (const index of ["string", "missing"]) {
+	test(`rpc: masking consistency for streamed tool arguments, a ${index} content index still holds the call`, async () => {
+		const run = secretRuns()["a multi-line hex secret"];
+		const args = multiLineToolCalls(run.lines).bash;
+		const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { index, before: [block("text", "Running it.\n")] });
+		const out = await runRpc(events);
+		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+		const deltas = deltasOf(out.events, "toolcall");
+		assertMasked(deltas, run.secret, "joined deltas");
+		assert.equal(deltas, JSON.stringify(vinciMaskJson(args)));
+	});
+}
+
+// What the view masks beyond the streamed text: each kind has its own row.
+test("rpc: read, grep, find and ls output is masked, as the view masks it", async () => {
+	const token = inlineToken();
+	const events = [];
+	for (const toolName of ["read", "grep", "find", "ls"]) {
+		const content = [{ type: "text", text: `found TOKEN=${token}\n` }];
+		events.push({ type: "tool_execution_end", toolCallId: `call-${toolName}`, toolName, result: { content }, isError: false });
+		const result = { role: "toolResult", toolCallId: `call-${toolName}`, toolName, content, isError: false, timestamp: 1 };
+		events.push({ type: "message_end", message: result });
+	}
+	const out = await runRpc(events);
+	assert.equal(out.events.length, events.length, "one line per event");
+	for (const event of out.events) {
+		const text = JSON.stringify(event);
+		assertMasked(text, [token], `${event.type} (${event.toolName ?? event.message?.toolName})`);
+	}
+});
+
+test("rpc: turn_end tool results are masked, as the view masks them", async () => {
+	const token = inlineToken();
+	const toolResult = { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [{ type: "text", text: `TOKEN=${token}\n` }], isError: false, timestamp: 1 };
+	const out = await runRpc([{ type: "turn_end", message: assistant([block("text", "Done.\n")]), toolResults: [toolResult] }]);
+	const turnEnd = out.events.find((event) => event.type === "turn_end");
+	assertMasked(JSON.stringify(turnEnd.toolResults), [token], "turn_end tool results");
+});
+
+test("rpc: agent_end messages are masked, as the view masks them", async () => {
+	const token = inlineToken();
+	const out = await runRpc([{ type: "agent_end", messages: [assistant([block("text", `The value is TOKEN=${token}\n`)])] }]);
+	const agentEnd = out.events.find((event) => event.type === "agent_end");
+	assertMasked(JSON.stringify(agentEnd.messages), [token], "agent_end messages");
+});
+
+test("rpc: an assistant error message is masked, as the view masks it", async () => {
+	const token = inlineToken();
+	const message = { ...assistant([], "error"), errorMessage: `request failed: TOKEN=${token}` };
+	const out = await runRpc([{ type: "message_start", message }, { type: "message_end", message }]);
+	for (const event of out.events.filter((candidate) => candidate.type === "message_end" || candidate.type === "message_start")) {
+		assertMasked(event.message.errorMessage, [token], `${event.type} error message`);
+	}
+});
+
 // Every command of the rpc-mode switch, with its verdict. A new command fails the row below until it is
 // classed here: masked (its case calls the masker), unmasked by design (with the reason), or no model text.
 const RPC_COMMAND_CENSUS = {
@@ -808,7 +979,8 @@ test("rpc command census: every command in the rpc-mode switch has a masking ver
 		if (verdict !== "masked") continue;
 		const labels = [...body.matchAll(caseLabel)];
 		const at = labels.findIndex((match) => match[2] === command);
-		const caseBody = body.slice(labels[at].index, labels[at + 1]?.index);
+		// Comments are stripped first: a comment that names the masker does not count.
+		const caseBody = body.slice(labels[at].index, labels[at + 1]?.index).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
 		// A masking function, called or handed to map: vinciMaskView*, vinciMaskSecrets or vinciMaskJson (not vinciMaskEnabled).
 		assert.match(caseBody, /\bvinciMask(?:View\w*|Secrets|Json)\b\s*[()]/, `${command}: its case calls the masker`);
 	}

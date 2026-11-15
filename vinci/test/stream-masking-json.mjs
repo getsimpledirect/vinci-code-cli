@@ -11,8 +11,11 @@ import {
 	assertNoSecretBytes,
 	assistant,
 	block,
+	cutPoints,
 	deltasOf,
+	finalEventsOf,
 	fragmentsOf,
+	heldWindows,
 	inlineToken,
 	keyMarkers,
 	multiLineToolCalls,
@@ -479,6 +482,126 @@ test("json: masking consistency for streamed tool arguments, a complete call wit
 	const out = await runJson(events);
 	assert.equal(deltasOf(out.events, "toolcall"), JSON.stringify(vinciMaskJson(args)));
 	assertMasked(out.stdout, run.secret, "whole stdout");
+});
+
+// Interrupted calls: in the final events (message_end, turn_end, agent_end) each argument value keeps only
+// the lines the hold-back would have released; from the first held line to the value's end it is the placeholder.
+const hasStringValue = (value) =>
+	typeof value === "string" ? value !== "" : value && typeof value === "object" ? Object.values(value).some(hasStringValue) : false;
+
+for (const { label, tool, args, secret } of multiLineCases()) {
+	test(`json: masking consistency for streamed tool arguments, an interrupted call's final events carry none of its held lines (${label})`, async () => {
+		const json = JSON.stringify(args);
+		let carried = 0;
+		for (const cut of cutPoints(json, secret)) {
+			const { events, final } = toolCallEvents(tool, fragmentsOf(json.slice(0, cut), toolFragment), { ending: "message_end", finals: true });
+			const raw = JSON.stringify(final);
+			if (secret.some((line) => raw.includes(line.slice(0, 12)))) carried++;
+			const out = await runJson(events);
+			const finals = finalEventsOf(out.events);
+			assert.equal(finals.length, 3, `cut ${cut}: message_end, turn_end and agent_end are written`);
+			const text = JSON.stringify(finals);
+			assertNoSecretBytes(text, secret, `cut ${cut}: final events`);
+			if (hasStringValue(final.content[0].arguments)) assert.ok(text.includes(PLACEHOLDER), `cut ${cut}: the placeholder is written`);
+		}
+		assert.ok(carried > 0, "fixture sanity: the raw final arguments carry secret lines");
+	});
+}
+
+test("json: masking consistency for streamed tool arguments, no raw held argument text reaches an interrupted call's final events", async () => {
+	for (const { label, tool, args, secret } of multiLineCases()) {
+		const json = JSON.stringify(args);
+		for (const cut of cutPoints(json, secret)) {
+			const { events } = toolCallEvents(tool, fragmentsOf(json.slice(0, cut), toolFragment), { ending: "message_end", finals: true });
+			const out = await runJson(events);
+			const text = JSON.stringify(finalEventsOf(out.events));
+			for (const window of heldWindows(json, secret, cut)) {
+				assert.ok(!text.includes(window), `${label}, cut ${cut}: raw held text ${JSON.stringify(window)} reached a final event`);
+			}
+		}
+	}
+});
+
+test("json positive control: a completed call's final events are masked exactly as before", async () => {
+	for (const { label, tool, args } of multiLineCases()) {
+		const { events } = toolCallEvents(tool, fragmentsOf(JSON.stringify(args), toolFragment), { finals: true });
+		const out = await runJson(events);
+		const lines = out.stdout.split("\n").filter((line) => /^\{"type":"(message_end|turn_end|agent_end)"/.test(line));
+		assert.deepEqual(
+			lines,
+			finalEventsOf(events).map((event) => JSON.stringify(vinciMaskJson(event))),
+			`${label}: byte-identical to the masked events`,
+		);
+	}
+});
+
+// A tool call whose name arrives late is held like a built-in until it does.
+test("json: masking consistency for streamed tool arguments, a built-in name that arrives late", async () => {
+	const run = secretRuns()["a multi-line hex secret"];
+	const args = multiLineToolCalls(run.lines).write;
+	const fragments = fragmentsOf(JSON.stringify(args), toolFragment);
+	// The name arrives two deltas before the end: the secret run streams before it.
+	const { events } = toolCallEvents("write", fragments, { nameFrom: fragments.length - 2 });
+	const nameless = events.filter((event) => event.message?.content?.[0]?.name === "").map((event) => event.assistantMessageEvent.delta ?? "").join("");
+	assert.ok(run.secret.every((line) => nameless.includes(line)), "fixture sanity: the secret run streams before the name");
+	const out = await runJson(events);
+	const deltas = deltasOf(out.events, "toolcall");
+	assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+	assertMasked(deltas, run.secret, "joined deltas");
+	assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "the release is the masked JSON of the parsed arguments");
+});
+
+for (const ending of ["end", "message_end"]) {
+	test(`json: masking consistency for streamed tool arguments, a call with no name to the end is released masked (${ending})`, async () => {
+		const run = secretRuns()["a multi-line base64 secret"];
+		const args = multiLineToolCalls(run.lines).write;
+		const { events } = toolCallEvents(undefined, fragmentsOf(JSON.stringify(args), toolFragment), { ending, stopReason: ending === "end" ? undefined : "aborted" });
+		const out = await runJson(events);
+		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+		const deltas = deltasOf(out.events, "toolcall");
+		assertMasked(deltas, run.secret, "joined deltas");
+		assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "released as a built-in call would be");
+	});
+}
+
+test("json positive control: a late name that names a tool the view does not mask releases the held text unchanged", async () => {
+	const json = JSON.stringify({ query: "list the open files", limit: 20 });
+	const { events } = toolCallEvents("extension_tool", fragmentsOf(json, 5), { nameFrom: 3 });
+	const out = await runJson(events);
+	assert.equal(deltasOf(out.events, "toolcall"), json, "the joined deltas equal the raw argument text");
+	const end = out.events.find((event) => event.type === "message_end");
+	assert.deepEqual(end.message.content[0].arguments, JSON.parse(json));
+	assert.ok(!out.stdout.includes(PLACEHOLDER));
+});
+
+for (const index of ["string", "missing"]) {
+	test(`json: masking consistency for streamed tool arguments, a ${index} content index still holds the call`, async () => {
+		const run = secretRuns()["a multi-line hex secret"];
+		const args = multiLineToolCalls(run.lines).bash;
+		const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { index, before: [block("text", "Running it.\n")] });
+		const out = await runJson(events);
+		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+		const deltas = deltasOf(out.events, "toolcall");
+		assertMasked(deltas, run.secret, "joined deltas");
+		assert.equal(deltas, JSON.stringify(vinciMaskJson(args)));
+	});
+}
+
+test("json: masking consistency for streamed tool arguments, an edit call's multi-line new text", async () => {
+	for (const [name, run] of Object.entries(secretRuns())) {
+		const text = ["Updated block:", ...run.lines, "end of block."].join("\n");
+		for (const args of [
+			{ path: "notes/out.txt", oldText: "old block", newText: text },
+			{ path: "notes/out.txt", edits: [{ oldText: "old block", newText: text }] },
+		]) {
+			const { events } = toolCallEvents("edit", fragmentsOf(JSON.stringify(args), toolFragment));
+			const out = await runJson(events);
+			const deltas = deltasOf(out.events, "toolcall");
+			assertMasked(deltas, run.secret, `${name}: joined deltas`);
+			assertMasked(out.stdout, run.secret, `${name}: whole stdout`);
+			assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), `${name}: the release is the masked JSON of the parsed arguments`);
+		}
+	}
 });
 
 test("json: the text hold-back examines each streamed character a bounded number of times", () => {

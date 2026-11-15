@@ -650,14 +650,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					entries = entries.slice(sinceIndex + 1);
 				}
 				// [vinci] message entries masked in the get_messages scope; ids and structure unchanged
-				const shownEntries = vinciMaskEnabled() ? entries.map(vinciMaskViewEntry) : entries;
+				const shownEntries = vinciMaskEnabled() ? entries.map((entry) => vinciMaskViewEntry(entry, streamMask)) : entries;
 				return success(id, "get_entries", { entries: shownEntries, leafId: sessionManager.getLeafId() });
 			}
 
 			case "get_tree": {
 				const sessionManager = session.sessionManager;
 				// [vinci] each node's entry masked in the get_messages scope; nodes and structure unchanged
-				const tree = vinciMaskEnabled() ? vinciMaskViewTree(sessionManager.getTree()) : sessionManager.getTree();
+				const tree = vinciMaskEnabled() ? vinciMaskViewTree(sessionManager.getTree(), streamMask) : sessionManager.getTree();
 				return success(id, "get_tree", { tree, leafId: sessionManager.getLeafId() });
 			}
 
@@ -683,8 +683,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "get_messages": {
-				// [vinci] masked in the scope the interactive view masks, like the event path
-				const messages = vinciMaskEnabled() ? session.messages.map(vinciMaskViewMessage) : session.messages;
+				// [vinci] masked in the scope the interactive view masks, like the event path (interrupted calls included)
+				const messages = vinciMaskEnabled()
+					? session.messages.map((message) => vinciMaskViewMessage(message, streamMask))
+					: session.messages;
 				return success(id, "get_messages", { messages });
 			}
 

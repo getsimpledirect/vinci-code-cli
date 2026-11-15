@@ -19,7 +19,14 @@
  * delta, the masked JSON of the parsed arguments (the masker the final arguments go through). A call
  * that ends any other way releases the masked JSON of its argument text when that text parses, and
  * otherwise only the placeholder. Until then its partial argument text is empty and its partial
- * `arguments` are `{}`.
+ * `arguments` are `{}`. A call whose name has not arrived yet is held the same way: a non-built-in name
+ * releases the held text unchanged, and a call that ends with no name is released masked.
+ *
+ * An interrupted call is a held call released without its `toolcall_end` (by `message_end`, `agent_end`,
+ * the next `message_start`, a stream-ending source event or an exit path). In the final events that
+ * carry it (`message_end`, `turn_end`, `agent_end`, a source `error`/`done` message) and in the
+ * transcript responses, each string value of its arguments keeps only the lines the hold-back would
+ * have released; from the first line it would still hold to the value's end, it is the placeholder.
  *
  * `vinciMaskViewEvent` masks an RPC event in exactly the scope the interactive view masks.
  */
@@ -73,6 +80,65 @@ const VIEW_MASKED_TOOLS = new Set(["bash", "read", "grep", "find", "ls", "edit",
 
 // biome-ignore lint/suspicious/noExplicitAny: events are opaque JSON-shaped values here.
 type Json = any;
+
+/** Whether a tool call's name is known: a non-empty string. */
+function hasName(block: Json): boolean {
+	return typeof block?.name === "string" && block.name !== "";
+}
+
+/** A built-in tool, or a call whose name is not known (masked like a built-in: the over-mask side). */
+function viewMasksCall(block: Json): boolean {
+	return !hasName(block) || VIEW_MASKED_TOOLS.has(block.name);
+}
+
+/** An event's content index as a number: a numeric string is read as its number; anything else is -1. */
+function contentIndexOf(source: Json): number {
+	const raw = source?.contentIndex;
+	if (typeof raw === "number" && Number.isInteger(raw) && raw >= 0) return raw;
+	if (typeof raw === "string" && /^\d+$/.test(raw)) return Number(raw);
+	return -1;
+}
+
+/**
+ * The content block a streamed event is about: its content index, or, when that is missing, the block
+ * with the event's tool-call id, else the last block of the event's kind (the one being streamed).
+ */
+function blockIndexOf(source: Json, content: Json[], matches: (block: Json) => boolean): number {
+	const index = contentIndexOf(source);
+	if (index >= 0) return index;
+	const id = source?.toolCall?.id;
+	if (typeof id === "string" && id !== "") {
+		const at = content.findIndex((block) => block?.type === "toolCall" && block.id === id);
+		if (at >= 0) return at;
+	}
+	for (let at = content.length - 1; at >= 0; at--) if (matches(content[at])) return at;
+	return -1;
+}
+
+/**
+ * One argument value of an interrupted call: the lines the hold-back would have released, then the
+ * placeholder in place of the first line it would still hold and everything after it. A last line with
+ * no line break is still held (the value may have been cut inside it), so only a value ending in a
+ * released line break is unchanged.
+ */
+export function vinciOverMaskHeldValue(text: string): string {
+	if (text === "") return text;
+	const scanner = new HoldScanner({ chars: 0 });
+	scanner.scan(text);
+	if (scanner.released > 0 && scanner.releasedEnd + 1 >= text.length) return text;
+	const kept = scanner.released > 0 ? text.slice(0, scanner.releasedEnd + 1) : "";
+	return `${kept}${UNPARSED_ARGUMENTS}`;
+}
+
+/** Every string value of `value` (at any depth) through vinciOverMaskHeldValue; keys and other values unchanged. */
+function overMaskArguments(value: unknown): unknown {
+	if (typeof value === "string") return vinciOverMaskHeldValue(value);
+	if (Array.isArray(value)) return value.map(overMaskArguments);
+	if (value && typeof value === "object") {
+		return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, overMaskArguments(entry)]));
+	}
+	return value;
+}
 
 function streamedKind(block: Json): StreamedKind | undefined {
 	if (block?.type === "text" && typeof block.text === "string") return "text";
@@ -219,6 +285,10 @@ function addedText(before: string, next: string): string {
 export class VinciStreamMask {
 	private blocks = new Map<number, BlockState>();
 	private tools = new Map<number, ToolCallState>();
+	/** Interrupted calls (released without their toolcall_end), by call id and by block object. */
+	private interruptedIds = new Set<string>();
+	private interruptedBlocks = new WeakSet<object>();
+	private anyInterrupted = false;
 	private latest: Json = undefined;
 	private readonly mask: (text: string) => string;
 	private readonly work = { chars: 0 };
@@ -256,13 +326,58 @@ export class VinciStreamMask {
 					const held = this.release(event.message);
 					const end = this.endEvent(event);
 					this.reset();
-					return [...held, end];
+					return [...held, this.withMessage(end, "message")];
 				}
 				return [event];
-			case "agent_end":
-				return [...this.flush(), event];
+			case "turn_end":
+				return [this.withMessage(event, "message")];
+			case "agent_end": {
+				const held = this.flush();
+				if (!this.anyInterrupted || !Array.isArray(event.messages)) return [...held, event];
+				return [...held, { ...event, messages: event.messages.map((message: Json) => this.maskInterrupted(message)) }];
+			}
 			default:
 				return [event];
+		}
+	}
+
+	/** `event` with its `field` message through maskInterrupted (the same object when nothing changes). */
+	private withMessage(event: Json, field: string): Json {
+		const message = event[field];
+		const shown = this.maskInterrupted(message);
+		return shown === message ? event : { ...event, [field]: shown };
+	}
+
+	/**
+	 * `message` with the arguments of every interrupted tool call over-masked (vinciOverMaskHeldValue on
+	 * each string value). Messages with no interrupted call are returned as given.
+	 */
+	maskInterrupted(message: Json): Json {
+		if (!this.anyInterrupted || !isAssistant(message)) return message;
+		let changed = false;
+		const content = message.content.map((block: Json) => {
+			if (!this.isInterrupted(block)) return block;
+			changed = true;
+			return { ...block, arguments: overMaskArguments(block.arguments) };
+		});
+		return changed ? { ...message, content } : message;
+	}
+
+	private isInterrupted(block: Json): boolean {
+		if (block?.type !== "toolCall" || !viewMasksCall(block)) return false;
+		if (this.interruptedBlocks.has(block)) return true;
+		return typeof block.id === "string" && block.id !== "" && this.interruptedIds.has(block.id);
+	}
+
+	/** Record the calls of `message` still held (not released by their toolcall_end) as interrupted. */
+	private markInterrupted(message: Json): void {
+		if (!isAssistant(message)) return;
+		for (const [index, state] of this.tools) {
+			const block = message.content[index];
+			if (state.released || block?.type !== "toolCall" || !viewMasksCall(block)) continue;
+			this.interruptedBlocks.add(block);
+			if (typeof block.id === "string" && block.id !== "") this.interruptedIds.add(block.id);
+			this.anyInterrupted = true;
 		}
 	}
 
@@ -289,14 +404,26 @@ export class VinciStreamMask {
 		return shown.replace(/[ \t\r]+$/, "");
 	}
 
+	/** The held state of a built-in tool call, or of one whose name has not arrived yet (held the same way). */
 	private toolStateFor(index: number, block: Json): ToolCallState | undefined {
-		if (block?.type !== "toolCall" || !VIEW_MASKED_TOOLS.has(block.name)) return undefined;
+		if (block?.type !== "toolCall" || !viewMasksCall(block)) return undefined;
 		let state = this.tools.get(index);
 		if (!state) {
 			state = { raw: "", shown: "", released: false, arguments: {} };
 			this.tools.set(index, state);
 		}
 		return state;
+	}
+
+	/**
+	 * A call held while its name was unknown whose name now names a tool the view does not mask: it is
+	 * no longer held, and the text held so far is returned to be released unchanged.
+	 */
+	private unholdNamed(index: number, block: Json): string {
+		const state = this.tools.get(index);
+		if (!state || block?.type !== "toolCall" || viewMasksCall(block)) return "";
+		this.tools.delete(index);
+		return state.released ? "" : state.raw;
 	}
 
 	/**
@@ -319,6 +446,15 @@ export class VinciStreamMask {
 		if (state.raw === "") state.shown = "";
 		else state.shown = parsed === undefined ? UNPARSED_ARGUMENTS : JSON.stringify(vinciMaskJson(parsed));
 		return state.shown;
+	}
+
+	/** Release a call held while its name was unknown, unchanged: its name names a tool the view does not mask. */
+	private releaseUnchanged(state: ToolCallState, block: Json): string {
+		if (state.released) return "";
+		state.released = true;
+		state.shown = state.raw;
+		state.arguments = block.arguments;
+		return state.raw;
 	}
 
 	/**
@@ -365,20 +501,31 @@ export class VinciStreamMask {
 		const message = event.message;
 		this.latest = message;
 		const source = event.assistantMessageEvent;
-		const ending =
-			source?.type === "text_end" || source?.type === "thinking_end" ? (source.contentIndex as number) : -1;
+		const type = source?.type;
+		const streamedIndex =
+			type === "text_delta" || type === "text_end" || type === "thinking_delta" || type === "thinking_end"
+				? blockIndexOf(source, message.content, (block) => streamedKind(block) === type.split("_")[0])
+				: -1;
+		const ending = type === "text_end" || type === "thinking_end" ? streamedIndex : -1;
 		const toolIndex =
-			source?.type === "toolcall_start" || source?.type === "toolcall_delta" || source?.type === "toolcall_end"
-				? (source.contentIndex as number)
+			type === "toolcall_start" || type === "toolcall_delta" || type === "toolcall_end"
+				? blockIndexOf(source, message.content, (block) => block?.type === "toolCall")
 				: -1;
 		let toolAdded = "";
+		let passedThrough = "";
+		if (toolIndex >= 0) passedThrough = this.unholdNamed(toolIndex, message.content[toolIndex]);
 		const toolState = toolIndex >= 0 ? this.toolStateFor(toolIndex, message.content[toolIndex]) : undefined;
 		if (toolState) {
-			if (source.type === "toolcall_delta" && typeof source.delta === "string") toolState.raw += source.delta;
-			if (source.type === "toolcall_end") {
+			if (type === "toolcall_delta" && typeof source.delta === "string") toolState.raw += source.delta;
+			if (type === "toolcall_end") {
+				const id = source.toolCall?.id ?? message.content[toolIndex]?.id;
+				if (typeof id === "string") this.interruptedIds.delete(id);
 				toolAdded = this.releaseTool(toolState, source.toolCall?.arguments ?? message.content[toolIndex]?.arguments);
 			}
 		}
+		// A stream-ending source event (`done` / `error`) ends every call still held: they are interrupted.
+		const final = type === "done" ? source.message : type === "error" ? source.error : undefined;
+		if (final) this.markInterrupted(final);
 		const added = new Map<number, string>();
 		const content = message.content.map((block: Json, index: number) => {
 			const kind = streamedKind(block);
@@ -398,14 +545,17 @@ export class VinciStreamMask {
 		const endingAdded = added.get(ending);
 		if (endingAdded) out.push(this.delta(masked, ending, endingAdded));
 		if (toolAdded) out.push(this.toolDelta(masked, toolIndex, toolAdded));
+		if (passedThrough) out.push(this.toolDelta(masked, toolIndex, passedThrough));
 		let rewritten = source;
 		if (source && typeof source === "object") {
 			rewritten = { ...source };
 			if ("partial" in source) rewritten.partial = masked;
 			if (source.type === "text_delta" || source.type === "thinking_delta") {
-				rewritten.delta = added.get(source.contentIndex) ?? "";
+				rewritten.delta = added.get(streamedIndex) ?? "";
 			}
 			if (toolState && source.type === "toolcall_delta") rewritten.delta = "";
+			if (type === "done" && final) rewritten.message = this.maskInterrupted(final);
+			if (type === "error" && final) rewritten.error = this.maskInterrupted(final);
 			if (ending >= 0 && added.has(ending)) {
 				const block = content[ending];
 				rewritten.content = block[streamedKind(block) as StreamedKind];
@@ -420,8 +570,12 @@ export class VinciStreamMask {
 		if ((this.blocks.size === 0 && this.tools.size === 0) || !isAssistant(message)) return [];
 		const added = new Map<number, string>();
 		const toolAdded = new Map<number, string>();
+		this.markInterrupted(message);
 		for (const [index, state] of this.tools) {
-			const text = this.releaseTool(state, undefined);
+			const block = message.content[index];
+			// A name that arrived only now and names a tool the view does not mask: released unchanged.
+			const unchanged = block?.type === "toolCall" && !viewMasksCall(block);
+			const text = unchanged ? this.releaseUnchanged(state, block) : this.releaseTool(state, undefined);
 			if (text) toolAdded.set(index, text);
 		}
 		const content = message.content.map((block: Json, index: number) => {
@@ -496,7 +650,7 @@ function maskAssistantMessage(message: Json): Json {
 	const content = message.content.map((block: Json) => {
 		const kind = streamedKind(block);
 		if (kind) return { ...block, [kind]: vinciMaskSecrets(block[kind]) };
-		if (block?.type === "toolCall" && VIEW_MASKED_TOOLS.has(block.name)) {
+		if (block?.type === "toolCall" && viewMasksCall(block)) {
 			return { ...block, arguments: vinciMaskJson(block.arguments) };
 		}
 		return block;
@@ -509,9 +663,10 @@ function maskAssistantMessage(message: Json): Json {
 /**
  * Mask one session message in the scope the interactive view masks: assistant text, thinking and
  * error text, built-in tool call arguments and built-in tool results. Other messages are unchanged.
+ * `stream`: the event path's VinciStreamMask; the calls it saw interrupted are over-masked the same way.
  */
-export function vinciMaskViewMessage(message: Json): Json {
-	return maskMessage(message);
+export function vinciMaskViewMessage(message: Json, stream?: VinciStreamMask): Json {
+	return maskMessage(stream ? stream.maskInterrupted(message) : message);
 }
 
 /**
@@ -519,19 +674,19 @@ export function vinciMaskViewMessage(message: Json): Json {
  * vinciMaskViewMessage. Ids, parent ids, timestamps and every other entry kind (compaction and branch
  * summaries, custom and custom-message entries, labels, session info) are unchanged.
  */
-export function vinciMaskViewEntry(entry: Json): Json {
+export function vinciMaskViewEntry(entry: Json, stream?: VinciStreamMask): Json {
 	if (entry?.type !== "message" || !entry.message) return entry;
-	return { ...entry, message: maskMessage(entry.message) };
+	return { ...entry, message: vinciMaskViewMessage(entry.message, stream) };
 }
 
 /**
  * Mask the entries of a session tree with vinciMaskViewEntry; the nodes, children, labels and order are
  * unchanged. Iterative, like the tree's own construction: a long session is a deep chain.
  */
-export function vinciMaskViewTree(roots: Json[]): Json[] {
+export function vinciMaskViewTree(roots: Json[], stream?: VinciStreamMask): Json[] {
 	const copy = (node: Json): Json => {
 		if (!node || typeof node !== "object") return node;
-		return "entry" in node ? { ...node, entry: vinciMaskViewEntry(node.entry) } : { ...node };
+		return "entry" in node ? { ...node, entry: vinciMaskViewEntry(node.entry, stream) } : { ...node };
 	};
 	const masked = roots.map(copy);
 	const stack: Json[] = [...masked];
@@ -557,7 +712,7 @@ function maskAssistantEvent(source: Json): Json {
 	if (source.message) masked.message = maskMessage(source.message);
 	if (source.error) masked.error = maskMessage(source.error);
 	if (source.type === "text_end" || source.type === "thinking_end") masked.content = maskText(source.content);
-	if (source.type === "toolcall_end" && source.toolCall && VIEW_MASKED_TOOLS.has(source.toolCall.name)) {
+	if (source.type === "toolcall_end" && source.toolCall && viewMasksCall(source.toolCall)) {
 		masked.toolCall = { ...source.toolCall, arguments: vinciMaskJson(source.toolCall.arguments) };
 	}
 	// text_delta / thinking_delta and a built-in tool's toolcall_delta already carry released, masked

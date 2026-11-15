@@ -120,46 +120,100 @@ function partialArguments(json) {
  * provider streams them. `before`: content blocks ahead of the tool call (index 0..n-1), already
  * streamed. `ending`: "end" (toolcall_end, then message_end), "message_end" (message_end only, as an
  * abort, an error or a cut stream writes it, with the best-effort parse of the text so far), or "none".
- * `partialOnEnd`: the message_end block keeps its partial text field.
+ * `partialOnEnd`: the message_end block keeps its partial text field. `nameFrom`: the block's name is ""
+ * until the `nameFrom`-th partial block (toolcall_start is the 0th); `name: undefined` leaves the name out
+ * everywhere. `index`: "string" sends each event's content index as a numeric string, "missing" leaves it out.
+ * `finals`: message_end is followed by turn_end and agent_end carrying the same message.
  */
 export function toolCallEvents(
 	name,
 	fragments,
-	{ id = "call-1", before = [], start = true, ending = "end", stopReason, field = "partialJson", partialOnEnd = false } = {},
+	{
+		id = "call-1",
+		before = [],
+		start = true,
+		ending = "end",
+		stopReason,
+		field = "partialJson",
+		partialOnEnd = false,
+		nameFrom = 0,
+		index: indexForm = "number",
+		finals = false,
+	} = {},
 ) {
 	const index = before.length;
+	const at = indexForm === "string" ? { contentIndex: String(index) } : indexForm === "missing" ? {} : { contentIndex: index };
 	const events = start ? [{ type: "message_start", message: assistant([]) }] : [];
+	let step = 0;
+	const named = () => (name === undefined ? {} : { name: step >= nameFrom ? name : "" });
 	const call = (json, done) =>
 		done
-			? { type: "toolCall", id, name, arguments: JSON.parse(json) }
-			: { type: "toolCall", id, name, arguments: partialArguments(json), [field]: json };
+			? { type: "toolCall", id, ...named(), arguments: JSON.parse(json) }
+			: { type: "toolCall", id, ...named(), arguments: partialArguments(json), [field]: json };
 	const message = (json, done, reason) => assistant([...before, call(json, done)], reason ?? (done ? "toolUse" : "stop"));
 	let json = "";
 	const first = message(json, false);
-	events.push({ type: "message_update", message: first, assistantMessageEvent: { type: "toolcall_start", contentIndex: index, partial: first } });
+	events.push({ type: "message_update", message: first, assistantMessageEvent: { type: "toolcall_start", ...at, partial: first } });
 	for (const fragment of fragments) {
 		json += fragment;
+		step++;
 		const partial = message(json, false);
 		events.push({
 			type: "message_update",
 			message: partial,
-			assistantMessageEvent: { type: "toolcall_delta", contentIndex: index, delta: fragment, partial },
+			assistantMessageEvent: { type: "toolcall_delta", ...at, delta: fragment, partial },
 		});
 	}
+	step = Number.POSITIVE_INFINITY;
+	let final;
 	if (ending === "end") {
-		const final = message(json, true, stopReason);
+		final = message(json, true, stopReason);
 		events.push({
 			type: "message_update",
 			message: final,
-			assistantMessageEvent: { type: "toolcall_end", contentIndex: index, toolCall: final.content[index], partial: final },
+			assistantMessageEvent: { type: "toolcall_end", ...at, toolCall: final.content[index], partial: final },
 		});
 		events.push({ type: "message_end", message: final });
 	} else if (ending === "message_end") {
-		const final = message(json, false, stopReason ?? "aborted");
+		final = message(json, false, stopReason ?? "aborted");
 		if (!partialOnEnd) delete final.content[index][field];
 		events.push({ type: "message_end", message: final });
 	}
-	return { events, json };
+	if (final && finals) {
+		events.push({ type: "turn_end", message: final, toolResults: [] });
+		events.push({ type: "agent_end", messages: [final] });
+	}
+	return { events, json, final };
+}
+
+/** The final events that carry a call's message: message_end, turn_end and agent_end. */
+export function finalEventsOf(events) {
+	return events.filter((event) => event.type === "message_end" || event.type === "turn_end" || event.type === "agent_end");
+}
+
+/**
+ * Cut points inside the secret run of `json`: within its first line, mid-run, inside its last line, just
+ * after it, twice inside the line after it (where a key body's END line is cut short, on a dash), and three
+ * characters before the argument text's end.
+ */
+export function cutPoints(json, secret) {
+	const start = json.indexOf(secret[0]);
+	const last = json.indexOf(secret.at(-1));
+	assert.ok(start >= 0 && last >= start, "fixture sanity: the secret run is in the argument text");
+	const end = last + secret.at(-1).length;
+	return [...new Set([start + 16, Math.floor((start + end) / 2), last + 3, end, end + 7, end + 30, json.length - 3])];
+}
+
+/**
+ * The 8-character windows of the raw argument text the stream held for the secret run: from its first
+ * line to the cut (at most to the end of its last line). None of them may reach a final event.
+ */
+export function heldWindows(json, secret, cut) {
+	const start = json.indexOf(secret[0]);
+	const end = Math.min(cut, json.indexOf(secret.at(-1)) + secret.at(-1).length);
+	const windows = [];
+	for (let at = start; at + 8 <= end; at++) windows.push(json.slice(at, at + 8));
+	return windows;
 }
 
 /** `text` cut into fragments of `size` characters. */
