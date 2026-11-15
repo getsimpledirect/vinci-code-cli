@@ -69,7 +69,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/modes/interactive/components/tool-execution.ts` | Tight tool spacing, semantic fallback rows for custom tools, and private display handling for blocked control guidance | 17,23 |
 | `coding-agent/src/modes/interactive/interactive-mode.ts` | `/login`→vinci, Ctrl+C window, clean launch, `/model` filter, lean `/` menu; injectable terminal/process-handler seam for offline UI tests; expose active overlay focus to extensions; post-login ecosystem pointer; fullscreen copy policy, selection-only copy, restart notice, LINE padding option, custom-modal mouse policy, first-copy disclosure and route-aware `/copy` status | 1–6,22,25 |
 | `coding-agent/src/modes/rpc/rpc-client.ts` | Settle `waitForIdle`/`collectEvents` (and release their timers) when the agent process dies or is stopped — a pure upstream bugfix, not env-gated | — |
-| `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists; mask streamed session events in the scope the interactive view masks, holding back streamed text and built-in tool-call argument deltas the mask may still change and flushing them masked on every end path; mask the `get_messages` and `get_last_assistant_text` responses in the same scope | 13 |
+| `coding-agent/src/modes/rpc/rpc-mode.ts` | Default the extension overlay-focus query to false when no local overlay exists; mask streamed session events in the scope the interactive view masks, holding back streamed text and built-in tool-call argument deltas the mask may still change and flushing them masked on every end path; mask the `get_messages`, `get_last_assistant_text`, `get_entries` and `get_tree` responses in the same scope (ids and tree structure unchanged) | 13 |
 | `coding-agent/src/modes/print-mode.ts` | Mask secrets in `-p` text + `--mode json` output (streamed text and built-in tool-call argument deltas held back until the mask can decide them, flushed masked on every end path, including the liveness-watchdog exit); preserve verification-blocked exit 3 for a truncated final response | 13 |
 | `coding-agent/src/core/compaction/branch-summarization.ts`, `compaction.ts` | Optional `__vinciRecordTaskCall` hook so Vinci can record summarization/compaction calls (no-op when absent) | — |
 | `coding-agent/src/core/model-resolver.ts` | Managed-class aliases (Fortissimo resolves to Forte) for provider `vinci` only | — |
@@ -443,9 +443,11 @@ line breaks, an open `${`), then release them masked; the joined `toolcall_delta
 tool call (the tools whose arguments the view masks) is held back the same way. A block end,
 `message_end`, `agent_end`, a new assistant `message_start`, a rebind and the exit paths flush what is
 held. The RPC event path masks exactly what the interactive view masks (assistant text, thinking and
-error text; built-in tool arguments and output) and leaves the rest unchanged; the `get_messages` and
-`get_last_assistant_text` responses are masked in the same scope (user messages, user shell commands
-and the `bash` command response stay unmasked, as the view shows them). With `VINCI_CODE` unset both
+error text; built-in tool arguments and output) and leaves the rest unchanged; the `get_messages`,
+`get_last_assistant_text`, `get_entries` and `get_tree` responses are masked in the same scope, with
+ids, parent ids, timestamps and the tree's shape unchanged (user messages, user shell commands, the
+`bash` command response, compaction and branch summaries and extension entries stay unmasked, as the
+view shows them). With `VINCI_CODE` unset both
 streams and all responses are byte-identical to upstream.
 
 Malformed completed tool calls are the diagnostic exception: `agent-session.ts` masks their

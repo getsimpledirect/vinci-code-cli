@@ -26,7 +26,13 @@ import {
 	writeRawStdout,
 } from "../../core/output-guard.ts";
 import { vinciMaskEnabled, vinciMaskSecrets } from "../../core/vinci-mask-secrets.ts";
-import { VinciStreamMask, vinciMaskViewEvent, vinciMaskViewMessage } from "../../core/vinci-stream-mask.ts";
+import {
+	VinciStreamMask,
+	vinciMaskViewEntry,
+	vinciMaskViewEvent,
+	vinciMaskViewMessage,
+	vinciMaskViewTree,
+} from "../../core/vinci-stream-mask.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -639,12 +645,16 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					}
 					entries = entries.slice(sinceIndex + 1);
 				}
-				return success(id, "get_entries", { entries, leafId: sessionManager.getLeafId() });
+				// [vinci] message entries masked in the get_messages scope; ids and structure unchanged
+				const shownEntries = vinciMaskEnabled() ? entries.map(vinciMaskViewEntry) : entries;
+				return success(id, "get_entries", { entries: shownEntries, leafId: sessionManager.getLeafId() });
 			}
 
 			case "get_tree": {
 				const sessionManager = session.sessionManager;
-				return success(id, "get_tree", { tree: sessionManager.getTree(), leafId: sessionManager.getLeafId() });
+				// [vinci] each node's entry masked in the get_messages scope; nodes and structure unchanged
+				const tree = vinciMaskEnabled() ? vinciMaskViewTree(sessionManager.getTree()) : sessionManager.getTree();
+				return success(id, "get_tree", { tree, leafId: sessionManager.getLeafId() });
 			}
 
 			case "get_last_assistant_text": {

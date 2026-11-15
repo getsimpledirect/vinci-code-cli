@@ -3,6 +3,7 @@
 // string written to stdout is recorded. Secret values are synthetic and built at runtime.
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
@@ -82,6 +83,9 @@ async function runRpc(events, { masking = true, during, state = {} } = {}) {
 		},
 		getLastAssistantText: () => state.lastAssistantText,
 		executeBash: async () => state.bash,
+		get sessionManager() {
+			return state.sessionManager;
+		},
 	};
 	let rebind;
 	const host = {
@@ -484,4 +488,183 @@ test("rpc: a pretty-printed bash call released line by line never carries the ra
 	const out = await runRpc(events);
 	assertMasked(deltasOf(out.events, "toolcall"), [token], "concatenated deltas");
 	assertMasked(out.stdout, [token], "whole stdout");
+});
+
+// get_entries and get_tree hand back the same session messages get_messages does: masked in the same scope,
+// with ids, parent ids, timestamps, labels and the tree's shape unchanged.
+function entriesState() {
+	const { token, run, assistantMessage, toolResult } = responseState();
+	const plain = assistant([block("text", "Plain answer, nothing to hide.\n")]);
+	const user = { role: "user", content: [{ type: "text", text: `my value is ${token}` }], timestamp: 1 };
+	const at = (n) => `2026-01-01T00:00:0${n}.000Z`;
+	const entries = [
+		{ type: "message", id: "e1", parentId: null, timestamp: at(1), message: user },
+		{ type: "message", id: "e2", parentId: "e1", timestamp: at(2), message: assistantMessage },
+		{ type: "message", id: "e3", parentId: "e2", timestamp: at(3), message: toolResult },
+		{ type: "message", id: "e4", parentId: "e3", timestamp: at(4), message: plain },
+		{ type: "compaction", id: "e5", parentId: "e4", timestamp: at(5), summary: `kept ${token}`, firstKeptEntryId: "e4", tokensBefore: 10 },
+		{ type: "custom", id: "e6", parentId: "e5", timestamp: at(6), customType: "test-note", data: { note: `saw ${token}` } },
+		{ type: "label", id: "e7", parentId: "e6", timestamp: at(7), targetId: "e2", label: "checkpoint" },
+		{ type: "message", id: "e8", parentId: "e1", timestamp: at(8), message: assistantMessage },
+	];
+	const node = (index, children = [], extra = {}) => ({ entry: entries[index], children, ...extra });
+	const tree = [
+		node(0, [
+			node(1, [node(2, [node(3, [node(4, [node(5, [node(6)])])])])], { label: "checkpoint", labelTimestamp: at(7) }),
+			node(7),
+		]),
+	];
+	const sessionManager = { getEntries: () => entries, getTree: () => tree, getLeafId: () => "e7" };
+	// Entries the view masks (assistant text, built-in tool arguments and results) and those it leaves raw.
+	return { token, run, entries, tree, sessionManager, masked: [1, 2, 7], raw: [0, 3, 4, 5, 6] };
+}
+
+const shapeOf = (entry) => ({ type: entry.type, id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp });
+
+function assertEntries(got, state, where) {
+	assert.deepEqual(got.map(shapeOf), state.entries.map(shapeOf), `${where}: ids, parent ids and timestamps unchanged`);
+	for (const index of state.masked) {
+		const text = JSON.stringify(got[index]);
+		assertMasked(text, [state.token], `${where}: entry ${state.entries[index].id}`);
+		assert.deepEqual(Object.keys(got[index]), Object.keys(state.entries[index]), `${where}: entry keys unchanged`);
+	}
+	assertMasked(JSON.stringify(got[1]), state.run.secret, `${where}: assistant text`);
+	for (const index of state.raw) {
+		assert.deepEqual(got[index], state.entries[index], `${where}: entry ${state.entries[index].id} is unchanged`);
+	}
+}
+
+test("rpc get_entries: message entries are masked like get_messages; ids, structure and the since cursor are unchanged", async () => {
+	const state = entriesState();
+	const got = {};
+	await runRpc([], {
+		state: { sessionManager: state.sessionManager },
+		during: async ({ send }) => {
+			got.all = await send({ type: "get_entries" });
+			got.since = await send({ type: "get_entries", since: "e4" });
+		},
+	});
+	assertMasked(got.all.line, state.run.secret, "get_entries");
+	assertEntries(got.all.response.data.entries, state, "get_entries");
+	assert.equal(got.all.response.data.leafId, "e7");
+	assert.deepEqual(
+		got.since.response.data.entries.map((entry) => entry.id),
+		["e5", "e6", "e7", "e8"],
+		"the since cursor works on the raw ids",
+	);
+	assertMasked(JSON.stringify(got.since.response.data.entries[3]), [state.token], "get_entries since: entry e8");
+});
+
+test("rpc get_tree: each node's entry is masked like get_messages; nodes, children and labels are unchanged", async () => {
+	const state = entriesState();
+	const before = JSON.stringify(state.tree);
+	let line;
+	let response;
+	await runRpc([], {
+		state: { sessionManager: state.sessionManager },
+		during: async ({ send }) => {
+			({ line, response } = await send({ type: "get_tree" }));
+		},
+	});
+	assertMasked(line, state.run.secret, "get_tree");
+	assert.equal(JSON.stringify(state.tree), before, "the session's own tree is not modified");
+	const flat = [];
+	const walk = (got, raw, path) => {
+		assert.equal(got.length, raw.length, `get_tree ${path}: same number of children`);
+		got.forEach((node, i) => {
+			assert.deepEqual(Object.keys(node), Object.keys(raw[i]), `get_tree ${path}/${i}: node keys unchanged`);
+			assert.equal(node.label, raw[i].label, `get_tree ${path}/${i}: label unchanged`);
+			assert.equal(node.labelTimestamp, raw[i].labelTimestamp, `get_tree ${path}/${i}: label time unchanged`);
+			flat.push(node.entry);
+			walk(node.children, raw[i].children, `${path}/${i}`);
+		});
+	};
+	walk(response.data.tree, state.tree, "root");
+	const order = flat.map((entry) => entry.id);
+	assert.deepEqual(order, ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8"], "depth-first order unchanged");
+	assertEntries(flat, state, "get_tree");
+	assert.equal(response.data.leafId, "e7");
+});
+
+test("rpc get_entries and get_tree with masking off: byte-identical data", async () => {
+	const state = entriesState();
+	const lines = [];
+	await runRpc([], {
+		masking: false,
+		state: { sessionManager: state.sessionManager },
+		during: async ({ send }) => {
+			lines.push((await send({ type: "get_entries" })).line);
+			lines.push((await send({ type: "get_tree" })).line);
+		},
+	});
+	const data = [
+		{ entries: state.entries, leafId: "e7" },
+		{ tree: state.tree, leafId: "e7" },
+	];
+	assert.equal(lines[0], serializeJsonLine({ id: "q1", type: "response", command: "get_entries", success: true, data: data[0] }).trimEnd());
+	assert.equal(lines[1], serializeJsonLine({ id: "q2", type: "response", command: "get_tree", success: true, data: data[1] }).trimEnd());
+});
+
+// Every command of the rpc-mode switch, with its verdict. A new command fails the row below until it is
+// classed here: masked (its case calls the masker), unmasked by design (with the reason), or no model text.
+const RPC_COMMAND_CENSUS = {
+	get_protocol: "no model text",
+	prompt: "no model text: an acknowledgement or the preflight error",
+	steer: "no model text",
+	follow_up: "no model text",
+	abort: "no model text",
+	new_session: "no model text: cancelled flag",
+	get_state: "no model text: model, modes, counts and the user-set session name",
+	set_model: "no model text: model metadata",
+	cycle_model: "no model text: model metadata",
+	get_available_models: "no model text: model metadata",
+	set_thinking_level: "no model text",
+	cycle_thinking_level: "no model text",
+	set_steering_mode: "no model text",
+	set_follow_up_mode: "no model text",
+	compact: "unmasked by design: the compaction summary, which the view shows unmasked",
+	set_auto_compaction: "no model text",
+	set_auto_retry: "no model text",
+	abort_retry: "no model text",
+	bash: "unmasked by design: user shell output, which the view shows unmasked",
+	abort_bash: "no model text",
+	get_session_stats: "no model text: counts, tokens, cost and the session file",
+	export_html: "no model text: the written file's path",
+	switch_session: "no model text: cancelled flag",
+	fork: "unmasked by design: the selected user message text",
+	clone: "no model text: cancelled flag",
+	get_fork_messages: "unmasked by design: user message text only",
+	get_entries: "masked",
+	get_tree: "masked",
+	get_last_assistant_text: "masked",
+	set_session_name: "no model text",
+	get_messages: "masked",
+	get_commands: "no model text: command names and descriptions",
+};
+
+test("rpc command census: every command in the rpc-mode switch has a masking verdict", () => {
+	const source = readFileSync(resolve(packages, "coding-agent/src/modes/rpc/rpc-mode.ts"), "utf8");
+	const start = source.indexOf("switch (command.type) {");
+	const end = source.indexOf("default: {", start);
+	assert.ok(start >= 0 && end > start, "fixture sanity: the command switch is found");
+	const body = source.slice(start, end);
+	const found = [...body.matchAll(/case "([^"]+)":/g)].map((match) => match[1]);
+	assert.ok(found.length > 0, "fixture sanity: the switch has cases");
+	assert.deepEqual(
+		found.filter((command) => !Object.hasOwn(RPC_COMMAND_CENSUS, command)),
+		[],
+		"every RPC command has a census verdict",
+	);
+	assert.deepEqual(
+		Object.keys(RPC_COMMAND_CENSUS).filter((command) => !found.includes(command)),
+		[],
+		"every census row names a command the switch still has",
+	);
+	for (const [command, verdict] of Object.entries(RPC_COMMAND_CENSUS)) {
+		assert.match(verdict, /^(masked|unmasked by design: .+|no model text(: .+)?)$/, `${command}: a known verdict`);
+		if (verdict !== "masked") continue;
+		const at = body.indexOf(`case "${command}":`);
+		const next = body.indexOf('case "', at + 1);
+		assert.match(body.slice(at, next < 0 ? undefined : next), /vinciMask/, `${command}: its case calls the masker`);
+	}
 });

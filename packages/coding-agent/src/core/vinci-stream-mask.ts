@@ -397,6 +397,36 @@ export function vinciMaskViewMessage(message: Json): Json {
 	return maskMessage(message);
 }
 
+/**
+ * Mask one session entry in the `get_messages` scope: a message entry's message goes through
+ * vinciMaskViewMessage. Ids, parent ids, timestamps and every other entry kind (compaction and branch
+ * summaries, custom and custom-message entries, labels, session info) are unchanged.
+ */
+export function vinciMaskViewEntry(entry: Json): Json {
+	if (entry?.type !== "message" || !entry.message) return entry;
+	return { ...entry, message: maskMessage(entry.message) };
+}
+
+/**
+ * Mask the entries of a session tree with vinciMaskViewEntry; the nodes, children, labels and order are
+ * unchanged. Iterative, like the tree's own construction: a long session is a deep chain.
+ */
+export function vinciMaskViewTree(roots: Json[]): Json[] {
+	const copy = (node: Json): Json => {
+		if (!node || typeof node !== "object") return node;
+		return "entry" in node ? { ...node, entry: vinciMaskViewEntry(node.entry) } : { ...node };
+	};
+	const masked = roots.map(copy);
+	const stack: Json[] = [...masked];
+	while (stack.length > 0) {
+		const node = stack.pop();
+		if (!node || typeof node !== "object" || !Array.isArray(node.children)) continue;
+		node.children = node.children.map(copy);
+		for (const child of node.children) stack.push(child);
+	}
+	return masked;
+}
+
 function maskMessage(message: Json): Json {
 	if (isAssistant(message)) return maskAssistantMessage(message);
 	if (message?.role === "toolResult" && VIEW_MASKED_TOOLS.has(message.toolName)) return maskToolOutput(message);
