@@ -10,11 +10,15 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
 	assertMasked,
+	assertNoSecretBytes,
 	assistant,
 	block,
 	deltasOf,
+	fragmentsOf,
 	inlineToken,
+	multiLineToolCalls,
 	PLACEHOLDER,
+	partialArgumentTexts,
 	secretRuns,
 	splitAcross,
 	streamEvents,
@@ -25,7 +29,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const packages = resolve(here, "../../packages");
 const { runRpcMode } = await import(resolve(packages, "coding-agent/src/modes/rpc/rpc-mode.ts"));
 const { serializeJsonLine } = await import(resolve(packages, "coding-agent/src/modes/rpc/jsonl.ts"));
-const { vinciMaskSecrets } = await import(resolve(packages, "coding-agent/src/core/vinci-mask-secrets.ts"));
+const { vinciMaskJson, vinciMaskSecrets } = await import(resolve(packages, "coding-agent/src/core/vinci-mask-secrets.ts"));
 const { waitForRawStdoutBackpressure } = await import(resolve(packages, "coding-agent/src/core/output-guard.ts"));
 const { RpcProcessInstance } = await import(resolve(packages, "orchestrator/src/rpc-process.ts"));
 
@@ -51,10 +55,11 @@ const bounded = (promise, ms, what) =>
 /**
  * Run runRpcMode, feed `events` to the session listener, then run `during(ctx)` (with `ctx.stdout()`,
  * `ctx.rebind()` and `ctx.send(command)`, which resolves with the command's response), then end stdin (the
- * RPC exit path) and wait for process.exit. `state` stands in for the session's messages and bash result.
- * Returns every stdout line.
+ * RPC exit path) and wait for process.exit. `signal`: deliver SIGTERM to the mode's handler instead of
+ * ending stdin. `state` stands in for the session's messages and bash result. Returns every stdout line
+ * and `atExit`, what had reached stdout when process.exit was called.
  */
-async function runRpc(events, { masking = true, during, state = {} } = {}) {
+async function runRpc(events, { masking = true, during, state = {}, signal = false } = {}) {
 	const saved = process.env.VINCI_CODE;
 	if (masking) process.env.VINCI_CODE = "1";
 	else delete process.env.VINCI_CODE;
@@ -62,12 +67,15 @@ async function runRpc(events, { masking = true, during, state = {} } = {}) {
 	Object.defineProperty(process, "stdin", { value: stdin, configurable: true, writable: true });
 	const realExit = process.exit;
 	let exitCode;
+	let atExit;
 	const exited = new Promise((resolveExit) => {
 		process.exit = (code) => {
 			exitCode = code ?? 0;
+			atExit = capture?.join("");
 			resolveExit();
 		};
 	});
+	const signalHandlersBefore = process.listeners("SIGTERM");
 	let listener;
 	const session = {
 		bindExtensions: async () => {},
@@ -120,12 +128,19 @@ async function runRpc(events, { masking = true, during, state = {} } = {}) {
 			};
 			await during({ stdout: () => capture.join(""), rebind: () => rebind(), send });
 		}
-		stdin.end();
-		await bounded(exited, 5000, "the RPC mode exits after stdin ends");
+		if (signal) {
+			const handler = process.listeners("SIGTERM").find((candidate) => !signalHandlersBefore.includes(candidate));
+			assert.ok(handler, "the RPC mode registered its SIGTERM handler");
+			handler();
+		} else {
+			stdin.end();
+		}
+		await bounded(exited, 5000, "the RPC mode exits");
 		const stdout = capture.join("");
 		return {
 			stdout,
 			exitCode,
+			atExit,
 			events: stdout
 				.split("\n")
 				.filter(Boolean)
@@ -329,12 +344,12 @@ test("rpc: a rebind writes the held run masked at once", async () => {
 	assert.ok(deltasOf(parseLines(afterRebind)).includes(PLACEHOLDER), "the rebind flush wrote the held run, masked");
 });
 
-// Tool-call argument deltas of the tools whose arguments the view masks are held back per tool call.
+// Masking consistency for streamed tool arguments: the tools whose arguments the view masks.
 for (const [label, step] of [
-	["two deltas", 0],
-	["five deltas", 9],
+	["case 1", 0],
+	["case 2", 9],
 ]) {
-	test(`rpc: a value split across ${label} of a bash call never reaches stdout; the placeholder does`, async () => {
+	test(`rpc: masking consistency for streamed tool arguments, single-line value (${label})`, async () => {
 		const token = inlineToken();
 		const json = JSON.stringify({ command: `echo ${token}` });
 		const fragments = splitAcross(json, token, step);
@@ -361,6 +376,134 @@ test("rpc: a tool the view does not mask passes its argument deltas through unch
 	const { events } = toolCallEvents("extension_tool", splitAcross(json, token, 0));
 	const out = await runRpc(events);
 	assert.equal(out.stdout, events.map((event) => serializeJsonLine(event)).join(""), "byte-identical");
+});
+
+const toolFragment = 9;
+const multiLineCases = () =>
+	Object.values(secretRuns()).flatMap((run, n) =>
+		Object.entries(multiLineToolCalls(run.lines)).map(([tool, args]) => ({ label: `${tool}, case ${n + 1}`, tool, args, secret: run.secret })),
+	);
+
+for (const { label, tool, args, secret } of multiLineCases()) {
+	test(`rpc: masking consistency for streamed tool arguments, multi-line value (${label})`, async () => {
+		const json = JSON.stringify(args);
+		const { events } = toolCallEvents(tool, fragmentsOf(json, toolFragment));
+		const out = await runRpc(events);
+		const deltas = deltasOf(out.events, "toolcall");
+		assertMasked(deltas, secret, "joined deltas");
+		assertNoSecretBytes(partialArgumentTexts(out.events).join("\n"), secret, "partial argument text");
+		assertMasked(out.stdout, secret, "whole stdout");
+		assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "the release is the masked JSON of the parsed arguments");
+		const released = out.events.filter((event) => event.assistantMessageEvent?.type === "toolcall_delta" && event.assistantMessageEvent.delta);
+		assert.equal(released.length, 1, "one release, at the call's end");
+		for (const text of partialArgumentTexts(out.events)) assert.ok(text === "" || text === deltas, "partial argument text is empty or the released text");
+		const end = out.events.find((event) => event.type === "message_end");
+		assert.deepEqual(end.message.content[0].arguments, vinciMaskJson(args), "message_end arguments are masked as before");
+	});
+}
+
+// A built-in tool call that ends without its toolcall_end, on every path: none of its held argument text.
+function interruptedCall({ ending = "none", stopReason, partialOnEnd = false } = {}) {
+	const run = secretRuns()["a multi-line base64 secret"];
+	const args = multiLineToolCalls(run.lines).write;
+	const json = JSON.stringify(args);
+	const cut = json.indexOf(run.lines[Math.floor(run.lines.length / 2)]) + 5;
+	const { events } = toolCallEvents("write", fragmentsOf(json.slice(0, cut), toolFragment), { ending, stopReason, partialOnEnd });
+	return { events, secret: run.secret };
+}
+
+/** The interrupted call released only the placeholder, and no streamed event carries its argument bytes. */
+function assertInterrupted(events, secret, where) {
+	assert.equal(deltasOf(events, "toolcall"), PLACEHOLDER, `${where}: only the placeholder is released`);
+	assertNoSecretBytes(partialArgumentTexts(events).join("\n"), secret, `${where}: partial argument text`);
+	const streamed = events.filter((event) => event.type !== "message_end" && event.type !== "agent_end" && event.type !== "turn_end");
+	assertNoSecretBytes(JSON.stringify(streamed), secret, `${where}: streamed events`);
+}
+
+for (const [label, stopReason, partialOnEnd] of [
+	["an abort", "aborted", true],
+	["an error", "error", false],
+	["a stream that ends", "stop", false],
+]) {
+	test(`rpc: masking consistency for streamed tool arguments, a call cut by ${label} (message_end only)`, async () => {
+		const { events, secret } = interruptedCall({ ending: "message_end", stopReason, partialOnEnd });
+		const out = await runRpc(events);
+		assertInterrupted(out.events, secret, label);
+		const end = out.events.find((event) => event.type === "message_end");
+		assert.equal(end.message.stopReason, stopReason);
+		assert.deepEqual(partialArgumentTexts([end]), partialOnEnd ? [PLACEHOLDER] : [], "message_end carries only the released text");
+	});
+}
+
+test("rpc: masking consistency for streamed tool arguments, a call cut by agent_end", async () => {
+	const { events, secret } = interruptedCall();
+	events.push({ type: "agent_end", messages: [] });
+	const out = await runRpc(events);
+	assertInterrupted(out.events, secret, "agent_end");
+	assertMasked(out.stdout, secret, "agent_end: whole stdout");
+	const agentEnd = out.events.findIndex((event) => event.type === "agent_end");
+	assert.equal(deltasOf(out.events.slice(0, agentEnd), "toolcall"), PLACEHOLDER, "released before agent_end");
+});
+
+test("rpc: masking consistency for streamed tool arguments, a call cut by the exit path", async () => {
+	const { events, secret } = interruptedCall();
+	const out = await runRpc(events);
+	assert.equal(out.exitCode, 0);
+	assertInterrupted(parseLines(out.atExit), secret, "exit");
+	assertMasked(out.atExit, secret, "exit: written before exit");
+});
+
+test("rpc: masking consistency for streamed tool arguments, a call cut by SIGTERM", async () => {
+	const { events, secret } = interruptedCall();
+	const out = await runRpc(events, { signal: true });
+	assert.equal(out.exitCode, 143);
+	assertInterrupted(parseLines(out.atExit), secret, "SIGTERM");
+	assertMasked(out.atExit, secret, "SIGTERM: written before exit");
+});
+
+test("rpc: masking consistency for streamed tool arguments, a call cut by a rebind", async () => {
+	const { events, secret } = interruptedCall();
+	let afterRebind;
+	await runRpc(events, {
+		during: async ({ stdout, rebind }) => {
+			await rebind();
+			await waitForRawStdoutBackpressure();
+			afterRebind = stdout();
+		},
+	});
+	assertInterrupted(parseLines(afterRebind), secret, "rebind");
+	assertMasked(afterRebind, secret, "rebind: whole stdout");
+});
+
+test("rpc: masking consistency for streamed tool arguments, a call cut by the next message_start", async () => {
+	const { events, secret } = interruptedCall();
+	const next = streamEvents(["Next answer."]).events;
+	const out = await runRpc([...events, ...next]);
+	assertInterrupted(out.events, secret, "message_start");
+	assertMasked(out.stdout, secret, "message_start: whole stdout");
+	const starts = out.events.flatMap((event, index) => (event.type === "message_start" ? [index] : []));
+	assert.equal(deltasOf(out.events.slice(0, starts[1]), "toolcall"), PLACEHOLDER, "released before the next message_start");
+});
+
+test("rpc: masking consistency for streamed tool arguments, a complete call with no toolcall_end releases its masked parse", async () => {
+	const run = secretRuns()["an END-only private-key body"];
+	const args = multiLineToolCalls(run.lines).bash;
+	const json = JSON.stringify(args);
+	const { events } = toolCallEvents("bash", fragmentsOf(json, toolFragment), { ending: "message_end", stopReason: "aborted" });
+	const out = await runRpc(events);
+	assert.equal(deltasOf(out.events, "toolcall"), JSON.stringify(vinciMaskJson(args)));
+	assertMasked(out.stdout, run.secret, "whole stdout");
+});
+
+test("rpc: SIGTERM mid-answer writes the held run masked and lets stdout drain before exit", async () => {
+	const run = secretRuns()["a multi-line base64 secret"];
+	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, withEnd: false });
+	const out = await runRpc(events, { signal: true });
+	assert.equal(out.exitCode, 143);
+	assertMasked(out.atExit, run.secret, "SIGTERM: written before exit");
+	const last = parseLines(out.atExit).at(-1);
+	assert.equal(last?.type, "message_update", "the flushed delta reached stdout before exit");
+	assert.ok(last.assistantMessageEvent.delta.includes(PLACEHOLDER), "the flushed delta is masked");
 });
 
 // RPC command responses carry the text the event path masks: masked the same way.
@@ -478,10 +621,9 @@ test("rpc positive control: the orchestrator client gets a masked response's non
 	assert.ok(!line.includes(PLACEHOLDER));
 });
 
-test("rpc: a pretty-printed bash call released line by line never carries the raw partial argument text", async () => {
+test("rpc: masking consistency for streamed tool arguments, multi-line argument text", async () => {
 	const token = inlineToken();
 	const json = JSON.stringify({ command: `echo ${token}`, note: "x" }, null, 2);
-	// Each fragment ends at a line break, so completed lines are released while the call streams.
 	const fragments = json.split(/(?<=\n)/);
 	assert.ok(fragments.length >= 3, "fixture sanity: several lines");
 	const { events } = toolCallEvents("bash", fragments);
@@ -648,7 +790,8 @@ test("rpc command census: every command in the rpc-mode switch has a masking ver
 	const end = source.indexOf("default: {", start);
 	assert.ok(start >= 0 && end > start, "fixture sanity: the command switch is found");
 	const body = source.slice(start, end);
-	const found = [...body.matchAll(/case "([^"]+)":/g)].map((match) => match[1]);
+	const caseLabel = /case\s+(["'`])([^"'`]+)\1\s*:/g;
+	const found = [...body.matchAll(caseLabel)].map((match) => match[2]);
 	assert.ok(found.length > 0, "fixture sanity: the switch has cases");
 	assert.deepEqual(
 		found.filter((command) => !Object.hasOwn(RPC_COMMAND_CENSUS, command)),
@@ -663,8 +806,10 @@ test("rpc command census: every command in the rpc-mode switch has a masking ver
 	for (const [command, verdict] of Object.entries(RPC_COMMAND_CENSUS)) {
 		assert.match(verdict, /^(masked|unmasked by design: .+|no model text(: .+)?)$/, `${command}: a known verdict`);
 		if (verdict !== "masked") continue;
-		const at = body.indexOf(`case "${command}":`);
-		const next = body.indexOf('case "', at + 1);
-		assert.match(body.slice(at, next < 0 ? undefined : next), /vinciMask/, `${command}: its case calls the masker`);
+		const labels = [...body.matchAll(caseLabel)];
+		const at = labels.findIndex((match) => match[2] === command);
+		const caseBody = body.slice(labels[at].index, labels[at + 1]?.index);
+		// A masking function, called or handed to map: vinciMaskView*, vinciMaskSecrets or vinciMaskJson (not vinciMaskEnabled).
+		assert.match(caseBody, /\bvinciMask(?:View\w*|Secrets|Json)\b\s*[()]/, `${command}: its case calls the masker`);
 	}
 });

@@ -79,8 +79,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		for (const out of streamMask.process(event)) output(vinciMaskViewEvent(out));
 	};
 	// [vinci] Every end path writes what the stream still holds, masked: nothing held is dropped unwritten.
-	const flushHeldEvents = () => {
-		if (vinciMaskEnabled()) for (const out of streamMask.flush()) output(vinciMaskViewEvent(out));
+	// Returns whether anything was written.
+	const flushHeldEvents = (): boolean => {
+		if (!vinciMaskEnabled()) return false;
+		const held = streamMask.flush();
+		for (const out of held) output(vinciMaskViewEvent(out));
+		return held.length > 0;
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -744,12 +748,23 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
-		flushHeldEvents(); // [vinci]
+		const flushed = flushHeldEvents(); // [vinci]
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();
 		if (signal !== "SIGTERM") {
 			await flushRawStdout();
+		} else if (flushed) {
+			// [vinci] SIGTERM exits at once, as before, unless held text was just written: then stdout drains
+			// first, bounded at 1s like the json mode's signal exit.
+			let timer: NodeJS.Timeout | undefined;
+			await Promise.race([
+				flushRawStdout().catch(() => {}),
+				new Promise((resolveDrain) => {
+					timer = setTimeout(resolveDrain, 1000);
+				}),
+			]);
+			clearTimeout(timer);
 		}
 		process.exit(exitCode);
 	}

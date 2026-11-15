@@ -11,12 +11,15 @@
  * a blank one, or one ending in a base64, hex or key-body character. The held run is released by the
  * next line that cannot belong to it; the block's released text is then masked whole. A block's end
  * (`text_end` / `thinking_end`), `message_end`, `agent_end` and every exit path release everything,
- * masked the same way. This is the decision rule of the interactive screen-reader writer.
+ * masked the same way. This is the decision rule of the interactive screen-reader writer. Each
+ * completed line is scanned once: the decision state is kept from one delta to the next.
  *
- * The argument text of a tool call whose arguments the interactive view masks (the built-in tools)
- * is held back the same way, over the joined `toolcall_delta` text of each tool call, so the
- * concatenated deltas never carry a value split across fragments. Until a tool call's text is
- * released, its partial `arguments` stay at the last value seen while nothing was held.
+ * Masking consistency for streamed tool arguments: the argument text of a tool call whose arguments
+ * the interactive view masks (the built-in tools) is held for the whole call. Its end releases one
+ * delta, the masked JSON of the parsed arguments (the masker the final arguments go through). A call
+ * that ends any other way releases the masked JSON of its argument text when that text parses, and
+ * otherwise only the placeholder. Until then its partial argument text is empty and its partial
+ * `arguments` are `{}`.
  *
  * `vinciMaskViewEvent` masks an RPC event in exactly the scope the interactive view masks.
  */
@@ -26,25 +29,38 @@ import { vinciMaskJson, vinciMaskSecrets } from "./vinci-mask-secrets.ts";
 /** The most streamed lines an unclosed `${` holds back. */
 const INTERPOLATION_HOLD_LINES = 20;
 
+/** What a tool call whose held argument text does not parse releases in its place. */
+const UNPARSED_ARGUMENTS = "‹redacted›";
+
+const KEY_BLOCK_MARKER = /-----(BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----/g;
+
 type StreamedKind = "text" | "thinking";
 
-interface HoldState {
-	/** Raw lines released so far. */
-	released: number;
+interface HeldLine {
+	index: number;
+	/** Offset of the line's line break in the block's text. */
+	end: number;
+	keyBlock: boolean;
+	interpolation: boolean;
+	text: string;
+}
+
+interface BlockState {
+	kind: StreamedKind;
+	scanner: HoldScanner;
 	/** The masked text emitted so far for this block. */
 	shown: string;
 	/** The block's end event was seen: everything is released. */
 	done: boolean;
 }
 
-interface BlockState extends HoldState {
-	kind: StreamedKind;
-}
-
-interface ToolCallState extends HoldState {
-	/** The joined raw argument text of every `toolcall_delta` so far. */
+interface ToolCallState {
+	/** The joined raw argument text of every `toolcall_delta` so far; it is never written. */
 	raw: string;
-	/** The partial arguments last seen while nothing was held. */
+	/** The masked argument text released (empty until the call is released). */
+	shown: string;
+	released: boolean;
+	/** The arguments the call shows once released. */
 	arguments: unknown;
 }
 
@@ -68,51 +84,18 @@ function isAssistant(message: Json): boolean {
 	return message?.role === "assistant" && Array.isArray(message.content);
 }
 
-/** For each line: whether a private-key BEGIN block is still open at its end. */
-export function vinciOpenKeyBlocks(lines: string[]): boolean[] {
-	const marker = /-----(BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----/g;
-	let open = false;
-	return lines.map((line) => {
-		for (const match of line.matchAll(marker)) open = match[1] === "BEGIN";
-		return open;
-	});
-}
-
-/**
- * For each line: whether a `${` opened so far is still unclosed at its end. An unclosed `${` holds
- * at most INTERPOLATION_HOLD_LINES lines and ends at a completed blank line.
- */
-export function vinciOpenInterpolations(lines: string[]): boolean[] {
-	const open: boolean[] = [];
-	const scan = (line: string, from: number): number => {
-		let depth = from;
-		for (let i = 0; i < line.length; i++) {
-			if (line.startsWith("${", i)) {
-				depth++;
-				i++;
-			} else if (line[i] === "}" && depth > 0) {
-				depth--;
-			}
+/** The `${` nesting depth at the end of `line`, starting from `from`. */
+function interpolationDepth(line: string, from: number): number {
+	let depth = from;
+	for (let i = 0; i < line.length; i++) {
+		if (line.startsWith("${", i)) {
+			depth++;
+			i++;
+		} else if (line[i] === "}" && depth > 0) {
+			depth--;
 		}
-		return depth;
-	};
-	let depth = 0;
-	let runStart = -1;
-	for (const [index, line] of lines.entries()) {
-		depth = scan(line, depth);
-		if (depth > 0 && runStart < 0) runStart = index;
-		// The last line is still streaming: only a completed line ends the run.
-		const completed = index < lines.length - 1;
-		const blank = line.trim() === "";
-		if (depth > 0 && completed && (blank || index - runStart >= INTERPOLATION_HOLD_LINES)) {
-			open.fill(false, runStart);
-			depth = scan(line, 0);
-			runStart = depth > 0 ? index : -1;
-		}
-		if (depth === 0) runStart = -1;
-		open.push(depth > 0);
 	}
-	return open;
+	return depth;
 }
 
 /** Whether a completed line could still be changed by the mask once later lines arrive. */
@@ -120,6 +103,109 @@ export function vinciLineMayChange(line: string, insideBlock: boolean): boolean 
 	if (insideBlock) return true;
 	const trimmed = line.trimEnd();
 	return trimmed === "" || /[A-Za-z0-9+/=]$/.test(trimmed);
+}
+
+/**
+ * The hold-back decision over one streamed text, kept from call to call: each completed line is
+ * scanned once, and only the lines past the release point are kept. An open BEGIN block holds every
+ * line until its END line; an unclosed `${` holds at most INTERPOLATION_HOLD_LINES lines and ends at a
+ * completed blank line.
+ */
+class HoldScanner {
+	/** Completed lines released, and the offset where the released text ends. */
+	released = 0;
+	releasedEnd = 0;
+	/** Offset just past the last completed line scanned. */
+	private end = 0;
+	/** Offset up to which a line break was looked for. */
+	private searched = 0;
+	/** The text just before `end`, to recognise the same text extended. */
+	private tail = "";
+	private lines = 0;
+	private keyBlock = false;
+	private depth = 0;
+	private runStart = -1;
+	private held: HeldLine[] = [];
+	private readonly work: { chars: number };
+
+	constructor(work: { chars: number }) {
+		this.work = work;
+	}
+
+	/** Scan the lines `raw` completed since the last call; whether the release point moved. */
+	scan(raw: string): boolean {
+		// A constant-size check per call; the counted work is the search for line breaks and the line scans.
+		if (raw.length < this.searched || !raw.startsWith(this.tail, this.end - this.tail.length)) this.restart();
+		const before = this.released;
+		let from = Math.max(this.end, this.searched);
+		for (;;) {
+			const at = raw.indexOf("\n", from);
+			if (at < 0) {
+				this.work.chars += raw.length - from;
+				this.searched = raw.length;
+				break;
+			}
+			this.work.chars += at + 1 - from;
+			this.line(raw.slice(this.end, at), at);
+			this.end = at + 1;
+			this.searched = this.end;
+			from = this.end;
+		}
+		this.tail = raw.slice(Math.max(0, this.end - 16), this.end);
+		if (this.released <= before) return false;
+		let drop = 0;
+		while (drop < this.held.length && this.held[drop].index < this.released) drop++;
+		this.held.splice(0, drop);
+		return true;
+	}
+
+	/** The text no longer extends what was scanned: scan it again from its start (released lines stay). */
+	private restart(): void {
+		this.end = 0;
+		this.searched = 0;
+		this.tail = "";
+		this.lines = 0;
+		this.keyBlock = false;
+		this.depth = 0;
+		this.runStart = -1;
+		this.held = [];
+	}
+
+	private line(text: string, end: number): void {
+		const index = this.lines++;
+		this.work.chars += text.length;
+		for (const match of text.matchAll(KEY_BLOCK_MARKER)) this.keyBlock = match[1] === "BEGIN";
+		this.depth = interpolationDepth(text, this.depth);
+		if (this.depth > 0 && this.runStart < 0) this.runStart = index;
+		if (this.depth > 0 && (text.trim() === "" || index - this.runStart >= INTERPOLATION_HOLD_LINES)) {
+			// The run ends here: its earlier lines no longer count as inside it.
+			for (let i = this.held.length - 1; i >= 0 && this.held[i].index >= this.runStart; i--) {
+				this.held[i].interpolation = false;
+				this.settle(this.held[i]);
+			}
+			this.depth = interpolationDepth(text, 0);
+			this.runStart = this.depth > 0 ? index : -1;
+		}
+		if (this.depth === 0) this.runStart = -1;
+		if (index < this.released) return;
+		const held: HeldLine = {
+			index,
+			end,
+			keyBlock: this.keyBlock,
+			interpolation: this.depth > 0,
+			text,
+		};
+		this.held.push(held);
+		this.settle(held);
+	}
+
+	/** Release up to `line` when nothing later can change it. */
+	private settle(line: HeldLine): void {
+		if (line.index + 1 > this.released && !vinciLineMayChange(line.text, line.keyBlock || line.interpolation)) {
+			this.released = line.index + 1;
+			this.releasedEnd = line.end;
+		}
+	}
 }
 
 /** The text `next` adds after `before`; when the mask rewrote emitted text, the rewritten tail. */
@@ -135,9 +221,15 @@ export class VinciStreamMask {
 	private tools = new Map<number, ToolCallState>();
 	private latest: Json = undefined;
 	private readonly mask: (text: string) => string;
+	private readonly work = { chars: 0 };
 
 	constructor(mask: (text: string) => string = vinciMaskSecrets) {
 		this.mask = mask;
+	}
+
+	/** Characters the text hold-back has examined so far (a work measure for tests). */
+	get scannedChars(): number {
+		return this.work.chars;
 	}
 
 	/**
@@ -162,8 +254,9 @@ export class VinciStreamMask {
 			case "message_end":
 				if (isAssistant(event.message)) {
 					const held = this.release(event.message);
+					const end = this.endEvent(event);
 					this.reset();
-					return [...held, event];
+					return [...held, end];
 				}
 				return [event];
 			case "agent_end":
@@ -187,57 +280,82 @@ export class VinciStreamMask {
 	}
 
 	/** Advance `state` over `raw` and return the block's masked released text. */
-	private advance(state: HoldState, raw: string): string {
-		const lines = raw.split("\n");
-		let release = state.done ? lines.length : state.released;
-		if (!state.done) {
-			const keyBlock = vinciOpenKeyBlocks(lines);
-			const interpolation = vinciOpenInterpolations(lines);
-			for (let i = state.released; i < lines.length - 1; i++) {
-				if (!vinciLineMayChange(lines[i], keyBlock[i] || interpolation[i])) release = i + 1;
-			}
-			if (release <= state.released) return state.shown;
-		}
-		state.released = release;
-		const shown = this.mask(lines.slice(0, release).join("\n"));
+	private advance(state: BlockState, raw: string): string {
+		if (state.done) return this.mask(raw);
+		if (!state.scanner.scan(raw)) return state.shown;
+		const shown = this.mask(raw.slice(0, state.scanner.releasedEnd));
 		// A later key body's END scan or a line-spanning run may still take the trailing whitespace
 		// (including the `\r` of a CRLF line) of a released line.
-		return state.done ? shown : shown.replace(/[ \t\r]+$/, "");
-	}
-
-	/** Whether `raw` still has text past what `state` released. */
-	private holds(state: HoldState, raw: string): boolean {
-		return !state.done && raw.split("\n").slice(state.released).join("\n") !== "";
+		return shown.replace(/[ \t\r]+$/, "");
 	}
 
 	private toolStateFor(index: number, block: Json): ToolCallState | undefined {
 		if (block?.type !== "toolCall" || !VIEW_MASKED_TOOLS.has(block.name)) return undefined;
 		let state = this.tools.get(index);
 		if (!state) {
-			state = { raw: "", released: 0, shown: "", done: false, arguments: {} };
+			state = { raw: "", shown: "", released: false, arguments: {} };
 			this.tools.set(index, state);
 		}
 		return state;
 	}
 
 	/**
-	 * A streaming tool call shows only what was released: its raw partial argument text is replaced by the
-	 * released, masked text, and while text is held its arguments stay at the last value seen unheld.
+	 * Release a held tool call once: `ended` holds the parsed arguments at the call's end; any other end
+	 * parses the held text, and text that does not parse releases only the placeholder. Returns the
+	 * released delta (empty when no argument text was streamed).
+	 */
+	private releaseTool(state: ToolCallState, ended: unknown): string {
+		if (state.released) return "";
+		state.released = true;
+		let parsed = ended;
+		if (parsed === undefined && state.raw.trim() !== "") {
+			try {
+				parsed = JSON.parse(state.raw);
+			} catch {
+				parsed = undefined;
+			}
+		}
+		state.arguments = parsed ?? {};
+		if (state.raw === "") state.shown = "";
+		else state.shown = parsed === undefined ? UNPARSED_ARGUMENTS : JSON.stringify(vinciMaskJson(parsed));
+		return state.shown;
+	}
+
+	/**
+	 * A streaming tool call shows only what was released: its partial argument text is the released,
+	 * masked text, and its arguments stay `{}` until the call is released.
 	 */
 	private toolBlock(block: Json, state: ToolCallState): Json {
 		const shown: Json = { ...block };
 		for (const field of ["partialJson", "partialArgs"]) {
 			if (typeof block[field] === "string") shown[field] = state.shown;
 		}
-		if (this.holds(state, state.raw)) shown.arguments = state.arguments;
-		else state.arguments = block.arguments;
+		shown.arguments = state.released ? state.arguments : {};
 		return shown;
+	}
+
+	/** `message_end` as given, except that a held tool call's partial argument text is the released text. */
+	private endEvent(event: Json): Json {
+		const content = event.message.content;
+		const carries = (block: Json, index: number) =>
+			this.tools.has(index) && (typeof block?.partialJson === "string" || typeof block?.partialArgs === "string");
+		if (!content.some(carries)) return event;
+		const shown = content.map((block: Json, index: number) => {
+			if (!carries(block, index)) return block;
+			const masked = { ...block };
+			const state = this.tools.get(index) as ToolCallState;
+			for (const field of ["partialJson", "partialArgs"]) {
+				if (typeof block[field] === "string") masked[field] = state.shown;
+			}
+			return masked;
+		});
+		return { ...event, message: { ...event.message, content: shown } };
 	}
 
 	private stateFor(index: number, kind: StreamedKind): BlockState {
 		let state = this.blocks.get(index);
 		if (!state || state.kind !== kind) {
-			state = { kind, released: 0, shown: "", done: false };
+			state = { kind, scanner: new HoldScanner(this.work), shown: "", done: false };
 			this.blocks.set(index, state);
 		}
 		return state;
@@ -257,10 +375,9 @@ export class VinciStreamMask {
 		const toolState = toolIndex >= 0 ? this.toolStateFor(toolIndex, message.content[toolIndex]) : undefined;
 		if (toolState) {
 			if (source.type === "toolcall_delta" && typeof source.delta === "string") toolState.raw += source.delta;
-			if (source.type === "toolcall_end") toolState.done = true;
-			const shown = this.advance(toolState, toolState.raw);
-			toolAdded = addedText(toolState.shown, shown);
-			toolState.shown = shown;
+			if (source.type === "toolcall_end") {
+				toolAdded = this.releaseTool(toolState, source.toolCall?.arguments ?? message.content[toolIndex]?.arguments);
+			}
 		}
 		const added = new Map<number, string>();
 		const content = message.content.map((block: Json, index: number) => {
@@ -280,7 +397,7 @@ export class VinciStreamMask {
 		const out: Json[] = [];
 		const endingAdded = added.get(ending);
 		if (endingAdded) out.push(this.delta(masked, ending, endingAdded));
-		if (toolState && source.type === "toolcall_end" && toolAdded) out.push(this.toolDelta(masked, toolIndex, toolAdded));
+		if (toolAdded) out.push(this.toolDelta(masked, toolIndex, toolAdded));
 		let rewritten = source;
 		if (source && typeof source === "object") {
 			rewritten = { ...source };
@@ -288,7 +405,7 @@ export class VinciStreamMask {
 			if (source.type === "text_delta" || source.type === "thinking_delta") {
 				rewritten.delta = added.get(source.contentIndex) ?? "";
 			}
-			if (toolState && source.type === "toolcall_delta") rewritten.delta = toolAdded;
+			if (toolState && source.type === "toolcall_delta") rewritten.delta = "";
 			if (ending >= 0 && added.has(ending)) {
 				const block = content[ending];
 				rewritten.content = block[streamedKind(block) as StreamedKind];
@@ -304,16 +421,15 @@ export class VinciStreamMask {
 		const added = new Map<number, string>();
 		const toolAdded = new Map<number, string>();
 		for (const [index, state] of this.tools) {
-			if (state.done) continue;
-			state.done = true;
-			const shown = this.advance(state, state.raw);
-			const text = addedText(state.shown, shown);
+			const text = this.releaseTool(state, undefined);
 			if (text) toolAdded.set(index, text);
-			state.shown = shown;
 		}
 		const content = message.content.map((block: Json, index: number) => {
 			const kind = streamedKind(block);
-			if (!kind) return block;
+			if (!kind) {
+				const tool = block?.type === "toolCall" ? this.tools.get(index) : undefined;
+				return tool ? this.toolBlock(block, tool) : block;
+			}
 			const state = this.blocks.get(index);
 			if (!state || state.kind !== kind) return { ...block, [kind]: this.mask(block[kind]) };
 			state.done = true;
@@ -352,6 +468,7 @@ export class VinciStreamMask {
 		};
 	}
 }
+
 
 // ---------------------------------------------------------------------------------------------------
 // RPC scope: exactly what the interactive view masks.

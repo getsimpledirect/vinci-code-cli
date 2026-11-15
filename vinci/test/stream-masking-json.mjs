@@ -8,12 +8,16 @@ import { fileURLToPath } from "node:url";
 import {
 	assertMasked,
 	assertNeverRewritten,
+	assertNoSecretBytes,
 	assistant,
 	block,
 	deltasOf,
+	fragmentsOf,
 	inlineToken,
 	keyMarkers,
+	multiLineToolCalls,
 	PLACEHOLDER,
+	partialArgumentTexts,
 	secretRuns,
 	splitAcross,
 	streamEvents,
@@ -25,6 +29,7 @@ const src = resolve(here, "../../packages/coding-agent/src");
 const { runPrintMode, setPrintModeTerminatingForTest } = await import(resolve(src, "modes/print-mode.ts"));
 const { vinciMaskJson, vinciMaskSecrets } = await import(resolve(src, "core/vinci-mask-secrets.ts"));
 const { waitForRawStdoutBackpressure } = await import(resolve(src, "core/output-guard.ts"));
+const { VinciStreamMask } = await import(resolve(src, "core/vinci-stream-mask.ts"));
 
 const realWrite = process.stdout.write;
 
@@ -295,12 +300,12 @@ test("json with masking off: the stream is byte-identical to the events", async 
 	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(event)}\n`).join(""));
 });
 
-// Tool-call argument deltas of the tools whose arguments the view masks are held back per tool call.
+// Masking consistency for streamed tool arguments: the tools whose arguments the view masks.
 for (const [label, step] of [
-	["two deltas", 0],
-	["five deltas", 9],
+	["case 1", 0],
+	["case 2", 9],
 ]) {
-	test(`json: a value split across ${label} of a bash call never reaches stdout; the placeholder does`, async () => {
+	test(`json: masking consistency for streamed tool arguments, single-line value (${label})`, async () => {
 		const token = inlineToken();
 		const json = JSON.stringify({ command: `echo ${token}` });
 		const fragments = splitAcross(json, token, step);
@@ -329,6 +334,172 @@ test("json: a tool the view does not mask keeps its old per-event masking of arg
 	const { events } = toolCallEvents("extension_tool", splitAcross(json, token, 0));
 	const out = await runJson(events);
 	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "as before this change");
+});
+
+const toolFragment = 9;
+const multiLineCases = () =>
+	Object.values(secretRuns()).flatMap((run, n) =>
+		Object.entries(multiLineToolCalls(run.lines)).map(([tool, args]) => ({ label: `${tool}, case ${n + 1}`, tool, args, secret: run.secret })),
+	);
+
+for (const { label, tool, args, secret } of multiLineCases()) {
+	test(`json: masking consistency for streamed tool arguments, multi-line value (${label})`, async () => {
+		const json = JSON.stringify(args);
+		const { events } = toolCallEvents(tool, fragmentsOf(json, toolFragment));
+		const out = await runJson(events);
+		const deltas = deltasOf(out.events, "toolcall");
+		assertMasked(deltas, secret, "joined deltas");
+		assertNoSecretBytes(partialArgumentTexts(out.events).join("\n"), secret, "partial argument text");
+		assertMasked(out.stdout, secret, "whole stdout");
+		assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "the release is the masked JSON of the parsed arguments");
+		const released = out.events.filter((event) => event.assistantMessageEvent?.type === "toolcall_delta" && event.assistantMessageEvent.delta);
+		assert.equal(released.length, 1, "one release, at the call's end");
+		for (const text of partialArgumentTexts(out.events)) assert.ok(text === "" || text === deltas, "partial argument text is empty or the released text");
+		const end = out.events.find((event) => event.type === "message_end");
+		const rawEnd = events.find((event) => event.type === "message_end");
+		assert.deepEqual(end, JSON.parse(JSON.stringify(vinciMaskJson(rawEnd))), "message_end is masked as before");
+	});
+}
+
+// A built-in tool call that ends without its toolcall_end, on every path: none of its held argument text.
+function interruptedCall({ ending = "none", stopReason, partialOnEnd = false } = {}) {
+	const run = secretRuns()["a multi-line base64 secret"];
+	const args = multiLineToolCalls(run.lines).write;
+	const json = JSON.stringify(args);
+	const cut = json.indexOf(run.lines[Math.floor(run.lines.length / 2)]) + 5;
+	const { events } = toolCallEvents("write", fragmentsOf(json.slice(0, cut), toolFragment), { ending, stopReason, partialOnEnd });
+	return { events, secret: run.secret };
+}
+
+/** The interrupted call released only the placeholder, and no streamed event carries its argument bytes. */
+function assertInterrupted(events, secret, where) {
+	assert.equal(deltasOf(events, "toolcall"), PLACEHOLDER, `${where}: only the placeholder is released`);
+	assertNoSecretBytes(partialArgumentTexts(events).join("\n"), secret, `${where}: partial argument text`);
+	const streamed = events.filter((event) => event.type !== "message_end" && event.type !== "agent_end" && event.type !== "turn_end");
+	assertNoSecretBytes(JSON.stringify(streamed), secret, `${where}: streamed events`);
+}
+
+for (const [label, stopReason, partialOnEnd] of [
+	["an abort", "aborted", true],
+	["an error", "error", false],
+	["a stream that ends", "stop", false],
+]) {
+	test(`json: masking consistency for streamed tool arguments, a call cut by ${label} (message_end only)`, async () => {
+		const { events, secret } = interruptedCall({ ending: "message_end", stopReason, partialOnEnd });
+		const out = await runJson(events);
+		assertInterrupted(out.events, secret, label);
+		const end = out.events.find((event) => event.type === "message_end");
+		assert.equal(end.message.stopReason, stopReason);
+		assert.deepEqual(partialArgumentTexts([end]), partialOnEnd ? [PLACEHOLDER] : [], "message_end carries only the released text");
+	});
+}
+
+test("json: masking consistency for streamed tool arguments, a call cut by agent_end", async () => {
+	const { events, secret } = interruptedCall();
+	events.push({ type: "agent_end", messages: [] });
+	const out = await runJson(events);
+	assertInterrupted(out.events, secret, "agent_end");
+	assertMasked(out.stdout, secret, "agent_end: whole stdout");
+	const agentEnd = out.events.findIndex((event) => event.type === "agent_end");
+	assert.equal(deltasOf(out.events.slice(0, agentEnd), "toolcall"), PLACEHOLDER, "released before agent_end");
+});
+
+test("json: masking consistency for streamed tool arguments, a call cut by a thrown error", async () => {
+	const { events, secret } = interruptedCall();
+	const out = await runJson(events, {
+		during: async () => {
+			throw new Error("provider failed");
+		},
+	});
+	assert.equal(out.exitCode, 1);
+	assertInterrupted(out.events, secret, "error");
+	assertMasked(out.stdout, secret, "error: whole stdout");
+});
+
+test("json: masking consistency for streamed tool arguments, a call cut by a termination signal", async () => {
+	const { events, secret } = interruptedCall();
+	const realExit = process.exit;
+	let exited;
+	let atExit;
+	let stdoutNow;
+	const exitCalled = new Promise((resolveExit) => {
+		process.exit = (code) => {
+			exited = code;
+			atExit = stdoutNow();
+			resolveExit();
+		};
+	});
+	try {
+		await runJson(events, {
+			during: async ({ stdout }) => {
+				stdoutNow = stdout;
+				process.emit("SIGTERM");
+				await Promise.race([exitCalled, new Promise((r) => setTimeout(r, 6000))]);
+			},
+		});
+	} finally {
+		process.exit = realExit;
+		setPrintModeTerminatingForTest(false);
+		process.exitCode = undefined;
+	}
+	assert.equal(exited, 143, "the signal path exits 143");
+	assertInterrupted(parseLines(atExit), secret, "signal");
+	assertMasked(atExit, secret, "signal: written before exit");
+});
+
+test("json: masking consistency for streamed tool arguments, a call cut by a rebind", async () => {
+	const { events, secret } = interruptedCall();
+	let afterRebind;
+	await runJson(events, {
+		during: async ({ stdout, rebind }) => {
+			await rebind();
+			await waitForRawStdoutBackpressure();
+			afterRebind = stdout();
+		},
+	});
+	assertInterrupted(parseLines(afterRebind), secret, "rebind");
+	assertMasked(afterRebind, secret, "rebind: whole stdout");
+});
+
+test("json: masking consistency for streamed tool arguments, a call cut by the next message_start", async () => {
+	const { events, secret } = interruptedCall();
+	const next = streamEvents(["Next answer."]).events;
+	const out = await runJson([...events, ...next]);
+	assertInterrupted(out.events, secret, "message_start");
+	assertMasked(out.stdout, secret, "message_start: whole stdout");
+	const starts = out.events.flatMap((event, index) => (event.type === "message_start" ? [index] : []));
+	assert.equal(deltasOf(out.events.slice(0, starts[1]), "toolcall"), PLACEHOLDER, "released before the next message_start");
+});
+
+test("json: masking consistency for streamed tool arguments, a complete call with no toolcall_end releases its masked parse", async () => {
+	const run = secretRuns()["an END-only private-key body"];
+	const args = multiLineToolCalls(run.lines).bash;
+	const json = JSON.stringify(args);
+	const { events } = toolCallEvents("bash", fragmentsOf(json, toolFragment), { ending: "message_end", stopReason: "aborted" });
+	const out = await runJson(events);
+	assert.equal(deltasOf(out.events, "toolcall"), JSON.stringify(vinciMaskJson(args)));
+	assertMasked(out.stdout, run.secret, "whole stdout");
+});
+
+test("json: the text hold-back examines each streamed character a bounded number of times", () => {
+	const lines = ["The quick brown fox jumps over the lazy dog; ok.", "A line that a later line may still change abc123"];
+	let raw = "";
+	for (let i = 0; raw.length < 100 * 1024; i++) raw += `${lines[i % 2]}\n`;
+	const stream = new VinciStreamMask();
+	const asst = (text) => assistant([block("text", text)]);
+	const deltas = [];
+	const keep = (outs) => {
+		for (const event of outs) if (event.assistantMessageEvent?.type === "text_delta") deltas.push(event.assistantMessageEvent.delta);
+	};
+	const bound = 4 * raw.length;
+	stream.process({ type: "message_start", message: assistant([]) });
+	for (let at = 0; at < raw.length && stream.scannedChars < bound; at += 8) {
+		const message = asst(raw.slice(0, at + 8));
+		keep(stream.process({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: raw.slice(at, at + 8), partial: message } }));
+	}
+	assert.ok(stream.scannedChars < bound, `scanned ${stream.scannedChars} characters for a ${raw.length}-character text`);
+	keep(stream.process({ type: "message_end", message: asst(raw) }));
+	assert.equal(deltas.join(""), vinciMaskSecrets(raw), "positive control: the deltas add up to the masked text");
 });
 
 test("json: an open `${` holds its lines until it closes, so released text is never rewritten", async () => {

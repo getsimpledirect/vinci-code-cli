@@ -116,17 +116,24 @@ function partialArguments(json) {
 
 /**
  * Assistant stream events for one tool call whose argument JSON arrives in `fragments`. Each partial
- * tool-call block carries the parsed partial `arguments` and the raw `partialJson`, as a provider
- * streams them. `before`: content blocks ahead of the tool call (index 0..n-1), already streamed.
+ * tool-call block carries the parsed partial `arguments` and the raw partial text (`field`), as a
+ * provider streams them. `before`: content blocks ahead of the tool call (index 0..n-1), already
+ * streamed. `ending`: "end" (toolcall_end, then message_end), "message_end" (message_end only, as an
+ * abort, an error or a cut stream writes it, with the best-effort parse of the text so far), or "none".
+ * `partialOnEnd`: the message_end block keeps its partial text field.
  */
-export function toolCallEvents(name, fragments, { id = "call-1", before = [], start = true } = {}) {
+export function toolCallEvents(
+	name,
+	fragments,
+	{ id = "call-1", before = [], start = true, ending = "end", stopReason, field = "partialJson", partialOnEnd = false } = {},
+) {
 	const index = before.length;
 	const events = start ? [{ type: "message_start", message: assistant([]) }] : [];
 	const call = (json, done) =>
 		done
 			? { type: "toolCall", id, name, arguments: JSON.parse(json) }
-			: { type: "toolCall", id, name, arguments: partialArguments(json), partialJson: json };
-	const message = (json, done) => assistant([...before, call(json, done)], done ? "toolUse" : "stop");
+			: { type: "toolCall", id, name, arguments: partialArguments(json), [field]: json };
+	const message = (json, done, reason) => assistant([...before, call(json, done)], reason ?? (done ? "toolUse" : "stop"));
 	let json = "";
 	const first = message(json, false);
 	events.push({ type: "message_update", message: first, assistantMessageEvent: { type: "toolcall_start", contentIndex: index, partial: first } });
@@ -139,14 +146,62 @@ export function toolCallEvents(name, fragments, { id = "call-1", before = [], st
 			assistantMessageEvent: { type: "toolcall_delta", contentIndex: index, delta: fragment, partial },
 		});
 	}
-	const final = message(json, true);
-	events.push({
-		type: "message_update",
-		message: final,
-		assistantMessageEvent: { type: "toolcall_end", contentIndex: index, toolCall: final.content[index], partial: final },
-	});
-	events.push({ type: "message_end", message: final });
+	if (ending === "end") {
+		const final = message(json, true, stopReason);
+		events.push({
+			type: "message_update",
+			message: final,
+			assistantMessageEvent: { type: "toolcall_end", contentIndex: index, toolCall: final.content[index], partial: final },
+		});
+		events.push({ type: "message_end", message: final });
+	} else if (ending === "message_end") {
+		const final = message(json, false, stopReason ?? "aborted");
+		if (!partialOnEnd) delete final.content[index][field];
+		events.push({ type: "message_end", message: final });
+	}
 	return { events, json };
+}
+
+/** `text` cut into fragments of `size` characters. */
+export function fragmentsOf(text, size) {
+	const parts = [];
+	for (let at = 0; at < text.length; at += size) parts.push(text.slice(at, at + size));
+	return parts;
+}
+
+/** Built-in tool calls whose arguments carry `lines` as multi-line text: a file write and a shell command. */
+export function multiLineToolCalls(lines) {
+	const text = lines.join("\n");
+	return {
+		write: { path: "notes/out.txt", content: `Saved notes:\n${text}\nend of notes.\n` },
+		bash: { command: `cat > out.txt <<'EOF'\n${text}\nEOF\nwc -l out.txt` },
+	};
+}
+
+/** Every partial argument text (`partialJson` / `partialArgs`) anywhere in `events`. */
+export function partialArgumentTexts(events) {
+	const found = [];
+	const walk = (value) => {
+		if (Array.isArray(value)) value.forEach(walk);
+		else if (value && typeof value === "object") {
+			for (const [key, entry] of Object.entries(value)) {
+				if ((key === "partialJson" || key === "partialArgs") && typeof entry === "string") found.push(entry);
+				else walk(entry);
+			}
+		}
+	};
+	walk(events);
+	return found;
+}
+
+/** No 12-byte window of any secret line appears in `text` (the placeholder need not). */
+export function assertNoSecretBytes(text, secret, where) {
+	for (const line of secret) {
+		for (let start = 0; start + 12 <= line.length; start += 4) {
+			const window = line.slice(start, start + 12);
+			assert.ok(!text.includes(window), `${where}: secret bytes ${JSON.stringify(window)} reached the stream`);
+		}
+	}
 }
 
 /** `json` cut into fragments so that `value` is split: at `value`'s 14th character, or every `step` characters across it. */
