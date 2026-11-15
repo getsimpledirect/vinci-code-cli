@@ -356,3 +356,88 @@ export function withSourceEnd(events, kind, final) {
 	const source = kind === "done" ? { type: "done", reason: "stop", message: final } : { type: "error", reason: "aborted", error: final };
 	return [...events.slice(0, at), { type: "message_update", message: final, assistantMessageEvent: source }, ...events.slice(at)];
 }
+
+/**
+ * Tool-call streams whose events name no call (an out-of-range content index and no usable id), so the
+ * fallback picks the call. Each case returns its events and the secret lines no stdout byte may carry:
+ * 1. text taken into a nameless call is ended by another call's `toolcall_end`, then a `done` event names
+ *    the call a tool the view does not mask;
+ * 2. a built-in call that never gets state of its own (the fallback picks a nameless call) ends cut;
+ * 3. a cut call's later fragment (a password value) is taken into a later call and parses alone;
+ * 4. a later call's `toolcall_end` ends the streaming cut call, which keeps its incomplete partial text.
+ */
+export function fallbackCases() {
+	const at = { contentIndex: 99 };
+	const update = (content, event, stopReason = "stop") => {
+		const message = assistant(content, stopReason);
+		return { type: "message_update", message, assistantMessageEvent: { ...event, partial: message } };
+	};
+	const ends = (final) => [
+		{ type: "message_end", message: final },
+		{ type: "turn_end", message: final, toolResults: [] },
+		{ type: "agent_end", messages: [final] },
+	];
+	const cut = secretRuns()["a multi-line hex secret"].lines[0];
+	const token = inlineToken();
+	const password = ["Zq8vLm3N", "pR7tWx2K"].join("");
+	const cases = {};
+	{
+		const json = JSON.stringify({ command: `TOKEN=${token} true` });
+		const a = { type: "toolCall", id: "", name: "bash", arguments: {} };
+		const b = (text) => ({ type: "toolCall", id: "", name: "", arguments: {}, partialJson: text });
+		const events = [{ type: "message_start", message: assistant([]) }, update([a, b("")], { type: "toolcall_start", ...at })];
+		let text = "";
+		for (const fragment of fragmentsOf(json, 9)) {
+			text += fragment;
+			events.push(update([a, b(text)], { type: "toolcall_delta", ...at, delta: fragment }));
+		}
+		const done = { ...a, arguments: JSON.parse(json) };
+		events.push(update([done, b(text)], { type: "toolcall_end", ...at, toolCall: done }));
+		const final = assistant([done, { type: "toolCall", id: "", name: "extension_tool", arguments: {}, partialJson: "" }], "toolUse");
+		events.push({ type: "message_update", message: final, assistantMessageEvent: { type: "done", reason: "toolUse", message: final } });
+		events.push(...ends(final));
+		cases["another call's end, then a done event naming the call a tool the view does not mask"] = { events, secret: [token] };
+	}
+	{
+		const a = (args) => ({ type: "toolCall", id: "a", name: "bash", arguments: args });
+		const b = { type: "toolCall", id: "b", name: "", arguments: {} };
+		const fragment = `{"command":"${cut}`;
+		const events = [
+			{ type: "message_start", message: assistant([]) },
+			update([a({}), b], { type: "toolcall_start", ...at }),
+			update([a({ command: cut }), b], { type: "toolcall_delta", ...at, delta: fragment }),
+		];
+		events.push(...ends(assistant([a({ command: cut }), b], "stop")));
+		cases["a built-in call with no state of its own, cut"] = { events, secret: [cut] };
+	}
+	{
+		const first = '{"command":"true","password":';
+		const second = `"${password}"`;
+		const a = (text, args) => ({ type: "toolCall", id: "", name: "bash", arguments: args, partialJson: text });
+		const b = { type: "toolCall", id: "", name: "read", arguments: {}, partialJson: "" };
+		const events = [
+			{ type: "message_start", message: assistant([]) },
+			update([a("", {})], { type: "toolcall_start", ...at }),
+			update([a(first, { command: "true" })], { type: "toolcall_delta", ...at, delta: first }),
+			update([a(first, { command: "true" }), b], { type: "toolcall_start", ...at }),
+			update([a(first + second, { command: "true", password }), b], { type: "toolcall_delta", ...at, delta: second }),
+		];
+		events.push(...ends(assistant([a(first + second, { command: "true", password }), b], "aborted")));
+		cases["a cut call's fragment taken into a later call"] = { events, secret: [password] };
+	}
+	{
+		const text = `{"command":"${cut}`;
+		const a = (partial) => ({ type: "toolCall", id: "", name: "bash", arguments: { command: cut }, partialJson: partial });
+		const b = (args) => ({ type: "toolCall", id: "", name: "read", arguments: args });
+		const events = [
+			{ type: "message_start", message: assistant([]) },
+			update([a(""), b({})], { type: "toolcall_start", ...at }),
+			update([a(text), b({})], { type: "toolcall_delta", ...at, delta: text }),
+		];
+		const done = b({ path: "ok" });
+		events.push(update([a(text), done], { type: "toolcall_end", ...at, toolCall: done }));
+		events.push(...ends(assistant([a(text), done], "stop")));
+		cases["another call's end taken by a streaming cut call"] = { events, secret: [cut] };
+	}
+	return cases;
+}

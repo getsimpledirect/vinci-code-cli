@@ -76,7 +76,10 @@ interface ToolCallState {
 	released: boolean;
 	/** The arguments the call shows once released. */
 	arguments: unknown;
-	/** Some of its text came from an event that named no call (taken by the fallback): never released unchanged. */
+	/**
+	 * Some of its text came from an event that named no call (taken by the fallback; it may be another
+	 * call's): nothing is released, it shows no arguments, and a built-in call is interrupted at the end.
+	 */
 	guessed?: boolean;
 }
 
@@ -493,13 +496,15 @@ export class VinciStreamMask {
 	/** Record the calls of `message` still held (not released by their toolcall_end) as interrupted. */
 	private markInterrupted(message: Json): void {
 		if (!isAssistant(message)) return;
-		for (const [index, state] of this.tools) {
-			const block = message.content[index];
-			if (state.released || block?.type !== "toolCall" || !viewMasksCall(block)) continue;
+		message.content.forEach((block: Json, index: number) => {
+			if (block?.type !== "toolCall" || !viewMasksCall(block)) return;
+			const state = this.tools.get(index);
+			// A built-in call with no state of its own, or whose state took fallback text, is interrupted too.
+			if (state && state.released && !state.guessed) return;
 			this.interruptedBlocks.add(block);
 			if (typeof block.id === "string" && block.id !== "") this.interruptedIds.add(block.id);
 			this.anyInterrupted = true;
-		}
+		});
 	}
 
 	/** Release whatever the streaming message still holds, masked (exit paths call this). */
@@ -555,6 +560,7 @@ export class VinciStreamMask {
 	 */
 	private releaseTool(state: ToolCallState, ended: unknown): string {
 		if (state.released) return "";
+		if (state.guessed) return this.dropGuessed(state);
 		state.released = true;
 		let parsed = ended;
 		if (parsed === undefined && state.raw.trim() !== "") {
@@ -571,9 +577,9 @@ export class VinciStreamMask {
 	}
 
 	/**
-	 * End a call the view does not mask whose held text was taken by the fallback (it may be another
-	 * call's): nothing is released, and the call shows no arguments and empty partial text until the final
-	 * events, which carry its own arguments.
+	 * End a call whose held text was taken by the fallback (it may be another call's): nothing is released,
+	 * and the call shows no arguments and empty partial text until the final events, which over-mask a
+	 * built-in call and carry a call the view does not mask with its own arguments.
 	 */
 	private dropGuessed(state: ToolCallState): string {
 		state.released = true;
@@ -598,9 +604,9 @@ export class VinciStreamMask {
 	private toolBlock(block: Json, state: ToolCallState): Json {
 		const shown: Json = { ...block };
 		for (const field of ["partialJson", "partialArgs"]) {
-			if (typeof block[field] === "string") shown[field] = state.shown;
+			if (typeof block[field] === "string") shown[field] = state.guessed ? "" : state.shown;
 		}
-		shown.arguments = state.released ? state.arguments : {};
+		shown.arguments = state.released && !state.guessed ? state.arguments : {};
 		return shown;
 	}
 

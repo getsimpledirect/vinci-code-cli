@@ -16,6 +16,7 @@ import {
 	cutPoints,
 	cutToolCalls,
 	deltasOf,
+	fallbackCases,
 	finalEventsOf,
 	fragmentsOf,
 	heldWindows,
@@ -942,12 +943,20 @@ test("rpc positive control: a late name that names a tool the view does not mask
 	assert.ok(!out.stdout.includes(PLACEHOLDER));
 });
 
+/** Text the fallback took (the events name no call) is not released; the final events show the call as interrupted. */
+function assertFallbackHeld(out, secret) {
+	assertNoSecretBytes(out.stdout, secret, "whole stdout");
+	assert.equal(deltasOf(out.events, "toolcall"), "", "text the fallback took is not released");
+	assert.ok(JSON.stringify(finalEventsOf(out.events)).includes(PLACEHOLDER), "the final events show the call as interrupted");
+}
+
 for (const index of ["string", "missing"]) {
 	test(`rpc: masking consistency for streamed tool arguments, a ${index} content index still holds the call`, async () => {
 		const run = secretRuns()["a multi-line hex secret"];
 		const args = multiLineToolCalls(run.lines).bash;
 		const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { index, before: [block("text", "Running it.\n")] });
 		const out = await runRpc(events);
+		if (index === "missing") return assertFallbackHeld(out, run.secret);
 		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
 		const deltas = deltasOf(out.events, "toolcall");
 		assertMasked(deltas, run.secret, "joined deltas");
@@ -1131,8 +1140,9 @@ for (const [what, kept] of [["an empty", ""], ["the placeholder as its", PLACEHO
 }
 
 // A content index that names no tool-call block (out of range, or the text block ahead of the call) falls
-// back to the call's id, else the last tool-call block; a numeric-string index is read as its number even
-// where that fallback would pick another block.
+// back to the fallback (the deltas carry no id), so the call's text is not released and its final events show
+// it as interrupted; a numeric-string index is read as its number even where that fallback would pick
+// another block, and the call is released as its masked arguments.
 for (const [label, index, after, id] of [
 	["an out-of-range content index with a later tool call", 5, [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }], "call-1"],
 	["a content index naming a text block with a later tool call", 0, [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {} }], "call-1"],
@@ -1143,6 +1153,7 @@ for (const [label, index, after, id] of [
 		const args = multiLineToolCalls(run.lines).bash;
 		const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id, index, after, before: [block("text", "Running it.\n")], finals: true });
 		const out = await runRpc(events);
+		if (index !== "string") return assertFallbackHeld(out, run.secret);
 		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
 		const deltas = deltasOf(out.events, "toolcall");
 		assertMasked(deltas, run.secret, "joined deltas");
@@ -1151,7 +1162,7 @@ for (const [label, index, after, id] of [
 }
 
 // The same fallback when no call carries streaming argument text (a provider that sends only parsed
-// arguments): the deltas are held as a masked call's, never passed through to the later call.
+// arguments): the deltas are held, never passed through to the later call.
 for (const [label, index] of [
 	["an out-of-range content index", 5],
 	["a content index naming a text block", 0],
@@ -1164,8 +1175,7 @@ for (const [label, index] of [
 		const stripped = JSON.parse(JSON.stringify(events, (key, value) => (key === "partialJson" ? undefined : value)));
 		assert.ok(!JSON.stringify(stripped).includes("partialJson"), "fixture sanity: no block carries streaming text");
 		const out = await runRpc(stripped);
-		assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
-		assertMasked(deltasOf(out.events, "toolcall"), run.secret, "joined deltas");
+		assertFallbackHeld(out, run.secret);
 	});
 }
 
@@ -1212,8 +1222,7 @@ test("rpc: masking consistency for streamed tool arguments, an out-of-range cont
 	assert.ok(events.every((event) => event.message?.content?.[0]?.partialJson === undefined), "fixture sanity: the built-in call carries no streaming text");
 	assert.ok(events.some((event) => event.message?.content?.[1]?.partialJson === "{}"), "fixture sanity: the later call keeps its text");
 	const out = await runRpc(events);
-	assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
-	assertMasked(deltasOf(out.events, "toolcall"), run.secret, "joined deltas");
+	assertFallbackHeld(out, run.secret);
 });
 
 // Text the fallback took into a call whose name was not known yet: when that name turns out to be one the
@@ -1276,10 +1285,7 @@ test("rpc: masking consistency for streamed tool arguments, an out-of-range cont
 	const after = [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {}, partialJson: "{}" }];
 	const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id: "call-1", index: 5, after, finals: true });
 	const out = await runRpc(events);
-	assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
-	const deltas = deltasOf(out.events, "toolcall");
-	assertMasked(deltas, run.secret, "joined deltas");
-	assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "released once, as the call's masked arguments");
+	assertFallbackHeld(out, run.secret);
 });
 
 
@@ -1461,3 +1467,13 @@ test("rpc command census: every command in the rpc-mode switch has a masking ver
 		assert.match(caseBody, /\bvinciMask(?:View\w*|Secrets|Json)\b\s*[()]/, `${command}: its case calls the masker`);
 	}
 });
+
+// Events that name no call (an out-of-range content index, no usable id): text the fallback took is never
+// released, and a built-in call the stream could not follow is shown as interrupted in its final events.
+for (const [label, { events, secret }] of Object.entries(fallbackCases())) {
+	test(`rpc: masking consistency for streamed tool arguments, events that name no call: ${label}`, async () => {
+		assert.ok(JSON.stringify(events).includes(secret[0]), "fixture sanity: the events carry the value");
+		const out = await runRpc(events);
+		assertNoSecretBytes(out.stdout, secret, "whole stdout");
+	});
+}
