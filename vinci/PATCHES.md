@@ -28,7 +28,7 @@ only patch core when there's no hook.)
 
 | File | What the `[vinci]` edit does | § |
 |---|---|---|
-| `agent/src/agent-loop.ts` | Canonicalize tool-name synonyms (`editor`→`edit`); repair double-encoded arguments before validation; mark Vinci-blocked results for private display handling | 20,23 |
+| `agent/src/agent-loop.ts` | Canonicalize tool-name synonyms (`editor`→`edit`), and export the pure synonym lookup (`vinciCanonicalToolName`) the streamed-output mask classifies calls by; repair double-encoded arguments before validation; mark Vinci-blocked results for private display handling | 20,23 |
 | `agent/src/types.ts` | `tool_hooks_start` agent event so a hung extension hook can be timed and killed | — |
 | `ai/src/api/openai-completions.ts` | Mark failed/blocked tool results with an explicit `ERROR —` prefix on the wire | 15 |
 | `ai/src/utils/retry.ts` | Keep 401, invalid API key, 402, and refusal errors non-retryable despite transient gateway wording | — |
@@ -444,7 +444,10 @@ call (the tools whose arguments the view masks) is held for the whole call; its 
 delta, the masked JSON of the parsed arguments, and any other end releases the masked JSON of the
 text when it parses, else only the placeholder. A call whose name has not arrived is held like a
 built-in one: a non-built-in name releases the held text unchanged, and a call that ends nameless is
-released masked. A call released without its `toolcall_end` is interrupted: in its final events
+released masked. A tool-name synonym of a built-in tool (folded onto the tool by `agent-loop.ts` only
+when the stream ends) is treated as that tool from the moment the name is known, through the
+`vinciCanonicalToolName` lookup exported beside the synonym table, whatever tools the turn has; tool
+execution events and tool results under such a name are masked the same way. A call released without its `toolcall_end` is interrupted: in its final events
 (`message_end`, `turn_end`, `agent_end`) and in the transcript responses, each string value of its
 arguments keeps only the lines the hold-back would have released and is the placeholder from the first
 line it would still hold to the value's end. A block end,

@@ -19,6 +19,7 @@ import {
 	fragmentsOf,
 	heldWindows,
 	inlineToken,
+	multiLineArguments,
 	multiLineToolCalls,
 	PLACEHOLDER,
 	partialArgumentTexts,
@@ -26,6 +27,7 @@ import {
 	splitAcross,
 	streamEvents,
 	toolCallEvents,
+	toolNameSynonyms,
 } from "./lib/stream-masking-fixtures.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -875,6 +877,76 @@ for (const index of ["string", "missing"]) {
 		assert.equal(deltas, JSON.stringify(vinciMaskJson(args)));
 	});
 }
+
+
+// Masking consistency for streamed tool arguments: a call streamed under a tool-name synonym of a built-in
+// tool (the agent loop folds the name onto the tool only when the stream ends) is masked as that tool from
+// the moment its name is known. Every synonym in the table, plus a mixed-case spelling.
+const synonymCases = () => [...toolNameSynonyms(), ["Shell", "bash"]];
+
+/** One call per secret shape, completed and cut (no toolcall_end), streamed under `name`. */
+function synonymCalls(name, tool) {
+	return Object.entries(secretRuns()).flatMap(([shape, run]) => {
+		const args = multiLineArguments(tool, run.lines);
+		const json = JSON.stringify(args);
+		const cut = json.indexOf(run.lines[Math.floor(run.lines.length / 2)]) + 5;
+		const completed = toolCallEvents(name, fragmentsOf(json, toolFragment), { finals: true }).events;
+		const interrupted = toolCallEvents(name, fragmentsOf(json.slice(0, cut), toolFragment), { ending: "message_end", finals: true }).events;
+		return [
+			{ where: `${shape}, completed`, events: completed, secret: run.secret, args },
+			{ where: `${shape}, cut`, events: interrupted, secret: run.secret },
+		];
+	});
+}
+
+/** No secret bytes in the joined deltas, any partial argument text, any written event or the whole stdout. */
+function assertSynonymMasked(out, raw, secret, where) {
+	assert.ok(JSON.stringify(raw).includes(secret[0].slice(0, 12)), `${where}: fixture sanity: the raw events carry the secret`);
+	assertMasked(deltasOf(out.events, "toolcall"), secret, `${where}: joined deltas`);
+	assertNoSecretBytes(partialArgumentTexts(out.events).join("\n"), secret, `${where}: partial argument text`);
+	for (const event of out.events) assertNoSecretBytes(JSON.stringify(event), secret, `${where}: ${event.type} event`);
+	assertMasked(out.stdout, secret, `${where}: whole stdout`);
+}
+
+for (const [name, tool] of synonymCases()) {
+	test(`rpc: masking consistency for streamed tool arguments, a call streamed under the synonym "${name}" of ${tool}`, async () => {
+		for (const { where, events, secret, args } of synonymCalls(name, tool)) {
+			const out = await runRpc(events);
+			assertSynonymMasked(out, events, secret, `${name}, ${where}`);
+			if (args) assert.equal(deltasOf(out.events, "toolcall"), JSON.stringify(vinciMaskJson(args)), `${name}, ${where}: released as the built-in call is`);
+		}
+	});
+}
+
+test("rpc positive control: a name that is neither a built-in tool nor a synonym of one is not held", async () => {
+	const token = inlineToken();
+	const json = JSON.stringify({ query: `find ${token}` });
+	for (const name of ["constructor", "toString", "shell_helper", "Edit"]) {
+		const { events } = toolCallEvents(name, splitAcross(json, token, 0));
+		const out = await runRpc(events);
+		assert.equal(out.stdout, events.map((event) => serializeJsonLine(event)).join(""), `${name}: as a tool the view does not mask`);
+	}
+});
+
+// A call whose name is not folded onto a tool (the tool is not in the turn's tool list) runs under its synonym.
+test("rpc: tool execution events and results under a tool-name synonym of a built-in tool are masked like that tool's", async () => {
+	const token = inlineToken();
+	for (const [name] of synonymCases()) {
+		const args = { value: `TOKEN=${token}` };
+		const content = [{ type: "text", text: `found TOKEN=${token}\n` }];
+		const result = { role: "toolResult", toolCallId: "call-1", toolName: name, content, isError: false, timestamp: 1 };
+		const events = [
+			{ type: "tool_execution_start", toolCallId: "call-1", toolName: name, args },
+			{ type: "tool_execution_update", toolCallId: "call-1", toolName: name, args, partialResult: { content } },
+			{ type: "tool_execution_end", toolCallId: "call-1", toolName: name, result: { content }, isError: false },
+			{ type: "message_end", message: result },
+			{ type: "turn_end", message: assistant([block("text", "Done.\n")]), toolResults: [result] },
+		];
+		const out = await runRpc(events);
+		assert.equal(out.events.length, events.length, `${name}: one line per event`);
+		for (const event of out.events) assertMasked(JSON.stringify(event), [token], `${name}: ${event.type}`);
+	}
+});
 
 // What the view masks beyond the streamed text: each kind has its own row.
 test("rpc: read, grep, find and ls output is masked, as the view masks it", async () => {

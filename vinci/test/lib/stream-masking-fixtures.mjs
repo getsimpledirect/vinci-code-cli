@@ -1,6 +1,9 @@
 // Shared fixtures for the stream-masking rows: synthetic secret runs (built at runtime, never usable
 // credentials) and assistant stream events, one completed line per update.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const PLACEHOLDER = "‹redacted›";
 
@@ -296,4 +299,27 @@ export function assertNeverRewritten(events, finalText, index = 0, kind = "text"
 		if (typeof shown !== "string") continue;
 		assert.ok(finalText.startsWith(shown), `released text ${JSON.stringify(shown.slice(-40))} is a prefix of the final text`);
 	}
+}
+
+/**
+ * The tool-name synonyms the agent loop folds onto a tool name, read from its table so that every entry
+ * is covered: `[synonym, tool]` pairs.
+ */
+export function toolNameSynonyms() {
+	const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages/agent/src/agent-loop.ts"), "utf8");
+	const table = source.match(/const VINCI_TOOL_SYNONYMS: Record<string, string> = \{([\s\S]*?)\n\};/);
+	assert.ok(table, "fixture sanity: the synonym table is found");
+	const pairs = [...table[1].matchAll(/^\s*([a-z_]+): "([a-z]+)",/gm)].map((match) => [match[1], match[2]]);
+	const entries = table[1].split("\n").filter((line) => /^\s*[^\s/]/.test(line));
+	assert.equal(pairs.length, entries.length, "fixture sanity: every entry of the synonym table is read");
+	assert.ok(pairs.length > 0, "fixture sanity: the synonym table has entries");
+	return pairs;
+}
+
+/** Arguments for a call of the built-in `tool` that carry `lines` as multi-line text. */
+export function multiLineArguments(tool, lines) {
+	const text = lines.join("\n");
+	if (tool === "write" || tool === "bash") return multiLineToolCalls(lines)[tool];
+	if (tool === "edit") return { path: "notes/out.txt", oldText: "old block", newText: `Updated block:\n${text}\nend of block.` };
+	return { path: `notes/\n${text}\nend` };
 }

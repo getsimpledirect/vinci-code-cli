@@ -20,7 +20,9 @@
  * that ends any other way releases the masked JSON of its argument text when that text parses, and
  * otherwise only the placeholder. Until then its partial argument text is empty and its partial
  * `arguments` are `{}`. A call whose name has not arrived yet is held the same way: a non-built-in name
- * releases the held text unchanged, and a call that ends with no name is released masked.
+ * releases the held text unchanged, and a call that ends with no name is released masked. A tool-name
+ * synonym of a built-in tool (which the agent loop folds onto the tool only when the stream ends) is
+ * classified as that tool from the moment the name is known.
  *
  * An interrupted call is a held call released without its `toolcall_end` (by `message_end`, `agent_end`,
  * the next `message_start`, a stream-ending source event or an exit path). In the final events that
@@ -31,6 +33,7 @@
  * `vinciMaskViewEvent` masks an RPC event in exactly the scope the interactive view masks.
  */
 
+import { vinciCanonicalToolName } from "@earendil-works/pi-agent-core";
 import { vinciMaskJson, vinciMaskSecrets } from "./vinci-mask-secrets.ts";
 
 /** The most streamed lines an unclosed `${` holds back. */
@@ -86,9 +89,16 @@ function hasName(block: Json): boolean {
 	return typeof block?.name === "string" && block.name !== "";
 }
 
+/**
+ * A built-in tool, or a tool-name synonym of one (mapped whatever tools the turn has: the over-mask side).
+ */
+function viewMasksTool(name: unknown): boolean {
+	return typeof name === "string" && VIEW_MASKED_TOOLS.has(vinciCanonicalToolName(name));
+}
+
 /** A built-in tool, or a call whose name is not known (masked like a built-in: the over-mask side). */
 function viewMasksCall(block: Json): boolean {
-	return !hasName(block) || VIEW_MASKED_TOOLS.has(block.name);
+	return !hasName(block) || viewMasksTool(block.name);
 }
 
 /** An event's content index as a number: a numeric string is read as its number; anything else is -1. */
@@ -701,7 +711,7 @@ export function vinciMaskViewTree(roots: Json[], stream?: VinciStreamMask): Json
 
 function maskMessage(message: Json): Json {
 	if (isAssistant(message)) return maskAssistantMessage(message);
-	if (message?.role === "toolResult" && VIEW_MASKED_TOOLS.has(message.toolName)) return maskToolOutput(message);
+	if (message?.role === "toolResult" && viewMasksTool(message.toolName)) return maskToolOutput(message);
 	return message;
 }
 
@@ -748,7 +758,7 @@ export function vinciMaskViewEvent(event: Json): Json {
 		case "tool_execution_start":
 		case "tool_execution_update":
 		case "tool_execution_end": {
-			if (!VIEW_MASKED_TOOLS.has(event.toolName)) return event;
+			if (!viewMasksTool(event.toolName)) return event;
 			const masked = { ...event };
 			if ("args" in event) masked.args = vinciMaskJson(event.args);
 			if ("partialResult" in event) masked.partialResult = maskToolOutput(event.partialResult);
