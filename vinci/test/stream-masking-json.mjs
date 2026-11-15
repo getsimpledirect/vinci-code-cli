@@ -818,16 +818,89 @@ test("json positive control: an out-of-range content index with only calls the v
 	assert.equal(out.stdout, stripped.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "passed through as calls the view does not mask");
 });
 
-// The fallback order: a call still carrying streaming text is taken before a later call the view masks
-// that carries none, so a streaming call the view does not mask passes through.
-test("json positive control: an out-of-range content index takes the streaming call before a later masked call", async () => {
+// The fallback order: when any call is one the view masks, an unidentified call's text is held as a masked
+// call's, even when a call the view does not mask still carries streaming text.
+test("json: masking consistency for streamed tool arguments, an out-of-range content index holds a streaming unmasked call's text when a later call is masked", async () => {
 	const token = inlineToken();
 	const json = JSON.stringify({ query: `find ${token}` });
 	const after = [{ type: "toolCall", id: "call-2", name: "bash", arguments: { command: "ls" } }];
 	const { events } = toolCallEvents("shell_helper", splitAcross(json, token, 0), { id: "call-1", index: 5, after });
 	assert.ok(events.every((event) => event.message?.content?.[1]?.partialJson === undefined), "fixture sanity: the later call carries no streaming text");
+	assert.ok(deltasOf(events, "toolcall").includes(token), "fixture sanity: passed through, the joined deltas would carry the value");
 	const out = await runJson(events);
-	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "the streaming call passes through unchanged");
+	assert.ok(!deltasOf(out.events, "toolcall").includes(token), "the text is held as a masked call's");
+});
+
+// A built-in call that carries only parsed arguments, before a later call the view does not mask that still
+// keeps streaming text: the built-in call's text is held.
+test("json: masking consistency for streamed tool arguments, an out-of-range content index holds a built-in call without streaming text before a later unmasked call that keeps its text", async () => {
+	const run = secretRuns()["a multi-line hex secret"];
+	const args = multiLineToolCalls(run.lines).bash;
+	const after = [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {}, partialJson: "{}" }];
+	const built = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id: "call-1", index: 5, after, finals: true });
+	const strip = (message) => (message?.content ? { ...message, content: message.content.map((block, at) => (at === 0 ? (({ partialJson, ...rest }) => rest)(block) : block)) } : message);
+	const events = built.events.map((event) => {
+		const copy = { ...event, message: strip(event.message) };
+		if (event.assistantMessageEvent?.partial) copy.assistantMessageEvent = { ...event.assistantMessageEvent, partial: strip(event.assistantMessageEvent.partial) };
+		return copy;
+	});
+	assert.ok(events.every((event) => event.message?.content?.[0]?.partialJson === undefined), "fixture sanity: the built-in call carries no streaming text");
+	assert.ok(events.some((event) => event.message?.content?.[1]?.partialJson === "{}"), "fixture sanity: the later call keeps its text");
+	const out = await runJson(events);
+	assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+	assertMasked(deltasOf(out.events, "toolcall"), run.secret, "joined deltas");
+});
+
+// Text the fallback took into a call whose name was not known yet: when that name turns out to be one the
+// view does not mask, the text is not released (it may be another call's); the call shows no arguments.
+test("json: masking consistency for streamed tool arguments, text taken by the fallback into a call named late as a tool the view does not mask is never shown as that call's", async () => {
+	const run = secretRuns()["a multi-line hex secret"];
+	const args = multiLineToolCalls(run.lines).bash;
+	const after = [{ type: "toolCall", id: "call-2", name: "", arguments: {} }];
+	const built = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id: "", index: 5, after, finals: true });
+	const shape = (message, final) =>
+		message?.content
+			? {
+					...message,
+					content: message.content.map((block, at) =>
+						at === 0 ? (({ partialJson, ...rest }) => rest)(block) : at === 1 && final ? { ...block, name: "extension_tool" } : block,
+					),
+				}
+			: message;
+	const events = built.events.map((event) => {
+		const final = event.type === "message_end" || event.type === "turn_end" || event.type === "agent_end" || event.assistantMessageEvent?.type === "toolcall_end";
+		const copy = { ...event, message: shape(event.message, final) };
+		if (event.messages) copy.messages = event.messages.map((message) => shape(message, true));
+		if (event.assistantMessageEvent?.partial) copy.assistantMessageEvent = { ...event.assistantMessageEvent, partial: shape(event.assistantMessageEvent.partial, final) };
+		return copy;
+	});
+	assert.ok(events.every((event) => event.message?.content?.[0]?.partialJson === undefined), "fixture sanity: the built-in call carries no streaming text");
+	assert.equal(events.find((event) => event.type === "message_end")?.message?.content?.[1]?.name, "extension_tool", "fixture sanity: the later call is named late");
+	const out = await runJson(events);
+	assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+	for (const event of out.events.filter((event) => event.type === "message_update")) {
+		assert.deepEqual(event.message?.content?.[1]?.arguments, {}, "the later call shows no arguments while streaming");
+	}
+});
+
+test("json positive control: a call named late as a tool the view does not mask, named by its content index after a built-in call, releases its own text unchanged", async () => {
+	const json = JSON.stringify({ query: "list the open files", limit: 20 });
+	const before = [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }];
+	const { events } = toolCallEvents("extension_tool", fragmentsOf(json, 5), { id: "call-2", nameFrom: 3, before });
+	const out = await runJson(events);
+	assert.equal(deltasOf(out.events, "toolcall"), json, "the joined deltas equal the raw argument text");
+	assert.ok(!out.stdout.includes(PLACEHOLDER));
+});
+
+test("json positive control: a tracked built-in call's streaming message shows its masked arguments once released, not the held empty arguments", async () => {
+	const run = secretRuns()["a multi-line hex secret"];
+	const args = multiLineToolCalls(run.lines).bash;
+	const after = [{ type: "toolCall", id: "call-2", name: "bash", arguments: { command: "ls" } }];
+	const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { after });
+	const out = await runJson(events);
+	const end = out.events.find((event) => event.assistantMessageEvent?.type === "toolcall_end");
+	assert.deepEqual(end?.message?.content?.[0]?.arguments, vinciMaskJson(args), "the released call shows its masked arguments");
+	assert.notDeepEqual(end?.message?.content?.[0]?.arguments, {}, "not the held empty arguments");
 });
 
 // The fallback takes a streaming call the view masks before a later call the view does not mask that still

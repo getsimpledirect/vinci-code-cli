@@ -455,8 +455,9 @@ placeholder. A call whose partial argument text is not complete JSON (a transcri
 is shown the same way. In RPC, every built-in call of a message that ended aborted or with an error is
 shown the same way in its final events and transcript responses, including calls that completed; so is
 every built-in call of a message cut at its length limit. A tool-call event whose content index names no tool-call block is taken to
-be about the call with its id, else the last call still carrying streaming argument text, else the last
-call the view masks, else the last tool call. A completed built-in call that still carries partial
+be about the call with its id, else the last call the view masks that still carries streaming argument
+text, else the last call the view masks, else the last call still carrying streaming text, else the last
+tool call: an unidentified call's text is held whenever any call in the message is one the view masks. A completed built-in call that still carries partial
 argument text (in its `toolcall_end` call, a final event or a transcript response) carries the masked
 JSON of its arguments there; an empty text or the placeholder is kept as given. A block end,
 `message_end`, `agent_end`, a new assistant `message_start`, a rebind and the exit paths flush what is

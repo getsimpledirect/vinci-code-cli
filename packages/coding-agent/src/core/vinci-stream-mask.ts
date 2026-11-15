@@ -31,7 +31,8 @@
  * transcript responses, each string value of its arguments keeps only the lines the hold-back would
  * have released; from the first line it would still hold to the value's end, it is the placeholder. Any
  * partial argument text the call still carries there is the placeholder. A tool-call event whose content
- * index names no tool-call block is taken to be about the call with its id, else the last tool call.
+ * index names no tool-call block is taken to be about the call with its id, else (see TOOL_FALLBACK) a
+ * call the view masks when there is one, so its text is held.
  *
  * `vinciMaskViewEvent` masks an RPC event in exactly the scope the interactive view masks.
  */
@@ -75,6 +76,8 @@ interface ToolCallState {
 	released: boolean;
 	/** The arguments the call shows once released. */
 	arguments: unknown;
+	/** Some of its text came from an event that named no call (taken by the fallback): never released unchanged. */
+	guessed?: boolean;
 }
 
 /**
@@ -140,14 +143,34 @@ function blockIndexOf(
 /**
  * The tool-call fallback when the content index names no call and the event carries no id: a call the view
  * masks that still carries its streaming argument text (a provider drops it once the call ends), else any
- * call that does, else a call the view masks, so an unidentified call's text is held rather than passed
- * through.
+ * call the view masks, else a call that still carries streaming text. So an unidentified call's text is
+ * held whenever any call in the message is one the view masks.
  */
 const TOOL_FALLBACK = [
 	(block: Json) => isStreamingCall(block) && viewMasksCall(block),
-	(block: Json) => isStreamingCall(block),
 	(block: Json) => block?.type === "toolCall" && viewMasksCall(block),
+	(block: Json) => isStreamingCall(block),
 ];
+
+/**
+ * A streaming message's block with no tool-call state: a call the view masks shows no arguments and empty
+ * partial text, as a held call does (its own events went to another call); any other block is unchanged.
+ */
+function untrackedCallBlock(block: Json): Json {
+	if (block?.type !== "toolCall" || !viewMasksCall(block)) return block;
+	const shown: Json = { ...block, arguments: {} };
+	for (const field of ["partialJson", "partialArgs"]) {
+		if (typeof block[field] === "string") shown[field] = "";
+	}
+	return shown;
+}
+
+/** Whether a tool event names the call at `index` itself: by its content index, or by its call id. */
+function namesToolCall(source: Json, content: Json[], index: number): boolean {
+	if (contentIndexOf(source) === index) return true;
+	const id = source?.toolCall?.id;
+	return typeof id === "string" && id !== "" && content[index]?.id === id;
+}
 
 /** A tool call that still carries its streaming argument text. */
 function isStreamingCall(block: Json): boolean {
@@ -521,6 +544,7 @@ export class VinciStreamMask {
 		const state = this.tools.get(index);
 		if (!state || block?.type !== "toolCall" || viewMasksCall(block)) return "";
 		this.tools.delete(index);
+		if (state.guessed) return this.dropGuessed(state);
 		return state.released ? "" : state.raw;
 	}
 
@@ -544,6 +568,18 @@ export class VinciStreamMask {
 		if (state.raw === "") state.shown = "";
 		else state.shown = parsed === undefined ? UNPARSED_ARGUMENTS : JSON.stringify(vinciMaskJson(parsed));
 		return state.shown;
+	}
+
+	/**
+	 * End a call the view does not mask whose held text was taken by the fallback (it may be another
+	 * call's): nothing is released, and the call shows no arguments and empty partial text until the final
+	 * events, which carry its own arguments.
+	 */
+	private dropGuessed(state: ToolCallState): string {
+		state.released = true;
+		state.shown = "";
+		state.arguments = {};
+		return "";
 	}
 
 	/** Release a call held while its name was unknown, unchanged: its name names a tool the view does not mask. */
@@ -607,14 +643,14 @@ export class VinciStreamMask {
 				? blockIndexOf(source, message.content, (block) => streamedKind(block) === type.split("_")[0])
 				: -1;
 		const ending = type === "text_end" || type === "thinking_end" ? streamedIndex : -1;
-		const toolIndex =
-			type === "toolcall_start" || type === "toolcall_delta" || type === "toolcall_end"
-				? blockIndexOf(source, message.content, (block) => block?.type === "toolCall", true, TOOL_FALLBACK)
-				: -1;
+		const isTool = type === "toolcall_start" || type === "toolcall_delta" || type === "toolcall_end";
+		const toolIndex = isTool ? blockIndexOf(source, message.content, (block) => block?.type === "toolCall", true, TOOL_FALLBACK) : -1;
+		const toolGuessed = toolIndex >= 0 && !namesToolCall(source, message.content, toolIndex);
 		let toolAdded = "";
 		let passedThrough = "";
 		if (toolIndex >= 0) passedThrough = this.unholdNamed(toolIndex, message.content[toolIndex]);
 		const toolState = toolIndex >= 0 ? this.toolStateFor(toolIndex, message.content[toolIndex]) : undefined;
+		if (toolState && toolGuessed) toolState.guessed = true;
 		if (toolState) {
 			if (type === "toolcall_delta" && typeof source.delta === "string") toolState.raw += source.delta;
 			if (type === "toolcall_end") {
@@ -631,7 +667,7 @@ export class VinciStreamMask {
 			const kind = streamedKind(block);
 			if (!kind) {
 				const tool = block?.type === "toolCall" ? this.tools.get(index) : undefined;
-				return tool ? this.toolBlock(block, tool) : block;
+				return tool ? this.toolBlock(block, tool) : untrackedCallBlock(block);
 			}
 			const state = this.stateFor(index, kind);
 			if (index === ending) state.done = true;
@@ -675,15 +711,15 @@ export class VinciStreamMask {
 		for (const [index, state] of this.tools) {
 			const block = message.content[index];
 			// A name that arrived only now and names a tool the view does not mask: released unchanged.
-			const unchanged = block?.type === "toolCall" && !viewMasksCall(block);
-			const text = unchanged ? this.releaseUnchanged(state, block) : this.releaseTool(state, undefined);
+			const unmasked = block?.type === "toolCall" && !viewMasksCall(block);
+			const text = !unmasked ? this.releaseTool(state, undefined) : state.guessed ? this.dropGuessed(state) : this.releaseUnchanged(state, block);
 			if (text) toolAdded.set(index, text);
 		}
 		const content = message.content.map((block: Json, index: number) => {
 			const kind = streamedKind(block);
 			if (!kind) {
 				const tool = block?.type === "toolCall" ? this.tools.get(index) : undefined;
-				return tool ? this.toolBlock(block, tool) : block;
+				return tool ? this.toolBlock(block, tool) : untrackedCallBlock(block);
 			}
 			const state = this.blocks.get(index);
 			if (!state || state.kind !== kind) return { ...block, [kind]: this.mask(block[kind]) };
