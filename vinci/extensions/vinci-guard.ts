@@ -1321,6 +1321,23 @@ export function isSensitiveShellRead(command: string): boolean {
   return /(?:^|[\s'"`])(?:\.\/)?(?:\.env(?:\.[\w.-]+)?|\.envrc|\.dev\.vars|\.npmrc|\.pypirc|\.netrc|terraform\.tfvars|[^\s/]+\.auto\.tfvars|credentials\.json|secrets?\.json|\.aws\/credentials|\.ssh\/id_[^\s/]+|\.docker\/config\.json|\.kube\/config)(?=$|[\s'"`;|&])/i.test(risk);
 }
 
+/**
+ * One layer of the read-only status exemption: true only when the command is one line of printable
+ * ASCII, with tabs allowed. Any line break, other control character or non-ASCII character fails it.
+ */
+export function isSingleLinePrintableAscii(command: string): boolean {
+  return !/[^\t\x20-\x7e]/.test(command);
+}
+
+/**
+ * The other layer of the read-only status exemption: true only when the WHOLE command is the status
+ * phrase, any case, with words and edges separated by spaces or tabs only (never `\s`, which would
+ * accept a line break).
+ */
+export function isReadOnlyMigrateStatusPhrase(command: string): boolean {
+  return /^[ \t]*npx[ \t]+prisma[ \t]+migrate[ \t]+status[ \t]*$/i.test(command);
+}
+
 export function isShellNetworkCommand(command: string): boolean {
   const risk = shellRiskText(command);
   // Unescape escaped sequences so disguised commands like c\u\r\l are detected as curl
@@ -2115,7 +2132,13 @@ export default function (pi: ExtensionAPI) {
       const netRiskText = shellRiskText(netText);
       const priorityDanger = DANGEROUS.find(([pattern]) => pattern.test(netRiskText));
       const priorityDatabase = DATABASE.find(([pattern]) => pattern.test(netRiskText));
-      const readOnlyLocalNpx = /\bnpx\s+prisma\s+migrate\s+status\b/i.test(netRiskText);
+      // The read-only status check is exempt only as the WHOLE command. Matched as a substring, any
+      // command that merely contains it would skip every network ask below. It must also be ONE line:
+      // `\s` would accept a line break, and a shell runs `npx prisma` + newline + `migrate status` as
+      // two commands. So words and edges are spaces or tabs only, and any other control character or
+      // any non-ASCII character (a no-break space, say) refuses the exemption outright.
+      // Both layers are pinned separately by direct tests.
+      const readOnlyLocalNpx = !scannedScript && isSingleLinePrintableAscii(cmd) && isReadOnlyMigrateStatusPhrase(cmd);
       if (!readOnlyLocalNpx && (isShellNetworkCommand(netText) || isCloudDeployCommand(netText))) {
         // Keep destructive/database intent ahead of the network prompt. If accepted, the command still
         // needs a separate one-command network grant before it can run.
