@@ -457,7 +457,10 @@ shown the same way in its final events and transcript responses, including calls
 every built-in call of a message cut at its length limit. A tool-call event whose content index names no tool-call block is taken to
 be about the call with its id, else the last call the view masks that still carries streaming argument
 text, else the last call the view masks, else the last call still carrying streaming text, else the last
-tool call: an unidentified call's text is held whenever any call in the message is one the view masks. A completed built-in call that still carries partial
+tool call: an unidentified call's text is held whenever any call in the message is one the view masks. Text
+taken that way is never released unchanged: if the call it went to is later named as a tool the view does
+not mask, the text is dropped and that call shows no arguments until the final events. While a message
+streams, a built-in call with no state of its own shows no arguments and empty partial text. A completed built-in call that still carries partial
 argument text (in its `toolcall_end` call, a final event or a transcript response) carries the masked
 JSON of its arguments there; an empty text or the placeholder is kept as given. A block end,
 `message_end`, `agent_end`, a new assistant `message_start`, a rebind and the exit paths flush what is
