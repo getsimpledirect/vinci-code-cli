@@ -3,7 +3,7 @@
 // migrations are consequential, and a shrinking whole-file rewrite fails closed.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -1089,6 +1089,45 @@ try {
       } finally {
         chmodSync(join(realProject, "startup-locked"), 0o755);
       }
+      // A link in a directory this user owns but has made read-only (0555) is still replaceable after one chmod.
+      mkdirSync(join(realProject, "startup-ro"));
+      symlinkSync(join(physicalRoot, "outside", "startup-real"), join(realProject, "startup-ro", "hop"));
+      symlinkSync(`${realProject}/startup-ro/hop`, join(fakeHome, ".bash_logout"));
+      chmodSync(join(realProject, "startup-ro"), 0o555);
+      // Root (and any user the mode does not deny) can write it anyway: the row only means something when writing is denied.
+      let readOnlyDenied = false;
+      try { fs.accessSync(join(realProject, "startup-ro"), fs.constants.W_OK); } catch (error) { readOnlyDenied = error?.code === "EACCES"; }
+      if (readOnlyDenied) assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes(join(realProject, "startup-ro", "hop")), "a link in a read-only directory this user owns is protected");
+      else console.log("guard-integration: SKIP owned read-only directory rows (mode 0555 does not deny this user, e.g. root)");
+      // Negative control: a chain through a link this user neither can write nor owns (macOS /etc in root-owned /)
+      // protects the destination, not that link.
+      symlinkSync("/etc/hosts", join(fakeHome, ".bashrc"));
+      if (process.platform === "darwin" && process.getuid?.() !== 0 && lstatSync("/etc").isSymbolicLink()) {
+        const throughSystem = toolDefinitions.vinciSensitiveNoWrite(physicalProject);
+        assert.ok(throughSystem.includes(realpathSync.native("/etc/hosts")), "precondition: a chain through a system link is walked to its destination");
+        assert.ok(!throughSystem.includes("/etc"), "a system link this user does not own is not protected");
+        // Fail closed: when ownership cannot be established, the link is protected.
+        const getuid = process.getuid;
+        try {
+          process.getuid = undefined;
+          assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes("/etc"), "without a user id, a chain link is protected (fail closed)");
+        } finally {
+          process.getuid = getuid;
+        }
+        const statSync = fs.statSync;
+        try {
+          fs.statSync = (path, ...rest) => {
+            if (path === "/") throw Object.assign(new Error("EIO: stubbed stat failure"), { code: "EIO" });
+            return statSync(path, ...rest);
+          };
+          syncBuiltinESMExports();
+          assert.ok(toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes("/etc"), "when the link's directory cannot be read, the link is protected (fail closed)");
+        } finally {
+          fs.statSync = statSync;
+          syncBuiltinESMExports();
+        }
+        assert.ok(!toolDefinitions.vinciSensitiveNoWrite(physicalProject).includes("/etc"), "the stubs are restored");
+      }
       // Bubblewrap binds follow links: chain links stay out of its read-only binds, their destinations stay in.
       {
         const sandboxCore = await loader.import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"), { default: false });
@@ -1153,6 +1192,9 @@ try {
           assert.ok(!existsSync(join(realProject, "startup-alias-new")), "the sandbox cannot create a missing directory reached through a chain link");
           sandboxed(`ln -sfn ${realProject}/startup-evil startup-hop`);
           assert.equal(readlinkSync(join(realProject, "startup-hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot replace an intermediate link");
+          sandboxed(`chmod u+w startup-ro && ln -sfn ${realProject}/startup-evil startup-ro/hop`);
+          if (readOnlyDenied) assert.equal(readlinkSync(join(realProject, "startup-ro", "hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot make a read-only directory writable and replace the chain link in it");
+          if (readOnlyDenied) assert.ok((fs.statSync(join(realProject, "startup-ro")).mode & 0o200) !== 0, "precondition: the sandboxed chmod of the read-only directory ran");
         } finally {
           if (previousCode === undefined) delete process.env.VINCI_CODE;
           else process.env.VINCI_CODE = previousCode;
@@ -1163,6 +1205,7 @@ try {
       symlinkSync(join(physicalRoot, "outside", "grant-target"), join(physicalProject, "dangling-out"));
       assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/dangling-out`), false, "the sandbox refuses a write through a dangling link");
     } finally {
+      try { chmodSync(join(realpathSync.native(physicalProject), "startup-ro"), 0o755); } catch {}
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
     }

@@ -191,13 +191,21 @@ function protectedWritePaths(path: string): string[] {
 	return [...out];
 }
 
-/** Whether this user (and so a sandboxed child) could replace the entry `path` names. */
+/**
+ * Whether this user (and so a sandboxed child) could replace the entry `path` names: its directory is writable now,
+ * or this user owns it and so could make it writable (a 0555 directory is one chmod away). Fail closed.
+ */
 function userCanReplace(path: string): boolean {
+	const parent = dirname(path);
 	try {
-		accessSync(dirname(path), fsConstants.W_OK);
+		accessSync(parent, fsConstants.W_OK);
 		return true;
+	} catch {}
+	try {
+		const uid = process.getuid?.();
+		return uid === undefined || statSync(parent).uid === uid;
 	} catch {
-		return false;
+		return true;
 	}
 }
 
