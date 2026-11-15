@@ -830,6 +830,20 @@ test("json positive control: an out-of-range content index takes the streaming c
 	assert.equal(out.stdout, events.map((event) => `${JSON.stringify(vinciMaskJson(event))}\n`).join(""), "the streaming call passes through unchanged");
 });
 
+// The fallback takes a streaming call the view masks before a later call the view does not mask that still
+// carries streaming text (a provider or extension that keeps the buffer after the call ends).
+test("json: masking consistency for streamed tool arguments, an out-of-range content index holds the streaming call before a later unmasked call that keeps its text", async () => {
+	const run = secretRuns()["a multi-line hex secret"];
+	const args = multiLineToolCalls(run.lines).bash;
+	const after = [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {}, partialJson: "{}" }];
+	const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id: "call-1", index: 5, after, finals: true });
+	const out = await runJson(events);
+	assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+	const deltas = deltasOf(out.events, "toolcall");
+	assertMasked(deltas, run.secret, "joined deltas");
+	assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "released once, as the call's masked arguments");
+});
+
 test("json: masking consistency for streamed tool arguments, an edit call's multi-line new text", async () => {
 	for (const [name, run] of Object.entries(secretRuns())) {
 		const text = ["Updated block:", ...run.lines, "end of block."].join("\n");

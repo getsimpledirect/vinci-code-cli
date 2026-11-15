@@ -138,11 +138,16 @@ function blockIndexOf(
 }
 
 /**
- * The tool-call fallback when the content index names no call and the event carries no id: the call that
- * still carries its streaming argument text (a provider drops it once the call ends), else a call the view
- * masks, so an unidentified call's text is held rather than passed through.
+ * The tool-call fallback when the content index names no call and the event carries no id: a call the view
+ * masks that still carries its streaming argument text (a provider drops it once the call ends), else any
+ * call that does, else a call the view masks, so an unidentified call's text is held rather than passed
+ * through.
  */
-const TOOL_FALLBACK = [(block: Json) => isStreamingCall(block), (block: Json) => block?.type === "toolCall" && viewMasksCall(block)];
+const TOOL_FALLBACK = [
+	(block: Json) => isStreamingCall(block) && viewMasksCall(block),
+	(block: Json) => isStreamingCall(block),
+	(block: Json) => block?.type === "toolCall" && viewMasksCall(block),
+];
 
 /** A tool call that still carries its streaming argument text. */
 function isStreamingCall(block: Json): boolean {
@@ -742,9 +747,9 @@ function maskToolOutput(result: Json): Json {
 	return masked;
 }
 
-/** A message the stream ended early (aborted or failed): its built-in calls may have been cut. */
+/** A message the stream ended early (aborted, failed or cut at its length limit): its built-in calls may have been cut. */
 function endedEarly(message: Json): boolean {
-	return message?.stopReason === "aborted" || message?.stopReason === "error";
+	return message?.stopReason === "aborted" || message?.stopReason === "error" || message?.stopReason === "length";
 }
 
 function maskAssistantMessage(message: Json): Json {

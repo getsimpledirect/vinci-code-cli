@@ -1064,7 +1064,7 @@ for (const field of ["partialJson", "partialArgs"]) {
 
 // A transcript the stream never saw (a reloaded session): a cut call that no longer carries partial text,
 // in a message that ended early (aborted or failed), is shown as interrupted in the transcript responses.
-for (const stopReason of ["aborted", "error"]) {
+for (const stopReason of ["aborted", "error", "length"]) {
 	test(`rpc: masking consistency for streamed tool arguments, a reloaded transcript's cut call without partial text in a message that ended ${stopReason}`, async () => {
 		for (const { label, tool, json, secret } of cutToolCalls()) {
 			const { final } = toolCallEvents(tool, fragmentsOf(json, toolFragment), { ending: "message_end", stopReason });
@@ -1092,7 +1092,7 @@ const overMaskValues = (value) =>
 			: value && typeof value === "object"
 				? Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, overMaskValues(entry)]))
 				: value;
-for (const stopReason of ["aborted", "error"]) {
+for (const stopReason of ["aborted", "error", "length"]) {
 	test(`rpc: masking consistency for streamed tool arguments, a completed call in a message that ended ${stopReason} is over-masked in its final events`, async () => {
 		for (const { label, tool, args, secret } of multiLineCases()) {
 			const { events } = toolCallEvents(tool, fragmentsOf(JSON.stringify(args), toolFragment), { stopReason, finals: true });
@@ -1193,6 +1193,20 @@ test("rpc positive control: an out-of-range content index takes the streaming ca
 	assert.ok(events.every((event) => event.message?.content?.[1]?.partialJson === undefined), "fixture sanity: the later call carries no streaming text");
 	const out = await runRpc(events);
 	assert.equal(out.stdout, events.map((event) => serializeJsonLine(event)).join(""), "the streaming call passes through unchanged");
+});
+
+// The fallback takes a streaming call the view masks before a later call the view does not mask that still
+// carries streaming text (a provider or extension that keeps the buffer after the call ends).
+test("rpc: masking consistency for streamed tool arguments, an out-of-range content index holds the streaming call before a later unmasked call that keeps its text", async () => {
+	const run = secretRuns()["a multi-line hex secret"];
+	const args = multiLineToolCalls(run.lines).bash;
+	const after = [{ type: "toolCall", id: "call-2", name: "extension_tool", arguments: {}, partialJson: "{}" }];
+	const { events } = toolCallEvents("bash", fragmentsOf(JSON.stringify(args), toolFragment), { id: "call-1", index: 5, after, finals: true });
+	const out = await runRpc(events);
+	assertNoSecretBytes(out.stdout, run.secret, "whole stdout");
+	const deltas = deltasOf(out.events, "toolcall");
+	assertMasked(deltas, run.secret, "joined deltas");
+	assert.equal(deltas, JSON.stringify(vinciMaskJson(args)), "released once, as the call's masked arguments");
 });
 
 
