@@ -727,3 +727,310 @@ export function boxedDetails() {
 		list: [new String("listed text"), new Number(3), new Boolean(false)],
 	};
 }
+
+// ---------------------------------------------------------------------------------------------------
+// 206t: inputs of the review probes for findings D01..D05, byte for byte; values are fake and built at runtime.
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * 206t (D01): the probe's token cut below the pattern's minimum length (alone the mask leaves it as it is), and the
+ * whole token (masked to its 4-character head). `tail`: the cut token past that head; no window of it may reach stdout.
+ */
+export function tokenPrefixCase() {
+	const prefix = `${["sk", "ant", "A1b2C3d4E5f6G7h"].join("-")}-`;
+	const full = `${prefix}${["J8k9L0m1N2", "p3Q4r5S6t7"].join("")}`;
+	return { prefix, full, tail: prefix.slice(4) };
+}
+
+/** No 6-character window of `tail` appears in `text`. */
+export function assertNoPrefixBytes(text, tail, where) {
+	assert.ok(typeof text === "string", `${where}: fixture sanity: there is text to search`);
+	for (let at = 0; at + 6 <= tail.length; at++) {
+		const window = tail.slice(at, at + 6);
+		assert.ok(!text.includes(window), `${where}: cut token bytes ${JSON.stringify(window)} reached stdout`);
+	}
+}
+
+/** 206t (D01): the probe's tool progress that is the cut token (no tool name, as the probe sent it). */
+export function tokenPrefixUpdate(toolCallId = "token-prefix") {
+	const { prefix } = tokenPrefixCase();
+	return { type: "tool_execution_update", toolCallId, partialResult: { content: [{ type: "text", text: prefix }] } };
+}
+
+/** 206t: a tool end for `toolCallId` with `text` as its only output; `isError` as given. */
+export function toolEnd(toolCallId, text, { isError = false, details, toolName } = {}) {
+	const result = { content: [{ type: "text", text }], ...(details === undefined ? {} : { details }) };
+	return { type: "tool_execution_end", ...(toolName === undefined ? {} : { toolName }), toolCallId, result, isError };
+}
+
+/** 206t (D01, D03): the probe's minimal assistant message with one text block. */
+export function probeTextMessage(text) {
+	return { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" };
+}
+
+/** 206t (D01, D03): the probe's text_delta update of block 0 of `message`. */
+export function probeTextUpdate(message, delta) {
+	return { type: "message_update", message, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta, partial: message } };
+}
+
+/**
+ * 206t (D02): the UTF-8 bytes of every string value a masker instance still holds (Maps, Sets, arrays and objects
+ * walked; keys, weak references and functions not counted): what it retains of the bodies it held.
+ */
+export function retainedStringBytes(root) {
+	const seen = new Set();
+	const stack = [root];
+	let total = 0;
+	while (stack.length > 0) {
+		const value = stack.pop();
+		if (typeof value === "string") {
+			total += Buffer.byteLength(value, "utf8");
+			continue;
+		}
+		if (!value || typeof value !== "object" || seen.has(value)) continue;
+		seen.add(value);
+		if (value instanceof Map) {
+			for (const [key, entry] of value) stack.push(key, entry);
+		} else if (value instanceof Set) {
+			for (const entry of value) stack.push(entry);
+		} else if (!(value instanceof WeakSet || value instanceof WeakMap || value instanceof WeakRef)) {
+			for (const key of Object.keys(value)) stack.push(value[key]);
+		}
+	}
+	return total;
+}
+
+/**
+ * 206t (D02): the probe's bounded inputs. `largeDetails`: ordinary text with 4096 bytes of details; `detailsOnly`: no
+ * text, the same details; `controls`: 4096 NUL bytes before ordinary text (normalisation removes them); `payload`: the
+ * details string. `callDeltas`: the probe's two argument deltas of one call (268 bytes, then 4096 more).
+ */
+export function boundedInputs() {
+	const payload = "x".repeat(4096);
+	const update = (toolCallId, partialResult) => ({ type: "tool_execution_update", toolCallId, toolName: "bash", partialResult });
+	return {
+		payload,
+		largeDetails: update("details", { content: [{ type: "text", text: "ordinary." }], details: { payload } }),
+		detailsOnly: update("details-only", { content: [], details: { payload } }),
+		controls: update("controls", { content: [{ type: "text", text: `${"\0".repeat(4096)}ordinary.` }] }),
+		callDeltas: [`{"command":"${"x".repeat(256)}`, "x".repeat(4096)],
+	};
+}
+
+/** 206t (D02): the probe's streamed call: message_start, then one toolcall_delta per entry of `deltas` (no end). */
+export function probeCallEvents(deltas) {
+	const message = (partialJson) => ({
+		role: "assistant",
+		content: [{ type: "toolCall", id: "bounded-call", name: "bash", arguments: {}, partialJson }],
+		stopReason: "stop",
+	});
+	const events = [{ type: "message_start", message: message("") }];
+	let raw = "";
+	for (const delta of deltas) {
+		raw += delta;
+		const m = message(raw);
+		events.push({ type: "message_update", message: m, assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta, partial: m } });
+	}
+	return events;
+}
+
+/**
+ * 206t (D02): a text block whose multi-byte body arrives with no delta of its own (in its text_start): 600 UTF-16 units,
+ * 1200 UTF-8 bytes. Then its text_end and message_end.
+ */
+export function multiByteStartEvents() {
+	const body = "é".repeat(600);
+	const message = assistant([block("text", body)]);
+	return {
+		body,
+		events: [
+			{ type: "message_start", message: assistant([]) },
+			{ type: "message_update", message, assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: message } },
+			{ type: "message_update", message, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: body, partial: message } },
+			{ type: "message_end", message },
+		],
+	};
+}
+
+/** 206t (D04): the probe's details-only checkpoint update. */
+export function checkpointUpdate() {
+	return {
+		type: "tool_execution_update",
+		toolCallId: "details-only",
+		toolName: "bash",
+		partialResult: { content: [], details: { checkpoint: "ordinary checkpoint data" } },
+	};
+}
+
+/** 206t (D05): String, Number and Boolean objects made in another realm (node:vm), as the probe made them. */
+export function crossRealmBoxed(vm) {
+	return vm.runInNewContext('({message:new String("ordinary boxed message"),count:new Number(7),flag:new Boolean(true)})');
+}
+
+/**
+ * 206t (D05): boxed values whose own methods JSON.stringify does not call: a Boolean whose valueOf is overridden (the
+ * probe's), and a String whose valueOf is overridden (its toString is read). `throwing`: the same with throwing
+ * overrides, and a Number whose toString throws (its valueOf is read).
+ */
+export function overriddenBoxed({ throwing = false } = {}) {
+	const fail = () => {
+		throw new Error("an own method was called");
+	};
+	const flag = new Boolean(true);
+	flag.valueOf = throwing ? fail : () => false;
+	const message = new String("ordinary boxed message");
+	message.valueOf = throwing ? fail : () => "other text";
+	const details = { flag, message };
+	if (throwing) {
+		const count = new Number(7);
+		count.toString = fail;
+		details.count = count;
+	}
+	return details;
+}
+
+/**
+ * 206t (D01): text blocks cut by an error, an abort or the length limit. Each ends in the cut token (below its
+ * minimum length) as its unfinished last line. `head`: the complete lines the stream keeps, before masking (the
+ * released text is their mask, then the placeholder); `startsWith`: when only the kept text's start is pinned;
+ * `forbidden`: text no byte of stdout may carry (a key marker, key lines, a secret inside the open construct).
+ */
+export function earlyCutCases() {
+	const { prefix, full } = tokenPrefixCase();
+	const secret = probeSecret();
+	const { begin } = keyMarkers();
+	const keyLines = Buffer.from("plain filler bytes for an open key block, test only. ".repeat(3))
+		.toString("base64")
+		.match(/.{1,64}/g);
+	return [
+		{ label: "a token cut below its minimum length", text: prefix, head: "", forbidden: [] },
+		{
+			label: "a full token on an earlier complete line, then the cut token",
+			text: `Here it is:\nThe old token was ${full}.\n${prefix}`,
+			head: `Here it is:\nThe old token was ${full}.\n`,
+			forbidden: [],
+		},
+		{
+			label: "a cut inside an open key block",
+			text: `Here it is:\n${begin}\n${keyLines.join("\n")}\n${prefix}`,
+			head: "Here it is:\n",
+			forbidden: [begin, ...keyLines.map((line) => line.slice(0, 24))],
+		},
+		{ label: "a cut inside an open ${", text: `Here it is:\nvalue: ${"$"}{\n${secret}!\n${prefix}`, head: "Here it is:\n", forbidden: [secret] },
+		{
+			label: "a cut inside an open angle value",
+			text: `Here it is:\npassword=<\n${secret}!\n${prefix}`,
+			head: "Here it is:\n",
+			forbidden: [secret],
+		},
+		{
+			label: "a cut after key-body lines with no END marker yet",
+			text: `Here it is:\n${keyLines.join("\n")}\n${prefix}`,
+			head: "Here it is:\n",
+			forbidden: keyLines.map((line) => line.slice(0, 24)),
+		},
+		{
+			label: "a cut after the first line of an encoded run",
+			text: `Here it is:\n${encodedRunLines().base64[0]}\n${prefix}`,
+			head: "Here it is:\n",
+			forbidden: [encodedRunLines().base64[0].slice(0, 16)],
+		},
+		{
+			label: "a cut inside an open ${ too short to mask alone",
+			text: `Here it is:\npassword=${"$"}{\n${prefix}`,
+			head: "Here it is:\n",
+			forbidden: [`password=${"$"}{`],
+		},
+		{
+			label: "a cut after a value a chained call on the next line would extend",
+			text: `Here it is:\npassword=q7;\n${prefix}`,
+			head: "Here it is:\n",
+			forbidden: ["password=q7"],
+		},
+		{
+			label: "a cut after an environment lookup not yet closed",
+			text: `Here it is:\npassword=getenv(\n${prefix}`,
+			head: "Here it is:\n",
+			forbidden: ["password=getenv("],
+		},
+	];
+}
+
+/**
+ * 206t (D01): an encoded run split over two lines. Each line alone decodes to nothing the mask treats as a secret;
+ * joined (base64: the mask's multi-line run; hex: its run across line breaks) they decode to a secret assignment.
+ * The first part is 18 bytes, so its base64 ends on a whole group and the lines join as one encoding.
+ */
+export function encodedRunLines() {
+	const first = Buffer.from(`padding pad\n${"TOK"}EN=`);
+	const second = Buffer.from(["zq8v3k", "xw2p9m"].join(""));
+	return {
+		base64: [first.toString("base64"), second.toString("base64")],
+		hex: [first.toString("hex"), second.toString("hex")],
+	};
+}
+
+/**
+ * 206t (D01): inputs for the cross-check of the cut block's hold against the mask, one group per construct of the mask
+ * that lets later text change how earlier complete lines are masked. `opened`: complete lines as a cut leaves them;
+ * `closed`: the same lines and what the construct could still take. `changes`: what the mask does (the masked closed
+ * text does not start with the masked opened text, trailing white space aside); `release`: a control the hold must
+ * release whole; `held`: the hold must keep back the text from this offset on (a construct the mask closes at the
+ * text's end, which the hold keeps back anyway).
+ */
+export function cutHoldCrossCheckInputs() {
+	const { begin, end } = keyMarkers();
+	const keyLines = Buffer.from("plain filler bytes for an open key block, test only. ".repeat(3))
+		.toString("base64")
+		.match(/.{1,64}/g);
+	const { base64, hex } = encodedRunLines();
+	const here = "Here it is:\n";
+	return [
+		{ construct: "BEGIN..END key block", opened: `${here}${begin}\n${keyLines[0]}\n`, closed: `${here}${begin}\n${keyLines[0]}\n${end}\n`, changes: false, held: here.length },
+		{ construct: "END-only key run", opened: `${here}${keyLines.join("\n")}\n`, closed: `${here}${keyLines.join("\n")}\n${end}\n`, changes: true },
+		{ construct: "END-only key run", opened: `${keyLines.join("\n")}\n`, closed: `${keyLines.join("\n")}\n${end}\n`, changes: true },
+		{ construct: "END-only key run", opened: "Here it is: done.\n", closed: `Here it is: done.\n${end}\n`, changes: false, release: true },
+		{ construct: "encoded run", opened: `${here}${base64[0]}\n`, closed: `${here}${base64[0]}\n${base64[1]}\n`, changes: true },
+		{ construct: "encoded run", opened: `${here}${hex[0]}\n`, closed: `${here}${hex[0]}\n${hex[1]}\n`, changes: true },
+		{ construct: "encoded run", opened: "Note: see the docs.\n", closed: `Note: see the docs.\n${base64[1]}\n`, changes: false, release: true },
+		{ construct: "open ${", opened: `password=${"$"}{\n`, closed: `password=${"$"}{\nx}\n`, changes: true },
+		{ construct: "open ${", opened: `${here}password=${"$"}{\n`, closed: `${here}password=${"$"}{\nx}\n`, changes: true },
+		{ construct: "open ${", opened: `password=${"$"}{HOME}\n`, closed: `password=${"$"}{HOME}\nx}\n`, changes: false, release: true },
+		{ construct: "chained call", opened: "password=q7;\n", closed: "password=q7;\n.x()\n", changes: true },
+		{
+			construct: "chained call",
+			opened: `${here}export password=process.env.DB_PASS;\n`,
+			closed: `${here}export password=process.env.DB_PASS;\n.split(':')[1]\n`,
+			changes: true,
+		},
+		{ construct: "chained call", opened: "password=q7;\nnext line.\n", closed: "password=q7;\nnext line.\n.x()\n", changes: false, release: true },
+		{ construct: "environment lookup", opened: "password=getenv(\n", closed: "password=getenv(\n9q-x)\n", changes: true },
+		{ construct: "environment lookup", opened: `${here}password=os.environ[\n`, closed: `${here}password=os.environ[\n9q-x]\n`, changes: true },
+		{
+			construct: "environment lookup",
+			opened: "password=getenv('HOME') # read once.\n",
+			closed: "password=getenv('HOME') # read once.\n.x()\n",
+			changes: false,
+			release: true,
+		},
+	];
+}
+
+/**
+ * 206t (D01): inputs for the cross-check of the cut block's open-angle rule against the mask: complete lines, opened
+ * and closed, with and without a secret name, on one line and across lines. The check appends a value and its `>`.
+ */
+export function angleCrossCheckInputs() {
+	return [
+		{ text: "password=<\n", keyed: true },
+		{ text: "password: <\n", keyed: true },
+		{ text: "password=\n<\n", keyed: true },
+		{ text: "api_key = <\n", keyed: true },
+		{ text: "password=<closed-value>\n", keyed: true },
+		{ text: "password=<a-value> token=<\n", keyed: true },
+		{ text: "note=<\n", keyed: false },
+		{ text: "a < b\n", keyed: false },
+		{ text: "see <link>\n", keyed: false },
+		{ text: "plain text\n", keyed: false },
+	];
+}

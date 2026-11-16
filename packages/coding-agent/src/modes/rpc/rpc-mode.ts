@@ -25,12 +25,13 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
-import { vinciMaskEnabled, vinciMaskSecrets } from "../../core/vinci-mask-secrets.ts";
+import { vinciMaskEnabled } from "../../core/vinci-mask-secrets.ts";
 import {
 	VinciStreamMask,
 	vinciMaskStreamJson,
 	vinciMaskViewEntry,
 	vinciMaskViewEvent,
+	vinciMaskViewLastAssistantText,
 	vinciMaskViewMessage,
 	vinciMaskViewTree,
 } from "../../core/vinci-stream-mask.ts";
@@ -671,9 +672,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "get_last_assistant_text": {
 				const text = session.getLastAssistantText();
-				// [vinci] the same text the event path masks, masked the same way
+				// [vinci] the same text the event path masks, masked the same way; a block cut by an error, an abort or
+				// the length limit reads as the stream wrote it (the get_messages view)
 				return success(id, "get_last_assistant_text", {
-					text: vinciMaskEnabled() && typeof text === "string" ? vinciMaskSecrets(text) : text,
+					text:
+						vinciMaskEnabled() && typeof text === "string"
+							? vinciMaskViewLastAssistantText(text, session.messages, streamMask)
+							: text,
 				});
 			}
 

@@ -207,7 +207,7 @@ test("rpc: a thinking block holds back and masks the same way", async () => {
 	assert.equal(deltasOf(out.events, "thinking"), fieldOf(end.message, "thinking"));
 });
 
-test("rpc: an aborted answer (message_end, no text_end) flushes the held run masked", async () => {
+test("rpc: an aborted answer (message_end, no text_end) keeps its complete lines, masked, then the placeholder for the held run", async () => {
 	const run = secretRuns()["a multi-line base64 secret"];
 	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, stopReason: "aborted" });
 	const out = await runRpc(events);
@@ -219,7 +219,12 @@ test("rpc: an aborted answer (message_end, no text_end) flushes the held run mas
 	const flushed = out.events[endIndex - 1];
 	assert.equal(flushed.type, "message_update", "a flushed delta precedes message_end");
 	assert.ok(flushed.assistantMessageEvent.delta.includes(PLACEHOLDER), "the flushed delta is masked");
-	assert.equal(deltasOf(out.events), fieldOf(out.events[endIndex].message));
+	// 206t (expectation: more masking): the abort cut the block before its end, so the flushed delta keeps only the
+	// complete lines no later text could change (masked), then the placeholder; message_end shows exactly that.
+	const flushedText = deltasOf(out.events);
+	assert.ok(flushedText.startsWith("Here it is:\n"), "the complete lines stay");
+	assert.ok(flushedText.endsWith(PLACEHOLDER), "then the placeholder for the held run");
+	assert.equal(fieldOf(out.events[endIndex].message), flushedText, "message_end shows the block as the stream wrote it");
 });
 
 test("rpc: the exit path (stdin ends mid-answer) writes the held run masked before exit", async () => {
@@ -2162,24 +2167,30 @@ test("rpc 206s (B03): a DCS string inside an assignment's key in an assistant er
 });
 
 // 206s (B04): a tool's latest progress is kept and released once, masked, when nothing later carries it.
-test("rpc 206s (B04): a tool's progress followed by the end of input (no tool end) goes out once, masked", async () => {
+test("rpc 206s (B04): a tool's progress followed by the end of input (no tool end) goes out once, as the placeholder", async () => {
 	const { text, update } = progressEvents();
 	const out = await runRpc([update]);
 	assert.equal(out.exitCode, 0, "206s (B04, rpc, update then end of input): the run exits 0");
 	const released = releasedUpdates(out.events);
 	assert.equal(released.length, 1, "the kept progress is written once");
 	assert.equal(released[0].toolCallId, "partial-only", "for its tool call");
-	assert.equal(released[0].partialResult.content[0].text, text, "whole");
-	assert.deepEqual(released[0].partialResult.details, { progress: 17 }, "with its details");
+	// 206t (expectation: more masking): a kept partial result never reached its end, so it goes out as the placeholder
+	// with empty details, not masked whole.
+	assert.ok(text !== PLACEHOLDER, "fixture sanity: the progress is ordinary text");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+	assert.deepEqual(released[0].partialResult.details, {}, "with empty details");
 });
 
-test("rpc 206s (B04): a tool's progress followed by an error-only tool end goes out once, before the end", async () => {
+test("rpc 206s (B04): a tool's progress followed by an error-only tool end goes out once, before the end, as the placeholder", async () => {
 	const { text, errorUpdate, errorEnd } = progressEvents();
 	const out = await runRpc([errorUpdate, errorEnd]);
 	assertCompleted(out, ["tool_execution_end"], "206s (B04, rpc, update then error)");
 	const released = releasedUpdates(out.events);
 	assert.equal(released.length, 1, "the kept progress is written once");
-	assert.equal(released[0].partialResult.content[0].text, text, "whole");
+	// 206t (expectation: more masking): the error-only end does not carry the kept progress, which never reached its end,
+	// so it goes out as the placeholder, not masked whole.
+	assert.ok(text !== PLACEHOLDER, "fixture sanity: the progress is ordinary text");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
 	const endAt = out.events.findIndex((event) => event?.type === "tool_execution_end");
 	assert.ok(out.events.indexOf(released[0]) < endAt, "before the tool end");
 	assert.equal(out.events[endAt].result.content[0].text, "operation aborted.", "the error-only end is written as it was");
@@ -2213,7 +2224,7 @@ test("rpc 206s (B04): a tool's progress cut inside an angle value, then an error
 });
 
 // 206s (B05): a held body has a byte bound and a deadline; at either it goes out at once, and nothing raw follows.
-test("rpc 206s (B05): a text block past the byte bound goes out at once, as the placeholder when it cannot be masked whole", async () => {
+test("rpc 206s (B05): a text block past the byte bound goes out at once, as the placeholder", async () => {
 	const set = holdLimitsSetter();
 	const run = secretRuns()["an END-only private-key body"];
 	const { events } = streamEvents(["Here it is:", ...run.lines, "That is all."]);
@@ -2274,7 +2285,7 @@ test("rpc 206s (B05): a tool call's argument text past the byte bound goes out a
 	assert.ok(out.events.indexOf(released[0]) < out.events.indexOf(deltas.at(-1)), "at the bound, before the call's later deltas");
 });
 
-test("rpc 206s (B05): a text block held for the deadline (10 minutes, a fake clock) goes out at once, masked whole when it can be", async () => {
+test("rpc 206s (B05): a text block held for the deadline (10 minutes, a fake clock) goes out at once, as the placeholder", async () => {
 	const set = holdLimitsSetter();
 	let now = 0;
 	const lines = ["First line.\n", "Second line.\n", "Third line.\n", "Fourth line.\n", "Fifth line.\n"];
@@ -2299,7 +2310,9 @@ test("rpc 206s (B05): a text block held for the deadline (10 minutes, a fake clo
 	assertCompleted(out, ["message_end"], "206s (B05, rpc, deadline)");
 	const released = releasedDeltas(out.events);
 	assert.equal(released.length, 1, "one release");
-	assert.equal(released[0].assistantMessageEvent.delta, lines.slice(0, 4).join(""), "at the deadline (not before), the body so far, masked whole");
+	// 206t (expectation: more masking): a body cut at the deadline goes out as the placeholder, never as the mask of the
+	// text so far.
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "at the deadline (not before), the placeholder");
 });
 
 // 206s (B07): an own "__proto__" key and its data survive the whole-object masker, as JSON.stringify writes them.
@@ -2338,3 +2351,694 @@ test("rpc 206s (B08): a String or Number object under a secret name is masked as
 	assert.equal(typeof end?.result?.details?.password, "string", "written as a string, as JSON.stringify writes it");
 	assert.deepEqual(end.result.details, JSON.parse(JSON.stringify(vinciMaskJson(plain))), "masked as the values are masked under their names");
 });
+
+// ---------------------------------------------------------------------------------------------------
+// 206t: review findings D01..D05 through runRpcMode. Inputs are the review probes', byte for byte. Each row asserts the
+// run completed, and fails on the code before 206t by an assertion (a cut token byte on stdout, retained bytes over the
+// bound, a lost update, an output that differs from JSON.stringify's), never by a crash.
+// ---------------------------------------------------------------------------------------------------
+
+const {
+	assertNoPrefixBytes,
+	boundedInputs,
+	checkpointUpdate,
+	crossRealmBoxed,
+	earlyCutCases,
+	multiByteStartEvents,
+	overriddenBoxed,
+	probeCallEvents,
+	probeTextMessage,
+	probeTextUpdate,
+	retainedStringBytes,
+	tokenPrefixCase,
+	tokenPrefixUpdate,
+	toolEnd,
+} = await import("./lib/stream-masking-fixtures.mjs");
+const vm = await import("node:vm");
+
+/** 206t (D01): the cut token alone is not masked, and the whole token masks to its 4-character head (positive control). */
+function tokenControl(where) {
+	const { prefix, full, tail } = tokenPrefixCase();
+	assert.equal(vinciMaskSecrets(prefix), prefix, `${where}: fixture sanity: the cut token alone is not masked`);
+	const masked = vinciMaskSecrets(full);
+	assert.ok(masked.startsWith(prefix.slice(0, 4)) && masked.includes(PLACEHOLDER), `${where}: positive control: the whole token masks to its head`);
+	assertNoPrefixBytes(masked, tail, `${where}: positive control`);
+	return { prefix, full, tail };
+}
+
+/** 206t: the written updates of `toolCallId` that carry anything (content or details), not the held empty shape. */
+const keptReleases = (events, toolCallId) =>
+	events.filter(
+		(event) =>
+			event?.type === "tool_execution_update" &&
+			event.toolCallId === toolCallId &&
+			(JSON.stringify(event.partialResult?.content ?? []) !== "[]" || JSON.stringify(event.partialResult?.details ?? {}) !== "{}"),
+	);
+
+const otherToolUpdate = () => ({ type: "tool_execution_update", toolCallId: "other", partialResult: { content: [] } });
+
+/** 206t: a masker of the event path's kind, for measuring what it keeps. */
+const newStreamMask = () => new streamMaskModule.VinciStreamMask();
+
+// 206t (D01): a body cut before its natural end (a bound, the deadline, the end of input, an error-only end) goes out as
+// the placeholder, never as the mask of its prefix.
+test("rpc 206t (D01): a token cut below its minimum length at a text block's byte bound goes out as the placeholder: no byte past its head reaches stdout", async () => {
+	const set = holdLimitsSetter();
+	const { prefix, full, tail } = tokenControl("206t (D01, rpc, text cap)");
+	const { events } = streamEvents([prefix, full.slice(prefix.length)], { eol: "" });
+	set({ maxBytes: 16 });
+	let out;
+	try {
+		out = await runRpc(events);
+	} finally {
+		set();
+	}
+	assertNoPrefixBytes(out.stdout, tail, "206t (D01, rpc, text cap): whole stdout");
+	assertCompleted(out, ["message_end"], "206t (D01, rpc, text cap)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "at the bound, the placeholder");
+	const end = out.events.find((event) => event?.type === "message_end");
+	assert.equal(fieldOf(end.message), vinciMaskSecrets(full), "positive control: message_end carries the whole token, masked to its head");
+});
+
+test("rpc 206t (D01): a token cut below its minimum length at a text block's deadline (a fake clock) goes out as the placeholder: no byte past its head reaches stdout", async () => {
+	const set = holdLimitsSetter();
+	const { prefix, full, tail } = tokenControl("206t (D01, rpc, text deadline)");
+	const cut = probeTextMessage(prefix);
+	const whole = probeTextMessage(full);
+	let now = 0;
+	set({ deadlineMs: 100, now: () => now });
+	let out;
+	try {
+		out = await runRpc([{ type: "message_start", message: probeTextMessage("") }, probeTextUpdate(cut, prefix)], {
+			during: async ({ emit }) => {
+				now = 101;
+				emit(probeTextUpdate(cut, ""));
+				emit(probeTextUpdate(whole, full.slice(prefix.length)));
+				emit({ type: "message_update", message: whole, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: full, partial: whole } });
+				emit({ type: "message_end", message: whole });
+			},
+		});
+	} finally {
+		set();
+	}
+	assertNoPrefixBytes(out.stdout, tail, "206t (D01, rpc, text deadline): whole stdout");
+	assertCompleted(out, ["message_end"], "206t (D01, rpc, text deadline)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "at the deadline, the placeholder");
+	const end = out.events.find((event) => event?.type === "message_end");
+	assert.equal(fieldOf(end.message), vinciMaskSecrets(full), "positive control: message_end carries the whole token, masked to its head");
+});
+
+test("rpc 206t (D01): a token cut below its minimum length when input ends before its block ends goes out as the placeholder: no byte past its head reaches stdout", async () => {
+	const { prefix, tail } = tokenControl("206t (D01, rpc, text end of input)");
+	const cut = probeTextMessage(prefix);
+	const out = await runRpc([{ type: "message_start", message: probeTextMessage("") }, probeTextUpdate(cut, prefix)]);
+	assertNoPrefixBytes(out.stdout, tail, "206t (D01, rpc, text end of input): whole stdout");
+	assert.equal(out.exitCode, 0, "206t (D01, rpc, text end of input): the run exits 0");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release, at the end of input");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder: the block was cut before its end");
+});
+
+/** 206t (D01): a probe message that ended with `stopReason`. */
+const endedWith = (text, stopReason) => ({ ...probeTextMessage(text), stopReason });
+
+/**
+ * 206t (D01): `text` streamed as one text block with no text_end, then a cut: a source `error` event (`withError`) and
+ * message_end, or message_end alone, of a message that ended with `stopReason`; then agent_end carrying it.
+ */
+function earlyEndEvents(text, stopReason, withError) {
+	const ended = endedWith(text, stopReason);
+	const events = [{ type: "message_start", message: probeTextMessage("") }, probeTextUpdate(probeTextMessage(text), text)];
+	if (withError) events.push({ type: "message_update", message: ended, assistantMessageEvent: { type: "error", reason: "error", error: ended } });
+	events.push({ type: "message_end", message: ended }, { type: "agent_end", messages: [ended] });
+	return events;
+}
+
+/** 206t (D01): the block's text in each final event written: the `error` event's message, message_end, agent_end. */
+const finalTexts = (events) =>
+	events.flatMap((event) => {
+		if (event?.assistantMessageEvent?.type === "error") return [["error", fieldOf(event.assistantMessageEvent.error)]];
+		if (event?.type === "message_end") return [["message_end", fieldOf(event.message)]];
+		if (event?.type === "agent_end") return (event.messages ?? []).map((message) => ["agent_end", fieldOf(message)]);
+		return [];
+	});
+
+const EARLY_ENDINGS = [
+	["at a source error event", "error", true],
+	["at message_end with stopReason aborted and no text_end", "aborted", false],
+	["at message_end with stopReason length and no text_end", "length", false],
+];
+
+// 206t (D01): a block cut by an error, an abort or the length limit keeps its complete lines (those the hold-back
+// releases, masked as one body) and ends with the placeholder for the unfinished part; no byte of the cut token, an
+// open key block, an open ${ or an open angle value reaches stdout, whole.
+for (const [ending, stopReason, withError] of EARLY_ENDINGS) {
+	for (const { label, text, head, startsWith, forbidden } of earlyCutCases()) {
+		test(`rpc 206t (D01): ${label}, ${ending}: the complete lines go out masked, then the placeholder; no byte past the token's head reaches stdout`, async () => {
+			const where = `206t (D01, rpc, ${label}, ${ending})`;
+			const { tail } = tokenControl(where);
+			const out = await runRpc(earlyEndEvents(text, stopReason, withError));
+			assertCompleted(out, ["message_end", "agent_end"], where);
+			assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+			for (const part of forbidden) assert.ok(!out.stdout.includes(part), `${where}: ${JSON.stringify(part.slice(0, 12))} reached stdout`);
+			const released = releasedDeltas(out.events);
+			assert.equal(released.length, 1, `${where}: one release`);
+			const delta = released[0].assistantMessageEvent.delta;
+			if (head !== undefined) assert.equal(delta, `${vinciMaskSecrets(head)}${PLACEHOLDER}`, `${where}: the complete lines, masked, then the placeholder`);
+			else {
+				assert.ok(delta.startsWith(startsWith), `${where}: the complete lines before the open value are kept`);
+				assert.ok(delta.endsWith(PLACEHOLDER), `${where}: then the placeholder`);
+			}
+		});
+	}
+}
+
+for (const [ending, stopReason, withError] of EARLY_ENDINGS) {
+	test(`rpc 206t (D01): a block cut ${ending}: every final event shows the block exactly as its streamed deltas wrote it`, async () => {
+		const where = `206t (D01, rpc, final equals streamed, ${ending})`;
+		const { tail } = tokenControl(where);
+		const { text } = earlyCutCases()[1];
+		const out = await runRpc(earlyEndEvents(text, stopReason, withError));
+		assertCompleted(out, ["message_end", "agent_end"], where);
+		assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+		const streamed = deltasOf(out.events);
+		assert.ok(streamed.includes("Here it is:") && streamed.endsWith(PLACEHOLDER), `${where}: fixture sanity: complete lines, then the placeholder`);
+		const finals = finalTexts(out.events);
+		assert.equal(finals.length, withError ? 3 : 2, `${where}: the final events are written`);
+		for (const [type, shown] of finals) assert.equal(shown, streamed, `${where}: ${type} shows the block as the stream wrote it`);
+	});
+}
+
+test("rpc 206t (D01): multi-line control: a full token on an earlier complete line is masked to its head and its lines stay; the cut last line is the placeholder", async () => {
+	const where = "206t (D01, rpc, multi-line control)";
+	const { full, tail } = tokenControl(where);
+	const out = await runRpc(earlyEndEvents(earlyCutCases()[1].text, "aborted", false));
+	assertCompleted(out, ["message_end"], where);
+	assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+	const streamed = deltasOf(out.events);
+	assert.ok(streamed.startsWith("Here it is:\nThe old token was "), `${where}: the complete lines stay`);
+	assert.ok(streamed.includes(`${vinciMaskSecrets(full)}.\n`), `${where}: the full token is masked to its head`);
+	assert.ok(streamed.endsWith(`.\n${PLACEHOLDER}`), `${where}: the cut last line is the placeholder`);
+});
+
+test("rpc 206t (D01): positive control: a message that ended normally (done, stopReason stop, no text_end) releases the whole token masked to its head, not the placeholder", async () => {
+	const where = "206t (D01, rpc, done stop)";
+	const { full, tail } = tokenControl(where);
+	const whole = endedWith(full, "stop");
+	const out = await runRpc([
+		{ type: "message_start", message: probeTextMessage("") },
+		probeTextUpdate(whole, full),
+		{ type: "message_update", message: whole, assistantMessageEvent: { type: "done", reason: "stop", message: whole } },
+		{ type: "message_end", message: whole },
+	]);
+	assertCompleted(out, ["message_end"], where);
+	assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, vinciMaskSecrets(full), "masked whole, not the placeholder");
+	assert.notEqual(released[0].assistantMessageEvent.delta, PLACEHOLDER, "not the placeholder");
+});
+
+test("rpc 206t (D01): a block of an early-ended message that never streamed a delta goes out in the cut form: no byte past the token's head reaches stdout", async () => {
+	const where = "206t (D01, rpc, never streamed)";
+	const { prefix, tail } = tokenControl(where);
+	const ended = endedWith(prefix, "aborted");
+	const out = await runRpc([
+		{ type: "message_start", message: probeTextMessage("") },
+		{ type: "message_end", message: ended },
+		{ type: "agent_end", messages: [ended] },
+	]);
+	assertCompleted(out, ["message_end", "agent_end"], where);
+	assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+	assert.equal(deltasOf(out.events), PLACEHOLDER, `${where}: one delta, the placeholder`);
+	for (const [type, shown] of finalTexts(out.events)) assert.equal(shown, PLACEHOLDER, `${where}: ${type} shows the block as the stream wrote it`);
+});
+
+/** 206t (D01): an RPC session holding one message: get_messages, get_entries and get_tree all hand it back. */
+function cutSession(message) {
+	const entry = { type: "message", id: "c1", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message };
+	const tree = [{ entry, children: [] }];
+	return { messages: [message], sessionManager: { getEntries: () => [entry], getTree: () => tree, getLeafId: () => "c1" } };
+}
+
+/** 206t (D01): the block's text in each transcript response: get_messages, get_entries, get_tree. */
+async function transcriptTexts(send) {
+	const messages = (await send({ type: "get_messages" })).response.data.messages;
+	const entries = (await send({ type: "get_entries" })).response.data.entries;
+	const tree = (await send({ type: "get_tree" })).response.data.tree;
+	return [
+		["get_messages", fieldOf(messages[0])],
+		["get_entries", fieldOf(entries[0].message)],
+		["get_tree", fieldOf(tree[0].entry.message)],
+	];
+}
+
+// 206t (D01): the transcript responses are stdout too. A block cut by an error, an abort or the length limit is shown
+// there in the cut form, computed from the message alone: the same text the stream wrote, before and after a reload.
+// The reload is a second RPC mode over a JSON copy of the session (what reading the session file gives: fresh objects,
+// no stream state and no object the first mode saw); this harness has no session file of its own.
+for (const [ending, stopReason, withError] of EARLY_ENDINGS) {
+	for (const { label, text, forbidden } of earlyCutCases()) {
+		test(`rpc 206t (D01): ${label}, ${ending}: get_messages, get_entries and get_tree show the block as the stream wrote it, before and after a reload; no byte past the token's head reaches stdout`, async () => {
+			const where = `206t (D01, rpc transcript, ${label}, ${ending})`;
+			const { tail } = tokenControl(where);
+			const events = earlyEndEvents(text, stopReason, withError);
+			const ended = events.find((event) => event.type === "message_end").message;
+			let before;
+			const out = await runRpc(events, {
+				state: cutSession(ended),
+				during: async ({ send }) => {
+					before = await transcriptTexts(send);
+				},
+			});
+			assertCompleted(out, ["message_end", "agent_end"], where);
+			assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+			let after;
+			const reloaded = await runRpc([], {
+				state: cutSession(JSON.parse(JSON.stringify(ended))),
+				during: async ({ send }) => {
+					after = await transcriptTexts(send);
+				},
+			});
+			assertNoPrefixBytes(reloaded.stdout, tail, `${where}: whole stdout after the reload`);
+			for (const part of forbidden) {
+				assert.ok(!out.stdout.includes(part) && !reloaded.stdout.includes(part), `${where}: ${JSON.stringify(part.slice(0, 12))} reached stdout`);
+			}
+			const streamed = deltasOf(out.events);
+			assert.ok(streamed.endsWith(PLACEHOLDER), `${where}: fixture sanity: the stream wrote the cut form`);
+			for (const [command, shown] of before) assert.equal(shown, streamed, `${where}: ${command} shows the block as the stream wrote it`);
+			for (const [command, shown] of after) assert.equal(shown, streamed, `${where}: ${command} after the reload shows the block as the stream wrote it`);
+		});
+	}
+}
+
+/** 206t (D01): the session as getLastAssistantText reads it: its text blocks joined, trimmed (cutSession, plus that). */
+function lastTextSession(message) {
+	const text = message.content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join("")
+		.trim();
+	return { ...cutSession(message), lastAssistantText: text || undefined };
+}
+
+// 206t (D01): get_last_assistant_text writes to stdout too: a block cut by an error, an abort or the length limit reads
+// there as the stream wrote it (the get_messages view), before and after a reload.
+for (const [ending, stopReason, withError] of EARLY_ENDINGS) {
+	for (const { label, text, forbidden } of earlyCutCases()) {
+		test(`rpc 206t (D01): ${label}, ${ending}: get_last_assistant_text reads the block as the stream wrote it, before and after a reload; no byte past the token's head reaches stdout`, async () => {
+			const where = `206t (D01, rpc last text, ${label}, ${ending})`;
+			const { tail } = tokenControl(where);
+			const events = earlyEndEvents(text, stopReason, withError);
+			const ended = events.find((event) => event.type === "message_end").message;
+			let before;
+			const out = await runRpc(events, {
+				state: lastTextSession(ended),
+				during: async ({ send }) => {
+					before = (await send({ type: "get_last_assistant_text" })).response.data.text;
+				},
+			});
+			assertCompleted(out, ["message_end", "agent_end"], where);
+			assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+			let after;
+			const reloaded = await runRpc([], {
+				state: lastTextSession(JSON.parse(JSON.stringify(ended))),
+				during: async ({ send }) => {
+					after = (await send({ type: "get_last_assistant_text" })).response.data.text;
+				},
+			});
+			assertNoPrefixBytes(reloaded.stdout, tail, `${where}: whole stdout after the reload`);
+			for (const part of forbidden) {
+				assert.ok(!out.stdout.includes(part) && !reloaded.stdout.includes(part), `${where}: ${JSON.stringify(part.slice(0, 12))} reached stdout`);
+			}
+			const streamed = deltasOf(out.events);
+			assert.ok(streamed.endsWith(PLACEHOLDER), `${where}: fixture sanity: the stream wrote the cut form`);
+			assert.equal(before, streamed, `${where}: get_last_assistant_text reads the block as the stream wrote it`);
+			assert.equal(after, streamed, `${where}: get_last_assistant_text after the reload reads the block as the stream wrote it`);
+		});
+	}
+}
+
+/**
+ * 206t (D01): a thinking block still open (no thinking_end) while a later text block streams (no text_end), then the
+ * message ends early. Each block ends in the cut token.
+ */
+function thinkingThenTextEvents(stopReason, withError) {
+	const { prefix } = tokenPrefixCase();
+	const thinking = `Let me check.\n${prefix}`;
+	const text = `The answer follows.\n${prefix}`;
+	const message = (thinkingText, textText, reason = "stop") => ({
+		role: "assistant",
+		content: [
+			{ type: "thinking", thinking: thinkingText },
+			{ type: "text", text: textText },
+		],
+		stopReason: reason,
+	});
+	const ended = message(thinking, text, stopReason);
+	const afterThinking = message(thinking, "");
+	const afterText = message(thinking, text);
+	const events = [
+		{ type: "message_start", message: message("", "") },
+		{ type: "message_update", message: afterThinking, assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: thinking, partial: afterThinking } },
+		{ type: "message_update", message: afterText, assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: text, partial: afterText } },
+	];
+	if (withError) events.push({ type: "message_update", message: ended, assistantMessageEvent: { type: "error", reason: "error", error: ended } });
+	events.push({ type: "message_end", message: ended }, { type: "agent_end", messages: [ended] });
+	return { events, ended };
+}
+
+for (const [ending, stopReason, withError] of EARLY_ENDINGS) {
+	test(`rpc 206t (D01): a thinking block still open while a later text block streams, cut ${ending}: it goes out in the cut form, and the final events and get_messages show it so, before and after a reload; no byte past the token's head reaches stdout`, async () => {
+		const where = `206t (D01, rpc, open thinking before text, ${ending})`;
+		const { tail } = tokenControl(where);
+		const { events, ended } = thinkingThenTextEvents(stopReason, withError);
+		let before;
+		const out = await runRpc(events, {
+			state: cutSession(ended),
+			during: async ({ send }) => {
+				before = (await send({ type: "get_messages" })).response.data.messages[0];
+			},
+		});
+		assertCompleted(out, ["message_end", "agent_end"], where);
+		assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+		let after;
+		const reloaded = await runRpc([], {
+			state: cutSession(JSON.parse(JSON.stringify(ended))),
+			during: async ({ send }) => {
+				after = (await send({ type: "get_messages" })).response.data.messages[0];
+			},
+		});
+		assertNoPrefixBytes(reloaded.stdout, tail, `${where}: whole stdout after the reload`);
+		const thinking = deltasOf(out.events, "thinking");
+		assert.equal(thinking, `${vinciMaskSecrets("Let me check.\n")}${PLACEHOLDER}`, `${where}: the thinking block's complete lines, masked, then the placeholder`);
+		assert.equal(deltasOf(out.events), `${vinciMaskSecrets("The answer follows.\n")}${PLACEHOLDER}`, `${where}: the text block too`);
+		const finals = out.events.flatMap((event) => {
+			if (event?.assistantMessageEvent?.type === "error") return [event.assistantMessageEvent.error];
+			if (event?.type === "message_end") return [event.message];
+			if (event?.type === "agent_end") return event.messages ?? [];
+			return [];
+		});
+		assert.equal(finals.length, withError ? 3 : 2, `${where}: the final events are written`);
+		for (const message of finals) assert.equal(fieldOf(message, "thinking"), thinking, `${where}: a final event shows the thinking block as the stream wrote it`);
+		assert.equal(fieldOf(before, "thinking"), thinking, `${where}: get_messages shows the thinking block as the stream wrote it`);
+		assert.equal(fieldOf(after, "thinking"), thinking, `${where}: get_messages after the reload shows the thinking block as the stream wrote it`);
+	});
+}
+
+for (const [label, ending, limits] of [
+	["at the byte bound", "end", { maxBytes: 16 }],
+	["at the end of input (no tool end)", "none", undefined],
+	["before an error-only tool end", "error", undefined],
+]) {
+	test(`rpc 206t (D01): a tool's progress that is a token cut below its minimum length, ${label}, goes out as the placeholder: no byte past its head reaches stdout`, async () => {
+		const set = holdLimitsSetter();
+		const where = `206t (D01, rpc, progress ${label})`;
+		const { full, tail } = tokenControl(where);
+		const events = [tokenPrefixUpdate()];
+		if (ending === "end") events.push(toolEnd("token-prefix", full));
+		if (ending === "error") events.push(toolEnd("token-prefix", "operation aborted.", { isError: true }));
+		if (limits) set(limits);
+		let out;
+		try {
+			out = await runRpc(events);
+		} finally {
+			set();
+		}
+		assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+		assertCompleted(out, ending === "none" ? [] : ["tool_execution_end"], where);
+		const released = releasedUpdates(out.events);
+		assert.equal(released.length, 1, "the kept progress is written once");
+		assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+		if (ending === "end") {
+			const end = out.events.find((event) => event?.type === "tool_execution_end");
+			assert.equal(end.result.content[0].text, vinciMaskSecrets(full), "positive control: the tool end carries the whole token, masked to its head");
+		}
+	});
+}
+
+// 206t (D02): the byte bound counts what is kept for a held body (its UTF-8 bytes, details and control bytes included), and
+// after the bound nothing raw of it is kept. The kept bytes are measured on the masker itself.
+for (const [label, key] of [
+	["ordinary text with large details", "largeDetails"],
+	["details only", "detailsOnly"],
+]) {
+	test(`rpc 206t (D02): a tool's progress past the byte bound by its details (${label}) goes out at once as the placeholder, and is not kept`, async () => {
+		const set = holdLimitsSetter();
+		const inputs = boundedInputs();
+		const update = inputs[key];
+		set({ maxBytes: 1024 });
+		let out;
+		let retained;
+		try {
+			out = await runRpc([update]);
+			const stream = newStreamMask();
+			stream.process(update);
+			retained = retainedStringBytes(stream);
+		} finally {
+			set();
+		}
+		assert.ok(!out.stdout.includes(inputs.payload.slice(0, 64)), `206t (D02, rpc, ${label}): the details past the bound never reach stdout`);
+		assert.ok(retained <= 1024, `the masker keeps at most the bound (${retained} bytes kept)`);
+		assert.equal(out.exitCode, 0, `206t (D02, rpc, ${label}): the run exits 0`);
+		const lines = out.events.filter((event) => event?.type === "tool_execution_update");
+		const released = keptReleases(out.events, update.toolCallId);
+		assert.equal(released.length, 1, "one release");
+		assert.equal(lines.indexOf(released[0]), 0, "at once: the update itself");
+		assert.equal(released[0].partialResult.content[0]?.text, PLACEHOLDER, "as the placeholder");
+		assert.deepEqual(released[0].partialResult.details, {}, "its details are not written");
+	});
+}
+
+test("rpc 206t (D02): a tool's progress past the byte bound by control bytes the normaliser removes goes out at once as the placeholder, and is not kept", async () => {
+	const set = holdLimitsSetter();
+	const { controls } = boundedInputs();
+	set({ maxBytes: 1024 });
+	let out;
+	let retained;
+	try {
+		out = await runRpc([controls]);
+		const stream = newStreamMask();
+		stream.process(controls);
+		retained = retainedStringBytes(stream);
+	} finally {
+		set();
+	}
+	assert.ok(retained <= 1024, `206t (D02, rpc, controls): the masker keeps at most the bound (${retained} bytes kept)`);
+	assert.equal(out.exitCode, 0, "206t (D02, rpc, controls): the run exits 0");
+	const lines = out.events.filter((event) => event?.type === "tool_execution_update");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(lines.indexOf(released[0]), 0, "at once: the update itself");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+});
+
+test("rpc 206t (D02): a text block past the byte bound in UTF-8 bytes but not in UTF-16 units, with no delta of its own, goes out at once as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const { body, events } = multiByteStartEvents();
+	assert.ok(body.length <= 1024 && Buffer.byteLength(body, "utf8") > 1024, "fixture sanity: under the bound in UTF-16 units, past it in UTF-8 bytes");
+	set({ maxBytes: 1024 });
+	let out;
+	let retained;
+	try {
+		out = await runRpc(events);
+		const stream = newStreamMask();
+		for (const event of events.slice(0, 2)) stream.process(event);
+		retained = retainedStringBytes(stream);
+	} finally {
+		set();
+	}
+	assert.ok(retained <= 1024, `206t (D02, rpc, multi-byte): the masker keeps at most the bound (${retained} bytes kept)`);
+	assertCompleted(out, ["message_end"], "206t (D02, rpc, multi-byte)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "as the placeholder");
+	const textEnd = out.events.findIndex((event) => event?.assistantMessageEvent?.type === "text_end");
+	assert.ok(out.events.indexOf(released[0]) < textEnd, "at the bound, before the block's end");
+});
+
+test("rpc 206t (D02): a call's cumulative argument text past the byte bound is not kept after the bound (no raw cumulative message)", async () => {
+	const set = holdLimitsSetter();
+	const { callDeltas } = boundedInputs();
+	const events = probeCallEvents(callDeltas);
+	set({ maxBytes: 1024 });
+	let out;
+	let retained;
+	try {
+		out = await runRpc(events);
+		const stream = newStreamMask();
+		for (const event of events) stream.process(event);
+		retained = retainedStringBytes(stream);
+	} finally {
+		set();
+	}
+	assert.ok(retained <= 1024, `206t (D02, rpc, cumulative arguments): the masker keeps at most the bound (${retained} bytes kept)`);
+	assert.ok(!out.stdout.includes("x".repeat(64)), "the held argument text never reaches stdout");
+	assert.equal(out.exitCode, 0, "206t (D02, rpc, cumulative arguments): the run exits 0");
+	const released = releasedDeltas(out.events, "toolcall");
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "at the bound, the placeholder");
+});
+
+// 206t (D03): no timer. The deadline of every held body is checked on every event, of any type; a silent stream holds
+// until the next event or the end.
+test("rpc 206t (D03): a text block's deadline (a fake clock) is checked on an unrelated event: the block goes out at that event, as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const text = probeTextMessage("ordinary.");
+	let now = 0;
+	set({ deadlineMs: 100, now: () => now });
+	let out;
+	try {
+		out = await runRpc([{ type: "message_start", message: text }, probeTextUpdate(text, "ordinary.")], {
+			during: async ({ emit }) => {
+				now = 101;
+				emit(otherToolUpdate());
+				emit({ type: "message_update", message: text, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ordinary.", partial: text } });
+				emit({ type: "message_end", message: text });
+			},
+		});
+	} finally {
+		set();
+	}
+	assertCompleted(out, ["message_end"], "206t (D03, rpc, unrelated event)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	const other = out.events.findIndex((event) => event?.type === "tool_execution_update");
+	assert.ok(other > 0 && out.events.indexOf(released[0]) < other, "released at the unrelated event, before it is written");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "as the placeholder");
+});
+
+test("rpc 206t (D03): in a tool-update-only stream a kept partial result's deadline is checked on another tool's update; it goes out then, as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const { tail } = tokenControl("206t (D03, rpc, tool updates only)");
+	let now = 0;
+	set({ deadlineMs: 100, now: () => now });
+	let out;
+	try {
+		out = await runRpc([tokenPrefixUpdate()], {
+			during: async ({ emit }) => {
+				now = 101;
+				emit(otherToolUpdate());
+			},
+		});
+	} finally {
+		set();
+	}
+	assertNoPrefixBytes(out.stdout, tail, "206t (D03, rpc, tool updates only): whole stdout");
+	assert.equal(out.exitCode, 0, "206t (D03, rpc, tool updates only): the run exits 0");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "the kept progress is written once");
+	assert.equal(released[0].toolCallId, "token-prefix", "for its tool call");
+	const other = out.events.findIndex((event) => event?.toolCallId === "other");
+	assert.ok(other > 0 && out.events.indexOf(released[0]) < other, "at the other tool's update, before it is written");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+});
+
+test("rpc 206t (D03): a text block held past its deadline with no later event releases nothing while the stream is silent, then goes out at the end as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const { prefix, tail } = tokenControl("206t (D03, rpc, silent)");
+	const cut = probeTextMessage(prefix);
+	let now = 0;
+	set({ deadlineMs: 100, now: () => now });
+	let out;
+	let silent;
+	try {
+		out = await runRpc([{ type: "message_start", message: probeTextMessage("") }, probeTextUpdate(cut, prefix)], {
+			during: async ({ stdout }) => {
+				now = 10_000;
+				await waitForRawStdoutBackpressure();
+				silent = stdout();
+			},
+		});
+	} finally {
+		set();
+	}
+	assertNoPrefixBytes(out.stdout, tail, "206t (D03, rpc, silent): whole stdout");
+	assert.equal(out.exitCode, 0, "206t (D03, rpc, silent): the run exits 0");
+	assert.equal(deltasOf(parseLines(silent)), "", "nothing is released while the stream is silent");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release, at the end");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "as the placeholder");
+});
+
+// 206t (D04): an end supersedes a kept partial result only when it carries all of it (text, details and other fields,
+// normalised and masked); otherwise the kept update goes out once, before the end, as the placeholder.
+for (const [label, end] of [
+	["an error-only tool end", () => toolEnd("details-only", "operation aborted.", { isError: true, details: {}, toolName: "bash" })],
+	["a tool end without its details", () => toolEnd("details-only", "done.", { details: {}, toolName: "bash" })],
+	["the end of input (no tool end)", undefined],
+]) {
+	test(`rpc 206t (D04): a details-only checkpoint, then ${label}: the kept update goes out once, before it, as the placeholder`, async () => {
+		const where = `206t (D04, rpc, details-only, ${label})`;
+		const out = await runRpc([checkpointUpdate(), ...(end ? [end()] : [])]);
+		assertCompleted(out, end ? ["tool_execution_end"] : [], where);
+		const released = keptReleases(out.events, "details-only");
+		assert.equal(released.length, 1, `${where}: the kept update is written once, not lost`);
+		if (end) {
+			const endAt = out.events.findIndex((event) => event?.type === "tool_execution_end");
+			assert.ok(out.events.indexOf(released[0]) < endAt, "before the tool end");
+		}
+		assert.equal(released[0].partialResult.content[0]?.text, PLACEHOLDER, "as the placeholder: a kept partial result is never released raw");
+		assert.deepEqual(released[0].partialResult.details, {}, "its details are not written");
+	});
+}
+
+test("rpc 206t (D04): progress whose text the end repeats but whose details differ goes out once, before the end, as the placeholder; with equal details it does not", async () => {
+	const update = (details) => ({
+		type: "tool_execution_update",
+		toolCallId: "stage",
+		toolName: "bash",
+		partialResult: { content: [{ type: "text", text: "step one." }], details },
+	});
+	const end = toolEnd("stage", "step one.", { details: { stage: "second" }, toolName: "bash" });
+	const out = await runRpc([update({ stage: "first" }), end]);
+	assertCompleted(out, ["tool_execution_end"], "206t (D04, rpc, equal text)");
+	const released = keptReleases(out.events, "stage");
+	assert.equal(released.length, 1, "the kept update is written once, not lost");
+	const endAt = out.events.findIndex((event) => event?.type === "tool_execution_end");
+	assert.ok(out.events.indexOf(released[0]) < endAt, "before the tool end");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+	const same = await runRpc([update({ stage: "second" }), end]);
+	assertCompleted(same, ["tool_execution_end"], "206t (D04, rpc, equal payload)");
+	assert.equal(keptReleases(same.events, "stage").length, 0, "positive control: an end that carries all of it supersedes it");
+});
+
+// 206t (D05): boxed values are recognised by their internal brand (any realm) and read with the prototype's own valueOf,
+// as JSON.stringify reads them.
+test("rpc 206t (D05): String, Number and Boolean objects made in another realm are written as JSON.stringify writes them", async () => {
+	const events = detailsEvents(crossRealmBoxed(vm));
+	assert.ok(JSON.stringify(events[1]).includes('"message":"ordinary boxed message","count":7,"flag":true'), "fixture sanity: JSON.stringify writes the values");
+	const out = await runRpc(events);
+	const line = lineOf(out.stdout, (event) => event?.type === "tool_execution_end");
+	assert.equal(`${line}\n`, serializeJsonLine(events[1]), "206t (D05, rpc, another realm): the tool_execution_end line is JSON.stringify's");
+	assertCompleted(out, ["tool_execution_end", "message_end"], "206t (D05, rpc, another realm)");
+});
+
+for (const throwing of [false, true]) {
+	const label = throwing ? "throwing" : "overridden";
+	test(`rpc 206t (D05): boxed values with ${label} own methods that JSON.stringify does not call are written as JSON.stringify writes them`, async () => {
+		const events = detailsEvents(overriddenBoxed({ throwing }));
+		const native = serializeJsonLine(events[1]);
+		assert.ok(native.includes('"flag":true') && native.includes('"message":"ordinary boxed message"'), "fixture sanity: JSON.stringify reads the own values");
+		let thrown;
+		const out = await runRpc([], {
+			during: async ({ emit }) => {
+				for (const event of events) {
+					try {
+						emit(event);
+					} catch (error) {
+						thrown = error;
+					}
+				}
+			},
+		});
+		assert.equal(thrown, undefined, `206t (D05, rpc, ${label}): the writer takes every event (no own method is called)`);
+		const line = lineOf(out.stdout, (event) => event?.type === "tool_execution_end");
+		assert.equal(`${line}\n`, native, "the tool_execution_end line is JSON.stringify's");
+		assertCompleted(out, ["tool_execution_end", "message_end"], `206t (D05, rpc, ${label})`);
+	});
+}

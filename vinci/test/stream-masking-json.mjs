@@ -149,7 +149,7 @@ test("json: a thinking block holds back and masks the same way", async () => {
 	assert.equal(deltasOf(out.events, "thinking"), fieldOf(end.message, "thinking"));
 });
 
-test("json: an aborted answer (message_end, no text_end) flushes the held run masked", async () => {
+test("json: an aborted answer (message_end, no text_end) keeps its complete lines, masked, then the placeholder for the held run", async () => {
 	const run = secretRuns()["a multi-line hex secret"];
 	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, stopReason: "aborted" });
 	const out = await runJson(events);
@@ -162,10 +162,15 @@ test("json: an aborted answer (message_end, no text_end) flushes the held run ma
 	const flushed = out.events[endIndex - 1];
 	assert.equal(flushed.type, "message_update", "a flushed delta precedes message_end");
 	assert.ok(flushed.assistantMessageEvent.delta.includes(PLACEHOLDER), "the flushed delta is masked");
-	assert.equal(deltasOf(out.events), fieldOf(out.events[endIndex].message), "the deltas add up to the message_end text");
+	// 206t (expectation: more masking): the abort cut the block before its end, so the flushed delta keeps only the
+	// complete lines no later text could change (masked), then the placeholder; message_end shows exactly that.
+	const flushedText = deltasOf(out.events);
+	assert.ok(flushedText.startsWith("Here it is:\n"), "the complete lines stay");
+	assert.ok(flushedText.endsWith(PLACEHOLDER), "then the placeholder for the held run");
+	assert.equal(fieldOf(out.events[endIndex].message), flushedText, "message_end shows the block as the stream wrote it");
 });
 
-test("json: agent_end with no message_end flushes the held run masked", async () => {
+test("json: agent_end with no message_end flushes the held run as the placeholder", async () => {
 	// The base64 run ends in run characters, so it is still held when agent_end arrives.
 	const run = secretRuns()["a multi-line base64 secret"];
 	const { events } = streamEvents(["Here it is:", ...run.lines], { end: false, withEnd: false });
@@ -177,7 +182,9 @@ test("json: agent_end with no message_end flushes the held run masked", async ()
 	// Without the agent_end flush the run stays held past agent_end (only the final flush would write it).
 	const before = deltasOf(out.events.slice(0, agentEnd));
 	assert.ok(before.includes(PLACEHOLDER), "the held run is written, masked, before agent_end");
-	assert.equal(before, vinciMaskSecrets(["Here it is:", ...run.lines, ""].join("\n")), "all of it, before agent_end");
+	// 206t (expectation: more masking): agent_end cut the block before its end, so it goes out as the placeholder, not
+	// as the mask of the text so far.
+	assert.equal(before, PLACEHOLDER, "the placeholder, before agent_end");
 	assert.equal(deltasOf(out.events.slice(agentEnd)), "", "nothing is left to write after agent_end");
 });
 
@@ -1607,24 +1614,30 @@ test("json 206s (B03): a DCS string inside an assignment's key in an assistant e
 });
 
 // 206s (B04): a tool's latest progress is kept and released once, masked, when nothing later carries it.
-test("json 206s (B04): a tool's progress followed by the end of the run (no tool end) goes out once, masked", async () => {
+test("json 206s (B04): a tool's progress followed by the end of the run (no tool end) goes out once, as the placeholder", async () => {
 	const { text, update } = progressEvents();
 	const out = await runJson([update]);
 	assert.equal(out.exitCode, 0, "206s (B04, json, update then end of run): the run exits 0");
 	const released = releasedUpdates(out.events);
 	assert.equal(released.length, 1, "the kept progress is written once");
 	assert.equal(released[0].toolCallId, "partial-only", "for its tool call");
-	assert.equal(released[0].partialResult.content[0].text, text, "whole");
-	assert.deepEqual(released[0].partialResult.details, { progress: 17 }, "with its details");
+	// 206t (expectation: more masking): a kept partial result never reached its end, so it goes out as the placeholder
+	// with empty details, not masked whole.
+	assert.ok(text !== PLACEHOLDER, "fixture sanity: the progress is ordinary text");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+	assert.deepEqual(released[0].partialResult.details, {}, "with empty details");
 });
 
-test("json 206s (B04): a tool's progress followed by an error-only tool end goes out once, before the end", async () => {
+test("json 206s (B04): a tool's progress followed by an error-only tool end goes out once, before the end, as the placeholder", async () => {
 	const { text, errorUpdate, errorEnd } = progressEvents();
 	const out = await runJson([errorUpdate, errorEnd]);
 	assertCompleted(out, ["tool_execution_end"], "206s (B04, json, update then error)");
 	const released = releasedUpdates(out.events);
 	assert.equal(released.length, 1, "the kept progress is written once");
-	assert.equal(released[0].partialResult.content[0].text, text, "whole");
+	// 206t (expectation: more masking): the error-only end does not carry the kept progress, which never reached its end,
+	// so it goes out as the placeholder, not masked whole.
+	assert.ok(text !== PLACEHOLDER, "fixture sanity: the progress is ordinary text");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
 	const endAt = out.events.findIndex((event) => event?.type === "tool_execution_end");
 	assert.ok(out.events.indexOf(released[0]) < endAt, "before the tool end");
 	assert.equal(out.events[endAt].result.content[0].text, "operation aborted.", "the error-only end is written as it was");
@@ -1658,7 +1671,7 @@ test("json 206s (B04): a tool's progress cut inside an angle value, then an erro
 });
 
 // 206s (B05): a held body has a byte bound and a deadline; at either it goes out at once, and nothing raw follows.
-test("json 206s (B05): a text block past the byte bound goes out at once, as the placeholder when it cannot be masked whole", async () => {
+test("json 206s (B05): a text block past the byte bound goes out at once, as the placeholder", async () => {
 	const set = holdLimitsSetter();
 	const run = secretRuns()["an END-only private-key body"];
 	const { events } = streamEvents(["Here it is:", ...run.lines, "That is all."]);
@@ -1735,7 +1748,7 @@ test("json 206s (B05): a tool call's argument text past the byte bound goes out 
 	assert.ok(stream.tools.get(0).raw.length <= 16384, `the held argument text stays bounded (${stream.tools.get(0).raw.length} characters)`);
 });
 
-test("json 206s (B05): a text block held for the deadline (10 minutes, a fake clock) goes out at once, masked whole when it can be", async () => {
+test("json 206s (B05): a text block held for the deadline (10 minutes, a fake clock) goes out at once, as the placeholder", async () => {
 	const set = holdLimitsSetter();
 	let now = 0;
 	const lines = ["First line.\n", "Second line.\n", "Third line.\n", "Fourth line.\n", "Fifth line.\n"];
@@ -1761,7 +1774,9 @@ test("json 206s (B05): a text block held for the deadline (10 minutes, a fake cl
 	assertCompleted(out, ["message_end"], "206s (B05, json, deadline)");
 	const released = releasedDeltas(out.events);
 	assert.equal(released.length, 1, "one release");
-	assert.equal(released[0].assistantMessageEvent.delta, lines.slice(0, 4).join(""), "at the deadline (not before), the body so far, masked whole");
+	// 206t (expectation: more masking): a body cut at the deadline goes out as the placeholder, never as the mask of the
+	// text so far.
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "at the deadline (not before), the placeholder");
 });
 
 // 206s (B06): after the watchdog's flush no event is taken: a late end event releases nothing again.
@@ -1847,7 +1862,9 @@ test("json 206s (B06): a late text_end during the watchdog exit's drain gives no
 	const events = parseLines(chunks.join(""));
 	const released = releasedDeltas(events);
 	assert.equal(released.length, 1, "exactly one nonempty delta: the late text_end releases nothing again");
-	assert.equal(released[0].assistantMessageEvent.delta, "ordinary progress.", "the body, once");
+	// 206t (expectation: more masking): the watchdog's flush cut the block before its end, so it goes out as the
+	// placeholder, not as the mask of the text so far.
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder, once");
 });
 
 // 206s (B07): an own "__proto__" key and its data survive the masker, as JSON.stringify writes them.
@@ -1886,3 +1903,618 @@ test("json 206s (B08): a String or Number object under a secret name is masked a
 	assert.equal(typeof end?.result?.details?.password, "string", "written as a string, as JSON.stringify writes it");
 	assert.deepEqual(end.result.details, JSON.parse(JSON.stringify(vinciMaskJson(plain))), "masked as the values are masked under their names");
 });
+
+// ---------------------------------------------------------------------------------------------------
+// 206t: review findings D01..D05 through runPrintMode. Inputs are the review probes', byte for byte. Each row asserts
+// the run completed, and fails on the code before 206t by an assertion (a cut token byte on stdout, retained bytes over
+// the bound, a lost update, an output that differs from JSON.stringify's), never by a crash.
+// ---------------------------------------------------------------------------------------------------
+
+const {
+	assertNoPrefixBytes,
+	boundedInputs,
+	checkpointUpdate,
+	crossRealmBoxed,
+	angleCrossCheckInputs,
+	cutHoldCrossCheckInputs,
+	earlyCutCases,
+	multiByteStartEvents,
+	overriddenBoxed,
+	probeSecret,
+	probeCallEvents,
+	probeTextMessage,
+	probeTextUpdate,
+	retainedStringBytes,
+	tokenPrefixCase,
+	tokenPrefixUpdate,
+	toolEnd,
+} = await import("./lib/stream-masking-fixtures.mjs");
+const vm = await import("node:vm");
+
+/** 206t (D01): the cut token alone is not masked, and the whole token masks to its 4-character head (positive control). */
+function tokenControl(where) {
+	const { prefix, full, tail } = tokenPrefixCase();
+	assert.equal(vinciMaskSecrets(prefix), prefix, `${where}: fixture sanity: the cut token alone is not masked`);
+	const masked = vinciMaskSecrets(full);
+	assert.ok(masked.startsWith(prefix.slice(0, 4)) && masked.includes(PLACEHOLDER), `${where}: positive control: the whole token masks to its head`);
+	assertNoPrefixBytes(masked, tail, `${where}: positive control`);
+	return { prefix, full, tail };
+}
+
+/** 206t: the written updates of `toolCallId` that carry anything (content or details), not the held empty shape. */
+const keptReleases = (events, toolCallId) =>
+	events.filter(
+		(event) =>
+			event?.type === "tool_execution_update" &&
+			event.toolCallId === toolCallId &&
+			(JSON.stringify(event.partialResult?.content ?? []) !== "[]" || JSON.stringify(event.partialResult?.details ?? {}) !== "{}"),
+	);
+
+const otherToolUpdate = () => ({ type: "tool_execution_update", toolCallId: "other", partialResult: { content: [] } });
+
+// 206t (D01): a body cut before its natural end (a bound, the deadline, the end of the run, an error-only end) goes out as
+// the placeholder, never as the mask of its prefix.
+test("json 206t (D01): a token cut below its minimum length at a text block's byte bound goes out as the placeholder: no byte past its head reaches stdout", async () => {
+	const set = holdLimitsSetter();
+	const { prefix, full, tail } = tokenControl("206t (D01, json, text cap)");
+	const { events } = streamEvents([prefix, full.slice(prefix.length)], { eol: "" });
+	set({ maxBytes: 16 });
+	let out;
+	try {
+		out = await runJson(events);
+	} finally {
+		set();
+	}
+	assertNoPrefixBytes(out.stdout, tail, "206t (D01, json, text cap): whole stdout");
+	assertCompleted(out, ["message_end"], "206t (D01, json, text cap)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "at the bound, the placeholder");
+	const end = out.events.find((event) => event?.type === "message_end");
+	assert.equal(fieldOf(end.message), vinciMaskSecrets(full), "positive control: message_end carries the whole token, masked to its head");
+});
+
+test("json 206t (D01): a token cut below its minimum length at a text block's deadline (a fake clock) goes out as the placeholder: no byte past its head reaches stdout", async () => {
+	const set = holdLimitsSetter();
+	const { prefix, full, tail } = tokenControl("206t (D01, json, text deadline)");
+	const cut = probeTextMessage(prefix);
+	const whole = probeTextMessage(full);
+	let now = 0;
+	set({ deadlineMs: 100, now: () => now });
+	let out;
+	try {
+		out = await runJson([{ type: "message_start", message: probeTextMessage("") }, probeTextUpdate(cut, prefix)], {
+			during: async ({ listener }) => {
+				now = 101;
+				listener(probeTextUpdate(cut, ""));
+				listener(probeTextUpdate(whole, full.slice(prefix.length)));
+				listener({ type: "message_update", message: whole, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: full, partial: whole } });
+				listener({ type: "message_end", message: whole });
+			},
+		});
+	} finally {
+		set();
+	}
+	assertNoPrefixBytes(out.stdout, tail, "206t (D01, json, text deadline): whole stdout");
+	assertCompleted(out, ["message_end"], "206t (D01, json, text deadline)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "at the deadline, the placeholder");
+	const end = out.events.find((event) => event?.type === "message_end");
+	assert.equal(fieldOf(end.message), vinciMaskSecrets(full), "positive control: message_end carries the whole token, masked to its head");
+});
+
+test("json 206t (D01): a token cut below its minimum length when the run ends before its block ends goes out as the placeholder: no byte past its head reaches stdout", async () => {
+	const { prefix, tail } = tokenControl("206t (D01, json, text end of run)");
+	const cut = probeTextMessage(prefix);
+	const out = await runJson([{ type: "message_start", message: probeTextMessage("") }, probeTextUpdate(cut, prefix)]);
+	assertNoPrefixBytes(out.stdout, tail, "206t (D01, json, text end of run): whole stdout");
+	assert.equal(out.exitCode, 0, "206t (D01, json, text end of run): the run exits 0");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release, at the end of the run");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder: the block was cut before its end");
+});
+
+/** 206t (D01): a probe message that ended with `stopReason`. */
+const endedWith = (text, stopReason) => ({ ...probeTextMessage(text), stopReason });
+
+/**
+ * 206t (D01): `text` streamed as one text block with no text_end, then a cut: a source `error` event (`withError`) and
+ * message_end, or message_end alone, of a message that ended with `stopReason`; then agent_end carrying it.
+ */
+function earlyEndEvents(text, stopReason, withError) {
+	const ended = endedWith(text, stopReason);
+	const events = [{ type: "message_start", message: probeTextMessage("") }, probeTextUpdate(probeTextMessage(text), text)];
+	if (withError) events.push({ type: "message_update", message: ended, assistantMessageEvent: { type: "error", reason: "error", error: ended } });
+	events.push({ type: "message_end", message: ended }, { type: "agent_end", messages: [ended] });
+	return events;
+}
+
+/** 206t (D01): the block's text in each final event written: the `error` event's message, message_end, agent_end. */
+const finalTexts = (events) =>
+	events.flatMap((event) => {
+		if (event?.assistantMessageEvent?.type === "error") return [["error", fieldOf(event.assistantMessageEvent.error)]];
+		if (event?.type === "message_end") return [["message_end", fieldOf(event.message)]];
+		if (event?.type === "agent_end") return (event.messages ?? []).map((message) => ["agent_end", fieldOf(message)]);
+		return [];
+	});
+
+const EARLY_ENDINGS = [
+	["at a source error event", "error", true],
+	["at message_end with stopReason aborted and no text_end", "aborted", false],
+	["at message_end with stopReason length and no text_end", "length", false],
+];
+
+// 206t (D01): a block cut by an error, an abort or the length limit keeps its complete lines (those the hold-back
+// releases, masked as one body) and ends with the placeholder for the unfinished part; no byte of the cut token, an
+// open key block, an open ${ or an open angle value reaches stdout, whole.
+for (const [ending, stopReason, withError] of EARLY_ENDINGS) {
+	for (const { label, text, head, startsWith, forbidden } of earlyCutCases()) {
+		test(`json 206t (D01): ${label}, ${ending}: the complete lines go out masked, then the placeholder; no byte past the token's head reaches stdout`, async () => {
+			const where = `206t (D01, json, ${label}, ${ending})`;
+			const { tail } = tokenControl(where);
+			const out = await runJson(earlyEndEvents(text, stopReason, withError));
+			assertCompleted(out, ["message_end", "agent_end"], where);
+			assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+			for (const part of forbidden) assert.ok(!out.stdout.includes(part), `${where}: ${JSON.stringify(part.slice(0, 12))} reached stdout`);
+			const released = releasedDeltas(out.events);
+			assert.equal(released.length, 1, `${where}: one release`);
+			const delta = released[0].assistantMessageEvent.delta;
+			if (head !== undefined) assert.equal(delta, `${vinciMaskSecrets(head)}${PLACEHOLDER}`, `${where}: the complete lines, masked, then the placeholder`);
+			else {
+				assert.ok(delta.startsWith(startsWith), `${where}: the complete lines before the open value are kept`);
+				assert.ok(delta.endsWith(PLACEHOLDER), `${where}: then the placeholder`);
+			}
+		});
+	}
+}
+
+for (const [ending, stopReason, withError] of EARLY_ENDINGS) {
+	test(`json 206t (D01): a block cut ${ending}: every final event shows the block exactly as its streamed deltas wrote it`, async () => {
+		const where = `206t (D01, json, final equals streamed, ${ending})`;
+		const { tail } = tokenControl(where);
+		const { text } = earlyCutCases()[1];
+		const out = await runJson(earlyEndEvents(text, stopReason, withError));
+		assertCompleted(out, ["message_end", "agent_end"], where);
+		assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+		const streamed = deltasOf(out.events);
+		assert.ok(streamed.includes("Here it is:") && streamed.endsWith(PLACEHOLDER), `${where}: fixture sanity: complete lines, then the placeholder`);
+		const finals = finalTexts(out.events);
+		assert.equal(finals.length, withError ? 3 : 2, `${where}: the final events are written`);
+		for (const [type, shown] of finals) assert.equal(shown, streamed, `${where}: ${type} shows the block as the stream wrote it`);
+	});
+}
+
+test("json 206t (D01): multi-line control: a full token on an earlier complete line is masked to its head and its lines stay; the cut last line is the placeholder", async () => {
+	const where = "206t (D01, json, multi-line control)";
+	const { full, tail } = tokenControl(where);
+	const out = await runJson(earlyEndEvents(earlyCutCases()[1].text, "aborted", false));
+	assertCompleted(out, ["message_end"], where);
+	assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+	const streamed = deltasOf(out.events);
+	assert.ok(streamed.startsWith("Here it is:\nThe old token was "), `${where}: the complete lines stay`);
+	assert.ok(streamed.includes(`${vinciMaskSecrets(full)}.\n`), `${where}: the full token is masked to its head`);
+	assert.ok(streamed.endsWith(`.\n${PLACEHOLDER}`), `${where}: the cut last line is the placeholder`);
+});
+
+test("json 206t (D01): positive control: a message that ended normally (done, stopReason stop, no text_end) releases the whole token masked to its head, not the placeholder", async () => {
+	const where = "206t (D01, json, done stop)";
+	const { full, tail } = tokenControl(where);
+	const whole = endedWith(full, "stop");
+	const out = await runJson([
+		{ type: "message_start", message: probeTextMessage("") },
+		probeTextUpdate(whole, full),
+		{ type: "message_update", message: whole, assistantMessageEvent: { type: "done", reason: "stop", message: whole } },
+		{ type: "message_end", message: whole },
+	]);
+	assertCompleted(out, ["message_end"], where);
+	assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, vinciMaskSecrets(full), "masked whole, not the placeholder");
+	assert.notEqual(released[0].assistantMessageEvent.delta, PLACEHOLDER, "not the placeholder");
+});
+
+test("json 206t (D01): a block of an early-ended message that never streamed a delta goes out in the cut form: no byte past the token's head reaches stdout", async () => {
+	const where = "206t (D01, json, never streamed)";
+	const { prefix, tail } = tokenControl(where);
+	const ended = endedWith(prefix, "aborted");
+	const out = await runJson([
+		{ type: "message_start", message: probeTextMessage("") },
+		{ type: "message_end", message: ended },
+		{ type: "agent_end", messages: [ended] },
+	]);
+	assertCompleted(out, ["message_end", "agent_end"], where);
+	assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+	assert.equal(deltasOf(out.events), PLACEHOLDER, `${where}: one delta, the placeholder`);
+	for (const [type, shown] of finalTexts(out.events)) assert.equal(shown, PLACEHOLDER, `${where}: ${type} shows the block as the stream wrote it`);
+});
+
+// 206t (D01): the open-angle rule of a cut block is the mask's own (an angle value after `:` / `=` is joined up to the
+// next `>`, across lines), widened to any name. Cross-check: on every input the mask joins, the rule finds the open
+// value; with a secret name the two agree exactly; without one the rule may only be wider (fail closed).
+test("json 206t (D01): the open-angle rule of a cut block agrees with the mask: every value the mask joins across lines is found open", () => {
+	const { vinciOpenAngleLine } = streamMaskModule;
+	if (typeof vinciOpenAngleLine !== "function") assert.fail("206t (D01): vinci-stream-mask.ts exports vinciOpenAngleLine (the open-angle rule of a cut block)");
+	const secret = probeSecret();
+	const wider = [];
+	for (const { text, keyed } of angleCrossCheckInputs()) {
+		const joins = !vinciMaskSecrets(`${text}${secret}>\n`).includes(secret);
+		const open = vinciOpenAngleLine(text) >= 0;
+		if (joins) assert.ok(open, `${JSON.stringify(text)}: the mask joins the next lines, so the value is open`);
+		if (keyed) assert.equal(open, joins, `${JSON.stringify(text)}: with a secret name the rule and the mask agree`);
+		else if (open && !joins) wider.push(text);
+	}
+	assert.ok(wider.length > 0, "fixture sanity: an input without a secret name shows the rule's fail-closed widening");
+	assert.ok(angleCrossCheckInputs().some(({ keyed, text }) => keyed && vinciOpenAngleLine(text) < 0), "fixture sanity: a closed keyed value");
+});
+
+// 206t (D01): every construct of the mask that lets later text change how earlier complete lines are masked is held at
+// a cut. Cross-check against the mask itself: on each input the mask is run on the opened and the closed text, and
+// whether the later text changed the earlier masked lines is observed, not assumed; the lines the hold releases
+// (vinciCutHeadEnd), masked, must be how the closed text masks them (trailing white space aside: an END marker joins
+// its run to the line before it), and a control the mask does not change is released whole.
+for (const construct of [...new Set(cutHoldCrossCheckInputs().map((input) => input.construct))]) {
+	test(`json 206t (D01): the cut hold agrees with the mask for ${construct}: the lines it releases are masked as the closed text masks them`, () => {
+		const headEnd = streamMaskModule.vinciCutHeadEnd;
+		if (typeof headEnd !== "function") assert.fail("206t (D01): vinci-stream-mask.ts exports vinciCutHeadEnd (where the released part of a cut block ends)");
+		const inputs = cutHoldCrossCheckInputs().filter((input) => input.construct === construct);
+		for (const { opened, closed, changes, release, held } of inputs) {
+			const where = `${construct}: ${JSON.stringify(opened.slice(-40))}`;
+			const maskedClosed = vinciMaskSecrets(closed);
+			const changed = !maskedClosed.startsWith(vinciMaskSecrets(opened).trimEnd());
+			assert.equal(changed, changes, `${where}: fixture sanity: the mask ${changes ? "changes" : "does not change"} the earlier lines once the later text arrives`);
+			const end = headEnd(opened);
+			assert.ok(Number.isInteger(end) && end >= 0 && end <= opened.length, `${where}: the released end is an offset into the text`);
+			const released = opened.slice(0, end);
+			assert.ok(maskedClosed.startsWith(vinciMaskSecrets(released).trimEnd()), `${where}: the released lines are masked as the closed text masks them`);
+			if (release) assert.equal(released, opened, `${where}: control: a text the mask does not change is released whole`);
+			if (held !== undefined) assert.ok(end <= held, `${where}: the construct's lines are held`);
+		}
+		assert.ok(inputs.some((input) => input.changes) || inputs.some((input) => input.held !== undefined), "fixture sanity: the construct is exercised");
+	});
+}
+
+/**
+ * 206t (D01): a thinking block still open (no thinking_end) while a later text block streams (no text_end), then the
+ * message ends early. Each block ends in the cut token.
+ */
+function thinkingThenTextEvents(stopReason, withError) {
+	const { prefix } = tokenPrefixCase();
+	const thinking = `Let me check.\n${prefix}`;
+	const text = `The answer follows.\n${prefix}`;
+	const message = (thinkingText, textText, reason = "stop") => ({
+		role: "assistant",
+		content: [
+			{ type: "thinking", thinking: thinkingText },
+			{ type: "text", text: textText },
+		],
+		stopReason: reason,
+	});
+	const ended = message(thinking, text, stopReason);
+	const afterThinking = message(thinking, "");
+	const afterText = message(thinking, text);
+	const events = [
+		{ type: "message_start", message: message("", "") },
+		{ type: "message_update", message: afterThinking, assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: thinking, partial: afterThinking } },
+		{ type: "message_update", message: afterText, assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: text, partial: afterText } },
+	];
+	if (withError) events.push({ type: "message_update", message: ended, assistantMessageEvent: { type: "error", reason: "error", error: ended } });
+	events.push({ type: "message_end", message: ended }, { type: "agent_end", messages: [ended] });
+	return { events, ended };
+}
+
+for (const [ending, stopReason, withError] of EARLY_ENDINGS) {
+	test(`json 206t (D01): a thinking block still open while a later text block streams, cut ${ending}: it goes out in the cut form, and every final event shows it so; no byte past the token's head reaches stdout`, async () => {
+		const where = `206t (D01, json, open thinking before text, ${ending})`;
+		const { tail } = tokenControl(where);
+		const { events } = thinkingThenTextEvents(stopReason, withError);
+		const out = await runJson(events);
+		assertCompleted(out, ["message_end", "agent_end"], where);
+		assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+		const thinking = deltasOf(out.events, "thinking");
+		assert.equal(thinking, `${vinciMaskSecrets("Let me check.\n")}${PLACEHOLDER}`, `${where}: the thinking block's complete lines, masked, then the placeholder`);
+		assert.equal(deltasOf(out.events), `${vinciMaskSecrets("The answer follows.\n")}${PLACEHOLDER}`, `${where}: the text block too`);
+		const finals = out.events.flatMap((event) => {
+			if (event?.assistantMessageEvent?.type === "error") return [event.assistantMessageEvent.error];
+			if (event?.type === "message_end") return [event.message];
+			if (event?.type === "agent_end") return event.messages ?? [];
+			return [];
+		});
+		assert.equal(finals.length, withError ? 3 : 2, `${where}: the final events are written`);
+		for (const message of finals) assert.equal(fieldOf(message, "thinking"), thinking, `${where}: a final event shows the thinking block as the stream wrote it`);
+	});
+}
+
+for (const [label, ending, limits] of [
+	["at the byte bound", "end", { maxBytes: 16 }],
+	["at the end of the run (no tool end)", "none", undefined],
+	["before an error-only tool end", "error", undefined],
+]) {
+	test(`json 206t (D01): a tool's progress that is a token cut below its minimum length, ${label}, goes out as the placeholder: no byte past its head reaches stdout`, async () => {
+		const set = holdLimitsSetter();
+		const where = `206t (D01, json, progress ${label})`;
+		const { full, tail } = tokenControl(where);
+		const events = [tokenPrefixUpdate()];
+		if (ending === "end") events.push(toolEnd("token-prefix", full));
+		if (ending === "error") events.push(toolEnd("token-prefix", "operation aborted.", { isError: true }));
+		if (limits) set(limits);
+		let out;
+		try {
+			out = await runJson(events);
+		} finally {
+			set();
+		}
+		assertNoPrefixBytes(out.stdout, tail, `${where}: whole stdout`);
+		assertCompleted(out, ending === "none" ? [] : ["tool_execution_end"], where);
+		const released = releasedUpdates(out.events);
+		assert.equal(released.length, 1, "the kept progress is written once");
+		assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+		if (ending === "end") {
+			const end = out.events.find((event) => event?.type === "tool_execution_end");
+			assert.equal(end.result.content[0].text, vinciMaskSecrets(full), "positive control: the tool end carries the whole token, masked to its head");
+		}
+	});
+}
+
+// 206t (D02): the byte bound counts what is kept for a held body (its UTF-8 bytes, details and control bytes included), and
+// after the bound nothing raw of it is kept. The kept bytes are measured on the masker itself.
+for (const [label, key] of [
+	["ordinary text with large details", "largeDetails"],
+	["details only", "detailsOnly"],
+]) {
+	test(`json 206t (D02): a tool's progress past the byte bound by its details (${label}) goes out at once as the placeholder, and is not kept`, async () => {
+		const set = holdLimitsSetter();
+		const inputs = boundedInputs();
+		const update = inputs[key];
+		set({ maxBytes: 1024 });
+		let out;
+		let retained;
+		try {
+			out = await runJson([update]);
+			const stream = new VinciStreamMask();
+			stream.process(update);
+			retained = retainedStringBytes(stream);
+		} finally {
+			set();
+		}
+		assert.ok(!out.stdout.includes(inputs.payload.slice(0, 64)), `206t (D02, json, ${label}): the details past the bound never reach stdout`);
+		assert.ok(retained <= 1024, `the masker keeps at most the bound (${retained} bytes kept)`);
+		assert.equal(out.exitCode, 0, `206t (D02, json, ${label}): the run exits 0`);
+		const lines = out.events.filter((event) => event?.type === "tool_execution_update");
+		const released = keptReleases(out.events, update.toolCallId);
+		assert.equal(released.length, 1, "one release");
+		assert.equal(lines.indexOf(released[0]), 0, "at once: the update itself");
+		assert.equal(released[0].partialResult.content[0]?.text, PLACEHOLDER, "as the placeholder");
+		assert.deepEqual(released[0].partialResult.details, {}, "its details are not written");
+	});
+}
+
+test("json 206t (D02): a tool's progress past the byte bound by control bytes the normaliser removes goes out at once as the placeholder, and is not kept", async () => {
+	const set = holdLimitsSetter();
+	const { controls } = boundedInputs();
+	set({ maxBytes: 1024 });
+	let out;
+	let retained;
+	try {
+		out = await runJson([controls]);
+		const stream = new VinciStreamMask();
+		stream.process(controls);
+		retained = retainedStringBytes(stream);
+	} finally {
+		set();
+	}
+	assert.ok(retained <= 1024, `206t (D02, json, controls): the masker keeps at most the bound (${retained} bytes kept)`);
+	assert.equal(out.exitCode, 0, "206t (D02, json, controls): the run exits 0");
+	const lines = out.events.filter((event) => event?.type === "tool_execution_update");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(lines.indexOf(released[0]), 0, "at once: the update itself");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+});
+
+test("json 206t (D02): a text block past the byte bound in UTF-8 bytes but not in UTF-16 units, with no delta of its own, goes out at once as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const { body, events } = multiByteStartEvents();
+	assert.ok(body.length <= 1024 && Buffer.byteLength(body, "utf8") > 1024, "fixture sanity: under the bound in UTF-16 units, past it in UTF-8 bytes");
+	set({ maxBytes: 1024 });
+	let out;
+	let retained;
+	try {
+		out = await runJson(events);
+		const stream = new VinciStreamMask();
+		for (const event of events.slice(0, 2)) stream.process(event);
+		retained = retainedStringBytes(stream);
+	} finally {
+		set();
+	}
+	assert.ok(retained <= 1024, `206t (D02, json, multi-byte): the masker keeps at most the bound (${retained} bytes kept)`);
+	assertCompleted(out, ["message_end"], "206t (D02, json, multi-byte)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "as the placeholder");
+	const textEnd = out.events.findIndex((event) => event?.assistantMessageEvent?.type === "text_end");
+	assert.ok(out.events.indexOf(released[0]) < textEnd, "at the bound, before the block's end");
+});
+
+test("json 206t (D02): a call's cumulative argument text past the byte bound is not kept after the bound (no raw cumulative message)", async () => {
+	const set = holdLimitsSetter();
+	const { callDeltas } = boundedInputs();
+	const events = probeCallEvents(callDeltas);
+	set({ maxBytes: 1024 });
+	let out;
+	let retained;
+	try {
+		out = await runJson(events);
+		const stream = new VinciStreamMask();
+		for (const event of events) stream.process(event);
+		retained = retainedStringBytes(stream);
+	} finally {
+		set();
+	}
+	assert.ok(retained <= 1024, `206t (D02, json, cumulative arguments): the masker keeps at most the bound (${retained} bytes kept)`);
+	assert.ok(!out.stdout.includes("x".repeat(64)), "the held argument text never reaches stdout");
+	assert.equal(out.exitCode, 0, "206t (D02, json, cumulative arguments): the run exits 0");
+	const released = releasedDeltas(out.events, "toolcall");
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "at the bound, the placeholder");
+});
+
+// 206t (D03): no timer. The deadline of every held body is checked on every event, of any type; a silent stream holds
+// until the next event or the end.
+test("json 206t (D03): a text block's deadline (a fake clock) is checked on an unrelated event: the block goes out at that event, as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const text = probeTextMessage("ordinary.");
+	let now = 0;
+	set({ deadlineMs: 100, now: () => now });
+	let out;
+	try {
+		out = await runJson([{ type: "message_start", message: text }, probeTextUpdate(text, "ordinary.")], {
+			during: async ({ listener }) => {
+				now = 101;
+				listener(otherToolUpdate());
+				listener({ type: "message_update", message: text, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ordinary.", partial: text } });
+				listener({ type: "message_end", message: text });
+			},
+		});
+	} finally {
+		set();
+	}
+	assertCompleted(out, ["message_end"], "206t (D03, json, unrelated event)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	const other = out.events.findIndex((event) => event?.type === "tool_execution_update");
+	assert.ok(other > 0 && out.events.indexOf(released[0]) < other, "released at the unrelated event, before it is written");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "as the placeholder");
+});
+
+test("json 206t (D03): in a tool-update-only stream a kept partial result's deadline is checked on another tool's update; it goes out then, as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const { tail } = tokenControl("206t (D03, json, tool updates only)");
+	let now = 0;
+	set({ deadlineMs: 100, now: () => now });
+	let out;
+	try {
+		out = await runJson([tokenPrefixUpdate()], {
+			during: async ({ listener }) => {
+				now = 101;
+				listener(otherToolUpdate());
+			},
+		});
+	} finally {
+		set();
+	}
+	assertNoPrefixBytes(out.stdout, tail, "206t (D03, json, tool updates only): whole stdout");
+	assert.equal(out.exitCode, 0, "206t (D03, json, tool updates only): the run exits 0");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "the kept progress is written once");
+	assert.equal(released[0].toolCallId, "token-prefix", "for its tool call");
+	const other = out.events.findIndex((event) => event?.toolCallId === "other");
+	assert.ok(other > 0 && out.events.indexOf(released[0]) < other, "at the other tool's update, before it is written");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+});
+
+test("json 206t (D03): a text block held past its deadline with no later event releases nothing while the stream is silent, then goes out at the end as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const { prefix, tail } = tokenControl("206t (D03, json, silent)");
+	const cut = probeTextMessage(prefix);
+	let now = 0;
+	set({ deadlineMs: 100, now: () => now });
+	let out;
+	let silent;
+	try {
+		out = await runJson([{ type: "message_start", message: probeTextMessage("") }, probeTextUpdate(cut, prefix)], {
+			during: async ({ stdout }) => {
+				now = 10_000;
+				await waitForRawStdoutBackpressure();
+				silent = stdout();
+			},
+		});
+	} finally {
+		set();
+	}
+	assertNoPrefixBytes(out.stdout, tail, "206t (D03, json, silent): whole stdout");
+	assert.equal(out.exitCode, 0, "206t (D03, json, silent): the run exits 0");
+	assert.equal(deltasOf(parseLines(silent)), "", "nothing is released while the stream is silent");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release, at the end");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "as the placeholder");
+});
+
+// 206t (D04): an end supersedes a kept partial result only when it carries all of it (text, details and other fields,
+// normalised and masked); otherwise the kept update goes out once, before the end, as the placeholder.
+for (const [label, end] of [
+	["an error-only tool end", () => toolEnd("details-only", "operation aborted.", { isError: true, details: {}, toolName: "bash" })],
+	["a tool end without its details", () => toolEnd("details-only", "done.", { details: {}, toolName: "bash" })],
+	["the end of the run (no tool end)", undefined],
+]) {
+	test(`json 206t (D04): a details-only checkpoint, then ${label}: the kept update goes out once, before it, as the placeholder`, async () => {
+		const where = `206t (D04, json, details-only, ${label})`;
+		const out = await runJson([checkpointUpdate(), ...(end ? [end()] : [])]);
+		assertCompleted(out, end ? ["tool_execution_end"] : [], where);
+		const released = keptReleases(out.events, "details-only");
+		assert.equal(released.length, 1, `${where}: the kept update is written once, not lost`);
+		if (end) {
+			const endAt = out.events.findIndex((event) => event?.type === "tool_execution_end");
+			assert.ok(out.events.indexOf(released[0]) < endAt, "before the tool end");
+		}
+		assert.equal(released[0].partialResult.content[0]?.text, PLACEHOLDER, "as the placeholder: a kept partial result is never released raw");
+		assert.deepEqual(released[0].partialResult.details, {}, "its details are not written");
+	});
+}
+
+test("json 206t (D04): progress whose text the end repeats but whose details differ goes out once, before the end, as the placeholder; with equal details it does not", async () => {
+	const update = (details) => ({
+		type: "tool_execution_update",
+		toolCallId: "stage",
+		toolName: "bash",
+		partialResult: { content: [{ type: "text", text: "step one." }], details },
+	});
+	const end = toolEnd("stage", "step one.", { details: { stage: "second" }, toolName: "bash" });
+	const out = await runJson([update({ stage: "first" }), end]);
+	assertCompleted(out, ["tool_execution_end"], "206t (D04, json, equal text)");
+	const released = keptReleases(out.events, "stage");
+	assert.equal(released.length, 1, "the kept update is written once, not lost");
+	const endAt = out.events.findIndex((event) => event?.type === "tool_execution_end");
+	assert.ok(out.events.indexOf(released[0]) < endAt, "before the tool end");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder");
+	const same = await runJson([update({ stage: "second" }), end]);
+	assertCompleted(same, ["tool_execution_end"], "206t (D04, json, equal payload)");
+	assert.equal(keptReleases(same.events, "stage").length, 0, "positive control: an end that carries all of it supersedes it");
+});
+
+// 206t (D05): boxed values are recognised by their internal brand (any realm) and read with the prototype's own valueOf,
+// as JSON.stringify reads them.
+test("json 206t (D05): String, Number and Boolean objects made in another realm are written as JSON.stringify writes them", async () => {
+	const events = detailsEvents(crossRealmBoxed(vm));
+	assert.ok(JSON.stringify(events[1]).includes('"message":"ordinary boxed message","count":7,"flag":true'), "fixture sanity: JSON.stringify writes the values");
+	const out = await runJson(events);
+	const line = lineOf(out.stdout, (event) => event?.type === "tool_execution_end");
+	assert.equal(line, JSON.stringify(events[1]), "206t (D05, json, another realm): the tool_execution_end line is JSON.stringify's");
+	assertCompleted(out, ["tool_execution_end", "message_end"], "206t (D05, json, another realm)");
+});
+
+for (const throwing of [false, true]) {
+	const label = throwing ? "throwing" : "overridden";
+	test(`json 206t (D05): boxed values with ${label} own methods that JSON.stringify does not call are written as JSON.stringify writes them`, async () => {
+		const events = detailsEvents(overriddenBoxed({ throwing }));
+		const native = JSON.stringify(events[1]);
+		assert.ok(native.includes('"flag":true') && native.includes('"message":"ordinary boxed message"'), "fixture sanity: JSON.stringify reads the own values");
+		let thrown;
+		const out = await runJson([], {
+			during: async ({ listener }) => {
+				for (const event of events) {
+					try {
+						listener(event);
+					} catch (error) {
+						thrown = error;
+					}
+				}
+			},
+		});
+		assert.equal(thrown, undefined, `206t (D05, json, ${label}): the writer takes every event (no own method is called)`);
+		const line = lineOf(out.stdout, (event) => event?.type === "tool_execution_end");
+		assert.equal(line, native, "the tool_execution_end line is JSON.stringify's");
+		assertCompleted(out, ["tool_execution_end", "message_end"], `206t (D05, json, ${label})`);
+	});
+}
