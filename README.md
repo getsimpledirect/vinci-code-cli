@@ -44,7 +44,7 @@ exact upstream commit this forked from, is in [`UPSTREAM.md`](UPSTREAM.md).
 </div>
 
 That is one unedited turn on a **user's own key** — the header reads `Anthropic: Claude Haiku 4.5`
-and `/login to connect`, because no Vinci account is involved. The capture shows its final report of what was verified, what was not, and the recorded cost.
+and `/login to connect`, because no Vinci account is involved. The capture ends with its final report of what was verified and what was not.
 
 ## How it fits together
 
@@ -219,8 +219,7 @@ The Vinci layer adds more on top of these — `/review`, `/checkpoint`, `/plan`,
 
 The final receipt distinguishes `DONE`, `DONE-UNVERIFIED`, `WAITING` and `BLOCKED`.
 Read the verification and stopping reason before treating a task as complete. The usage
-meter is a local estimate; missing usage or pricing is unknown, and the account/provider
-billing surface remains authoritative.
+meter is a local estimate, and the account/provider billing surface remains authoritative.
 
 - `/agents` opens helper status and reviewed changes; `/task-info` gives the task ID.
 - Press Escape to abort active work. Reopen a saved task with `vinci resume <task-id>`.
@@ -237,8 +236,8 @@ reduced-motion presentation options are documented in
 ### Local Work task client
 
 `vinci runtime --help` lists an optional local Work client. It requires an explicitly
-configured, owned mode-0600 `VINCI_RUNTIME_CONFIG` profile with a numeric loopback origin
-and a separately authorized Work credential. It does not reuse an inference login.
+configured, owned, private (no group or world access) `VINCI_RUNTIME_CONFIG` profile with a
+numeric loopback origin and exactly one Work cookie or token. It reads only its own profile.
 
 The client can create an admitted saved task, inspect state/events, answer a current
 question, approve or correct an exact action, read receipts/artifacts and request
@@ -252,7 +251,7 @@ this interface. See [configuration and limits](vinci/docs/environment.md#local-w
 | Variable | Effect |
 |---|---|
 | `VINCI_SHOW_OTHER_PROVIDERS` | Other providers are off by default. `1` enables them, `0` hides them; either overrides the saved `/other` preference. |
-| `VINCI_ENV` | `prod` (default) or `dev`. Dev isolates credentials/sessions and disables auto-update; inspect the effective environment with `vinci doctor`. See [the development reference](vinci/docs/environment.md). |
+| `VINCI_ENV` | `prod` (default) or `dev`. Dev defaults to an isolated credential/session directory and disables auto-update unless those are set explicitly; any other value exits with an error; inspect the effective environment with `vinci doctor`. See [the development reference](vinci/docs/environment.md). |
 | `VINCI_RUNTIME_CONFIG` | Explicit private profile for the optional local Work task client; unrelated to provider authentication. |
 | `VINCI_PROVIDER` | `vinci` (default) or `openrouter` |
 | `VINCI_MODEL` | With `VINCI_PROVIDER=vinci`: `auto` (default), `mezzo`, `forte`, or `fortissimo` (alias of Forte). `auto` resolves server-side to your account's class. With `openrouter`: a full `vendor/model` id. |
@@ -279,8 +278,8 @@ Build with `bash vinci/build.sh` after the source installation above; it uses th
 model catalogs. Run `npm run check` for the repository checks and
 `VINCI_SKIP_SMOKE=1 bash vinci/test/run.sh` for the offline Vinci harness. The full
 harness can make live gateway calls when authenticated, so choose that lane explicitly.
-Use [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) for focused package
-tests and dependency-install rules.
+Use [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) for contribution and
+dependency-install rules.
 
 ## Releases
 
@@ -297,8 +296,8 @@ Release preparation and activation are separate runs:
 2. A separate manual `activate` run needs the exact candidate/artifact and QA-receipt
    identities plus a fresh protected approval. It validates the retained signed bytes,
    policy/expiry and unchanged live baseline, then conditionally updates the manifest.
-   It does not rebuild or re-sign. Public installer and release-note publication follows
-   verification of the activated manifest.
+   It does not rebuild or re-sign. Public GitHub Release assets and release notes are
+   published after the activated manifest's live bytes are verified.
 
 A successful candidate run does not establish that a version is available to users.
 Clients verify the signed manifest and archive hash. See
