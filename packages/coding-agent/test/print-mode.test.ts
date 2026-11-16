@@ -120,26 +120,57 @@ describe("runPrintMode", () => {
 			expect(exitCode).toBe(1);
 			expect(errors.mock.calls).toEqual([[truncationWarning]]);
 			const output = writes.join("");
-			expect(output).toContain("Partial answer");
 			expect(output).not.toContain(secret);
 			expect(output).toContain("redacted");
 			if (mode === "text") {
+				expect(output).toContain("Partial answer");
 				expect(output.trim().split("\n")).toHaveLength(1);
 			} else {
+				// 206t (expectation: more masking): a message cut at its length limit keeps only its complete lines,
+				// masked, then the placeholder. This one-line answer has no complete line, so it is the placeholder
+				// alone, released once as a synthesized text_delta before message_end.
 				const events = output
 					.trim()
 					.split("\n")
 					.map((line) => JSON.parse(line));
-				expect(events).toHaveLength(1);
-				expect(events[0]).toEqual({
-					type: "message_end",
-					message: { ...message, content: [{ type: "text", text: expect.stringContaining("redacted") }] },
+				expect(events).toHaveLength(2);
+				expect(events[0]).toMatchObject({
+					type: "message_update",
+					assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "‹redacted›" },
 				});
-				// The normal path must produce the same event envelope and fields.
+				expect(events[1]).toEqual({
+					type: "message_end",
+					message: { ...message, content: [{ type: "text", text: "‹redacted›" }] },
+				});
+				// The normal path keeps the answer, masked, in one message_end with the same envelope.
 				writes.length = 0;
 				message.stopReason = "stop";
 				expect(await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(0);
-				expect(JSON.parse(writes.join("")).message).toEqual({ ...events[0].message, stopReason: "stop" });
+				const stopEvents = writes
+					.join("")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				expect(stopEvents).toHaveLength(1);
+				expect(stopEvents[0].type).toBe("message_end");
+				const stopText = stopEvents[0].message.content[0].text;
+				expect(stopText).toContain("Partial answer");
+				expect(stopText).toContain("redacted");
+				expect(stopText).not.toContain(secret);
+				const envelope = (m: {
+					api: unknown;
+					provider: unknown;
+					model: unknown;
+					usage: unknown;
+					role: unknown;
+				}) => ({
+					api: m.api,
+					provider: m.provider,
+					model: m.model,
+					usage: m.usage,
+					role: m.role,
+				});
+				expect(envelope(stopEvents[0].message)).toEqual(envelope(events[1].message));
 				expect(errors.mock.calls).toEqual([[truncationWarning]]);
 			}
 		});
