@@ -251,7 +251,6 @@ this interface. See [configuration and limits](vinci/docs/environment.md#local-w
 | Variable | Effect |
 |---|---|
 | `VINCI_SHOW_OTHER_PROVIDERS` | Other providers are off by default. `1` enables them, `0` hides them; either overrides the saved `/other` preference. |
-| `VINCI_ENV` | `prod` (default) or `dev`. Dev defaults to an isolated credential/session directory and disables auto-update unless those are set explicitly; any other value exits with an error; inspect the effective environment with `vinci doctor`. See [the development reference](vinci/docs/environment.md). |
 | `VINCI_RUNTIME_CONFIG` | Explicit private profile for the optional local Work task client; unrelated to provider authentication. |
 | `VINCI_PROVIDER` | `vinci` (default) or `openrouter` |
 | `VINCI_MODEL` | With `VINCI_PROVIDER=vinci`: `auto` (default), `mezzo`, `forte`, or `fortissimo` (alias of Forte). `auto` resolves server-side to your account's class. With `openrouter`: a full `vendor/model` id. |
