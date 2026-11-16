@@ -452,7 +452,7 @@ encoded line could claim (`vinciCutHeadEnd`), then the placeholder (the unfinish
 an open `${`, an open angle value, an open assignment value, such trailing lines). A block cut before its end any other way (`agent_end`, a new
 assistant message, a rebind or an exit path) goes out once as the placeholder, never as the mask of its text so
 far. The final events (`error`, `message_end`, `turn_end`, `agent_end`) show a cut block exactly as the stream
-wrote it. RPC transcript responses (`get_messages`, `get_entries`, `get_tree`) show a cut block the same way, and `get_last_assistant_text` reads it the same way. The session file and the interactive view are unchanged. Tool output is held the same way: a
+wrote it. RPC transcript responses (`get_messages`, `get_entries`, `get_tree`) and `get_last_assistant_text` compute their view from the message alone: in a message that ended aborted, with an error or at its length limit, every text or thinking block from the earlier of its last text block and its last thinking block on is shown in the cut form (complete lines masked, then the placeholder), even when the stream carried it whole; in any other message each block's whole masked text. The cut form is written by the json and RPC writers only; the session keeps the message as received. Tool output is held the same way: a
 `tool_execution_update` carries an empty partial result, and the output, joined as the view joins it
 and masked, goes out at `tool_execution_end`. The latest partial result of each tool call is kept and
 written once more, as one `tool_execution_update` before the tool's end when the end result does not
