@@ -1,5 +1,7 @@
 # Termux (Android) Setup
 
+This page documents the retained Pi harness setup on Android. The npm command below installs upstream Pi; see [Vinci Code installation](../../../README.md#installation) for Vinci.
+
 Pi runs on Android via [Termux](https://termux.dev/), a terminal emulator and Linux environment for Android.
 
 ## Prerequisites

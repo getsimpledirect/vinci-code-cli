@@ -1,5 +1,7 @@
 # Windows Setup
 
+This page documents the retained Pi harness setup on Windows. Vinci Code lists macOS and Linux in its [system requirements](../../../README.md#system-requirements).
+
 Pi requires a bash shell on Windows. Checked locations (in order):
 
 1. Custom path from `~/.pi/agent/settings.json`
