@@ -55,6 +55,7 @@ tui.addInputListener((data) => {
     tui.stop();
     process.exit(0);
   }
+  return undefined;
 });
 
 // Start

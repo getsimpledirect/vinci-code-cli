@@ -105,7 +105,7 @@ async execute(toolCallId, params, signal, onUpdate, ctx) {
   await ctx.ui.custom<void>((_tui, _theme, _keybindings, done) =>
     new MyDialog({ onClose: () => done(undefined) })
   );
-  return { content: [{ type: "text", text: "Dialog closed" }] };
+  return { content: [{ type: "text", text: "Dialog closed" }], details: {} };
 }
 ```
 
