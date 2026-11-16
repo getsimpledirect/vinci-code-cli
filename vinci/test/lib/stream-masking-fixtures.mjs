@@ -775,7 +775,8 @@ export function probeTextUpdate(message, delta) {
 
 /**
  * 206t (D02): the UTF-8 bytes of every string value a masker instance still holds (Maps, Sets, arrays and objects
- * walked; keys, weak references and functions not counted): what it retains of the bodies it held.
+ * walked; weak references and functions not counted): what it retains of the bodies it held.
+ * 206u (E02): include keys, container overhead, binary storage and scalar values too.
  */
 export function retainedStringBytes(root) {
 	const seen = new Set();
@@ -784,17 +785,24 @@ export function retainedStringBytes(root) {
 	while (stack.length > 0) {
 		const value = stack.pop();
 		if (typeof value === "string") {
-			total += Buffer.byteLength(value, "utf8");
+			total += 2 + Buffer.byteLength(value, "utf8");
 			continue;
 		}
+		if (typeof value === "number" || typeof value === "bigint") total += 8;
+		else if (value === null || typeof value === "boolean") total += 5;
 		if (!value || typeof value !== "object" || seen.has(value)) continue;
 		seen.add(value);
-		if (value instanceof Map) {
+		if (value instanceof WeakSet || value instanceof WeakMap || value instanceof WeakRef) continue;
+		total += 2;
+		if (ArrayBuffer.isView(value)) total += value.byteLength;
+		else if (value instanceof Map) {
 			for (const [key, entry] of value) stack.push(key, entry);
 		} else if (value instanceof Set) {
 			for (const entry of value) stack.push(entry);
-		} else if (!(value instanceof WeakSet || value instanceof WeakMap || value instanceof WeakRef)) {
-			for (const key of Object.keys(value)) stack.push(value[key]);
+		} else if (Array.isArray(value)) {
+			for (const entry of value) stack.push(entry);
+		} else {
+			for (const key of Object.keys(value)) stack.push(key, value[key]);
 		}
 	}
 	return total;
@@ -1032,5 +1040,119 @@ export function angleCrossCheckInputs() {
 		{ text: "a < b\n", keyed: false },
 		{ text: "see <link>\n", keyed: false },
 		{ text: "plain text\n", keyed: false },
+		// 206u (E01): compare the unbounded opener with the actual whole-body mask.
+		...[255, 256, 300, 5000].map((count) => ({ text: `password=${" ".repeat(count)}<\n`, keyed: true })),
+		{ text: `password:${" \n\t".repeat(100)}<\n`, keyed: true },
+		{ text: " \n\t<\n", keyed: false },
 	];
+}
+
+/** 206u (E01): complete angle values with an unfinished closing line. */
+export function angleWhitespaceCases() {
+	const secret = ["qV7zL9mK", "2wR8pT4x", "N6bH3dF5!"].join("");
+	return [
+		...[0, 255, 256, 300, 5000].map((count) => ({ label: `${count} spaces`, whitespace: " ".repeat(count) })),
+		{ label: "mixed spaces and line breaks", whitespace: " \n\t".repeat(100) },
+	].map((entry) => ({ ...entry, secret }));
+}
+
+/** 206u (E01): one block, optionally streamed, followed by source and session final events. */
+export function angleEndingEvents(text, kind, streamed, stopReason) {
+	const final = assistant([block(kind, text)], stopReason);
+	const events = [{ type: "message_start", message: assistant([]) }];
+	if (streamed) {
+		const partial = assistant([block(kind, text)]);
+		events.push({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: `${kind}_delta`, contentIndex: 0, delta: text, partial },
+		});
+	}
+	const source =
+		stopReason === "error"
+			? { type: "error", reason: "error", error: final }
+			: { type: "done", reason: stopReason, message: final };
+	events.push(
+		{ type: "message_update", message: final, assistantMessageEvent: source },
+		{ type: "message_end", message: final },
+		{ type: "turn_end", message: final, toolResults: [] },
+		{ type: "agent_end", messages: [final] },
+	);
+	return { events, final };
+}
+
+/** 206u (E01, E03): every five-character window past the normal mask head is absent. */
+export function assertNoFiveCharacterSecret(text, hidden, where) {
+	assert.equal(typeof text, "string", `${where}: stdout is present`);
+	for (let at = 0; at + 5 <= hidden.length; at++) {
+		const window = hidden.slice(at, at + 5);
+		assert.ok(!text.includes(window), `${where}: hidden bytes ${JSON.stringify(window)} reached stdout`);
+	}
+}
+
+/** 206u (E02): each body has its own budget, independent of earlier shown bodies and neighboring metadata. */
+export function isolatedBodyCases() {
+	const { secret } = angleWhitespaceCases()[0];
+	const answer = `Answer: password=${secret}\nDone.`;
+	const cap = 1024;
+	const cases = [
+		{
+			label: "a thinking bound leaves the following text answer intact",
+			blocks: [
+				{ kind: "thinking", text: "ordinary reasoning; ".repeat(80), cut: true },
+				{ kind: "text", text: answer },
+			],
+		},
+		{
+			label: "an oversized signature cuts only the middle of three blocks",
+			blocks: [
+				{ kind: "text", text: "Before the signed block." },
+				{
+					kind: "thinking",
+					text: "ordinary reasoning.",
+					thinkingSignature: "ordinary opaque data; ".repeat(100),
+					cut: true,
+				},
+				{ kind: "text", text: answer },
+			],
+		},
+		{
+			label: "completed text above the cap is not metered against the following held block",
+			blocks: [
+				{ kind: "text", text: "Completed prose. ".repeat(100), endOnly: true },
+				{ kind: "text", text: answer },
+			],
+		},
+	];
+	return cases.map(({ label, blocks }) => {
+		const events = [{ type: "message_start", message: assistant([]) }];
+		const content = [];
+		const push = (type, index, extra = {}) => {
+			const message = assistant(content.map((part) => ({ ...part })));
+			events.push({
+				type: "message_update",
+				message,
+				assistantMessageEvent: { type, contentIndex: index, partial: message, ...extra },
+			});
+		};
+		for (const [index, spec] of blocks.entries()) {
+			content.push(block(spec.kind, ""));
+			push(`${spec.kind}_start`, index);
+			content[index][spec.kind] = spec.text;
+			if (spec.thinkingSignature) content[index].thinkingSignature = spec.thinkingSignature;
+			if (!spec.endOnly) push(`${spec.kind}_delta`, index, { delta: spec.text });
+			if (!spec.cut) push(`${spec.kind}_end`, index, { content: spec.text });
+		}
+		const final = assistant(content.map((part) => ({ ...part })));
+		events.push(
+			{
+				type: "message_update",
+				message: final,
+				assistantMessageEvent: { type: "done", reason: "stop", message: final },
+			},
+			{ type: "message_end", message: final },
+			{ type: "agent_end", messages: [final] },
+		);
+		return { label, blocks, cap, events, final, secret };
+	});
 }

@@ -7,9 +7,12 @@ import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+	angleEndingEvents,
+	angleWhitespaceCases,
 	ansiSecretCases,
 	assertMasked,
 	assertNeverRewritten,
+	assertNoFiveCharacterSecret,
 	assertNoRawSecret,
 	assertNoSecretBytes,
 	assistant,
@@ -24,6 +27,7 @@ import {
 	fragmentsOf,
 	heldWindows,
 	inlineToken,
+	isolatedBodyCases,
 	keyMarkers,
 	multiLineArguments,
 	multiLineToolCalls,
@@ -2517,4 +2521,238 @@ for (const throwing of [false, true]) {
 		assert.equal(line, native, "the tool_execution_end line is JSON.stringify's");
 		assertCompleted(out, ["tool_execution_end", "message_end"], `206t (D05, json, ${label})`);
 	});
+}
+
+for (const { label, whitespace, secret } of angleWhitespaceCases()) {
+	for (const separator of [":", "="]) {
+		for (const kind of ["text", "thinking"]) {
+			for (const streamed of [false, true]) {
+				for (const stopReason of ["error", "aborted", "length"]) {
+					const name = `json 206u (E01): ${label}, ${separator}, ${kind}, streamed=${streamed}, ${stopReason}`;
+					test(name, async () => {
+						const body = `password${separator}${whitespace}<\n${secret}\n>`;
+						const whole = vinciMaskSecrets(body);
+						assertNoSecretBytes(whole, [secret.slice(2)], `${name}: whole-body control`);
+						assert.ok(whole.includes(`${secret.slice(0, 2)}…${PLACEHOLDER}`), `${name}: normal mask head`);
+						const built = angleEndingEvents(body, kind, streamed, stopReason);
+						const out = await runJson(built.events);
+						assertCompleted(out, ["message_end", "turn_end", "agent_end"], name);
+						assertNoSecretBytes(out.stdout, [secret.slice(2)], name);
+						assertNoFiveCharacterSecret(out.stdout, secret.slice(2), name);
+						assert.equal(deltasOf(out.events, kind), PLACEHOLDER, `${name}: the angle value stays held`);
+						const source = out.events.find(
+							(event) => event.assistantMessageEvent?.type === (stopReason === "error" ? "error" : "done"),
+						);
+						assert.ok(source, `${name}: source end is written`);
+						for (const event of finalEventsOf(out.events)) {
+							const message = event.type === "agent_end" ? event.messages[0] : event.message;
+							assert.equal(fieldOf(message, kind), PLACEHOLDER, `${name}: ${event.type}`);
+						}
+						const natural = await runJson(angleEndingEvents(body, kind, streamed, "stop").events);
+						assertCompleted(natural, ["message_end", "agent_end"], `${name}: natural end`);
+						assertNoFiveCharacterSecret(natural.stdout, secret.slice(2), `${name}: natural end`);
+						const naturalEnd = natural.events.find((event) => event.type === "message_end");
+						assert.equal(fieldOf(naturalEnd.message, kind), whole);
+						// Check the opener independently: the start of the line holding the `:` or `=`.
+						// The assignment guard also holds this value.
+						assert.equal(
+							streamMaskModule.vinciOpenAngleLine(body, body.length - 1),
+							body.lastIndexOf("\n", body.indexOf(separator)) + 1,
+						);
+					});
+				}
+			}
+		}
+	}
+}
+
+test("json 206u (E01): whitespace-only prefix holds the angle opener", async () => {
+	const { secret } = angleWhitespaceCases()[0];
+	const body = `${" \n\t".repeat(1700)}<\n${secret}\n>`;
+	const out = await runJson(angleEndingEvents(body, "text", true, "error").events);
+	assertCompleted(out, ["message_end", "agent_end"], "206u (E01): whitespace-only prefix");
+	assertNoFiveCharacterSecret(out.stdout, secret, "206u (E01): whitespace-only prefix");
+	assert.equal(deltasOf(out.events), PLACEHOLDER);
+});
+
+test("json 206u (E01): second guard alone holds an unclosed angle beyond the old window", async () => {
+	const { secret } = angleWhitespaceCases()[0];
+	const body = `password=${" ".repeat(5000)}<\n${secret}\n`;
+	const out = await runJson(angleEndingEvents(body, "text", true, "error").events);
+	assertCompleted(out, ["message_end", "agent_end"], "206u (E01): second guard alone");
+	assertNoFiveCharacterSecret(out.stdout, secret.slice(2), "206u (E01): second guard alone");
+	assert.equal(deltasOf(out.events), PLACEHOLDER);
+});
+
+test("json 206u (E01): seeded cut stdout agrees with whole-body hidden runs", async () => {
+	const seed = 0x206e01;
+	const cases = 2000;
+	let state = seed;
+	const random = () => {
+		state = (state + 0x6d2b79f5) | 0;
+		let value = Math.imul(state ^ (state >>> 15), state | 1);
+		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+		return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+	};
+	const started = performance.now();
+	let exercised = 0;
+	try {
+		for (let index = 0; index < cases; index++) {
+			const secret = `qV${index.toString(36).padStart(4, "0")}${"L9mK2wR8pT4xN6bH3dF5"}!`;
+			const count = index === 0 ? 300 : Math.floor(random() * 5001);
+			const whitespace = index % 3 === 0 ? " ".repeat(count) : " \n\t".repeat(Math.ceil(count / 3)).slice(0, count);
+			const { begin, end } = keyMarkers();
+			const fragments = [
+				`password=${whitespace}<\n${secret}\n>`,
+				`password=${whitespace}${secret}\nDone.`,
+				`${begin}\n${secret}\n${end}`,
+				`password=${whitespace}${"$"}{VALUE:-\n${secret}\n}`,
+			];
+			const full =
+				index === 0
+					? fragments[0]
+					: Array.from(
+							{ length: 1 + Math.floor(random() * 4) },
+							() => fragments[Math.floor(random() * fragments.length)],
+						).join("\n");
+			const cut = index === 0 ? full.length : Math.floor(random() * (full.length + 1));
+			const stopReason = ["error", "aborted", "length"][Math.floor(random() * 3)];
+			const masked = vinciMaskSecrets(full);
+			const hidden = [];
+			// Ask the actual mask which values it replaces, then compare each value with its actual rendering.
+			const traced = vinciMaskSecrets(full, {
+				render(value, kind) {
+					const shown =
+						kind === "private-key"
+							? vinciMaskSecrets(value)
+							: vinciMaskSecrets(value, { propertyName: "password" });
+					let left = 0;
+					while (left < value.length && value[left] === shown[left]) left++;
+					let right = 0;
+					while (
+						right < value.length - left &&
+						value[value.length - 1 - right] === shown[shown.length - 1 - right]
+					) right++;
+					const at = value.indexOf(secret);
+					if (at >= 0) {
+						hidden.push(secret.slice(Math.max(0, left - at), Math.min(secret.length, value.length - right - at)));
+					}
+					return shown;
+				},
+			});
+			const inputs = JSON.stringify({ seed, index, full, cut, stopReason });
+			assert.equal(traced, masked, `206u (E01): oracle rendering agrees: ${inputs}`);
+			const built = angleEndingEvents(full.slice(0, cut), index % 2 ? "thinking" : "text", true, stopReason);
+			const out = await runJson(built.events);
+			assertCompleted(out, ["message_end", "agent_end"], inputs);
+			for (const run of hidden) {
+				assertNoFiveCharacterSecret(masked, run, `206u (E01): whole-body control: ${inputs}`);
+				assertNoFiveCharacterSecret(out.stdout, run, `206u (E01): cut stdout: ${inputs}`);
+				if (run.length >= 5) exercised++;
+			}
+		}
+		assert.ok(exercised > 0, "206u (E01): the oracle exercises hidden runs");
+	} finally {
+		console.log(`206u (E01): seed=${seed} cases=${cases} runtimeMs=${(performance.now() - started).toFixed(1)}`);
+	}
+});
+
+for (const { label, blocks, cap, events, secret } of isolatedBodyCases()) {
+	const name = `json 206u (E02): ${label}`;
+	test(name, async () => {
+		const set = holdLimitsSetter();
+		let out;
+		let snapshot;
+		set({ maxBytes: cap });
+		try {
+			const stream = new VinciStreamMask();
+			for (const event of events) {
+				if (event.type === "message_end") break;
+				stream.process(event);
+			}
+			snapshot = stream.snapshot;
+			out = await runJson(events);
+		} finally {
+			set();
+		}
+		assertCompleted(out, ["message_end", "agent_end"], name);
+		assertNoFiveCharacterSecret(out.stdout, secret.slice(2), name);
+		const sourceEnd = out.events.find((event) => event.assistantMessageEvent?.type === "done");
+		assert.ok(sourceEnd, `${name}: source done is written`);
+		const end = out.events.find((event) => event.type === "message_end");
+		assert.equal(end.message.stopReason, "stop", `${name}: normal message end`);
+		for (const [index, spec] of blocks.entries()) {
+			const expected = spec.cut ? PLACEHOLDER : vinciMaskSecrets(spec.text);
+			assert.equal(deltasOf(out.events, spec.kind, index), expected, `${name}: block ${index} release`);
+			assert.equal(end.message.content[index][spec.kind], expected, `${name}: block ${index} at message_end`);
+			if (spec.thinkingSignature) {
+				assert.equal(end.message.content[index].thinkingSignature, spec.thinkingSignature);
+				assert.equal(snapshot?.content?.[index]?.thinkingSignature, undefined, `${name}: no retained signature`);
+			}
+			if (!spec.cut) {
+				assert.notEqual(expected, PLACEHOLDER, `${name}: the normal body is preserved`);
+				if (spec.endOnly) assert.ok(Buffer.byteLength(expected, "utf8") > cap, `${name}: shown text exceeds cap`);
+				const at = out.events.findIndex(
+					(event) =>
+						event.assistantMessageEvent?.type === `${spec.kind}_end` &&
+						event.assistantMessageEvent.contentIndex === index,
+				);
+				assert.ok(at >= 0, `${name}: block ${index} end is written`);
+				assert.equal(deltasOf(out.events.slice(0, at), spec.kind, index), expected);
+			}
+		}
+	});
+}
+
+for (const kind of ["text", "thinking"]) {
+	for (const afterBound of [false, true]) {
+		for (const field of ["signature", "unknown string", "unknown containers"]) {
+			const name = `json 206u (E02): ${kind}, ${field}, afterBound=${afterBound}: retained snapshot stays within cap`;
+			test(name, async () => {
+				const set = holdLimitsSetter();
+				const cap = 1024;
+				const signatureName = kind === "text" ? "textSignature" : "thinkingSignature";
+				const payload = "ordinary opaque data; ".repeat(220);
+				const signature = field === "signature" ? payload : "ordinary signature";
+				const signed = assistant([{ ...block(kind, "ordinary."), [signatureName]: signature }]);
+				if (field === "unknown string") signed.extra = payload;
+				if (field === "unknown containers") signed.extra = { [payload]: [new Uint8Array(4096), 17, false] };
+				const empty = { ...signed, content: [{ ...signed.content[0], [kind]: "" }] };
+				const messages = [...(afterBound ? [assistant([block(kind, "x".repeat(2048))])] : []), empty, signed];
+				const events = messages.map((message) => ({
+					type: "message_update",
+					message,
+					assistantMessageEvent: { type: `${kind}_delta`, contentIndex: 0, delta: "", partial: message },
+				}));
+				const final = { ...signed, stopReason: "stop" };
+				set({ maxBytes: cap });
+				let out;
+				let retained;
+				try {
+					const stream = new VinciStreamMask();
+					for (const event of events) stream.process(event);
+					retained = retainedStringBytes(stream);
+					out = await runJson([
+						...events,
+						{
+							type: "message_update",
+							message: final,
+							assistantMessageEvent: { type: "done", reason: "stop", message: final },
+						},
+						{ type: "message_end", message: final },
+						{ type: "agent_end", messages: [final] },
+					]);
+				} finally {
+					set();
+				}
+				assert.ok(retained <= cap, `206u (E02): ${retained} retained bytes exceed ${cap}`);
+				assertCompleted(out, ["message_end", "agent_end"], "206u (E02)");
+				assert.equal(deltasOf(out.events, kind), PLACEHOLDER, "206u (E02): metadata also triggers the bound");
+				const end = out.events.find((event) => event.type === "message_end");
+				assert.equal(end.message.content[0][signatureName], signature);
+				const source = out.events.find((event) => event.assistantMessageEvent?.type === "done");
+				assert.equal(source?.assistantMessageEvent.message.content[0][signatureName], signature);
+			});
+		}
+	}
 }

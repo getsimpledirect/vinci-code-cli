@@ -445,9 +445,11 @@ stripped with `vinciStripControlText` in `utils/ansi.ts`, the same function the 
 uses, carriage returns removed) and masked, before the end event. With masking on, a block cut by an error,
 an abort or the length limit keeps its complete lines (masked) and ends with a placeholder for the unfinished
 part: the lines the existing hold-back (`HoldScanner`) releases as complete, masked as one body, up to the line
-where an open angle value starts (`vinciOpenAngleLine`, the mask's own rule widened to any name) or an assignment value later
+where an open angle value starts (`vinciOpenAngleLine`, the mask's own rule widened to any name, with an uncapped
+backward whitespace walk across line breaks and a whitespace-only prefix held too) or an assignment value later
 text could extend starts (`vinciOpenValueLine`: an environment lookup not yet closed, or a value a chained call
-could follow; the mask's own patterns, without its exceptions), and back over trailing lines a later END marker or
+could follow, or a `<` value with no closing `>` in the head; the mask's own patterns, without its exceptions),
+and back over trailing lines a later END marker or
 encoded line could claim (`vinciCutHeadEnd`), then the placeholder (the unfinished last line, an open key block,
 an open `${`, an open angle value, an open assignment value, such trailing lines). A block cut before its end any other way (`agent_end`, a new
 assistant message, a rebind or an exit path) goes out once as the placeholder, never as the mask of its text so
@@ -466,7 +468,13 @@ retained for the body (a block's text, a call's argument text, a partial result'
 details and control bytes); the deadline has no timer: it is checked on every event; a silent stream holds
 until the next event or the end. At either bound the body is written at once as the placeholder, never a
 prefix (a call is then shown as interrupted), and nothing more of it is held or written while it streams; no
-raw body is kept after the bound (only the placeholder and ids). Masking consistency for streamed tool arguments: the
+raw body is kept after the bound (only the placeholder and ids). Retained streaming snapshots use an allowlist of
+routing, usage and error fields and shown block bodies. Each held block counts its own text, signatures and unknown
+fields; a call counts its argument text and its own unknown fields. Message-level unknown fields count toward each
+held block and call. Released bodies are not metered again, and a body's bound cuts only that body. Signatures and
+unknown fields are excluded from retained snapshots; a bounded body's entry keeps its placeholder and routing
+fields. Final provider events and session entries supply signatures from their own messages, through the
+output mask. Masking consistency for streamed tool arguments: the
 argument text of every tool call is held for the whole call. A built-in call's (the tools whose
 arguments the view masks) end releases one delta, the masked JSON of the parsed arguments, and any
 other end releases the masked JSON of the text when it parses, else only the placeholder; a call of any

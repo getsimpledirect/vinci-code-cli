@@ -889,6 +889,10 @@ A held body (a text or thinking block, a tool call's argument text, a tool's par
 }
 ```
 
+An open angle value after `:` or `=` stays held at a cut across spaces and line breaks, including whitespace runs longer than 256 characters. An angle opener preceded only by whitespace is also held. The assignment guard separately holds a `<` value whose closing `>` is outside the released head.
+
+The retained streaming snapshot uses an allowlist of message routing, usage and error fields and shown block bodies. Each held text or thinking block counts its own text, signature fields and unknown fields toward its byte bound; a call counts its argument text and its own unknown fields. Message-level unknown fields count toward every held block and call. Released bodies are not counted again. Crossing a body's bound cuts only that body; neighboring blocks and calls keep their own budgets. Signatures and unknown fields are excluded from retained snapshots, and a bounded body's entry keeps its placeholder and routing fields. Provider final events and session entries supply their own signatures, which still pass through the output mask.
+
 The `assistantMessageEvent` field contains one of these delta types:
 
 | Type | Description |

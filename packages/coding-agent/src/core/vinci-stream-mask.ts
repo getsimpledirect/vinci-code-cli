@@ -41,9 +41,12 @@
  *
  * Bounds: a held body (a text or thinking block, a tool call's argument text, a tool's partial result) is
  * held for at most VINCI_STREAM_HOLD_MAX_BYTES bytes (1 MiB) and VINCI_STREAM_HOLD_DEADLINE_MS (10 minutes)
- * from its first held byte. The bytes are the UTF-8 bytes kept for it: a block's text, a call's argument text, a
- * partial result's whole event (details, other strings and control bytes included). The deadline is checked on
- * every event; a silent stream holds until the next event or the end. At either bound the body goes out at once
+ * from its first held byte. Each block counts its own text, signatures and unknown fields; each call counts its
+ * argument text and unknown fields. Message-level unknown fields count toward every held block and call. Shown
+ * bodies no longer count, and one body's bound never cuts another. A partial result counts its whole event.
+ * Retained snapshots allow only routing and writer fields, with each bounded body shown as its placeholder.
+ * The deadline is checked on every event; a silent stream holds until the next event or the end. At either bound
+ * the body goes out at once
  * as the placeholder (a call is then shown as interrupted in its final events), never as the mask of its text so
  * far; nothing more of it is kept or released while it streams, and only the placeholder and its ids are kept.
  *
@@ -149,6 +152,12 @@ interface TextMeter {
 	tail: string;
 }
 
+/** A metadata string measured only when it changes, kept only while its body's total stays within the bound. */
+interface MetadataFieldMeter {
+	value: string;
+	bytes: number;
+}
+
 /**
  * The UTF-8 bytes of `text`, a block's text as it now stands. A text that extends the one last measured (its last
  * characters are where they were) adds the bytes of what was appended; any other text is measured whole.
@@ -195,6 +204,103 @@ function heldBytes(value: unknown, limit: number): number {
 	return total;
 }
 
+/** Metadata storage and traversal, conservatively charged per visited value and stopped at the remaining budget. */
+function metadataValueBytes(value: unknown, limit: number): number {
+	let total = 0;
+	const seen = new Set<object>();
+	const stack: Iterator<unknown>[] = [[value][Symbol.iterator]()];
+	try {
+		while (stack.length > 0 && total <= limit) {
+			const next = stack[stack.length - 1].next();
+			if (next.done) {
+				stack.pop();
+				continue;
+			}
+			const item = next.value;
+			// Bound traversal too, including repeated references and values JSON would omit.
+			total++;
+			if (typeof item === "string") {
+				// A string is never fewer UTF-8 bytes than UTF-16 units: one longer than what is left is past the limit.
+				total += 2 + (item.length > limit - total ? item.length : utf8Bytes(item));
+			} else if (typeof item === "number" || typeof item === "bigint") total += 8;
+			else if (item === null || typeof item === "boolean") total += 5;
+			else if (item !== undefined && typeof item === "object" && !seen.has(item)) {
+				seen.add(item);
+				total += 2;
+				if (ArrayBuffer.isView(item)) total += item.byteLength;
+				else if (types.isMap(item)) stack.push(item.entries());
+				else if (types.isSet(item) || Array.isArray(item)) stack.push(item.values());
+				else {
+					stack.push(
+						(function* () {
+							for (const key in item) if (Object.hasOwn(item, key)) yield [key, (item as Json)[key]];
+						})(),
+					);
+				}
+			}
+		}
+	} catch {
+		return limit + 1;
+	}
+	return total;
+}
+
+const MESSAGE_SNAPSHOT_FIELDS = [
+	"api",
+	"provider",
+	"model",
+	"responseModel",
+	"serviceTier",
+	"timestamp",
+	"stopReason",
+	"usage",
+	"errorMessage",
+	"diagnostics",
+];
+const MESSAGE_METER_ALLOWLIST = new Set(["role", "content", "type", "id", "responseId", ...MESSAGE_SNAPSHOT_FIELDS]);
+const TEXT_METER_ALLOWLIST = new Set(["type", "text"]);
+const THINKING_METER_ALLOWLIST = new Set(["type", "thinking"]);
+const CALL_METER_ALLOWLIST = new Set(["type", "id", "name", "arguments", "partialJson", "partialArgs"]);
+
+/**
+ * Only metadata outside the retained allowlist, before masking. Unchanged strings reuse their exact byte count;
+ * mutable containers are read afresh, with traversal capped by the remaining budget. Cached strings count toward
+ * that budget and are cleared at the bound or when their body is released; snapshots never retain these fields.
+ */
+function metadataBytes(value: Json, allowlist: ReadonlySet<string>, meters: Map<string, MetadataFieldMeter>): number {
+	let total = 0;
+	try {
+		for (const key of meters.keys()) if (!Object.hasOwn(value, key)) meters.delete(key);
+		for (const key in value) {
+			if (!Object.hasOwn(value, key) || allowlist.has(key)) continue;
+			total += metadataValueBytes(key, holdLimits.maxBytes - total);
+			if (pastByteBound(total)) break;
+			const field = value[key];
+			if (typeof field === "string") {
+				let meter = meters.get(key);
+				if (!meter || meter.value !== field) {
+					// A string longer in UTF-16 units than the remaining bytes cannot fit; do not retain it.
+					if (field.length > holdLimits.maxBytes - total) {
+						total = holdLimits.maxBytes + 1;
+						break;
+					}
+					meter = { value: field, bytes: utf8Bytes(field) };
+					meters.set(key, meter);
+				}
+				total += 2 + meter.bytes;
+			} else {
+				meters.delete(key);
+				total += metadataValueBytes(field, holdLimits.maxBytes - total);
+			}
+			if (pastByteBound(total)) break;
+		}
+	} catch {
+		total = holdLimits.maxBytes + 1;
+	}
+	if (pastByteBound(total)) meters.clear();
+	return total;
+}
+
 const KEY_BLOCK_MARKER = /-----(BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----/g;
 
 type StreamedKind = "text" | "thinking";
@@ -220,6 +326,7 @@ interface BlockState {
 	/** The UTF-8 bytes of its text as last seen (none of it is kept), and when its first byte was held. */
 	size: number;
 	meter: TextMeter;
+	metadata: Map<string, MetadataFieldMeter>;
 	started?: number;
 	/**
 	 * It went out cut, before its own end (a bound, the deadline, an exit path, an `error` or an early end): the final
@@ -243,6 +350,7 @@ interface ToolCallState {
 	guessed?: boolean;
 	/** UTF-8 bytes of its held text, and when its first byte was held (for the bounds). */
 	bytes: number;
+	metadata: Map<string, MetadataFieldMeter>;
 	started?: number;
 	/** Released at a bound: nothing more of its text is held, and its final events show it as interrupted. */
 	bounded?: boolean;
@@ -563,15 +671,14 @@ function releasesWhole(text: string): boolean {
 	return scanner.released > 0 && scanner.releasedEnd + 1 >= text.length;
 }
 
-/** The text before a value the mask's assignment rule reads: `:` or `=`, then white space (line breaks included). */
-const ANGLE_OPENER = /[:=]\s*$/;
-
 /**
- * Where an angle value the mask would join across lines opens in `text` before `end`: the start of the first line
- * with a `<` that no `>` closes later on that line and that follows `:` or `=` (white space and line breaks between).
+ * Where an angle value the mask would join across lines opens in `text` before `end`. For the first `<` that no `>`
+ * closes later on its line and that follows `:` or `=` (white space and line breaks between), the start of the line
+ * holding that `:` or `=`, so the name is held with its value; 0 when only white space comes before the `<`.
  * This mirrors the mask's own rule (vinci-mask-secrets.ts: replaceAssignments matches a secret name then
  * `["'\`]?\s*[:=]\s*`, and scanAssignmentValue's `<` branch takes the value up to the next `>`, across lines), widened
- * to fail closed: any name before the `:` / `=`, not only a secret one. -1 when no such line opens before `end`.
+ * to fail closed: any name before the `:` / `=`, not only a secret one, and a whitespace-only prefix too.
+ * -1 when no such line opens before `end`.
  */
 export function vinciOpenAngleLine(text: string, end = text.length): number {
 	let start = 0;
@@ -583,7 +690,11 @@ export function vinciOpenAngleLine(text: string, end = text.length): number {
 		const lastClose = line.lastIndexOf(">");
 		for (let at = line.indexOf("<", lastClose + 1); at >= 0; at = line.indexOf("<", at + 1)) {
 			const from = start + at;
-			if (ANGLE_OPENER.test(text.slice(Math.max(0, from - 256), from))) return start;
+			// Candidate `<` characters separate the whitespace runs: each run is walked at most once per scan.
+			let before = from - 1;
+			while (before >= 0 && /\s/.test(text[before])) before--;
+			if (before < 0) return 0;
+			if (text[before] === ":" || text[before] === "=") return text.lastIndexOf("\n", before) + 1;
 		}
 		start = lineEnd + 1;
 	}
@@ -595,7 +706,7 @@ export function vinciOpenAngleLine(text: string, end = text.length): number {
  * `["'\`]?\s*[:=]\s*`), the same pattern: the value it reads starts where a match ends.
  */
 const ASSIGNMENT_MIRROR =
-	/[A-Za-z0-9_.\-]{0,64}(?:api[_-]?key|secret|token|password|passwd|pwd|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credential|session[_-]?secret|encryption[_-]?key|webhook[_-]?secret)[A-Za-z0-9_.\-]{0,64}["'`]?\s*[:=]\s*/gi;
+	/[A-Za-z0-9_.-]{0,64}(?:api[_-]?key|secret|token|password|passwd|pwd|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credential|session[_-]?secret|encryption[_-]?key|webhook[_-]?secret)[A-Za-z0-9_.-]{0,64}["'`]?\s*[:=]\s*/gi;
 
 /** The mask's environment lookups whose value runs to a closing delimiter (scanDelimitedCodeReferenceEnd). */
 const DELIMITED_STARTS = [
@@ -648,8 +759,8 @@ function chainedValueOpen(text: string, from: number, end: number): boolean {
  * the line where the first such secret-name assignment starts (ASSIGNMENT_MIRROR), or -1. Its value is an environment
  * lookup not yet closed, or a value with nothing but white space after it (a chained call could follow). Fail closed:
  * the mask's own exceptions (a value too short, a placeholder, a code reference, its 256-character bound) are not
- * applied. A quoted value ends on its line; a `${` value is held by the hold-back (HoldScanner) and an angle value
- * by vinciOpenAngleLine.
+ * applied. A quoted value ends on its line; a `${` value is held by the hold-back (HoldScanner). An angle value
+ * without its closing `>` is held here as well as by vinciOpenAngleLine.
  */
 function vinciOpenValueLine(text: string, end: number): number {
 	const head = text.slice(0, end);
@@ -657,9 +768,13 @@ function vinciOpenValueLine(text: string, end: number): number {
 		const at = match.index ?? 0;
 		const from = at + match[0].length;
 		const first = head[from];
-		if (first === undefined || first === '"' || first === "'" || first === "`" || first === "<") continue;
+		if (first === undefined || first === '"' || first === "'" || first === "`") continue;
 		if (head.startsWith("${", from)) continue;
 		const lineStart = head.lastIndexOf("\n", at - 1) + 1;
+		if (first === "<") {
+			if (head.indexOf(">", from + 1) < 0) return lineStart;
+			continue;
+		}
 		const lookup = head.slice(from, from + 256);
 		const delimited = DELIMITED_STARTS.map((start) => start.exec(lookup)).find((found) => found !== null);
 		if (delimited) {
@@ -1138,6 +1253,8 @@ export class VinciStreamMask {
 	 * placeholder): what an expiry or an exit path releases from. No raw body of the message is kept.
 	 */
 	private snapshot: Json = undefined;
+	/** Message-level unknown fields count toward each held body, excluding all content and writer fields. */
+	private messageMetadata = new Map<string, MetadataFieldMeter>();
 	/**
 	 * The streaming message as given, while anything else still keeps it: an exit path records its interrupted call
 	 * blocks themselves (a later final event may carry those very blocks). Not kept by this reference.
@@ -1450,6 +1567,7 @@ export class VinciStreamMask {
 		this.blocks.clear();
 		this.tools.clear();
 		this.snapshot = undefined;
+		this.messageMetadata.clear();
 		this.latestRef = undefined;
 		this.fallback = false;
 	}
@@ -1462,7 +1580,7 @@ export class VinciStreamMask {
 		if (block?.type !== "toolCall") return undefined;
 		let state = this.tools.get(index);
 		if (!state) {
-			state = { raw: "", shown: "", released: false, arguments: {}, bytes: 0 };
+			state = { raw: "", shown: "", released: false, arguments: {}, bytes: 0, metadata: new Map() };
 			this.tools.set(index, state);
 		}
 		return state;
@@ -1486,6 +1604,7 @@ export class VinciStreamMask {
 		if (state.released) return "";
 		if (state.guessed) return this.dropGuessed(state);
 		state.released = true;
+		state.metadata.clear();
 		let parsed = ended;
 		if (parsed === undefined && state.raw.trim() !== "") {
 			try {
@@ -1512,6 +1631,7 @@ export class VinciStreamMask {
 
 	private dropGuessed(state: ToolCallState): string {
 		state.released = true;
+		state.metadata.clear();
 		state.shown = "";
 		state.arguments = {};
 		return "";
@@ -1527,6 +1647,7 @@ export class VinciStreamMask {
 		if (state.released) return "";
 		if (state.guessed) return this.dropGuessed(state);
 		state.released = true;
+		state.metadata.clear();
 		state.arguments = ended ?? block.arguments;
 		if (state.raw === "") state.shown = "";
 		else {
@@ -1578,7 +1699,14 @@ export class VinciStreamMask {
 	private stateFor(index: number, kind: StreamedKind): BlockState {
 		let state = this.blocks.get(index);
 		if (!state || state.kind !== kind) {
-			state = { kind, shown: "", done: false, size: 0, meter: { length: 0, bytes: 0, tail: "" } };
+			state = {
+				kind,
+				shown: "",
+				done: false,
+				size: 0,
+				meter: { length: 0, bytes: 0, tail: "" },
+				metadata: new Map(),
+			};
 			this.blocks.set(index, state);
 		}
 		return state;
@@ -1590,6 +1718,7 @@ export class VinciStreamMask {
 		state.done = true;
 		state.shown = this.body(raw);
 		state.meter = { length: 0, bytes: 0, tail: "" };
+		state.metadata.clear();
 		return state.shown;
 	}
 
@@ -1604,6 +1733,7 @@ export class VinciStreamMask {
 		state.cut = true;
 		state.shown = state.size > 0 ? UNPARSED_ARGUMENTS : "";
 		state.meter = { length: 0, bytes: 0, tail: "" };
+		state.metadata.clear();
 		return state.shown;
 	}
 
@@ -1619,6 +1749,7 @@ export class VinciStreamMask {
 		state.cut = true;
 		state.shown = cutForm(raw, this.mask);
 		state.meter = { length: 0, bytes: 0, tail: "" };
+		state.metadata.clear();
 		return state.shown;
 	}
 
@@ -1633,13 +1764,14 @@ export class VinciStreamMask {
 		state.shown = state.guessed || state.raw === "" ? "" : UNPARSED_ARGUMENTS;
 		state.arguments = {};
 		state.raw = "";
+		state.metadata.clear();
 		return state.shown;
 	}
 
-	/** Every held call whose argument text is past the byte bound goes out (boundCall); its delta goes in `added`. */
+	/** Check every call's own argument meter, even when the current message temporarily omits its block. */
 	private releaseBoundedCalls(added: Map<number, string>): void {
 		for (const [index, state] of this.tools) {
-			if (state.bounded || state.released || !pastByteBound(state.bytes)) continue;
+			if (state.released || state.raw === "" || !pastByteBound(state.bytes)) continue;
 			const text = this.boundCall(state);
 			if (text) added.set(index, text);
 		}
@@ -1666,7 +1798,7 @@ export class VinciStreamMask {
 		}
 		if (added.size === 0 && toolAdded.size === 0) return [];
 		const content = message.content.map((block: Json, index: number) => this.shownBlock(block, index));
-		const masked = { ...message, content };
+		const masked = this.snapshotOf(message, content);
 		this.snapshot = masked;
 		return [
 			...[...added].map(([index, text]) => this.delta(masked, index, text)),
@@ -1681,6 +1813,28 @@ export class VinciStreamMask {
 		if (kind && state?.kind === kind) return { ...block, [kind]: state.shown };
 		const tool = block?.type === "toolCall" ? this.tools.get(index) : undefined;
 		return tool ? this.toolBlock(block, tool) : block;
+	}
+
+	/** Retained snapshots have explicit fields; provider signatures stay on transient events and final messages. */
+	private snapshotOf(message: Json, blocks: Json[] = message.content): Json {
+		const content = blocks.map((block: Json) => {
+			const kind = streamedKind(block);
+			if (kind) return { type: block.type, [kind]: block[kind] };
+			if (block?.type !== "toolCall") return { type: block?.type };
+			const call: Json = { type: "toolCall", id: block.id, name: block.name, arguments: block.arguments };
+			for (const field of ["partialJson", "partialArgs"]) {
+				if (typeof block[field] === "string") call[field] = block[field];
+			}
+			return call;
+		});
+		const snapshot: Json = { role: message.role, content };
+		for (const field of ["type", "id", "responseId"]) {
+			if (typeof message[field] === "string") snapshot[field] = message[field];
+		}
+		for (const field of MESSAGE_SNAPSHOT_FIELDS) {
+			if (message[field] !== undefined) snapshot[field] = vinciMaskStreamJson(message[field]);
+		}
+		return snapshot;
 	}
 
 	private update(event: Json): Json[] {
@@ -1731,17 +1885,30 @@ export class VinciStreamMask {
 		const streamEnded = type === "done" || type === "error";
 		const streamCut = type === "error" || (type === "done" && endedEarly(final));
 		const added = new Map<number, string>();
+		const messageBytes = metadataBytes(message, MESSAGE_METER_ALLOWLIST, this.messageMetadata);
 		const content = message.content.map((block: Json, index: number) => {
 			const kind = streamedKind(block);
 			if (!kind) {
 				const tool = block?.type === "toolCall" ? this.tools.get(index) : undefined;
+				if (tool && !tool.released && tool.raw !== "") {
+					const bytes = tool.bytes + metadataBytes(block, CALL_METER_ALLOWLIST, tool.metadata) + messageBytes;
+					if (pastByteBound(bytes)) {
+						const text = this.boundCall(tool);
+						if (text) toolAdded.set(index, text);
+					}
+				}
 				return tool ? this.toolBlock(block, tool) : untrackedCallBlock(block);
 			}
 			const state = this.stateFor(index, kind);
+			let bytes = 0;
 			if (!state.done) {
 				if (state.started === undefined && block[kind] !== "") state.started = now;
 				// The UTF-8 bytes of the text as it now stands, however it grew (a delta, or none of its own).
 				state.size = measuredBytes(state.meter, block[kind]);
+				bytes =
+					state.size +
+					metadataBytes(block, kind === "text" ? TEXT_METER_ALLOWLIST : THINKING_METER_ALLOWLIST, state.metadata) +
+					messageBytes;
 			}
 			// Its own end: from here its final events carry its whole text, masked.
 			if (index === ending) state.cut = false;
@@ -1751,15 +1918,15 @@ export class VinciStreamMask {
 			} else if (streamCut) {
 				const text = this.releaseEarlyBlock(state, block[kind]);
 				if (text) added.set(index, text);
-			} else if (!state.done && pastByteBound(state.size)) {
+			} else if (!state.done && state.size > 0 && pastByteBound(bytes)) {
 				const text = this.releaseCutBlock(state);
 				if (text) added.set(index, text);
 			}
 			return { ...block, [kind]: state.shown };
 		});
 		const masked = { ...message, content };
-		// What an expiry or an exit path releases from: the message as written, with no raw body.
-		this.snapshot = masked;
+		// Expiry and exit paths retain only the allowlisted form, separate from the transient event.
+		this.snapshot = this.snapshotOf(masked);
 		// A stream-ending event's message shows each block that went out cut as it went out (maskFinal, showCut).
 		if (streamEnded) {
 			this.registerCutBlocks(message);

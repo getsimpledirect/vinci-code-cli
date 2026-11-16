@@ -98,7 +98,7 @@ describe("runPrintMode", () => {
 	const truncationWarning = "Warning: the response was cut off at the output limit and is incomplete.";
 
 	for (const mode of ["text", "json"] as const) {
-		it(`${mode}: prints masked partial output and exits 1 for final length`, async () => {
+		it(`${mode} 206u (E03): prints masked partial output and exits 1 for final length`, async () => {
 			vi.stubEnv("VINCI_CODE", "1");
 			const secret = "sk-ant-TESTONLY-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 			const message = createAssistantMessage({ text: `Partial answer AUTH_TOKEN=${secret}`, stopReason: "length" });
@@ -121,6 +121,9 @@ describe("runPrintMode", () => {
 			expect(errors.mock.calls).toEqual([[truncationWarning]]);
 			const output = writes.join("");
 			expect(output).not.toContain(secret);
+			for (let at = 4; at + 5 <= secret.length; at++) {
+				expect(output).not.toContain(secret.slice(at, at + 5));
+			}
 			expect(output).toContain("redacted");
 			if (mode === "text") {
 				expect(output).toContain("Partial answer");
@@ -134,15 +137,22 @@ describe("runPrintMode", () => {
 					.split("\n")
 					.map((line) => JSON.parse(line));
 				expect(events).toHaveLength(2);
-				expect(events[0]).toMatchObject({
+				const cutMessage = { ...message, content: [{ type: "text", text: "‹redacted›" }] };
+				expect(events[0]).toEqual({
 					type: "message_update",
-					assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "‹redacted›" },
+					message: cutMessage,
+					assistantMessageEvent: {
+						type: "text_delta",
+						contentIndex: 0,
+						delta: "‹redacted›",
+						partial: cutMessage,
+					},
 				});
 				expect(events[1]).toEqual({
 					type: "message_end",
 					message: { ...message, content: [{ type: "text", text: "‹redacted›" }] },
 				});
-				// The normal path keeps the answer, masked, in one message_end with the same envelope.
+				// 206u (E03): pin the normal-stop message independently, including its masked body.
 				writes.length = 0;
 				message.stopReason = "stop";
 				expect(await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(0);
@@ -152,25 +162,16 @@ describe("runPrintMode", () => {
 					.split("\n")
 					.map((line) => JSON.parse(line));
 				expect(stopEvents).toHaveLength(1);
-				expect(stopEvents[0].type).toBe("message_end");
-				const stopText = stopEvents[0].message.content[0].text;
-				expect(stopText).toContain("Partial answer");
-				expect(stopText).toContain("redacted");
-				expect(stopText).not.toContain(secret);
-				const envelope = (m: {
-					api: unknown;
-					provider: unknown;
-					model: unknown;
-					usage: unknown;
-					role: unknown;
-				}) => ({
-					api: m.api,
-					provider: m.provider,
-					model: m.model,
-					usage: m.usage,
-					role: m.role,
+				expect(stopEvents[0]).toEqual({
+					type: "message_end",
+					message: {
+						...message,
+						content: [{ type: "text", text: "Partial answer AUTH_TOKEN=sk-a…‹redacted›" }],
+					},
 				});
-				expect(envelope(stopEvents[0].message)).toEqual(envelope(events[1].message));
+				for (let at = 4; at + 5 <= secret.length; at++) {
+					expect(writes.join("")).not.toContain(secret.slice(at, at + 5));
+				}
 				expect(errors.mock.calls).toEqual([[truncationWarning]]);
 			}
 		});

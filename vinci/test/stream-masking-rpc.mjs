@@ -9,8 +9,11 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+	angleEndingEvents,
+	angleWhitespaceCases,
 	ansiSecretCases,
 	assertMasked,
+	assertNoFiveCharacterSecret,
 	assertNoRawSecret,
 	assertNoSecretBytes,
 	assistant,
@@ -25,6 +28,7 @@ import {
 	fragmentsOf,
 	heldWindows,
 	inlineToken,
+	isolatedBodyCases,
 	multiLineArguments,
 	multiLineToolCalls,
 	PLACEHOLDER,
@@ -3041,4 +3045,198 @@ for (const throwing of [false, true]) {
 		assert.equal(`${line}\n`, native, "the tool_execution_end line is JSON.stringify's");
 		assertCompleted(out, ["tool_execution_end", "message_end"], `206t (D05, rpc, ${label})`);
 	});
+}
+
+for (const { label, whitespace, secret } of angleWhitespaceCases()) {
+	for (const separator of [":", "="]) {
+		for (const kind of ["text", "thinking"]) {
+			for (const streamed of [false, true]) {
+				for (const stopReason of ["error", "aborted", "length"]) {
+					const name = `rpc 206u (E01): ${label}, ${separator}, ${kind}, streamed=${streamed}, ${stopReason}`;
+					test(name, async () => {
+						const body = `password${separator}${whitespace}<\n${secret}\n>`;
+						const whole = vinciMaskSecrets(body);
+						assertNoSecretBytes(whole, [secret.slice(2)], `${name}: whole-body control`);
+						assert.ok(whole.includes(`${secret.slice(0, 2)}…${PLACEHOLDER}`), `${name}: normal mask head`);
+						const { events, final } = angleEndingEvents(body, kind, streamed, stopReason);
+						const replies = [];
+						const out = await runRpc(events, {
+							state: lastTextSession(final),
+							during: async ({ send }) => {
+								for (const type of ["get_messages", "get_entries", "get_tree", "get_last_assistant_text"]) {
+									replies.push((await send({ type })).response);
+								}
+							},
+						});
+						assertCompleted(out, ["message_end", "turn_end", "agent_end"], name);
+						assertNoSecretBytes(out.stdout, [secret.slice(2)], name);
+						assertNoFiveCharacterSecret(out.stdout, secret.slice(2), name);
+						assert.equal(deltasOf(out.events, kind), PLACEHOLDER);
+						assert.ok(
+							out.events.some(
+								(event) => event.assistantMessageEvent?.type === (stopReason === "error" ? "error" : "done"),
+							),
+						);
+						for (const event of finalEventsOf(out.events)) {
+							const message = event.type === "agent_end" ? event.messages[0] : event.message;
+							assert.equal(fieldOf(message, kind), PLACEHOLDER, `${name}: ${event.type}`);
+						}
+						assert.equal(replies.length, 4, `${name}: all views answered`);
+						for (const reply of replies) assert.equal(reply.success, true, `${name}: ${reply.command}`);
+						for (const message of [
+							replies[0].data.messages[0],
+							replies[1].data.entries[0].message,
+							replies[2].data.tree[0].entry.message,
+						]) {
+							assert.equal(fieldOf(message, kind), PLACEHOLDER, `${name}: transcript body`);
+						}
+						if (kind === "text") assert.equal(replies[3].data.text, PLACEHOLDER);
+						const natural = await runRpc(angleEndingEvents(body, kind, streamed, "stop").events);
+						assertCompleted(natural, ["message_end", "agent_end"], `${name}: natural end`);
+						assertNoFiveCharacterSecret(natural.stdout, secret.slice(2), `${name}: natural end`);
+						const naturalEnd = natural.events.find((event) => event.type === "message_end");
+						assert.equal(fieldOf(naturalEnd.message, kind), whole);
+						assert.equal(
+							streamMaskModule.vinciOpenAngleLine(body, body.length - 1),
+							body.lastIndexOf("\n", body.indexOf(separator)) + 1,
+						);
+					});
+				}
+			}
+		}
+	}
+}
+
+test("rpc 206u (E01): whitespace-only prefix holds the angle opener", async () => {
+	const { secret } = angleWhitespaceCases()[0];
+	const body = `${" \n\t".repeat(1700)}<\n${secret}\n>`;
+	const out = await runRpc(angleEndingEvents(body, "text", true, "error").events);
+	assertCompleted(out, ["message_end", "agent_end"], "206u (E01): whitespace-only prefix");
+	assertNoFiveCharacterSecret(out.stdout, secret, "206u (E01): whitespace-only prefix");
+	assert.equal(deltasOf(out.events), PLACEHOLDER);
+});
+
+test("rpc 206u (E01): second guard alone holds an unclosed angle beyond the old window", async () => {
+	const { secret } = angleWhitespaceCases()[0];
+	const body = `password=${" ".repeat(5000)}<\n${secret}\n`;
+	const { events, final } = angleEndingEvents(body, "text", true, "error");
+	const out = await runRpc(events, {
+		state: lastTextSession(final),
+		during: async ({ send }) => {
+			for (const type of ["get_messages", "get_entries", "get_tree", "get_last_assistant_text"]) await send({ type });
+		},
+	});
+	assertCompleted(out, ["message_end", "agent_end"], "206u (E01): second guard alone");
+	assertNoFiveCharacterSecret(out.stdout, secret.slice(2), "206u (E01): second guard alone");
+	assert.equal(deltasOf(out.events), PLACEHOLDER);
+});
+
+for (const { label, blocks, cap, events, secret } of isolatedBodyCases()) {
+	const name = `rpc 206u (E02): ${label}`;
+	test(name, async () => {
+		const set = holdLimitsSetter();
+		let out;
+		let snapshot;
+		set({ maxBytes: cap });
+		try {
+			const stream = newStreamMask();
+			for (const event of events) {
+				if (event.type === "message_end") break;
+				stream.process(event);
+			}
+			snapshot = stream.snapshot;
+			out = await runRpc(events);
+		} finally {
+			set();
+		}
+		assertCompleted(out, ["message_end", "agent_end"], name);
+		assertNoFiveCharacterSecret(out.stdout, secret.slice(2), name);
+		const sourceEnd = out.events.find((event) => event.assistantMessageEvent?.type === "done");
+		assert.ok(sourceEnd, `${name}: source done is written`);
+		const end = out.events.find((event) => event.type === "message_end");
+		assert.equal(end.message.stopReason, "stop", `${name}: normal message end`);
+		for (const [index, spec] of blocks.entries()) {
+			const expected = spec.cut ? PLACEHOLDER : vinciMaskSecrets(spec.text);
+			assert.equal(deltasOf(out.events, spec.kind, index), expected, `${name}: block ${index} release`);
+			assert.equal(end.message.content[index][spec.kind], expected, `${name}: block ${index} at message_end`);
+			if (spec.thinkingSignature) {
+				assert.equal(end.message.content[index].thinkingSignature, spec.thinkingSignature);
+				assert.equal(snapshot?.content?.[index]?.thinkingSignature, undefined, `${name}: no retained signature`);
+			}
+			if (!spec.cut) {
+				assert.notEqual(expected, PLACEHOLDER, `${name}: the normal body is preserved`);
+				if (spec.endOnly) assert.ok(Buffer.byteLength(expected, "utf8") > cap, `${name}: shown text exceeds cap`);
+				const at = out.events.findIndex(
+					(event) =>
+						event.assistantMessageEvent?.type === `${spec.kind}_end` &&
+						event.assistantMessageEvent.contentIndex === index,
+				);
+				assert.ok(at >= 0, `${name}: block ${index} end is written`);
+				assert.equal(deltasOf(out.events.slice(0, at), spec.kind, index), expected);
+			}
+		}
+	});
+}
+
+for (const kind of ["text", "thinking"]) {
+	for (const afterBound of [false, true]) {
+		for (const field of ["signature", "unknown string", "unknown containers"]) {
+			test(`rpc 206u (E02): ${kind}, ${field}, afterBound=${afterBound}: retained snapshot stays within cap`, async () => {
+				const set = holdLimitsSetter();
+				const cap = 1024;
+				const signatureName = kind === "text" ? "textSignature" : "thinkingSignature";
+				const payload = "ordinary opaque data; ".repeat(220);
+				const signature = field === "signature" ? payload : "ordinary signature";
+				const signed = assistant([{ ...block(kind, "ordinary."), [signatureName]: signature }]);
+				if (field === "unknown string") signed.extra = payload;
+				if (field === "unknown containers") signed.extra = { [payload]: [new Uint8Array(4096), 17, false] };
+				const empty = { ...signed, content: [{ ...signed.content[0], [kind]: "" }] };
+				const messages = [...(afterBound ? [assistant([block(kind, "x".repeat(2048))])] : []), empty, signed];
+				const events = messages.map((message) => ({
+					type: "message_update",
+					message,
+					assistantMessageEvent: { type: `${kind}_delta`, contentIndex: 0, delta: "", partial: message },
+				}));
+				const final = { ...signed, stopReason: "stop" };
+				let out;
+				let retained;
+				set({ maxBytes: cap });
+				try {
+					const stream = newStreamMask();
+					for (const event of events) stream.process(event);
+					retained = retainedStringBytes(stream);
+					out = await runRpc(
+						[
+							...events,
+							{
+								type: "message_update",
+								message: final,
+								assistantMessageEvent: { type: "done", reason: "stop", message: final },
+							},
+							{ type: "message_end", message: final },
+							{ type: "agent_end", messages: [final] },
+						],
+						{
+							state: cutSession(final),
+							during: async ({ send }) => {
+								await send({ type: "get_entries" });
+							},
+						},
+					);
+				} finally {
+					set();
+				}
+				assert.ok(retained <= cap, `206u (E02): ${retained} retained bytes exceed ${cap}`);
+				assertCompleted(out, ["message_end", "agent_end"], "206u (E02)");
+				assert.equal(deltasOf(out.events, kind), PLACEHOLDER, "206u (E02): metadata also triggers the bound");
+				const end = out.events.find((event) => event.type === "message_end");
+				assert.equal(end.message.content[0][signatureName], signature);
+				const source = out.events.find((event) => event.assistantMessageEvent?.type === "done");
+				assert.equal(source?.assistantMessageEvent.message.content[0][signatureName], signature);
+				const entry = out.events.find((event) => event.command === "get_entries");
+				assert.equal(entry?.success, true);
+				assert.equal(entry.data.entries[0].message.content[0][signatureName], signature);
+			});
+		}
+	}
 }
