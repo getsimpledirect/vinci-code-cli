@@ -148,7 +148,8 @@ async function runRpc(events, { masking = true, during, state = {}, signal = fal
 				}
 				throw new assert.AssertionError({ message: `a response to ${command.type} within 1000 turns` });
 			};
-			await during({ stdout: () => capture.join(""), rebind: () => rebind(), send });
+			// 206s: `emit` hands one more event to the session listener (rows that move a fake clock between events).
+			await during({ stdout: () => capture.join(""), rebind: () => rebind(), send, emit: (event) => listener?.(event) });
 		}
 		if (signal) {
 			const handler = process.listeners("SIGTERM").find((candidate) => !signalHandlersBefore.includes(candidate));
@@ -812,8 +813,8 @@ test("rpc get_entries and get_tree with masking off: byte-identical data", async
 });
 
 // Interrupted calls: in the final events (message_end, turn_end, agent_end) and in the transcript responses
-// (get_messages, get_entries, get_tree) each argument value keeps only the lines the hold-back would have
-// released; from the first held line to the value's end it is the placeholder.
+// (get_messages, get_entries, get_tree) an argument value is kept only when it is complete and the hold-back would
+// release all of it; any other value is the placeholder, whole (206s (B01): no released prefix is kept).
 const hasStringValue = (value) =>
 	typeof value === "string" ? value !== "" : value && typeof value === "object" ? Object.values(value).some(hasStringValue) : false;
 
@@ -2067,4 +2068,273 @@ test("rpc positive control 206r (C3): ordinary toJSON values and function-valued
 	assert.deepEqual(end?.result?.details, expected, "tool_execution_end details are unchanged");
 	const message = out.events.find((line) => line?.type === "message_end");
 	assert.deepEqual(message?.message?.details, expected, "the tool result message's details are unchanged");
+});
+
+// ---------------------------------------------------------------------------------------------------
+// 206s: review findings B01..B08 through runRpcMode. Inputs are the review probes', byte for byte. Each row
+// asserts the run completed, and fails on the code before 206s by an assertion (a raw secret byte on stdout, or a
+// missing, duplicated or retyped field), never by a crash.
+// ---------------------------------------------------------------------------------------------------
+
+const {
+	angleCutCase,
+	boxedDetails,
+	controlStringError,
+	interruptedCutEvents,
+	keyBlockProgress,
+	ownProtoDetails,
+	progressEvents,
+	releasedUpdates,
+	retainedCutEvents,
+	splitReasoningMessage,
+} = await import("./lib/stream-masking-fixtures.mjs");
+const streamMaskModule = await import(resolve(packages, "coding-agent/src/core/vinci-stream-mask.ts"));
+const ansiModule = await import(resolve(packages, "coding-agent/src/utils/ansi.ts"));
+
+/** The test-only hold-bounds setter; where it is not exported the row fails here, by an assertion. */
+function holdLimitsSetter() {
+	const set = streamMaskModule.vinciSetStreamHoldLimitsForTest;
+	if (typeof set !== "function") assert.fail("206s (B05): vinciSetStreamHoldLimitsForTest is exported (the hold bounds can be set for a test)");
+	return set;
+}
+
+/** The nonempty deltas of one kind, as the written events that carry them. */
+const releasedDeltas = (events, kind = "text") =>
+	events.filter((event) => event?.type === "message_update" && event.assistantMessageEvent?.type === `${kind}_delta` && event.assistantMessageEvent.delta !== "");
+
+// 206s (B01): a cut or interrupted call keeps no released raw prefix of a value, in events and transcript responses.
+test("rpc 206s (B01): an aborted call whose argument text was cut after a complete multi-line value: no raw secret byte reaches stdout", async () => {
+	const { events, message, command, secret } = interruptedCutEvents();
+	assert.ok(command.includes(secret), "fixture sanity: the command carries the secret");
+	assert.ok(!vinciMaskSecrets(command).includes(secret), "fixture sanity: the view masks the whole command");
+	const out = await runWithTranscript(events, [message]);
+	assert.deepEqual(
+		out.events.filter((line) => line?.type === "response").map((line) => line.command),
+		["get_messages", "get_entries", "get_tree"],
+		"fixture sanity: the three responses are written",
+	);
+	assertNoRawSecretInLines(out, secret, "206s (B01, rpc, interrupted)");
+	assertCompleted(out, ["message_end", "agent_end"], "206s (B01, rpc, interrupted)");
+	const messages = out.events.find((line) => line?.command === "get_messages")?.data?.messages;
+	assert.equal(messages?.[0]?.content?.[0]?.arguments?.command, PLACEHOLDER, "get_messages: the cut call's command is the placeholder, whole");
+});
+
+test("rpc 206s (B01): a completed call that keeps argument text cut after a complete multi-line value (retained invalid partial): no raw secret byte reaches stdout", async () => {
+	const { events, message, command, secret } = retainedCutEvents();
+	assert.ok(!vinciMaskSecrets(command).includes(secret), "fixture sanity: the view masks the whole command");
+	assert.throws(() => JSON.parse(message.content[0].partialJson), SyntaxError, "fixture sanity: the retained partial argument text is not complete JSON");
+	const out = await runWithTranscript(events, [message]);
+	assertNoRawSecretInLines(out, secret, "206s (B01, rpc, retained cut text)");
+	assertCompleted(out, ["message_end", "turn_end", "agent_end"], "206s (B01, rpc, retained cut text)");
+});
+
+// 206s (B02): a reasoning item's parts are masked joined, as the provider joins them, in events and get_messages.
+for (const field of ["summary", "content"]) {
+	test(`rpc 206s (B02): a private-key body split across a reasoning item's ${field} entries, kept as thinkingSignature: no raw key byte reaches stdout`, async () => {
+		const { events, run, message } = splitReasoningMessage(field);
+		assert.ok(run.secret.some((line) => vinciMaskSecrets(line) === line), "fixture sanity: an entry alone is not masked");
+		assert.ok(vinciMaskSecrets(message.content[0].thinking).includes(PLACEHOLDER), "fixture sanity: the joined body (the thinking block) is masked");
+		let line;
+		const out = await runRpc(events, {
+			state: { messages: [message] },
+			during: async ({ send }) => {
+				({ line } = await send({ type: "get_messages" }));
+			},
+		});
+		assertNoSecretBytes(out.stdout, run.secret, `206s (B02, rpc, ${field}): whole stdout`);
+		assertNoSecretBytes(line, run.secret, `206s (B02, rpc, ${field}): get_messages`);
+		assertCompleted(out, ["message_end", "agent_end"], `206s (B02, rpc, ${field})`);
+		const written = signaturesIn(out.events.find((event) => event?.type === "message_end"));
+		assert.equal(written.length, 1, "message_end carries the signature");
+		assert.ok(JSON.parse(written[0])[field].map((part) => part.text).join("\n\n").includes(PLACEHOLDER), `the signature's ${field} text holds the placeholder`);
+	});
+}
+
+// 206s (B03): the stream normalises control strings with the error view's own function.
+test("rpc 206s (B03): a DCS string inside an assignment's key in an assistant error: no raw secret byte reaches stdout", async () => {
+	const { secret, errorMessage, events } = controlStringError();
+	const out = await runRpc(events);
+	assertNoRawSecret(out.stdout, secret, "206s (B03, rpc)");
+	assertCompleted(out, ["message_end", "agent_end"], "206s (B03, rpc)");
+	const strip = ansiModule.vinciStripControlText;
+	if (typeof strip !== "function") assert.fail("206s (B03): utils/ansi.ts exports the shared control normaliser vinciStripControlText");
+	assert.ok(!vinciMaskSecrets(strip(errorMessage)).includes(secret), "positive control: the error view's transform masks the secret");
+});
+
+// 206s (B04): a tool's latest progress is kept and released once, masked, when nothing later carries it.
+test("rpc 206s (B04): a tool's progress followed by the end of input (no tool end) goes out once, masked", async () => {
+	const { text, update } = progressEvents();
+	const out = await runRpc([update]);
+	assert.equal(out.exitCode, 0, "206s (B04, rpc, update then end of input): the run exits 0");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "the kept progress is written once");
+	assert.equal(released[0].toolCallId, "partial-only", "for its tool call");
+	assert.equal(released[0].partialResult.content[0].text, text, "whole");
+	assert.deepEqual(released[0].partialResult.details, { progress: 17 }, "with its details");
+});
+
+test("rpc 206s (B04): a tool's progress followed by an error-only tool end goes out once, before the end", async () => {
+	const { text, errorUpdate, errorEnd } = progressEvents();
+	const out = await runRpc([errorUpdate, errorEnd]);
+	assertCompleted(out, ["tool_execution_end"], "206s (B04, rpc, update then error)");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "the kept progress is written once");
+	assert.equal(released[0].partialResult.content[0].text, text, "whole");
+	const endAt = out.events.findIndex((event) => event?.type === "tool_execution_end");
+	assert.ok(out.events.indexOf(released[0]) < endAt, "before the tool end");
+	assert.equal(out.events[endAt].result.content[0].text, "operation aborted.", "the error-only end is written as it was");
+});
+
+test("rpc 206s (B04): a tool's progress that is a key body cut before its END line goes out as the placeholder: no raw key byte reaches stdout", async () => {
+	const { body, final, hidden, update } = keyBlockProgress();
+	assert.ok(vinciMaskSecrets(body).includes(hidden), "fixture sanity: the cut body alone is not masked");
+	assert.ok(!vinciMaskSecrets(final).includes(hidden), "fixture sanity: the whole body is masked");
+	const out = await runRpc([update]);
+	assert.equal(out.exitCode, 0, "206s (B04, rpc, key-block progress): the run exits 0");
+	assertNoRawSecretInLines(out, hidden, "206s (B04, rpc, key-block progress)");
+	const released = out.events.filter((event) => event?.type === "tool_execution_update" && JSON.stringify(event.partialResult).includes(PLACEHOLDER));
+	assert.equal(released.length, 1, "the kept progress is written once, as the placeholder (it cannot be masked whole)");
+	assert.deepEqual(released[0].partialResult.details, {}, "its details are empty");
+});
+
+test("rpc 206s (B04): a tool's progress cut inside an angle value, then an error-only end, goes out as the placeholder: no raw secret byte reaches stdout", async () => {
+	const { secret, body, update, errorEnd } = angleCutCase();
+	assert.ok(vinciMaskSecrets(body).includes(secret), "fixture sanity: the cut body alone is not masked");
+	assert.ok(!vinciMaskSecrets(`${body}>\n`).includes(secret), "fixture sanity: with its closing line it is masked");
+	const lineMayChange = streamMaskModule.vinciLineMayChange;
+	assert.ok(body.split("\n").slice(0, -1).every((line) => !lineMayChange(line, false)), "fixture sanity: the hold-back releases every line");
+	const out = await runRpc([update, errorEnd]);
+	assertCompleted(out, ["tool_execution_end"], "206s (B04, rpc, angle-cut progress)");
+	assertNoRawSecretInLines(out, secret, "206s (B04, rpc, angle-cut progress)");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "the kept progress is written once");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder (a later line could still mask it)");
+	assert.deepEqual(released[0].partialResult.details, {}, "its details are empty");
+});
+
+// 206s (B05): a held body has a byte bound and a deadline; at either it goes out at once, and nothing raw follows.
+test("rpc 206s (B05): a text block past the byte bound goes out at once, as the placeholder when it cannot be masked whole", async () => {
+	const set = holdLimitsSetter();
+	const run = secretRuns()["an END-only private-key body"];
+	const { events } = streamEvents(["Here it is:", ...run.lines, "That is all."]);
+	set({ maxBytes: 200 });
+	let out;
+	try {
+		out = await runRpc(events);
+	} finally {
+		set();
+	}
+	assertCompleted(out, ["message_end"], "206s (B05, rpc, text cap)");
+	assertNoSecretBytes(out.stdout, run.secret, "206s (B05, rpc, text cap): whole stdout");
+	const deltas = out.events.filter((event) => event?.assistantMessageEvent?.type === "text_delta");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder: the body was cut inside the key body");
+	assert.ok(out.events.indexOf(released[0]) < out.events.indexOf(deltas.at(-1)), "at the bound, before the block's later deltas");
+});
+
+test("rpc 206s (B05): a text block cut inside an angle value at the byte bound goes out as the placeholder: no raw secret byte reaches stdout", async () => {
+	const set = holdLimitsSetter();
+	const { secret, body, lines, cutBytes } = angleCutCase();
+	assert.ok(vinciMaskSecrets(body).includes(secret), "fixture sanity: the cut body alone is not masked");
+	const { events } = streamEvents(lines);
+	set({ maxBytes: cutBytes });
+	let out;
+	try {
+		out = await runRpc(events);
+	} finally {
+		set();
+	}
+	assertCompleted(out, ["message_end"], "206s (B05, rpc, angle-cut text cap)");
+	assertNoRawSecretInLines(out, secret, "206s (B05, rpc, angle-cut text cap)");
+	const deltas = out.events.filter((event) => event?.assistantMessageEvent?.type === "text_delta");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder: the body was cut inside the angle value");
+	assert.ok(out.events.indexOf(released[0]) < out.events.indexOf(deltas.at(-1)), "at the bound, before the block's later deltas");
+});
+
+test("rpc 206s (B05): a tool call's argument text past the byte bound goes out at once, as the placeholder", async () => {
+	const set = holdLimitsSetter();
+	const chunk = "x".repeat(256);
+	const fragments = ['{"command":"', ...Array.from({ length: 16 }, () => chunk)];
+	const { events } = toolCallEvents("bash", fragments, { ending: "none" });
+	set({ maxBytes: 1024 });
+	let out;
+	try {
+		out = await runRpc(events);
+	} finally {
+		set();
+	}
+	assert.equal(out.exitCode, 0, "206s (B05, rpc, argument cap): the run exits 0");
+	const deltas = out.events.filter((event) => event?.assistantMessageEvent?.type === "toolcall_delta");
+	const released = releasedDeltas(out.events, "toolcall");
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder: the text so far does not parse");
+	assert.ok(out.events.indexOf(released[0]) < out.events.indexOf(deltas.at(-1)), "at the bound, before the call's later deltas");
+});
+
+test("rpc 206s (B05): a text block held for the deadline (10 minutes, a fake clock) goes out at once, masked whole when it can be", async () => {
+	const set = holdLimitsSetter();
+	let now = 0;
+	const lines = ["First line.\n", "Second line.\n", "Third line.\n", "Fourth line.\n", "Fifth line.\n"];
+	const { events } = streamEvents(lines, { eol: "" });
+	const head = events.slice(0, 4);
+	const [third, fourth, ...tail] = events.slice(4);
+	set({ now: () => now });
+	let out;
+	try {
+		out = await runRpc(head, {
+			during: async ({ emit }) => {
+				now = 599_999;
+				emit(third);
+				now = 600_000;
+				emit(fourth);
+				for (const event of tail) emit(event);
+			},
+		});
+	} finally {
+		set();
+	}
+	assertCompleted(out, ["message_end"], "206s (B05, rpc, deadline)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, lines.slice(0, 4).join(""), "at the deadline (not before), the body so far, masked whole");
+});
+
+// 206s (B07): an own "__proto__" key and its data survive the whole-object masker, as JSON.stringify writes them.
+test("rpc 206s (B07): an own __proto__ key in tool details, nested and through toJSON, is written as JSON.stringify writes it", async () => {
+	for (const [label, details] of [
+		["parsed", ownProtoDetails()],
+		["through toJSON", { toJSON: () => ownProtoDetails() }],
+	]) {
+		const events = detailsEvents(details);
+		assert.ok(JSON.stringify(events[1]).includes('"__proto__":{"note":"plain preserved data"'), `${label}: fixture sanity: JSON.stringify writes the own key`);
+		const out = await runRpc(events);
+		assertCompleted(out, ["tool_execution_end", "message_end"], `206s (B07, rpc, ${label})`);
+		const line = lineOf(out.stdout, (event) => event?.type === "tool_execution_end");
+		assert.equal(`${line}\n`, serializeJsonLine(events[1]), `${label}: the tool_execution_end line is JSON.stringify's, own __proto__ key and data included`);
+	}
+});
+
+// 206s (B08): String, Number and Boolean objects are written as their values, as JSON.stringify writes them.
+test("rpc 206s (B08): String, Number and Boolean objects in tool details, nested in an array too, are written as JSON.stringify writes them", async () => {
+	const events = detailsEvents(boxedDetails());
+	assert.ok(JSON.stringify(events[1]).includes('"message":"ordinary boxed message","count":7,"flag":true'), "fixture sanity: JSON.stringify writes the values");
+	const out = await runRpc(events);
+	assertCompleted(out, ["tool_execution_end", "message_end"], "206s (B08, rpc)");
+	const line = lineOf(out.stdout, (event) => event?.type === "tool_execution_end");
+	assert.equal(`${line}\n`, serializeJsonLine(events[1]), "the tool_execution_end line is JSON.stringify's");
+});
+
+test("rpc 206s (B08): a String or Number object under a secret name is masked as its value is", async () => {
+	const secret = fakeSecret();
+	const details = { password: new String(secret), list: [{ password: new String(secret) }], auth: { password: new Number(4242) } };
+	const plain = { password: secret, list: [{ password: secret }], auth: { password: 4242 } };
+	const out = await runRpc(detailsEvents(details));
+	assertCompleted(out, ["tool_execution_end", "message_end"], "206s (B08, rpc, secret name)");
+	assertNoRawSecret(out.stdout, secret, "206s (B08, rpc, secret name): whole stdout");
+	const end = out.events.find((event) => event?.type === "tool_execution_end");
+	assert.equal(typeof end?.result?.details?.password, "string", "written as a string, as JSON.stringify writes it");
+	assert.deepEqual(end.result.details, JSON.parse(JSON.stringify(vinciMaskJson(plain))), "masked as the values are masked under their names");
 });

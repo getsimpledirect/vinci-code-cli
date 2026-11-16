@@ -568,3 +568,162 @@ export function probeBashCallEvents(command) {
 		{ type: "agent_end", messages: [message] },
 	];
 }
+
+// ---------------------------------------------------------------------------------------------------
+// 206s: inputs of the review probes for findings B01..B08, byte for byte; values are fake and built at runtime.
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * 206s (B01): a bash command whose value spans lines (crossLineCases()[0] joined, its final line break removed): the
+ * view masks it whole. `cut`: its argument text cut in a later field, as a stream that ended there leaves it.
+ */
+export function cutCommandCase() {
+	const { chunks, secret } = crossLineCases()[0];
+	const command = chunks.join("").trimEnd();
+	return { command, secret, cut: `${JSON.stringify({ command }).slice(0, -1)},"timeout":` };
+}
+
+/** 206s (B01): the probe's interrupted call: the cut argument text kept on a call in a message that ended aborted. */
+export function interruptedCutEvents() {
+	const { command, secret, cut } = cutCommandCase();
+	const call = { type: "toolCall", id: "cut-a", name: "bash", arguments: { command }, partialJson: cut };
+	const message = assistant([call], "aborted");
+	const events = [
+		{ type: "message_start", message: assistant([]) },
+		{ type: "message_end", message },
+		{ type: "agent_end", messages: [message] },
+	];
+	return { events, message, command, secret };
+}
+
+/**
+ * 206s (B01): a call that completed (its toolcall_end carries the parsed arguments) while its streamed text stopped in a
+ * later field: the call, its final message, turn_end and agent_end keep that cut text as partialJson.
+ */
+export function retainedCutEvents() {
+	const { command, secret, cut } = cutCommandCase();
+	const call = { type: "toolCall", id: "cut-b", name: "bash", arguments: { command }, partialJson: cut };
+	const message = assistant([call], "toolUse");
+	const streaming = assistant([{ type: "toolCall", id: "cut-b", name: "bash", arguments: {}, partialJson: "" }]);
+	const delta = assistant([{ type: "toolCall", id: "cut-b", name: "bash", arguments: {}, partialJson: cut }]);
+	const events = [
+		{ type: "message_start", message: assistant([]) },
+		{ type: "message_update", message: streaming, assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: streaming } },
+		{ type: "message_update", message: delta, assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: cut, partial: delta } },
+		{ type: "message_update", message, assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: call, partial: message } },
+		{ type: "message_end", message },
+		{ type: "turn_end", message, toolResults: [] },
+		{ type: "agent_end", messages: [message] },
+	];
+	return { events, message, command, secret };
+}
+
+/**
+ * 206s (B02): the probe's reasoning item: an END-only private-key body, one line per `field` entry ("summary" or
+ * "content", the provider's fallback), the END line in the last; the thinking block is the provider's join of them.
+ */
+export function splitReasoningMessage(field) {
+	const run = secretRuns()["an END-only private-key body"];
+	const item = {
+		id: "rs_fixture",
+		type: "reasoning",
+		[field]: run.lines.map((text) => ({ type: field === "summary" ? "summary_text" : "reasoning_text", text })),
+	};
+	const thinking = run.lines.join("\n\n");
+	const message = { role: "assistant", content: [{ type: "thinking", thinking, thinkingSignature: JSON.stringify(item) }], stopReason: "stop" };
+	return { message, run, item, events: [{ type: "message_end", message }, { type: "agent_end", messages: [message] }] };
+}
+
+/** 206s (B03): the probe's assistant error: a DCS string inside an assignment's key. */
+export function controlStringError() {
+	const secret = probeSecret();
+	const errorMessage = `password\x1bP harmless text;\x1b\\=${secret}`;
+	const message = { ...assistant([], "error"), errorMessage };
+	return { secret, errorMessage, message, events: [{ type: "message_end", message }, { type: "agent_end", messages: [message] }] };
+}
+
+/** 206s (B04): the probe's ordinary tool progress, and the error-only end that follows it in the second probe. */
+export function progressEvents() {
+	const text = "ordinary progress worth retaining.";
+	const update = {
+		type: "tool_execution_update",
+		toolName: "custom",
+		toolCallId: "partial-only",
+		partialResult: { content: [{ type: "text", text }], details: { progress: 17 } },
+	};
+	const errorUpdate = { type: "tool_execution_update", toolName: "custom", toolCallId: "a", partialResult: { content: [{ type: "text", text }] } };
+	const errorEnd = {
+		type: "tool_execution_end",
+		toolName: "custom",
+		toolCallId: "a",
+		result: { content: [{ type: "text", text: "operation aborted." }] },
+		isError: true,
+	};
+	return { text, update, errorUpdate, errorEnd };
+}
+
+/**
+ * 206s (B04): a tool's progress that is a key body cut before its END line (splitKeyResult's first cumulative update:
+ * alone it is not masked, and it cannot be masked whole). `final`: the same body with its END line, which is masked.
+ */
+export function keyBlockProgress() {
+	const { cumulative, final, hidden } = splitKeyResult();
+	const update = {
+		type: "tool_execution_update",
+		toolName: "custom",
+		toolCallId: "key-progress",
+		partialResult: { content: [{ type: "text", text: cumulative }], details: { note: cumulative } },
+	};
+	return { body: cumulative, final, hidden, update };
+}
+
+/**
+ * 206s follow-up (B04, B05): a body cut inside an angle value whose closing `>` has not arrived. Every line of it is
+ * complete and ends in punctuation, so the hold-back would release it whole, yet alone it is not masked, while with
+ * its `>` line it is.
+ * `update` / `errorEnd`: that body as a tool's progress, then an error-only end; `lines`: the same body as text
+ * lines, then the closing line and more (a text block cut at a byte bound of `cutBytes`).
+ */
+export function angleCutCase() {
+	const secret = probeSecret();
+	const body = `password=<\n${secret}!\n`;
+	const update = {
+		type: "tool_execution_update",
+		toolName: "custom",
+		toolCallId: "angle-cut",
+		partialResult: { content: [{ type: "text", text: body }], details: { note: body } },
+	};
+	const errorEnd = {
+		type: "tool_execution_end",
+		toolName: "custom",
+		toolCallId: "angle-cut",
+		result: { content: [{ type: "text", text: "operation aborted." }] },
+		isError: true,
+	};
+	return { secret, body, update, errorEnd, lines: ["password=<", `${secret}!`, ">", "That is all."], cutBytes: body.length - 1 };
+}
+
+/** The tool_execution_update events of `events` whose partial result carries text. */
+export function releasedUpdates(events) {
+	return events.filter(
+		(event) =>
+			event?.type === "tool_execution_update" &&
+			Array.isArray(event.partialResult?.content) &&
+			event.partialResult.content.some((part) => part?.type === "text" && typeof part.text === "string" && part.text !== ""),
+	);
+}
+
+/** 206s (B07): details with an own `__proto__` key (as JSON.parse makes it), at two levels. */
+export function ownProtoDetails() {
+	return JSON.parse('{"__proto__":{"note":"plain preserved data","inner":{"__proto__":{"deep":"kept too"}}},"count":7}');
+}
+
+/** 206s (B08): String, Number and Boolean objects, at top level and nested in an array (no secret). */
+export function boxedDetails() {
+	return {
+		message: new String("ordinary boxed message"),
+		count: new Number(7),
+		flag: new Boolean(true),
+		list: [new String("listed text"), new Number(3), new Boolean(false)],
+	};
+}

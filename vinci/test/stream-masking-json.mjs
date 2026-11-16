@@ -254,6 +254,8 @@ test("json: the liveness-watchdog exit writes the held run masked before exit", 
 		});
 	} finally {
 		process.exit = realExit;
+		// 206s (B06): the watchdog now marks the run terminating before its flush; later rows start a fresh run.
+		setPrintModeTerminatingForTest(false);
 		if (savedTimeout === undefined) delete process.env.VINCI_PRESTREAM_TIMEOUT_MS;
 		else process.env.VINCI_PRESTREAM_TIMEOUT_MS = savedTimeout;
 	}
@@ -510,8 +512,9 @@ test("json: masking consistency for streamed tool arguments, a complete call wit
 	assertMasked(out.stdout, run.secret, "whole stdout");
 });
 
-// Interrupted calls: in the final events (message_end, turn_end, agent_end) each argument value keeps only
-// the lines the hold-back would have released; from the first held line to the value's end it is the placeholder.
+// Interrupted calls: in the final events (message_end, turn_end, agent_end) an argument value is kept only when
+// it is complete and the hold-back would release all of it; any other value is the placeholder, whole (206s (B01):
+// no released prefix is kept).
 const hasStringValue = (value) =>
 	typeof value === "string" ? value !== "" : value && typeof value === "object" ? Object.values(value).some(hasStringValue) : false;
 
@@ -1518,4 +1521,368 @@ test("json positive control 206r (C3): ordinary toJSON values and function-value
 	assert.deepEqual(end?.result?.details, expected, "tool_execution_end details are unchanged");
 	const message = out.events.find((event) => event?.type === "message_end");
 	assert.deepEqual(message?.message?.details, expected, "the tool result message's details are unchanged");
+});
+
+// ---------------------------------------------------------------------------------------------------
+// 206s: review findings B01..B08 through runPrintMode. Inputs are the review probes', byte for byte. Each row
+// asserts the run completed, and fails on the code before 206s by an assertion (a raw secret byte on stdout, or a
+// missing, duplicated or retyped field), never by a crash.
+// ---------------------------------------------------------------------------------------------------
+
+const {
+	angleCutCase,
+	boxedDetails,
+	controlStringError,
+	interruptedCutEvents,
+	keyBlockProgress,
+	ownProtoDetails,
+	progressEvents,
+	releasedUpdates,
+	retainedCutEvents,
+	splitReasoningMessage,
+} = await import("./lib/stream-masking-fixtures.mjs");
+const streamMaskModule = await import(resolve(src, "core/vinci-stream-mask.ts"));
+const ansiModule = await import(resolve(src, "utils/ansi.ts"));
+
+/** The test-only hold-bounds setter; where it is not exported the row fails here, by an assertion. */
+function holdLimitsSetter() {
+	const set = streamMaskModule.vinciSetStreamHoldLimitsForTest;
+	if (typeof set !== "function") assert.fail("206s (B05): vinciSetStreamHoldLimitsForTest is exported (the hold bounds can be set for a test)");
+	return set;
+}
+
+/** The nonempty deltas of one kind, as the written events that carry them. */
+const releasedDeltas = (events, kind = "text") =>
+	events.filter((event) => event?.type === "message_update" && event.assistantMessageEvent?.type === `${kind}_delta` && event.assistantMessageEvent.delta !== "");
+
+// 206s (B01): a cut or interrupted call keeps no released raw prefix of a value: a value whose context the cut may
+// have removed is the placeholder, whole.
+test("json 206s (B01): an aborted call whose argument text was cut after a complete multi-line value: no raw secret byte reaches stdout", async () => {
+	const { events, command, secret } = interruptedCutEvents();
+	assert.ok(command.includes(secret), "fixture sanity: the command carries the secret");
+	assert.ok(!vinciMaskSecrets(command).includes(secret), "fixture sanity: the view masks the whole command");
+	const out = await runJson(events);
+	assertNoRawSecretInEvents(out, secret, "206s (B01, json, interrupted)");
+	assertCompleted(out, ["message_end", "agent_end"], "206s (B01, json, interrupted)");
+	for (const event of out.events.filter((event) => event.type === "message_end" || event.type === "agent_end")) {
+		const message = event.type === "agent_end" ? event.messages[0] : event.message;
+		assert.equal(message.content[0].arguments.command, PLACEHOLDER, `${event.type}: the cut call's command is the placeholder, whole`);
+	}
+});
+
+test("json 206s (B01): a completed call that keeps argument text cut after a complete multi-line value (retained invalid partial): no raw secret byte reaches stdout", async () => {
+	const { events, command, secret, message } = retainedCutEvents();
+	assert.ok(!vinciMaskSecrets(command).includes(secret), "fixture sanity: the view masks the whole command");
+	assert.throws(() => JSON.parse(message.content[0].partialJson), SyntaxError, "fixture sanity: the retained partial argument text is not complete JSON");
+	const out = await runJson(events);
+	assertNoRawSecretInEvents(out, secret, "206s (B01, json, retained cut text)");
+	assertCompleted(out, ["message_end", "turn_end", "agent_end"], "206s (B01, json, retained cut text)");
+});
+
+// 206s (B02): a reasoning item's parts are masked joined, as the provider joins them into the thinking block.
+for (const field of ["summary", "content"]) {
+	test(`json 206s (B02): a private-key body split across a reasoning item's ${field} entries, kept as thinkingSignature: no raw key byte reaches stdout`, async () => {
+		const { events, run, message } = splitReasoningMessage(field);
+		assert.ok(run.secret.some((line) => vinciMaskSecrets(line) === line), "fixture sanity: an entry alone is not masked");
+		assert.ok(vinciMaskSecrets(message.content[0].thinking).includes(PLACEHOLDER), "fixture sanity: the joined body (the thinking block) is masked");
+		const out = await runJson(events);
+		assertNoSecretBytes(out.stdout, run.secret, `206s (B02, json, ${field}): whole stdout`);
+		assertCompleted(out, ["message_end", "agent_end"], `206s (B02, json, ${field})`);
+		const written = signaturesIn(out.events.find((event) => event?.type === "message_end"));
+		assert.equal(written.length, 1, "message_end carries the signature");
+		const decoded = JSON.parse(written[0]);
+		assert.ok(decoded[field].map((part) => part.text).join("\n\n").includes(PLACEHOLDER), `the signature's ${field} text holds the placeholder`);
+	});
+}
+
+// 206s (B03): the stream normalises control strings with the error view's own function.
+test("json 206s (B03): a DCS string inside an assignment's key in an assistant error: no raw secret byte reaches stdout", async () => {
+	const { secret, errorMessage, events } = controlStringError();
+	const out = await runJson(events);
+	assertNoRawSecret(out.stdout, secret, "206s (B03, json)");
+	assertCompleted(out, ["message_end", "agent_end"], "206s (B03, json)");
+	const strip = ansiModule.vinciStripControlText;
+	if (typeof strip !== "function") assert.fail("206s (B03): utils/ansi.ts exports the shared control normaliser vinciStripControlText");
+	assert.ok(!vinciMaskSecrets(strip(errorMessage)).includes(secret), "positive control: the error view's transform masks the secret");
+});
+
+// 206s (B04): a tool's latest progress is kept and released once, masked, when nothing later carries it.
+test("json 206s (B04): a tool's progress followed by the end of the run (no tool end) goes out once, masked", async () => {
+	const { text, update } = progressEvents();
+	const out = await runJson([update]);
+	assert.equal(out.exitCode, 0, "206s (B04, json, update then end of run): the run exits 0");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "the kept progress is written once");
+	assert.equal(released[0].toolCallId, "partial-only", "for its tool call");
+	assert.equal(released[0].partialResult.content[0].text, text, "whole");
+	assert.deepEqual(released[0].partialResult.details, { progress: 17 }, "with its details");
+});
+
+test("json 206s (B04): a tool's progress followed by an error-only tool end goes out once, before the end", async () => {
+	const { text, errorUpdate, errorEnd } = progressEvents();
+	const out = await runJson([errorUpdate, errorEnd]);
+	assertCompleted(out, ["tool_execution_end"], "206s (B04, json, update then error)");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "the kept progress is written once");
+	assert.equal(released[0].partialResult.content[0].text, text, "whole");
+	const endAt = out.events.findIndex((event) => event?.type === "tool_execution_end");
+	assert.ok(out.events.indexOf(released[0]) < endAt, "before the tool end");
+	assert.equal(out.events[endAt].result.content[0].text, "operation aborted.", "the error-only end is written as it was");
+});
+
+test("json 206s (B04): a tool's progress that is a key body cut before its END line goes out as the placeholder: no raw key byte reaches stdout", async () => {
+	const { body, final, hidden, update } = keyBlockProgress();
+	assert.ok(vinciMaskSecrets(body).includes(hidden), "fixture sanity: the cut body alone is not masked");
+	assert.ok(!vinciMaskSecrets(final).includes(hidden), "fixture sanity: the whole body is masked");
+	const out = await runJson([update]);
+	assert.equal(out.exitCode, 0, "206s (B04, json, key-block progress): the run exits 0");
+	assertNoRawSecretInEvents(out, hidden, "206s (B04, json, key-block progress)");
+	const released = out.events.filter((event) => event?.type === "tool_execution_update" && JSON.stringify(event.partialResult).includes(PLACEHOLDER));
+	assert.equal(released.length, 1, "the kept progress is written once, as the placeholder (it cannot be masked whole)");
+	assert.deepEqual(released[0].partialResult.details, {}, "its details are empty");
+});
+
+test("json 206s (B04): a tool's progress cut inside an angle value, then an error-only end, goes out as the placeholder: no raw secret byte reaches stdout", async () => {
+	const { secret, body, update, errorEnd } = angleCutCase();
+	assert.ok(vinciMaskSecrets(body).includes(secret), "fixture sanity: the cut body alone is not masked");
+	assert.ok(!vinciMaskSecrets(`${body}>\n`).includes(secret), "fixture sanity: with its closing line it is masked");
+	const lineMayChange = streamMaskModule.vinciLineMayChange;
+	assert.ok(body.split("\n").slice(0, -1).every((line) => !lineMayChange(line, false)), "fixture sanity: the hold-back releases every line");
+	const out = await runJson([update, errorEnd]);
+	assertCompleted(out, ["tool_execution_end"], "206s (B04, json, angle-cut progress)");
+	assertNoRawSecretInEvents(out, secret, "206s (B04, json, angle-cut progress)");
+	const released = releasedUpdates(out.events);
+	assert.equal(released.length, 1, "the kept progress is written once");
+	assert.equal(released[0].partialResult.content[0].text, PLACEHOLDER, "as the placeholder (a later line could still mask it)");
+	assert.deepEqual(released[0].partialResult.details, {}, "its details are empty");
+});
+
+// 206s (B05): a held body has a byte bound and a deadline; at either it goes out at once, and nothing raw follows.
+test("json 206s (B05): a text block past the byte bound goes out at once, as the placeholder when it cannot be masked whole", async () => {
+	const set = holdLimitsSetter();
+	const run = secretRuns()["an END-only private-key body"];
+	const { events } = streamEvents(["Here it is:", ...run.lines, "That is all."]);
+	set({ maxBytes: 200 });
+	let out;
+	try {
+		out = await runJson(events);
+	} finally {
+		set();
+	}
+	assertCompleted(out, ["message_end"], "206s (B05, json, text cap)");
+	assertNoSecretBytes(out.stdout, run.secret, "206s (B05, json, text cap): whole stdout");
+	const deltas = out.events.filter((event) => event?.assistantMessageEvent?.type === "text_delta");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder: the body was cut inside the key body");
+	assert.ok(out.events.indexOf(released[0]) < out.events.indexOf(deltas.at(-1)), "at the bound, before the block's later deltas");
+});
+
+test("json 206s (B05): a text block cut inside an angle value at the byte bound goes out as the placeholder: no raw secret byte reaches stdout", async () => {
+	const set = holdLimitsSetter();
+	const { secret, body, lines, cutBytes } = angleCutCase();
+	assert.ok(vinciMaskSecrets(body).includes(secret), "fixture sanity: the cut body alone is not masked");
+	const { events } = streamEvents(lines);
+	set({ maxBytes: cutBytes });
+	let out;
+	try {
+		out = await runJson(events);
+	} finally {
+		set();
+	}
+	assertCompleted(out, ["message_end"], "206s (B05, json, angle-cut text cap)");
+	assertNoRawSecretInEvents(out, secret, "206s (B05, json, angle-cut text cap)");
+	const deltas = out.events.filter((event) => event?.assistantMessageEvent?.type === "text_delta");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder: the body was cut inside the angle value");
+	assert.ok(out.events.indexOf(released[0]) < out.events.indexOf(deltas.at(-1)), "at the bound, before the block's later deltas");
+});
+
+test("json 206s (B05): a tool call's argument text past the byte bound goes out at once, as the placeholder; its held text is dropped", async () => {
+	const set = holdLimitsSetter();
+	const chunk = "x".repeat(256);
+	const fragments = ['{"command":"', ...Array.from({ length: 16 }, () => chunk)];
+	const { events } = toolCallEvents("bash", fragments, { ending: "none" });
+	set({ maxBytes: 1024 });
+	let out;
+	try {
+		out = await runJson(events);
+	} finally {
+		set();
+	}
+	assert.equal(out.exitCode, 0, "206s (B05, json, argument cap): the run exits 0");
+	const deltas = out.events.filter((event) => event?.assistantMessageEvent?.type === "toolcall_delta");
+	const released = releasedDeltas(out.events, "toolcall");
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, "the placeholder: the text so far does not parse");
+	assert.ok(out.events.indexOf(released[0]) < out.events.indexOf(deltas.at(-1)), "at the bound, before the call's later deltas");
+	// The held state stays bounded however long the call streams (measured on the masker itself).
+	const stream = new VinciStreamMask();
+	let raw = "";
+	set({ maxBytes: 16384 });
+	try {
+		for (let n = 0; n < 64; n++) {
+			const delta = "x".repeat(4096);
+			raw += delta;
+			const call = { type: "toolCall", id: "growing", name: "bash", arguments: {}, partialJson: raw };
+			const message = assistant([call]);
+			stream.process({ type: "message_update", message, assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta, partial: message } });
+		}
+	} finally {
+		set();
+	}
+	assert.ok(stream.tools.get(0).raw.length <= 16384, `the held argument text stays bounded (${stream.tools.get(0).raw.length} characters)`);
+});
+
+test("json 206s (B05): a text block held for the deadline (10 minutes, a fake clock) goes out at once, masked whole when it can be", async () => {
+	const set = holdLimitsSetter();
+	let now = 0;
+	const lines = ["First line.\n", "Second line.\n", "Third line.\n", "Fourth line.\n", "Fifth line.\n"];
+	const { events } = streamEvents(lines, { eol: "" });
+	// message_start, text_start, five deltas, text_end, message_end
+	const head = events.slice(0, 4);
+	const [third, fourth, ...tail] = events.slice(4);
+	set({ now: () => now });
+	let out;
+	try {
+		out = await runJson(head, {
+			during: async ({ listener }) => {
+				now = 599_999;
+				listener(third);
+				now = 600_000;
+				listener(fourth);
+				for (const event of tail) listener(event);
+			},
+		});
+	} finally {
+		set();
+	}
+	assertCompleted(out, ["message_end"], "206s (B05, json, deadline)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	assert.equal(released[0].assistantMessageEvent.delta, lines.slice(0, 4).join(""), "at the deadline (not before), the body so far, masked whole");
+});
+
+// 206s (B06): after the watchdog's flush no event is taken: a late end event releases nothing again.
+test("json 206s (B06): a late text_end during the watchdog exit's drain gives no second release", async () => {
+	const message = assistant([block("text", "ordinary progress.")]);
+	const late = [
+		{ type: "message_update", message, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ordinary progress.", partial: message } },
+		{ type: "message_end", message },
+		{ type: "agent_end", messages: [message] },
+	];
+	const savedCode = process.env.VINCI_CODE;
+	const savedTimeout = process.env.VINCI_PRESTREAM_TIMEOUT_MS;
+	process.env.VINCI_CODE = "1";
+	process.env.VINCI_PRESTREAM_TIMEOUT_MS = "40";
+	const chunks = [];
+	const exits = [];
+	// The session callback is kept past any unsubscribe: a late event still reaches it, and only the mode can ignore it.
+	let callback;
+	let endPrompt;
+	const promptEnded = new Promise((resolvePrompt) => {
+		endPrompt = resolvePrompt;
+	});
+	let drainHeld = false;
+	const messages = [];
+	const session = {
+		state: { messages },
+		agent: { waitForIdle: async () => {} },
+		sessionManager: { getHeader: () => undefined },
+		extensionRunner: undefined,
+		bindExtensions: async () => {},
+		subscribe(fn) {
+			callback = fn;
+			return () => {};
+		},
+		prompt: async () => {
+			callback({ type: "message_start", message: assistant([]) });
+			callback({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "ordinary progress.", partial: message } });
+			await promptEnded;
+			messages.push(message);
+		},
+	};
+	const runtime = { session, setRebindSession() {}, dispose: async () => {} };
+	const realExit = process.exit;
+	const savedError = console.error;
+	process.stdout.write = function (chunk, encodingOrCallback, cb) {
+		if (typeof chunk !== "string") return realWrite.call(process.stdout, chunk, encodingOrCallback, cb);
+		const done = typeof encodingOrCallback === "function" ? encodingOrCallback : cb;
+		chunks.push(chunk);
+		if (chunk === "" && exits.length === 0 && !drainHeld) {
+			// The watchdog exit's drain is held while the late events arrive.
+			drainHeld = true;
+			setImmediate(() => {
+				for (const event of late) callback(event);
+				setImmediate(() => done?.());
+			});
+			return true;
+		}
+		done?.();
+		return true;
+	};
+	process.exit = (code) => {
+		exits.push(code);
+		endPrompt();
+	};
+	console.error = () => {};
+	let returned;
+	try {
+		returned = await runPrintMode(runtime, { mode: "json", initialMessage: "go" });
+	} finally {
+		process.stdout.write = realWrite;
+		process.exit = realExit;
+		console.error = savedError;
+		setPrintModeTerminatingForTest(false);
+		process.exitCode = undefined;
+		if (savedCode === undefined) delete process.env.VINCI_CODE;
+		else process.env.VINCI_CODE = savedCode;
+		if (savedTimeout === undefined) delete process.env.VINCI_PRESTREAM_TIMEOUT_MS;
+		else process.env.VINCI_PRESTREAM_TIMEOUT_MS = savedTimeout;
+	}
+	assert.equal(exits[0], 1, "206s (B06): the watchdog exit (1) is requested");
+	assert.ok(drainHeld, "fixture sanity: the late events arrived while the exit's drain was held");
+	assert.equal(typeof returned, "number", "the run returned");
+	const events = parseLines(chunks.join(""));
+	const released = releasedDeltas(events);
+	assert.equal(released.length, 1, "exactly one nonempty delta: the late text_end releases nothing again");
+	assert.equal(released[0].assistantMessageEvent.delta, "ordinary progress.", "the body, once");
+});
+
+// 206s (B07): an own "__proto__" key and its data survive the masker, as JSON.stringify writes them.
+test("json 206s (B07): an own __proto__ key in tool details, nested and through toJSON, is written as JSON.stringify writes it", async () => {
+	for (const [label, details] of [
+		["parsed", ownProtoDetails()],
+		["through toJSON", { toJSON: () => ownProtoDetails() }],
+	]) {
+		const events = detailsEvents(details);
+		assert.ok(JSON.stringify(events[1]).includes('"__proto__":{"note":"plain preserved data"'), `${label}: fixture sanity: JSON.stringify writes the own key`);
+		const out = await runJson(events);
+		assertCompleted(out, ["tool_execution_end", "message_end"], `206s (B07, json, ${label})`);
+		const line = lineOf(out.stdout, (event) => event?.type === "tool_execution_end");
+		assert.equal(line, JSON.stringify(events[1]), `${label}: the tool_execution_end line is JSON.stringify's, own __proto__ key and data included`);
+	}
+});
+
+// 206s (B08): String, Number and Boolean objects are written as their values, as JSON.stringify writes them.
+test("json 206s (B08): String, Number and Boolean objects in tool details, nested in an array too, are written as JSON.stringify writes them", async () => {
+	const events = detailsEvents(boxedDetails());
+	assert.ok(JSON.stringify(events[1]).includes('"message":"ordinary boxed message","count":7,"flag":true'), "fixture sanity: JSON.stringify writes the values");
+	const out = await runJson(events);
+	assertCompleted(out, ["tool_execution_end", "message_end"], "206s (B08, json)");
+	const line = lineOf(out.stdout, (event) => event?.type === "tool_execution_end");
+	assert.equal(line, JSON.stringify(events[1]), "the tool_execution_end line is JSON.stringify's");
+});
+
+test("json 206s (B08): a String or Number object under a secret name is masked as its value is", async () => {
+	const secret = fakeSecret();
+	const details = { password: new String(secret), list: [{ password: new String(secret) }], auth: { password: new Number(4242) } };
+	const plain = { password: secret, list: [{ password: secret }], auth: { password: 4242 } };
+	const out = await runJson(detailsEvents(details));
+	assertCompleted(out, ["tool_execution_end", "message_end"], "206s (B08, json, secret name)");
+	assertNoRawSecret(out.stdout, secret, "206s (B08, json, secret name): whole stdout");
+	const end = out.events.find((event) => event?.type === "tool_execution_end");
+	assert.equal(typeof end?.result?.details?.password, "string", "written as a string, as JSON.stringify writes it");
+	assert.deepEqual(end.result.details, JSON.parse(JSON.stringify(vinciMaskJson(plain))), "masked as the values are masked under their names");
 });

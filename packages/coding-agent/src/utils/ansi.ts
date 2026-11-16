@@ -26,6 +26,8 @@
  * SOFTWARE.
  */
 
+import { stripVTControlCharacters } from "node:util";
+
 function ansiRegex({ onlyFirst = false }: { onlyFirst?: boolean } = {}): RegExp {
 	// Valid string terminator sequences are BEL, ESC\, and 0x9c
 	const ST = "(?:\\u0007|\\u001B\\u005C|\\u009C)";
@@ -57,4 +59,14 @@ export function stripAnsi(value: string): string {
 	// because unlike `.exec()` and `.test()`, `.replace()` does it automatically
 	// and doing it manually has a performance penalty.
 	return value.replace(regex, "");
+}
+
+/**
+ * [vinci] Text with terminal control strings removed, as the assistant error view shows it: DCS, APC and PM
+ * strings (ESC P, ESC _ or ESC ^ up to their terminator, or to the end of the text) first, since Node's stripper
+ * leaves their payload, then every sequence stripVTControlCharacters removes. The one control normaliser shared
+ * by the error view (assistant-message.ts) and the streamed-output masker (vinci-stream-mask.ts).
+ */
+export function vinciStripControlText(text: string): string {
+	return stripVTControlCharacters(text.replace(/\x1b[_P^][\s\S]*?(?:\x1b\\|\x07|\x9c|$)/g, ""));
 }

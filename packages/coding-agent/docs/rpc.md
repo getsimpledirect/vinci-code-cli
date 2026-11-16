@@ -872,7 +872,9 @@ Emitted when a message begins and completes. The `message` field contains an `Ag
 
 Emitted during streaming of assistant messages. Contains both the partial message and a streaming delta event.
 
-With secret masking on (`VINCI_CODE=1`, as every Vinci run sets it), bodies arrive at block end: each intermediate `text_delta` and `thinking_delta` carries an empty `delta`, and the partial message keeps each text or thinking block at its last released state (empty until the block ends). When the block ends, one `text_delta` / `thinking_delta` carries the whole masked body, then `text_end` / `thinking_end` carries the same text. A client that appends deltas still has the whole answer before the end event. Tool-call argument deltas are held the same way and released in one delta when the call ends. With masking off, deltas stream as they arrive.
+With secret masking on (`VINCI_CODE=1`, as every Vinci run sets it), bodies arrive at block end: each intermediate `text_delta` and `thinking_delta` carries an empty `delta`, and the partial message keeps each text or thinking block at its last released state (empty until the block ends). When the block ends, one `text_delta` / `thinking_delta` carries the whole masked body, then `text_end` / `thinking_end` carries the same text. A client that appends deltas still has the whole answer before the end event. Tool-call argument deltas are held the same way and released in one delta when the call ends.
+
+A held body (a text or thinking block, a tool call's argument text, a tool's partial result) is held for at most 1 MiB (1,048,576 bytes) and 10 minutes from its first held byte, checked as events arrive. At either bound it is written at once: masked whole when no line of it could still be changed by later text, otherwise as the placeholder `‹redacted›` (a tool call's argument text: its masked JSON when it parses, else the placeholder). Nothing more of that body is written while it streams; the final message still carries the whole body, masked. A tool call that ends without its `toolcall_end` (an abort, an error, a cut stream) shows, in its final events and in the transcript responses, each argument value that may have been cut as the placeholder, whole; no part of such a value is kept. With masking off, deltas stream as they arrive.
 
 ```json
 {
@@ -925,7 +927,7 @@ Emitted when a tool begins, streams progress, and completes execution.
 }
 ```
 
-During execution, `tool_execution_update` events stream partial results (e.g., bash output as it arrives). With secret masking on (`VINCI_CODE=1`), bodies arrive at result end: each `tool_execution_update` is still emitted, but its `partialResult` content and details are empty, and the masked output arrives in `tool_execution_end`.
+During execution, `tool_execution_update` events stream partial results (e.g., bash output as it arrives). With secret masking on (`VINCI_CODE=1`), bodies arrive at result end: each `tool_execution_update` is still emitted, but its `partialResult` content and details are empty, and the masked output arrives in `tool_execution_end`. The latest partial result of each tool call is kept: when the tool's end result does not contain its text (an error-only result, for example), or the tool never ends (input ends, the session is rebound or the mode shuts down), it is written once more, masked, as one `tool_execution_update` before that end. Its text is the placeholder `‹redacted›` (and its details are empty) when it may have been cut inside a value the mask needs whole, such as a key block. A partial result past 1 MiB, or held for 10 minutes, is written at once the same way, and later updates of that tool stay empty.
 
 ```json
 {
@@ -955,9 +957,9 @@ When complete:
 }
 ```
 
-Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update. With secret masking on (`VINCI_CODE=1`), it is empty until the result ends; use `tool_execution_end` for the output.
+Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update. With secret masking on (`VINCI_CODE=1`), it is empty until the result ends (apart from the kept partial result described above); use `tool_execution_end` for the output.
 
-With secret masking on, every string the RPC mode writes (events, command responses, extension UI requests and errors) is masked: terminal control sequences and carriage returns are removed first, as the interactive view removes them, and the written text is the normalised, masked text.
+With secret masking on, every string the RPC mode writes (events, command responses, extension UI requests and errors) is masked: terminal control strings and sequences (including DCS, APC and PM strings) and carriage returns are removed first, as the interactive view removes them, and the written text is the normalised, masked text. A provider reasoning item kept as a `thinkingSignature` has its summary (or content) texts masked joined, as they are joined into the thinking block. String, Number and Boolean objects are written as their values, and an own `__proto__` key is kept, as `JSON.stringify` writes them.
 
 ### queue_update
 

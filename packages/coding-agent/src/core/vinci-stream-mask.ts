@@ -15,13 +15,25 @@
  * way, once, before that event. A client that only appends deltas still holds the whole masked answer
  * before the end event.
  *
- * Normalisation, as the view does it before masking: terminal control sequences are stripped
- * (stripAnsi) and carriage returns removed. The written body is the normalised, masked text.
+ * Normalisation, as the view does it before masking: terminal control strings and sequences are stripped
+ * (vinciStripControlText, the function the assistant error view uses, then stripAnsi) and carriage returns
+ * removed. The written body is the normalised, masked text.
  *
  * Tool output: a `tool_execution_update` keeps its event, but its `partialResult` is emptied (its bodies
  * are held); the masked result goes out at `tool_execution_end`. A result's text parts are masked joined
  * with line breaks, as the view joins them (getTextOutput), in `tool_execution_end`, the tool result
- * message and the final events that carry it.
+ * message and the final events that carry it. The latest partial result of each tool call is kept: when
+ * the tool's end result does not contain its text (an error-only result, say), or the tool never ends (the
+ * end of the run, a new assistant message, a rebind or an exit path), it goes out once, as one
+ * `tool_execution_update`, before that end: masked whole when no line of it could still be changed by later
+ * text, otherwise its text is the placeholder.
+ *
+ * Bounds: a held body (a text or thinking block, a tool call's argument text, a tool's partial result) is
+ * held for at most VINCI_STREAM_HOLD_MAX_BYTES bytes (1 MiB) and VINCI_STREAM_HOLD_DEADLINE_MS (10 minutes)
+ * from its first held byte, checked as events arrive. At either bound it goes out at once: a block masked whole
+ * when no line of it could still be changed by later text, otherwise the placeholder; a call as when it ends any
+ * other way (and its final events show it as interrupted); a partial result as above. Nothing more of that body
+ * is held or released while it streams.
  *
  * Masking consistency for streamed tool arguments: the argument text of every tool call is held for the
  * whole call. A call whose arguments the interactive view masks (the built-in tools) releases at its end
@@ -41,23 +53,26 @@
  * An interrupted call is a held call released without its `toolcall_end` (by `message_end`, `agent_end`,
  * the next `message_start`, a stream-ending source event or an exit path). In the final events that
  * carry it (`message_end`, `turn_end`, `agent_end`, a source `error`/`done` message) and in the
- * transcript responses, each string value of its arguments keeps only the lines the hold-back would
- * have released; from the first line it would still hold to the value's end, it is the placeholder. Any
- * partial argument text the call still carries there is the placeholder. A tool-call event whose content
+ * transcript responses, a string value of its arguments is kept whole (and masked whole by the writer) only
+ * when it is complete (its partial argument text closes it) and the hold-back would release all of it;
+ * every other string value is the placeholder, whole: no prefix of it is kept. Any partial argument text
+ * the call still carries there is the placeholder. A tool-call event whose content
  * index names no tool-call block is taken to be about the call with its id, else (see TOOL_FALLBACK) a
  * call the view masks when there is one, so its text is held.
  *
  * `vinciMaskStreamJson` masks every string of an outgoing object (normalised, then masked), iteratively
  * so that a deep session tree cannot exhaust the stack. Both writers put everything they write through
  * it. A `thinkingSignature` / `textSignature` string that is the JSON of an object or array (a provider's
- * replay item) is masked decoded and written as its JSON; function-valued properties are dropped, as
- * JSON.stringify drops them. `vinciMaskViewEvent` / `vinciMaskViewMessage` / `vinciMaskViewEntry` /
+ * replay item) is masked decoded and written as its JSON; a reasoning item's summary (or content) texts are
+ * masked joined as the provider joins them for the thinking block. Function-valued properties are dropped
+ * and String, Number and Boolean objects are written as their values, as JSON.stringify writes them, and an
+ * own `__proto__` key is kept. `vinciMaskViewEvent` / `vinciMaskViewMessage` / `vinciMaskViewEntry` /
  * `vinciMaskViewTree` first show interrupted and early-ended built-in calls over-masked, retained partial
  * argument text replaced and tool output joined, then apply it.
  */
 
 import { vinciCanonicalToolName } from "@earendil-works/pi-agent-core";
-import { stripAnsi } from "../utils/ansi.ts";
+import { stripAnsi, vinciStripControlText } from "../utils/ansi.ts";
 import { sanitizeBinaryOutput } from "../utils/shell.ts";
 import { vinciMaskJson, vinciMaskSecrets } from "./vinci-mask-secrets.ts";
 
@@ -66,6 +81,57 @@ const INTERPOLATION_HOLD_LINES = 20;
 
 /** What a tool call whose held argument text does not parse releases in its place. */
 const UNPARSED_ARGUMENTS = "‹redacted›";
+
+/** The most bytes (UTF-8) one held body may reach before it goes out: 1 MiB. */
+export const VINCI_STREAM_HOLD_MAX_BYTES = 1_048_576;
+
+/** How long one body may be held, from its first held byte: 10 minutes. */
+export const VINCI_STREAM_HOLD_DEADLINE_MS = 600_000;
+
+/** The bounds of one held body, and the clock its deadline is measured with. */
+export interface VinciStreamHoldLimits {
+	maxBytes: number;
+	deadlineMs: number;
+	now: () => number;
+}
+
+let holdLimits: VinciStreamHoldLimits = {
+	maxBytes: VINCI_STREAM_HOLD_MAX_BYTES,
+	deadlineMs: VINCI_STREAM_HOLD_DEADLINE_MS,
+	now: Date.now,
+};
+
+/**
+ * Tests only: a smaller byte bound, a shorter deadline or a fake clock for every VinciStreamMask; called with
+ * nothing, the defaults again.
+ */
+export function vinciSetStreamHoldLimitsForTest(limits: Partial<VinciStreamHoldLimits> = {}): void {
+	holdLimits = {
+		maxBytes: limits.maxBytes ?? VINCI_STREAM_HOLD_MAX_BYTES,
+		deadlineMs: limits.deadlineMs ?? VINCI_STREAM_HOLD_DEADLINE_MS,
+		now: limits.now ?? Date.now,
+	};
+}
+
+/** The UTF-8 length of `text`. */
+function utf8Bytes(text: string): number {
+	return Buffer.byteLength(text, "utf8");
+}
+
+/** Whether `text` is past the byte bound (its length in UTF-16 units never exceeds its UTF-8 length). */
+function pastByteBound(text: string): boolean {
+	const max = holdLimits.maxBytes;
+	return text.length > max || (text.length * 3 > max && utf8Bytes(text) > max);
+}
+
+/**
+ * Whether a held body is past a bound: `bytes` counted as it streamed, or its current `length` (UTF-16 units),
+ * past the byte bound, or held since `started` for the deadline or longer.
+ */
+function pastBound(bytes: number, length: number, started: number | undefined, now: number): boolean {
+	if (bytes > holdLimits.maxBytes || length > holdLimits.maxBytes) return true;
+	return started !== undefined && now - started >= holdLimits.deadlineMs;
+}
 
 const KEY_BLOCK_MARKER = /-----(BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----/g;
 
@@ -86,6 +152,9 @@ interface BlockState {
 	shown: string;
 	/** The block was released (its end event, or the end of its message): its body went out once. */
 	done: boolean;
+	/** UTF-8 bytes of its deltas so far, and when its first byte was held (for the bounds). */
+	bytes: number;
+	started?: number;
 }
 
 interface ToolCallState {
@@ -101,6 +170,19 @@ interface ToolCallState {
 	 * call's): nothing is released, it shows no arguments, and a built-in call is interrupted at the end.
 	 */
 	guessed?: boolean;
+	/** UTF-8 bytes of its held text, and when its first byte was held (for the bounds). */
+	bytes: number;
+	started?: number;
+	/** Released at a bound: nothing more of its text is held, and its final events show it as interrupted. */
+	bounded?: boolean;
+}
+
+/** The latest update of a running tool, held until its end. */
+interface HeldPartial {
+	/** The tool's latest `tool_execution_update` event (its partial result is the latest one). */
+	event: Json;
+	/** When its first partial result was held. */
+	started: number;
 }
 
 /**
@@ -113,11 +195,12 @@ const VIEW_MASKED_TOOLS = new Set(["bash", "read", "grep", "find", "ls", "edit",
 type Json = any;
 
 /**
- * A body normalised as the view normalises it before masking: terminal control sequences stripped
- * (stripAnsi), then carriage returns removed.
+ * A body normalised as the view normalises it before masking: terminal control strings and sequences stripped
+ * (vinciStripControlText, the assistant error view's own normaliser, then stripAnsi), then carriage returns
+ * removed.
  */
 export function vinciNormaliseForMask(text: string): string {
-	return stripAnsi(text).replace(/\r/g, "");
+	return stripAnsi(vinciStripControlText(text)).replace(/\r/g, "");
 }
 
 /** Property names vinciMaskJson treats as secret (it masks every value under one), as already asked. */
@@ -157,19 +240,68 @@ function decodedSignature(text: string): object | undefined {
 }
 
 /**
+ * The fields of a reasoning replay item whose `text` parts the provider joins into the thinking block
+ * (openai-responses-shared.ts: `summary[].text`, else `content[].text`), and the join it uses.
+ */
+const REASONING_PART_FIELDS = ["summary", "content"];
+const REASONING_JOIN = "\n\n";
+
+/**
+ * A decoded replay item with each of its reasoning part lists masked as the thinking block is masked: the
+ * parts' texts normalised, joined as the provider joins them, then masked whole. When masking each part on its
+ * own gives the same joined text, the parts are kept (the walk masks each the same way); otherwise the masked
+ * joined body replaces their texts, as one part where the first one was. Anything else is returned as given.
+ */
+function shapeReasoningItem(decoded: object): object {
+	if (Array.isArray(decoded)) return decoded;
+	let shaped: Json = decoded;
+	for (const field of REASONING_PART_FIELDS) {
+		const parts = (decoded as Json)[field];
+		if (!Array.isArray(parts)) continue;
+		const texts = parts.filter((part: Json) => typeof part?.text === "string");
+		if (texts.length < 2) continue;
+		// Masked under the name the walk masks each part's text under.
+		const normalised = texts.map((part: Json) => vinciNormaliseForMask(part.text as string));
+		const joined = vinciMaskJson(normalised.join(REASONING_JOIN), "text") as string;
+		const each = normalised.map((text: string) => vinciMaskJson(text, "text") as string);
+		if (each.join(REASONING_JOIN) === joined) continue;
+		let placed = false;
+		const kept: Json[] = [];
+		for (const part of parts) {
+			if (typeof part?.text !== "string") kept.push(part);
+			else if (!placed) {
+				kept.push({ ...part, text: joined });
+				placed = true;
+			}
+		}
+		if (shaped === decoded) shaped = { ...decoded };
+		shaped[field] = kept;
+	}
+	return shaped;
+}
+
+/**
  * A signature string as written. When it is the JSON of an object or array, that value is masked decoded
- * (vinciMaskStreamJson) and, when that changes anything, written as the JSON of the masked value. Otherwise
- * (nothing inside is masked, or it is not such JSON) it is masked as any other string is: a signature that
- * masking and normalisation leave unchanged (compact provider JSON with no secret) is kept byte-identical, so
- * a client can still replay it.
+ * (shapeReasoningItem, then vinciMaskStreamJson) and, when that changes anything, written as the JSON of the
+ * masked value. Otherwise (nothing inside is masked, or it is not such JSON) it is masked as any other string
+ * is: a signature that masking and normalisation leave unchanged (compact provider JSON with no secret) is kept
+ * byte-identical, so a client can still replay it.
  */
 function maskSignature(text: string, name: string): unknown {
 	const decoded = decodedSignature(text);
 	if (decoded !== undefined) {
-		const masked = JSON.stringify(vinciMaskStreamJson(decoded));
+		const masked = JSON.stringify(vinciMaskStreamJson(shapeReasoningItem(decoded)));
 		if (masked !== JSON.stringify(decoded)) return masked;
 	}
 	return vinciMaskJson(vinciNormaliseForMask(text), name);
+}
+
+/** A String, Number or Boolean object as its value, as JSON.stringify reads it; anything else as given. */
+function unboxed(value: Json): Json {
+	if (value instanceof Number) return Number(value);
+	if (value instanceof String) return String(value);
+	if (value instanceof Boolean) return value.valueOf();
+	return value;
 }
 
 /**
@@ -178,7 +310,8 @@ function maskSignature(text: string, name: string): unknown {
  * holds; numbers and booleans are kept unless they are under one). Keys, numbers and structure are unchanged
  * as JSON.stringify would write them: a value with a `toJSON` method is read through it, as JSON.stringify
  * reads it, and a function value is dropped as JSON.stringify drops it (null in an array), so the output holds
- * nothing callable for JSON.stringify to call. A signature string (SIGNATURE_NAMES) goes through maskSignature.
+ * nothing callable for JSON.stringify to call; a String, Number or Boolean object is masked as its value, and an
+ * own `__proto__` key stays an own key. A signature string (SIGNATURE_NAMES) goes through maskSignature.
  * Iterative, so that a deep session tree cannot exhaust the stack; a shared object is masked once, and a cycle
  * stays a cycle (which JSON.stringify then refuses, as it refuses the raw value).
  */
@@ -195,6 +328,8 @@ export function vinciMaskStreamJson(value: unknown): unknown {
 			current = current.toJSON(key);
 		}
 		if (typeof current === "function") return DROPPED;
+		// After its one toJSON step a String, Number or Boolean object is its value, as JSON.stringify reads it.
+		current = unboxed(current);
 		if (current === null || typeof current !== "object") {
 			if (typeof current === "string" && SIGNATURE_NAMES.has(name)) return maskSignature(current, name);
 			return vinciMaskJson(typeof current === "string" ? vinciNormaliseForMask(current) : current, name);
@@ -225,7 +360,16 @@ export function vinciMaskStreamJson(value: unknown): unknown {
 		} else {
 			for (const [key, entry] of Object.entries(source)) {
 				const shown = visit(entry, key, name || key);
-				if (shown !== DROPPED) target[key] = shown;
+				if (shown === DROPPED) continue;
+				// An own "__proto__" key is defined: assigning it would set the target's prototype instead.
+				if (key === "__proto__") {
+					Object.defineProperty(target, key, {
+						value: shown,
+						enumerable: true,
+						writable: true,
+						configurable: true,
+					});
+				} else target[key] = shown;
 			}
 		}
 	}
@@ -296,6 +440,63 @@ function heldPartialResult(partial: Json): Json {
 	const held: Json = { content: [] };
 	if ("details" in partial) held.details = {};
 	return held;
+}
+
+/** The text of a tool result (or partial result) as the view shows it: its text parts normalised and joined. */
+function resultText(result: Json): string {
+	if (typeof result === "string") return normaliseToolText(result);
+	if (!result || typeof result !== "object" || !Array.isArray(result.content)) return "";
+	return result.content
+		.filter(isTextPart)
+		.map((part: Json) => normaliseToolText(part.text as string))
+		.join("\n");
+}
+
+/** A result's content with its text parts replaced by one placeholder part, where the first one was. */
+function placeholderContent(content: Json): Json[] {
+	if (!Array.isArray(content)) return [];
+	let placed = false;
+	const shown: Json[] = [];
+	for (const part of content) {
+		if (!isTextPart(part)) shown.push(part);
+		else if (!placed) {
+			shown.push({ ...part, text: UNPARSED_ARGUMENTS });
+			placed = true;
+		}
+	}
+	return shown;
+}
+
+/** Whether the hold-back would release all of `text`: its last line ends in a line break and no line of it is held. */
+function releasesWhole(text: string): boolean {
+	const scanner = new HoldScanner({ chars: 0 });
+	scanner.scan(text);
+	return scanner.released > 0 && scanner.releasedEnd + 1 >= text.length;
+}
+
+/**
+ * Continuations the mask's cross-line grammar can still join to a cut body: an angle value's closing `>`, a chained
+ * call that ends a value, and a key block's END line (built split, so this source carries no key marker).
+ */
+const SETTLE_CLOSERS: readonly string[] = [">\n", ".trim()\n", ["-----END ", "PRIVATE KEY-----\n"].join("")];
+
+/**
+ * Whether a body that may have been cut (a partial result, a body at a bound) can be masked whole: it is empty,
+ * or the hold-back would release all of it, its last line taken as complete, and its masked text stays a prefix
+ * of the mask of the body with any SETTLE_CLOSERS continuation. A body that ends inside a key block, an open `${`,
+ * an open angle value or a line that later text could still change cannot. `mask` is the caller's own mask.
+ */
+function settles(text: string, mask: (text: string) => string): boolean {
+	if (text === "") return true;
+	const whole = text.endsWith("\n") ? text : `${text}\n`;
+	if (!releasesWhole(whole)) return false;
+	const masked = mask(whole);
+	return SETTLE_CLOSERS.every((closer) => mask(`${whole}${closer}`).startsWith(masked));
+}
+
+/** The key a tool event's kept partial result is held under: its tool-call id. */
+function partialKey(event: Json): string {
+	return typeof event?.toolCallId === "string" ? event.toolCallId : "";
 }
 
 /** `event` with its `field` through `shape`: the same object when the field is absent or nothing changes. */
@@ -396,28 +597,59 @@ function isStreamingCall(block: Json): boolean {
 }
 
 /**
- * One argument value of an interrupted call: the lines the hold-back would have released, then the
- * placeholder in place of the first line it would still hold and everything after it. A last line with
- * no line break is still held (the value may have been cut inside it), so only a value ending in a
- * released line break is unchanged.
+ * One argument value of an interrupted or cut call. A value known to be `complete` that the hold-back would
+ * release whole (it ends in a released line break) is kept, and the writer masks it whole, as the view masks it.
+ * Any other value (one that may have been cut, or that the hold-back would split) is the placeholder, whole: no
+ * prefix of it is kept, since a kept prefix can lose the context that makes a value a secret.
  */
-export function vinciOverMaskHeldValue(text: string): string {
+export function vinciOverMaskHeldValue(text: string, complete = false): string {
 	if (text === "") return text;
-	const scanner = new HoldScanner({ chars: 0 });
-	scanner.scan(text);
-	if (scanner.released > 0 && scanner.releasedEnd + 1 >= text.length) return text;
-	const kept = scanner.released > 0 ? text.slice(0, scanner.releasedEnd + 1) : "";
-	return `${kept}${UNPARSED_ARGUMENTS}`;
+	if (complete && releasesWhole(text)) return text;
+	return UNPARSED_ARGUMENTS;
 }
 
-/** Every string value of `value` (at any depth) through vinciOverMaskHeldValue; keys and other values unchanged. */
-function overMaskArguments(value: unknown): unknown {
-	if (typeof value === "string") return vinciOverMaskHeldValue(value);
-	if (Array.isArray(value)) return value.map(overMaskArguments);
+/**
+ * Every string value of `value` (at any depth) through vinciOverMaskHeldValue, complete when `complete` holds
+ * it; keys and other values unchanged.
+ */
+function overMaskArguments(value: unknown, complete: ReadonlySet<string>): unknown {
+	if (typeof value === "string") return vinciOverMaskHeldValue(value, complete.has(value));
+	if (Array.isArray(value)) return value.map((entry) => overMaskArguments(entry, complete));
 	if (value && typeof value === "object") {
-		return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, overMaskArguments(entry)]));
+		return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, overMaskArguments(entry, complete)]));
 	}
 	return value;
+}
+
+/**
+ * The string values a call's partial argument text closes: each string literal of the text that ends before
+ * the text does and is followed by `,`, `}` or `]` (a value, not a key). A value it does not close may have
+ * been cut.
+ */
+function closedValueStrings(block: Json): Set<string> {
+	const closed = new Set<string>();
+	for (const field of ["partialJson", "partialArgs"]) {
+		const text = block?.[field];
+		if (typeof text !== "string" || text === UNPARSED_ARGUMENTS) continue;
+		for (let at = text.indexOf('"'); at >= 0; at = text.indexOf('"', at)) {
+			let end = at + 1;
+			while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
+			// A literal the text ends inside was cut there; nothing after it is complete.
+			if (end >= text.length) break;
+			let next = end + 1;
+			while (next < text.length && /\s/.test(text[next])) next++;
+			if (next < text.length && ",}]".includes(text[next])) {
+				try {
+					const value = JSON.parse(text.slice(at, end + 1));
+					if (typeof value === "string") closed.add(value);
+				} catch {
+					// not a JSON string literal: not complete
+				}
+			}
+			at = end + 1;
+		}
+	}
+	return closed;
 }
 
 /**
@@ -466,9 +698,12 @@ function isCutCall(block: Json): boolean {
 	});
 }
 
-/** An interrupted call as shown: arguments over-masked, any partial argument text the placeholder. */
+/**
+ * An interrupted call as shown: arguments over-masked (a value its partial argument text closes counts as
+ * complete), any partial argument text the placeholder.
+ */
 function maskCutCall(block: Json): Json {
-	const shown: Json = { ...block, arguments: overMaskArguments(block.arguments) };
+	const shown: Json = { ...block, arguments: overMaskArguments(block.arguments, closedValueStrings(block)) };
 	for (const field of ["partialJson", "partialArgs"]) {
 		if (typeof block[field] === "string" && block[field] !== "") shown[field] = UNPARSED_ARGUMENTS;
 	}
@@ -634,6 +869,10 @@ export class VinciStreamMask {
 	 */
 	private fallback = false;
 	private latest: Json = undefined;
+	/** The latest partial result of each running tool, by tool-call id, until it goes out or its end supersedes it. */
+	private partials = new Map<string, HeldPartial>();
+	/** Tools whose partial result went out at a bound: their later updates are written held and not kept. */
+	private boundedPartials = new Set<string>();
 	private readonly mask: (text: string) => string;
 	private readonly work = { chars: 0 };
 
@@ -659,10 +898,17 @@ export class VinciStreamMask {
 	 * hold only their released, masked body (empty until the block is released); a text or thinking delta
 	 * is written empty. A block's end, a stream-ending source event, `message_end`, `agent_end` and a new
 	 * assistant `message_start` are preceded by one synthesized delta per block not yet released. A tool
-	 * update's partial result is emptied; a tool result's output is masked joined. Every other event
-	 * passes through unchanged (the writer masks every string).
+	 * update's partial result is emptied (the latest one is kept until the tool ends); a tool result's output is
+	 * masked joined. Every other event passes through unchanged (the writer masks every string). A partial result
+	 * held past the deadline goes out first.
 	 */
 	process(event: Json): Json[] {
+		const expired = this.expirePartials();
+		const out = this.handle(event);
+		return expired.length > 0 ? [...expired, ...out] : out;
+	}
+
+	private handle(event: Json): Json[] {
 		switch (event?.type) {
 			case "message_start":
 				if (isAssistant(event.message)) {
@@ -691,13 +937,92 @@ export class VinciStreamMask {
 				return [...held, { ...event, messages }];
 			}
 			case "tool_execution_update":
-				// The update keeps its event; its bodies are held until the tool ends.
-				return [withField(event, "partialResult", heldPartialResult)];
+				// The update keeps its event; its bodies are held until the tool ends (the latest one is kept).
+				return [this.holdPartial(event)];
 			case "tool_execution_end":
-				return [withField(event, "result", (result: Json) => vinciMaskToolOutput(result, this.mask))];
+				return [
+					...this.endPartial(event),
+					withField(event, "result", (result: Json) => vinciMaskToolOutput(result, this.mask)),
+				];
 			default:
 				return [event];
 		}
+	}
+
+	/**
+	 * A tool update as written: its partial result is held (heldPartialResult) and kept as the tool's latest
+	 * until the tool ends. One past the byte bound goes out at once instead (shownPartial), and later updates of
+	 * that tool are written held and not kept.
+	 */
+	private holdPartial(event: Json): Json {
+		const id = partialKey(event);
+		const held = withField(event, "partialResult", heldPartialResult);
+		if (this.boundedPartials.has(id)) return held;
+		const started = this.partials.get(id)?.started ?? holdLimits.now();
+		if (pastByteBound(resultText(event.partialResult))) {
+			this.partials.delete(id);
+			this.boundedPartials.add(id);
+			return withField(event, "partialResult", (partial: Json) => this.shownPartial(partial));
+		}
+		this.partials.set(id, { event, started });
+		return held;
+	}
+
+	/**
+	 * Before a tool's end event: its kept partial result, once, when the end result does not contain its text
+	 * (an error-only end, say); nothing when it does, or when it has no text.
+	 */
+	private endPartial(event: Json): Json[] {
+		const id = partialKey(event);
+		this.boundedPartials.delete(id);
+		const held = this.partials.get(id);
+		if (!held) return [];
+		this.partials.delete(id);
+		const text = resultText(held.event.partialResult);
+		if (text === "" || resultText(event.result).includes(text)) return [];
+		return [this.releasePartial(held)];
+	}
+
+	/** Partial results held for the deadline or longer go out now; later updates of those tools are not kept. */
+	private expirePartials(): Json[] {
+		if (this.partials.size === 0) return [];
+		const now = holdLimits.now();
+		const out: Json[] = [];
+		for (const [id, held] of this.partials) {
+			if (now - held.started < holdLimits.deadlineMs) continue;
+			this.partials.delete(id);
+			this.boundedPartials.add(id);
+			out.push(this.releasePartial(held));
+		}
+		return out;
+	}
+
+	/** Every kept partial result goes out (the end of the run, a new assistant message, a rebind, an exit path). */
+	private releasePartials(): Json[] {
+		const out = [...this.partials.values()].map((held) => this.releasePartial(held));
+		this.partials.clear();
+		this.boundedPartials.clear();
+		return out;
+	}
+
+	/** A kept tool update written once more, its partial result shown (shownPartial). */
+	private releasePartial(held: HeldPartial): Json {
+		return withField(held.event, "partialResult", (partial: Json) => this.shownPartial(partial));
+	}
+
+	/**
+	 * A partial result as released: masked whole (its text parts joined, as at the tool's end) when its text can
+	 * be masked whole (settles); otherwise its text is the placeholder and its details are empty.
+	 */
+	private shownPartial(partial: Json): Json {
+		const text = resultText(partial);
+		const whole = settles(text, this.mask);
+		if (typeof partial === "string") return whole ? this.mask(text) : UNPARSED_ARGUMENTS;
+		if (!partial || typeof partial !== "object" || Array.isArray(partial)) return heldPartialResult(partial);
+		if (whole) return vinciMaskToolOutput(partial, this.mask);
+		const shown: Json = { ...partial, content: placeholderContent(partial.content) };
+		if ("details" in partial) shown.details = {};
+		return shown;
 	}
 
 	/** `event` with its `field` message through maskFinal (the same object when nothing changes). */
@@ -740,20 +1065,24 @@ export class VinciStreamMask {
 		message.content.forEach((block: Json, index: number) => {
 			if (block?.type !== "toolCall" || (!this.fallback && !viewMasksCall(block))) return;
 			const state = this.tools.get(index);
-			// A built-in call with no state of its own, or whose state took fallback text, is interrupted too;
-			// after a tool event that named no call, every call of the message is.
-			if (!this.fallback && state && state.released && !state.guessed) return;
+			// A built-in call with no state of its own, whose state took fallback text, or that went out at a bound
+			// is interrupted too; after a tool event that named no call, every call of the message is.
+			if (!this.fallback && state && state.released && !state.guessed && !state.bounded) return;
 			this.interruptedBlocks.add(block);
 			if (typeof block.id === "string" && block.id !== "") this.interruptedIds.add(block.id);
 			this.anyInterrupted = true;
 		});
 	}
 
-	/** Release whatever the streaming message still holds, masked (exit paths call this). */
+	/**
+	 * Release whatever the streaming message still holds, masked, then every kept partial result (exit paths,
+	 * `agent_end` and a new assistant message call this).
+	 */
 	flush(): Json[] {
 		const held = this.latest && (this.blocks.size > 0 || this.tools.size > 0) ? this.release(this.latest) : [];
 		this.reset();
-		return held;
+		const partials = this.releasePartials();
+		return partials.length > 0 ? [...held, ...partials] : held;
 	}
 
 	private reset(): void {
@@ -771,7 +1100,7 @@ export class VinciStreamMask {
 		if (block?.type !== "toolCall") return undefined;
 		let state = this.tools.get(index);
 		if (!state) {
-			state = { raw: "", shown: "", released: false, arguments: {} };
+			state = { raw: "", shown: "", released: false, arguments: {}, bytes: 0 };
 			this.tools.set(index, state);
 		}
 		return state;
@@ -887,7 +1216,7 @@ export class VinciStreamMask {
 	private stateFor(index: number, kind: StreamedKind): BlockState {
 		let state = this.blocks.get(index);
 		if (!state || state.kind !== kind) {
-			state = { kind, shown: "", done: false };
+			state = { kind, shown: "", done: false, bytes: 0 };
 			this.blocks.set(index, state);
 		}
 		return state;
@@ -901,11 +1230,42 @@ export class VinciStreamMask {
 		return state.shown;
 	}
 
+	/**
+	 * Release a held block at a bound, once: its body so far masked whole when no line of it could still be
+	 * changed by later text (settles), otherwise the placeholder. Nothing more of it is released while it streams.
+	 */
+	private releaseBoundedBlock(state: BlockState, raw: string): string {
+		state.done = true;
+		const body = vinciNormaliseForMask(raw);
+		state.shown = settles(body, this.mask) ? this.mask(body) : UNPARSED_ARGUMENTS;
+		return state.shown;
+	}
+
+	/**
+	 * Release every held call whose argument text is past a bound, as when it ends any other way (its text masked
+	 * when it parses, else the placeholder); its held text is dropped, its arguments are not shown while the message
+	 * streams, and its final events show it as interrupted. The released deltas are added to `added`.
+	 */
+	private releaseBoundedCalls(message: Json, now: number, added: Map<number, string>): void {
+		for (const [index, state] of this.tools) {
+			if (state.bounded || state.released) continue;
+			if (!pastBound(state.bytes, state.raw.length, state.started, now)) continue;
+			state.bounded = true;
+			const text = state.guessed
+				? this.dropGuessed(state)
+				: this.releaseCall(state, message.content[index], undefined);
+			state.arguments = {};
+			state.raw = "";
+			if (text) added.set(index, text);
+		}
+	}
+
 	private update(event: Json): Json[] {
 		const message = event.message;
 		this.latest = message;
 		const source = event.assistantMessageEvent;
 		const type = source?.type;
+		const now = holdLimits.now();
 		const streamedIndex =
 			type === "text_delta" || type === "text_end" || type === "thinking_delta" || type === "thinking_end"
 				? blockIndexOf(source, message.content, (block) => streamedKind(block) === type.split("_")[0])
@@ -917,20 +1277,27 @@ export class VinciStreamMask {
 			: -1;
 		const toolGuessed = toolIndex >= 0 && !namesToolCall(source, message.content, toolIndex);
 		if (isTool && (toolIndex < 0 || toolGuessed)) this.fallback = true;
-		let toolAdded = "";
+		const toolAdded = new Map<number, string>();
 		this.holdAllAfterFallback();
 		const toolState = toolIndex >= 0 ? this.toolStateFor(toolIndex, message.content[toolIndex]) : undefined;
 		if (toolState && toolGuessed) toolState.guessed = true;
 		this.holdAllAfterFallback();
 		if (toolState) {
-			if (type === "toolcall_delta" && typeof source.delta === "string") toolState.raw += source.delta;
+			// A released call (at its end, or at a bound) holds no more text.
+			if (type === "toolcall_delta" && typeof source.delta === "string" && !toolState.released) {
+				toolState.raw += source.delta;
+				toolState.bytes += utf8Bytes(source.delta);
+				if (toolState.started === undefined) toolState.started = now;
+			}
 			if (type === "toolcall_end") {
 				const block = message.content[toolIndex];
 				const id = source.toolCall?.id ?? block?.id;
 				if (typeof id === "string") this.interruptedIds.delete(id);
-				toolAdded = this.releaseCall(toolState, block, source.toolCall?.arguments ?? block?.arguments);
+				const text = this.releaseCall(toolState, block, source.toolCall?.arguments ?? block?.arguments);
+				if (text) toolAdded.set(toolIndex, text);
 			}
 		}
+		this.releaseBoundedCalls(message, now, toolAdded);
 		// A stream-ending source event (`done` / `error`) ends every call still held: they are interrupted.
 		const final = type === "done" ? source.message : type === "error" ? source.error : undefined;
 		if (final) this.markInterrupted(final);
@@ -944,8 +1311,16 @@ export class VinciStreamMask {
 				return tool ? this.toolBlock(block, tool) : untrackedCallBlock(block);
 			}
 			const state = this.stateFor(index, kind);
+			if (!state.done) {
+				if (state.started === undefined && block[kind] !== "") state.started = now;
+				const delta = index === streamedIndex && type.endsWith("_delta") ? source.delta : undefined;
+				if (typeof delta === "string") state.bytes += utf8Bytes(delta);
+			}
 			if (index === ending || streamEnded) {
 				const text = this.releaseBlock(state, block[kind]);
+				if (text) added.set(index, text);
+			} else if (!state.done && pastBound(state.bytes, block[kind].length, state.started, now)) {
+				const text = this.releaseBoundedBlock(state, block[kind]);
 				if (text) added.set(index, text);
 			}
 			return { ...block, [kind]: state.shown };
@@ -953,7 +1328,7 @@ export class VinciStreamMask {
 		const masked = { ...message, content };
 		const out: Json[] = [];
 		for (const [index, text] of added) out.push(this.delta(masked, index, text));
-		if (toolAdded) out.push(this.toolDelta(masked, toolIndex, toolAdded));
+		for (const [index, text] of toolAdded) out.push(this.toolDelta(masked, index, text));
 		let rewritten = source;
 		if (source && typeof source === "object") {
 			rewritten = { ...source };

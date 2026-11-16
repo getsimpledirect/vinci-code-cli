@@ -286,6 +286,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	// [vinci] --mode json with masking on: streamed bodies (text, thinking, tool-call arguments, tool output)
 	// are held whole until their block or result ends, then written once, normalised and masked.
 	const streamMask = new VinciStreamMask();
+	// [vinci] Cleared when the liveness watchdog stops the run: events that arrive after its flush are not taken,
+	// so nothing it released is released again.
+	let acceptingEvents = true;
 	const writeJsonEvent = (event: object): void => {
 		writeRawStdout(`${JSON.stringify(vinciMaskStreamJson(event))}\n`);
 	};
@@ -325,7 +328,11 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				`BLOCKED: The provider stopped responding (no activity for ${timeoutMs}ms); the print-mode run was stopped.\n`,
 			);
 			killTrackedDetachedChildren();
-			// [vinci] the watchdog exit still writes what the stream held, masked
+			// [vinci] stop taking events before the flush (a late end event would release its body again), then
+			// the watchdog exit still writes what the stream held, masked
+			terminating = true;
+			acceptingEvents = false;
+			unsubscribe?.();
 			exitAfterFlush(flushHeldJson(), 1);
 		}, timeoutMs);
 		prestreamWatchdog = watchdog;
@@ -428,6 +435,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe?.();
 		flushHeldJson(); // [vinci] a rebind ends the previous stream
 		unsubscribe = session.subscribe((event) => {
+			if (!acceptingEvents) return; // [vinci] the watchdog stopped the run
 			// Tool execution windows suspend the liveness timer — a long quiet local build is not a wedge.
 			// Hooks run with the timer armed, and tool/boundary events are handled exclusively (not
 			// also as generic activity) so the suspend/resume pairing has no ordering dependence.
