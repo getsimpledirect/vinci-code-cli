@@ -1317,7 +1317,11 @@ try {
           assert.equal(readlinkSync(join(realProject, "startup-hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot replace an intermediate link");
           sandboxed(`chmod u+w startup-ro && ln -sfn ${realProject}/startup-evil startup-ro/hop`);
           if (readOnlyDenied) assert.equal(readlinkSync(join(realProject, "startup-ro", "hop")), join(physicalRoot, "outside", "startup-real"), "the sandbox cannot make a read-only directory writable and replace the chain link in it");
-          if (readOnlyDenied) assert.ok((fs.statSync(join(realProject, "startup-ro")).mode & 0o200) !== 0, "precondition: the sandboxed chmod of the read-only directory ran");
+          // The directory holding the link may itself refuse the sandboxed chmod (vinciProtectedAncestorPaths), so make
+          // it writable outside the sandbox: the link stays protected on its own, not only by the directory's mode.
+          chmodSync(join(realProject, "startup-ro"), 0o755);
+          assert.equal(sandboxed(`ln -sfn ${realProject}/startup-evil startup-ro/hop`), false, "the sandbox cannot replace the chain link once its directory is writable");
+          assert.equal(readlinkSync(join(realProject, "startup-ro", "hop")), join(physicalRoot, "outside", "startup-real"), "the chain link in a writable directory still resolves to its destination");
         } finally {
           if (previousCode === undefined) delete process.env.VINCI_CODE;
           else process.env.VINCI_CODE = previousCode;
@@ -1327,6 +1331,85 @@ try {
       // A grant never follows a dangling link out of the project.
       symlinkSync(join(physicalRoot, "outside", "grant-target"), join(physicalProject, "dangling-out"));
       assert.equal(toolDefinitions.vinciSandboxWriteGranted(physicalProject, `${physicalProject}/dangling-out`), false, "the sandbox refuses a write through a dangling link");
+      // The directories holding a protected chain stay in place: ~/.bash_logout -> <project>/gp/startup-ro/hop ->
+      // outside/startup-real, with the link's directory read-only (R, 0555) or writable (W, 0755). Each variant uses
+      // its own home, so only this chain is protected. Writes inside those directories, and renaming an unrelated
+      // directory, stay allowed.
+      {
+        const ancestorCore = await loader.import(resolve(here, "../../packages/coding-agent/dist/core/vinci-sandbox.js"), { default: false });
+        const chainTarget = join(physicalRoot, "outside", "startup-real");
+        const physicalTarget = realpathSync.native(chainTarget);
+        const targetBytes = readFileSync(chainTarget);
+        const gp = join(realProject, "gp");
+        const linkDirectory = join(gp, "startup-ro");
+        const cleanupAncestorFixture = (home) => {
+          for (const directory of [join(gp, "startup-ro"), join(realProject, "gp.aside", "startup-ro")]) {
+            try { chmodSync(directory, 0o755); } catch {}
+          }
+          for (const path of [gp, join(realProject, "gp.aside"), join(realProject, "other"), join(realProject, "other2"), home]) rmSync(path, { recursive: true, force: true });
+          rmSync(join(realProject, "ancestor-root.txt"), { force: true });
+        };
+        for (const [variant, mode] of [["R", 0o555], ["W", 0o755]]) {
+          const ancestorHome = join(physicalRoot, `home-ancestor-${variant}`);
+          const suffix = ` (link directory ${mode.toString(8).padStart(4, "0")})`;
+          cleanupAncestorFixture(ancestorHome);
+          mkdirSync(ancestorHome);
+          mkdirSync(linkDirectory, { recursive: true });
+          mkdirSync(join(realProject, "other"));
+          symlinkSync(chainTarget, join(linkDirectory, "hop"));
+          symlinkSync(join(linkDirectory, "hop"), join(ancestorHome, ".bash_logout"));
+          chmodSync(linkDirectory, mode);
+          process.env.HOME = ancestorHome;
+          try {
+            assert.equal(realpathSync.native(join(ancestorHome, ".bash_logout")), physicalTarget, `precondition: the protected link resolves through gp${suffix}`);
+            if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) {
+              const previousCode = process.env.VINCI_CODE;
+              const previousNoSandbox = process.env.VINCI_NO_SANDBOX;
+              process.env.VINCI_CODE = "1";
+              delete process.env.VINCI_NO_SANDBOX;
+              const sandboxedHere = (command) => {
+                try {
+                  execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", ancestorCore.vinciSandboxWrap(command, realProject)], { cwd: realProject, timeout: 10000, env: { ...localShellEnv, HOME: ancestorHome }, stdio: "pipe" });
+                  return true;
+                } catch {
+                  return false;
+                }
+              };
+              try {
+                // Positive controls first: they hold on every build, so the first failing assertion is the rename row.
+                assert.equal(sandboxedHere("echo one > gp/inside.txt && echo two >> gp/inside.txt && echo one > ancestor-root.txt && echo two >> ancestor-root.txt"), true, `sandboxed create and edit inside an ancestor of a protected link succeed${suffix}`);
+                assert.equal(readFileSync(join(gp, "inside.txt"), "utf8"), "one\ntwo\n", `the sandboxed write inside gp landed${suffix}`);
+                assert.equal(readFileSync(join(realProject, "ancestor-root.txt"), "utf8"), "one\ntwo\n", `the sandboxed write inside the project root landed${suffix}`);
+                assert.equal(sandboxedHere("mv other other2"), true, `sandboxed rename of an unrelated project directory succeeds${suffix}`);
+                assert.ok(!existsSync(join(realProject, "other")) && existsSync(join(realProject, "other2")), `the unrelated directory was renamed${suffix}`);
+                const renamed = sandboxedHere("mv gp gp.aside");
+                assert.equal(renamed, false, `sandboxed rename of an ancestor of a protected link is denied${suffix}`);
+                assert.ok(existsSync(gp) && !existsSync(join(realProject, "gp.aside")), `the ancestor of the protected link stays in place${suffix}`);
+                assert.equal(realpathSync.native(join(ancestorHome, ".bash_logout")), physicalTarget, `the protected link still resolves to its destination${suffix}`);
+                assert.ok(readFileSync(chainTarget).equals(targetBytes), `the protected destination's bytes are unchanged${suffix}`);
+              } finally {
+                if (previousCode === undefined) delete process.env.VINCI_CODE;
+                else process.env.VINCI_CODE = previousCode;
+                if (previousNoSandbox !== undefined) process.env.VINCI_NO_SANDBOX = previousNoSandbox;
+              }
+            }
+            // Membership: an older build without the export fails this row with a message, not the whole file with a TypeError.
+            if (typeof ancestorCore.vinciProtectedAncestorPaths !== "function") {
+              assert.fail(`the protected-ancestor list is exported by the sandbox module${suffix}`);
+            }
+            const ancestors = ancestorCore.vinciProtectedAncestorPaths(physicalProject);
+            assert.ok(ancestors.includes(linkDirectory), `the protected-ancestor list holds the link's directory${suffix}`);
+            assert.ok(ancestors.includes(gp), `the protected-ancestor list holds gp${suffix}`);
+            assert.ok(ancestors.includes(realProject), `the protected-ancestor list holds the project${suffix}`);
+            assert.ok(!ancestors.includes("/"), `the protected-ancestor list never holds the filesystem root${suffix}`);
+            assert.ok(!toolDefinitions.vinciSensitiveNoWrite(physicalProject).some((entry) => entry === gp || entry === realProject), `gp and the project stay out of the subtree protections${suffix}`);
+          } finally {
+            process.env.HOME = fakeHome;
+            cleanupAncestorFixture(ancestorHome);
+          }
+        }
+        check("the directories holding a protected chain stay in place while writes inside them succeed", true);
+      }
     } finally {
       try { chmodSync(join(realpathSync.native(physicalProject), "startup-ro"), 0o755); } catch {}
       if (previousHome === undefined) delete process.env.HOME;

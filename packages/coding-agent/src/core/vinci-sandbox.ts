@@ -149,7 +149,13 @@ function canonicalWritePath(path: string): string | undefined {
  * path. Fail closed: an unreadable component is protected itself.
  */
 function protectedWritePaths(path: string): string[] {
+	return protectedWalk(path).paths;
+}
+
+/** The walk behind protectedWritePaths: its protected paths, and the replaceable links it visited (in order). */
+function protectedWalk(path: string): { paths: string[]; links: string[] } {
 	const out = new Set<string>();
+	const replaceable: string[] = [];
 	let pending = unresolvedAbsolute(path)
 		.split(sep)
 		.filter((part) => part !== "");
@@ -174,12 +180,15 @@ function protectedWritePaths(path: string): string[] {
 		} catch (error) {
 			out.add(next);
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") out.add(resolve(next, ...pending));
-			return [...out];
+			return { paths: [...out], links: replaceable };
 		}
 		if (isLink) {
-			if (userCanReplace(next)) out.add(next);
+			if (userCanReplace(next)) {
+				out.add(next);
+				replaceable.push(next);
+			}
 			// The OS refuses to resolve more than 32 links (ELOOP), so a longer chain cannot be written through.
-			if (++links > 32) return [...out];
+			if (++links > 32) return { paths: [...out], links: replaceable };
 			const destination = readlinkSync(next);
 			pending = [...destination.split(sep).filter((piece) => piece !== ""), ...pending];
 			if (isAbsolute(destination)) current = sep;
@@ -188,7 +197,7 @@ function protectedWritePaths(path: string): string[] {
 		current = realOrSelf(next);
 	}
 	out.add(current);
-	return [...out];
+	return { paths: [...out], links: replaceable };
 }
 
 /**
@@ -406,6 +415,27 @@ export function vinciSensitiveNoWrite(_cwd: string): string[] {
 }
 
 /**
+ * [vinci] Directories that hold a protected chain: every physical ancestor of each replaceable link the protected
+ * walk visits (a protected entry that is itself such a link included), up to but not including the filesystem root,
+ * that this user could replace. The macOS seatbelt profile denies writes to each directory itself, so renaming,
+ * removing or re-moding it is refused while creating and editing entries inside it stays allowed. Kept out of
+ * vinciSensitiveNoWrite, which protects whole subtrees. macOS seatbelt only; bubblewrap does not use this list.
+ * Cost: in the sandbox, renaming such a directory, including a project root that holds part of a protected chain,
+ * is refused. Fail closed like the walk: a directory whose ownership cannot be read is included.
+ */
+export function vinciProtectedAncestorPaths(_cwd: string): string[] {
+	const out = new Set<string>();
+	for (const entry of protectedEntryPaths()) {
+		for (const link of protectedWalk(entry).links) {
+			for (let directory = dirname(link); directory !== dirname(directory); directory = dirname(directory)) {
+				if (userCanReplace(directory)) out.add(directory);
+			}
+		}
+	}
+	return [...out];
+}
+
+/**
  * Protected paths bubblewrap binds read-only. Bind mounts follow links, so a chain link would make its whole
  * destination read-only; its destination is listed on its own. Chain links are protected by the macOS profile only.
  */
@@ -439,6 +469,10 @@ function seatbeltProfile(
 	const sensitive = vinciSensitiveNoWrite(cwd)
 		.map((r) => `(subpath "${esc(r)}")`)
 		.join(" ");
+	// [vinci] The directories holding a protected chain themselves (not their contents) stay in place.
+	const ancestors = vinciProtectedAncestorPaths(cwd)
+		.map((r) => `(literal "${esc(r)}")`)
+		.join(" ");
 	const sensitiveReads = vinciSensitiveNoRead(cwd)
 		.map((r) => `(subpath "${esc(r)}")`)
 		.join(" ");
@@ -460,6 +494,7 @@ function seatbeltProfile(
 		`(allow file-write* ${roots})`,
 		'(allow file-write* (subpath "/dev"))', // /dev/null, /dev/tty, ptys
 		sensitive ? `(deny file-write* ${sensitive})` : "", // crown jewels stay read-only (last match wins)
+		ancestors ? `(deny file-write* ${ancestors})` : "",
 		files ? `(allow file-write* ${files})` : "", // explicit file authority does not unlock its parent
 		!sensitiveReadAllowed && sensitiveReads ? `(deny file-read* ${sensitiveReads})` : "",
 	]
