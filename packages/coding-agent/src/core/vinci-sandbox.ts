@@ -152,10 +152,10 @@ function protectedWritePaths(path: string): string[] {
 	return protectedWalk(path).paths;
 }
 
-/** The walk behind protectedWritePaths: its protected paths, and the replaceable links it visited (in order). */
+/** The walk behind protectedWritePaths: its protected paths, and every link it visited (in order), replaceable or not. */
 function protectedWalk(path: string): { paths: string[]; links: string[] } {
 	const out = new Set<string>();
-	const replaceable: string[] = [];
+	const chainLinks: string[] = [];
 	let pending = unresolvedAbsolute(path)
 		.split(sep)
 		.filter((part) => part !== "");
@@ -180,15 +180,15 @@ function protectedWalk(path: string): { paths: string[]; links: string[] } {
 		} catch (error) {
 			out.add(next);
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") out.add(resolve(next, ...pending));
-			return { paths: [...out], links: replaceable };
+			return { paths: [...out], links: chainLinks };
 		}
 		if (isLink) {
-			if (userCanReplace(next)) {
-				out.add(next);
-				replaceable.push(next);
-			}
+			if (userCanReplace(next)) out.add(next);
+			// Every visited link feeds the ancestor pass, even one this user cannot replace: its parent may be locked
+			// while a directory above it can still be renamed aside.
+			chainLinks.push(next);
 			// The OS refuses to resolve more than 32 links (ELOOP), so a longer chain cannot be written through.
-			if (++links > 32) return { paths: [...out], links: replaceable };
+			if (++links > 32) return { paths: [...out], links: chainLinks };
 			const destination = readlinkSync(next);
 			pending = [...destination.split(sep).filter((piece) => piece !== ""), ...pending];
 			if (isAbsolute(destination)) current = sep;
@@ -197,7 +197,7 @@ function protectedWalk(path: string): { paths: string[]; links: string[] } {
 		current = realOrSelf(next);
 	}
 	out.add(current);
-	return { paths: [...out], links: replaceable };
+	return { paths: [...out], links: chainLinks };
 }
 
 /**
@@ -415,8 +415,8 @@ export function vinciSensitiveNoWrite(_cwd: string): string[] {
 }
 
 /**
- * [vinci] Directories that hold a protected chain: every physical ancestor of each replaceable link the protected
- * walk visits (a protected entry that is itself such a link included), up to but not including the filesystem root,
+ * [vinci] Directories that hold a protected chain: every physical ancestor of each link the protected walk
+ * visits, whether or not this user can replace the link (a protected entry that is itself a link included), up to but not including the filesystem root,
  * that this user could replace. The macOS seatbelt profile denies writes to each directory itself, so renaming,
  * removing or re-moding it is refused while creating and editing entries inside it stays allowed. Kept out of
  * vinciSensitiveNoWrite, which protects whole subtrees. macOS seatbelt only; bubblewrap does not use this list.
@@ -494,8 +494,8 @@ function seatbeltProfile(
 		`(allow file-write* ${roots})`,
 		'(allow file-write* (subpath "/dev"))', // /dev/null, /dev/tty, ptys
 		sensitive ? `(deny file-write* ${sensitive})` : "", // crown jewels stay read-only (last match wins)
-		ancestors ? `(deny file-write* ${ancestors})` : "",
 		files ? `(allow file-write* ${files})` : "", // explicit file authority does not unlock its parent
+		ancestors ? `(deny file-write* ${ancestors})` : "", // after the file grants: a grant naming a chain directory cannot reopen it
 		!sensitiveReadAllowed && sensitiveReads ? `(deny file-read* ${sensitiveReads})` : "",
 	]
 		.filter(Boolean)

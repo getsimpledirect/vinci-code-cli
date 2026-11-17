@@ -46,7 +46,7 @@ only patch core when there's no hook.)
 | `coding-agent/src/core/extensions/runner.ts` | Default the extension overlay-focus query to false outside interactive UI | — |
 | `coding-agent/src/core/extensions/types.ts` | Expose an optional overlay-focus query to extensions; optional `AgentEndEvent.retryCancelled` (#166); `newRequest` send option and `AgentStartEvent.newRequest` (#170) | — |
 | `coding-agent/src/core/vinci-grader.ts` | Shared grader core (verification system): untracked-aware diff, skeptical prompt, verdict parse, completion-claim detector — one check for core + `vinci-review`/`vinci-todo` | 8 |
-| `coding-agent/src/core/vinci-sandbox.ts` | Protect ancestor directories of protected startup files from rename (macOS seatbelt) | — |
+| `coding-agent/src/core/vinci-sandbox.ts` | Refuse renaming the ancestor directories the user could replace, of each link on a protected startup file's chain (macOS seatbelt; denied after explicit file grants) | — |
 | `coding-agent/src/core/auth-guidance.ts` | Warm managed sign-in copy; selected-provider credential guidance through `/other` | 4,9 |
 | `coding-agent/src/core/slash-commands.ts` | Register the Vinci-only `/other` command for autocomplete | 4 |
 | `coding-agent/src/core/keybindings.ts` | Free `shift+tab` for the Auto/Plan cycle | 11 |

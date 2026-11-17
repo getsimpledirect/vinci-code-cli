@@ -1403,12 +1403,73 @@ try {
             assert.ok(ancestors.includes(realProject), `the protected-ancestor list holds the project${suffix}`);
             assert.ok(!ancestors.includes("/"), `the protected-ancestor list never holds the filesystem root${suffix}`);
             assert.ok(!toolDefinitions.vinciSensitiveNoWrite(physicalProject).some((entry) => entry === gp || entry === realProject), `gp and the project stay out of the subtree protections${suffix}`);
+            if (mode === 0o555 && process.getuid?.() !== 0) {
+              // A link whose own directory this user cannot replace still protects the directories above it. The
+              // directory is 0555; faking another uid makes the user no longer its owner, so the link is not replaceable.
+              const realGetuid = process.getuid;
+              process.getuid = () => realGetuid.call(process) + 1;
+              try {
+                assert.throws(() => fs.accessSync(linkDirectory, fs.constants.W_OK), "precondition: the link's directory is not writable");
+                assert.notEqual(fs.statSync(linkDirectory).uid, process.getuid(), "precondition: under the seam this user does not own the link's directory");
+                const lockedAncestors = ancestorCore.vinciProtectedAncestorPaths(physicalProject);
+                assert.ok(lockedAncestors.includes(gp), "a link whose directory cannot be replaced still protects gp");
+                assert.ok(lockedAncestors.includes(linkDirectory), "a link whose directory cannot be replaced still protects that directory, which gp lets the user rename");
+                assert.ok(lockedAncestors.includes(realProject), "a link whose directory cannot be replaced still protects the project");
+                assert.ok(!lockedAncestors.includes("/"), "the protected-ancestor list never holds the filesystem root (unreplaceable link)");
+              } finally {
+                process.getuid = realGetuid;
+              }
+              check("a link whose own directory is locked still protects the directories above it", true);
+            }
           } finally {
             process.env.HOME = fakeHome;
             cleanupAncestorFixture(ancestorHome);
           }
         }
         check("the directories holding a protected chain stay in place while writes inside them succeed", true);
+        // A cached file grant can name a directory after the original file is replaced. The ancestor deny
+        // must still win; build the macOS wrapper's profile without executing a sandboxed command.
+        if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) {
+          const ancestorHome = join(physicalRoot, "home-ancestor-file-grant");
+          const previousFiles = process.env.VINCI_SANDBOX_WRITE_FILES;
+          const previousCode = process.env.VINCI_CODE;
+          const previousNoSandbox = process.env.VINCI_NO_SANDBOX;
+          cleanupAncestorFixture(ancestorHome);
+          mkdirSync(ancestorHome);
+          process.env.HOME = ancestorHome;
+          try {
+            writeFileSync(gp, "file grant\n");
+            process.env.VINCI_SANDBOX_WRITE_FILES = JSON.stringify([gp]);
+            // HOME and the JSON value form the configured-path cache key; keep both unchanged below.
+            assert.equal(ancestorCore.vinciSandboxWriteGranted(ancestorHome, gp), true, "precondition: the regular file has an explicit file grant");
+            rmSync(gp);
+            mkdirSync(linkDirectory, { recursive: true });
+            symlinkSync(chainTarget, join(linkDirectory, "hop"));
+            symlinkSync(join(linkDirectory, "hop"), join(ancestorHome, ".bash_logout"));
+            process.env.VINCI_CODE = "1";
+            delete process.env.VINCI_NO_SANDBOX;
+            const wrapped = ancestorCore.vinciSandboxWrap("true", realProject);
+            const profile = wrapped.match(/^\/usr\/bin\/sandbox-exec -p '((?:[^']|'\\'')*)' /)?.[1]?.replace(/'\\''/g, "'");
+            assert.ok(profile, "precondition: the wrapper embeds a seatbelt profile");
+            const literal = `(literal "${gp.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}")`;
+            const fileAllow = `(allow file-write* ${literal})`;
+            // The deny clause that names gp itself, not merely the first deny clause in the profile.
+            const ancestorDeny = (profile.match(/\(deny file-write\* (?:\(literal "(?:\\.|[^"\\])*"\) ?)+\)/g) ?? []).find((clause) => clause.includes(literal));
+            assert.ok(profile.includes(fileAllow), "precondition: the profile explicitly allows the file grant naming gp");
+            assert.ok(ancestorDeny?.includes(literal), "precondition: the ancestor deny names the same gp directory");
+            assert.ok(profile.lastIndexOf(ancestorDeny) > profile.indexOf(fileAllow), "the ancestor deny follows the explicit file allow for the same directory");
+            check("a file grant naming a protected-chain directory cannot override its ancestor deny", true);
+          } finally {
+            if (previousFiles === undefined) delete process.env.VINCI_SANDBOX_WRITE_FILES;
+            else process.env.VINCI_SANDBOX_WRITE_FILES = previousFiles;
+            if (previousCode === undefined) delete process.env.VINCI_CODE;
+            else process.env.VINCI_CODE = previousCode;
+            if (previousNoSandbox === undefined) delete process.env.VINCI_NO_SANDBOX;
+            else process.env.VINCI_NO_SANDBOX = previousNoSandbox;
+            process.env.HOME = fakeHome;
+            cleanupAncestorFixture(ancestorHome);
+          }
+        }
       }
     } finally {
       try { chmodSync(join(realpathSync.native(physicalProject), "startup-ro"), 0o755); } catch {}
