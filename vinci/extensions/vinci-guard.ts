@@ -772,7 +772,11 @@ function shellWriteTokens(command: string, depth: number): {
       const ahead = tokenLookahead(command, index);
       if (ahead.text.startsWith(frame.close)) {
         const end = ahead.ends[frame.close.length - 1];
-        if (frame.close === ")" || frame.close === "`") current.nested.push(command.slice(frame.contentStart, index));
+        // Only an outermost substitution is collected: its text is tokenized again one level down, which finds the
+        // substitutions inside it, so each span is tokenized once per level instead of once per enclosing level.
+        if ((frame.close === ")" || frame.close === "`") && !frames.slice(0, -1).some((outer) => outer.close === ")" || outer.close === "`")) {
+          current.nested.push(command.slice(frame.contentStart, index));
+        }
         frames.pop();
         if (frames.length === 0) word.push(command.slice(frame.start, end));
         else frames[frames.length - 1].delimiter?.parts.push(command.slice(frame.start, end));

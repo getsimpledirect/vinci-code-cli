@@ -2154,6 +2154,12 @@ try {
     ["R10b", "unterminated nonwriter input containing > fails closed", 'true "x > f'],
     ["R10d", "unterminated input mentioning a writer fails closed", "true 'tee"],
     ["R11", "input nested past the depth cap fails closed", "echo " + "$(".repeat(33) + "true" + ")".repeat(33)],
+    ["R12", "an explicit 1> is a file redirect", "echo x 1> f"],
+    ["R13", "a tee behind a quote in a comment is a writer", "true # '\ntee f"],
+    ["R14", "an in-place sed behind a quote in a comment is a writer", "true # '\nsed -i s/a/b/ f"],
+    ["R15", "an in-place perl inside a substitution is a writer", "x=$(perl -pi -e 1 f)"],
+    ["R16", "a write in the innermost span of a three-deep nest", "x=$(true $(true $(echo y > f)))"],
+    ["R17", "a write at nesting depth 31", "echo " + "$(".repeat(31) + "echo y > f" + ")".repeat(31)],
   ]) {
     const selectionCount = selections.length;
     const controlCount = controls.length;
@@ -2192,6 +2198,18 @@ try {
       guard.isShellFileWrite(command) === false && result === undefined && selections.length === selectionCount,
     );
   }
+  {
+    // 32 nested substitutions, each with padding, at exactly the length cap and with no write: depth 32 is allowed.
+    let nest = "true";
+    for (let level = 0; level < 32; level++) nest = "$(true " + "a".repeat(8182) + " " + nest + ")";
+    const command = "echo " + nest + " " + "b".repeat(262144 - 5 - nest.length - 1);
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      "168 R11c: a padded 32-deep nest at the length cap with no write is not a write",
+      command.length === 262144 && guard.isShellFileWrite(command) === false && result === undefined && selections.length === selectionCount,
+    );
+  }
   for (const [row, command, expected] of [
     ["R10c", 'echo "x', false],
     ["C2", "echo x >&2", false],
@@ -2212,6 +2230,7 @@ try {
     // These controls distinguish the comment and escape rules from the conservative fallback.
     ["C-comment", "true # '\necho tee", false],
     ["C-esc", "true \\& echo x 2>&1 > f", false],
+    ["C-nest3", "x=$(true $(true $(true)))", false],
   ]) {
     const selectionCount = selections.length;
     const result = await toolCall("bash", { command });
