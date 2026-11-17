@@ -875,6 +875,7 @@ run_group crew-loopbreak-integration node --test "${ROOT}/vinci/test/crew-loopbr
 # finalization git commands exempt from the reserve (never push/network).
 run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-harness-integration.mjs"
 run_group guard-integration node "${ROOT}/vinci/test/guard-integration.mjs"
+run_group guard-trust-order node "${ROOT}/vinci/test/guard-trust-order.mjs"
 run_group input-images node "${ROOT}/vinci/test/input-images.test.mjs"
 # Replay failed tool results offline; guidance must preserve raw errors without inventing their cause.
 run_group guard-error-guidance-integration node --test "${ROOT}/vinci/test/guard-error-guidance-integration.mjs"
