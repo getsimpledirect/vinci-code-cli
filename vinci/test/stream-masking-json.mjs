@@ -2838,3 +2838,166 @@ for (const kind of ["text", "thinking"]) {
 		}
 	}
 }
+
+// 206g (#227): every ECMAScript WhiteSpace and LineTerminator code point, independently named.
+const gapWhitespaceCases = [
+	["U+0009", "\u0009"],
+	["U+000A", "\u000a"],
+	["U+000B", "\u000b"],
+	["U+000C", "\u000c"],
+	["U+000D", "\u000d"],
+	["U+0020", "\u0020"],
+	["U+00A0", "\u00a0"],
+	["U+1680", "\u1680"],
+	["U+2000", "\u2000"],
+	["U+2001", "\u2001"],
+	["U+2002", "\u2002"],
+	["U+2003", "\u2003"],
+	["U+2004", "\u2004"],
+	["U+2005", "\u2005"],
+	["U+2006", "\u2006"],
+	["U+2007", "\u2007"],
+	["U+2008", "\u2008"],
+	["U+2009", "\u2009"],
+	["U+200A", "\u200a"],
+	["U+2028", "\u2028"],
+	["U+2029", "\u2029"],
+	["U+202F", "\u202f"],
+	["U+205F", "\u205f"],
+	["U+3000", "\u3000"],
+	["U+FEFF", "\ufeff"],
+];
+
+for (const [label, separator] of gapWhitespaceCases) {
+	test(`json 206g (#227): direct ${label}`, () => {
+		const { vinciOpenAngleLine } = streamMaskModule;
+		const message = `206g (#227): the opener is found across ${label}`;
+		assert.equal(typeof vinciOpenAngleLine, "function", message);
+		assert.equal(vinciOpenAngleLine(`TOKEN=${separator}<abc\ndef`), 0, message);
+		assert.equal(vinciOpenAngleLine(`${separator}<abc\ndef`), 0, message);
+		assert.ok(vinciOpenAngleLine(`TOKEN=${separator}<abc>`) < 0, message);
+	});
+}
+
+test("json 206g (#227): direct mixed Unicode whitespace", () => {
+	const { vinciOpenAngleLine } = streamMaskModule;
+	const separator = "\u00a0\u1680\u2003\u2028\ufeff";
+	const message = "206g (#227): the opener is found across U+00A0 U+1680 U+2003 U+2028 U+FEFF";
+	assert.equal(typeof vinciOpenAngleLine, "function", message);
+	assert.equal(vinciOpenAngleLine(`TOKEN=${separator}<abc\ndef`), 0, message);
+	assert.equal(vinciOpenAngleLine(`${separator}<abc\ndef`), 0, message);
+	assert.ok(vinciOpenAngleLine(`TOKEN=${separator}<abc>`) < 0, message);
+});
+
+for (const [label, separator] of gapWhitespaceCases) {
+	// vinci-stream-mask.ts:381-382, vinciNormaliseForMask's .replace(/\r/g, "") removes CR before masking.
+	if (label === "U+000D") continue;
+	test(`json 206g (#227): writer ${label}`, async () => {
+		const where = `206g (#227): ${label}`;
+		const { secret } = angleWhitespaceCases()[0];
+		const body = `TOKEN=${separator}<\n${secret}\n`;
+		const { events } = angleEndingEvents(body, "text", true, "error");
+		assert.ok(events.some((event) => event.assistantMessageEvent?.delta === body), `${where}: the open value is streamed`);
+		const out = await runJson(events);
+		assertCompleted(out, ["message_end", "turn_end", "agent_end"], where);
+		assertNoSecretBytes(out.stdout, [secret], `${where}: no raw byte of the open value reaches stdout`);
+		assertNoFiveCharacterSecret(out.stdout, secret, `${where}: no raw byte of the open value reaches stdout`);
+		assert.equal(deltasOf(out.events), PLACEHOLDER, `${where}: the angle value stays held`);
+		assert.ok(out.events.some((event) => event.assistantMessageEvent?.type === "error"), `${where}: the source cut is written`);
+		for (const event of finalEventsOf(out.events)) {
+			const message = event.type === "agent_end" ? event.messages[0] : event.message;
+			assert.equal(fieldOf(message), PLACEHOLDER, `${where}: ${event.type} holds the open value`);
+		}
+	});
+}
+
+// 206g (#229/#230): isolate each metadata charge from argument bytes, with the same normal-end control.
+for (const [issue, metadataOn, label] of [
+	["#229", "call", "held call metadata crosses the byte bound"],
+	["#230", "message", "message metadata crosses the held call byte bound"],
+	["#229/#230", "none", "held call without oversized metadata ends normally"],
+]) {
+	test(`json 206g (${issue}): ${label}`, async () => {
+		const where = `206g (${issue})`;
+		const set = holdLimitsSetter();
+		const cap = 1024;
+		const { secret } = angleWhitespaceCases()[0];
+		const args = { command: `printf 'TOKEN=${secret}'`, timeout: 30, note: "ordinary arguments" };
+		const json = JSON.stringify(args);
+		const payload = "opaque metadata; ".repeat(65);
+		const callMetadata = metadataOn === "call" ? { thoughtSignature: payload } : {};
+		const messageMetadata = metadataOn === "message" ? { providerMetadata: payload } : {};
+		const argumentBytes = Buffer.byteLength(json, "utf8");
+		const callMetadataBytes = Buffer.byteLength(JSON.stringify(callMetadata), "utf8");
+		const messageMetadataBytes = Buffer.byteLength(JSON.stringify(messageMetadata), "utf8");
+		assert.ok(argumentBytes >= 80 && argumentBytes <= 160, `${where}: fixture sanity: small arguments are held`);
+		if (metadataOn === "call") {
+			assert.ok(argumentBytes + messageMetadataBytes < cap, `${where}: fixture sanity: args + message metadata < 1024`);
+			assert.ok(argumentBytes + callMetadataBytes > cap, `${where}: fixture sanity: args + call metadata > 1024`);
+		} else if (metadataOn === "message") {
+			assert.ok(argumentBytes + callMetadataBytes < cap, `${where}: fixture sanity: args + call metadata < 1024`);
+			assert.ok(argumentBytes + messageMetadataBytes > cap, `${where}: fixture sanity: args + message metadata > 1024`);
+		} else {
+			assert.ok(argumentBytes + callMetadataBytes + messageMetadataBytes < cap, `${where}: fixture sanity: the control stays below 1024`);
+		}
+		const head = probeCallEvents([json]);
+		const first = head[0].message;
+		head.splice(1, 0, { type: "message_update", message: first, assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: first } });
+		const held = head.at(-1).message;
+		const call = { ...held.content[0], ...callMetadata };
+		const message = { ...held, ...messageMetadata, content: [call] };
+		const update = { type: "message_update", message, assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: "", partial: message } };
+		const final = { ...message, content: [{ ...call, arguments: args }], stopReason: "toolUse" };
+		const tail = [
+			{ type: "message_update", message: final, assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: final.content[0], partial: final } },
+			{ type: "message_update", message: final, assistantMessageEvent: { type: "done", reason: "toolUse", message: final } },
+			{ type: "message_end", message: final },
+			{ type: "agent_end", messages: [final] },
+		];
+		let out;
+		let beforeBound;
+		let atBound;
+		let retained;
+		set({ maxBytes: cap });
+		try {
+			out = await runJson(head, {
+				during: async ({ listener, stdout }) => {
+					await waitForRawStdoutBackpressure();
+					beforeBound = parseLines(stdout());
+					listener(update);
+					await waitForRawStdoutBackpressure();
+					atBound = parseLines(stdout());
+					for (const event of tail) listener(event);
+				},
+			});
+			const stream = new VinciStreamMask();
+			for (const event of head) stream.process(event);
+			stream.process(update);
+			// Measure before the normal end resets the stream, at the same update observed on stdout.
+			retained = retainedStringBytes(stream);
+			for (const event of tail) stream.process(event);
+		} finally {
+			set();
+		}
+		assert.equal(deltasOf(beforeBound, "toolcall"), "", `${where}: the small call is held before the metadata update`);
+		const crossing = atBound.slice(beforeBound.length);
+		assert.ok(crossing.some((event) => event.assistantMessageEvent?.type === "toolcall_delta"), `${where}: the metadata update is written`);
+		if (metadataOn === "none") {
+			assert.notEqual(deltasOf(crossing, "toolcall"), PLACEHOLDER, `${where}: the control is not released as the placeholder at the update`);
+			assert.equal(deltasOf(crossing, "toolcall"), "", `${where}: the control stays held at the update`);
+			assert.equal(deltasOf(out.events, "toolcall"), JSON.stringify(vinciMaskJson(args)), `${where}: the normal end releases the real arguments, masked as usual`);
+			const end = out.events.find((event) => event.type === "message_end");
+			assert.deepEqual(end?.message.content[0].arguments, vinciMaskJson(args), `${where}: message_end keeps the real arguments, masked as usual`);
+		} else {
+			assert.equal(deltasOf(crossing, "toolcall"), PLACEHOLDER, `${where}: the call is released as the placeholder at the bound`);
+			assert.equal(deltasOf(out.events, "toolcall"), PLACEHOLDER, `${where}: the normal end releases no argument text again`);
+		}
+		assert.ok(retained <= cap, `${where}: retainedStringBytes(stream) <= 1024 (${retained} bytes kept)`);
+		assertNoSecretBytes(out.stdout, [secret], `${where}: no raw argument byte reaches stdout`);
+		assertNoFiveCharacterSecret(out.stdout, secret.slice(2), `${where}: no raw argument byte reaches stdout`);
+		assertCompleted(out, ["message_end", "agent_end"], where);
+		const done = out.events.find((event) => event.assistantMessageEvent?.type === "done");
+		assert.equal(done?.assistantMessageEvent.message.stopReason, "toolUse", `${where}: source done ends normally with toolUse`);
+		assert.equal(out.events.find((event) => event.type === "message_end")?.message.stopReason, "toolUse", `${where}: message_end ends normally with toolUse`);
+	});
+}
