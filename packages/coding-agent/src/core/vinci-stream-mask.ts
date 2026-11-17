@@ -1130,7 +1130,7 @@ function interpolationDepth(line: string, from: number): number {
 export function vinciLineMayChange(line: string, insideBlock: boolean): boolean {
 	if (insideBlock) return true;
 	const trimmed = line.trimEnd();
-	return trimmed === "" || /[A-Za-z0-9+/=]$/.test(trimmed);
+	return trimmed === "" || /[A-Za-z0-9+/=_-]$/.test(trimmed);
 }
 
 /**

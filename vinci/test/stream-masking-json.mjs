@@ -2049,6 +2049,67 @@ const EARLY_ENDINGS = [
 	["at message_end with stopReason length and no text_end", "length", false],
 ];
 
+// #207 closure rows: a stream cut (error or length) while a completed line ending in "-" or "_" is still held
+// must replace the held text with the placeholder, whole; no raw byte of it is written before the cut. Benign text,
+// so the placeholder does not depend on the masker recognising a secret.
+for (const [variant, body, stopReason, withError] of [
+	["length, -", "see the release-candidate-\nnotes", "length", false],
+	["error, -", "see the release-candidate-\nnotes", "error", true],
+	["length, _", "see the release_candidate_\nnotes", "length", false],
+]) {
+	test(`json 207 (S-R1n, ${variant}): a held line is cut as one placeholder, never raw`, async () => {
+		const where = `207 (S-R1n, json, ${variant})`;
+		const out = await runJson(earlyEndEvents(body, stopReason, withError));
+		assertCompleted(out, ["message_end", "agent_end"], where);
+		assert.ok(!out.stdout.includes("see the release"), `${where}: no raw byte of the held line reaches stdout`);
+		const released = releasedDeltas(out.events);
+		assert.equal(released.length, 1, `${where}: one release`);
+		assert.equal(released[0].assistantMessageEvent.delta, PLACEHOLDER, `${where}: the placeholder, whole`);
+		assert.equal(out.events.indexOf(released[0]), 2, `${where}: the release is at index 2`);
+		const endAt = out.events.findIndex((event) => withError ? event.assistantMessageEvent?.type === "error" : event.type === "message_end");
+		assert.equal(endAt, 3, `${where}: ${withError ? "error" : "message_end"} follows at index 3`);
+		assert.equal(deltasOf(out.events.slice(0, 2)), "", `${where}: nothing is released before index 2`);
+		for (const [type, shown] of finalTexts(out.events)) assert.equal(shown, PLACEHOLDER, `${where}: ${type} shows the placeholder, whole`);
+	});
+}
+
+for (const [ch, where] of [
+	["-", "207 (S-G1, json, -)"],
+	["_", "207 (S-G1, json, _)"],
+]) {
+	test(`json 207 (S-G1, control): a line ending in "${ch}" is released unchanged at text_end`, async () => {
+		const { events, text: body } = streamEvents([`build step${ch}`, " done"], { eol: "" });
+		const out = await runJson(events);
+		assertCompleted(out, ["message_end"], where);
+		assert.equal(deltasOf(out.events.slice(0, 4)), "", `${where}: nothing is released before index 4`);
+		const released = releasedDeltas(out.events);
+		assert.equal(released.length, 1, `${where}: one release`);
+		assert.equal(out.events.indexOf(released[0]), 4, `${where}: the release is at index 4`);
+		const endAt = out.events.findIndex((event) => event.assistantMessageEvent?.type === "text_end");
+		assert.equal(endAt, 5, `${where}: text_end follows at index 5`);
+		assert.equal(released[0].assistantMessageEvent.delta, body, `${where}: the full body is released byte-identical`);
+		assert.equal(out.events[endAt].assistantMessageEvent.content, body, `${where}: text_end carries the full body`);
+		const end = out.events.find((event) => event.type === "message_end");
+		assert.equal(fieldOf(end.message), body, `${where}: message_end carries the full body`);
+	});
+}
+
+test("json 207 (S-C1/E3, control): benign prose ending in a dash is released unchanged at text_end", async () => {
+	const { events, text } = streamEvents(["see the release-candidate-", "then read the notes."]);
+	const out = await runJson(events);
+	assertCompleted(out, ["message_end"], "207 (S-C1/E3, json)");
+	const released = releasedDeltas(out.events);
+	assert.equal(released.length, 1, "one release");
+	const endAt = out.events.findIndex((event) => event.assistantMessageEvent?.type === "text_end");
+	assert.equal(out.events.indexOf(released[0]), 4, "released at the natural block end, at the existing event index");
+	assert.equal(endAt, 5, "text_end immediately follows the release");
+	assert.equal(deltasOf(out.events.slice(0, 4)), "", "held until text_end");
+	assert.equal(released[0].assistantMessageEvent.delta, text, "the whole body is byte-identical");
+	assert.equal(out.events[endAt].assistantMessageEvent.content, text, "text_end carries the unchanged body");
+	const end = out.events.find((event) => event.type === "message_end");
+	assert.equal(fieldOf(end.message), text, "message_end carries the unchanged body");
+});
+
 // 206t (D01): a block cut by an error, an abort or the length limit keeps its complete lines (those the hold-back
 // releases, masked as one body) and ends with the placeholder for the unfinished part; no byte of the cut token, an
 // open key block, an open ${ or an open angle value reaches stdout, whole.
