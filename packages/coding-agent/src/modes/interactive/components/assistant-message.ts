@@ -1,9 +1,9 @@
-import { stripVTControlCharacters } from "node:util";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { getOverflowPatterns, isContextOverflow } from "@earendil-works/pi-ai";
 import { Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import { formatVinciRecoveryMessage, getVinciRecoveryGuidance } from "../../../core/auth-guidance.ts";
 import { vinciMaskSecrets } from "../../../core/vinci-mask-secrets.ts";
+import { vinciStripControlText } from "../../../utils/ansi.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 
 // [vinci] raw provider error JSON (a 400/429/500, a socket error) alarms a non-programmer for nothing
@@ -18,8 +18,9 @@ const VINCI = process.env.VINCI_CODE === "1";
 const vinciMaskOut = (s: string): string => (VINCI ? vinciMaskSecrets(s) : s);
 const VINCI_OVERFLOW_LINE = "Context filled up — condensing the history and picking up where I left off…";
 function vinciErrorText(text: string): string {
-	// Node's stripper omits APC/DCS strings, including Kitty images. Error data is plain text.
-	return vinciMaskSecrets(stripVTControlCharacters(text.replace(/\x1b[_P^][\s\S]*?(?:\x1b\\|\x07|\x9c|$)/g, "")));
+	// Node's stripper omits APC/DCS strings, including Kitty images. Error data is plain text. The streamed
+	// output masker normalises with the same function.
+	return vinciMaskSecrets(vinciStripControlText(text));
 }
 function vinciCalmsOverflow(message: AssistantMessage): boolean {
 	if (!VINCI || !message.errorMessage) return false;

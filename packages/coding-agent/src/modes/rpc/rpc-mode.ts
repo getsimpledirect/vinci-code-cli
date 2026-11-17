@@ -25,6 +25,16 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import { vinciMaskEnabled } from "../../core/vinci-mask-secrets.ts";
+import {
+	VinciStreamMask,
+	vinciMaskStreamJson,
+	vinciMaskViewEntry,
+	vinciMaskViewEvent,
+	vinciMaskViewLastAssistantText,
+	vinciMaskViewMessage,
+	vinciMaskViewTree,
+} from "../../core/vinci-stream-mask.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
@@ -56,8 +66,30 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
 
+	// [vinci] With masking on, everything written (events, command responses, extension UI requests and
+	// errors) goes through the whole-object masker: every string normalised, then masked. Unchanged
+	// (byte-identical) when masking is off.
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		writeRawStdout(serializeJsonLine(obj));
+		writeRawStdout(serializeJsonLine(vinciMaskEnabled() ? vinciMaskStreamJson(obj) : obj));
+	};
+
+	// [vinci] Session events: streamed bodies (text, thinking, tool-call arguments, tool output) are held
+	// whole until their block or result ends, then written once, masked. Unchanged when masking is off.
+	const streamMask = new VinciStreamMask();
+	const outputEvent = (event: object) => {
+		if (!vinciMaskEnabled()) {
+			output(event);
+			return;
+		}
+		for (const out of streamMask.process(event)) output(vinciMaskViewEvent(out));
+	};
+	// [vinci] Every end path writes what the stream still holds, masked: nothing held is dropped unwritten.
+	// Returns whether anything was written.
+	const flushHeldEvents = (): boolean => {
+		if (!vinciMaskEnabled()) return false;
+		const held = streamMask.flush();
+		for (const out of held) output(vinciMaskViewEvent(out));
+		return held.length > 0;
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -353,8 +385,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
+		flushHeldEvents(); // [vinci] a rebind ends the previous stream
 		unsubscribe = session.subscribe((event) => {
-			output(event);
+			outputEvent(event); // [vinci]
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
 			await waitForRawStdoutBackpressure();
@@ -621,17 +654,32 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					}
 					entries = entries.slice(sinceIndex + 1);
 				}
-				return success(id, "get_entries", { entries, leafId: sessionManager.getLeafId() });
+				// [vinci] entries masked like get_messages (and output masks every string); ids and structure unchanged
+				const shownEntries = vinciMaskEnabled()
+					? entries.map((entry) => vinciMaskViewEntry(entry, streamMask))
+					: entries;
+				return success(id, "get_entries", { entries: shownEntries, leafId: sessionManager.getLeafId() });
 			}
 
 			case "get_tree": {
 				const sessionManager = session.sessionManager;
-				return success(id, "get_tree", { tree: sessionManager.getTree(), leafId: sessionManager.getLeafId() });
+				// [vinci] each node's entry masked like get_messages; nodes and structure unchanged
+				const tree = vinciMaskEnabled()
+					? vinciMaskViewTree(sessionManager.getTree(), streamMask)
+					: sessionManager.getTree();
+				return success(id, "get_tree", { tree, leafId: sessionManager.getLeafId() });
 			}
 
 			case "get_last_assistant_text": {
 				const text = session.getLastAssistantText();
-				return success(id, "get_last_assistant_text", { text });
+				// [vinci] the same text the event path masks, masked the same way; a block cut by an error, an abort or
+				// the length limit reads as the stream wrote it (the get_messages view)
+				return success(id, "get_last_assistant_text", {
+					text:
+						vinciMaskEnabled() && typeof text === "string"
+							? vinciMaskViewLastAssistantText(text, session.messages, streamMask)
+							: text,
+				});
 			}
 
 			case "set_session_name": {
@@ -648,7 +696,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "get_messages": {
-				return success(id, "get_messages", { messages: session.messages });
+				// [vinci] masked like the event path (interrupted calls included); output masks every string
+				const messages = vinciMaskEnabled()
+					? session.messages.map((message) => vinciMaskViewMessage(message, streamMask))
+					: session.messages;
+				return success(id, "get_messages", { messages });
 			}
 
 			// =================================================================
@@ -711,11 +763,23 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
+		const flushed = flushHeldEvents(); // [vinci]
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();
 		if (signal !== "SIGTERM") {
 			await flushRawStdout();
+		} else if (flushed) {
+			// [vinci] SIGTERM exits at once, as before, unless held text was just written: then stdout drains
+			// first, bounded at 1s like the json mode's signal exit.
+			let timer: NodeJS.Timeout | undefined;
+			await Promise.race([
+				flushRawStdout().catch(() => {}),
+				new Promise((resolveDrain) => {
+					timer = setTimeout(resolveDrain, 1000);
+				}),
+			]);
+			clearTimeout(timer);
 		}
 		process.exit(exitCode);
 	}

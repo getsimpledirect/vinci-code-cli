@@ -132,6 +132,16 @@ async function* withVinciStreamWatchdog<T>(source: AsyncIterable<T>, controller:
 	}
 }
 
+/**
+ * [vinci] The built-in tool a tool-name synonym stands for (case-insensitive), or `name` itself when it is
+ * not a synonym. Pure: it does not look at which tools exist (the streamed-output mask classifies a call
+ * by it from the moment its name is known, before the end-of-stream fold below).
+ */
+export function vinciCanonicalToolName(name: string): string {
+	const key = name.toLowerCase();
+	return Object.hasOwn(VINCI_TOOL_SYNONYMS, key) ? VINCI_TOOL_SYNONYMS[key] : name;
+}
+
 export function vinciNormalizeToolName(name: string, tools: readonly AgentTool[] | undefined): string {
 	const canonical = VINCI_TOOL_SYNONYMS[name.toLowerCase()];
 	if (canonical && canonical !== name && tools?.some((t) => t.name === canonical)) {

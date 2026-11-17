@@ -872,6 +872,10 @@ Emitted when a message begins and completes. The `message` field contains an `Ag
 
 Emitted during streaming of assistant messages. Contains both the partial message and a streaming delta event.
 
+With secret masking on (`VINCI_CODE=1`, as every Vinci run sets it), bodies arrive at block end: each intermediate `text_delta` and `thinking_delta` carries an empty `delta`, and the partial message keeps each text or thinking block at its last released state (empty until the block ends). When the block ends, one `text_delta` / `thinking_delta` carries the whole masked body, then `text_end` / `thinking_end` carries the same text (when a message that ended normally has no block end event, the delta precedes `done` / `message_end`). With masking on, a block cut by an error, an abort or the length limit keeps its complete lines (masked) and ends with a placeholder for the unfinished part. (The complete lines are those no later text could still change; an open key block, an open `${` or an open angle value, an assignment value a later line could still extend (an environment lookup not yet closed, or a value a chained call could follow) and trailing lines a later END marker or a later line of an encoded run could claim stay in the placeholder.) A text or thinking block cut before its end in any other way (input ends, the session is rebound, the mode shuts down, or a new message starts) is written as the placeholder `‹redacted›`, never as the masked text so far. The final events (the `error` event, `message_end`, `turn_end`, `agent_end`) show a cut block exactly as the stream wrote it. RPC transcript responses (`get_messages`, `get_entries`, `get_tree`) and `get_last_assistant_text` compute their view from the message alone: in a message that ended aborted, with an error or at its length limit, every text or thinking block from the earlier of its last text block and its last thinking block on is shown in the cut form (complete lines masked, then the placeholder), even when the stream carried it whole; in any other message each block's whole masked text. The cut form is written by the json and RPC writers only; the session keeps the message as received. A client that appends deltas has the whole answer before the end event, unless a bound or a cut wrote the placeholder in its place. Tool-call argument deltas are held the same way and released in one delta when the call ends.
+
+A held body (a text or thinking block, a tool call's argument text, a tool's partial result) is held for at most 1 MiB (1,048,576 bytes) and 10 minutes from its first held byte. The bytes are the UTF-8 bytes kept for that body: a block's text, a call's argument text, or a partial result's whole event (details, other strings and control bytes included). The deadline is checked on every event; a silent stream holds until the next event or the end. At either bound the body is written at once as the placeholder `‹redacted›`, never as a prefix; nothing more of that body is kept or written while it streams. Clients that need the complete text read the final message, which still carries the whole body, masked, when the block reached its own end (a block that never did is shown there as the stream wrote it). A tool call that ends without its `toolcall_end` (an abort, an error, a cut stream, or a bound) shows, in its final events and in the transcript responses, each argument value that may have been cut as the placeholder, whole; no part of such a value is kept. With masking off, deltas stream as they arrive.
+
 ```json
 {
   "type": "message_update",
@@ -884,6 +888,10 @@ Emitted during streaming of assistant messages. Contains both the partial messag
   }
 }
 ```
+
+An open angle value after `:` or `=` stays held at a cut across spaces and line breaks, including whitespace runs longer than 256 characters. An angle opener preceded only by whitespace is also held. The assignment guard separately holds a `<` value whose closing `>` is outside the released head.
+
+The retained streaming snapshot uses an allowlist of message routing, usage and error fields and shown block bodies. Each held text or thinking block counts its own text, signature fields and unknown fields toward its byte bound; a call counts its argument text and its own unknown fields. Message-level unknown fields count toward every held block and call. Released bodies are not counted again. Crossing a body's bound cuts only that body; neighboring blocks and calls keep their own budgets. Signatures and unknown fields are excluded from retained snapshots, and a bounded body's entry keeps its placeholder and routing fields. Provider final events and session entries supply their own signatures, which still pass through the output mask.
 
 The `assistantMessageEvent` field contains one of these delta types:
 
@@ -923,7 +931,7 @@ Emitted when a tool begins, streams progress, and completes execution.
 }
 ```
 
-During execution, `tool_execution_update` events stream partial results (e.g., bash output as it arrives):
+During execution, `tool_execution_update` events stream partial results (e.g., bash output as it arrives). With secret masking on (`VINCI_CODE=1`), bodies arrive at result end: each `tool_execution_update` is still emitted, but its `partialResult` content and details are empty, and the masked output arrives in `tool_execution_end`. The latest partial result of each tool call is kept: when the tool's end result does not carry all of it (its text within the end's text and its details and other fields equal, compared masked; an error-only result, for example), or the tool never ends (input ends, the session is rebound or the mode shuts down), it is written once more as one `tool_execution_update` before that end. It never reached its end, so its text is the placeholder `‹redacted›` and its details are empty, never its masked text. A partial result whose kept event passes 1 MiB, or held for 10 minutes (checked on every event), is written at once the same way, and later updates of that tool stay empty.
 
 ```json
 {
@@ -953,7 +961,9 @@ When complete:
 }
 ```
 
-Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update.
+Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update. With secret masking on (`VINCI_CODE=1`), it is empty until the result ends (apart from the kept partial result described above); use `tool_execution_end` for the output.
+
+With secret masking on, every string the RPC mode writes (events, command responses, extension UI requests and errors) is masked: terminal control strings and sequences (including DCS, APC and PM strings) and carriage returns are removed first, as the interactive view removes them, and the written text is the normalised, masked text. A provider reasoning item kept as a `thinkingSignature` has its summary (or content) texts masked joined, as they are joined into the thinking block. String, Number and Boolean objects (from any realm) are written as their own values, read without calling an own `valueOf`, and an own `__proto__` key is kept.
 
 ### queue_update
 

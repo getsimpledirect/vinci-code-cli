@@ -11,7 +11,8 @@ import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { emitSessionBeforeExitEvent } from "../core/extensions/runner.ts";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.ts";
-import { vinciMaskEnabled, vinciMaskJson, vinciMaskSecrets } from "../core/vinci-mask-secrets.ts";
+import { vinciMaskEnabled, vinciMaskSecrets } from "../core/vinci-mask-secrets.ts";
+import { VinciStreamMask, vinciMaskStreamJson } from "../core/vinci-stream-mask.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 
 // The 180000ms default is deliberately generous to avoid false kills during slow provider activity;
@@ -282,6 +283,35 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	const signalCleanupHandlers: Array<() => void> = [];
 	const timeoutMs = printModePrestreamTimeoutMs();
 	let prestreamWatchdog: PrintModeLivenessWatchdog | undefined;
+	// [vinci] --mode json with masking on: streamed bodies (text, thinking, tool-call arguments, tool output)
+	// are held whole until their block or result ends, then written once, normalised and masked.
+	const streamMask = new VinciStreamMask();
+	// [vinci] Cleared when the liveness watchdog stops the run: events that arrive after its flush are not taken,
+	// so nothing it released is released again.
+	let acceptingEvents = true;
+	const writeJsonEvent = (event: object): void => {
+		writeRawStdout(`${JSON.stringify(vinciMaskStreamJson(event))}\n`);
+	};
+	// [vinci] Every end path writes what the stream still holds, masked: nothing held is dropped unwritten.
+	// Returns whether anything was written.
+	const flushHeldJson = (): boolean => {
+		if (mode !== "json" || !vinciMaskEnabled()) return false;
+		const held = streamMask.flush();
+		for (const event of held) writeJsonEvent(event);
+		return held.length > 0;
+	};
+	// [vinci] An exit path that flushed held text lets stdout drain (bounded) before exiting; otherwise the
+	// exit is immediate, as before.
+	const exitAfterFlush = (flushed: boolean, code: number | undefined): void => {
+		if (!flushed) {
+			process.exit(code);
+			return;
+		}
+		void Promise.race([
+			flushRawStdout().catch(() => {}),
+			new Promise((resolve) => setTimeout(resolve, 1000)),
+		]).finally(() => process.exit(code));
+	};
 
 	const cancelPrestreamWatchdog = (): void => {
 		prestreamWatchdog?.cancel();
@@ -298,7 +328,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				`BLOCKED: The provider stopped responding (no activity for ${timeoutMs}ms); the print-mode run was stopped.\n`,
 			);
 			killTrackedDetachedChildren();
-			process.exit(1);
+			// [vinci] stop taking events before the flush (a late end event would release its body again), then
+			// the watchdog exit still writes what the stream held, masked
+			terminating = true;
+			acceptingEvents = false;
+			unsubscribe?.();
+			exitAfterFlush(flushHeldJson(), 1);
 		}, timeoutMs);
 		prestreamWatchdog = watchdog;
 		try {
@@ -336,12 +371,13 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				process.exitCode = signalExitCode;
 				cancelPrestreamWatchdog();
 				cancelStartupLivenessWatchdog();
+				const flushed = flushHeldJson(); // [vinci]
 				killTrackedDetachedChildren();
 				// Bound the signal-triggered dispose: a stalled shutdown handler must not hang the exit.
 				void Promise.race([
 					disposeRuntime().catch(() => {}),
 					new Promise((resolve) => setTimeout(resolve, 5000)),
-				]).finally(() => process.exit(signalExitCode));
+				]).finally(() => exitAfterFlush(flushed, signalExitCode)); // [vinci]
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -397,7 +433,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		});
 
 		unsubscribe?.();
+		flushHeldJson(); // [vinci] a rebind ends the previous stream
 		unsubscribe = session.subscribe((event) => {
+			if (!acceptingEvents) return; // [vinci] the watchdog stopped the run
 			// Tool execution windows suspend the liveness timer — a long quiet local build is not a wedge.
 			// Hooks run with the timer armed, and tool/boundary events are handled exclusively (not
 			// also as generic activity) so the suspend/resume pairing has no ordering dependence.
@@ -417,8 +455,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				// carry keys). Mask the structured event before serialization so redaction can never consume
 				// JSON punctuation or turn numeric telemetry into invalid syntax. Same "piped to a log never
 				// emits a live key" intent as the text path below — json includes raw tool output.
-				const line = JSON.stringify(vinciMaskEnabled() ? vinciMaskJson(event) : event);
-				writeRawStdout(`${line}\n`);
+				// Streamed bodies are held whole until their block or result ends (VinciStreamMask).
+				if (vinciMaskEnabled()) {
+					for (const out of streamMask.process(event)) writeJsonEvent(out);
+				} else {
+					writeRawStdout(`${JSON.stringify(event)}\n`);
+				}
 			}
 		});
 	};
@@ -508,6 +550,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		for (const cleanup of signalCleanupHandlers) {
 			cleanup();
 		}
+		flushHeldJson(); // [vinci] an error path still writes what the stream held, masked
 		await disposeRuntime();
 		await flushRawStdout();
 	}

@@ -98,7 +98,7 @@ describe("runPrintMode", () => {
 	const truncationWarning = "Warning: the response was cut off at the output limit and is incomplete.";
 
 	for (const mode of ["text", "json"] as const) {
-		it(`${mode}: prints masked partial output and exits 1 for final length`, async () => {
+		it(`${mode} 206u (E03): prints masked partial output and exits 1 for final length`, async () => {
 			vi.stubEnv("VINCI_CODE", "1");
 			const secret = "sk-ant-TESTONLY-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 			const message = createAssistantMessage({ text: `Partial answer AUTH_TOKEN=${secret}`, stopReason: "length" });
@@ -120,26 +120,58 @@ describe("runPrintMode", () => {
 			expect(exitCode).toBe(1);
 			expect(errors.mock.calls).toEqual([[truncationWarning]]);
 			const output = writes.join("");
-			expect(output).toContain("Partial answer");
 			expect(output).not.toContain(secret);
+			for (let at = 4; at + 5 <= secret.length; at++) {
+				expect(output).not.toContain(secret.slice(at, at + 5));
+			}
 			expect(output).toContain("redacted");
 			if (mode === "text") {
+				expect(output).toContain("Partial answer");
 				expect(output.trim().split("\n")).toHaveLength(1);
 			} else {
+				// 206t (expectation: more masking): a message cut at its length limit keeps only its complete lines,
+				// masked, then the placeholder. This one-line answer has no complete line, so it is the placeholder
+				// alone, released once as a synthesized text_delta before message_end.
 				const events = output
 					.trim()
 					.split("\n")
 					.map((line) => JSON.parse(line));
-				expect(events).toHaveLength(1);
+				expect(events).toHaveLength(2);
+				const cutMessage = { ...message, content: [{ type: "text", text: "‹redacted›" }] };
 				expect(events[0]).toEqual({
-					type: "message_end",
-					message: { ...message, content: [{ type: "text", text: expect.stringContaining("redacted") }] },
+					type: "message_update",
+					message: cutMessage,
+					assistantMessageEvent: {
+						type: "text_delta",
+						contentIndex: 0,
+						delta: "‹redacted›",
+						partial: cutMessage,
+					},
 				});
-				// The normal path must produce the same event envelope and fields.
+				expect(events[1]).toEqual({
+					type: "message_end",
+					message: { ...message, content: [{ type: "text", text: "‹redacted›" }] },
+				});
+				// 206u (E03): pin the normal-stop message independently, including its masked body.
 				writes.length = 0;
 				message.stopReason = "stop";
 				expect(await runPrintMode(runtime as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(0);
-				expect(JSON.parse(writes.join("")).message).toEqual({ ...events[0].message, stopReason: "stop" });
+				const stopEvents = writes
+					.join("")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				expect(stopEvents).toHaveLength(1);
+				expect(stopEvents[0]).toEqual({
+					type: "message_end",
+					message: {
+						...message,
+						content: [{ type: "text", text: "Partial answer AUTH_TOKEN=sk-a…‹redacted›" }],
+					},
+				});
+				for (let at = 4; at + 5 <= secret.length; at++) {
+					expect(writes.join("")).not.toContain(secret.slice(at, at + 5));
+				}
 				expect(errors.mock.calls).toEqual([[truncationWarning]]);
 			}
 		});
