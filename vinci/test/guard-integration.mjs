@@ -2138,14 +2138,98 @@ try {
   // still its own segment. This `>` case is answered by the base pass; the `>|` list above holds the
   // same shape aimed at a `>|` target, which only the second pass answers.
   check("a writer behind `\\>|` (a literal `>` and a real pipe) is still a shell file write", guard.isShellFileWrite("true \\>| echo x >out.txt"));
+  for (const [row, description, command] of [
+    ["R1", "a quote in a comment cannot hide a later write", "true # '\necho x > f"],
+    ["R2", "a parameter-expansion separator stays in its word", "echo ${v:-;} > f"],
+    ["R2b", "a substitution separator stays in its word", "echo $(true; echo y) > f"],
+    ["R3", "an escaped ampersand leaves a file redirect", "echo x \\&> out.txt"],
+    ["R4", "three backslashes leave an escaped ampersand before a redirect", "echo x \\\\\\&> out.txt"],
+    ["R5", "a descriptor duplication cannot hide a later redirect", "echo x 2>&1 > out.txt"],
+    ["R6", "a nondigit target after >& is a file", "echo x >& f"],
+    ["R7", "a continuation joins an input descriptor duplication", "echo x <\\\n&0 > o"],
+    ["R8", "an assignment can execute a writing substitution", "x=$(echo y > f)"],
+    ["R8b", "an assignment can execute a writing backtick", "x=`echo y 2>&1 > f`"],
+    ["R9", "decoded sh -c text gets the same comment handling", "sh -c 'true # '\"'\"'\necho x > f'"],
+    ["R10", "unterminated input containing > fails closed", 'echo "x > f'],
+    ["R10b", "unterminated nonwriter input containing > fails closed", 'true "x > f'],
+    ["R10d", "unterminated input mentioning a writer fails closed", "true 'tee"],
+    ["R11", "input nested past the depth cap fails closed", "echo " + "$(".repeat(33) + "true" + ")".repeat(33)],
+  ]) {
+    const selectionCount = selections.length;
+    const controlCount = controls.length;
+    const result = await toolCall("bash", { command });
+    check(`168 ${row}: ${description} is classified as a write`, guard.isShellFileWrite(command) === true);
+    check(
+      `168 ${row}: ${description} takes the shell-write block`,
+      result?.block === true &&
+        /shell-based file write/i.test(result.reason) &&
+        selections.length === selectionCount &&
+        controls.slice(controlCount).some(({ message }) => message.customType === "vinci-shell-write-block"),
+    );
+  }
+  {
+    const command = "echo " + "a".repeat(262144 - 4);
+    const started = performance.now();
+    const selectionCount = selections.length;
+    const controlCount = controls.length;
+    const result = await toolCall("bash", { command });
+    check("168 R11b: a command over the length cap is classified as a write", guard.isShellFileWrite(command) === true);
+    check(
+      "168 R11b: a command over the length cap takes the shell-write block",
+      result?.block === true &&
+        /shell-based file write/i.test(result.reason) &&
+        selections.length === selectionCount &&
+        controls.slice(controlCount).some(({ message }) => message.customType === "vinci-shell-write-block"),
+    );
+    console.log("168 R11b wall ms=" + (performance.now() - started));
+  }
+  {
+    const command = "ls " + "a".repeat(262144 - 3);
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(
+      "168 C-cap: a command at exactly the length cap keeps main's value",
+      guard.isShellFileWrite(command) === false && result === undefined && selections.length === selectionCount,
+    );
+  }
+  for (const [row, command, expected] of [
+    ["R10c", 'echo "x', false],
+    ["C2", "echo x >&2", false],
+    ["C2", "echo x 2>&1", false],
+    ["C2", "echo x >& 2", false],
+    ["C2", "echo x >&-", false],
+    ["C2", "echo '${v:-;}'", false],
+    ["C2", "cat <<EOF\nhello\nEOF", false],
+    ["C2", "cat <<'EOF'\na > b\nEOF", false],
+    ["F3", "echo x 2>/dev/null", false],
+    ["F3", "echo x >/dev/null", false],
+    ["F3", "echo x &>/dev/null", false],
+    ["F3", "echo x 2>&1 | tee -a log", true],
+    ["F3", "tee /dev/null", false],
+    ["C3", "ls", false],
+    ["C3", "git status", false],
+    ["C-depth", "echo " + "$(".repeat(32) + "true" + ")".repeat(32), false],
+    // These controls distinguish the comment and escape rules from the conservative fallback.
+    ["C-comment", "true # '\necho tee", false],
+    ["C-esc", "true \\& echo x 2>&1 > f", false],
+  ]) {
+    const selectionCount = selections.length;
+    const result = await toolCall("bash", { command });
+    check(`168 ${row}: ${JSON.stringify(command)} is classified as ${expected}`, guard.isShellFileWrite(command) === expected);
+    check(
+      `168 ${row}: ${JSON.stringify(command)} ${expected ? "takes the shell-write block" : "stays allowed"}`,
+      (expected ? result?.block === true && /shell-based file write/i.test(result.reason) : result === undefined) &&
+        selections.length === selectionCount,
+    );
+  }
   // Outside this change's operators, behaviour is pinned as it was (not an endorsement of either).
   check("plain `2> file` keeps its previous classification (not a write form here)", !guard.isShellFileWrite("echo x 2> err.txt"));
   check("`>> /dev/null` keeps its previous classification", guard.isShellFileWrite("echo x >> /dev/null"));
-  check("known miss kept from main: a plain `>` after `2>&1` (shared splitter limit, out of scope)", !guard.isShellFileWrite("echo x 2>&1 > out.txt"));
+  check("168: a plain `>` after `2>&1` is a write", guard.isShellFileWrite("echo x 2>&1 > out.txt"));
   check("`2>&1 >> /dev/null` keeps its previous classification", !guard.isShellFileWrite("echo x 2>&1 >> /dev/null"));
   check("`echo >& tee out.txt` keeps its previous classification", guard.isShellFileWrite("echo >& tee out.txt"));
-  check("known miss kept from main: an escaped `\\&>` (a literal `&`, then a plain `>`; shared splitter limit, out of scope)", !guard.isShellFileWrite("echo x \\&> out.txt"));
-  check("known miss kept from main: three backslashes then `&>` (an escaped `&`, then a plain `>`)", !guard.isShellFileWrite("echo x \\\\\\&> out.txt"));
+  check("168: an escaped `\\&` before `>` is a write", guard.isShellFileWrite("echo x \\&> out.txt"));
+  check("168: three backslashes then `&>` is a write", guard.isShellFileWrite("echo x \\\\\\&> out.txt"));
   // Quotes are not parsed either: an operator inside quotes counts as a write, exactly as main's `>`
   // does (main also refuses `echo '>out.txt'`). Quote-aware detection for every operator is tracked
   // separately.

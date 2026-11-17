@@ -639,7 +639,7 @@ function shellFileWriteAt(command: string, depth: number): boolean {
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i[A-Za-z]*\b)/i.test(writerBody(segment, false))) return true;
     return false;
-  }) || clobberOrBothRedirectWrite(command);
+  }) || clobberOrBothRedirectWrite(command) || tokenWrite(command);
 }
 
 /** `>|`, `N>|`, `&>` and `&>>` writes, which the split above cuts off from their targets (it reads
@@ -653,6 +653,352 @@ function clobberOrBothRedirectWrite(command: string): boolean {
     // Mask each escaped character (left to right, so `\\` pairs first) in one linear pass.
     return CLOBBER_OR_BOTH_REDIRECT.test(body.replace(/\\[\s\S]/g, "__"));
   });
+}
+
+const TOKEN_MAX_DEPTH = 32;
+const TOKEN_MAX_LENGTH = 262144;
+const TOKEN_JOIN_CONTINUATIONS = true;
+const TOKEN_NEST_START = /^(?:\$\(\(|\$\(|\$\{|`)/;
+const TOKEN_REDIRECT = /^(?:&>>|&>|<<<|<<-|<<|<&|<|>>|>\||>&|>)/;
+
+/** Look ahead by at most three logical characters, joining only backslash + LF pairs. */
+function tokenLookahead(command: string, index: number): { text: string; ends: number[] } {
+  let text = "";
+  const ends: number[] = [];
+  while (text.length < 3 && index < command.length) {
+    if (TOKEN_JOIN_CONTINUATIONS && command[index] === "\\" && command[index + 1] === "\n") {
+      index += 2;
+      continue;
+    }
+    text += command[index++];
+    ends.push(index);
+  }
+  return { text, ends };
+}
+
+/** Heredoc bodies are data even when they contain quotes or substitution delimiters. */
+function tokenHeredocEnd(command: string, index: number, heredocs: Array<{ delimiter: string; stripTabs: boolean }>): number {
+  for (const heredoc of heredocs) {
+    while (index < command.length) {
+      const newline = command.indexOf("\n", index);
+      const end = newline === -1 ? command.length : newline;
+      const line = command.slice(index, end);
+      index = newline === -1 ? command.length : newline + 1;
+      if ((heredoc.stripTabs ? line.replace(/^\t+/, "") : line) === heredoc.delimiter) break;
+    }
+  }
+  return index;
+}
+
+/** A bounded word/operator scan used only to add shell-write refusals. */
+function shellWriteTokens(command: string, depth: number): {
+  ok: boolean;
+  bounded: boolean;
+  commands: Array<{ words: string[]; redirects: Array<{ op: string; target: string }>; nested: string[] }>;
+} {
+  const commands: Array<{ words: string[]; redirects: Array<{ op: string; target: string }>; nested: string[] }> = [];
+  if (command.length > TOKEN_MAX_LENGTH || depth > TOKEN_MAX_DEPTH) return { ok: false, bounded: true, commands };
+  let current: (typeof commands)[number] = { words: [], redirects: [], nested: [] };
+  const frames: Array<{
+    close: string;
+    start: number;
+    contentStart: number;
+    quote: "'" | '"' | null;
+    parens: number;
+    wordStart: boolean;
+    delimiter: { parts: string[]; started: boolean; stripTabs: boolean } | undefined;
+    heredocs: Array<{ delimiter: string; stripTabs: boolean }>;
+  }> = [];
+  const heredocs: Array<{ delimiter: string; stripTabs: boolean }> = [];
+  let quote: "'" | '"' | null = null;
+  let word: string[] = [];
+  let started = false;
+  let descriptor = true;
+  let redirect: string | undefined;
+  const finishWord = (): void => {
+    if (!started) return;
+    const value = word.join("");
+    if (redirect !== undefined) {
+      current.redirects.push({ op: redirect, target: value });
+      if (redirect === "<<" || redirect === "<<-") heredocs.push({ delimiter: value, stripTabs: redirect === "<<-" });
+      redirect = undefined;
+    } else current.words.push(value);
+    word = [];
+    started = false;
+    descriptor = true;
+  };
+  const finishCommand = (): void => {
+    finishWord();
+    if (current.words.length || current.redirects.length || current.nested.length) commands.push(current);
+    current = { words: [], redirects: [], nested: [] };
+    redirect = undefined;
+  };
+
+  for (let index = 0; index < command.length;) {
+    const frame = frames[frames.length - 1];
+    const activeQuote = frame ? frame.quote : quote;
+    const ch = command[index];
+    if (activeQuote !== "'" && ch === "\\") {
+      const ahead = tokenLookahead(command, index);
+      if (ahead.ends[0] !== index + 1) {
+        index = ahead.ends[0] === undefined ? command.length : ahead.ends[0] - 1;
+        continue;
+      }
+    }
+    if (ch === "\\" && activeQuote !== "'") {
+      if (index + 1 === command.length) return { ok: false, bounded: false, commands };
+      const escaped = command[index + 1];
+      if (activeQuote === '"' && !/[$`"\\\n]/.test(escaped)) {
+        if (!frame) word.push(ch);
+        else frame.delimiter?.parts.push(ch);
+        index++;
+      } else {
+        if (!frame) word.push(escaped);
+        else frame.delimiter?.parts.push(escaped);
+        index += 2;
+      }
+      if (frame) {
+        frame.wordStart = false;
+        if (frame.delimiter) frame.delimiter.started = true;
+      } else { started = true; descriptor = false; }
+      continue;
+    }
+    if (ch === "#" && activeQuote === null && (frame ? (frame.close === ")" || frame.close === "`") && frame.wordStart : !started)) {
+      const newline = command.indexOf("\n", index);
+      index = newline === -1 ? command.length : newline;
+      continue;
+    }
+    if (frame && activeQuote === null && ch === frame.close[0] && frame.parens === 0) {
+      const ahead = tokenLookahead(command, index);
+      if (ahead.text.startsWith(frame.close)) {
+        const end = ahead.ends[frame.close.length - 1];
+        if (frame.close === ")" || frame.close === "`") current.nested.push(command.slice(frame.contentStart, index));
+        frames.pop();
+        if (frames.length === 0) word.push(command.slice(frame.start, end));
+        else frames[frames.length - 1].delimiter?.parts.push(command.slice(frame.start, end));
+        index = end;
+        continue;
+      }
+    }
+    if (activeQuote !== "'" && (ch === "$" || ch === "`")) {
+      const ahead = tokenLookahead(command, index);
+      const opening = TOKEN_NEST_START.exec(ahead.text)?.[0];
+      if (opening !== undefined) {
+        if (depth + frames.length + 1 > TOKEN_MAX_DEPTH) return { ok: false, bounded: true, commands };
+        if (frame) {
+          frame.wordStart = false;
+          if (frame.delimiter) frame.delimiter.started = true;
+        } else { started = true; descriptor = false; }
+        const end = ahead.ends[opening.length - 1];
+        frames.push({
+          close: opening === "${" ? "}" : opening === "$(" ? ")" : opening === "`" ? "`" : "))",
+          start: index, contentStart: end, quote: null, parens: 0, wordStart: true,
+          delimiter: undefined, heredocs: [],
+        });
+        index = end;
+        continue;
+      }
+    }
+    if (activeQuote !== null) {
+      if (ch === activeQuote) {
+        if (frame) frame.quote = null;
+        else quote = null;
+      } else if (!frame) word.push(ch);
+      else frame.delimiter?.parts.push(ch);
+      index++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      if (frame) {
+        frame.quote = ch;
+        frame.wordStart = false;
+        if (frame.delimiter) frame.delimiter.started = true;
+      } else { quote = ch; started = true; descriptor = false; }
+      index++;
+      continue;
+    }
+    if (frame) {
+      const boundary = /[\s;&|<>]/.test(ch);
+      if (boundary && frame.delimiter?.started) {
+        frame.heredocs.push({ delimiter: frame.delimiter.parts.join(""), stripTabs: frame.delimiter.stripTabs });
+        frame.delimiter = undefined;
+      }
+      if (ch === "\n") {
+        index = tokenHeredocEnd(command, index + 1, frame.heredocs);
+        frame.heredocs.length = 0;
+        frame.wordStart = true;
+        continue;
+      }
+      if ((ch === "<" || ch === ">" || ch === "&") && (frame.close === ")" || frame.close === "`")) {
+        const ahead = tokenLookahead(command, index);
+        const op = TOKEN_REDIRECT.exec(ahead.text)?.[0];
+        if (op !== undefined) {
+          if (op === "<<" || op === "<<-") frame.delimiter = { parts: [], started: false, stripTabs: op === "<<-" };
+          frame.wordStart = true;
+          index = ahead.ends[op.length - 1];
+          continue;
+        }
+      }
+      if (!boundary && frame.delimiter) {
+        frame.delimiter.parts.push(ch);
+        frame.delimiter.started = true;
+      }
+      if (frame.close === ")" || frame.close === "))") {
+        if (ch === "(") frame.parens++;
+        else if (ch === ")" && frame.parens > 0) frame.parens--;
+      }
+      frame.wordStart = boundary;
+      index++;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      finishWord();
+      index++;
+      if (ch === "\n") {
+        finishCommand();
+        index = tokenHeredocEnd(command, index, heredocs);
+        heredocs.length = 0;
+      }
+      continue;
+    }
+    if (ch === ">" || ch === "<" || ch === "&") {
+      const ahead = tokenLookahead(command, index);
+      const op = TOKEN_REDIRECT.exec(ahead.text)?.[0];
+      if (op !== undefined) {
+        // A leading descriptor number stays on a `>` operator: only stdout (none or 1) or `&>` writes content.
+        const fd = started && descriptor && redirect === undefined && op.startsWith(">") ? word.join("") : "";
+        if (started && descriptor && redirect === undefined) { word = []; started = false; }
+        finishWord();
+        redirect = fd + op;
+        index = ahead.ends[op.length - 1];
+        continue;
+      }
+    }
+    if (ch === ";" || ch === "&" || ch === "|") {
+      finishCommand();
+      const ahead = tokenLookahead(command, index);
+      index = ahead.ends[(ch === "&" || ch === "|") && ahead.text[1] === ch ? 1 : 0];
+      continue;
+    }
+    word.push(ch);
+    started = true;
+    descriptor &&= /[0-9]/.test(ch);
+    index++;
+  }
+  if (quote !== null || frames.length > 0) return { ok: false, bounded: false, commands };
+  finishCommand();
+  return { ok: true, bounded: false, commands };
+}
+
+/** Apply writerBody's wrapper grammar to words without reparsing quoted or escaped operators. */
+function tokenWriterWords(words: string[], peelXargs = true): string[] {
+  let start = 0;
+  while (/^[A-Za-z_]\w*=/.test(words[start] ?? "")) start++;
+  for (let depth = 0; depth < 8; depth++) {
+    const wrapper = words[start] ?? "";
+    if (!/^(?:builtin|exec|eval|command|sudo|env|nohup|time|xargs)$/i.test(wrapper) || (!peelXargs && /^xargs$/i.test(wrapper))) break;
+    let index = start + 1;
+    while (index < words.length && (words[index].startsWith("-") || /^[A-Za-z_]\w*=/.test(words[index]))) {
+      if (/^command$/i.test(wrapper) && /^-p*[vV][pvV]*$/.test(words[index])) return [];
+      if (wrapperTakesValue(wrapper, words[index])) index++;
+      index++;
+    }
+    start = index;
+    while (/^[A-Za-z_]\w*=/.test(words[start] ?? "")) start++;
+  }
+  return words.slice(start);
+}
+
+/** The same nested-shell option handling as nestedShellText, on already decoded token words. */
+function tokenNestedShellText(words: string[]): string | undefined {
+  let start = 0;
+  for (let depth = 0; depth < 8; depth++) {
+    while (start < words.length && /^[A-Za-z_]\w*=/.test(words[start])) start++;
+    const executable = words[start] ?? "";
+    if (/^eval$/i.test(executable)) return words.slice(words[start + 1] === "--" ? start + 2 : start + 1).join(" ");
+    if (!/^(?:builtin|exec|command|sudo|env|nohup|time|xargs)$/i.test(executable)) break;
+    let index = start + 1;
+    while (index < words.length && (words[index].startsWith("-") || /^[A-Za-z_]\w*=/.test(words[index]))) {
+      if (/^command$/i.test(executable) && /^-p*[vV][pvV]*$/.test(words[index])) return undefined;
+      if (wrapperTakesValue(executable, words[index])) index++;
+      index++;
+    }
+    start = index;
+  }
+  if (!NESTED_SHELL.test(words[start] ?? "")) return undefined;
+  let noexec = false;
+  let command = false;
+  for (let index = start + 1; index < words.length; index++) {
+    const word = words[index];
+    if (word === "-" || word === "--") return command && !noexec ? words[index + 1] : undefined;
+    if (!/^[-+]/.test(word)) return command && !noexec ? word : undefined;
+    if (word.startsWith("--")) {
+      if (word === "--rcfile" || word === "--init-file") index++;
+      continue;
+    }
+    const letters = word.slice(1);
+    if (!/^[A-Za-z]+$/.test(letters)) return undefined;
+    const on = word.startsWith("-");
+    let values = 0;
+    for (const letter of letters) {
+      if (letter === "o" || letter === "O") {
+        values++;
+        if (letter === "o") {
+          let name = (words[index + values] ?? "").toLowerCase().replaceAll("_", "");
+          let set = on;
+          while (name.startsWith("no")) {
+            name = name.slice(2);
+            set = !set;
+          }
+          if (name === "exec") noexec = !set;
+        }
+      } else if (letter === "n") {
+        noexec = on;
+      } else if (letter === "c") {
+        command = true;
+      }
+    }
+    index += values;
+  }
+  return undefined;
+}
+
+function tokenWrite(command: string, depth = 0): boolean {
+  if (command.length > TOKEN_MAX_LENGTH || depth > TOKEN_MAX_DEPTH) return true;
+  return tokenWriteAt(command, depth, new Map());
+}
+
+/** Every substitution is collected, so cache repeated inner spans at the same execution depth. */
+function tokenWriteAt(command: string, depth: number, cache: Map<number, Map<string, boolean>>): boolean {
+  let results = cache.get(depth);
+  if (results === undefined) {
+    results = new Map();
+    cache.set(depth, results);
+  }
+  const cached = results.get(command);
+  if (cached !== undefined) return cached;
+  const tokens = shellWriteTokens(command, depth);
+  if (tokens.bounded) return true;
+  if (!tokens.ok) return />/.test(command) || /(^|[^A-Za-z0-9_-])(tee|sed|perl)([^A-Za-z0-9_-]|$)/.test(command);
+  const result = tokens.commands.some((part) => {
+    if (part.nested.some((nested) => tokenWriteAt(nested, depth + 1, cache))) return true;
+    const nested = tokenNestedShellText(part.words);
+    if (nested !== undefined && tokenWriteAt(nested, depth + 1, cache)) return true;
+    const words = tokenWriterWords(part.words);
+    const fileRedirect = part.redirects.some((redirect) => {
+      if (redirect.target === "/dev/null") return false;
+      if (/^1?>&$/.test(redirect.op)) return !/^(?:\d+|-)$/.test(redirect.target);
+      return /^(?:1?(?:>|>>|>\|)|&>|&>>)$/.test(redirect.op);
+    });
+    if (/^(?:echo|printf)$/i.test(words[0] ?? "") && fileRedirect) return true;
+    if (/^cat$/i.test(words[0] ?? "") && part.redirects.some((redirect) => /^<<-?$/.test(redirect.op)) && fileRedirect) return true;
+    if (/^tee$/i.test(words[0] ?? "") && words.slice(1).some((word) => !word.startsWith("-") && word !== "/dev/null")) return true;
+    const inPlace = tokenWriterWords(part.words, false);
+    return /^sed$/i.test(inPlace[0] ?? "") && inPlace.slice(1).some((word) => /^-i\b/.test(word))
+      || /^perl$/i.test(inPlace[0] ?? "") && inPlace.slice(1).some((word) => /^-[A-Za-z]*i[A-Za-z]*\b/.test(word));
+  });
+  results.set(command, result);
+  return result;
 }
 
 /** Literal redirect/tee targets for wording only; "" means "unknown, give the generic route".
