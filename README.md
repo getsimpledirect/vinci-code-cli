@@ -237,7 +237,7 @@ reduced-motion presentation options are documented in
 
 `vinci runtime --help` lists an optional local Work client. It requires an explicitly
 configured, owned, private (no group or world access) `VINCI_RUNTIME_CONFIG` profile with a
-numeric loopback origin and exactly one Work cookie or token. It reads only its own profile.
+numeric loopback origin and exactly one Work cookie or token. The client itself reads no other credential or profile; like every `vinci` command, the launcher first loads `~/.vinci-code.env` if it exists.
 
 The client can create an admitted saved task, inspect state/events, answer a current
 question, approve or correct an exact action, read receipts/artifacts and request
