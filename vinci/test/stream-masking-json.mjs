@@ -2073,6 +2073,27 @@ for (const [variant, body, stopReason, withError] of [
 	});
 }
 
+// Pins #207's releasesWhole path for a complete value; missing indexes keep the call interrupted.
+// Its toolcall_end retains complete JSON, so closedValueStrings marks the value complete at the length cut.
+test("json 207 (S-T1, length): a complete tool-call argument ending in \"-\" and a line break is the placeholder in a cut call", async () => {
+	const where = "207 (S-T1, json, length)";
+	const args = { command: "see the release-\n" };
+	const json = JSON.stringify(args);
+	const { events, final } = toolCallEvents("bash", fragmentsOf(json, toolFragment), {
+		index: "missing",
+		stopReason: "length",
+		finals: true,
+		keepPartialOnEnd: true,
+	});
+	assert.deepEqual(final?.content?.[0]?.arguments, args, "fixture sanity: the cut call carries the complete argument value");
+	assert.equal(final?.content?.[0]?.partialJson, json, "fixture sanity: retained JSON closes the argument value");
+	const out = await runJson(events);
+	assertCompleted(out, ["message_end", "turn_end", "agent_end"], where);
+	const end = out.events.find((event) => event.assistantMessageEvent?.type === "toolcall_end");
+	assert.equal(end?.assistantMessageEvent?.toolCall?.arguments?.command, PLACEHOLDER, `${where}: the complete value is the placeholder`);
+	assert.ok(!out.stdout.includes("see the release"), `${where}: no raw argument value reaches stdout`);
+});
+
 for (const [ch, where] of [
 	["-", "207 (S-G1, json, -)"],
 	["_", "207 (S-G1, json, _)"],
