@@ -116,16 +116,16 @@ export function clearTrust(cwd: string): void {
 }
 
 // 3-way risky-command prompt with a project-remember option. Returns true to allow, false to block.
-// If the exact command was already trusted for this project, allows silently (no prompt).
-async function confirmRisky(ctx: ExtensionContext, title: string, detail: string, cmd: string): Promise<boolean> {
+// If the exact command was already trusted or approved in this invocation, allows silently (no prompt).
+async function confirmRisky(ctx: ExtensionContext, title: string, detail: string, cmd: string, pendingGrants: string[]): Promise<boolean> {
   const c = cmd.trim();
-  if (isTrusted(ctx.cwd, c)) return true;
+  if (pendingGrants.includes(c) || isTrusted(ctx.cwd, c)) return true;
   const YES = "Yes, run it";
   const ALWAYS = "Always allow this exact command in this project";
   const NO = "No, don't";
   const choice = await ctx.ui.select(`${title}\n\n${detail}`, [NO, YES, ALWAYS], { vinciReviewContext: true });
   if (choice === ALWAYS) {
-    addTrust(ctx.cwd, c);
+    pendingGrants.push(c);
     ctx.ui.notify("Got it — I won't ask about that exact command in this project again (/allowed to undo).", "info");
     return true;
   }
@@ -1964,6 +1964,13 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     // --- Shell commands: block catastrophic, confirm dangerous. ---
     if (event.toolName === "bash") {
+      const pendingGrants: string[] = [];
+      // [vinci] #198: persist invocation-local grants only when the handler allows the call.
+      const commitPendingGrants = (): undefined => {
+        for (const command of pendingGrants) addTrust(ctx.cwd, command);
+        return undefined;
+      };
+
       // Two views of one command, and the split matters in both directions.
       // `cmd` is what will actually RUN, and is what every guard below classifies: the risk of a
       // command is a property of the thing that executes, and a handle is not inert to a classifier
@@ -1974,7 +1981,7 @@ export default function (pi: ExtensionAPI) {
       let cmd = String((event.input as { command?: unknown }).command ?? "");
       // Set when live secret handles were restored into cmd: its text then holds secret values.
       let carriesRestoredSecrets = false;
-      if (!cmd.trim()) return undefined;
+      if (!cmd.trim()) return commitPendingGrants();
       const displayCommand = cmd;
 
       // The masking placeholder is a hole in the model's VIEW, not a value. Shipped inside a real
@@ -2149,7 +2156,7 @@ export default function (pi: ExtensionAPI) {
           // destroy the tree the work order lives in — and none of these is a dialog the interactive
           // UX would have rubber-stamped.
           if (!ctx.hasUI) return headlessGate(pi, "network-priority-dangerous", "keep-blocking", priorityDanger[1]);
-          if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${priorityDanger[1]}):\n\n  ${displayCommand}\n\nRun it?`, displayCommand))) {
+          if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${priorityDanger[1]}):\n\n  ${displayCommand}\n\nRun it?`, displayCommand, pendingGrants))) {
             ctx.ui.notify("Command blocked.", "info");
             return { block: true, reason: "Blocked — the user declined the risky command. Do not retry it or achieve the same effect another way; do what they asked differently, or ask them." };
           }
@@ -2160,7 +2167,7 @@ export default function (pi: ExtensionAPI) {
           // it and no revert of the branch undoes it. Explicitly named as keep-blocking in the W2
           // spec; stays a hard block under the profile.
           if (!ctx.hasUI) return headlessGate(pi, "network-priority-database", "keep-blocking", priorityDatabase[1]);
-          if (!(await confirmRisky(ctx, "Vinci — confirm a database change", `Vinci wants to ${priorityDatabase[1]}:\n\n  ${displayCommand}\n\nGo ahead?`, displayCommand))) {
+          if (!(await confirmRisky(ctx, "Vinci — confirm a database change", `Vinci wants to ${priorityDatabase[1]}:\n\n  ${displayCommand}\n\nGo ahead?`, displayCommand, pendingGrants))) {
             ctx.ui.notify("Held off — good call.", "info");
             return { block: true, reason: `Blocked — the user declined to ${priorityDatabase[1]}. Don't run this; do what they asked another way, or ask them.` };
           }
@@ -2402,12 +2409,12 @@ export default function (pi: ExtensionAPI) {
         // delete them, and there is no version of "the Governor authorized rm -rf" that a run should
         // infer for itself.
         if (!ctx.hasUI) return headlessGate(pi, "dangerous-command", "keep-blocking", why);
-        if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${why}):\n\n  ${displayCommand}\n\nRun it?`, displayCommand))) {
+        if (!(await confirmRisky(ctx, "Vinci — confirm a risky command", `This looks destructive (${why}):\n\n  ${displayCommand}\n\nRun it?`, displayCommand, pendingGrants))) {
           ctx.ui.notify("Command blocked.", "info");
           return { block: true, reason: "Blocked — the user declined the risky command. Do not retry it or achieve the same effect another way; do what they asked differently, or ask them." };
         }
         confirmedClasses.add("dangerous");
-        if (!hasMultipleGuardClasses) return undefined;
+        if (!hasMultipleGuardClasses) return commitPendingGrants();
       }
 
       // Consequential — reaches the real world / changes your whole computer. Confirm with tailored wording.
@@ -2431,12 +2438,12 @@ export default function (pi: ExtensionAPI) {
             guardClass === "database" ? "keep-blocking" : "escalate",
             hit[1],
           );
-        if (!(await confirmRisky(ctx, g.title, `Vinci wants to ${hit[1]}:\n\n  ${displayCommand}\n\nGo ahead?`, displayCommand))) {
+        if (!(await confirmRisky(ctx, g.title, `Vinci wants to ${hit[1]}:\n\n  ${displayCommand}\n\nGo ahead?`, displayCommand, pendingGrants))) {
           ctx.ui.notify("Held off — good call.", "info");
           return { block: true, reason: `Blocked — the user declined to ${hit[1]}. Don't run this; do what they asked another way, or ask them.` };
         }
         confirmedClasses.add(guardClass);
-        if (!hasMultipleGuardClasses) return undefined;
+        if (!hasMultipleGuardClasses) return commitPendingGrants();
       }
 
       // Committing secret files → leaks them once pushed. Two ways in: the command NAMES a secret file,
@@ -2459,7 +2466,7 @@ export default function (pi: ExtensionAPI) {
           );
           // `keep-blocking` never returns undefined; the guard is here so a future re-bucketing of
           // this site cannot silently fall through into the interactive branch with no UI.
-          if (!held) return undefined;
+          if (!held) return commitPendingGrants();
           recordFinalizationRefusal(ctx, "guard", cmd, held.reason);
           return held;
         }
@@ -2475,9 +2482,9 @@ export default function (pi: ExtensionAPI) {
           recordFinalizationRefusal(ctx, "guard", cmd, declined);
           return { block: true, reason: declined };
         }
-        return undefined;
+        return commitPendingGrants();
       }
-      return undefined;
+      return commitPendingGrants();
     }
 
     if (event.toolName === "read") {
