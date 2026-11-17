@@ -126,7 +126,7 @@ async function confirmRisky(ctx: ExtensionContext, title: string, detail: string
   const choice = await ctx.ui.select(`${title}\n\n${detail}`, [NO, YES, ALWAYS], { vinciReviewContext: true });
   if (choice === ALWAYS) {
     pendingGrants.push(c);
-    ctx.ui.notify("Got it — I won't ask about that exact command in this project again (/allowed to undo).", "info");
+    ctx.ui.notify("Got it — I'll remember that exact command in this project if it passes the remaining checks (/allowed to undo).", "info");
     return true;
   }
   return choice === YES;

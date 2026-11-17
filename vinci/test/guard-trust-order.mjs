@@ -25,6 +25,7 @@ const NO = "No, don't";
 const YES = "Yes, run it";
 const ALWAYS = "Always allow this exact command in this project";
 const ALLOW = "Yes, allow it";
+const REMEMBER_NOTICE = "Got it — I'll remember that exact command in this project if it passes the remaining checks (/allowed to undo).";
 
 function createHarness({ riskyChoice = ALWAYS, deniedTitle, rememberError } = {}) {
   const handlers = {};
@@ -84,6 +85,7 @@ const refusedFixtures = [
     titles: ["Vinci — confirm a risky command", "Vinci — allow this network command once?"],
     refusal: /force-push to a protected branch/,
     message: "protected-branch refusal leaves trust unchanged after ALWAYS",
+    noPermanencePromise: true,
   },
   {
     name: "R2",
@@ -140,6 +142,11 @@ async function assertRefusalPreservesTrust(fixture) {
     assert.match(result.reason, fixture.refusal, `${fixture.name}: expected refusal`);
   }
   assert.deepEqual(trustSnapshot(), before, `${fixture.name}: refusal or exception must not change trust bytes`);
+  if (fixture.noPermanencePromise) {
+    // The ALWAYS notice must have fired (so this check is not vacuous) and must not promise a saved grant.
+    assert.ok(harness.notifications.some(({ message }) => message.startsWith("Got it —")), `${fixture.name}: the ALWAYS notice must be shown`);
+    assert.ok(!harness.notifications.some(({ message }) => /won.t ask/.test(message)), `${fixture.name}: a refused ALWAYS must not promise never to ask again`);
+  }
 }
 
 const rows = [
@@ -204,6 +211,7 @@ const rows = [
       const first = createHarness();
       assert.notEqual((await first.toolCall(command))?.block, true, "first reset must be allowed");
       assert.equal(first.dialogs.length, 1, "first reset asks exactly once");
+      assert.ok(first.notifications.some(({ message }) => message === REMEMBER_NOTICE), "C1: the ALWAYS notice must say the grant is kept only if the remaining checks pass");
       assertOnlyTrust(command);
       const second = createHarness();
       assert.notEqual((await second.toolCall(command))?.block, true, "trusted reset must be allowed");
