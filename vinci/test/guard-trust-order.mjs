@@ -174,6 +174,8 @@ const rows = [
     message: "secret-staging refusal leaves trust unchanged after an earlier ALWAYS choice",
     async run() {
       // Use the C6 path: approve the checkpoint, choose ALWAYS, then decline secret staging.
+      // The command first raises the credential-exposure dialog (No / Yes, allow it); the harness
+      // answers ALLOW, which grants this one invocation only and writes nothing to the trust file.
       const command = "git reset --hard HEAD~1; prisma migrate dev; git add .env";
       const harness = createHarness({ riskyChoice: ALWAYS, deniedTitle: "Vinci — put secrets into git?" });
       const before = trustSnapshot();
@@ -183,12 +185,13 @@ const rows = [
       assert.ok(harness.dialogs.some(({ title }) => title.startsWith("Vinci — put secrets into git?\n\n")),
         "R6: must show the secret-staging prompt");
       assert.deepEqual(harness.dialogs.map(({ title }) => title.split("\n\n")[0]), [
+        "Vinci — expose credentials to this session?",
         "Vinci — save a git checkpoint?",
         "Vinci — confirm a risky command",
         "Vinci — put secrets into git?",
       ], "R6: checkpoint approval and ALWAYS must precede the secret-staging decline");
-      assert.deepEqual(harness.dialogs[1].options, [NO, YES, ALWAYS], "R6: earlier ask must offer ALWAYS");
-      assert.deepEqual(harness.dialogs[2].options, [NO, ALLOW], "R6: secret-staging decline must be offered");
+      assert.deepEqual(harness.dialogs[2].options, [NO, YES, ALWAYS], "R6: earlier ask must offer ALWAYS");
+      assert.deepEqual(harness.dialogs[3].options, [NO, ALLOW], "R6: secret-staging decline must be offered");
       // Base persists ALWAYS before this late refusal; the fix must leave trust unchanged.
       assert.deepEqual(trustSnapshot(), before, "R6: secret-staging refusal must not change trust bytes");
     },
@@ -268,12 +271,18 @@ const rows = [
     name: "C6",
     message: "secret-staging approval commits an earlier pending ALWAYS grant",
     async run() {
+      // The credential-exposure dialog comes first and is answered ALLOW (once only, never saved);
+      // the trust assertions below show that answer adds nothing to the trust file.
       // Dangerous + database avoids both single-class early exits; git add .env reaches the
       // secret-staging return after ALWAYS. No shell command is executed by this harness.
       const command = "git reset --hard HEAD~1; prisma migrate dev; git add .env";
       const harness = createHarness();
       assert.notEqual((await harness.toolCall(command))?.block, true, "approved secret staging must be allowed");
       assert.deepEqual(harness.dialogs, [
+        {
+          title: `Vinci — expose credentials to this session?\n\nThis command may print credentials into Vinci's model context:\n\n  ${command}\n\nRun this exact command once? Detected values will be redacted.`,
+          options: [NO, ALLOW],
+        },
         {
           title: `Vinci — save a git checkpoint?\n\nYou didn't ask Vinci to stage or commit changes in this request:\n\n  ${command}\n\nCreate a git checkpoint now?`,
           options: [NO, ALLOW],
