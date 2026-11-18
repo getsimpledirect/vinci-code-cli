@@ -76,7 +76,8 @@ jobs:
     # showed 0.0.50 as latest. A skip is indistinguishable from a pass at a glance, which is what
     # let it go unnoticed for a whole version.
     if: github.repository == 'getsimpledirect/vinci-code-cli' && (github.event_name == 'push' || inputs.operation == 'candidate')
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-26.04 lacks the bwrap-userns-restrict AppArmor profile the Bubblewrap step loads (#244).
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
