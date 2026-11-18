@@ -2231,6 +2231,13 @@ try {
     ["C-comment", "true # '\necho tee", false],
     ["C-esc", "true \\& echo x 2>&1 > f", false],
     ["C-nest3", "x=$(true $(true $(true)))", false],
+    // Read-only shapes the tokenizer must not refuse, each beside a write that must stay a write.
+    ["D1", "echo x >&2-", false],
+    ["D2", "true $'can\\'t > data'", false],
+    ["D2+", "echo $'a\\'b' > f", true],
+    ["D3", "sed -n -e p -- '-i'", false],
+    ["D3", "perl -e 'print qq(ok)' -- '-i'", false],
+    ["D3+", "sed -i -- s/a/b/ f", true],
   ]) {
     const selectionCount = selections.length;
     const result = await toolCall("bash", { command });

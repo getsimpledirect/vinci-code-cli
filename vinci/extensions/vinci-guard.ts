@@ -803,6 +803,31 @@ function shellWriteTokens(command: string, depth: number): {
         continue;
       }
     }
+    if (activeQuote === null && ch === "$" && command[index + 1] === "'") {
+      // ANSI-C quoting ($'...'), lexed as Bash does: a backslash escapes the next character, a quote included.
+      let end = index + 2;
+      const text: string[] = [];
+      while (end < command.length && command[end] !== "'") {
+        if (command[end] === "\\" && end + 1 < command.length) {
+          text.push(/['"\\?]/.test(command[end + 1]) ? command[end + 1] : command.slice(end, end + 2));
+          end += 2;
+        } else text.push(command[end++]);
+      }
+      if (end >= command.length) return { ok: false, bounded: false, commands };
+      if (frame) {
+        frame.wordStart = false;
+        if (frame.delimiter) {
+          frame.delimiter.parts.push(text.join(""));
+          frame.delimiter.started = true;
+        }
+      } else {
+        word.push(text.join(""));
+        started = true;
+        descriptor = false;
+      }
+      index = end + 1;
+      continue;
+    }
     if (activeQuote !== null) {
       if (ch === activeQuote) {
         if (frame) frame.quote = null;
@@ -991,15 +1016,19 @@ function tokenWriteAt(command: string, depth: number, cache: Map<number, Map<str
     const words = tokenWriterWords(part.words);
     const fileRedirect = part.redirects.some((redirect) => {
       if (redirect.target === "/dev/null") return false;
-      if (/^1?>&$/.test(redirect.op)) return !/^(?:\d+|-)$/.test(redirect.target);
+      // `>&N` duplicates, `>&N-` moves and `>&-` closes a descriptor; any other target is a file.
+      if (/^1?>&$/.test(redirect.op)) return !/^(?:\d+-?|-)$/.test(redirect.target);
       return /^(?:1?(?:>|>>|>\|)|&>|&>>)$/.test(redirect.op);
     });
     if (/^(?:echo|printf)$/i.test(words[0] ?? "") && fileRedirect) return true;
     if (/^cat$/i.test(words[0] ?? "") && part.redirects.some((redirect) => /^<<-?$/.test(redirect.op)) && fileRedirect) return true;
     if (/^tee$/i.test(words[0] ?? "") && words.slice(1).some((word) => !word.startsWith("-") && word !== "/dev/null")) return true;
     const inPlace = tokenWriterWords(part.words, false);
-    return /^sed$/i.test(inPlace[0] ?? "") && inPlace.slice(1).some((word) => /^-i\b/.test(word))
-      || /^perl$/i.test(inPlace[0] ?? "") && inPlace.slice(1).some((word) => /^-[A-Za-z]*i[A-Za-z]*\b/.test(word));
+    // The in-place flag search stops at `--`: the words after it are operands, not options.
+    const optionsEnd = inPlace.indexOf("--", 1);
+    const options = inPlace.slice(1, optionsEnd === -1 ? undefined : optionsEnd);
+    return /^sed$/i.test(inPlace[0] ?? "") && options.some((word) => /^-i\b/.test(word))
+      || /^perl$/i.test(inPlace[0] ?? "") && options.some((word) => /^-[A-Za-z]*i[A-Za-z]*\b/.test(word));
   });
   results.set(command, result);
   return result;
