@@ -637,7 +637,8 @@ function shellFileWriteAt(command: string, depth: number): boolean {
     if (/^(?:echo|printf)\b/i.test(body) && FILE_REDIRECT.test(body)) return true;
     if (/^tee\b(?:\s+-[A-Za-z]+)*\s+(?!-)(?!\/dev\/null\b)\S+/i.test(body)) return true;
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
-    if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i[A-Za-z]*\b)/i.test(writerBody(segment, false))) return true;
+    // perl: one quantifier after `-` (a long unquoted `-ii…i0` word made `[A-Za-z]*i[A-Za-z]*\b` backtrack quadratically).
+    if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i)/i.test(writerBody(segment, false))) return true;
     return false;
   }) || clobberOrBothRedirectWrite(command) || tokenWrite(command);
 }
@@ -1028,7 +1029,9 @@ function tokenWriteAt(command: string, depth: number, cache: Map<number, Map<str
     const optionsEnd = inPlace.indexOf("--", 1);
     const options = inPlace.slice(1, optionsEnd === -1 ? undefined : optionsEnd);
     return /^sed$/i.test(inPlace[0] ?? "") && options.some((word) => /^-i\b/.test(word))
-      || /^perl$/i.test(inPlace[0] ?? "") && options.some((word) => /^-[A-Za-z]*i[A-Za-z]*\b/.test(word));
+      // One quantifier only: `[A-Za-z]*i[A-Za-z]*\b` backtracked quadratically on a long `-ii…i0` word.
+      // `-i<suffix>` (in place with a backup extension) counts as in place, as perl reads it.
+      || /^perl$/i.test(inPlace[0] ?? "") && options.some((word) => /^-[A-Za-z]*i/.test(word));
   });
   results.set(command, result);
   return result;

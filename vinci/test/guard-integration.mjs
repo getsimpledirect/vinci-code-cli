@@ -2210,6 +2210,28 @@ try {
       command.length === 262144 && guard.isShellFileWrite(command) === false && result === undefined && selections.length === selectionCount,
     );
   }
+  {
+    // A long quoted perl word `-ii…i0` must not make the in-place flag search backtrack. The bound is checked
+    // before the value: with the old regex the value is also wrong, and only the bound shows the backtracking.
+    const command = "perl -e 'print qq(ok)' data '-" + "i".repeat(262000) + "0'";
+    const started = performance.now();
+    const value = guard.isShellFileWrite(command);
+    const ms = performance.now() - started;
+    console.log("168 E1 wall ms=" + ms);
+    check("168 E1: a long quoted perl -ii…i0 word is classified within 2,000 ms", ms < 2000);
+    check("168 E1: a long quoted perl -ii…i0 word (in place with a backup suffix) is a write", value === true);
+  }
+  {
+    // The same word unquoted reaches the existing passes' perl check first. Bound first again: with the old
+    // pattern there, the new pass still returns the right value afterwards, so only the bound shows the backtracking.
+    const command = "perl -e 'print qq(ok)' data -" + "i".repeat(262000) + "0";
+    const started = performance.now();
+    const value = guard.isShellFileWrite(command);
+    const ms = performance.now() - started;
+    console.log("168 L640 wall ms=" + ms);
+    check("168 L640: a long unquoted perl -ii…i0 word is classified within 2,000 ms", ms < 2000);
+    check("168 L640: a long unquoted perl -ii…i0 word (in place with a backup suffix) is a write", value === true);
+  }
   for (const [row, command, expected] of [
     ["R10c", 'echo "x', false],
     ["C2", "echo x >&2", false],
