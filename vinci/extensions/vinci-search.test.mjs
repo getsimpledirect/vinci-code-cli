@@ -385,3 +385,111 @@ test("web_fetch handles missing, null, empty, malformed, and wrong-type input wi
     assert.match(resultText(result), /valid web address/);
   }
 });
+
+// web_search sends a model credential only to the Vinci gateway, and only for a Vinci model: a
+// key for another provider (bring your own key) is sent to that provider and to nobody else.
+const BYOK_KEY = "byok-provider-key-sentinel";
+const VINCI_TOKEN = "vinci-device-token";
+
+function registeredWebSearch() {
+  const tools = [];
+  registerVinciSearch({ registerTool: (tool) => tools.push(tool) });
+  const webSearch = tools.find((tool) => tool.name === "web_search");
+  assert.ok(webSearch, "production extension must register web_search");
+  return webSearch;
+}
+
+function searchContext(provider, apiKey) {
+  const lookups = [];
+  return {
+    lookups,
+    ctx: {
+      model: { provider, id: `${provider}-model` },
+      modelRegistry: {
+        async getApiKeyAndHeaders(model) {
+          lookups.push(model.provider);
+          return { ok: true, apiKey };
+        },
+      },
+    },
+  };
+}
+
+function jsonResponse(status, body) {
+  return { ok: status >= 200 && status < 300, status, async json() { return body; } };
+}
+
+async function runWebSearch({ provider, apiKey, braveKey, respond }) {
+  const originalFetch = globalThis.fetch;
+  const originalBrave = process.env.BRAVE_SEARCH_API_KEY;
+  const requests = [];
+  if (braveKey === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
+  else process.env.BRAVE_SEARCH_API_KEY = braveKey;
+  globalThis.fetch = async (url, init) => {
+    const href = String(url instanceof URL ? url.href : url);
+    const headers = Object.fromEntries(Object.entries(init?.headers ?? {}).map(([key, value]) => [key.toLowerCase(), String(value)]));
+    requests.push({ href, brave: href.startsWith("https://api.search.brave.com/"), headers });
+    return respond(href);
+  };
+  const { ctx, lookups } = searchContext(provider, apiKey);
+  try {
+    const result = await registeredWebSearch().execute("call", { query: "vinci" }, signal, undefined, ctx);
+    return { result, requests, lookups };
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalBrave === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
+    else process.env.BRAVE_SEARCH_API_KEY = originalBrave;
+  }
+}
+
+const gatewayHits = { results: [{ title: "Gateway hit", url: "https://example.com/gateway", content: "from the gateway" }] };
+const braveHits = { web: { results: [{ title: "Brave hit", url: "https://example.com/brave", description: "from Brave" }] } };
+
+test("web_search never sends a bring-your-own-key provider key to the Vinci gateway", async () => {
+  const { result, requests, lookups } = await runWebSearch({ provider: "anthropic", apiKey: BYOK_KEY, respond: () => jsonResponse(200, gatewayHits) });
+  assert.deepEqual(requests.filter((request) => !request.brave), [], "no gateway request for a non-Vinci model");
+  assert.ok(requests.every((request) => !JSON.stringify(request.headers).includes(BYOK_KEY)), "the provider key is in no request header");
+  assert.deepEqual(lookups, [], "the provider key is not even read");
+  assert.match(resultText(result), /Search unavailable/);
+  assert.match(resultText(result), /BRAVE_SEARCH_API_KEY|\/login vinci/);
+});
+
+test("web_search does not fall back to the Vinci gateway with a provider key when Brave fails", async () => {
+  const { result, requests, lookups } = await runWebSearch({
+    provider: "openai",
+    apiKey: BYOK_KEY,
+    braveKey: "brave-subscription-token",
+    respond: (href) => (href.startsWith("https://api.search.brave.com/") ? jsonResponse(500, {}) : jsonResponse(200, gatewayHits)),
+  });
+  assert.equal(requests.length, 1, "only the Brave request is made");
+  assert.equal(requests[0].brave, true);
+  assert.ok(!JSON.stringify(requests[0].headers).includes(BYOK_KEY), "the provider key is not sent to Brave either");
+  assert.deepEqual(lookups, []);
+  assert.match(resultText(result), /Search unavailable/);
+});
+
+test("positive control: a Vinci model still searches through the gateway with its Vinci token", async () => {
+  const { result, requests, lookups } = await runWebSearch({ provider: "vinci", apiKey: VINCI_TOKEN, respond: () => jsonResponse(200, gatewayHits) });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].brave, false);
+  assert.match(requests[0].href, /\/search$/);
+  assert.equal(requests[0].headers.authorization, `Bearer ${VINCI_TOKEN}`);
+  assert.deepEqual(lookups, ["vinci"]);
+  assert.match(resultText(result), /Gateway hit/);
+});
+
+test("positive control: a working Brave key still searches for a bring-your-own-key model without the provider key", async () => {
+  const { result, requests, lookups } = await runWebSearch({
+    provider: "anthropic",
+    apiKey: BYOK_KEY,
+    braveKey: "brave-subscription-token",
+    respond: () => jsonResponse(200, braveHits),
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].brave, true);
+  assert.equal(requests[0].headers["x-subscription-token"], "brave-subscription-token");
+  assert.equal(requests[0].headers.authorization, undefined);
+  assert.ok(!JSON.stringify(requests[0].headers).includes(BYOK_KEY));
+  assert.deepEqual(lookups, []);
+  assert.match(resultText(result), /Brave hit/);
+});

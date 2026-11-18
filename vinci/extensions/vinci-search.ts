@@ -91,7 +91,7 @@ export function formatResults(query: string, results: SearchResult[]): string {
 // Enabled by setting BRAVE_SEARCH_API_KEY (loaded from an UNTRACKED local file — never committed; see
 // bin/vinci). When set, web_search uses Brave's Web Search API directly. TRADEOFF: this is a
 // CLIENT-SIDE call, so unlike the ZDR gateway path the query + your IP reach Brave's servers. On any
-// Brave failure web_search falls back to the ZDR gateway, so search still works.
+// Brave failure web_search falls back to the ZDR gateway for a Vinci model, so search still works.
 // Docs: https://api.search.brave.com/app/documentation/web-search
 const BRAVE_URL = "https://api.search.brave.com/res/v1/web/search";
 const BRAVE_FRESHNESS: Record<string, string> = { day: "pd", week: "pw", month: "pm", year: "py" };
@@ -475,7 +475,7 @@ export default function (pi: ExtensionAPI) {
           ? AbortSignal.any([signal, timeout])
           : timeout;
 
-      // Opt-in Brave backend (BRAVE_SEARCH_API_KEY set). Falls through to the ZDR gateway on any error.
+      // Opt-in Brave backend (BRAVE_SEARCH_API_KEY set). On any error a Vinci model falls through to the ZDR gateway.
       const braveKey = process.env.BRAVE_SEARCH_API_KEY?.trim();
       if (braveKey) {
         try {
@@ -491,6 +491,14 @@ export default function (pi: ExtensionAPI) {
 
       // Gateway backend (self-hosted SearxNG, ZDR) — needs a signed-in model.
       if (!ctx.model) return { content: [{ type: "text", text: "Search unavailable: no model selected." }], details };
+      // The gateway takes a Vinci credential only. A key for another provider (bring your own key) goes to
+      // that provider and to nobody else (PRIVACY.md), so it is never read or sent here.
+      if (ctx.model.provider !== "vinci") {
+        return {
+          content: [{ type: "text", text: "Search unavailable: web search needs a Vinci sign-in (/login vinci) or BRAVE_SEARCH_API_KEY." }],
+          details,
+        };
+      }
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
       if (!auth.ok || !auth.apiKey) {
         return { content: [{ type: "text", text: "Search unavailable: not signed in (run /login vinci)." }], details };
