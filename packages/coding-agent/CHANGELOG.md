@@ -75,6 +75,7 @@
 - Fixed the edit tool schema to allow model-invented extra replacement fields instead of rejecting otherwise valid edits ([#6278](https://github.com/earendil-works/pi/issues/6278)).
 - Fixed new session resets to clear cached label timestamps ([#6354](https://github.com/earendil-works/pi/issues/6354)).
 - Fixed the Vinci guard saving an "Always allow" grant for a command that the guard then refuses; the grant is now saved only when the guard allows the command. ([#198](https://github.com/getsimpledirect/vinci-code-cli/issues/198))
+- Fixed some shell commands previously allowed by the Vinci guard to count as file writes and be refused: an escaped `&` before `>`, a `>` after descriptor duplication such as `2>&1`, an explicit `1>`, `>& file`, a separator inside `${...}`, a quote inside a comment, a line continuation inside `<&0`, a write inside `$(...)` or backticks (including in an assignment), unterminated input that contains `>` or a `tee`, `sed` or `perl` word, and very deeply nested input; commands over 262,144 characters are treated as file writes ([#168](https://github.com/getsimpledirect/vinci-code-cli/issues/168)).
 
 ### Removed
 
