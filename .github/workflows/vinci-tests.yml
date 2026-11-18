@@ -159,7 +159,8 @@ jobs:
         run: node --experimental-strip-types vinci/test/sandbox-integration.mjs
 
   offline-shard:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-26.04 lacks the bwrap-userns-restrict AppArmor profile the Bubblewrap step loads (#244).
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         # A DRAFT pull request runs the Node 24 leg only; every other event
