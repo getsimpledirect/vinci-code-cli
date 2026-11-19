@@ -153,7 +153,7 @@ export type VerificationReservationDecision = {
   verifierFingerprint: string;
   fingerprintDiffers: boolean;
   upgradeAllowance: boolean;
-  refusal: "kept-passing" | "reserved-rerun" | undefined;
+  refusal: "kept-passing" | "kept-failed-required" | "reserved-rerun" | undefined;
 };
 
 /**
@@ -225,13 +225,25 @@ export function verificationReservationDecision({
     verificationState.variant === "normal" &&
     checkClass &&
     (verificationState.status === "passed" ||
-      verificationState.status === "stale" ||
-      (verificationState.status === "failed" && Boolean(verificationState.requiredCommand))) &&
+      verificationState.status === "stale") &&
     tool === "bash" &&
     vinciVerificationClassRank(checkClass) <= vinciVerificationClassRank(verificationState.checkClass) &&
     !contextualIdentityMatch
   ) {
     refusal = "kept-passing";
+  } else if (
+    // A failed required check is not completion evidence: the narrower check is still refused,
+    // but under its own value so the call site does not report a passing verifier.
+    mutationSucceeded &&
+    verificationState.variant === "normal" &&
+    checkClass &&
+    verificationState.status === "failed" &&
+    Boolean(verificationState.requiredCommand) &&
+    tool === "bash" &&
+    vinciVerificationClassRank(checkClass) <= vinciVerificationClassRank(verificationState.checkClass) &&
+    !contextualIdentityMatch
+  ) {
+    refusal = "kept-failed-required";
   } else if (
     mutationSucceeded &&
     verificationState.variant === "normal" &&
@@ -1334,6 +1346,14 @@ export default function (pi: ExtensionAPI) {
     // upgrade path: a stopped call never uses an upgrade attempt.
     if (compoundStop) return stopCompound();
     if (upgradeAllowance) return undefined;
+
+    if (reservation.refusal === "kept-failed-required") {
+      const requiredCommand = vinciRequiredVerificationCommand(verificationState).trim();
+      return {
+        block: true,
+        reason: `The required check \`${requiredCommand}\` failed; a narrower check cannot replace it. Fix the failure or report it.`,
+      };
+    }
 
     if (reservation.refusal === "kept-passing") {
       sendVinciControl(
