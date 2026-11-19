@@ -2,6 +2,10 @@ import { appendFileSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+// The shared secret masker, imported from source: this command runs before any build output is
+// required (see below), and the masker module has no imports of its own. A static import fails
+// closed: if the module cannot load, the process exits before anything is written.
+import { vinciMaskSecrets } from "../../packages/coding-agent/src/core/vinci-mask-secrets.ts";
 
 const OUTCOME_ENTRY = "vinci-task-outcome";
 const REPORT_ENTRY = "vinci-false-completion-report";
@@ -138,7 +142,13 @@ function parseArgs(args) {
       positional.push(args[index]);
     }
   }
-  return { taskId: positional[0] || "", note: positional.slice(1).join(" ").trim().slice(0, 500), sessionDir };
+  // Mask before truncating, so a credential cut at the limit cannot survive as an unrecognizable fragment.
+  const note = vinciMaskSecrets(positional.slice(1).join(" ").trim(), { render: noteSentinel }).slice(0, 500);
+  return { taskId: positional[0] || "", note, sessionDir };
+}
+
+function noteSentinel(_value, kind) {
+  return kind === "private-key" ? "<vinci-private-key>" : "<vinci-secret>";
 }
 
 const { taskId, note, sessionDir } = parseArgs(process.argv.slice(2));

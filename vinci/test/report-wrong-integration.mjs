@@ -117,6 +117,61 @@ try {
   const missing = run(home, sessions, "missing-task");
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /No task found/);
+
+  // Credentials in the note are masked before the report is stored. Built at runtime so no
+  // credential-shaped literal sits in the source.
+  const syntheticToken = `ghp_${"TESTONLY"}${"r".repeat(32)}`;
+  const storedNote = (path) =>
+    readFileSync(path, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.type === "custom" && entry.customType === taskOutcome.VINCI_FALSE_COMPLETION_ENTRY)
+      .at(-1)?.data.note;
+
+  // Positive control (W2): an ordinary note passes through the masking path unchanged. It runs
+  // before W1, so it is GREEN at the base (no masking) and at the head (masking).
+  const plainPath = writeSession(sessions, "plain-task", "DONE");
+  const plainText =
+    "fix didn't hold: see https://example.com/docs/page?x=1 — café ✓, commit 0123456789abcdef0123456789abcdef01234567 (still fails!)";
+  const plain = run(home, sessions, "plain-task", plainText);
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.equal(storedNote(plainPath), plainText, "H07 W2: an ordinary note is stored unchanged");
+  assert.ok(readFileSync(plainPath, "utf8").includes(JSON.stringify(plainText)), "H07 W2: the stored bytes are the note's own JSON");
+
+  const secretPath = writeSession(sessions, "secret-task", "DONE");
+  const secret = run(home, sessions, "secret-task", `the run was rejected with ${syntheticToken} again`);
+  assert.equal(secret.status, 0, secret.stderr);
+  const secretNote = storedNote(secretPath);
+  assert.equal(secretNote.includes(syntheticToken), false, "H07 W1: a recognized credential in the note must not be stored");
+  assert.equal(secretNote.includes("ghp_"), false, "H07 W1: no part of the credential is stored");
+  assert.match(secretNote, /^the run was rejected with <vinci-secret> again$/, "H07 W1: the rest of the note is kept");
+
+  // Masking happens before the 500-character limit: a cut must not leave an unrecognizable fragment.
+  const longPath = writeSession(sessions, "long-task", "DONE");
+  const filler = "the focused test still fails. ".repeat(16);
+  const long = run(home, sessions, "long-task", `${filler}${syntheticToken}`);
+  assert.equal(long.status, 0, long.stderr);
+  const longNote = storedNote(longPath);
+  assert.equal(longNote.includes("ghp_"), false, "H07 W3: a credential at the limit must not survive as a fragment");
+  assert.ok(longNote.length <= 500, "H07 W3: the note stays within its limit");
+  assert.ok(longNote.startsWith(filler.trim()), "H07 W3: the ordinary text before the credential is kept");
+
+  // Fail closed: when the masker cannot load, the command exits non-zero and writes nothing.
+  const closedRoot = join(temp, "masker-missing");
+  mkdirSync(join(closedRoot, "vinci/scripts"), { recursive: true });
+  const closedScript = join(closedRoot, "vinci/scripts/report-wrong.mjs");
+  writeFileSync(closedScript, readFileSync(join(root, "vinci/scripts/report-wrong.mjs")));
+  const closedPath = writeSession(sessions, "closed-task", "DONE");
+  const closedBefore = readFileSync(closedPath, "utf8");
+  const closed = spawnSync(process.execPath, [closedScript, "closed-task", `raw ${syntheticToken}`, "--session-dir", sessions], {
+    cwd: temp,
+    env: { ...process.env, HOME: home },
+    encoding: "utf8",
+  });
+  assert.notEqual(closed.status, 0, "H07 W4: without the masker the command must fail");
+  assert.equal(readFileSync(closedPath, "utf8"), closedBefore, "H07 W4: without the masker nothing is written");
+  assert.doesNotMatch(closed.stdout, /Recorded/, "H07 W4: without the masker no report is claimed");
 } finally {
   rmSync(temp, { recursive: true, force: true });
 }
