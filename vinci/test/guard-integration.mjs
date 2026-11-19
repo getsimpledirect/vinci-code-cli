@@ -415,6 +415,49 @@ async function shellWriteWrapperChecks() {
   guard.isShellFileWrite(`bash -${"n".repeat(50000)}1 -c 'ls'`);
   guard.isShellFileWrite(`bash -${"c".repeat(50000)}1 'ls'`);
   assert.ok(Date.now() - clusterStarted < 2000, "a long option cluster is classified quickly");
+  {
+    // Every sed in-place spelling is a file write: -i inside a short-option cluster, -i with a glued
+    // backup suffix, and the long option (GNU sed also accepts any unambiguous prefix of it, e.g. --in).
+    // The read-only controls below keep their old classification. All rows are compared before one
+    // assertion, so a regression names every row it changes. Labels: "new" = main allows it;
+    // "main already refuses" = a regression control; "accepted over-refusal (fail closed)" = read-only but refused.
+    const sedRows = [
+      ["SI-Ei", "sed -Ei s/a/b/ f", true, "new"],
+      ["SI-nEi", "sed -nEi s/a/b/p f", true, "new"],
+      ["SI-ibak", "sed -ibak s/a/b/ f", true, "new"],
+      ["SI-long", "sed --in-place s/a/b/ f", true, "new"],
+      ["SI-long=", "sed --in-place=.bak s/a/b/ f", true, "new"],
+      ["SI-prefix", "sed --in s/a/b/ f", true, "new"],
+      ["SQ-Ei", "sed '-Ei' s/a/b/ f", true, "new"],
+      ["SQ-long", 'sed "--in-place" s/a/b/ f', true, "new"],
+      ["SQ-I", "sed '-I' s/a/b/ f", true, "new"],
+      ["SQ-EI", "sed '-EI' s/a/b/ f", true, "new"],
+      ["SI-i.bak", "sed -i.bak s/a/b/ f", true, "main already refuses"],
+      ["SI-E-i", "sed -E -i s/a/b/ f", true, "main already refuses"],
+      ["SQ-i", "sed '-i' s/a/b/ f", true, "main already refuses"],
+      ["SI-I", "sed -I s/a/b/ f", true, "main already refuses"],
+      ["PI-pi_bak", "perl -pi_bak -e 's/a/b/' out.txt", true, "main already refuses"],
+      ["PI-pi0", "perl -pi0 -e 's/a/b/g' input.txt", true, "main already refuses"],
+      ["SO-fix", "sed -n '/ -fix/p' f", true, "accepted over-refusal (fail closed)"],
+      ["SO-fglued", "sed -fscript.sed f", true, "accepted over-refusal (fail closed)"],
+      ["SO-ddash", "sed -n '/ --in/p' f", true, "accepted over-refusal (fail closed)"],
+      ["SC-n", "sed -n p f", false, "control"],
+      ["SC-E", "sed -E s/a/b/ f", false, "control"],
+      ["SC-e", "sed -e s/a/b/ f", false, "control"],
+      ["SC-nE", "sed -nE '/x/p' f", false, "control"],
+      ["SC-expr", "sed --expression=s/a/b/ f", false, "control"],
+      ["SC-quiet", "sed --quiet p f", false, "control"],
+      ["SC-f", "sed -f script.sed f", false, "control"],
+      ["SC-grep", "grep -in x f", false, "control"],
+    ];
+    const wrong = [];
+    for (const [row, command, expected, label] of sedRows) {
+      const value = guard.isShellFileWrite(command);
+      console.log(`  sed in-place ${row} [${label}]: ${JSON.stringify(command)} -> ${value} (expected ${expected})`);
+      if (value !== expected) wrong.push(row);
+    }
+    check(`every sed in-place spelling is a write and the read-only sed controls are not (wrong: ${wrong.join(", ") || "none"})`, wrong.length === 0);
+  }
   // Positive controls: commands that run no content writer keep their old classification.
   for (const command of ["ls > out.txt", "bash script.sh > out.log", "zsh -c 'echo ok'", "bash -c 'ls > listing.txt'", "builtin cd .", "exec >/dev/null", "builtin echo x >/dev/null", "command -v echo", "command -v echo > out.txt", "bash -c 'ls' > out.txt", "bash -c 'echo ok' > /dev/null", "git ls-files | xargs sed -i 's/a/b/'",
     // A lookup (also with grouped options) writes nothing, even of a shell.

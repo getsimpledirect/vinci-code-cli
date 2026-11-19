@@ -638,7 +638,11 @@ function shellFileWriteAt(command: string, depth: number): boolean {
     if (/^tee\b(?:\s+-[A-Za-z]+)*\s+(?!-)(?!\/dev\/null\b)\S+/i.test(body)) return true;
     if (/^cat\b[^\n]*<<-?\s*\S+/i.test(body) && FILE_REDIRECT.test(body)) return true;
     // perl: one quantifier after `-` (a long unquoted `-ii…i0` word made `[A-Za-z]*i[A-Za-z]*\b` backtrack quadratically).
-    if (/^(?:sed\b[^\n]*\s-i\b|perl\b[^\n]*\s-[A-Za-z]*i)/i.test(writerBody(segment, false))) return true;
+    // sed in place: -i alone, inside a short-option cluster (-Ei), with a glued backup suffix (-ibak), or the long
+    // option or any GNU prefix of it (--in-place, --in). After `sed\b` the branch has two unbounded repeats
+    // (`[^\n]*`, then `[A-Za-z]*`), so linearity is not proven: adversarial inputs of ~262K characters took at most
+    // 40.6 ms in one local probe.
+    if (/^(?:sed\b[^\n]*\s(?:-[A-Za-z]*i|--i)|perl\b[^\n]*\s-[A-Za-z]*i)/i.test(writerBody(segment, false))) return true;
     return false;
   }) || clobberOrBothRedirectWrite(command) || tokenWrite(command);
 }
@@ -1028,7 +1032,10 @@ function tokenWriteAt(command: string, depth: number, cache: Map<number, Map<str
     // The in-place flag search stops at `--`: the words after it are operands, not options.
     const optionsEnd = inPlace.indexOf("--", 1);
     const options = inPlace.slice(1, optionsEnd === -1 ? undefined : optionsEnd);
-    return /^sed$/i.test(inPlace[0] ?? "") && options.some((word) => /^-i\b/.test(word))
+    // sed: the same in-place shapes as the existing pass (-i, -Ei, -ibak, --in-place and its prefixes such as --in),
+    // read here on shell words, so a quoted flag (`sed '-Ei' …`) counts too. Case-insensitive like the existing
+    // pass (BSD sed takes -I for in place). Every word `/^-i\b/` matched still matches.
+    return /^sed$/i.test(inPlace[0] ?? "") && options.some((word) => /^(?:-[A-Za-z]*i|--i)/i.test(word))
       // One quantifier only: `[A-Za-z]*i[A-Za-z]*\b` backtracked quadratically on a long `-ii…i0` word.
       // `-i<suffix>` (in place with a backup extension) counts as in place, as perl reads it.
       || /^perl$/i.test(inPlace[0] ?? "") && options.some((word) => /^-[A-Za-z]*i/.test(word));
