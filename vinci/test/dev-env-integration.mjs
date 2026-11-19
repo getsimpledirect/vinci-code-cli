@@ -1058,7 +1058,7 @@ async function capturedSearchUrl() {
       { query: "vinci" },
       undefined,
       undefined,
-      { model: { id: "auto" }, modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }) } },
+      { model: { id: "auto", provider: "vinci" }, modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }) } },
     );
   } finally {
     globalThis.fetch = originalFetch;
