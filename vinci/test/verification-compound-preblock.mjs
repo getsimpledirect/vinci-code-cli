@@ -412,7 +412,8 @@ await measure("T6b-ceiling", async (make) => {
   const controlsBefore = f.controls.length;
   const fourth = await f.bash("npm test; echo d");
   assert.equal(fourth.spy, 0, "T6b-ceiling: 4th spy 0");
-  assert.equal(fourth.reason, "Vinci stopped a repeated action before it could run again.", "T6b-ceiling: returned reason (:765)");
+  assert.match(fourth.reason, /^Vinci reached the limit of 25 actions allowed in one turn before finishing\./, "T6b-ceiling: the ceiling's tool result names the action limit");
+  assert.doesNotMatch(fourth.reason, /stopped a repeated action/, "T6b-ceiling: the ceiling's tool result does not call it a repeat");
   const message = f.controls.slice(controlsBefore).find((entry) => entry.message.customType === "vinci-loop-stop")?.message.content ?? "";
   assert.ok(message.includes("(Action 26 this turn — over the limit. Write your answer as plain text now; further non-navigation calls will also be blocked.)"), "T6b-ceiling: control message (:1029)");
   assert.equal(control.getVinciAutomationStop().reason, "Vinci reached the limit of 25 actions allowed in one turn before finishing.", "T6b-ceiling: humanReason (:1030)");
@@ -558,7 +559,8 @@ await measure("T7d-ii", async (make) => {
   for (const n of [1, 2, 3]) assert.equal((await f.bash(`npm test; echo ${n}`)).spy, 0, `T7d (ii): free stop ${n}`);
   const fourth = await f.bash("npm test; echo 4");
   assert.equal(fourth.spy, 0, "T7d (ii): 4th spy 0");
-  assert.equal(fourth.reason, "Vinci stopped a repeated action before it could run again.", "T7d (ii): the ceiling's own reason");
+  assert.match(fourth.reason, /^Vinci reached the limit of 25 actions allowed in one turn before finishing\./, "T7d (ii): the ceiling's tool result names the action limit");
+  assert.doesNotMatch(fourth.reason, /stopped a repeated action/, "T7d (ii): the ceiling's tool result does not call it a repeat");
   assert.equal(await nextCallUpgradeAttempts(f, seen), 0, "T7d (ii): incompleteUpgradeAttempts unchanged");
   await delay(250);
 });

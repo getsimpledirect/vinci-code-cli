@@ -1016,7 +1016,16 @@ export default function (pi: ExtensionAPI) {
   // `reason` is the MODEL-facing steer; `humanReason` is the short plain sentence recorded on the
   // automation stop — verification's closing message quotes it as "Why I stopped: …", so steer prose
   // ("Stop now — … Tell the user in plain language…") must never land there (round-2 audit P1-3).
-  function firmBlock(ctx: ExtensionContext, note: string, reason: string, humanReason: string): { block: true; reason: string } {
+  // `toolResult` is the text the blocked call returns to the model. Repeat-style blocks keep the
+  // repeated-action wording; the action ceiling passes its own sentence so a non-repeated call is
+  // not described as a repeat (LIMITREC R-a).
+  function firmBlock(
+    ctx: ExtensionContext,
+    note: string,
+    reason: string,
+    humanReason: string,
+    toolResult = "Vinci stopped a repeated action before it could run again.",
+  ): { block: true; reason: string } {
     if (ctx.hasUI && hardBlocks === 0) ctx.ui.notify(note, "warning");
     requestVinciAutomationStop(humanReason);
     sendVinciControl(pi, "vinci-loop-stop", reason);
@@ -1034,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
         }
       }, 200);
     }
-    return { block: true, reason: "Vinci stopped a repeated action before it could run again." };
+    return { block: true, reason: toolResult };
   }
 
   // A substantive assistant message = it's narrating findings and converging, so reset the
@@ -1324,6 +1333,7 @@ export default function (pi: ExtensionAPI) {
         ctx,
         ACTION_LIMIT_NOTE,
         `${STOP_AND_REPORT}\n\n(Action ${actionCalls} this turn — over the limit. Write your answer as plain text now; further non-navigation calls will also be blocked.)`,
+        actionLimitStopReason(ctx),
         actionLimitStopReason(ctx),
       );
     }
