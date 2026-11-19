@@ -203,13 +203,19 @@ export class SettingsList implements Component {
 		if (item.submenu) {
 			// Open submenu, passing current value so it can pre-select correctly
 			this.submenuItemIndex = this.selectedIndex;
-			this.submenuComponent = item.submenu(item.currentValue, (selectedValue?: string) => {
+			let completed = false;
+			const submenuComponent = item.submenu(item.currentValue, (selectedValue?: string) => {
+				completed = true;
 				if (selectedValue !== undefined) {
 					item.currentValue = selectedValue;
 					this.onChange(item.id, selectedValue);
 				}
 				this.closeSubmenu();
 			});
+			// The submenu factory may complete before it returns.
+			if (!completed) {
+				this.submenuComponent = submenuComponent;
+			}
 		} else if (item.values && item.values.length > 0) {
 			// Cycle through values
 			const currentIndex = item.values.indexOf(item.currentValue);
