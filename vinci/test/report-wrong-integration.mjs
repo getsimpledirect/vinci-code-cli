@@ -1,8 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createJiti } from "jiti/static";
 
@@ -172,6 +182,142 @@ try {
   assert.notEqual(closed.status, 0, "H07 W4: without the masker the command must fail");
   assert.equal(readFileSync(closedPath, "utf8"), closedBefore, "H07 W4: without the masker nothing is written");
   assert.doesNotMatch(closed.stdout, /Recorded/, "H07 W4: without the masker no report is claimed");
+
+  // W5: src masker present but throwing, with a loadable built masker.
+  const brokenRoot = join(temp, "masker-throwing");
+  const brokenScript = join(brokenRoot, "vinci/scripts/report-wrong.mjs");
+  const brokenSource = join(brokenRoot, "packages/coding-agent/src/core/vinci-mask-secrets.ts");
+  const builtFallback = join(brokenRoot, "packages/coding-agent/dist/core/vinci-mask-secrets.js");
+  mkdirSync(dirname(brokenScript), { recursive: true });
+  mkdirSync(dirname(brokenSource), { recursive: true });
+  mkdirSync(dirname(builtFallback), { recursive: true });
+  writeFileSync(brokenScript, readFileSync(join(root, "vinci/scripts/report-wrong.mjs")));
+  writeFileSync(join(brokenRoot, "packages/coding-agent/package.json"), '{"type":"module"}\n');
+  writeFileSync(brokenSource, 'throw new Error("masker broken");\n');
+  writeFileSync(builtFallback, "export function vinciMaskSecrets(text) { return `[dist-stub] ${text}`; }\n");
+  const brokenPath = writeSession(sessions, "broken-task", "DONE");
+  const brokenBefore = readFileSync(brokenPath);
+  const broken = spawnSync(process.execPath, [brokenScript, "broken-task", `raw ${syntheticToken}`, "--session-dir", sessions], {
+    cwd: temp,
+    env: { ...process.env, HOME: home },
+    encoding: "utf8",
+  });
+  assert.equal(broken.status, 1, "W5: a throwing source masker must make the command fail");
+  assert.deepEqual(readFileSync(brokenPath), brokenBefore, "W5: a throwing source masker leaves the session unchanged");
+  assert.doesNotMatch(broken.stdout, /Recorded/, "W5: a throwing source masker must not claim a report");
+
+  // Node resolves the CLI entry point through symlinks before resolving its imports.
+  const fixtureRoot = realpathSync(temp);
+  const fixtureOptions = {
+    cwd: temp,
+    env: { ...process.env, HOME: home },
+    encoding: "utf8",
+    timeout: 30_000,
+    killSignal: "SIGKILL",
+  };
+
+  function probeSourceImport(source) {
+    return spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `try {
+          await import(process.argv[1]);
+        } catch ({ code, url, message }) {
+          console.log(JSON.stringify({ code, url, message }));
+        }`,
+        pathToFileURL(source).href,
+      ],
+      fixtureOptions,
+    );
+  }
+
+  function assertMissingImport(probe, missingPath, message) {
+    assert.equal(probe.status, 0, probe.error?.message || probe.stderr || message);
+    assert.ok(probe.stdout, message);
+    const error = JSON.parse(probe.stdout);
+    assert.equal(error.code, "ERR_MODULE_NOT_FOUND", message);
+    if (error.url !== undefined) {
+      assert.equal(error.url, pathToFileURL(missingPath).href, message);
+    } else {
+      assert.equal(/^Cannot find module '([^']+)'/.exec(error.message)?.[1], missingPath, message);
+    }
+  }
+
+  // W5b: a missing dependency of the source masker must not trigger the built fallback.
+  const missingImportRoot = join(fixtureRoot, "masker-missing-import");
+  cpSync(brokenRoot, missingImportRoot, { recursive: true });
+  const missingImportScript = join(missingImportRoot, "vinci/scripts/report-wrong.mjs");
+  const missingImportSource = join(missingImportRoot, "packages/coding-agent/src/core/vinci-mask-secrets.ts");
+  writeFileSync(
+    missingImportSource,
+    'import "./missing-sibling.ts";\nexport function vinciMaskSecrets(text) { return text; }\n',
+  );
+  assertMissingImport(
+    probeSourceImport(missingImportSource),
+    join(dirname(missingImportSource), "missing-sibling.ts"),
+    "W5b: fixture import must fail with ERR_MODULE_NOT_FOUND for the missing sibling",
+  );
+  const missingImportPath = writeSession(sessions, "missing-import-task", "DONE");
+  const missingImportBefore = readFileSync(missingImportPath);
+  const missingImport = spawnSync(
+    process.execPath,
+    [missingImportScript, "missing-import-task", `raw ${syntheticToken}`, "--session-dir", sessions],
+    fixtureOptions,
+  );
+  assert.equal(missingImport.status, 1, "W5b: a missing dependency of the source masker must make the command exit 1");
+  assert.match(missingImport.stderr, /secret masker "vinciMaskSecrets" could not load/, "W5b: the failure must name the masker");
+  assert.deepEqual(readFileSync(missingImportPath), missingImportBefore, "W5b: the failed command leaves the session unchanged");
+  assert.doesNotMatch(missingImport.stdout, /Recorded/, "W5b: the failed command must not claim a report");
+
+  // W5d: the built masker loads when the source masker is absent.
+  const fallbackRoot = join(fixtureRoot, "masker-built-only");
+  cpSync(brokenRoot, fallbackRoot, { recursive: true, filter: (source) => source !== brokenSource });
+  const fallbackScript = join(fallbackRoot, "vinci/scripts/report-wrong.mjs");
+  const fallbackPath = writeSession(sessions, "built-only-task", "DONE");
+  const fallbackNote = "focused test still fails";
+  const fallback = spawnSync(
+    process.execPath,
+    [fallbackScript, "built-only-task", fallbackNote, "--session-dir", sessions],
+    fixtureOptions,
+  );
+  assert.equal(fallback.status, 0, fallback.stderr);
+  assert.match(fallback.stdout, /Recorded/, "W5d: the built masker must let the command record a report");
+  assert.equal(storedNote(fallbackPath), `[dist-stub] ${fallbackNote}`, "W5d: the built masker must mark the stored note");
+
+  // W5c: deny traversal to an otherwise loadable source masker.
+  if (process.platform === "win32" || process.getuid?.() === 0) {
+    process.stdout.write("  SKIP W5c: directory permission checks require a non-root POSIX user\n");
+  } else {
+    const fallbackSource = join(fallbackRoot, "packages/coding-agent/src/core/vinci-mask-secrets.ts");
+    cpSync(builtFallback, fallbackSource);
+    const sourceDir = dirname(fallbackSource);
+    const sourceDirMode = lstatSync(sourceDir).mode & 0o7777;
+    let sourceImport;
+    let inaccessible;
+    try {
+      chmodSync(sourceDir, 0o000);
+      assert.throws(() => lstatSync(fallbackSource), { code: "EACCES" }, "W5c: the source masker must be inaccessible");
+      sourceImport = probeSourceImport(fallbackSource);
+      inaccessible = spawnSync(
+        process.execPath,
+        [fallbackScript, "broken-task", `raw ${syntheticToken}`, "--session-dir", sessions],
+        fixtureOptions,
+      );
+    } finally {
+      chmodSync(sourceDir, sourceDirMode);
+    }
+    assertMissingImport(
+      sourceImport,
+      fallbackSource,
+      "W5c: fixture import must fail with ERR_MODULE_NOT_FOUND for the source masker",
+    );
+    assert.equal(inaccessible.status, 1, "W5c: an inaccessible source masker must make the command exit 1");
+    assert.match(inaccessible.stderr, /secret masker "vinciMaskSecrets" could not load/, "W5c: the failure must name the masker");
+    assert.deepEqual(readFileSync(brokenPath), brokenBefore, "W5c: the failed command leaves the session unchanged");
+    assert.doesNotMatch(inaccessible.stdout, /Recorded/, "W5c: the failed command must not claim a report");
+  }
 } finally {
   rmSync(temp, { recursive: true, force: true });
 }

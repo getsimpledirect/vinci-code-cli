@@ -59,7 +59,7 @@ COPYFILE_DISABLE=1 tar -czf "${TGZ}" -C "${ROOT}" \
   --exclude='vinci/worker/README.md' \
   packages/agent/dist packages/agent/package.json \
   packages/ai/dist packages/ai/package.json \
-  packages/coding-agent/dist packages/coding-agent/package.json packages/coding-agent/src/core/vinci-mask-secrets.ts \
+  packages/coding-agent/dist packages/coding-agent/package.json \
   packages/orchestrator/dist packages/orchestrator/package.json \
   packages/tui/dist packages/tui/package.json \
   vinci/bin vinci/extensions vinci/dist vinci/themes vinci/assets vinci/updater vinci/worker \

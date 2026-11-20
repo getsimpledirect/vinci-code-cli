@@ -1,11 +1,47 @@
-import { appendFileSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { appendFileSync, lstatSync, readFileSync, readdirSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-// The shared secret masker, imported from source: this command runs before any build output is
-// required (see below), and the masker module has no imports of its own. A static import fails
-// closed: if the module cannot load, the process exits before anything is written.
-import { vinciMaskSecrets } from "../../packages/coding-agent/src/core/vinci-mask-secrets.ts";
+import { fileURLToPath } from "node:url";
+
+// A source checkout loads the .ts directly (build-free). A packaged install loads the built .js.
+// If neither can load, fail closed before reading or writing any session files.
+const sourceMasker = new URL("../../packages/coding-agent/src/core/vinci-mask-secrets.ts", import.meta.url);
+const builtMasker = new URL("../../packages/coding-agent/dist/core/vinci-mask-secrets.js", import.meta.url);
+let vinciMaskSecrets;
+try {
+  let masker;
+  try {
+    masker = await import(sourceMasker.href);
+  } catch (error) {
+    // The missing module itself must be the source masker. The error may also name its importer.
+    const sourceMissing =
+      error?.code === "ERR_MODULE_NOT_FOUND" &&
+      (error.url === sourceMasker.href || (
+        error.url === undefined &&
+        typeof error.message === "string" &&
+        error.message.startsWith(`Cannot find module '${fileURLToPath(sourceMasker)}'`)
+      ));
+    if (!sourceMissing) throw error;
+    let sourceAbsent = false;
+    try {
+      lstatSync(fileURLToPath(sourceMasker));
+    } catch (lstatError) {
+      if (lstatError?.code !== "ENOENT") throw lstatError;
+      sourceAbsent = true;
+    }
+    if (!sourceAbsent) throw error;
+    masker = await import(builtMasker.href);
+  }
+  vinciMaskSecrets = masker.vinciMaskSecrets;
+  if (typeof vinciMaskSecrets !== "function") throw new TypeError("Missing vinciMaskSecrets function export");
+} catch {
+  writeSync(
+    2,
+    'The report-wrong secret masker "vinciMaskSecrets" could not load. Restore the Vinci checkout or reinstall Vinci Code, then retry.\n',
+  );
+  process.exit(1);
+}
 
 const OUTCOME_ENTRY = "vinci-task-outcome";
 const REPORT_ENTRY = "vinci-false-completion-report";
