@@ -871,6 +871,8 @@ run_group loopbreak-ceiling-continue node "${ROOT}/vinci/test/loopbreak-ceiling-
 run_group verification-compound-preblock node "${ROOT}/vinci/test/verification-compound-preblock.mjs"
 run_group loopbreak-stop-message node "${ROOT}/vinci/test/loopbreak-stop-message.mjs"
 run_group crew-loopbreak-integration node --test "${ROOT}/vinci/test/crew-loopbreak-integration.mjs"
+# Failing read-only shell commands have their own bound and never get a later edit refused (R-s).
+run_group loopbreak-readonly-failures node --test "${ROOT}/vinci/test/loopbreak-readonly-failures.mjs"
 # #5/#6: no harness contradictions in unattended (`vinci -p`) runs — latch wording, hard stop ⇒ BLOCKED,
 # finalization git commands exempt from the reserve (never push/network).
 run_group unattended-harness-integration node "${ROOT}/vinci/test/unattended-harness-integration.mjs"
