@@ -90,6 +90,7 @@ const PRE_MUTATION_STEER = 8; // source-localization checkpoint early enough for
 const PRE_MUTATION_GRACE_CALLS = 2; // after the checkpoint, reserve the remaining calls for edit + direct proof
 const POST_MUTATION_INSPECTION_LIMIT = 3; // bounds non-navigation investigation after a successful change
 const ERROR_LIMIT = 4; // failing tool calls in a row (bad edits, invalid calls) before we stop
+const READ_ONLY_ERROR_LIMIT = 4; // failing read-only shell commands in a row before further ones are paused (edits stay allowed)
 const NARRATE_MIN = 200; // an assistant text this long = it's synthesizing, not spiraling → relax limits
 const MAX_INCOMPLETE_UPGRADE_ATTEMPTS = 2;
 const TRACKED_PATH_CACHE_TTL_MS = 2_000;
@@ -369,6 +370,11 @@ const ERROR_STEER =
   "didn't work). You are not converging — stop retrying. Tell the user plainly: what you were trying to " +
   "do, what keeps failing, and where you're stuck. If you may have damaged a file, say so and tell them " +
   "they can run /undo to restore it. Then end your turn — do NOT attempt another edit/write right now.";
+
+const READ_ONLY_ERROR_STEER =
+  "Several read-only commands in a row FAILED. They changed nothing, so trying more variants of them will not help. " +
+  "Stop running read-only commands for now. Either tell the user plainly what failed (for example: this folder is not a " +
+  "git repository) or go ahead with the change you need: edits are still allowed.";
 
 const EXPLORE_STEER =
   "You've read/searched many times in a row without converging — STOP exploring now. You already have " +
@@ -826,6 +832,7 @@ export default function (pi: ExtensionAPI) {
   let interventions = 0; // loops broken this turn (escalates the response)
   let readOnlyStreak = 0; // reads/searches since the last edit/write (catches varied exploration spirals)
   let errorStreak = 0; // failing tool calls in a row (catches edit/write thrashing after a self-inflicted mess)
+  let readOnlyFailStreak = 0; // failing read-only shell commands in a row; they never feed errorStreak
   let hardBlocks = 0; // firm blocks issued this turn (arms the opt-in deferred turn-stop)
   let stopScheduled = false; // the deferred turn-stop fires at most once per turn
   let carryRepeats = false; // non-interactive continuations keep budget and fixation state across turns
@@ -870,6 +877,7 @@ export default function (pi: ExtensionAPI) {
       interventions = 0;
       readOnlyStreak = 0;
       errorStreak = 0;
+      readOnlyFailStreak = 0;
       hardBlocks = 0;
       silentRounds = 0;
       narrationNudges = 0;
@@ -1119,7 +1127,17 @@ export default function (pi: ExtensionAPI) {
         (!!event.isError ||
           /could not find the exact text|no changes|validation failed|overlap|must match exactly|didn'?t match|required propert/i.test(result) ||
           /page doesn'?t exist|couldn'?t (?:read|reach|resolve)|took too long to load|resolves to an internal/i.test(result)));
-    errorStreak = failed && !READ_ONLY_TOOLS.has(event.toolName) ? errorStreak + 1 : 0;
+    // A read-only shell command (git status, ls, cat) that fails changed nothing: it neither feeds nor resets the
+    // edit-failure streak, so a later edit is not refused for it. It has its own bound below (READ_ONLY_ERROR_LIMIT).
+    const readOnlyShell =
+      event.toolName === "bash" &&
+      isReadOnlyShellCommand(String((event.input as { command?: unknown }).command ?? ""), ctx.cwd);
+    if (readOnlyShell && failed) {
+      readOnlyFailStreak++;
+    } else {
+      errorStreak = failed && !READ_ONLY_TOOLS.has(event.toolName) ? errorStreak + 1 : 0;
+      if (!failed) readOnlyFailStreak = 0;
+    }
     // [#6] A refused `git add -A` followed by a landed `git add file && git commit` is a finished
     // task, not a stopped one: a SUCCESSFUL finalization command resolves a refusal-class hard stop
     // (never the latch — nothing can land under it).
@@ -1216,6 +1234,11 @@ export default function (pi: ExtensionAPI) {
       const n = (seen.get(key) ?? 0) + 1;
       seen.set(key, n);
       if (n >= IDENTICAL_LIMIT) return fixation(key, n);
+      if (readOnlyFailStreak >= READ_ONLY_ERROR_LIMIT) {
+        readOnlyFailStreak = 0;
+        sendVinciControl(pi, "vinci-readonly-error-streak", READ_ONLY_ERROR_STEER);
+        return { block: true, reason: "Vinci paused after several failed read-only commands." };
+      }
       readOnlyNavigationCalls += 1;
       if (readOnlyNavigationCalls > READ_ONLY_NAVIGATION_CEILING) {
         return firmBlock(
