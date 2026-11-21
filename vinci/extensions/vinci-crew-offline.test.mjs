@@ -27,3 +27,32 @@ test("C3 neither: no scope means no --offline, and extensions and thinking still
   assert.ok(!args.includes("--offline"), `C3: no --offline expected: ${args.join(" ")}`);
   assert.deepEqual(args, ["--extension", "/x/vinci-search.ts", "--thinking", "low"], "C3: the crew extension is dropped, the rest kept");
 });
+
+// The production call site is childLaunch() with no arguments: the defaults (process.argv, process.env) are what ship.
+test("C4 default env: childLaunch() with no arguments reads the scope signal from process.env", () => {
+  const saved = process.env.VINCI_OFFLINE_SCOPE;
+  try {
+    process.env.VINCI_OFFLINE_SCOPE = "1";
+    assert.ok(!process.argv.includes("--offline"), "C4: the test process must not carry --offline");
+    const { args } = crew.childLaunch();
+    assert.ok(args.includes("--offline"), `C4: helper args must include --offline: ${args.join(" ")}`);
+  } finally {
+    if (saved === undefined) delete process.env.VINCI_OFFLINE_SCOPE;
+    else process.env.VINCI_OFFLINE_SCOPE = saved;
+  }
+});
+
+test("C5 default argv: childLaunch() with no arguments reads --offline from process.argv", () => {
+  const savedArgv = process.argv;
+  const savedEnv = process.env.VINCI_OFFLINE_SCOPE;
+  try {
+    delete process.env.VINCI_OFFLINE_SCOPE;
+    process.argv = [...savedArgv, "--offline"];
+    const { args } = crew.childLaunch();
+    assert.ok(args.includes("--offline"), `C5: helper args must include --offline: ${args.join(" ")}`);
+  } finally {
+    process.argv = savedArgv;
+    if (savedEnv === undefined) delete process.env.VINCI_OFFLINE_SCOPE;
+    else process.env.VINCI_OFFLINE_SCOPE = savedEnv;
+  }
+});
