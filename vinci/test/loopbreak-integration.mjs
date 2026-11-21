@@ -673,7 +673,7 @@ let ceilingHit = false;
 for (let i = 0; i < 60; i++) {
   await call("edit", { path: "f" + i, edits: [] }); // resets explore + identical streaks each round
   const r = await call("bash", { command: "distinct-" + i }); // distinct → dodges identical too
-  if (r && r.block && /stopped a repeated action/i.test(r.reason)) { ceilingHit = true; break; }
+  if (r && r.block && /reached the limit of 25 actions allowed in one turn/i.test(r.reason) && !/stopped a repeated action/i.test(r.reason)) { ceilingHit = true; break; }
 }
 check("per-turn ceiling firmly blocks a varied edit+read runaway (no abort)", ceilingHit === true && aborted === 0);
 
@@ -883,7 +883,8 @@ check(
   "exact contextual reruns past the ceiling consume only the one-shot verification escape",
   contextualCeilingEscape === undefined &&
     contextualAfterCeilingEscape?.block === true &&
-    /stopped a repeated action/i.test(contextualAfterCeilingEscape.reason),
+    /reached the limit of 25 actions allowed in one turn/i.test(contextualAfterCeilingEscape.reason) &&
+    !/stopped a repeated action/i.test(contextualAfterCeilingEscape.reason),
 );
 
 // Verification recovery is delivered as an extension-owned follow-up turn. It must retain the
@@ -923,7 +924,7 @@ for (let i = 0; i < 40; i++) {
       content: [{ type: "text", text: `I checked the last result and am explaining the next migration attempt clearly. ${"detail ".repeat(30)}` }],
     },
   });
-  if (r && r.block && /stopped a repeated action/i.test(r.reason)) {
+  if (r && r.block && /reached the limit of 25 actions allowed in one turn/i.test(r.reason) && !/stopped a repeated action/i.test(r.reason)) {
     narratedCeilingHit = true;
     break;
   }

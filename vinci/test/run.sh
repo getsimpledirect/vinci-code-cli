@@ -986,6 +986,7 @@ if [ "${VINCI_TEST_LIST_GROUPS:-0}" = "1" ] || { [ -n "${packaged_tgz}" ] && [ -
     packaged_boundary=(--deny-source "${ROOT}" --deny-source "$(dirname "${common_git}")")
   fi
   run_group packaged-launch-artifact node "${ROOT}/vinci/test/packaged-launch-check.mjs" "${packaged_dir}/unpacked" ${packaged_boundary[@]+"${packaged_boundary[@]}"}
+  run_group report-wrong-packaged node "${ROOT}/vinci/test/report-wrong-packaged.mjs" "${packaged_dir}/unpacked" ${packaged_boundary[@]+"${packaged_boundary[@]}"}
   run_group non-tty-output-packaged node "${ROOT}/vinci/test/non-tty-output-integration.mjs" "${packaged_dir}/unpacked"
   run_group runtime-cli-packaged node "${ROOT}/vinci/test/runtime-integration.mjs" "${packaged_dir}/unpacked"
 else
