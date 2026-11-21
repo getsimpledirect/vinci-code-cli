@@ -508,10 +508,21 @@ for (const [id, recorded, cwdOf] of [
     await f.start();
     await f.mutate();
     stateModule.recordVinciVerification(recorded, false, COMPOUND_SUMMARY, false, "behavioral", undefined, false, cwdOf(f));
+    const controlsBefore = f.controls.length;
     const observation = await f.bash("npm test; echo done");
     assert.equal(observation.spy, 0, `${id}: spy 0 (loopbreak's reservation refuses)`);
     assertNoCompoundReason(id, observation);
-    assert.equal(observation.reason, "Vinci kept the passing focused verification as the completion evidence.", `${id}: loopbreak's first reason (:1054)`);
+    // The recorded check FAILED: the refusal names it and never claims a passing verifier.
+    assert.equal(
+      observation.reason,
+      `The required check \`${recorded}\` failed; a narrower check cannot replace it. Fix the failure or report it.`,
+      `${id}: loopbreak's failed-required reason`,
+    );
+    const controlTypes = f.controls.slice(controlsBefore).map((entry) => entry.message.customType);
+    assert.ok(
+      !controlTypes.includes("vinci-verification-complete"),
+      `${id}: no completion control after a failed required check (got: ${controlTypes.join(", ")})`,
+    );
   });
 }
 await measure("T7c", async (make) => {

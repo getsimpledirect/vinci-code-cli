@@ -22,6 +22,7 @@ import { clearVinciHardStop, recordVinciHardStop, refuseFinalization, vinciTaskI
 import { isVinciFinalizationCommand, isVinciUnattended } from "./lib/unattended.ts";
 import { getVinciUiState, setVinciPlan } from "./lib/ui-state.ts";
 import { installVinciUsageAccumulator } from "./lib/usage-accumulator.ts";
+import { getVinciTaskOutcome } from "./lib/task-outcome.ts";
 import {
   getVinciVerificationState,
   hasIncompleteVinciBehavioralAttempt,
@@ -82,9 +83,14 @@ function planWidget(steps: readonly Step[]): (_tui: unknown, theme: Theme) => Co
       // "Complete" requires every step truly finished (the verification gate marks them), never the
       // effective count below.
       if (explicitDone === steps.length) {
+        // Display only: a focused pass beside a failed or unrun required check is not "complete".
+        const partiallyVerified = Boolean(getVinciTaskOutcome()?.requiredCheck?.passed);
         return [
           truncateToWidth(
-            theme.fg("success", theme.bold("  ✓ Plan complete")) + theme.fg("dim", `  ·  ${explicitDone} steps`),
+            (partiallyVerified
+              ? theme.fg("warning", theme.bold("  Plan steps done — partially verified"))
+              : theme.fg("success", theme.bold("  ✓ Plan complete"))) +
+              theme.fg("dim", `  ·  ${explicitDone} steps`),
             width,
             theme.fg("dim", "…"),
           ),
