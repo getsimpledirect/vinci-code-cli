@@ -19,7 +19,19 @@
  *
  * Additive — no core edits. Local only (never cloud). Nothing here logs content.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fchmodSync,
+  ftruncateSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  type Stats,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -34,6 +46,7 @@ import {
   serializeDocument,
   upsertIntoDocument,
 } from "./lib/memory-entries.ts";
+import { redactSecrets } from "./lib/secrets.ts";
 
 const INJECT_CAP = 1600; // chars of memory injected per turn — protect the small context window.
 /**
@@ -68,9 +81,29 @@ function readEntriesAt(path: string): MemoryEntry[] {
   return documentEntries(readDocumentAt(path));
 }
 
+const NOT_A_REGULAR_FILE = "the memory file is a link or not a regular file, so nothing was written";
+
 function writeDocumentAt(path: string, doc: MemoryDocument): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, serializeDocument(doc), "utf8");
+  // Owner-only BEFORE any content changes: memory holds facts about the person and the project.
+  // A link (or anything but a regular file) is refused, so a write can never land somewhere else.
+  let existing: Stats | undefined;
+  try {
+    existing = lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  if (existing && !existing.isFile()) throw new Error(NOT_A_REGULAR_FILE);
+  // O_NOFOLLOW refuses a link that appears after the check. The file is not truncated until the
+  // open descriptor is owner-only: a failed chmod (a file someone else owns) leaves it unchanged.
+  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0), 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    ftruncateSync(fd, 0);
+    writeFileSync(fd, serializeDocument(doc), "utf8");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function today(): string {
@@ -196,8 +229,21 @@ export default function (pi: ExtensionAPI) {
       ctx: ExtensionContext,
     ) {
       const details = { tool: "remember" };
-      const note = (params.note || "").replace(/\s+/g, " ").trim();
+      if (params.note !== undefined && params.note !== null && typeof params.note !== "string") {
+        return { content: [{ type: "text", text: "Not saved: the note must be text." }], details };
+      }
+      const raw = params.note || "";
+      const note = raw.replace(/\s+/g, " ").trim();
       if (!note) return { content: [{ type: "text", text: "Nothing to remember." }], details };
+      // Never persist a credential: refuse any note the secret masker would change, checked on the
+      // note as given AND as it would be stored (collapsing line breaks can hide a shape the masker
+      // recognizes). The reply does not repeat the note, so the value goes no further than the call.
+      if (redactSecrets(raw) !== raw || redactSecrets(note) !== note) {
+        return {
+          content: [{ type: "text", text: "Not saved: the note looks like it contains a credential. Remove it and save again." }],
+          details,
+        };
+      }
 
       const scope: MemoryScope = params.scope === "me" ? "me" : "project";
       const path = pathFor(scope, ctx.cwd);
