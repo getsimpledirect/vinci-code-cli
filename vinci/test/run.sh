@@ -927,6 +927,8 @@ if node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.ex
   run_group search-integration node --experimental-strip-types "${ROOT}/vinci/test/search-integration.mjs"
   # SSRF boundary: drive the real search extension through helper and WHATWG URL forms.
   run_group search-ssrf node --experimental-strip-types "${ROOT}/vinci/extensions/vinci-search.test.mjs"
+  # offline scope: a user-stated "no online access" or --offline refuses the web tools.
+  run_group search-offline-scope node --experimental-strip-types "${ROOT}/vinci/extensions/vinci-search-offline.test.mjs"
   # command sandbox: real write confinement through macOS sandbox-exec or Linux bubblewrap.
   run_group sandbox-integration node --experimental-strip-types "${ROOT}/vinci/test/sandbox-integration.mjs"
   # session auto-naming: model title reply → tidy session name for the resume picker.

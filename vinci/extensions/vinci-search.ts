@@ -418,7 +418,86 @@ function formatPage(url: string, text: string, truncated: boolean): string {
   return `<web_page untrusted="true" url="${defang(url)}">\n${defang(body)}\n</web_page>\n\n${UNTRUSTED_NOTE}`;
 }
 
-export default function (pi: ExtensionAPI) {
+// ── Offline scope ────────────────────────────────────────────────────────────────────────────────
+// A run is offline-scoped when Vinci was started with `--offline` (the sure form), or when the
+// USER's own prompt text says so ("no online access", "offline only", "do not use the web", ...).
+// Only user input counts: tool results, files, model text and extension-injected input are never
+// read. While scoped, every web tool call is refused with a reason that names the scope and how to
+// lift it. A prompt scope lasts for the rest of the session (continue included) and is lifted only
+// by an explicit user phrase ("you may use the web"); the `--offline` scope cannot be lifted from a
+// prompt. Known limit: paraphrases outside the phrase list do not set the scope; `--offline` does.
+export const OFFLINE_SCOPED_TOOLS: ReadonlySet<string> = new Set(["web_search", "web_fetch", "web_answer", "library_docs"]);
+
+/** Quoted strings and code (fenced, inline) are content the user is talking about, not instructions. */
+export function stripQuotedText(text: string): string {
+  return text
+    .replace(/```[\s\S]*?(?:```|$)/g, " ")
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, " ")
+    .replace(/`[^`\n]*`/g, " ")
+    .replace(/"[^"\n]*"/g, " ")
+    .replace(/“[^”\n]*”/g, " ");
+}
+
+const OFFLINE_LIFT =
+  /\b(?:you (?:may|can|are allowed to|have permission to) (?:now |again )?(?:use|access|search|browse) (?:the )?(?:web|internet|online)|(?:web|internet|online) access is (?:fine|ok|okay|allowed|back on)|go ahead and (?:use|search|browse) (?:the )?(?:web|internet))\b/;
+// Negation + web/online/internet/network, optionally naming what is off ("no web search").
+const OFFLINE_NEGATED =
+  /\b(?:no|not|don't|dont|do not|never|without)\s+(?:(?:use|using|access|accessing|search|searching|browse|browsing|go|going|call|calling|any|the|to|on|for)\s+){0,3}(?:web|internet|online|network)\b(?:[\s_-]+(?:access|search(?:es)?|fetch(?:es)?|lookups?|browsing|tools?|calls?|use))?/g;
+// "offline" as an instruction needs a cue: "offline only", "stay offline", "you are offline".
+const OFFLINE_WORD = /\b(?:(stay|remain|keep|be|are|go)\s+)?offline(?:([\s-]+)only)?\b/g;
+// Product guard: the phrase describes the software being built, not this run's scope.
+const OFFLINE_PRODUCT_NEXT =
+  /^[\s-]*(?:mode|modes|first|support|feature|features|version|build|app|application|banner|state|status|case|cases|scenario|scenarios|handling|capability|capabilities|storage|cache|sync|queue|indicator|message|messages|screen|page|fallback|user|users|experience|flow|behaviou?r)\b/;
+const OFFLINE_PRODUCT_BEFORE =
+  /\b(?:when|whenever|if|while|unless|case|handle|handles|handling|detect|detects|support|supports|add|adding|implement|implementing|build|building|show|shows|display|displays|test|tests|testing|works|working|app|apps|users?|devices?|customers?)\b/;
+
+function offlineProductUse(text: string, start: number, end: number): boolean {
+  if (OFFLINE_PRODUCT_NEXT.test(text.slice(end))) return true;
+  const before = text.slice(0, start).split(/[.!?;:\n]/).pop() ?? "";
+  const lastWords = before.trim().split(/\s+/).slice(-4).join(" ");
+  return OFFLINE_PRODUCT_BEFORE.test(lastWords);
+}
+
+/** "set" when user text states an offline scope, "lift" when it explicitly allows the web again. */
+export function offlineScopeInstruction(userText: string): "set" | "lift" | undefined {
+  const text = stripQuotedText(userText).toLowerCase().replace(/[‘’]/g, "'");
+  if (OFFLINE_LIFT.test(text)) return "lift";
+  for (const match of text.matchAll(OFFLINE_NEGATED)) {
+    const start = match.index ?? 0;
+    if (!offlineProductUse(text, start, start + match[0].length)) return "set";
+  }
+  for (const match of text.matchAll(OFFLINE_WORD)) {
+    if (!match[1] && !match[2]) continue;
+    const start = match.index ?? 0;
+    if (!offlineProductUse(text, start, start + match[0].length)) return "set";
+  }
+  return undefined;
+}
+
+export function offlineScopeReason(scope: "flag" | "prompt"): string {
+  return scope === "flag"
+    ? "Web tools are off for this run: Vinci was started with --offline. Continue with local files and tools only; restart without --offline to use the web."
+    : "Web tools are off for this session: the user asked for no online access. Continue with local files and tools only; the user can lift this by saying \"you may use the web\".";
+}
+
+export default function (pi: ExtensionAPI, options: { argv?: readonly string[] } = {}) {
+  // Offline scope (see OFFLINE_SCOPED_TOOLS above). Hook registration is skipped by API-less callers.
+  const flagScope = (options.argv ?? process.argv).includes("--offline");
+  let promptScope = false;
+  if (typeof pi.on === "function") {
+    pi.on("input", async (event) => {
+      if (event.source === "extension" || typeof event.text !== "string") return;
+      const instruction = offlineScopeInstruction(event.text);
+      if (instruction === "set") promptScope = true;
+      else if (instruction === "lift") promptScope = false;
+    });
+    pi.on("tool_call", async (event) => {
+      if (!OFFLINE_SCOPED_TOOLS.has(event.toolName)) return undefined;
+      if (flagScope) return { block: true as const, reason: offlineScopeReason("flag") };
+      if (promptScope) return { block: true as const, reason: offlineScopeReason("prompt") };
+      return undefined;
+    });
+  }
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
