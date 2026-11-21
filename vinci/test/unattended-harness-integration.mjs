@@ -463,7 +463,8 @@ try {
   {
     const { call } = await ceilingScenario(false, "task-ceiling-unattended");
     const probe = await call("action-probe");
-    check("control: after 26 actions the ceiling refuses ordinary actions", probe?.block === true && /stopped a repeated action before it could run again/.test(probe.reason));
+    check("control: after 26 actions the ceiling refuses ordinary actions", probe?.block === true && /reached the limit of 25 actions allowed in one turn/.test(probe.reason));
+    check("R-a: the ceiling's tool result does not call a non-repeated action a repeat", !/repeated action/.test(probe?.reason ?? ""));
     check("BLOCK-2: unattended, git commit passes the ceiling", (await call('git add a.ts && git commit -m "land it"')) === undefined);
     check("BLOCK-2: unattended, git push does not pass the ceiling", (await call("git push"))?.block === true);
     check("BLOCK-2: the exempt commit never records a hard stop", hardStop.getVinciHardStop("task-ceiling-unattended") === undefined);

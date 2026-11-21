@@ -117,7 +117,8 @@ test("integration and coordination retain the absolute action ceiling (3 trials 
       }
       const block = await h.call(toolName, { agent_id: 1, instruction: "Finish the repair.", message: "Verify the repair." });
       assert.equal(block?.block, true);
-      assert.match(block.reason, /stopped a repeated action/);
+      assert.match(block.reason, /reached the limit of \d+ actions allowed in one turn/);
+      assert.doesNotMatch(block.reason, /stopped a repeated action/);
     }
   }
 });
