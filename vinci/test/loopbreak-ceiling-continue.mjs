@@ -168,5 +168,19 @@ await measure("C6", async () => {
   await f.finish([refused, read, bash]);
 });
 
+// C7 (LIMITREC R-a): the 26th call's TOOL RESULT names the action limit and the continue remedy (this
+// fixture is ctx.mode "tui"), not the repeated-action wording: call 26 is a distinct edit, not a repeat.
+await measure("C7", async () => {
+  const f = fixture("C7");
+  const refused = await exhaust(f, "C7");
+  assert.equal(
+    refused.reason,
+    "Vinci reached the limit of 25 actions allowed in one turn before finishing. Type continue to start a fresh turn on the same task.",
+    "C7: the ceiling's tool result names the 25-action limit and the continue remedy",
+  );
+  assert.doesNotMatch(refused.reason, /repeated action/, "C7: a distinct call at the ceiling is not called a repeat");
+  await f.finish([refused]);
+});
+
 console.log(`loopbreak-ceiling-continue: ${failures} failed (C5 has two isolated inputs; C3 grants)`);
 process.exitCode = failures === 0 ? 0 : 1;
