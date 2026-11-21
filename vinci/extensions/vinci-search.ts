@@ -425,16 +425,20 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 // are stripped before the phrase check; tool results and model text never reach the hook. The
 // strip is split by polarity so that a wrong cut can only keep the scope set: lift phrases are
 // read with everything from the first `<file` wrapper to the LAST `</file>` removed (a file that
-// itself contains "</file>" cannot lift), and with markdown blockquote lines removed; restrictions
-// are read with each wrapper removed only up to its first `</file>` (an unclosed one loses only its
-// tag), and blockquotes kept. While
+// itself contains "</file>" cannot lift), then any wrapper left open, and markdown blockquote lines;
+// a lift inside an attached file or a blockquote never lifts. Restrictions are read in the pieces
+// of text outside file blocks (each block ends at its first `</file>`; an unclosed tag loses only
+// itself), with code and quotes stripped in each piece separately, so nothing inside a file can
+// hide text typed after it; blockquotes are kept. Text pasted into the prompt counts as typed. While
 // scoped, every web tool call is refused with a reason that names the scope and how to lift it, and
 // crew helpers launched from then on start with `--offline`. Only the web tools are off: model
 // calls continue. A restriction in a message wins over a lift phrase in the same message, and a
 // lift with a bounded exception ("... for library docs") does not lift.
 // Known limits: paraphrases outside the phrase list do not set the scope, and a false lift match
 // re-enables the tools (bounds outside the bound list, such as "exclusively on <site>", lift the
-// whole scope); a lift typed between two attached files is ignored (type it after the files);
+// whole scope); a lift typed between two attached files, or after a literal `</file>` in the
+// user's own text, is ignored (type it after the files); a restriction split by a file tag is not
+// detected;
 // steer and follow-up messages queued while the agent works skip the input hook; a prompt scope
 // lives in one runtime, so /new, resume and fork start unscoped; one runtime per process is
 // assumed (the crew signal is one process-wide value); text piped on stdin is read as typed.
@@ -442,23 +446,51 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 export const OFFLINE_SCOPE_ENV = "VINCI_OFFLINE_SCOPE";
 export const OFFLINE_SCOPED_TOOLS: ReadonlySet<string> = new Set(["web_search", "web_fetch", "web_answer", "library_docs"]);
 
+function stripCode(text: string, join: string): string {
+  return text
+    .replace(/```[\s\S]*?(?:```|$)/g, join)
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, join)
+    .replace(/`[^`\n]*`/g, join)
+    .replace(/"[^"\n]*"/g, join)
+    .replace(/“[^”\n]*”/g, join);
+}
+
+/**
+ * The text outside attached files, split at every `<file ...>` / `</file>` tag. A block runs from an
+ * opener that has a later `</file>` to its FIRST `</file>` and is dropped; an opener with no later
+ * close loses only its tag. Each tag is a segment boundary, so code or quote openers inside file
+ * text can never reach the text typed after the files.
+ */
+function outsideFileSegments(text: string): string[] {
+  const segments: string[] = [];
+  const tags = /<file\b[^>]*>|<\/file>/g;
+  let inFile = false;
+  let last = 0;
+  for (const tag of text.matchAll(tags)) {
+    const at = tag.index ?? 0;
+    if (!inFile) segments.push(text.slice(last, at));
+    if (tag[0] === "</file>") inFile = false;
+    else if (!inFile && text.includes("</file>", at + tag[0].length)) inFile = true;
+    last = at + tag[0].length;
+  }
+  if (!inFile) segments.push(text.slice(last));
+  return segments;
+}
+
 /**
  * Double-quoted strings, code (fenced, inline) and attached @file contents are content the user is
- * talking about, not instructions. "restriction" (default) ends each file wrapper at its first
- * `</file>` and drops only the tag of an unclosed one; "lift" strips from the first wrapper to the
- * last `</file>` (or to the end when none closes it) and also drops blockquotes.
+ * talking about, not instructions. "restriction" (default) keeps the text outside file blocks, strips
+ * code and quotes in each piece separately, and joins the pieces with line breaks; "lift" strips from
+ * the first wrapper to the last `</file>`, then any wrapper left open to the end, and blockquotes,
+ * replacing each stripped span with a line break so that no lift phrase can join across it.
  */
 export function stripQuotedText(text: string, polarity: "restriction" | "lift" = "restriction"): string {
-  const files =
-    polarity === "lift"
-      ? text.replace(/<file\b[^>]*>(?:[\s\S]*<\/file>|[\s\S]*$)/, " ").replace(/^[ \t]*>.*$/gm, " ")
-      : text.replace(/<file\b[^>]*>[\s\S]*?<\/file>/g, " ").replace(/<file\b[^>]*>/g, " ");
-  return files
-    .replace(/```[\s\S]*?(?:```|$)/g, " ")
-    .replace(/~~~[\s\S]*?(?:~~~|$)/g, " ")
-    .replace(/`[^`\n]*`/g, " ")
-    .replace(/"[^"\n]*"/g, " ")
-    .replace(/“[^”\n]*”/g, " ");
+  if (polarity === "restriction") return outsideFileSegments(text).map((segment) => stripCode(segment, " ")).join("\n");
+  const files = text
+    .replace(/<file\b[^>]*>(?:[\s\S]*<\/file>|[\s\S]*$)/, "\n")
+    .replace(/<file\b[^>]*>[\s\S]*$/, "\n")
+    .replace(/^[ \t]*>.*$/gm, "\n");
+  return stripCode(files, "\n");
 }
 
 const OFFLINE_LIFT =
