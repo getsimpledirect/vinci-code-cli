@@ -28,6 +28,7 @@ import {
   formatVinciTaskUsage,
   getVinciTaskOutcome,
   isVinciTaskOutcome,
+  partialVerificationLine,
   setVinciTaskOutcome,
   summarizeVinciTaskUsage,
   taskStateLabel,
@@ -159,8 +160,11 @@ function receiptWidget(outcome: Readonly<VinciTaskOutcome>, remoteVerdict?: Para
       const wrapIndented = (text: string, color: "muted" | "dim"): string[] =>
         wrapTextWithAnsi(trimIndent(text), Math.max(1, width - 2))
           .map((line) => theme.fg(color, "  ") + trimIndent(line));
+      // From the outcome record itself: a focused pass beside a failed or unrun required check.
+      const partial = partialVerificationLine(outcome);
       return [
         truncateToWidth(head, width, theme.fg("dim", "…")),
+        ...(partial ? wrapIndented(theme.fg("warning", `  ${partial}`), "muted") : []),
         ...wrapIndented(detail, "muted"),
         ...wrapIndented(usage, "dim"),
         ...(billing ? wrapIndented(billing, "dim") : []),

@@ -21,6 +21,8 @@ import {
   hasIncompleteVinciBehavioralAttempt,
   hasVinciZeroCollectionAttempt,
   vinciCheckWarrantedPath,
+  getVinciLockedPassCommand,
+  vinciRequiredVerificationCommand,
   vinciVerificationCommand,
   vinciIncompleteBehavioralAttemptSummary,
   type RemoteIssuedAcceptanceVerdict,
@@ -139,6 +141,9 @@ export type VinciTaskOutcome = {
   /** Structured unfinished work; absent on historical outcomes, which are never reclassified. */
   requiredOperations?: VinciRequiredOperation[];
   gitCheckpointDecline?: { note: typeof GIT_CHECKPOINT_DECLINE_NOTE; count: number };
+  /** Display only: the required check that failed or was not rerun, and the narrower check that
+   *  passed meanwhile, when one did. Absent on historical outcomes. */
+  requiredCheck?: { command: string; status: "failed" | "stale"; passed?: string };
   recordedAt: string;
 };
 
@@ -645,6 +650,13 @@ export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcom
   // assistant message and is excluded from the supplemental snapshot before totals are combined.
   const supplementalUsage = getVinciTaskUsageSnapshot(input.taskId, responseKeys);
   const declineCount = gitCheckpointDeclines.get(input.taskId) ?? 0;
+  const requiredCommand = vinciRequiredVerificationCommand(input.verification);
+  const requiredStatus = input.verification.status;
+  const lockedPass = getVinciLockedPassCommand();
+  const requiredCheck =
+    requiredCommand && (requiredStatus === "failed" || requiredStatus === "stale")
+      ? { command: requiredCommand, status: requiredStatus, ...(lockedPass ? { passed: lockedPass } : {}) }
+      : undefined;
   return {
     schemaVersion: SCHEMA_VERSION,
     taskId: input.taskId,
@@ -664,6 +676,7 @@ export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcom
     ...(requiredOperations.length > 0 ? { requiredOperations } : {}),
     ...(hardStop ? { hardStop: { source: hardStop.source, reason: hardStop.reason } } : {}),
     ...(declineCount > 0 ? { gitCheckpointDecline: { note: GIT_CHECKPOINT_DECLINE_NOTE, count: declineCount } } : {}),
+    ...(requiredCheck ? { requiredCheck } : {}),
     recordedAt: (input.now ?? new Date()).toISOString(),
   };
 }
@@ -671,6 +684,7 @@ export function buildVinciTaskOutcome(input: BuildOutcomeInput): VinciTaskOutcom
 export function isVinciTaskOutcome(value: unknown): value is VinciTaskOutcome {
   const candidate = record(value);
   const decline = record(candidate?.gitCheckpointDecline);
+  const requiredCheck = record(candidate?.requiredCheck);
   return (
     candidate?.schemaVersion === SCHEMA_VERSION &&
     typeof candidate.taskId === "string" &&
@@ -702,6 +716,12 @@ export function isVinciTaskOutcome(value: unknown): value is VinciTaskOutcome {
     (candidate.assistantUsage === undefined || isTaskUsageRecord(candidate.assistantUsage))
     && (candidate.requiredOperations === undefined ||
       (Array.isArray(candidate.requiredOperations) && candidate.requiredOperations.every(isVinciRequiredOperation)))
+    && (candidate.requiredCheck === undefined ||
+      (typeof requiredCheck?.command === "string" &&
+        requiredCheck.command !== "" &&
+        (requiredCheck.status === "failed" || requiredCheck.status === "stale") &&
+        (requiredCheck.passed === undefined ||
+          (typeof requiredCheck.passed === "string" && requiredCheck.passed !== ""))))
   );
 }
 
@@ -862,6 +882,16 @@ export function taskStateLabel(state: VinciTaskState): string {
       : state === "WAITING"
         ? "Waiting for you"
         : "Stopped — needs you";
+}
+
+// DISPLAY ONLY, like taskStateLabel: the receipt line for a task whose narrower check passed while
+// the required check failed or was not rerun after a change. The state enum is untouched.
+export function partialVerificationLine(outcome: Readonly<VinciTaskOutcome>): string | undefined {
+  const check = outcome.requiredCheck;
+  if (!check?.passed) return undefined;
+  if (check.status === "failed") return `Partially verified: required check \`${check.command}\` failed`;
+  if (check.status === "stale") return `Partially verified: required check \`${check.command}\` not run`;
+  return undefined;
 }
 
 function tokenLabel(tokens: number): string {
