@@ -104,7 +104,9 @@ The three fixes are the three flaws, in order. The shape is right; it leaks at e
   evidence and does not clear an unresolved local required operation. Completed read-only work
   remains `DONE`. The receipt and `/usage` label `WAITING` “Waiting for you” and `BLOCKED`
   “Stopped — needs you”; the editor shows `WAITING` or `BLOCKED`. Provider, check, and runtime stops
-  remain `BLOCKED`. The same non-context task record carries model-call,
+  remain `BLOCKED`. When a focused check passed but a required check failed or was not rerun after
+  a change, the receipt adds a “Partially verified” line naming that check, and the plan widget does
+  not say “Plan complete”. The same non-context task record carries model-call,
   token, cache, provider/model, and locally estimated cost telemetry for `/usage` and `/task-info`.
   A plain confirmation such as `yes` or `go ahead` carries unresolved required work into the next
   turn until an equivalent successful result clears it. A go-ahead with additional words, or `no`,

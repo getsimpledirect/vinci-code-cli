@@ -54,6 +54,7 @@ export type RemoteAcceptanceVerdictInput = Omit<
 const RESET_STORE_STATE = Symbol.for("vinci.verification-state.reset");
 const SET_STORE_STATE = Symbol.for("vinci.verification-state.set-internal");
 const HYDRATE_STORE_STATE = Symbol.for("vinci.verification-state.hydrate");
+const LOCKED_PASS_STORE_STATE = Symbol.for("vinci.verification-state.locked-pass");
 
 type VinciVerificationStore = Readonly<{
   getState(): VinciVerificationState;
@@ -61,6 +62,7 @@ type VinciVerificationStore = Readonly<{
   [SET_STORE_STATE](state: VinciVerificationState): void;
   [HYDRATE_STORE_STATE](state: unknown): boolean;
   [RESET_STORE_STATE](): void;
+  [LOCKED_PASS_STORE_STATE](command?: string): string;
 }>;
 
 type BranchEntry = {
@@ -138,6 +140,9 @@ function initialState(): VinciNormalVerificationState {
 
 function createStore(state: VinciVerificationState): VinciVerificationStore {
   let current = freezeState(state);
+  // Display memo, never part of the state and never persisted: the focused check that passed while
+  // the required check stayed failed. Every accepted ingest and every reset forgets it.
+  let lockedPassCommand = "";
   const ingest = (candidate: unknown): boolean => {
     const parsed = parseSharedVinciVerificationState(candidate);
     if (parsed === undefined) {
@@ -147,6 +152,7 @@ function createStore(state: VinciVerificationState): VinciVerificationStore {
     // functions directly, so guarding this store against hostile in-process callers buys nothing.
     // This state defends against crash/resume loss and corrupt persisted history.
     current = freezeState(parsed);
+    lockedPassCommand = "";
     return true;
   };
   return Object.freeze({
@@ -162,6 +168,11 @@ function createStore(state: VinciVerificationState): VinciVerificationStore {
     },
     [RESET_STORE_STATE](): void {
       current = initialState();
+      lockedPassCommand = "";
+    },
+    [LOCKED_PASS_STORE_STATE](command?: string): string {
+      if (command !== undefined) lockedPassCommand = command;
+      return lockedPassCommand;
     },
   });
 }
@@ -199,6 +210,15 @@ function setState(state: VinciVerificationState): void {
 
 export function resetVinciVerificationState(): void {
   store[RESET_STORE_STATE]();
+}
+
+function setLockedPassCommand(command: string): void {
+  store[LOCKED_PASS_STORE_STATE](command);
+}
+
+/** Display only: the check that passed while the required check stayed failed, or "". */
+export function getVinciLockedPassCommand(): string {
+  return store[LOCKED_PASS_STORE_STATE]();
 }
 
 export function getVinciMutationDigestObservation(): VinciMutationDigestObservation {
@@ -494,6 +514,7 @@ export function recordVinciMutationFailure(summary: string): void {
     verifiedRevision: -1,
     summary: cleanSummary || "The attempted project change did not apply.",
   });
+  setLockedPassCommand("");
 }
 
 export function recordVinciTerminalUnverifiable(): void {
@@ -517,6 +538,7 @@ export function recordVinciTerminalUnverifiable(): void {
     ...(state.remoteAcceptanceVerdicts ? { remoteAcceptanceVerdicts: state.remoteAcceptanceVerdicts } : {}),
     ...(state.remoteVerificationAttempts ? { remoteVerificationAttempts: state.remoteVerificationAttempts } : {}),
   });
+  setLockedPassCommand("");
 }
 
 const VERIFICATION_CLASS_RANK: Readonly<Record<VinciVerificationClass, number>> = {
@@ -641,6 +663,7 @@ export function recordVinciVerification(
       behavioralAttemptCompleted: true,
       behavioralVerifiedRevision,
     });
+    setLockedPassCommand("");
     return;
   }
   const state = current;
@@ -677,6 +700,7 @@ export function recordVinciVerification(
       behavioralAttemptCompleted:
         checkClass === "behavioral" ? false : state.behavioralAttemptCompleted,
     });
+    setLockedPassCommand("");
     return;
   }
   const currentClass = state.checkClass;
@@ -705,6 +729,7 @@ export function recordVinciVerification(
           behavioralAttemptCompleted: true,
         });
       }
+      setLockedPassCommand("");
       return;
     }
     setState({
@@ -729,6 +754,7 @@ export function recordVinciVerification(
       behavioralAttemptCompleted:
         checkClass === "behavioral" ? true : state.behavioralAttemptCompleted,
     });
+    setLockedPassCommand(cleanCommand);
     return;
   }
   const currentCommandKey = state.commandKey || state.command;
@@ -805,6 +831,9 @@ export function recordVinciVerification(
     ...nextState,
     status: passed && evidenceIsComplete(nextState) ? "passed" : nextState.status,
   });
+  // A pass clears the required check; a fresh failure names a new one. Either way an earlier
+  // locked pass no longer describes it.
+  setLockedPassCommand("");
 }
 
 export function recordVinciVerificationRecovery(): number {
