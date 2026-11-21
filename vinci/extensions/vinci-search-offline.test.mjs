@@ -7,16 +7,16 @@ import registerVinciSearch from "./vinci-search.ts";
 
 const WEB_TOOLS = ["web_search", "web_fetch", "library_docs"];
 
+// argv === null registers the way the real extension loader does: factory(api), one argument.
 function session(argv = []) {
   const handlers = new Map();
   const tools = [];
-  registerVinciSearch(
-    {
-      registerTool: (tool) => tools.push(tool),
-      on: (name, handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
-    },
-    { argv },
-  );
+  const api = {
+    registerTool: (tool) => tools.push(tool),
+    on: (name, handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
+  };
+  if (argv === null) registerVinciSearch(api);
+  else registerVinciSearch(api, { argv });
   return {
     tools,
     async say(text, source = "interactive") {
@@ -66,6 +66,16 @@ test("Oa2 --offline refuses every web tool and a prompt cannot lift it", async (
   await assertWebBlocked(s, "Oa2", /started with --offline/);
   await s.say("You may use the web now.");
   await assertWebBlocked(s, "Oa2 after lift phrase", /started with --offline/);
+});
+
+test("R1 production entry: --offline in process.argv, registered with no options, refuses every web tool", async () => {
+  const saved = process.argv;
+  process.argv = [...saved, "--offline"];
+  try {
+    await assertWebBlocked(session(null), "R1", /started with --offline/);
+  } finally {
+    process.argv = saved;
+  }
 });
 
 test("Oa3 controls: product wording does not scope the run", async () => {
