@@ -421,22 +421,39 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 // ── Offline scope ────────────────────────────────────────────────────────────────────────────────
 // A run is offline-scoped when Vinci was started with `--offline`, or when a user prompt that goes
 // through the input hook says so ("no online access", "offline only", "do not use the web", ...).
-// Input from extensions is skipped, and quoted text, code and attached @file contents are stripped
-// before the phrase check; tool results and model text never reach the hook. While scoped, every
-// web tool call is refused with a reason that names the scope and how to lift it, and crew helpers
-// launched from then on start with `--offline`. A restriction in a message wins over a lift phrase
-// in the same message, and a lift with a bounded exception ("... for library docs") does not lift.
+// Input from extensions is skipped, and double-quoted strings, code and attached @file contents
+// are stripped before the phrase check; tool results and model text never reach the hook. The
+// strip is split by polarity so that a wrong cut can only keep the scope set: lift phrases are
+// read with everything from the first `<file` wrapper to the LAST `</file>` removed (a file that
+// itself contains "</file>" cannot lift), and with markdown blockquote lines removed; restrictions
+// are read with each wrapper removed only up to its first `</file>` (an unclosed one loses only its
+// tag), and blockquotes kept. While
+// scoped, every web tool call is refused with a reason that names the scope and how to lift it, and
+// crew helpers launched from then on start with `--offline`. Only the web tools are off: model
+// calls continue. A restriction in a message wins over a lift phrase in the same message, and a
+// lift with a bounded exception ("... for library docs") does not lift.
 // Known limits: paraphrases outside the phrase list do not set the scope, and a false lift match
-// re-enables the tools; steer and follow-up messages queued while the agent works skip the input
-// hook; a prompt scope lives in one runtime, so /new, resume and fork start unscoped; text piped
-// on stdin is read as typed. `--offline` covers all of these and cannot be lifted from a prompt.
+// re-enables the tools (bounds outside the bound list, such as "exclusively on <site>", lift the
+// whole scope); a lift typed between two attached files is ignored (type it after the files);
+// steer and follow-up messages queued while the agent works skip the input hook; a prompt scope
+// lives in one runtime, so /new, resume and fork start unscoped; one runtime per process is
+// assumed (the crew signal is one process-wide value); text piped on stdin is read as typed.
+// `--offline` covers all of these and cannot be lifted from a prompt.
 export const OFFLINE_SCOPE_ENV = "VINCI_OFFLINE_SCOPE";
 export const OFFLINE_SCOPED_TOOLS: ReadonlySet<string> = new Set(["web_search", "web_fetch", "web_answer", "library_docs"]);
 
-/** Quoted strings, code (fenced, inline) and attached @file contents are content the user is talking about, not instructions. */
-export function stripQuotedText(text: string): string {
-  return text
-    .replace(/<file\b[^>]*>[\s\S]*?(?:<\/file>|$)/g, " ")
+/**
+ * Double-quoted strings, code (fenced, inline) and attached @file contents are content the user is
+ * talking about, not instructions. "restriction" (default) ends each file wrapper at its first
+ * `</file>` and drops only the tag of an unclosed one; "lift" strips from the first wrapper to the
+ * last `</file>` (or to the end when none closes it) and also drops blockquotes.
+ */
+export function stripQuotedText(text: string, polarity: "restriction" | "lift" = "restriction"): string {
+  const files =
+    polarity === "lift"
+      ? text.replace(/<file\b[^>]*>(?:[\s\S]*<\/file>|[\s\S]*$)/, " ").replace(/^[ \t]*>.*$/gm, " ")
+      : text.replace(/<file\b[^>]*>[\s\S]*?<\/file>/g, " ").replace(/<file\b[^>]*>/g, " ");
+  return files
     .replace(/```[\s\S]*?(?:```|$)/g, " ")
     .replace(/~~~[\s\S]*?(?:~~~|$)/g, " ")
     .replace(/`[^`\n]*`/g, " ")
@@ -458,7 +475,7 @@ const OFFLINE_LIFT_BOUNDED = /^[^.!?\n]*?\b(?:for|only|except|but|just|to|when|i
 const OFFLINE_PRODUCT_NEXT =
   /^[\s-]*(?:mode|modes|first|support|feature|features|version|build|app|application|banner|state|status|case|cases|scenario|scenarios|handling|capability|capabilities|storage|cache|sync|queue|indicator|message|messages|screen|page|fallback|user|users|experience|flow|behaviou?r)\b/;
 const OFFLINE_PRODUCT_BEFORE =
-  /\b(?:when|whenever|if|while|unless|case|handle|handles|handling|detect|detects|support|supports|add|adding|implement|implementing|build|building|show|shows|display|displays|test|tests|testing|works|working|app|apps|users?|devices?|customers?)\b/;
+  /\b(?:when|whenever|if|while|unless|case|handle|handles|handling|detect|detects|support|supports|add|adding|implement|implementing|build|building|show|shows|display|displays|test|testing|works|working|app|apps|users?|devices?|customers?)\b/;
 
 function offlineProductUse(text: string, start: number, end: number): boolean {
   if (OFFLINE_PRODUCT_NEXT.test(text.slice(end))) return true;
@@ -469,7 +486,8 @@ function offlineProductUse(text: string, start: number, end: number): boolean {
 
 /** "set" when user text states an offline scope, "lift" when it explicitly allows the web again. */
 export function offlineScopeInstruction(userText: string): "set" | "lift" | undefined {
-  const text = stripQuotedText(userText).toLowerCase().replace(/[‘’]/g, "'");
+  const text = stripQuotedText(userText, "restriction").toLowerCase().replace(/[‘’]/g, "'");
+  const liftText = stripQuotedText(userText, "lift").toLowerCase().replace(/[‘’]/g, "'");
   // A restriction anywhere in the message wins over a lift phrase in the same message.
   for (const match of text.matchAll(OFFLINE_NEGATED)) {
     const start = match.index ?? 0;
@@ -480,15 +498,15 @@ export function offlineScopeInstruction(userText: string): "set" | "lift" | unde
     const start = match.index ?? 0;
     if (!offlineProductUse(text, start, start + match[0].length)) return "set";
   }
-  const lift = OFFLINE_LIFT.exec(text);
-  if (lift && !OFFLINE_LIFT_BOUNDED.test(text.slice(lift.index + lift[0].length))) return "lift";
+  const lift = OFFLINE_LIFT.exec(liftText);
+  if (lift && !OFFLINE_LIFT_BOUNDED.test(liftText.slice(lift.index + lift[0].length))) return "lift";
   return undefined;
 }
 
 export function offlineScopeReason(scope: "flag" | "prompt"): string {
   return scope === "flag"
-    ? "Web tools are off for this run: Vinci was started with --offline. Continue with local files and tools only; restart without --offline to use the web."
-    : "Web tools are off for this session: the user asked for no online access. Continue with local files and tools only; the user can lift this by saying \"you may use the web\".";
+    ? "Web tools are off for this run: Vinci was started with --offline. Continue without web search, page fetches, web answers or library docs; restart without --offline to use the web tools."
+    : "Web tools are off for this session: the user asked for no online access. Continue without web search, page fetches, web answers or library docs; the user can lift this by saying \"you may use the web\".";
 }
 
 export default function (pi: ExtensionAPI, options: { argv?: readonly string[] } = {}) {
