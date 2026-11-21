@@ -869,6 +869,8 @@ run_group loopbreak-integration node "${ROOT}/vinci/test/loopbreak-integration.m
 run_group loopbreak-continue-grant node "${ROOT}/vinci/test/loopbreak-continue-grant.mjs"
 run_group loopbreak-ceiling-continue node "${ROOT}/vinci/test/loopbreak-ceiling-continue.mjs"
 run_group verification-compound-preblock node "${ROOT}/vinci/test/verification-compound-preblock.mjs"
+# A focused pass beside a failed or unrun required check is labeled partially verified, never complete.
+run_group verification-partial-label node --test "${ROOT}/vinci/test/verification-partial-label.mjs"
 run_group loopbreak-stop-message node "${ROOT}/vinci/test/loopbreak-stop-message.mjs"
 run_group crew-loopbreak-integration node --test "${ROOT}/vinci/test/crew-loopbreak-integration.mjs"
 # Failing read-only shell commands have their own bound and never get a later edit refused (R-s).
