@@ -419,18 +419,24 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 }
 
 // ── Offline scope ────────────────────────────────────────────────────────────────────────────────
-// A run is offline-scoped when Vinci was started with `--offline` (the sure form), or when the
-// USER's own prompt text says so ("no online access", "offline only", "do not use the web", ...).
-// Only user input counts: tool results, files, model text and extension-injected input are never
-// read. While scoped, every web tool call is refused with a reason that names the scope and how to
-// lift it. A prompt scope lasts for the rest of the session (continue included) and is lifted only
-// by an explicit user phrase ("you may use the web"); the `--offline` scope cannot be lifted from a
-// prompt. Known limit: paraphrases outside the phrase list do not set the scope; `--offline` does.
+// A run is offline-scoped when Vinci was started with `--offline`, or when a user prompt that goes
+// through the input hook says so ("no online access", "offline only", "do not use the web", ...).
+// Input from extensions is skipped, and quoted text, code and attached @file contents are stripped
+// before the phrase check; tool results and model text never reach the hook. While scoped, every
+// web tool call is refused with a reason that names the scope and how to lift it, and crew helpers
+// launched from then on start with `--offline`. A restriction in a message wins over a lift phrase
+// in the same message, and a lift with a bounded exception ("... for library docs") does not lift.
+// Known limits: paraphrases outside the phrase list do not set the scope, and a false lift match
+// re-enables the tools; steer and follow-up messages queued while the agent works skip the input
+// hook; a prompt scope lives in one runtime, so /new, resume and fork start unscoped; text piped
+// on stdin is read as typed. `--offline` covers all of these and cannot be lifted from a prompt.
+export const OFFLINE_SCOPE_ENV = "VINCI_OFFLINE_SCOPE";
 export const OFFLINE_SCOPED_TOOLS: ReadonlySet<string> = new Set(["web_search", "web_fetch", "web_answer", "library_docs"]);
 
-/** Quoted strings and code (fenced, inline) are content the user is talking about, not instructions. */
+/** Quoted strings, code (fenced, inline) and attached @file contents are content the user is talking about, not instructions. */
 export function stripQuotedText(text: string): string {
   return text
+    .replace(/<file\b[^>]*>[\s\S]*?(?:<\/file>|$)/g, " ")
     .replace(/```[\s\S]*?(?:```|$)/g, " ")
     .replace(/~~~[\s\S]*?(?:~~~|$)/g, " ")
     .replace(/`[^`\n]*`/g, " ")
@@ -442,9 +448,12 @@ const OFFLINE_LIFT =
   /\b(?:you (?:may|can|are allowed to|have permission to) (?:now |again )?(?:use|access|search|browse) (?:the )?(?:web|internet|online)|(?:web|internet|online) access is (?:fine|ok|okay|allowed|back on)|go ahead and (?:use|search|browse) (?:the )?(?:web|internet))\b/;
 // Negation + web/online/internet/network, optionally naming what is off ("no web search").
 const OFFLINE_NEGATED =
-  /\b(?:no|not|don't|dont|do not|never|without)\s+(?:(?:use|using|access|accessing|search|searching|browse|browsing|go|going|call|calling|any|the|to|on|for)\s+){0,3}(?:web|internet|online|network)\b(?:[\s_-]+(?:access|search(?:es)?|fetch(?:es)?|lookups?|browsing|tools?|calls?|use))?/g;
+  /\b(?:no|not|don't|dont|do not|never|without|can't|cant|cannot)[\s-]+(?:(?:use|using|access|accessing|search|searching|browse|browsing|go|going|call|calling|any|the|to|on|for)\s+){0,3}(?:web|internet|online|network|library[_ ]docs)(?![a-z0-9])(?:[\s_-]+(?:access|search(?:es)?|fetch(?:es)?|lookups?|browsing|tools?|calls?|use))?/g;
 // "offline" as an instruction needs a cue: "offline only", "stay offline", "you are offline".
-const OFFLINE_WORD = /\b(?:(stay|remain|keep|be|are|go)\s+)?offline(?:([\s-]+)only)?\b/g;
+const OFFLINE_WORD = /\b(?:(stay|remain|keep|be|are|go)\s+)?offline(?:([\s-]+)only|(,?\s+please))?\b/g;
+// A lift followed in the same sentence by a bound ("for library docs", "only to check X") is a
+// bounded exception, not a lift of the whole scope.
+const OFFLINE_LIFT_BOUNDED = /^[^.!?\n]*?\b(?:for|only|except|but|just|to|when|if)\b/;
 // Product guard: the phrase describes the software being built, not this run's scope.
 const OFFLINE_PRODUCT_NEXT =
   /^[\s-]*(?:mode|modes|first|support|feature|features|version|build|app|application|banner|state|status|case|cases|scenario|scenarios|handling|capability|capabilities|storage|cache|sync|queue|indicator|message|messages|screen|page|fallback|user|users|experience|flow|behaviou?r)\b/;
@@ -461,16 +470,18 @@ function offlineProductUse(text: string, start: number, end: number): boolean {
 /** "set" when user text states an offline scope, "lift" when it explicitly allows the web again. */
 export function offlineScopeInstruction(userText: string): "set" | "lift" | undefined {
   const text = stripQuotedText(userText).toLowerCase().replace(/[‘’]/g, "'");
-  if (OFFLINE_LIFT.test(text)) return "lift";
+  // A restriction anywhere in the message wins over a lift phrase in the same message.
   for (const match of text.matchAll(OFFLINE_NEGATED)) {
     const start = match.index ?? 0;
     if (!offlineProductUse(text, start, start + match[0].length)) return "set";
   }
   for (const match of text.matchAll(OFFLINE_WORD)) {
-    if (!match[1] && !match[2]) continue;
+    if (!match[1] && !match[2] && !match[3]) continue;
     const start = match.index ?? 0;
     if (!offlineProductUse(text, start, start + match[0].length)) return "set";
   }
+  const lift = OFFLINE_LIFT.exec(text);
+  if (lift && !OFFLINE_LIFT_BOUNDED.test(text.slice(lift.index + lift[0].length))) return "lift";
   return undefined;
 }
 
@@ -484,12 +495,19 @@ export default function (pi: ExtensionAPI, options: { argv?: readonly string[] }
   // Offline scope (see OFFLINE_SCOPED_TOOLS above). Hook registration is skipped by API-less callers.
   const flagScope = (options.argv ?? process.argv).includes("--offline");
   let promptScope = false;
+  // Process-wide signal for crew helpers launched later (vinci-crew childLaunch adds --offline).
+  const signalScope = (on: boolean) => {
+    if (on) process.env[OFFLINE_SCOPE_ENV] = "1";
+    else delete process.env[OFFLINE_SCOPE_ENV];
+  };
+  signalScope(flagScope);
   if (typeof pi.on === "function") {
     pi.on("input", async (event) => {
       if (event.source === "extension" || typeof event.text !== "string") return;
       const instruction = offlineScopeInstruction(event.text);
       if (instruction === "set") promptScope = true;
       else if (instruction === "lift") promptScope = false;
+      if (instruction) signalScope(flagScope || promptScope);
     });
     pi.on("tool_call", async (event) => {
       if (!OFFLINE_SCOPED_TOOLS.has(event.toolName)) return undefined;
