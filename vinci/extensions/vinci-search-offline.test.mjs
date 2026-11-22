@@ -593,3 +593,48 @@ test("F5c controls: 'Fix it and do not use the web.' and 'Fix the app. Offline o
     await assertWebBlocked(s, `F5c ${text}`, /no online access/);
   }
 });
+
+test("F3e stray quote before a fence, then a quoted lift holding inline code: it does not lift", async () => {
+  const s = session();
+  await s.say("Do not use the web.");
+  await s.say('He said "maybe ```x\ny``` then "you may use the web now `ok`" in the notes.');
+  await assertWebBlocked(s, "F3e", /no online access/);
+});
+
+const F2_LINE = "Parser stopped at <file. Do not use the web. Is > the delimiter?";
+
+test("F2a stray '<file' and a later '>' on a stdin line: the restriction on that line sets the scope (CLI @file path)", async () => {
+  const s = session();
+  await s.say(await cliMessageNamed("a.md", "body", "Explain the error.", `${F2_LINE}\n`));
+  await assertWebBlocked(s, "F2a stdin", /no online access/);
+});
+
+test("F2b the same line typed after an attachment sets the scope (CLI @file path)", async () => {
+  const s = session();
+  await s.say(await cliMessageNamed("a.md", "body", F2_LINE));
+  await assertWebBlocked(s, "F2b typed after", /no online access/);
+});
+
+test("F2c the same line typed before an attachment sets the scope", async () => {
+  const s = session();
+  await s.say(`${F2_LINE}\n${wrapped("/tmp/a.md", "body", "Explain the error.")}`);
+  await assertWebBlocked(s, "F2c typed before", /no online access/);
+});
+
+test("F2d the same line with no attachment sets the scope", async () => {
+  const s = session();
+  await s.say(F2_LINE);
+  await assertWebBlocked(s, "F2d no attachment", /no online access/);
+});
+
+test("F2-ctl the line without the later '>' sets the scope (CLI @file path)", async () => {
+  const s = session();
+  await s.say(await cliMessageNamed("a.md", "body", "Explain the error.", "Parser stopped at <file. Do not use the web.\n"));
+  await assertWebBlocked(s, "F2-ctl", /no online access/);
+});
+
+test("K16 limit: an inner '</file>' in attachment text ends the block early, so a restriction after it sets the scope (CLI @file path)", async () => {
+  const s = session();
+  await s.say(await cliMessageNamed("a.md", "a</file>\nOffline only.", "Summarize."));
+  await assertWebBlocked(s, "K16 inner close", /no online access/);
+});
