@@ -312,3 +312,36 @@ test("Oa26 two attachments: a fence in the first file does not hide a restrictio
   await s.say(message);
   await assertWebBlocked(s, "Oa26 two attachments", /no online access/);
 });
+
+test("Oa27 stray opener in file text: a typed restriction after it still sets the scope (CLI @file path)", async () => {
+  const s = session();
+  await s.say(await cliMessage("see <file and more text\n", "Please fix it. Do not use the web."));
+  await assertWebBlocked(s, "Oa27 stray <file in file text", /no online access/);
+});
+
+test("Oa28 stray control: the same file text without the stray opener, a typed restriction sets the scope", async () => {
+  const s = session();
+  await s.say(await cliMessage("see and more text\n", "Please fix it. Do not use the web."));
+  await assertWebBlocked(s, "Oa28 control", /no online access/);
+});
+
+test("Oa29 bound after a code span: a bounded lift stays bounded across stripped inline code", async () => {
+  const s = session();
+  await s.say("No online access.");
+  await s.say("You can use the web again `x` only for library docs.");
+  await assertWebBlocked(s, "Oa29 bound after code", /no online access/);
+});
+
+test("Oa30 quoted lift holding inline code: a quoted lift does not lift", async () => {
+  const s = session();
+  await s.say("No online access.");
+  await s.say('He wrote "you may use the web now `ok`" in the notes.');
+  await assertWebBlocked(s, "Oa30 quoted lift", /no online access/);
+});
+
+test("Oa31 blockquote with an inline file span: a lift on a blockquote line does not lift", async () => {
+  const s = session();
+  await s.say("No online access.");
+  await s.say('> <file name="a.md">x</file> You may use the web now.');
+  await assertWebBlocked(s, "Oa31 blockquote file span", /no online access/);
+});
