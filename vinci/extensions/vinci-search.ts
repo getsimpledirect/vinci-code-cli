@@ -418,7 +418,211 @@ function formatPage(url: string, text: string, truncated: boolean): string {
   return `<web_page untrusted="true" url="${defang(url)}">\n${defang(body)}\n</web_page>\n\n${UNTRUSTED_NOTE}`;
 }
 
-export default function (pi: ExtensionAPI) {
+// ── Offline scope ────────────────────────────────────────────────────────────────────────────────
+// A run is offline-scoped when Vinci was started with `--offline`, or when a user prompt that goes
+// through the input hook says so ("no online access", "offline only", "do not use the web", ...).
+// Input from extensions is skipped, and double-quoted strings, code and attached @file contents
+// are stripped before the phrase check; tool results and model text never reach the hook. The
+// strip is split by polarity so that a wrong cut can only keep the scope set: lift phrases are
+// read with everything from the first `<file` wrapper to the LAST `</file>` removed (a file that
+// itself contains "</file>" cannot lift), then any wrapper left open, and markdown blockquote lines;
+// a lift inside an attached file or a blockquote never lifts. Restrictions are read in the pieces
+// of text outside file blocks (each block ends at its first `</file>`; an unclosed tag loses only
+// itself; an opener tag is the file processor's exact wrapper `<file name="...">` followed by a line
+// break, whatever the path holds except `<file` or `</file`, or else a tag of plain `name="..."` attributes); code and quotes are stripped
+// in each piece separately and each piece is matched on its own, so nothing inside a file can hide
+// text typed after it; blockquotes are kept. Text pasted into the prompt counts as typed. While
+// scoped, every web tool call is refused with a reason that names the scope and how to lift it, and
+// crew helpers launched from then on start with `--offline`. Only the web tools are off: model
+// calls continue. A restriction in a message wins over a lift phrase in the same message, and a
+// lift with a bounded exception ("... for library docs") does not lift.
+// Known limits: paraphrases outside the phrase list do not set the scope, and a false lift match
+// re-enables the tools (bounds outside the bound list, such as "exclusively on <site>", lift the
+// whole scope); a lift typed between two attached files, or after an attached file but before a
+// literal `</file>` in the user's own text, is ignored (type it after the last `</file>`); a restriction split by a file tag is not
+// detected;
+// steer and follow-up messages queued while the agent works skip the input hook; a prompt scope
+// lives in one runtime, so /new, resume and fork start unscoped; one runtime per process is
+// assumed (the crew signal is one process-wide value); text piped on stdin is read as typed.
+// `--offline` covers all of these and cannot be lifted from a prompt.
+export const OFFLINE_SCOPE_ENV = "VINCI_OFFLINE_SCOPE";
+export const OFFLINE_SCOPED_TOOLS: ReadonlySet<string> = new Set(["web_search", "web_fetch", "web_answer", "library_docs"]);
+
+// Lift pass: a stripped span becomes this gap. It joins no words (a lift phrase needs its words
+// separated by single spaces) and adds no line break, so bounds read across it as they would
+// across a space; quotes and inline code never pair across it, and a blockquote marker may follow it.
+const LIFT_GAP = " \u001f ";
+
+function stripCode(text: string, join: string): string {
+  return text
+    .replace(/```[\s\S]*?(?:```|$)/g, join)
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, join)
+    .replace(/`[^`\n]*`/g, join)
+    .replace(/"[^"\n]*"/g, join)
+    .replace(/“[^”\n]*”/g, join);
+}
+
+// Lift pass: fences first, then quotes (which may hold inline code), then inline code; no quote or
+// code span pairs across a gap, so a stray quote before a removed span cannot pair with a quoted lift.
+function stripLiftCode(text: string): string {
+  return text
+    .replace(/```[\s\S]*?(?:```|$)/g, LIFT_GAP)
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, LIFT_GAP)
+    .replace(/"[^"\n\u001f]*"/g, LIFT_GAP)
+    .replace(/“[^”\n\u001f]*”/g, LIFT_GAP)
+    .replace(/`[^`\n\u001f]*`/g, LIFT_GAP);
+}
+// The second reading for the lift pass: inline code first, then quotes that may hold a stripped span.
+function stripLiftCodeOuter(text: string): string {
+  return text
+    .replace(/```[\s\S]*?(?:```|$)/g, LIFT_GAP)
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, LIFT_GAP)
+    .replace(/`[^`\n]*`/g, LIFT_GAP)
+    .replace(/"[^"\n]*"/g, LIFT_GAP)
+    .replace(/“[^”\n]*”/g, LIFT_GAP);
+}
+
+/**
+ * The text outside attached files, split at every `<file ...>` / `</file>` tag. A block runs from an
+ * opener that has a later `</file>` to its FIRST `</file>` and is dropped; an opener with no later
+ * close loses only its tag. An opener tag is the processor's wrapper `<file name="...">` + line break
+ * (any path bytes but `<file` or `</file`) or a one-line tag of plain `name="..."` attributes (spaces and
+ * tabs only), so a stray `<file` cannot swallow a real close or a typed restriction. Any other one-line
+ * `<file ...>` outside a block is a boundary only: it never opens a block, and its own text is a segment
+ * of its own. Each tag is a segment boundary, so code or quote openers inside file text can never reach
+ * the text typed after the files.
+ */
+function outsideFileSegments(text: string): string[] {
+  const segments: string[] = [];
+  const tags = /<file name="(?:(?!<\/?file\b)[\s\S])*?">(?=\n)|<file(?:[ \t]+[\w-]+="[^"<>\n]*")*[ \t]*\/?>|<\/file>|(<file\b[^<>\n]*>)/g;
+  let inFile = false;
+  let last = 0;
+  for (const tag of text.matchAll(tags)) {
+    const at = tag.index ?? 0;
+    if (tag[1] !== undefined) {
+      if (!inFile) {
+        segments.push(text.slice(last, at), tag[1].slice("<file".length, -1));
+        last = at + tag[0].length;
+      }
+      continue;
+    }
+    if (!inFile) segments.push(text.slice(last, at));
+    if (tag[0] === "</file>") inFile = false;
+    else if (!inFile && text.includes("</file>", at + tag[0].length)) inFile = true;
+    last = at + tag[0].length;
+  }
+  if (!inFile) segments.push(text.slice(last));
+  return segments;
+}
+
+/** The pieces restrictions are matched in, one at a time: text outside file blocks, code and quotes stripped in each. */
+function restrictionPieces(text: string): string[] {
+  return outsideFileSegments(text).map((piece) => stripCode(piece, " "));
+}
+
+/**
+ * Double-quoted strings, code (fenced, inline) and attached @file contents are content the user is
+ * talking about, not instructions. "restriction" (default) returns the restriction pieces (text
+ * outside file blocks) joined with line breaks, for reading only: matching runs on each piece alone;
+ * "lift" strips from
+ * the first wrapper to the last `</file>`, then any wrapper left open to the end, and blockquotes,
+ * replacing each stripped span with LIFT_GAP.
+ */
+export function stripQuotedText(text: string, polarity: "restriction" | "lift" | "lift-outer" = "restriction"): string {
+  if (polarity === "restriction") return restrictionPieces(text).join("\n");
+  const files = text
+    .replace(/<file\b[^>]*>(?:[\s\S]*<\/file>|[\s\S]*$)/, LIFT_GAP)
+    .replace(/<file\b[^>]*>[\s\S]*$/, LIFT_GAP)
+    .replace(/^[ \t\u001f]*>.*$/gm, "\n");
+  return polarity === "lift" ? stripLiftCode(files) : stripLiftCodeOuter(files);
+}
+
+const OFFLINE_LIFT =
+  /\b(?:you (?:may|can|are allowed to|have permission to) (?:now |again )?(?:use|access|search|browse) (?:the )?(?:web|internet|online)|(?:web|internet|online) access is (?:fine|ok|okay|allowed|back on)|go ahead and (?:use|search|browse) (?:the )?(?:web|internet))\b/;
+// Negation + web/online/internet/network, optionally naming what is off ("no web search").
+const OFFLINE_NEGATED =
+  /\b(?:no|not|don't|dont|do not|never|without|can't|cant|cannot)[\s-]+(?:(?:use|using|access|accessing|search|searching|browse|browsing|go|going|call|calling|any|the|to|on|for)\s+){0,3}(?:web|internet|online|network|library[_ ]docs)(?![a-z0-9])(?:[\s_-]+(?:access|search(?:es)?|fetch(?:es)?|lookups?|browsing|tools?|calls?|use))?/g;
+// "offline" as an instruction needs a cue: "offline only", "stay offline", "you are offline".
+const OFFLINE_WORD = /\b(?:(stay|remain|keep|be|are|go)\s+)?offline(?:([\s-]+)only|(,?\s+please))?\b/g;
+// A lift followed in the same sentence by a bound ("for library docs", "only to check X") is a
+// bounded exception, not a lift of the whole scope.
+const OFFLINE_LIFT_BOUNDED = /^[^.!?\n]*?\b(?:for|only|except|but|just|to|when|if)\b/;
+// Product guard: the phrase describes the software being built, not this run's scope.
+const OFFLINE_PRODUCT_NEXT =
+  /^[\s-]*(?:mode|modes|first|support|feature|features|version|build|app|application|banner|state|status|case|cases|scenario|scenarios|handling|capability|capabilities|storage|cache|sync|queue|indicator|message|messages|screen|page|fallback|user|users|experience|flow|behaviou?r)\b/;
+const OFFLINE_PRODUCT_BEFORE =
+  /\b(?:when|whenever|if|while|unless|case|handle|handles|handling|detect|detects|support|supports|add|adding|implement|implementing|build|building|show|shows|display|displays|test|testing|works|working|app|apps|users?|devices?|customers?)\b/;
+
+// For a negation ("do not use the web") the lookback also stops at "and" / "but": "fix the app and
+// do not use the web" is a restriction. An "offline" phrase keeps the whole clause ("build the app and
+// make it offline only" describes the product).
+function offlineProductUse(text: string, start: number, end: number, negation = false): boolean {
+  if (OFFLINE_PRODUCT_NEXT.test(text.slice(end))) return true;
+  const before = text.slice(0, start).split(negation ? /[.!?;:\n]|\b(?:and|but)\b/ : /[.!?;:\n]/).pop() ?? "";
+  const lastWords = before.trim().split(/\s+/).slice(-4).join(" ");
+  return OFFLINE_PRODUCT_BEFORE.test(lastWords);
+}
+
+function restrictionIn(piece: string): boolean {
+  const text = piece.toLowerCase().replace(/[‘’]/g, "'");
+  for (const match of text.matchAll(OFFLINE_NEGATED)) {
+    const start = match.index ?? 0;
+    if (!offlineProductUse(text, start, start + match[0].length, true)) return true;
+  }
+  for (const match of text.matchAll(OFFLINE_WORD)) {
+    if (!match[1] && !match[2] && !match[3]) continue;
+    const start = match.index ?? 0;
+    if (!offlineProductUse(text, start, start + match[0].length)) return true;
+  }
+  return false;
+}
+
+/** "set" when user text states an offline scope, "lift" when it explicitly allows the web again. */
+export function offlineScopeInstruction(userText: string): "set" | "lift" | undefined {
+  // A restriction anywhere in the message wins over a lift phrase in the same message. Each piece
+  // is matched on its own, so a cue in one piece cannot reject a phrase in another.
+  if (restrictionPieces(userText).some(restrictionIn)) return "set";
+  // A lift counts only when it is unquoted and unbounded in both quote readings.
+  if (liftIn(stripQuotedText(userText, "lift")) && liftIn(stripQuotedText(userText, "lift-outer"))) return "lift";
+  return undefined;
+}
+function liftIn(stripped: string): boolean {
+  const liftText = stripped.toLowerCase().replace(/[‘’]/g, "'");
+  const lift = OFFLINE_LIFT.exec(liftText);
+  return lift !== null && !OFFLINE_LIFT_BOUNDED.test(liftText.slice(lift.index + lift[0].length));
+}
+
+export function offlineScopeReason(scope: "flag" | "prompt"): string {
+  return scope === "flag"
+    ? "Web tools are off for this run: Vinci was started with --offline. Continue without web search, page fetches, web answers or library docs; restart without --offline to use the web tools."
+    : "Web tools are off for this session: the user asked for no online access. Continue without web search, page fetches, web answers or library docs; the user can lift this by saying \"you may use the web\".";
+}
+
+export default function (pi: ExtensionAPI, options: { argv?: readonly string[] } = {}) {
+  // Offline scope (see OFFLINE_SCOPED_TOOLS above). Hook registration is skipped by API-less callers.
+  const flagScope = (options.argv ?? process.argv).includes("--offline");
+  let promptScope = false;
+  // Process-wide signal for crew helpers launched later (vinci-crew childLaunch adds --offline).
+  const signalScope = (on: boolean) => {
+    if (on) process.env[OFFLINE_SCOPE_ENV] = "1";
+    else delete process.env[OFFLINE_SCOPE_ENV];
+  };
+  signalScope(flagScope);
+  if (typeof pi.on === "function") {
+    pi.on("input", async (event) => {
+      if (event.source === "extension" || typeof event.text !== "string") return;
+      const instruction = offlineScopeInstruction(event.text);
+      if (instruction === "set") promptScope = true;
+      else if (instruction === "lift") promptScope = false;
+      if (instruction) signalScope(flagScope || promptScope);
+    });
+    pi.on("tool_call", async (event) => {
+      if (!OFFLINE_SCOPED_TOOLS.has(event.toolName)) return undefined;
+      if (flagScope) return { block: true as const, reason: offlineScopeReason("flag") };
+      if (promptScope) return { block: true as const, reason: offlineScopeReason("prompt") };
+      return undefined;
+    });
+  }
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
