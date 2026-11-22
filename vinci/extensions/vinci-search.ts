@@ -472,6 +472,15 @@ function stripLiftCode(text: string): string {
     .replace(/“[^”\n\u001f]*”/g, LIFT_GAP)
     .replace(/`[^`\n\u001f]*`/g, LIFT_GAP);
 }
+// The second reading for the lift pass: inline code first, then quotes that may hold a stripped span.
+function stripLiftCodeOuter(text: string): string {
+  return text
+    .replace(/```[\s\S]*?(?:```|$)/g, LIFT_GAP)
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, LIFT_GAP)
+    .replace(/`[^`\n]*`/g, LIFT_GAP)
+    .replace(/"[^"\n]*"/g, LIFT_GAP)
+    .replace(/“[^”\n]*”/g, LIFT_GAP);
+}
 
 /**
  * The text outside attached files, split at every `<file ...>` / `</file>` tag. A block runs from an
@@ -510,13 +519,13 @@ function restrictionPieces(text: string): string[] {
  * the first wrapper to the last `</file>`, then any wrapper left open to the end, and blockquotes,
  * replacing each stripped span with LIFT_GAP.
  */
-export function stripQuotedText(text: string, polarity: "restriction" | "lift" = "restriction"): string {
+export function stripQuotedText(text: string, polarity: "restriction" | "lift" | "lift-outer" = "restriction"): string {
   if (polarity === "restriction") return restrictionPieces(text).join("\n");
   const files = text
     .replace(/<file\b[^>]*>(?:[\s\S]*<\/file>|[\s\S]*$)/, LIFT_GAP)
     .replace(/<file\b[^>]*>[\s\S]*$/, LIFT_GAP)
     .replace(/^[ \t\u001f]*>.*$/gm, "\n");
-  return stripLiftCode(files);
+  return polarity === "lift" ? stripLiftCode(files) : stripLiftCodeOuter(files);
 }
 
 const OFFLINE_LIFT =
@@ -535,9 +544,12 @@ const OFFLINE_PRODUCT_NEXT =
 const OFFLINE_PRODUCT_BEFORE =
   /\b(?:when|whenever|if|while|unless|case|handle|handles|handling|detect|detects|support|supports|add|adding|implement|implementing|build|building|show|shows|display|displays|test|testing|works|working|app|apps|users?|devices?|customers?)\b/;
 
-function offlineProductUse(text: string, start: number, end: number): boolean {
+// For a negation ("do not use the web") the lookback also stops at "and" / "but": "fix the app and
+// do not use the web" is a restriction. An "offline" phrase keeps the whole clause ("build the app and
+// make it offline only" describes the product).
+function offlineProductUse(text: string, start: number, end: number, negation = false): boolean {
   if (OFFLINE_PRODUCT_NEXT.test(text.slice(end))) return true;
-  const before = text.slice(0, start).split(/[.!?;:\n]/).pop() ?? "";
+  const before = text.slice(0, start).split(negation ? /[.!?;:\n]|\b(?:and|but)\b/ : /[.!?;:\n]/).pop() ?? "";
   const lastWords = before.trim().split(/\s+/).slice(-4).join(" ");
   return OFFLINE_PRODUCT_BEFORE.test(lastWords);
 }
@@ -546,7 +558,7 @@ function restrictionIn(piece: string): boolean {
   const text = piece.toLowerCase().replace(/[‘’]/g, "'");
   for (const match of text.matchAll(OFFLINE_NEGATED)) {
     const start = match.index ?? 0;
-    if (!offlineProductUse(text, start, start + match[0].length)) return true;
+    if (!offlineProductUse(text, start, start + match[0].length, true)) return true;
   }
   for (const match of text.matchAll(OFFLINE_WORD)) {
     if (!match[1] && !match[2] && !match[3]) continue;
@@ -561,10 +573,14 @@ export function offlineScopeInstruction(userText: string): "set" | "lift" | unde
   // A restriction anywhere in the message wins over a lift phrase in the same message. Each piece
   // is matched on its own, so a cue in one piece cannot reject a phrase in another.
   if (restrictionPieces(userText).some(restrictionIn)) return "set";
-  const liftText = stripQuotedText(userText, "lift").toLowerCase().replace(/[‘’]/g, "'");
-  const lift = OFFLINE_LIFT.exec(liftText);
-  if (lift && !OFFLINE_LIFT_BOUNDED.test(liftText.slice(lift.index + lift[0].length))) return "lift";
+  // A lift counts only when it is unquoted and unbounded in both quote readings.
+  if (liftIn(stripQuotedText(userText, "lift")) && liftIn(stripQuotedText(userText, "lift-outer"))) return "lift";
   return undefined;
+}
+function liftIn(stripped: string): boolean {
+  const liftText = stripped.toLowerCase().replace(/[‘’]/g, "'");
+  const lift = OFFLINE_LIFT.exec(liftText);
+  return lift !== null && !OFFLINE_LIFT_BOUNDED.test(liftText.slice(lift.index + lift[0].length));
 }
 
 export function offlineScopeReason(scope: "flag" | "prompt"): string {
