@@ -1,4 +1,4 @@
-  Vinci v0.0.63 Code
+  Vinci v0.0.64 Code
   Vero DONE · Vinci · <repo>
   ● connected · Read the receipt. · /undo · Ctrl+T thinking
 
