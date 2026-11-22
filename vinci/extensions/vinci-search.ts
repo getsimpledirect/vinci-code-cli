@@ -428,8 +428,10 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 // itself contains "</file>" cannot lift), then any wrapper left open, and markdown blockquote lines;
 // a lift inside an attached file or a blockquote never lifts. Restrictions are read in the pieces
 // of text outside file blocks (each block ends at its first `</file>`; an unclosed tag loses only
-// itself; an opener tag never spans a line break or another `<`), with code and quotes stripped in each piece separately, so nothing inside a file can
-// hide text typed after it; blockquotes are kept. Text pasted into the prompt counts as typed. While
+// itself; an opener tag is the file processor's exact wrapper `<file name="...">` followed by a line
+// break, whatever the path holds except another `<file`, or else a one-line tag with no `<`); code and quotes are stripped
+// in each piece separately and each piece is matched on its own, so nothing inside a file can hide
+// text typed after it; blockquotes are kept. Text pasted into the prompt counts as typed. While
 // scoped, every web tool call is refused with a reason that names the scope and how to lift it, and
 // crew helpers launched from then on start with `--offline`. Only the web tools are off: model
 // calls continue. A restriction in a message wins over a lift phrase in the same message, and a
@@ -447,8 +449,8 @@ export const OFFLINE_SCOPE_ENV = "VINCI_OFFLINE_SCOPE";
 export const OFFLINE_SCOPED_TOOLS: ReadonlySet<string> = new Set(["web_search", "web_fetch", "web_answer", "library_docs"]);
 
 // Lift pass: a stripped span becomes this gap. It joins no words (a lift phrase needs its words
-// separated by single spaces) and adds no line break, so bounds, quotes and blockquote lines read
-// across it as they would across a space.
+// separated by single spaces) and adds no line break, so bounds read across it as they would
+// across a space; quotes and inline code never pair across it, and a blockquote marker may follow it.
 const LIFT_GAP = " \u001f ";
 
 function stripCode(text: string, join: string): string {
@@ -460,16 +462,28 @@ function stripCode(text: string, join: string): string {
     .replace(/“[^”\n]*”/g, join);
 }
 
+// Lift pass: fences first, then quotes (which may hold inline code), then inline code; no quote or
+// code span pairs across a gap, so a stray quote before a removed span cannot pair with a quoted lift.
+function stripLiftCode(text: string): string {
+  return text
+    .replace(/```[\s\S]*?(?:```|$)/g, LIFT_GAP)
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, LIFT_GAP)
+    .replace(/"[^"\n\u001f]*"/g, LIFT_GAP)
+    .replace(/“[^”\n\u001f]*”/g, LIFT_GAP)
+    .replace(/`[^`\n\u001f]*`/g, LIFT_GAP);
+}
+
 /**
  * The text outside attached files, split at every `<file ...>` / `</file>` tag. A block runs from an
  * opener that has a later `</file>` to its FIRST `</file>` and is dropped; an opener with no later
- * close loses only its tag. An opener tag never spans a line break or another `<`, so a stray `<file`
- * in file text cannot swallow the real `</file>`. Each tag is a segment boundary, so code or quote
+ * close loses only its tag. An opener tag is the processor's wrapper `<file name="...">` + line break
+ * (any path bytes but `<file`) or a one-line tag with no `<`, so a stray `<file` cannot swallow a real close or
+ * a typed restriction. Each tag is a segment boundary, so code or quote
  * openers inside file text can never reach the text typed after the files.
  */
 function outsideFileSegments(text: string): string[] {
   const segments: string[] = [];
-  const tags = /<file\b[^<>\n]*>|<\/file>/g;
+  const tags = /<file name="(?:(?!<file\b)[\s\S])*?">(?=\n)|<file\b[^<>\n]*>|<\/file>/g;
   let inFile = false;
   let last = 0;
   for (const tag of text.matchAll(tags)) {
@@ -483,20 +497,26 @@ function outsideFileSegments(text: string): string[] {
   return segments;
 }
 
+/** The pieces restrictions are matched in, one at a time: text outside file blocks, code and quotes stripped in each. */
+function restrictionPieces(text: string): string[] {
+  return outsideFileSegments(text).map((piece) => stripCode(piece, " "));
+}
+
 /**
  * Double-quoted strings, code (fenced, inline) and attached @file contents are content the user is
- * talking about, not instructions. "restriction" (default) keeps the text outside file blocks, strips
- * code and quotes in each piece separately, and joins the pieces with line breaks; "lift" strips from
+ * talking about, not instructions. "restriction" (default) returns the restriction pieces (text
+ * outside file blocks) joined with line breaks, for reading only: matching runs on each piece alone;
+ * "lift" strips from
  * the first wrapper to the last `</file>`, then any wrapper left open to the end, and blockquotes,
  * replacing each stripped span with LIFT_GAP.
  */
 export function stripQuotedText(text: string, polarity: "restriction" | "lift" = "restriction"): string {
-  if (polarity === "restriction") return outsideFileSegments(text).map((segment) => stripCode(segment, " ")).join("\n");
+  if (polarity === "restriction") return restrictionPieces(text).join("\n");
   const files = text
     .replace(/<file\b[^>]*>(?:[\s\S]*<\/file>|[\s\S]*$)/, LIFT_GAP)
     .replace(/<file\b[^>]*>[\s\S]*$/, LIFT_GAP)
-    .replace(/^[ \t]*>.*$/gm, "\n");
-  return stripCode(files, LIFT_GAP);
+    .replace(/^[ \t\u001f]*>.*$/gm, "\n");
+  return stripLiftCode(files);
 }
 
 const OFFLINE_LIFT =
@@ -522,20 +542,26 @@ function offlineProductUse(text: string, start: number, end: number): boolean {
   return OFFLINE_PRODUCT_BEFORE.test(lastWords);
 }
 
-/** "set" when user text states an offline scope, "lift" when it explicitly allows the web again. */
-export function offlineScopeInstruction(userText: string): "set" | "lift" | undefined {
-  const text = stripQuotedText(userText, "restriction").toLowerCase().replace(/[‘’]/g, "'");
-  const liftText = stripQuotedText(userText, "lift").toLowerCase().replace(/[‘’]/g, "'");
-  // A restriction anywhere in the message wins over a lift phrase in the same message.
+function restrictionIn(piece: string): boolean {
+  const text = piece.toLowerCase().replace(/[‘’]/g, "'");
   for (const match of text.matchAll(OFFLINE_NEGATED)) {
     const start = match.index ?? 0;
-    if (!offlineProductUse(text, start, start + match[0].length)) return "set";
+    if (!offlineProductUse(text, start, start + match[0].length)) return true;
   }
   for (const match of text.matchAll(OFFLINE_WORD)) {
     if (!match[1] && !match[2] && !match[3]) continue;
     const start = match.index ?? 0;
-    if (!offlineProductUse(text, start, start + match[0].length)) return "set";
+    if (!offlineProductUse(text, start, start + match[0].length)) return true;
   }
+  return false;
+}
+
+/** "set" when user text states an offline scope, "lift" when it explicitly allows the web again. */
+export function offlineScopeInstruction(userText: string): "set" | "lift" | undefined {
+  // A restriction anywhere in the message wins over a lift phrase in the same message. Each piece
+  // is matched on its own, so a cue in one piece cannot reject a phrase in another.
+  if (restrictionPieces(userText).some(restrictionIn)) return "set";
+  const liftText = stripQuotedText(userText, "lift").toLowerCase().replace(/[‘’]/g, "'");
   const lift = OFFLINE_LIFT.exec(liftText);
   if (lift && !OFFLINE_LIFT_BOUNDED.test(liftText.slice(lift.index + lift[0].length))) return "lift";
   return undefined;
