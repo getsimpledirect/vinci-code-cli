@@ -486,17 +486,26 @@ function stripLiftCodeOuter(text: string): string {
  * The text outside attached files, split at every `<file ...>` / `</file>` tag. A block runs from an
  * opener that has a later `</file>` to its FIRST `</file>` and is dropped; an opener with no later
  * close loses only its tag. An opener tag is the processor's wrapper `<file name="...">` + line break
- * (any path bytes but `<file` or `</file`) or a tag of plain `name="..."` attributes, so a stray `<file` cannot swallow a real close or
- * a typed restriction. Each tag is a segment boundary, so code or quote
- * openers inside file text can never reach the text typed after the files.
+ * (any path bytes but `<file` or `</file`) or a one-line tag of plain `name="..."` attributes (spaces and
+ * tabs only), so a stray `<file` cannot swallow a real close or a typed restriction. Any other one-line
+ * `<file ...>` outside a block is a boundary only: it never opens a block, and its own text is a segment
+ * of its own. Each tag is a segment boundary, so code or quote openers inside file text can never reach
+ * the text typed after the files.
  */
 function outsideFileSegments(text: string): string[] {
   const segments: string[] = [];
-  const tags = /<file name="(?:(?!<\/?file\b)[\s\S])*?">(?=\n)|<file(?:\s+[\w-]+="[^"<>\n]*")*\s*\/?>|<\/file>/g;
+  const tags = /<file name="(?:(?!<\/?file\b)[\s\S])*?">(?=\n)|<file(?:[ \t]+[\w-]+="[^"<>\n]*")*[ \t]*\/?>|<\/file>|(<file\b[^<>\n]*>)/g;
   let inFile = false;
   let last = 0;
   for (const tag of text.matchAll(tags)) {
     const at = tag.index ?? 0;
+    if (tag[1] !== undefined) {
+      if (!inFile) {
+        segments.push(text.slice(last, at), tag[1].slice("<file".length, -1));
+        last = at + tag[0].length;
+      }
+      continue;
+    }
     if (!inFile) segments.push(text.slice(last, at));
     if (tag[0] === "</file>") inFile = false;
     else if (!inFile && text.includes("</file>", at + tag[0].length)) inFile = true;
