@@ -638,3 +638,53 @@ test("K16 limit: an inner '</file>' in attachment text ends the block early, so 
   await s.say(await cliMessageNamed("a.md", "a</file>\nOffline only.", "Summarize."));
   await assertWebBlocked(s, "K16 inner close", /no online access/);
 });
+
+const R1_TAIL = "\nDo not use the web.\n";
+
+test("R1a a typed '<file' tag split over lines is not a file opener: the restriction after it sets the scope", async () => {
+  const s = session();
+  await s.say(`<file\n data-id="x">${R1_TAIL}${wrapped("/tmp/a.md", "notes", "Summarize.")}`);
+  await assertWebBlocked(s, "R1a multi-line attribute tag", /no online access/);
+});
+
+test("R1b the bare form '<file' + line break + '>' before an attachment does not hide the restriction", async () => {
+  const s = session();
+  await s.say(`<file\n>${R1_TAIL}${wrapped("/tmp/a.md", "notes", "Summarize.")}`);
+  await assertWebBlocked(s, "R1b bare multi-line tag", /no online access/);
+});
+
+test("R1c the self-closing form '<file' + line break + '/>' before an attachment does not hide the restriction", async () => {
+  const s = session();
+  await s.say(`<file\n/>${R1_TAIL}${wrapped("/tmp/a.md", "notes", "Summarize.")}`);
+  await assertWebBlocked(s, "R1c self-closing multi-line tag", /no online access/);
+});
+
+test("R1d a lift typed before the multi-line tag does not lift: the restriction still sets the scope", async () => {
+  const s = session();
+  await s.say(`You may use the web now.\n<file\n data-id="x">${R1_TAIL}${wrapped("/tmp/a.md", "notes", "Summarize.")}`);
+  await assertWebBlocked(s, "R1d lift-prefixed", /no online access/);
+});
+
+test("R1e after the last attachment, a multi-line tag and a typed '</file>' do not hide the restriction between them", async () => {
+  const s = session();
+  await s.say(wrapped("/tmp/a.md", "notes", `<file\n>${R1_TAIL}</file>\nthanks`));
+  await assertWebBlocked(s, "R1e typed close after the last wrapper", /no online access/);
+});
+
+test("R2a a stray '<file path=x>' is still a boundary: 'Fix the app <file path=x> do not use the web.' sets the scope", async () => {
+  const s = session();
+  await s.say("Fix the app <file path=x> do not use the web.");
+  await assertWebBlocked(s, "R2a alone", /no online access/);
+});
+
+test("R2b the same line typed after an attachment sets the scope", async () => {
+  const s = session();
+  await s.say(wrapped("/tmp/a.md", "notes", "Fix the app <file path=x> do not use the web."));
+  await assertWebBlocked(s, "R2b after an attachment", /no online access/);
+});
+
+test("R2c the 'offline only' form after a stray '<file path=x>' sets the scope", async () => {
+  const s = session();
+  await s.say("Fix the app <file path=x> offline only.");
+  await assertWebBlocked(s, "R2c offline only", /no online access/);
+});
