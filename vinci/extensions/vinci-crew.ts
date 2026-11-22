@@ -426,8 +426,13 @@ const ORCHESTRATOR_DISMISS_GUIDANCE =
   "Mention /agents only when the user asks to look at the agent's changes.";
 
 // --- child launch config, derived from how MAIN was launched (so a helper is a faithful Vinci) ---
-function childLaunch(): { cliPath: string; args: string[] } {
-  const argv = process.argv; // node <cli.js> --theme … --extension … --thinking high --provider vinci --model …
+// An offline scope (`--offline`, or a prompt scope signalled by vinci-search in VINCI_OFFLINE_SCOPE)
+// is passed on as `--offline`, so the helper's web tools are refused too. Helpers already launched
+// keep the scope they started with.
+export function childLaunch(
+  argv: readonly string[] = process.argv, // node <cli.js> --theme … --extension … --thinking high --provider vinci --model …
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): { cliPath: string; args: string[] } {
   const cliPath = argv[1];
   const args: string[] = [];
   let thinking = "high";
@@ -463,6 +468,7 @@ function childLaunch(): { cliPath: string; args: string[] } {
     }
   }
   args.push("--thinking", thinking);
+  if (argv.includes("--offline") || env.VINCI_OFFLINE_SCOPE === "1") args.push("--offline");
   return { cliPath, args };
 }
 
