@@ -429,7 +429,7 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 // a lift inside an attached file or a blockquote never lifts. Restrictions are read in the pieces
 // of text outside file blocks (each block ends at its first `</file>`; an unclosed tag loses only
 // itself; an opener tag is the file processor's exact wrapper `<file name="...">` followed by a line
-// break, whatever the path holds except `<file` or `</file`, or else a one-line tag with no `<`); code and quotes are stripped
+// break, whatever the path holds except `<file` or `</file`, or else a tag of plain `name="..."` attributes); code and quotes are stripped
 // in each piece separately and each piece is matched on its own, so nothing inside a file can hide
 // text typed after it; blockquotes are kept. Text pasted into the prompt counts as typed. While
 // scoped, every web tool call is refused with a reason that names the scope and how to lift it, and
@@ -486,13 +486,13 @@ function stripLiftCodeOuter(text: string): string {
  * The text outside attached files, split at every `<file ...>` / `</file>` tag. A block runs from an
  * opener that has a later `</file>` to its FIRST `</file>` and is dropped; an opener with no later
  * close loses only its tag. An opener tag is the processor's wrapper `<file name="...">` + line break
- * (any path bytes but `<file` or `</file`) or a one-line tag with no `<`, so a stray `<file` cannot swallow a real close or
+ * (any path bytes but `<file` or `</file`) or a tag of plain `name="..."` attributes, so a stray `<file` cannot swallow a real close or
  * a typed restriction. Each tag is a segment boundary, so code or quote
  * openers inside file text can never reach the text typed after the files.
  */
 function outsideFileSegments(text: string): string[] {
   const segments: string[] = [];
-  const tags = /<file name="(?:(?!<\/?file\b)[\s\S])*?">(?=\n)|<file\b[^<>\n]*>|<\/file>/g;
+  const tags = /<file name="(?:(?!<\/?file\b)[\s\S])*?">(?=\n)|<file(?:\s+[\w-]+="[^"<>\n]*")*\s*\/?>|<\/file>/g;
   let inFile = false;
   let last = 0;
   for (const tag of text.matchAll(tags)) {
