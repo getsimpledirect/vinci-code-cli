@@ -494,3 +494,53 @@ test("S1c control: the same stdin without the stray opener sets the scope (CLI @
   await s.say(await cliMessageNamed("a.md", "body", "fix it", "x\nDo not use the web.\n"));
   await assertWebBlocked(s, "S1c control", /no online access/);
 });
+
+// The processor's text-file wrapper followed by the typed message, written out as a string (inputs of the review probe P-OA8R).
+const wrapped = (name, body, typed, stdin = "") => `${stdin}<file name="${name}">\n${body}\n</file>\n${typed}`;
+
+test("X1 file text with an unclosed '<file name=\"' and a typed line ending '\">': a typed restriction after it still sets the scope", async () => {
+  const s = session();
+  await s.say(wrapped("/tmp/a.md", 'see <file name="q', 'Read <a href="x">\nOffline only.'));
+  await assertWebBlocked(s, "X1 unclosed name opener in file", /no online access/);
+});
+
+test("X1b the same, the file text ends the unclosed opener on its own line: a typed restriction still sets the scope", async () => {
+  const s = session();
+  await s.say(wrapped("/tmp/a.md", 'see\n<file name="q\nmore', 'Read <a href="x">\nOffline only.'));
+  await assertWebBlocked(s, "X1b opener on its own line", /no online access/);
+});
+
+test("X1d the same as X1 with a typed 'Do not use the web.': sets the scope", async () => {
+  const s = session();
+  await s.say(wrapped("/tmp/a.md", 'see <file name="q', 'Read <a href="x">\nDo not use the web.'));
+  await assertWebBlocked(s, "X1d negated", /no online access/);
+});
+
+test("X3 restriction typed before the html line, text after it: sets the scope", async () => {
+  const s = session();
+  await s.say(wrapped("/tmp/a.md", 'see <file name="q', 'Offline only.\nRead <a href="x">\nthanks'));
+  await assertWebBlocked(s, "X3 restriction first", /no online access/);
+});
+
+test("X1c-tail the X3 input through the CLI file processor: sets the scope (CLI @file path)", async () => {
+  const s = session();
+  await s.say(await cliMessageNamed("a.md", 'see <file name="q', 'Offline only.\nRead <a href="x">\nthanks'));
+  await assertWebBlocked(s, "X1c-tail restriction first", /no online access/);
+});
+
+test("X-controls: no typed html line, a plain file, a stdin restriction each set the scope; a restriction only in the file does not", async () => {
+  for (const [label, message] of [
+    ["C0", "Offline only."],
+    ["X0", wrapped("/tmp/a.md", "notes", 'Read <a href="x">\nOffline only.')],
+    ["X1c", wrapped("/tmp/a.md", 'see <file name="q', "Offline only.")],
+    ["X2", wrapped("/tmp/b.md", "notes", 'Read <a href="x">\nOffline only.')],
+    ["X4", wrapped("/tmp/a.md", 'see <file name="q', 'Read <a href="x">\nthanks', "Offline only.\n")],
+  ]) {
+    const s = session();
+    await s.say(message);
+    await assertWebBlocked(s, `X-controls ${label}`, /no online access/);
+  }
+  const s = session();
+  await s.say(wrapped("/tmp/a.md", 'Offline only. see <file name="q', 'Read <a href="x">\nthanks'));
+  await assertWebAllowed(s, "X-controls X5");
+});
