@@ -428,7 +428,7 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 // itself contains "</file>" cannot lift), then any wrapper left open, and markdown blockquote lines;
 // a lift inside an attached file or a blockquote never lifts. Restrictions are read in the pieces
 // of text outside file blocks (each block ends at its first `</file>`; an unclosed tag loses only
-// itself), with code and quotes stripped in each piece separately, so nothing inside a file can
+// itself; an opener tag never spans a line break or another `<`), with code and quotes stripped in each piece separately, so nothing inside a file can
 // hide text typed after it; blockquotes are kept. Text pasted into the prompt counts as typed. While
 // scoped, every web tool call is refused with a reason that names the scope and how to lift it, and
 // crew helpers launched from then on start with `--offline`. Only the web tools are off: model
@@ -436,8 +436,8 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 // lift with a bounded exception ("... for library docs") does not lift.
 // Known limits: paraphrases outside the phrase list do not set the scope, and a false lift match
 // re-enables the tools (bounds outside the bound list, such as "exclusively on <site>", lift the
-// whole scope); a lift typed between two attached files, or after a literal `</file>` in the
-// user's own text, is ignored (type it after the files); a restriction split by a file tag is not
+// whole scope); a lift typed between two attached files, or after an attached file but before a
+// literal `</file>` in the user's own text, is ignored (type it after the last `</file>`); a restriction split by a file tag is not
 // detected;
 // steer and follow-up messages queued while the agent works skip the input hook; a prompt scope
 // lives in one runtime, so /new, resume and fork start unscoped; one runtime per process is
@@ -445,6 +445,11 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 // `--offline` covers all of these and cannot be lifted from a prompt.
 export const OFFLINE_SCOPE_ENV = "VINCI_OFFLINE_SCOPE";
 export const OFFLINE_SCOPED_TOOLS: ReadonlySet<string> = new Set(["web_search", "web_fetch", "web_answer", "library_docs"]);
+
+// Lift pass: a stripped span becomes this gap. It joins no words (a lift phrase needs its words
+// separated by single spaces) and adds no line break, so bounds, quotes and blockquote lines read
+// across it as they would across a space.
+const LIFT_GAP = " \u001f ";
 
 function stripCode(text: string, join: string): string {
   return text
@@ -458,12 +463,13 @@ function stripCode(text: string, join: string): string {
 /**
  * The text outside attached files, split at every `<file ...>` / `</file>` tag. A block runs from an
  * opener that has a later `</file>` to its FIRST `</file>` and is dropped; an opener with no later
- * close loses only its tag. Each tag is a segment boundary, so code or quote openers inside file
- * text can never reach the text typed after the files.
+ * close loses only its tag. An opener tag never spans a line break or another `<`, so a stray `<file`
+ * in file text cannot swallow the real `</file>`. Each tag is a segment boundary, so code or quote
+ * openers inside file text can never reach the text typed after the files.
  */
 function outsideFileSegments(text: string): string[] {
   const segments: string[] = [];
-  const tags = /<file\b[^>]*>|<\/file>/g;
+  const tags = /<file\b[^<>\n]*>|<\/file>/g;
   let inFile = false;
   let last = 0;
   for (const tag of text.matchAll(tags)) {
@@ -482,15 +488,15 @@ function outsideFileSegments(text: string): string[] {
  * talking about, not instructions. "restriction" (default) keeps the text outside file blocks, strips
  * code and quotes in each piece separately, and joins the pieces with line breaks; "lift" strips from
  * the first wrapper to the last `</file>`, then any wrapper left open to the end, and blockquotes,
- * replacing each stripped span with a line break so that no lift phrase can join across it.
+ * replacing each stripped span with LIFT_GAP.
  */
 export function stripQuotedText(text: string, polarity: "restriction" | "lift" = "restriction"): string {
   if (polarity === "restriction") return outsideFileSegments(text).map((segment) => stripCode(segment, " ")).join("\n");
   const files = text
-    .replace(/<file\b[^>]*>(?:[\s\S]*<\/file>|[\s\S]*$)/, "\n")
-    .replace(/<file\b[^>]*>[\s\S]*$/, "\n")
+    .replace(/<file\b[^>]*>(?:[\s\S]*<\/file>|[\s\S]*$)/, LIFT_GAP)
+    .replace(/<file\b[^>]*>[\s\S]*$/, LIFT_GAP)
     .replace(/^[ \t]*>.*$/gm, "\n");
-  return stripCode(files, "\n");
+  return stripCode(files, LIFT_GAP);
 }
 
 const OFFLINE_LIFT =
