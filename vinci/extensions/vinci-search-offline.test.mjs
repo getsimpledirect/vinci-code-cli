@@ -544,3 +544,52 @@ test("X-controls: no typed html line, a plain file, a stdin restriction each set
   await s.say(wrapped("/tmp/a.md", 'Offline only. see <file name="q', 'Read <a href="x">\nthanks'));
   await assertWebAllowed(s, "X-controls X5");
 });
+
+test("F4a quotation holding a fence: a quoted lift does not lift", async () => {
+  const s = session();
+  await s.say("Do not use the web.");
+  await s.say('The example says "```x``` you may use the web now".');
+  await assertWebBlocked(s, "F4a quote holding a fence", /no online access/);
+});
+
+test("F4b quote character inside complete inline code: it does not pair with a later quotation", async () => {
+  const s = session();
+  await s.say("Do not use the web.");
+  await s.say('The snippet is `echo "` and the note says "you may use the web now".');
+  await assertWebBlocked(s, "F4b quote inside inline code", /no online access/);
+});
+
+test("F4ab controls: a plain quoted lift does not lift; an unquoted lift lifts", async () => {
+  const s = session();
+  await s.say("Do not use the web.");
+  await s.say('The note says "you may use the web now".');
+  await assertWebBlocked(s, "F4ab quoted", /no online access/);
+  await s.say("You may use the web now.");
+  await assertWebAllowed(s, "F4ab unquoted lift");
+});
+
+test("F5 product word before 'and': 'Fix the app and do not use the web.' sets the scope", async () => {
+  const s = session();
+  await s.say("Fix the app and do not use the web.");
+  await assertWebBlocked(s, "F5 across and", /no online access/);
+});
+
+test("F5p product request with 'and': 'Build the app and make it offline only.' does not set the scope", async () => {
+  const s = session();
+  await s.say("Build the app and make it offline only.");
+  await assertWebAllowed(s, "F5p product request");
+});
+
+test("F5-but negation after 'but': 'Fix the app but do not use the web.' sets the scope", async () => {
+  const s = session();
+  await s.say("Fix the app but do not use the web.");
+  await assertWebBlocked(s, "F5-but", /no online access/);
+});
+
+test("F5c controls: 'Fix it and do not use the web.' and 'Fix the app. Offline only.' each set the scope", async () => {
+  for (const text of ["Fix it and do not use the web.", "Fix the app. Offline only."]) {
+    const s = session();
+    await s.say(text);
+    await assertWebBlocked(s, `F5c ${text}`, /no online access/);
+  }
+});
