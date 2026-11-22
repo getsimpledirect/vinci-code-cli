@@ -21,7 +21,7 @@ bash "${ROOT}/vinci/scripts/check-no-contracts-at-runtime.sh"
 
 echo "── Building (network-free) ─────────────────────────"
 if [ "${VINCI_PACKAGE_REUSE_BUILD:-0}" = "1" ]; then
-  for built in packages/{agent,ai,coding-agent,orchestrator,tui}/dist/index.js vinci/dist/extensions/vinci-header.js; do
+  for built in packages/{agent,ai,coding-agent,orchestrator,tui}/dist/index.js packages/coding-agent/dist/core/vinci-mask-secrets.js vinci/dist/extensions/vinci-header.js; do
     [ -f "${ROOT}/${built}" ] || { echo "Reusable build file \"${built}\" is absent. Run vinci/build.sh before reusing its payload." >&2; exit 1; }
   done
 else

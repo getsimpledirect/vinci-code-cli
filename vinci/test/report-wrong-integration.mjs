@@ -179,7 +179,7 @@ try {
     env: { ...process.env, HOME: home },
     encoding: "utf8",
   });
-  assert.notEqual(closed.status, 0, "H07 W4: without the masker the command must fail");
+  assert.equal(closed.status, 1, "H07 W4: without the masker the command must exit 1");
   assert.equal(readFileSync(closedPath, "utf8"), closedBefore, "H07 W4: without the masker nothing is written");
   assert.doesNotMatch(closed.stdout, /Recorded/, "H07 W4: without the masker no report is claimed");
 
@@ -285,6 +285,27 @@ try {
   assert.equal(fallback.status, 0, fallback.stderr);
   assert.match(fallback.stdout, /Recorded/, "W5d: the built masker must let the command record a report");
   assert.equal(storedNote(fallbackPath), `[dist-stub] ${fallbackNote}`, "W5d: the built masker must mark the stored note");
+
+  // N1: a built masker without a vinciMaskSecrets function fails closed with the masker diagnostic.
+  for (const [label, body] of [
+    ["missing", "export function other(text) { return text; }\n"],
+    ["non-function", 'export const vinciMaskSecrets = "not a function";\n'],
+  ]) {
+    const badRoot = join(fixtureRoot, `masker-built-${label}`);
+    cpSync(fallbackRoot, badRoot, { recursive: true });
+    writeFileSync(join(badRoot, "packages/coding-agent/dist/core/vinci-mask-secrets.js"), body);
+    const badPath = writeSession(sessions, `built-${label}-task`, "DONE");
+    const badBefore = readFileSync(badPath);
+    const bad = spawnSync(
+      process.execPath,
+      [join(badRoot, "vinci/scripts/report-wrong.mjs"), `built-${label}-task`, `raw ${syntheticToken}`, "--session-dir", sessions],
+      fixtureOptions,
+    );
+    assert.equal(bad.status, 1, `N1 ${label}: a built masker without the function export must exit 1`);
+    assert.match(bad.stderr, /secret masker "vinciMaskSecrets" could not load/, `N1 ${label}: the failure must name the masker`);
+    assert.deepEqual(readFileSync(badPath), badBefore, `N1 ${label}: the session is unchanged`);
+    assert.doesNotMatch(bad.stdout, /Recorded/, `N1 ${label}: no report is claimed`);
+  }
 
   // W5c: deny traversal to an otherwise loadable source masker.
   if (process.platform === "win32" || process.getuid?.() === 0) {
