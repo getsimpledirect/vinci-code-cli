@@ -361,7 +361,7 @@ test("Oa31 blockquote with an inline file span: a lift on a blockquote line does
 test("F1 path with '<': attachment bytes do not remove a typed restriction (CLI @file path)", async () => {
   const s = session();
   const message = await cliMessageNamed("a<b.md", "build the app stay", "Offline only.");
-  assert.ok(message.includes('a<b.md">\nbuild the app stay\n</file>\nOffline only.'), "F1: the processor's own wrapper");
+  assert.ok(message.includes('a&lt;b.md">\nbuild the app stay\n</file>\nOffline only.'), "F1: the processor's own wrapper");
   await s.say(message);
   await assertWebBlocked(s, "F1 path with <", /no online access/);
 });
@@ -395,7 +395,7 @@ test("F1c controls: a plain body, a plain path, and a typed 'Do not use the web.
 test("F1q path with a double quote: attachment bytes do not remove a typed restriction (CLI @file path)", async () => {
   const s = session();
   const message = await cliMessageNamed('a"b.md', "build the app stay", "Offline only.");
-  assert.ok(message.includes('a"b.md">\nbuild the app stay\n</file>\nOffline only.'), "F1q: the processor's own wrapper");
+  assert.ok(message.includes('a&quot;b.md">\nbuild the app stay\n</file>\nOffline only.'), "F1q: the processor's own wrapper");
   await s.say(message);
   await assertWebBlocked(s, "F1q path with a quote", /no online access/);
 });
@@ -668,6 +668,25 @@ test("K16 text attachments escape closing tags and colliding literals losslessly
       token === "&lt;/file>" ? "</file>" : token.replace("&amp;", "&"),
     );
     assert.equal(decoded, content, `K16: round-tripped payload ${index}`);
+  }
+});
+
+test("K16 CLI text attachment preserves special characters in the file name and body", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "vinci-oa-"));
+  try {
+    const path = join(dir, 'notes &quot; "draft" <v2>.txt');
+    const content = 'R&D <draft> "notes"\nSecond line > first.';
+    writeFileSync(path, content);
+
+    const { text } = await processFileArguments([path]);
+    const openers = [...text.matchAll(/<file name="((?:[^"&<>]|&(?:amp|quot|lt|gt);)+)">/g)];
+    assert.equal(openers.length, 1, "K16: exactly one well-formed file opener");
+    const [[opener, encodedPath]] = openers;
+    const entities = { amp: "&", quot: '"', lt: "<", gt: ">" };
+    assert.equal(encodedPath.replace(/&(amp|quot|lt|gt);/g, (_, name) => entities[name]), path, "K16: round-tripped file name");
+    assert.equal(text, `${opener}\n${content}\n</file>\n`, "K16: unchanged attachment body");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
