@@ -74,7 +74,11 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 			// Handle text file
 			try {
 				const content = await readFile(absolutePath, "utf-8");
-				text += `<file name="${absolutePath}">\n${content}\n</file>\n`;
+				// Reserve the closing delimiter and its escaped spellings so the body can round-trip.
+				const escapedContent = content.replace(/<\/file>|&(?:amp;)*lt;\/file>/g, (token) =>
+					token === "</file>" ? "&lt;/file>" : `&amp;${token.slice(1)}`,
+				);
+				text += `<file name="${absolutePath}">\n${escapedContent}\n</file>\n`;
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);
 				console.error(chalk.red(`Error: Could not read file ${absolutePath}: ${message}`));
