@@ -12,7 +12,7 @@ describe("Box", () => {
 	});
 
 	it("subtracts both horizontal pads from the child width and pads the rendered rows", () => {
-		const box = new Box(2, 2);
+		const box = new Box(2, 3);
 		let childWidth: number | undefined;
 		box.addChild({
 			render(width) {
@@ -23,8 +23,15 @@ describe("Box", () => {
 		});
 
 		const blank = " ".repeat(10);
-		assert.deepEqual(box.render(10), [blank, blank, "  hi      ", "  bye     ", blank, blank]);
+		assert.deepEqual(box.render(10), [blank, blank, blank, "  hi      ", "  bye     ", blank, blank, blank]);
 		assert.equal(childWidth, 6);
+	});
+
+	it("pads a wide character by its terminal width", () => {
+		const box = new Box(1, 0);
+		box.addChild({ render: () => ["界"], invalidate() {} });
+
+		assert.deepEqual(box.render(4), [" 界 "]);
 	});
 
 	it("reuses row decoration when the render inputs are unchanged", () => {
