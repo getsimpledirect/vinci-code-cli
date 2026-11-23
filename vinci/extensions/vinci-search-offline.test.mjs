@@ -197,21 +197,42 @@ test("Oa9 file contents attached with @file neither set nor lift the scope", asy
   await assertWebBlocked(s, "Oa9 file text does not lift", /no online access/);
 });
 
+// VINCI_INTERNAL_OFFLINE_SIGNAL is an internal signal, not a user setting: --offline is the only start switch.
 test("Oa10 env signal: the scope is published for crew helpers and cleared on lift", async () => {
-  const saved = process.env.VINCI_OFFLINE_SCOPE;
+  const saved = process.env.VINCI_INTERNAL_OFFLINE_SIGNAL;
   try {
-    delete process.env.VINCI_OFFLINE_SCOPE;
+    delete process.env.VINCI_INTERNAL_OFFLINE_SIGNAL;
     const s = session();
-    assert.equal(process.env.VINCI_OFFLINE_SCOPE, undefined, "Oa10: unscoped at start");
+    assert.equal(process.env.VINCI_INTERNAL_OFFLINE_SIGNAL, undefined, "Oa10: unscoped at start");
     await s.say("No online access.");
-    assert.equal(process.env.VINCI_OFFLINE_SCOPE, "1", "Oa10: a prompt scope must be published");
+    assert.equal(process.env.VINCI_INTERNAL_OFFLINE_SIGNAL, "1", "Oa10: a prompt scope must be published");
     await s.say("You may use the web now.");
-    assert.equal(process.env.VINCI_OFFLINE_SCOPE, undefined, "Oa10: a lift must clear it");
+    assert.equal(process.env.VINCI_INTERNAL_OFFLINE_SIGNAL, undefined, "Oa10: a lift must clear it");
     session(["node", "pi", "--offline"]);
-    assert.equal(process.env.VINCI_OFFLINE_SCOPE, "1", "Oa10: --offline must be published");
+    assert.equal(process.env.VINCI_INTERNAL_OFFLINE_SIGNAL, "1", "Oa10: --offline must be published");
   } finally {
-    if (saved === undefined) delete process.env.VINCI_OFFLINE_SCOPE;
-    else process.env.VINCI_OFFLINE_SCOPE = saved;
+    if (saved === undefined) delete process.env.VINCI_INTERNAL_OFFLINE_SIGNAL;
+    else process.env.VINCI_INTERNAL_OFFLINE_SIGNAL = saved;
+  }
+});
+
+// #261: the old name VINCI_OFFLINE_SCOPE is not a start switch; only --offline scopes a run at start.
+test("Oa10b old name ignored: VINCI_OFFLINE_SCOPE=1 without --offline does not scope the web tools", async () => {
+  const savedOld = process.env.VINCI_OFFLINE_SCOPE;
+  const savedNew = process.env.VINCI_INTERNAL_OFFLINE_SIGNAL;
+  try {
+    process.env.VINCI_OFFLINE_SCOPE = "1";
+    delete process.env.VINCI_INTERNAL_OFFLINE_SIGNAL;
+    const s = session(["node", "pi"]);
+    await assertWebAllowed(s, "Oa10b old name");
+    assert.equal(process.env.VINCI_INTERNAL_OFFLINE_SIGNAL, undefined, "Oa10b: the old name must not publish the internal signal");
+    // Positive control: --offline still scopes the run with the old name set.
+    await assertWebBlocked(session(["node", "pi", "--offline"]), "Oa10b --offline control", /started with --offline/);
+  } finally {
+    if (savedOld === undefined) delete process.env.VINCI_OFFLINE_SCOPE;
+    else process.env.VINCI_OFFLINE_SCOPE = savedOld;
+    if (savedNew === undefined) delete process.env.VINCI_INTERNAL_OFFLINE_SIGNAL;
+    else process.env.VINCI_INTERNAL_OFFLINE_SIGNAL = savedNew;
   }
 });
 
