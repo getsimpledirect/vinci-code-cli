@@ -445,7 +445,8 @@ function formatPage(url: string, text: string, truncated: boolean): string {
 // lives in one runtime, so /new, resume and fork start unscoped; one runtime per process is
 // assumed (the crew signal is one process-wide value); text piped on stdin is read as typed.
 // `--offline` covers all of these and cannot be lifted from a prompt.
-export const OFFLINE_SCOPE_ENV = "VINCI_OFFLINE_SCOPE";
+// VINCI_INTERNAL_OFFLINE_SIGNAL is an internal signal, not a user setting: --offline is the only start switch.
+export const OFFLINE_SCOPE_ENV = "VINCI_INTERNAL_OFFLINE_SIGNAL";
 export const OFFLINE_SCOPED_TOOLS: ReadonlySet<string> = new Set(["web_search", "web_fetch", "web_answer", "library_docs"]);
 
 // Lift pass: a stripped span becomes this gap. It joins no words (a lift phrase needs its words
@@ -604,6 +605,7 @@ export default function (pi: ExtensionAPI, options: { argv?: readonly string[] }
   let promptScope = false;
   // Process-wide signal for crew helpers launched later (vinci-crew childLaunch adds --offline).
   const signalScope = (on: boolean) => {
+    // OFFLINE_SCOPE_ENV is an internal signal, not a user setting: --offline is the only start switch; it is written here, never read.
     if (on) process.env[OFFLINE_SCOPE_ENV] = "1";
     else delete process.env[OFFLINE_SCOPE_ENV];
   };
