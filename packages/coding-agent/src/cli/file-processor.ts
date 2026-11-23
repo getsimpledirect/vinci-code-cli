@@ -20,6 +20,10 @@ export interface ProcessFileOptions {
 	autoResizeImages?: boolean;
 }
 
+function escapeFileNameAttribute(name: string): string {
+	return name.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
 /** Process @file arguments into text content and image attachments */
 export async function processFileArguments(fileArgs: string[], options?: ProcessFileOptions): Promise<ProcessedFiles> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
@@ -45,6 +49,7 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 			continue;
 		}
 
+		const escapedName = escapeFileNameAttribute(absolutePath);
 		const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
 
 		if (mimeType) {
@@ -53,7 +58,7 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 			const processed = await processImage(content, mimeType, { autoResizeImages });
 
 			if (!processed.ok) {
-				text += `<file name="${absolutePath}">${processed.message}</file>\n`;
+				text += `<file name="${escapedName}">${processed.message}</file>\n`;
 				continue;
 			}
 
@@ -66,9 +71,9 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 
 			// Add text reference to image with optional processing hints
 			if (processed.hints.length > 0) {
-				text += `<file name="${absolutePath}">${processed.hints.join("\n")}</file>\n`;
+				text += `<file name="${escapedName}">${processed.hints.join("\n")}</file>\n`;
 			} else {
-				text += `<file name="${absolutePath}"></file>\n`;
+				text += `<file name="${escapedName}"></file>\n`;
 			}
 		} else {
 			// Handle text file
@@ -78,7 +83,7 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 				const escapedContent = content.replace(/<\/file>|&(?:amp;)*lt;\/file>/g, (token) =>
 					token === "</file>" ? "&lt;/file>" : `&amp;${token.slice(1)}`,
 				);
-				text += `<file name="${absolutePath}">\n${escapedContent}\n</file>\n`;
+				text += `<file name="${escapedName}">\n${escapedContent}\n</file>\n`;
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);
 				console.error(chalk.red(`Error: Could not read file ${absolutePath}: ${message}`));
