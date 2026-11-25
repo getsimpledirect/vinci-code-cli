@@ -10,6 +10,7 @@ const read = (path) => readFileSync(join(root, path), "utf8");
 const identity = JSON.parse(read("vinci/identity.json"));
 const launcher = read("vinci/bin/vinci");
 const header = read("vinci/extensions/vinci-header.ts");
+const cliLook = read("vinci/extensions/lib/cli-look.ts");
 const provider = read("vinci/extensions/vinci-provider.ts");
 const updater = read("vinci/updater/update.mjs");
 const updaterShim = read("vinci/updater/vinci");
@@ -47,10 +48,21 @@ assert.ok(
   "The Vinci provider must register its classes from VINCI_MODEL_NAMES",
 );
 assert.ok(launcher.toLowerCase().includes(identity.tagline.toLowerCase()), "The Vinci tagline is missing from the launcher sign-off");
-assert.ok(header.includes("Choose a model: /model"), "An unset session model must not imply a configured provider route");
+assert.ok(cliLook.includes("Choose a model: /model"), "An unset session model must not imply a configured provider route");
+assert.match(header, /import \{[^}]*\bgetVinciLook\b[^}]*\} from "\.\/lib\/cli-look\.ts"/, "The header must import getVinciLook from cli-look.ts");
 assert.match(header, /import \{[^}]*VINCI_VERSION[^}]*\} from "\.\/lib\/product-identity\.ts"/, "The header must read Vinci's authoritative product identity");
+const productVersion = read("vinci/extensions/lib/product-version.ts");
+assert.match(
+  productVersion,
+  /^[ \t]*const path = new URL\("identity\.json", VINCI_ROOT\);[\s\S]*?^[ \t]*const identity = JSON\.parse\(readFileSync\(path, "utf8"\)\)/m,
+  "The header identity must be loaded from vinci/identity.json",
+);
 const productIdentity = read("vinci/extensions/lib/product-identity.ts");
-assert.match(productIdentity, /readFileSync\(new URL\("identity\.json", VINCI_ROOT\)/, "The header identity must be loaded from vinci/identity.json");
+assert.match(
+  productIdentity,
+  /^[ \t]*import \{ getVinciVersion \} from "\.\/product-version\.ts";[\s\S]*?^[ \t]*export const VINCI_VERSION = getVinciVersion\(\);/m,
+  "The product identity must take its version from the version loader",
+);
 assert.doesNotMatch(header, /VINCI_VERSION\s*=\s*["']\d+\.\d+\.\d+["']/, "The header must not duplicate a product version constant");
 assert.match(updater, /verifySignature/, "The commercial updater must verify signed release manifests");
 assert.match(updater, /update\.lock/, "The commercial updater must serialize concurrent updates");

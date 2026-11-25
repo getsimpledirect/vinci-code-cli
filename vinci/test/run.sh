@@ -805,6 +805,9 @@ run_group print-mode-liveness node --experimental-strip-types --input-type=modul
 # remains one store instead of leaving the composer stuck on "checking".
 run_group ui-state-integration node "${ROOT}/vinci/test/ui-state-integration.mjs"
 run_group vero-integration node "${ROOT}/vinci/test/vero-integration.mjs"
+run_group vero-presentation-sources node --test --test-reporter=tap "${ROOT}/vinci/test/vero-presentation-sources.test.mjs"
+run_group look-render node "${ROOT}/vinci/test/look-render.mjs"
+run_group launcher-presentation node "${ROOT}/vinci/test/launcher-presentation.mjs"
 run_group shell-recovery-integration node "${ROOT}/vinci/test/shell-recovery-integration.mjs"
 run_group non-tty-output-integration node "${ROOT}/vinci/test/non-tty-output-integration.mjs"
 run_group headless-required-operations node "${ROOT}/vinci/test/headless-required-operations.mjs"
@@ -909,7 +912,7 @@ run_group coding-agent-cli-units node "${VITEST_CLI}" \
   --root "${ROOT}/packages/coding-agent" --run \
   "test/args.test.ts" "test/list-models.test.ts" "test/vinci-grader.test.ts" \
   "test/vinci-auth-ui.test.ts" "test/vinci-auth-guidance.test.ts" "test/vinci-recovery-guidance.test.ts" \
-  "test/vinci-signin-link-safety.test.ts" \
+  "test/vinci-signin-link-safety.test.ts" "test/vinci-look.test.ts" \
   "test/assistant-message.test.ts"
 # Remaining integrations drive the REAL modules directly (Node 23+ strips TS types at load).
 if node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>=23?0:1)'; then
@@ -1012,6 +1015,10 @@ run_group ui-scenarios node "${VITEST_CLI}" \
   --root "${ROOT}" --run \
   --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
   "vinci/test/ui/scenarios.test.mjs"
+run_group ui-fullscreen-journeys node "${VITEST_CLI}" \
+  --root "${ROOT}" --run \
+  --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' \
+  "vinci/test/ui/fullscreen-journeys.test.mjs"
 run_group ui-regular-bytes node "${VITEST_CLI}" --root "${ROOT}" --run --exclude '**/node_modules/**' --exclude '**/dist/**' --exclude '**/.claude/**' --pool=forks --maxWorkers=1 --no-file-parallelism --configLoader native --no-cache "vinci/test/ui/regular-bytes.test.mjs"
 
 run_group ui-fixture-lifecycle node "${VITEST_CLI}" \
@@ -1036,8 +1043,8 @@ run_group ui-crew-status node "${VITEST_CLI}" \
 
 echo
 echo "── VISUAL (rendered TUI header via PTY) ──────────────"
-# The native recorder drives a delayed local faux provider through script(1), so this verifies both
-# active animation and the completed composer without paid calls or terminal-specific input races.
+# The native recorder drives a delayed local faux provider through script(1) to verify the active
+# composer with the current motion settings, the continuation handoff, and completion.
 if command -v script >/dev/null 2>&1; then
   if select_group native-pty; then
   visual_fails_before="${fails}"
@@ -1051,14 +1058,13 @@ if command -v script >/dev/null 2>&1; then
     continuing="$(sed -n '1,80p' "${visual_dir}/80x24-continuing.txt" 2>/dev/null)"
     complete="$(sed -n '1,80p' "${visual_dir}/80x24-complete.txt" 2>/dev/null)"
     vfail=0
-    # "Vinci" not "Vinci Forte": the startup header names the account-resolved class, which is the
-    # auto sentinel until the gateway resolves it, so pinning a class name here would fail for
-    # anyone not on Forte.
-    for needle in "Vinci" "% full"; do
+    for needle in "Vinci Code" "% full"; do
       echo "${startup}" | grep -qF "${needle}" || { echo "  ✗ startup render missing: ${needle}"; vfail=1; }
     done
-    echo "${continuing}" | grep -qF "Continuing the task" || { echo "  ✗ continuation render missing active handoff"; vfail=1; }
-    for needle in "Ask Vinci" "Visual test complete." "changed · +1 −1" "quiet" "lively"; do
+    echo "${startup}" | grep -qE '^[+╭][-─] Ready ' || { echo "  ✗ startup render missing the Ready composer border"; vfail=1; }
+    echo "${continuing}" | grep -qE '^[+╭][-─] [.o*·•●] Thinking [-·] Continuing the task' || { echo "  ✗ continuation render missing active handoff"; vfail=1; }
+    echo "${complete}" | grep -qE '^[+╭][-─] (Ready|Done|Not sure) ' || { echo "  ✗ completion render missing the settled composer border"; vfail=1; }
+    for needle in "Visual test complete." "changed · +1 −1" "quiet" "lively"; do
       echo "${complete}" | grep -qF "${needle}" || { echo "  ✗ completion render missing: ${needle}"; vfail=1; }
     done
     # Engineer telemetry must NOT leak into the consumer footer.

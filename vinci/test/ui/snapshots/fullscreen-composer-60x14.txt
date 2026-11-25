@@ -1,11 +1,13 @@
-  Vinci v<version> Code
-  Vero READY · Vinci · <repo>
-  /login to connect · Ask Vero a task · /undo
+  Vinci Code <version> · Made, not generated.
+  <workspace> · Vinci
+  /login to connect · /undo to undo · /help
+  Try: fix a bug · add a feature · explain this code
 
 
 
 
-╭ ✹ Ask Vinci ───────────────────────────────────── /login ╮
+
+╭─ Ready ──────────────────────────────────────────────────╮
 │                                                          │
 │› DRAFT-SENTINEL                                          │
 │                                                          │

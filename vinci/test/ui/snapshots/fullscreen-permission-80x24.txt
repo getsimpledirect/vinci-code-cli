@@ -1,12 +1,14 @@
-  Vinci v<version> Code
-  Vero WORKING · Vinci · <repo>
-  ● connected • Working through it… · /undo · Ctrl+T thinking
-
+  Vinci Code <version> · Made, not generated.
+  <workspace> · Vinci
+  Connected · /undo to undo · /help
+  Try: fix a bug · add a feature · explain this code
 
 
  Clean generated files
 
  ● Confirm change
+
+
 
 
 ▎ ──────────────────────────────────────────────────────────────────────────────

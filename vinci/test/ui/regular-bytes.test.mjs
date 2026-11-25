@@ -21,7 +21,7 @@ function privateModes(stream) {
 }
 
 // The header shows the release version; normalise it so a version bump is not a screen change.
-const normaliseVersion = (screen) => screen.replace(/Vinci v\d+\.\d+\.\d+/g, "Vinci v<version>");
+const normaliseVersion = (screen) => screen.replace(/^(  Vinci Code )\d+\.\d+\.\d+/m, "$1<version>");
 
 async function checkpoint(ui) {
 	return { screen: normaliseVersion(await ui.screen()), cursor: ui.terminal.getCursorPosition() };

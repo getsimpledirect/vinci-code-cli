@@ -8,6 +8,7 @@
 		"vinci/test/required-operations-integration.mjs": "Imported by vinci/test/outcome-integration.mjs in the Node 23+ outcome-integration run_group.",
 		"vinci/test/plan-refusal-outcome.mjs": "Imported by vinci/test/outcome-integration.mjs in the Node 23+ outcome-integration run_group.",
 		"vinci/test/unbound-hotkeys.mjs": "Spawned by packages/coding-agent/test/vinci-hotkeys.test.ts in the upstream test suite.",
+		"vinci/test/pty-look-fixture.py": "Spawned by vinci/test/non-tty-output-integration.mjs for the source and packaged PTY cases.",
 		"vinci/test/forge-backport.mjs": "Runs in its own offline-shard step before the harness.",
 		"vinci/test/vllm-provider-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
 		"vinci/test/orchestrate-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
@@ -15,8 +16,7 @@
 		"vinci/test/undo-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
 		"vinci/test/pairing-progress.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
 		"vinci/test/vinci-launcher-refusals.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
-		"vinci/test/council-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope.",
-		"vinci/test/ui/fullscreen-journeys.test.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope."
+		"vinci/test/council-integration.mjs": "Pre-existing executable without a run_group on pinned r4; cannot enroll within test-only scope."
 	},
 	"packagedReplays": [
 		"vinci/test/runtime-integration.mjs",

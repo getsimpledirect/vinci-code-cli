@@ -20,6 +20,8 @@ export type VinciUiState = {
   workingSince: number | undefined;
   continuationPending: boolean;
   blockingReason?: string;
+  providerError?: string;
+  promptState?: "approval" | "input";
 };
 
 type VinciUiStore = {
@@ -49,9 +51,12 @@ vinciGlobal[STORE_KEY] = store;
 
 function publish(next: VinciUiState): void {
   store.state = next;
-  for (const listener of store.listeners) listener();
+  notifyVinciUiState();
 }
 
+export function notifyVinciUiState(): void {
+  for (const listener of store.listeners) listener();
+}
 export function resetVinciUiState(): void {
   publish({
     connection: "unknown",
@@ -63,6 +68,8 @@ export function resetVinciUiState(): void {
     workingSince: undefined,
     continuationPending: false,
     blockingReason: undefined,
+    providerError: undefined,
+    promptState: undefined,
   });
 }
 
@@ -77,6 +84,7 @@ export function resetShellUiState(): void {
     workingSince: undefined,
     continuationPending: false,
     blockingReason: undefined,
+    providerError: undefined,
   });
 }
 
@@ -117,6 +125,16 @@ export function setVinciBlocker(reason: string | undefined): void {
   const blockingReason = reason?.replace(/[\r\n\t]+/g, " ").trim() || undefined;
   if (store.state.blockingReason === blockingReason) return;
   publish({ ...store.state, blockingReason });
+}
+
+export function setVinciProviderError(providerError: string | undefined): void {
+  if (store.state.providerError === providerError) return;
+  publish({ ...store.state, providerError });
+}
+
+export function setVinciPromptState(promptState: VinciUiState["promptState"]): void {
+  if (store.state.promptState === promptState) return;
+  publish({ ...store.state, promptState });
 }
 
 export function setVinciWorkingLabel(label: string): void {

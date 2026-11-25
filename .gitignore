@@ -78,3 +78,24 @@ vinci/extensions/vinci-links.js
 vinci/extensions/vinci-links.js.map
 vinci/extensions/vinci-links.d.ts
 vinci/extensions/vinci-links.d.ts.map
+# Same pattern for the CLI look, presentation, product-version, UI-state and Vero presentation modules (imported by the coding-agent interactive and plain modes).
+vinci/extensions/lib/cli-look.js
+vinci/extensions/lib/cli-look.js.map
+vinci/extensions/lib/cli-look.d.ts
+vinci/extensions/lib/cli-look.d.ts.map
+vinci/extensions/lib/cli-presentation.js
+vinci/extensions/lib/cli-presentation.js.map
+vinci/extensions/lib/cli-presentation.d.ts
+vinci/extensions/lib/cli-presentation.d.ts.map
+vinci/extensions/lib/product-version.js
+vinci/extensions/lib/product-version.js.map
+vinci/extensions/lib/product-version.d.ts
+vinci/extensions/lib/product-version.d.ts.map
+vinci/extensions/lib/ui-state.js
+vinci/extensions/lib/ui-state.js.map
+vinci/extensions/lib/ui-state.d.ts
+vinci/extensions/lib/ui-state.d.ts.map
+vinci/extensions/lib/vero-presentation.js
+vinci/extensions/lib/vero-presentation.js.map
+vinci/extensions/lib/vero-presentation.d.ts
+vinci/extensions/lib/vero-presentation.d.ts.map

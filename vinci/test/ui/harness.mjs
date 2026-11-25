@@ -35,9 +35,10 @@ function normalizeScreen(lines, tempDir) {
 			.replace(/\/\S*\/pi-[^\s]*/g, "<workspace>")
 			.replace(/\bpi-harness-[\w.-]+/g, "<workspace>")
 			.replace(/^(\s*Vinci(?: Forte| Fortissimo)?\s+·\s+).+$/, "$1<repo>")
-			.replace(/^(\s*Vero (?:READY|WORKING|REVIEW|BLOCKED|WAITING|DONE(?:-UNVERIFIED)?)\s+·\s+Vinci(?: Forte| Fortissimo)?\s+·\s+).+$/, "$1<repo>")
+			.replace(/^(\s*Vero (?:READY|WORKING|REVIEW|BLOCKED|WAITING|DONE(?:-UNVERIFIED)?|Ready|Thinking|Done|Error|Not sure|Blocked|Needs your OK|Waiting for you)\s+·\s+Vinci(?: Forte| Fortissimo)?\s+·\s+).+$/, "$1<repo>")
 			.replace(/\b\d+(?:\.\d+)?s\b/g, "<time>")
 			.replace(/(^|\s)[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?= Working\.\.\.)/g, "$1•")
+			.replace(/^([+╭][-─] )[.o*·•●](?= Thinking\b)/, "$1•")
 			.replace(
 				/(^|\s)[·•●](?=\s+(?:Contemplating|Considering|Looking|Making|Checking|Reviewing|Organizing|Coordinating|Adjusting|Running|Updating|Working))/g,
 				"$1•",

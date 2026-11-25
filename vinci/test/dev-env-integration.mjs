@@ -1150,64 +1150,72 @@ try {
 
   // ── 4. Header badge ───────────────────────────────────────────────────────────────────────────
   const { ENV_AGENT_DIR } = await freshLoader().import(resolve(root, "packages/coding-agent/src/config.ts"), { default: false });
-  const savedAgentDir = process.env[ENV_AGENT_DIR];
-  const savedWordmark = process.env.VINCI_ASCII_WORDMARK;
-  process.env[ENV_AGENT_DIR] = mkdtempSync(join(tmpdir(), "vinci-badge-agent-"));
-  process.env.VINCI_ASCII_WORDMARK = "1"; // force the no-image header path
+  const presentation = {
+    [ENV_AGENT_DIR]: join(stage, "badge-agent"), TERM: "xterm-256color", LC_ALL: "C.UTF-8",
+    VINCI_ASCII: "0", FORCE_COLOR: "3", NO_COLOR: undefined, VINCI_PLAIN: undefined, VINCI_SCREEN_READER: undefined,
+  };
+  const warning = "\x1b[38;2;217;180;138m";
 
-  // Theme stub: mark warning-styled spans so the badge is identifiable (and its style pinned)
-  // without depending on ANSI codes; everything else passes through.
-  const theme = { fg: (style, text) => (style === "warning" ? `«W:${text}»` : text), bold: (text) => text };
-  async function renderedHeader() {
-    const headerExtension = await freshLoader().import(resolve(root, "vinci/extensions/vinci-header.ts"), { default: true });
-    let sessionStart;
-    let factory;
-    headerExtension({ on: (name, handler) => name === "session_start" && (sessionStart = handler) });
-    await sessionStart({}, {
-      mode: "tui",
-      cwd: "/workspace",
-      model: { id: "auto", name: "Vinci" },
-      ui: { notify() {}, setHeader: (f) => (factory = f) },
-    });
-    return factory(undefined, theme).render(500).join("\n");
+  async function renderedConnectionRow() {
+    const saved = Object.keys(presentation).map((key) => [key, process.env[key]]);
+    try {
+      for (const [key, value] of Object.entries(presentation)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      const headerExtension = await freshLoader().import(resolve(root, "vinci/extensions/vinci-header.ts"), { default: true });
+      let sessionStart;
+      let factory;
+      headerExtension({ on: (name, handler) => name === "session_start" && (sessionStart = handler) });
+      await sessionStart({}, {
+        mode: "tui",
+        cwd: "/workspace",
+        model: { id: "auto", name: "Vinci" },
+        ui: { notify() {}, setHeader: (f) => (factory = f) },
+      });
+      const rows = factory(undefined, { name: "vinci-dark" }).render(80);
+      assert.ok(rows[2].includes("/login"), "header row 3 contains the connection status");
+      return rows[2];
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   }
 
   setEnv({ VINCI_ENV: "dev" });
-  const devHeader = await renderedHeader();
-  ok("the header shows a warning-colored dev badge under VINCI_ENV=dev", devHeader.includes("«W:▲ dev»"), devHeader);
+  const devHeader = await renderedConnectionRow();
+  ok("header row 3 starts with a warning-colored dev badge under VINCI_ENV=dev",
+    devHeader.startsWith(`  ${warning}▲ dev\x1b[39m`), devHeader);
 
   setEnv({});
-  const prodHeader = await renderedHeader();
+  const prodHeader = await renderedConnectionRow();
   ok(
     "the prod header carries no environment badge (and no other warning span)",
-    !prodHeader.includes("▲") && !prodHeader.includes("«W:"),
+    !prodHeader.includes("▲") && !prodHeader.includes(warning),
     prodHeader,
   );
 
   setEnv({ VINCI_BASE_URL: "https://custom.example/api/v1" });
-  const overriddenHeader = await renderedHeader();
+  const overriddenHeader = await renderedConnectionRow();
   ok(
     "a bare base-URL override badges the session with the gateway host",
-    overriddenHeader.includes("«W:▲ custom.example»"),
+    overriddenHeader.startsWith(`  ${warning}▲ custom.example\x1b[39m`),
     overriddenHeader,
   );
 
   // Cosmetic variants of the PROD URL must NOT read as a different backend, and an
   // exported-but-empty override means "unset", not a mystery backend labeled "▲ ".
   setEnv({ VINCI_BASE_URL: `${PROD_GATEWAY}/` });
-  const trailingSlashHeader = await renderedHeader();
-  ok("a trailing slash on the prod URL renders no badge", !trailingSlashHeader.includes("«W:"), trailingSlashHeader);
+  const trailingSlashHeader = await renderedConnectionRow();
+  ok("a trailing slash on the prod URL renders no badge", !trailingSlashHeader.includes(warning), trailingSlashHeader);
   setEnv({ VINCI_BASE_URL: "https://VINCI.getsimpledirect.com/api/v1" });
-  const upperHostHeader = await renderedHeader();
-  ok("an uppercase prod host renders no badge", !upperHostHeader.includes("«W:"), upperHostHeader);
+  const upperHostHeader = await renderedConnectionRow();
+  ok("an uppercase prod host renders no badge", !upperHostHeader.includes(warning), upperHostHeader);
   setEnv({ VINCI_BASE_URL: "" });
-  const emptyOverrideHeader = await renderedHeader();
-  ok("an exported-but-empty override renders no badge", !emptyOverrideHeader.includes("«W:"), emptyOverrideHeader);
-
-  if (savedAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
-  else process.env[ENV_AGENT_DIR] = savedAgentDir;
-  if (savedWordmark === undefined) delete process.env.VINCI_ASCII_WORDMARK;
-  else process.env.VINCI_ASCII_WORDMARK = savedWordmark;
+  const emptyOverrideHeader = await renderedConnectionRow();
+  ok("an exported-but-empty override renders no badge", !emptyOverrideHeader.includes(warning), emptyOverrideHeader);
 } finally {
   restoreEnv();
 }

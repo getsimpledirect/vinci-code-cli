@@ -1,10 +1,12 @@
 /** Send model-only guidance without putting implementation instructions in the visible transcript. */
 import { isAcceptedWireStatus } from "./canonical-verdicts.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { notifyVinciUiState } from "./ui-state.ts";
 import {
   recordRemoteAcceptanceVerdict as recordVerificationRemoteAcceptanceVerdict,
   type RemoteVerificationResult,
 } from "./verification-state.ts";
+import { registerVeroAutomationStopSource } from "./vero-presentation.ts";
 
 export type VinciAutomationStop = {
   stopped: boolean;
@@ -24,6 +26,7 @@ type VinciGlobal = typeof globalThis & { [STOP_STORE_KEY]?: VinciAutomationStopS
 const vinciGlobal = globalThis as VinciGlobal;
 const stopStore = vinciGlobal[STOP_STORE_KEY] ?? { state: { stopped: false, reason: "", source: "other" as const } };
 vinciGlobal[STOP_STORE_KEY] = stopStore;
+registerVeroAutomationStopSource(() => getVinciAutomationStop().stopped);
 
 export function getVinciAutomationStop(): Readonly<VinciAutomationStop> {
   return stopStore.state;
@@ -35,10 +38,12 @@ export function requestVinciAutomationStop(reason: string, source: "verification
     reason: reason.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim(),
     source,
   };
+  notifyVinciUiState();
 }
 
 export function clearVinciAutomationStop(): void {
   stopStore.state = { stopped: false, reason: "", source: "other" };
+  notifyVinciUiState();
 }
 
 // Consequential actions (a DB migration, an outward call, a system change) the guard held for the

@@ -1,7 +1,7 @@
-  Vinci v0.0.64 Code
-  Vero DONE · Vinci · <repo>
-  ● connected · Read the receipt. · /undo · Ctrl+T thinking
-
+  Vinci Code 0.0.64 · Made, not generated.
+  <workspace> · Vinci
+  Connected · /undo to undo · /help
+  Try: fix a bug · add a feature · explain this code
 
 
  Clean generated files
@@ -12,7 +12,7 @@
  Skipped the deletion and kept the project unchanged.
 
 
-╭ ✹ Ask Vinci · DONE: Read the receipt. ────────────────────────── ● connected ╮
+╭─ Done ───────────────────────────────────────────────────────────────────────╮
 │                                                                              │
 │›                                                                             │
 │                                                                              │
