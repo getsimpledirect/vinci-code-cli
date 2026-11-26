@@ -17,7 +17,8 @@ import {
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Component, EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { formatDuration } from "./lib/format-duration.ts";
+import { getVinciLook } from "./lib/cli-look.ts";
+import { vinciPlainPresentation, vinciReducedMotion } from "./lib/cli-presentation.ts";
 import {
   getVinciUiState,
   resetShellUiState,
@@ -25,17 +26,19 @@ import {
   setVinciBlocker,
   setVinciConnection,
   setVinciContinuationPending,
+  setVinciProviderError,
   setVinciWorking,
   setVinciWorkingLabel,
   subscribeVinciUiState,
   type VinciActivityState,
 } from "./lib/ui-state.ts";
 import { containsVerificationCommand } from "./vinci-verification.ts";
-import { getVeroPresentation, vinciReducedMotion } from "./lib/vero-state.ts";
+import { getVeroPresentation } from "./lib/vero-state.ts";
 import { vinciCarriesOperations, vinciRequiredOperations, type VinciRequiredOperation } from "./lib/required-operations.ts";
 import { getVinciTaskOutcome } from "./lib/task-outcome.ts";
 
 export const VINCI_PULSE_FRAMES = ["·", "•", "●", "•"] as const;
+const ASCII_PULSE_FRAMES = [".", "o", "*", "o"] as const;
 const PULSE_INTERVAL_MS = 260;
 const COMPOSER_TOP_MARGIN = "";
 
@@ -103,6 +106,7 @@ function fitBorder(
   fill: (text: string) => string,
   leftEdge = "─",
   rightEdge = "─",
+  horizontal = "─",
 ): string {
   if (width <= 0) return "";
   if (width === 1) return edge(leftEdge);
@@ -129,18 +133,11 @@ function fitBorder(
   }
 
   const gap = Math.max(0, width - fixedWidth - visibleWidth(leftText) - visibleWidth(rightText));
-  return `${edge(leftEdge)}${leftText}${fill("─".repeat(gap))}${rightText}${edge(rightEdge)}`;
+  return `${edge(leftEdge)}${leftText}${fill(horizontal.repeat(gap))}${rightText}${edge(rightEdge)}`;
 }
 
 function plainLine(line: string): string {
   return line.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
-}
-
-function paintBackground(text: string, background: (part: string) => string): string {
-  return text
-    .split("\x1b[0m")
-    .map((part) => background(part))
-    .join("\x1b[0m");
 }
 
 function formatTokens(count: number): string {
@@ -151,13 +148,13 @@ function formatTokens(count: number): string {
   return `${Math.round(count / 1000000)}M`;
 }
 
-function formatContext(ctx: ExtensionContext): string {
+function formatContext(ctx: ExtensionContext, ascii: boolean): string {
   const usage = ctx.getContextUsage();
   if (!usage || usage.percent === null) return "";
   // Keep the percentage and token count together; footer allocation treats metrics as atomic so
   // a clipped suffix can never turn a value such as 26k into a misleading 2.
   const percent = `${Math.round(usage.percent)}% full`;
-  return usage.tokens === null || usage.tokens === undefined ? percent : `${percent} · ↓ ${formatTokens(usage.tokens)}`;
+  return usage.tokens === null || usage.tokens === undefined ? percent : `${percent}${ascii ? " - " : " · ↓ "}${formatTokens(usage.tokens)}`;
 }
 
 function formatModel(ctx: ExtensionContext): string {
@@ -222,6 +219,7 @@ export default function (pi: ExtensionAPI) {
   let displayedRecovery: string | undefined;
   const publishRecovery = () => {
     const reason = toolBlocker?.reason ?? providerBlocker?.reason;
+    setVinciProviderError(providerBlocker?.reason);
     if (reason) {
       setVinciBlocker(reason);
       displayedRecovery = getVinciUiState().blockingReason;
@@ -240,11 +238,12 @@ export default function (pi: ExtensionAPI) {
     if (continuationWatchdog) clearTimeout(continuationWatchdog);
     continuationWatchdog = undefined;
   };
-  const startAnimation = () => {
-    stopAnimation();
-    // Print mode has no TUI to animate; an interval here only pins the event
-    // loop open after the answer is written.
-    if (!activeTui || vinciReducedMotion()) return;
+  const updateAnimation = () => {
+    if (!activeTui || vinciReducedMotion() || getVeroPresentation().label !== "Thinking") {
+      stopAnimation();
+      return;
+    }
+    if (animation) return;
     frame = 0;
     animation = setInterval(() => {
       frame = (frame + 1) % VINCI_PULSE_FRAMES.length;
@@ -253,6 +252,9 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    unsubscribeState?.();
+    unsubscribeState = undefined;
+    activeTui = undefined;
     verificationToolCallIds.clear();
     resetShellUiState();
     providerBlocker = undefined;
@@ -264,8 +266,12 @@ export default function (pi: ExtensionAPI) {
     displayedRecovery = undefined;
     stopAnimation();
     clearContinuationWatchdog();
-    unsubscribeState?.();
-    unsubscribeState = subscribeVinciUiState(requestRender);
+    if (ctx.mode !== "tui") return;
+    if (vinciPlainPresentation()) return;
+    unsubscribeState = subscribeVinciUiState(() => {
+      updateAnimation();
+      requestRender();
+    });
 
     ctx.ui.setWorkingVisible(false);
     ctx.ui.setFooter(() => new EmptyFooter());
@@ -292,77 +298,53 @@ export default function (pi: ExtensionAPI) {
 
         const state = getVinciUiState();
         const theme = ctx.ui.theme;
-        const elapsedMs = state.workingSince ? Math.max(0, Date.now() - state.workingSince) : 0;
-        const elapsed = formatDuration(elapsedMs, { rounding: "floor" });
-        const workingLabel = truncateToWidth(state.workingLabel, Math.max(16, width - 42), "…");
+        const look = getVinciLook(width, theme.name);
         const modeLabel =
           state.mode === "plan"
-            ? theme.fg("warning", theme.bold("◇ PLAN"))
-            : theme.fg("success", theme.bold("▶ AUTO"));
-        const connectionLabel =
-          state.connection === "connected"
-            ? theme.fg("success", " ● connected ")
-            : state.connection === "signed-in"
-              ? theme.fg("accent", " ● auth saved ")
-              : state.connection === "reconnect"
-                ? theme.fg("warning", " ! reconnect ")
-                : state.connection === "signed-out"
-                  ? theme.fg("warning", " /login ")
-                  : theme.fg("dim", " ◌ checking ");
-        const pulse = frame === 2 ? theme.bold(VINCI_PULSE_FRAMES[frame]) : VINCI_PULSE_FRAMES[frame];
-        const vero = getVeroPresentation();
-        const topLeft = state.working
-          ? theme.fg("accent", ` ${pulse} `) +
-            theme.fg("mdHeading", ` ${workingLabel} `) +
-            theme.fg("dim", `· ${elapsed} `)
-          : state.mode === "plan"
-            ? theme.fg("warning", theme.bold(" ◇ Plan with Vinci "))
-            : theme.fg("accent", theme.bold(" ✹ Ask Vinci ")) +
-              (vero.pose === "pixel" ? "" : theme.fg("muted", `· ${vero.label}: ${vero.nextAction} `));
+            ? look.fg("warning", look.bold(look.ascii ? "PLAN" : "◇ PLAN"))
+            : look.fg("success", look.bold(look.ascii ? "AUTO" : "▶ AUTO"));
+        const work = getVeroPresentation();
+        const frames = look.ascii ? ASCII_PULSE_FRAMES : VINCI_PULSE_FRAMES;
+        const pulse = work.label === "Thinking" ? frames[animation ? frame : 2] : undefined;
+        const detail = work.detail && look.ascii ? work.detail.replaceAll("…", "...") : work.detail;
+        const label = detail ? work.label + look.separator + detail : work.label;
         // Reserve the corners and minimum border gap first, then fit complete status fields before
         // the project. Widening to a full cwd must never steal cells from numeric context metrics.
         const footerBudget = Math.max(0, width - 2 - 3);
-        let bottomLeft = truncateToWidth(` ${modeLabel} `, footerBudget, "…");
-        let context = width >= 70 ? formatContext(ctx) : "";
+        const ellipsis = look.ascii ? "..." : "…";
+        let bottomLeft = truncateToWidth(` ${modeLabel} `, footerBudget, ellipsis);
+        let context = width >= 70 ? formatContext(ctx, look.ascii) : "";
         if (context && visibleWidth(bottomLeft) + visibleWidth(context) + 2 > footerBudget) context = "";
         const contextWidth = context ? visibleWidth(context) + 2 : 0;
-        const separator = "  ·  ";
+        const separator = look.ascii ? "  -  " : "  ·  ";
         const modelWidth = footerBudget - visibleWidth(bottomLeft) - contextWidth - visibleWidth(separator);
         if (modelWidth > 0) {
-          const model = truncateToWidth(theme.fg("muted", formatModel(ctx)), modelWidth, theme.fg("muted", "…"));
-          bottomLeft = ` ${modeLabel}${theme.fg("dim", separator)}${model} `;
+          const model = truncateToWidth(look.fg("muted", formatModel(ctx)), modelWidth, look.fg("muted", ellipsis));
+          bottomLeft = ` ${modeLabel}${look.fg("dim", separator)}${model} `;
         }
         const project = `${formatProject(ctx.cwd, width)}${branch ? ` (${branch})` : ""}`;
         const projectWidth = footerBudget - visibleWidth(bottomLeft) - contextWidth - (context ? visibleWidth(separator) : 2);
         // Truncation resets ANSI styling before its ellipsis. Style each segment independently so
         // shortening the path cannot change the following metrics' foreground color.
         const fittedProject = projectWidth > 0
-          ? truncateToWidth(theme.fg("dim", project), projectWidth, theme.fg("dim", "…"))
+          ? truncateToWidth(look.fg("dim", project), projectWidth, look.fg("dim", ellipsis))
           : "";
-        const bottomRightParts = [fittedProject, context ? theme.fg("dim", context) : ""].filter(Boolean);
-        const bottomRight = bottomRightParts.length ? ` ${bottomRightParts.join(theme.fg("dim", separator))} ` : "";
-        const edgeColor = state.working
-          ? (text: string) => theme.fg("accent", text)
-          : state.mode === "plan"
-            ? (text: string) => theme.fg("warning", text)
-            : (text: string) => theme.fg("accent", text);
-        const fillColor = (text: string) => theme.fg("borderMuted", text);
-
-        lines[0] = fitBorder(topLeft, connectionLabel, width, edgeColor, fillColor, "╭", "╮");
+        const bottomRightParts = [fittedProject, context ? look.fg("dim", context) : ""].filter(Boolean);
+        const bottomRight = bottomRightParts.length ? ` ${bottomRightParts.join(look.fg("dim", separator))} ` : "";
+        const edgeColor = (text: string) => look.fg("border", text);
+        lines[0] = look.topBorder(label, work.token, pulse);
         const bottomBorderIndex = lines.findIndex(
           (line, index) => index > 0 && (/^─+$/.test(plainLine(line)) || /^─── ↓ \d+ more ─*$/.test(plainLine(line))),
         );
         if (bottomBorderIndex > 0) {
           const contentLines: string[] = [];
           for (let index = 1; index < bottomBorderIndex; index++) {
-            const prompt = index === 1 ? theme.fg("accent", "›") : " ";
+            const prompt = index === 1 ? look.fg("accent", look.marker) : " ";
             const content = `${prompt}${lines[index].slice(1)}`;
-            contentLines.push(
-              `${edgeColor("│")}${paintBackground(content, (part) => theme.bg("selectedBg", part))}${edgeColor("│")}`,
-            );
+            contentLines.push(`${edgeColor(look.vertical)}${content}${edgeColor(look.vertical)}`);
           }
-          const blank = `${edgeColor("│")}${theme.bg("selectedBg", " ".repeat(innerWidth))}${edgeColor("│")}`;
-          const bottom = fitBorder(bottomLeft, bottomRight, width, edgeColor, fillColor, "╰", "╯");
+          const blank = `${edgeColor(look.vertical)}${" ".repeat(innerWidth)}${edgeColor(look.vertical)}`;
+          const bottom = fitBorder(bottomLeft, bottomRight, width, edgeColor, edgeColor, look.corners[2], look.corners[3], look.horizontal);
           const autocomplete = lines.slice(bottomBorderIndex + 1).map((line) => ` ${line} `);
           // TUI keeps the end of the component tree at the bottom of the viewport.
           // Put transient autocomplete rows above the composer so opening or closing
@@ -409,7 +391,7 @@ export default function (pi: ExtensionAPI) {
           ? "Considering the approach…"
           : "Contemplating…",
     );
-    startAnimation();
+    updateAnimation();
   });
 
   pi.on("turn_start", () => {
@@ -500,7 +482,7 @@ export default function (pi: ExtensionAPI) {
         setVinciWorking(false);
         return;
       }
-      startAnimation();
+      updateAnimation();
       clearContinuationWatchdog();
       continuationWatchdog = setTimeout(() => {
         // Whether the continuation resolved on its own or timed out here, the

@@ -6,6 +6,7 @@ import { stripVTControlCharacters } from "node:util";
 import { TUI } from "@earendil-works/pi-tui";
 import { createJiti } from "jiti/static";
 
+process.env.TERM = "xterm-256color";
 const sourceIndex = fileURLToPath(new URL("../../packages/coding-agent/src/index.ts", import.meta.url));
 const loader = createJiti(import.meta.url, {
   moduleCache: false, fsCache: false, tryNative: false,
@@ -20,6 +21,7 @@ shell.default({
   on: (name, handler) => handlers.set(name, handler),
 });
 const context = {
+  mode: "tui",
   cwd: process.cwd(), model: { provider: "faux" },
   ui: { setWorkingVisible() {}, setFooter() {}, setTitle() {}, setEditorComponent() {} },
 };
@@ -156,26 +158,30 @@ try {
   state.resetVinciUiState();
   await handlers.get("session_start")({}, renderContext);
   const renderTool = async (event) => handlers.get("tool_result")(event, renderContext);
-  const renderedEditor = () => stripVTControlCharacters(editor.render(120).join("\n"));
+  const renderedEditor = () => stripVTControlCharacters(editor.render(120)[1]);
   await renderTool(blockedWrite);
-  check("the actual live editor displays a structured required-operation failure", renderedEditor().includes("BLOCKED"));
+  check("the actual live editor displays a structured required-operation failure", renderedEditor().includes("Blocked"));
   await renderTool({ toolCallId: toolCallId(), toolName: "write", input: { path: resolve(context.cwd, "owned.txt"), content: "owned" }, isError: false, content: [] });
-  check("the actual live editor clears after an equivalent absolute-path retry", !renderedEditor().includes("BLOCKED"));
+  check("the actual live editor clears after an equivalent absolute-path retry", !renderedEditor().includes("Blocked"));
+  const { createVinciLook } = await loader.import(fileURLToPath(new URL("../extensions/lib/cli-look.ts", import.meta.url)));
+  const look = createVinciLook({ width: 120, color: "none", ascii: true, plain: false, theme: "dark" });
   for (const [connection, label] of [
-    ["signed-in", "auth saved"],
-    ["connected", "connected"],
-    ["reconnect", "reconnect"],
-    ["signed-out", "/login"],
-    ["unknown", "checking"],
+    ["signed-in", "Signed in"],
+    ["connected", "Connected"],
+    ["reconnect", "Reconnect - /login"],
+    ["signed-out", "/login to connect"],
+    ["unknown", "/login to connect"],
   ]) {
     state.setVinciConnection(connection);
-    const rendered = stripVTControlCharacters(editor.render(120).join("\n"));
-    check(`the registered composer gives ${connection} its distinct honest label`, rendered.includes(label));
-    check(`the registered composer preserves Ask Vinci for ${connection}`, rendered.includes("Ask Vinci"));
+    const lines = look.header({ version: "0.0.62", project: "example", connection });
+    check(`the header gives ${connection} its distinct honest label`, stripVTControlCharacters(lines[2]).includes(label));
+    check(`the editor work state stays Ready for ${connection}`, renderedEditor().includes("Ready"));
     if (connection === "signed-in") {
-      check("a saved credential neither claims a connected provider nor rewrites its internal enum", !rendered.includes("connected") && !rendered.includes("signed in") && state.getVinciUiState().connection === "signed-in");
+      check("a saved credential neither claims a connected provider nor rewrites its internal enum",
+        !lines[2].includes("Connected") && state.getVinciUiState().connection === "signed-in");
     }
   }
+
 } finally {
   await emit("session_shutdown", {});
   state.resetVinciUiState();

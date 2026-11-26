@@ -1,6 +1,6 @@
-  Vero DONE · Vinci · <repo>
-  ● connected · Read the receipt. · /undo · Ctrl+T thinking
-
+  <workspace> · Vinci
+  Connected · /undo to undo · /help
+  Try: fix a bug · add a feature · explain this code
 
 
  Update the README
@@ -17,7 +17,7 @@
   2 model calls · 200 in / 100 out · 0% cached · ~$0.0000 estimated · <time> active
   Billed by faux, not Vinci.
 
-╭ ✹ Ask Vinci · DONE: Read the receipt. ────────────────────────── ● connected ╮
+╭─ Done ───────────────────────────────────────────────────────────────────────╮
 │                                                                              │
 │›                                                                             │
 │                                                                              │

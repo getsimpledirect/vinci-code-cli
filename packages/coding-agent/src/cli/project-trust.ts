@@ -1,8 +1,10 @@
 import chalk from "chalk";
+import { vinciPlainPresentation } from "../../../../vinci/extensions/lib/cli-presentation.ts";
 import type { ProjectTrustContext } from "../core/extensions/types.ts";
 import type { AppMode } from "../core/project-trust.ts";
 import type { SettingsManager } from "../core/settings-manager.ts";
 import { showStartupInput, showStartupSelector } from "./startup-ui.ts";
+import { inputVinciPlain, selectVinciPlain } from "./vinci-lines.ts";
 
 export function createProjectTrustContext(options: {
 	cwd: string;
@@ -10,6 +12,7 @@ export function createProjectTrustContext(options: {
 	settingsManager: SettingsManager;
 	hasUI: boolean;
 }): ProjectTrustContext {
+	const plain = process.env.VINCI_CODE === "1" && vinciPlainPresentation();
 	return {
 		cwd: options.cwd,
 		mode: options.mode === "interactive" ? "tui" : options.mode,
@@ -22,6 +25,7 @@ export function createProjectTrustContext(options: {
 				if (options.mode !== "interactive") {
 					return undefined;
 				}
+				if (plain) return selectVinciPlain(title, selectOptions);
 				return showStartupSelector(
 					options.settingsManager,
 					title,
@@ -35,6 +39,7 @@ export function createProjectTrustContext(options: {
 				if (options.mode !== "interactive") {
 					return false;
 				}
+				if (plain) return (await selectVinciPlain(`${title}\n${message}`, ["Yes", "No"])) === "Yes";
 				return (
 					(await showStartupSelector(options.settingsManager, `${title}\n${message}`, [
 						{ label: "Yes", value: true },
@@ -49,6 +54,7 @@ export function createProjectTrustContext(options: {
 				if (options.mode !== "interactive") {
 					return undefined;
 				}
+				if (plain) return inputVinciPlain(title);
 				return showStartupInput(options.settingsManager, title, placeholder);
 			},
 			notify: (message, type = "info") => {

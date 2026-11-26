@@ -45,6 +45,8 @@ beforeEach(() => {
 		TERM_PROGRAM: "xterm",
 		VINCI_CREW_CAPACITY: "2",
 		VINCI_ASCII_WORDMARK: "1",
+		VINCI_ASCII: "0",
+		LC_ALL: "C.UTF-8",
 		VINCI_NO_VERIFY: "1",
 		VINCI_NO_SANDBOX: "1",
 	}))
@@ -93,7 +95,7 @@ async function snapshot(name, ui) {
 	await expectSnapshot(`fullscreen-${name}`, {
 		async screen() {
 			return (await ui.screen())
-				.replace(/Vinci v\d+\.\d+\.\d+/g, "Vinci v<version>")
+				.replace(/^(  Vinci Code )\d+\.\d+\.\d+/m, "$1<version>")
 				.replace(/\b(?:Option|Alt)\+/g, "<alt>+");
 		},
 	});
@@ -151,7 +153,7 @@ describe("Vinci opt-in fullscreen journeys", { concurrency: false }, () => {
 	test("header, framed editor and EmptyFooter survive a short resized composer", async () => {
 		const ui = await createUi();
 		assertDock(ui, "startup");
-		assert.match(await ui.screen(), /Vinci v\d+\.\d+\.\d+ Code/);
+		assert.match(await ui.screen(), /^  Vinci Code \d+\.\d+\.\d+/m);
 		assert.match(await ui.screen(), /\/login to connect/);
 		await snapshot("startup-80x24", ui);
 		ui.sendKeys("DRAFT-SENTINEL");

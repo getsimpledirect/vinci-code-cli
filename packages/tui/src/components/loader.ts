@@ -10,6 +10,25 @@ export interface LoaderIndicatorOptions {
 
 const DEFAULT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const DEFAULT_INTERVAL_MS = 80;
+const CI_DISABLED = ["", "0", "false", "no", "off"];
+
+/**
+ * Vinci motion gate (spec r4 section 3), mirrored from `vinciReducedMotion()` in
+ * vinci/extensions/lib/cli-presentation.ts because this package cannot import the Vinci layer:
+ * plain presentation, a non-TTY stream, VINCI_REDUCED_MOTION=1 or an enabled CI value.
+ * vinci-look.test.ts checks the two stay equal.
+ */
+function vinciMotionDisabled(): boolean {
+	return (
+		process.env.TERM === "dumb" ||
+		process.env.VINCI_PLAIN === "1" ||
+		process.env.VINCI_SCREEN_READER === "1" ||
+		!process.stdin.isTTY ||
+		!process.stdout.isTTY ||
+		process.env.VINCI_REDUCED_MOTION === "1" ||
+		!CI_DISABLED.includes(process.env.CI?.trim().toLowerCase() ?? "")
+	);
+}
 
 /**
  * Loader component that updates with an optional spinning animation.
@@ -63,7 +82,12 @@ export class Loader extends Text {
 
 	setIndicator(indicator?: LoaderIndicatorOptions): void {
 		this.renderIndicatorVerbatim = indicator !== undefined;
-		this.frames = indicator?.frames !== undefined ? [...indicator.frames] : [...DEFAULT_FRAMES];
+		this.frames =
+			process.env.VINCI_CODE === "1" && vinciMotionDisabled()
+				? []
+				: indicator?.frames !== undefined
+					? [...indicator.frames]
+					: [...DEFAULT_FRAMES];
 		this.intervalMs = indicator?.intervalMs && indicator.intervalMs > 0 ? indicator.intervalMs : DEFAULT_INTERVAL_MS;
 		this.currentFrame = 0;
 		this.start();

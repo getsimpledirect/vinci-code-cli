@@ -906,6 +906,12 @@ export class SettingsManager {
 		return this.settings.showOtherProviders ?? false;
 	}
 
+	areOtherProvidersExplicitlyDisabled(): boolean {
+		const override = process.env.VINCI_SHOW_OTHER_PROVIDERS;
+		if (override !== undefined) return override !== "1";
+		return this.settings.showOtherProviders === false;
+	}
+
 	setShowOtherProviders(show: boolean): void {
 		this.globalSettings.showOtherProviders = show;
 		this.markModified("showOtherProviders");

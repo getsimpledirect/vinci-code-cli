@@ -20,6 +20,20 @@ if [ ! -d "${VINCI_EXTENSIONS}" ]; then
   VINCI_EXTENSION_SUFFIX="ts"
 fi
 
+# Keep the leading presentation option available to product commands and the normal CLI.
+while [ "${1:-}" = "--no-color" ]; do
+  export NO_COLOR=""
+  shift
+done
+# `--no-color` later on the line (before `--`) is the same as NO_COLOR for the launcher's own output; it
+# stays in the arguments for Pi, which applies it too.
+for _a in "$@"; do
+  case "${_a}" in
+    --) break ;;
+    --no-color) export NO_COLOR=""; break ;;
+  esac
+done
+
 # ── Self-heal the bootstrap updater ─────────────────────────────────────────────────────────────
 # The install shim runs $VINCI_HOME/updater/update.mjs — the BOOTSTRAP copy — for every command,
 # including the automatic before-launch update. Only the installer ever refreshed that copy, so an
@@ -500,14 +514,30 @@ case "${VINCI_PROVIDER}" in
     ;;
 esac
 
-# Start on a clean screen so the Vinci welcome opens at the top, not buried under prior terminal
-# output (build logs, the shell prompt, etc.). Only when attached to a real terminal.
-if [ -t 1 ]; then printf '\033[H\033[2J'; fi
+# Resolve escape-free presentation before the first terminal write; the exit bookend observes the
+# same decision. Rich interactive = both streams on a terminal, not print/rpc/json, and not one of the
+# zero-escape presentations (TERM=dumb, VINCI_PLAIN=1, VINCI_SCREEN_READER=1). NO_COLOR and
+# --no-color stay rich: they remove colour only.
+VINCI_STDIN_TTY=0
+VINCI_STDOUT_TTY=0
+if [ -t 0 ]; then VINCI_STDIN_TTY=1; fi
+if [ -t 1 ]; then VINCI_STDOUT_TTY=1; fi
+# Offline launcher regressions have no PTY. Under the offline provider switch only, they may stand in
+# for the terminal probe to observe the rich path's terminal writes.
+if [ "${VINCI_INTERNAL_PROVIDER_TEST:-0}" = "1" ] && [ "${VINCI_INTERNAL_ASSUME_TTY:-0}" = "1" ]; then
+  VINCI_STDIN_TTY=1
+  VINCI_STDOUT_TTY=1
+fi
+VINCI_RICH_INTERACTIVE=1
+if [ "${VINCI_STDIN_TTY}" != "1" ] || [ "${VINCI_STDOUT_TTY}" != "1" ] ||
+  [ "${TERM:-}" = "dumb" ] || [ "${VINCI_PLAIN:-}" = "1" ] || [ "${VINCI_SCREEN_READER:-}" = "1" ]; then
+  VINCI_RICH_INTERACTIVE=0
+fi
+for _a in "$@"; do case "${_a}" in -p | --print | --mode | --mode=*) VINCI_RICH_INTERACTIVE=0 ;; esac; done
 
-# Interactive run? (attached to a real terminal, not print/rpc/json). Only then do we sign off on exit.
-VINCI_INTERACTIVE=1
-{ [ -t 0 ] && [ -t 1 ]; } || VINCI_INTERACTIVE=0
-for _a in "$@"; do case "${_a}" in -p | --print | --mode) VINCI_INTERACTIVE=0 ;; esac; done
+# Start on a clean screen so the Vinci welcome opens at the top, not buried under prior terminal
+# output (build logs, the shell prompt, etc.). Only on the rich interactive path.
+if [ "${VINCI_RICH_INTERACTIVE}" = "1" ]; then printf '\033[H\033[2J'; fi
 
 # Not exec'd (so we regain control to print the bookend below). We run Pi in the BACKGROUND and `wait`,
 # with a trap that forwards a directed SIGTERM / terminal-close SIGHUP down to it — otherwise those kill
@@ -574,10 +604,74 @@ while kill -0 "${VINCI_CHILD}" 2>/dev/null; do wait "${VINCI_CHILD}"; VINCI_EXIT
 trap - TERM HUP
 
 # A warm brand bookend — the counterpart to the welcome hero — printed once after the session closes.
-if [ "${VINCI_INTERACTIVE}" = "1" ]; then
-  _sage=$'\033[38;2;184;197;176m'
-  _dim=$'\033[38;2;107;107;100m'
-  _rst=$'\033[0m'
-  printf '\n  %s𝐯𝟏𝐧𝐜𝟏%s  %s·  made, not generated.%s\n\n' "${_sage}" "${_rst}" "${_dim}" "${_rst}"
+# Rich interactive only. Colours are the Vinci look tokens (text, muted) on the same colour
+# path as vinci/extensions/lib/cli-look.ts vinciLookColor(): none under NO_COLOR (also set by
+# --no-color), else truecolor, then 256, then 16 (both use the default foreground there). The theme is
+# the environment's terminal background (COLORFGBG), as detectTerminalBackgroundFromEnv() reads it.
+# vinci-look.test.ts pins this mirror against those functions.
+_vinci_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+_vinci_truecolor_terminal() {
+  local _tp _te _term _ct _hint=0
+  _tp="$(_vinci_lower "${TERM_PROGRAM:-}")"
+  _te="$(_vinci_lower "${TERMINAL_EMULATOR:-}")"
+  _term="$(_vinci_lower "${TERM:-}")"
+  _ct="$(_vinci_lower "${COLORTERM:-}")"
+  if [ "${_ct}" = "truecolor" ] || [ "${_ct}" = "24bit" ]; then _hint=1; fi
+  if [ -n "${TMUX:-}" ] || [[ "${_term}" == tmux* ]] || [[ "${_term}" == screen* ]]; then
+    [ "${_hint}" = "1" ]; return
+  fi
+  if [ -n "${KITTY_WINDOW_ID:-}" ] || [ "${_tp}" = "kitty" ] ||
+    [ "${_tp}" = "ghostty" ] || [[ "${_term}" == *ghostty* ]] || [ -n "${GHOSTTY_RESOURCES_DIR:-}" ] ||
+    [ -n "${WEZTERM_PANE:-}" ] || [ "${_tp}" = "wezterm" ] ||
+    [ "${_tp}" = "warpterminal" ] || [ -n "${WARP_SESSION_ID:-}" ] || [ -n "${WARP_TERMINAL_SESSION_UUID:-}" ] ||
+    [ -n "${ITERM_SESSION_ID:-}" ] || [ "${_tp}" = "iterm.app" ] || [ -n "${WT_SESSION:-}" ] ||
+    [ "${_tp}" = "vscode" ] || [ "${_tp}" = "alacritty" ] || [ "${_te}" = "jetbrains-jediterm" ]; then
+    return 0
+  fi
+  [ "${_hint}" = "1" ]
+}
+# 1 = light background for each xterm-256 index (luminance >= 0.5 in theme.ts ansi256ToHex).
+_VINCI_LIGHT_INDEX="0000000100110011000000000000000000000000001111111111000000000000000000000000111111111111000000000000000000000000111111111111000000000000000000000000111111111111000000000000000000000011111111111111000000000000000000111111111111111111000000000000000000111111"
+_vinci_light_background() {
+  # The last field of COLORFGBG that parses (like parseInt) as an index 0-255 is the background.
+  local _rest="${COLORFGBG:-}" _part _digits
+  while :; do
+    _part="${_rest##*;}"
+    _part="${_part#"${_part%%[![:space:]]*}"}"
+    if [[ "${_part}" =~ ^([+-]?)([0-9]+) ]]; then
+      _digits="${BASH_REMATCH[2]}"
+      while [ "${#_digits}" -gt 1 ] && [ "${_digits:0:1}" = "0" ]; do _digits="${_digits:1}"; done
+      if [ "${BASH_REMATCH[1]}" = "-" ] && [ "${_digits}" != "0" ]; then
+        :
+      elif [ "${#_digits}" -le 3 ] && [ "${_digits}" -le 255 ]; then
+        [ "${_VINCI_LIGHT_INDEX:${_digits}:1}" = "1" ]; return
+      fi
+    fi
+    if [ "${_rest}" = "${_part}" ] || [[ "${_rest}" != *";"* ]]; then return 1; fi
+    _rest="${_rest%;*}"
+  done
+}
+if [ "${VINCI_RICH_INTERACTIVE}" = "1" ]; then
+  _text=""
+  _muted=""
+  if [ -z "${NO_COLOR+set}" ]; then
+    _light=0
+    if _vinci_light_background; then _light=1; fi
+    if _vinci_truecolor_terminal || [ "${FORCE_COLOR:-}" = "3" ]; then
+      if [ "${_light}" = "1" ]; then _text="38;2;20;22;26"; _muted="38;2;108;106;98"
+      else _text="38;2;244;241;236"; _muted="38;2;163;163;156"; fi
+    elif [[ "$(_vinci_lower "${TERM:-}")" == *256color* ]] || [ "${FORCE_COLOR:-}" = "2" ]; then
+      if [ "${_light}" = "1" ]; then _text="38;5;233"; _muted="38;5;242"
+      else _text="38;5;255"; _muted="38;5;247"; fi
+    fi
+  fi
+  _separator="·"
+  _locale="$(_vinci_lower "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}")"
+  if [ "${VINCI_ASCII:-}" = "1" ] || [ "${TERM:-}" = "linux" ] ||
+    [[ "${_locale}" != *utf-8* && "${_locale}" != *utf8* ]]; then
+    _separator="-"
+  fi
+  _paint() { if [ -n "$1" ]; then printf '\033[%sm%s\033[39m' "$1" "$2"; else printf '%s' "$2"; fi; }
+  printf '\n  %s %s %s\n\n' "$(_paint "${_text}" "$(printf '\033[1mVinci Code\033[22m')")" "${_separator}" "$(_paint "${_muted}" "Made, not generated.")"
 fi
 exit "${VINCI_EXIT}"

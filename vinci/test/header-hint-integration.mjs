@@ -1,6 +1,6 @@
 // Vinci Code — durable one-time thinking-hint regression test.
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,15 +25,20 @@ extension.default({ on(name, handler) { if (name === "session_start") handlers.p
 assert.equal(handlers.length, 1);
 
 const notifications = [];
+let headers = 0;
 const ctx = {
   mode: "tui",
   cwd: agentDir,
   ui: {
     notify(message, level) { notifications.push({ message, level }); },
-    setHeader() {},
+    setHeader() { headers++; },
   },
 };
 
+process.env.TERM = "dumb";
+await handlers[0]({}, ctx);
+assert.equal(notifications.length, 0, "plain sessions must leave the rich keyboard hint available");
+process.env.TERM = "xterm-256color";
 await handlers[0]({}, ctx);
 await handlers[0]({}, ctx);
 assert.deepEqual(notifications, [{
@@ -47,8 +52,10 @@ const secondExtension = await secondLoader.import(resolve(here, "../extensions/v
 secondExtension.default({ on(name, handler) { if (name === "session_start") secondProcessHandlers.push(handler); } });
 await secondProcessHandlers[0]({}, ctx);
 assert.equal(notifications.length, 1, "the marker must suppress the hint across extension reloads");
+assert.equal(headers, 3, "the normal header must register on every session even after the hint is claimed");
 
 if (previousAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
 else process.env[ENV_AGENT_DIR] = previousAgentDir;
+rmSync(agentDir, { recursive: true });
 
-console.log("header-hint-integration: 2/2 passed");
+console.log("header-hint-integration: 4/4 passed");

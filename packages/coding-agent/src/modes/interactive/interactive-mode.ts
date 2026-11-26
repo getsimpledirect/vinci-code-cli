@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+	type Api,
 	type AssistantMessage,
 	getProviders,
 	type ImageContent,
@@ -52,7 +53,14 @@ import {
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { spawn, spawnSync } from "child_process";
+import {
+	getVinciLook,
+	runVinciWelcome,
+	type VinciWelcomeChoice,
+} from "../../../../../vinci/extensions/lib/cli-look.ts";
 import { groupVinciModels } from "../../../../../vinci/extensions/lib/model-catalogue.ts";
+import { getVinciVersion } from "../../../../../vinci/extensions/lib/product-version.ts";
+import { setVinciConnection, setVinciPromptState } from "../../../../../vinci/extensions/lib/ui-state.ts";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -82,6 +90,7 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
+import type { ModelRegistry } from "../../core/model-registry.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.ts";
@@ -265,6 +274,73 @@ function hasDefaultModelProvider(providerId: string): providerId is keyof typeof
 	return providerId in defaultModelPerProvider;
 }
 
+export async function getModelCandidates(
+	session: AgentSession,
+	settingsManager: AgentSession["settingsManager"],
+	{ fallbackToAvailable = false }: { fallbackToAvailable?: boolean } = {},
+): Promise<Model<Api>[]> {
+	// [vinci] The scoped-model early return was UNFILTERED upstream and stayed unfiltered through
+	// the provider-visibility work, so a scoped session could surface non-Vinci models even in the
+	// managed default. Harmless while nothing could reach another provider; a real hole once BYOK
+	// exists. Filtered here so "managed default is Vinci-only" is true on every path, not most.
+	// Default to the managed provider without making VINCI_CODE's security controls an obstacle to
+	// user-supplied provider keys. Upstream remains unchanged when VINCI_CODE is unset.
+	// Shared by the rich picker and plain /model so both offer the same usable list.
+	// Plain /model can fall back to the full list when no scoped models pass the filter.
+	const filterModels = (models: Model<Api>[]): Model<Api>[] => {
+		if (process.env.VINCI_CODE !== "1") return models;
+		return settingsManager.getShowOtherProviders()
+			? groupVinciModels(models)
+			: models.filter((model) => model.provider === "vinci");
+	};
+	let models: Model<Api>[] = session.scopedModels.map((entry) => entry.model);
+	if (models.length > 0) {
+		const scoped = filterModels(models);
+		if (scoped.length > 0 || !fallbackToAvailable) return scoped;
+	}
+	session.modelRegistry.refresh();
+	try {
+		models = await session.modelRegistry.getAvailable();
+	} catch {
+		return [];
+	}
+	return filterModels(models);
+}
+
+export async function selectDefaultModelAfterAuthentication(
+	session: AgentSession,
+	providerId: string,
+	previousModel: AgentSession["model"],
+	actionLabel: string,
+): Promise<{ selectedModel: AgentSession["model"]; selectionError: string | undefined }> {
+	let selectedModel: AgentSession["model"];
+	let selectionError: string | undefined;
+	if (isUnknownModel(previousModel)) {
+		const availableModels = session.modelRegistry.getAvailable();
+		const providerModels = availableModels.filter((model) => model.provider === providerId);
+		if (!hasDefaultModelProvider(providerId)) {
+			selectionError = `${actionLabel}, but no default model is configured for provider "${providerId}". Use /model to select a model.`;
+		} else if (providerModels.length === 0) {
+			selectionError = `${actionLabel}, but no models are available for that provider. Use /model to select a model.`;
+		} else {
+			const defaultModelId = defaultModelPerProvider[providerId];
+			selectedModel = providerModels.find((model) => model.id === defaultModelId);
+			if (!selectedModel) {
+				selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
+			} else {
+				try {
+					await session.setModel(selectedModel);
+				} catch (error: unknown) {
+					selectedModel = undefined;
+					const errorMessage = error instanceof Error ? error.message : String(error);
+					selectionError = `${actionLabel}, but selecting its default model failed: ${errorMessage}. Use /model to select a model.`;
+				}
+			}
+		}
+	}
+	return { selectedModel, selectionError };
+}
+
 const BEDROCK_PROVIDER_ID = "amazon-bedrock";
 
 const BUILT_IN_MODEL_PROVIDERS = new Set<string>(getProviders());
@@ -281,6 +357,35 @@ export function isApiKeyLoginProvider(
 		return false;
 	}
 	return !oauthProviderIds.has(providerId);
+}
+
+export function getLoginProviderOptions(
+	modelRegistry: ModelRegistry,
+	authType?: "oauth" | "api_key",
+): AuthSelectorProvider[] {
+	const authStorage = modelRegistry.authStorage;
+	const oauthProviders = authStorage.getOAuthProviders();
+	const oauthProviderIds = new Set(oauthProviders.map((provider) => provider.id));
+	const options: AuthSelectorProvider[] = oauthProviders.map((provider) => ({
+		id: provider.id,
+		name: provider.name,
+		authType: "oauth",
+	}));
+
+	const modelProviders = new Set(modelRegistry.getAll().map((model) => model.provider));
+	for (const providerId of modelProviders) {
+		if (!isApiKeyLoginProvider(providerId, oauthProviderIds)) {
+			continue;
+		}
+		options.push({
+			id: providerId,
+			name: modelRegistry.getProviderDisplayName(providerId),
+			authType: "api_key",
+		});
+	}
+
+	const filteredOptions = authType ? options.filter((option) => option.authType === authType) : options;
+	return filteredOptions.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**
@@ -311,6 +416,7 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
+	vinciWelcome?: boolean;
 }
 
 export class InteractiveMode {
@@ -333,6 +439,7 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
+	private vinciWelcomeActive = false;
 	private onInputCallback?: (text: string) => void;
 	private pendingUserInputs: string[] = [];
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -806,6 +913,12 @@ export class InteractiveMode {
 			console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
 		}
 
+		this.vinciWelcomeActive =
+			this.options.vinciWelcome === true &&
+			this.session.modelRegistry.getAvailable().length === 0 &&
+			!this.sessionManager.getEntries().some((entry) => entry.type === "message") &&
+			!fs.existsSync(path.join(getAgentDir(), ".vinci-welcome-v1"));
+
 		// Add header container as first child. Populate it after applying theme settings.
 		// Keep loaded resources before chat so restored session messages never precede them.
 		this.ui.addChild(this.headerContainer);
@@ -831,7 +944,7 @@ export class InteractiveMode {
 		await this.themeController.applyFromSettings();
 
 		// Add header with keybindings from config (unless silenced)
-		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
+		if (process.env.VINCI_CODE !== "1" && (this.options.verbose || !this.settingsManager.getQuietStartup())) {
 			const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
 
 			// Build startup instructions using keybinding hint helpers
@@ -910,6 +1023,8 @@ export class InteractiveMode {
 
 		// Initialize extensions first so resources are shown before messages
 		await this.rebindCurrentSession();
+
+		if (this.vinciWelcomeActive) await this.showVinciWelcome();
 
 		// Render initial messages AFTER showing loaded resources
 		this.renderInitialMessages();
@@ -2180,7 +2295,14 @@ export class InteractiveMode {
 
 		if (factory) {
 			// Create and add custom header
-			this.customHeader = factory(this.ui, theme);
+			const header = factory(this.ui, theme);
+			this.customHeader = this.vinciWelcomeActive
+				? {
+						render: (width) => (this.vinciWelcomeActive ? [] : header.render(width)),
+						invalidate: () => header.invalidate(),
+						dispose: () => header.dispose?.(),
+					}
+				: header;
 			if (isExpandable(this.customHeader)) {
 				this.customHeader.setExpanded(this.toolOutputExpanded);
 			}
@@ -2242,9 +2364,19 @@ export class InteractiveMode {
 
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
-			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
+			select: (title, options, opts) =>
+				this.withVinciPrompt(
+					() =>
+						this.showExtensionSelector(
+							opts?.vinciReviewContext ? `Needs your OK\n${title}` : title,
+							options,
+							opts,
+						),
+					opts?.vinciReviewContext ? "approval" : "input",
+				),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
-			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
+			input: (title, placeholder, opts) =>
+				this.withVinciPrompt(() => this.showExtensionInput(title, placeholder, opts), "input"),
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
@@ -2371,6 +2503,16 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private async withVinciPrompt<T>(operation: () => Promise<T>, kind: "approval" | "input"): Promise<T> {
+		if (process.env.VINCI_CODE !== "1") return operation();
+		setVinciPromptState(kind);
+		try {
+			return await operation();
+		} finally {
+			setVinciPromptState(undefined);
+		}
+	}
+
 	/**
 	 * Show a confirmation dialog for extensions.
 	 */
@@ -2380,10 +2522,15 @@ export class InteractiveMode {
 		opts?: ExtensionUIDialogOptions,
 	): Promise<boolean> {
 		// Context review is select-only: confirm's legacy ordering is not safe-first.
-		const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], {
-			signal: opts?.signal,
-			timeout: opts?.timeout,
-		});
+		const heading = process.env.VINCI_CODE === "1" ? `Needs your OK\n${title}` : title;
+		const result = await this.withVinciPrompt(
+			() =>
+				this.showExtensionSelector(`${heading}\n${message}`, ["Yes", "No"], {
+					signal: opts?.signal,
+					timeout: opts?.timeout,
+				}),
+			"approval",
+		);
 		return result === "Yes";
 	}
 
@@ -4591,32 +4738,8 @@ export class InteractiveMode {
 		return findExactModelReferenceMatch(searchTerm, models);
 	}
 
-	private async getModelCandidates(): Promise<Model<any>[]> {
-		// [vinci] The scoped-model early return was UNFILTERED upstream and stayed unfiltered through
-		// the provider-visibility work, so a scoped session could surface non-Vinci models even in the
-		// managed default. Harmless while nothing could reach another provider; a real hole once BYOK
-		// exists. Filtered here so "managed default is Vinci-only" is true on every path, not most.
-		if (this.session.scopedModels.length > 0) {
-			const scoped = this.session.scopedModels.map((entry) => entry.model);
-			if (process.env.VINCI_CODE !== "1") return scoped;
-			return this.settingsManager.getShowOtherProviders()
-				? groupVinciModels(scoped)
-				: scoped.filter((model) => model.provider === "vinci");
-		}
-
-		this.session.modelRegistry.refresh();
-		try {
-			const models = await this.session.modelRegistry.getAvailable();
-			// [vinci] Default to the managed provider without making VINCI_CODE's security controls an
-			// obstacle to user-supplied provider keys. Upstream remains unchanged when VINCI_CODE is unset.
-			if (process.env.VINCI_CODE !== "1") return models;
-			if (!this.settingsManager.getShowOtherProviders()) {
-				return models.filter((model) => model.provider === "vinci");
-			}
-			return groupVinciModels(models);
-		} catch {
-			return [];
-		}
+	private getModelCandidates(): Promise<Model<Api>[]> {
+		return getModelCandidates(this.session, this.settingsManager);
 	}
 
 	/** Update the footer's available provider count from current model candidates */
@@ -5077,32 +5200,6 @@ export class InteractiveMode {
 		}
 	}
 
-	private getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
-		const authStorage = this.session.modelRegistry.authStorage;
-		const oauthProviders = authStorage.getOAuthProviders();
-		const oauthProviderIds = new Set(oauthProviders.map((provider) => provider.id));
-		const options: AuthSelectorProvider[] = oauthProviders.map((provider) => ({
-			id: provider.id,
-			name: provider.name,
-			authType: "oauth",
-		}));
-
-		const modelProviders = new Set(this.session.modelRegistry.getAll().map((model) => model.provider));
-		for (const providerId of modelProviders) {
-			if (!isApiKeyLoginProvider(providerId, oauthProviderIds)) {
-				continue;
-			}
-			options.push({
-				id: providerId,
-				name: this.session.modelRegistry.getProviderDisplayName(providerId),
-				authType: "api_key",
-			});
-		}
-
-		const filteredOptions = authType ? options.filter((option) => option.authType === authType) : options;
-		return filteredOptions.sort((a, b) => a.name.localeCompare(b.name));
-	}
-
 	private getLogoutProviderOptions(): AuthSelectorProvider[] {
 		const authStorage = this.session.modelRegistry.authStorage;
 		const options: AuthSelectorProvider[] = [];
@@ -5149,6 +5246,53 @@ export class InteractiveMode {
 		});
 	}
 
+	private async showVinciWelcome(): Promise<void> {
+		const status = await runVinciWelcome({
+			profile: getAgentDir(),
+			signedIn: this.session.modelRegistry.getAvailable().length > 0,
+			showOtherProviders: !this.settingsManager.areOtherProvidersExplicitlyDisabled(),
+			select: (choices) => this.selectVinciWelcome(choices),
+			pair: () => this.showLoginDialog("vinci", "Vinci"),
+			key: async () => {
+				this.settingsManager.setShowOtherProviders(true);
+				this.showLoginProviderSelector("api_key");
+			},
+		});
+		this.vinciWelcomeActive = false;
+		if (status === "quit") await this.shutdown();
+		this.ui.requestRender();
+	}
+
+	private selectVinciWelcome(choices: readonly VinciWelcomeChoice[]): Promise<VinciWelcomeChoice["id"] | undefined> {
+		return new Promise((resolve) => {
+			let selected = 0;
+			const previous = [...this.ui.children];
+			const finish = (choice?: VinciWelcomeChoice["id"]) => {
+				this.ui.clear();
+				for (const child of previous) this.ui.addChild(child);
+				this.ui.setFocus(this.editor);
+				this.ui.requestRender();
+				resolve(choice);
+			};
+			const welcome: Component = {
+				render: (width) => getVinciLook(width, theme.name).welcome(getVinciVersion(), choices, selected),
+				invalidate() {},
+				handleInput: (data) => {
+					if (this.keybindings.matches(data, "tui.select.cancel")) return finish();
+					if (this.keybindings.matches(data, "tui.select.confirm")) return finish(choices[selected]?.id);
+					if (this.keybindings.matches(data, "tui.select.up"))
+						selected = (selected + choices.length - 1) % choices.length;
+					if (this.keybindings.matches(data, "tui.select.down")) selected = (selected + 1) % choices.length;
+					this.ui.requestRender();
+				},
+			};
+			this.ui.clear();
+			this.ui.addChild(welcome);
+			this.ui.setFocus(welcome);
+			this.ui.requestRender();
+		});
+	}
+
 	private showLoginAuthTypeSelector(): void {
 		const vinci = process.env.VINCI_CODE === "1";
 		const vinciLabel = "Vinci account";
@@ -5178,7 +5322,7 @@ export class InteractiveMode {
 	}
 
 	private showLoginProviderSelector(authType: "oauth" | "api_key"): void {
-		const providerOptions = this.getLoginProviderOptions(authType);
+		const providerOptions = getLoginProviderOptions(this.session.modelRegistry, authType);
 		if (providerOptions.length === 0) {
 			this.showStatus(
 				authType === "oauth" ? "No subscription providers available." : "No API key providers available.",
@@ -5255,6 +5399,10 @@ export class InteractiveMode {
 					try {
 						this.session.modelRegistry.authStorage.logout(providerOption.id);
 						this.session.modelRegistry.refresh();
+						if (process.env.VINCI_CODE === "1") {
+							const count = this.session.modelRegistry.getAvailable().length;
+							setVinciConnection(count ? "signed-in" : "signed-out");
+						}
 						await this.updateAvailableProviderCount();
 						const message =
 							providerOption.authType === "oauth"
@@ -5281,34 +5429,16 @@ export class InteractiveMode {
 		previousModel: Model<any> | undefined,
 	): Promise<void> {
 		this.session.modelRegistry.refresh();
+		if (process.env.VINCI_CODE === "1") setVinciConnection("signed-in");
 
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
 
-		let selectedModel: Model<any> | undefined;
-		let selectionError: string | undefined;
-		if (isUnknownModel(previousModel)) {
-			const availableModels = this.session.modelRegistry.getAvailable();
-			const providerModels = availableModels.filter((model) => model.provider === providerId);
-			if (!hasDefaultModelProvider(providerId)) {
-				selectionError = `${actionLabel}, but no default model is configured for provider "${providerId}". Use /model to select a model.`;
-			} else if (providerModels.length === 0) {
-				selectionError = `${actionLabel}, but no models are available for that provider. Use /model to select a model.`;
-			} else {
-				const defaultModelId = defaultModelPerProvider[providerId];
-				selectedModel = providerModels.find((model) => model.id === defaultModelId);
-				if (!selectedModel) {
-					selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
-				} else {
-					try {
-						await this.session.setModel(selectedModel);
-					} catch (error: unknown) {
-						selectedModel = undefined;
-						const errorMessage = error instanceof Error ? error.message : String(error);
-						selectionError = `${actionLabel}, but selecting its default model failed: ${errorMessage}. Use /model to select a model.`;
-					}
-				}
-			}
-		}
+		const { selectedModel, selectionError } = await selectDefaultModelAfterAuthentication(
+			this.session,
+			providerId,
+			previousModel,
+			actionLabel,
+		);
 
 		await this.updateAvailableProviderCount();
 		this.footer.invalidate();

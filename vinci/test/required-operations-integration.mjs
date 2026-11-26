@@ -379,10 +379,13 @@ test("persistence-readers", async () => {
   await emit(resumedHost, "session_start", { reason: "resume" }, resumed.context);
   assertRequiredFailure(outcome.getVinciTaskOutcome());
   assert.match(resumed.renderReceipt(), /Stopped — needs you/);
-  assert.equal(vero.getVeroPresentation().label, "BLOCKED", "Vero must read the restored blocker without a live UI latch.");
+  assert.equal(vero.getVeroPresentation().label, "Blocked", "Vero must read the restored blocker without a live UI latch.");
+  uiState.setVinciBlocker(saved.reason);
+  assert.equal(vero.getVeroPresentation().label, "Blocked", "Vero must also show the live blocker.");
+  uiState.setVinciBlocker(undefined);
   const shellHost = registered(shell.default);
   await emit(shellHost, "session_start", {}, resumed.context);
-  assert.match(resumed.renderEditor(), /BLOCKED/, "The actual reopened shell editor must show the persisted blocker.");
+  assert.match(resumed.renderEditor(), /Blocked/, "The actual reopened shell editor must show the persisted blocker.");
   await emit(shellHost, "session_shutdown", {}, resumed.context);
   await resumedHost.commands.get("usage").handler("", resumed.context);
   assert.match(resumed.notifications.at(-1).text, /State: Stopped — needs you/, "Usage after restore must retain the blocker.");
@@ -448,7 +451,7 @@ test("live-equivalent-retry", async () => {
     await emit(host, "tool_result", { ...firstFailure, input: args }, state.context);
     assert.ok(uiState.getVinciUiState().blockingReason, "The failed write must publish its live blocker.");
     await emit(host, "agent_end", { messages: [firstCall, firstFailure, complete()] }, state.context);
-    assert.match(state.renderEditor(), /BLOCKED/, "The live editor must display the structured write failure.");
+    assert.match(state.renderEditor(), /Blocked/, "The live editor must display the structured write failure.");
     await emit(host, "before_agent_start", { prompt: "Continue the unfinished request." }, state.context);
     await emit(host, "agent_start", {}, state.context);
     writeFileSync(resolve(cwd, args.path), args.content);
@@ -458,7 +461,7 @@ test("live-equivalent-retry", async () => {
     await emit(host, "agent_end", { messages }, state.context);
     assert.equal(outcome.getVinciTaskOutcome().state, "DONE", "The equivalent live retry must persist DONE.");
     assert.deepEqual(outcome.getVinciTaskOutcome().changedFiles, ["recovery.txt"], "The receipt must retain the successful retry's changed file.");
-    assert.match(state.renderEditor(), /DONE/, "The terminal editor must agree with persisted completion.");
+    assert.match(state.renderEditor(), /Done/, "The terminal editor must agree with persisted completion.");
     assert.match(state.renderReceipt(), /✓ Done/, "The actual receipt must agree with the terminal editor.");
   } finally {
     await emit(host, "session_shutdown", {}, state.context);
@@ -526,7 +529,7 @@ test("closing-ask", async () => {
     assert.equal(saved.state, "BLOCKED", "A refused required write with a closing ask must persist BLOCKED.");
     assert.match(saved.reason, /Required write operation.*approval\.txt.*outside the project folder/);
     assert.equal(saved.requiredOperations.length, 1);
-    assert.match(state.renderEditor(), /BLOCKED/);
+    assert.match(state.renderEditor(), /Blocked/);
     const transcript = plain(new AssistantMessageComponent(final).render(140).join("\n"));
     const interactive = [transcript, state.renderReceipt(), state.renderEditor()].join("\n").replace(/\s+/g, " ");
     if (!interactive.includes(closingAsk)) {
@@ -534,7 +537,7 @@ test("closing-ask", async () => {
       error.stop = true;
       throw error;
     }
-    assert.match(interactive, /BLOCKED/, "The interactive ask must remain visible alongside the BLOCKED editor.");
+    assert.match(interactive, /Blocked/, "The interactive ask must remain visible alongside the blocked editor.");
     assert.equal(verification.recordRemoteAcceptanceVerdict({ jobId: "approval-snapshot", snapshotDigest: "sha256:approval-snapshot", status: "VERIFIED_PASS", summary: "Remote snapshot passed." }), true);
     await emit(host, "session_shutdown", {}, state.context);
     const resumedHost = registered((api) => { receipt.default(api); shell.default(api); });
@@ -547,7 +550,7 @@ test("closing-ask", async () => {
       assert.match(resumed.renderReceipt(), /Remote snapshot passed/);
       await resumedHost.commands.get("usage").handler("", resumed.context);
       assert.match(resumed.notifications.at(-1).text, /State: Stopped — needs you/);
-      assert.match(resumed.renderEditor(), /BLOCKED/);
+      assert.match(resumed.renderEditor(), /Blocked/);
       const restoredFinal = resumedHost.branch.filter((entry) => entry.type === "message" && entry.message.role === "assistant").at(-1).message;
       const restoredTranscript = plain(new AssistantMessageComponent(restoredFinal).render(140).join("\n"));
       if (![restoredTranscript, resumed.renderReceipt(), resumed.renderEditor()].join(" ").replace(/\s+/g, " ").includes(closingAsk)) {
@@ -578,7 +581,7 @@ test("go-ahead-live", async () => {
     await emit(host, "before_agent_start", { prompt: "go ahead" }, state.context);
     await emit(host, "agent_start", {}, state.context);
     await emit(host, "agent_end", {}, state.context);
-    assert.match(state.renderEditor(), /BLOCKED/, "A go-ahead without retry must retain the live BLOCKED line.");
+    assert.match(state.renderEditor(), /Blocked/, "A go-ahead without retry must retain the live Blocked line.");
     assert.ok(uiState.getVinciUiState().blockingReason.includes("output.ts"), "The carried live blocker must name its required target.");
   } finally {
     await emit(host, "session_shutdown", {}, state.context);
@@ -623,7 +626,7 @@ test("go-ahead-retry", async () => {
     assert.equal(outcome.getVinciTaskOutcome().state, "DONE", "A go-ahead followed by an equivalent successful retry must complete.");
     assert.deepEqual(outcome.getVinciTaskOutcome().changedFiles, ["approved.txt"]);
     assert.ok(!uiState.getVinciUiState().blockingReason, "An approved equivalent retry must clear its live blocker.");
-    assert.match(state.renderEditor(), /DONE/);
+    assert.match(state.renderEditor(), /Done/);
   } finally {
     await emit(host, "session_shutdown", {}, state.context);
     rmSync(resolve(cwd, args.path), { force: true });

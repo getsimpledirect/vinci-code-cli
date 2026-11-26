@@ -51,6 +51,7 @@ import {
   sweepStaleTempCopies,
 } from "./lib/crew-worktree.ts";
 import { setVinciCrewStatus } from "./lib/crew-status.ts";
+import { vinciNoColor } from "./lib/cli-presentation.ts";
 import { vinciPlainPresentation, vinciReducedMotion } from "./lib/vero-state.ts";
 import { VINCI_CREW_HELPER_ENV, scanVinciScopeDriftEntries } from "./lib/scope-drift.ts";
 import {
@@ -1028,7 +1029,7 @@ function renderTree(theme: Theme, width: number): string[] {
     ? navActive && !overlayActive ? "↑↓ · Enter · Esc" : anyReady ? "↓ · /agents to apply" : "↓ opens agent"
     : navActive && !overlayActive ? "  ↑↓ move · enter open · esc back" : anyReady ? "  ↓ browse · /agents to apply" : "  ↓ to open an agent";
   lines.push(dim(hint));
-  return lines.map((line) => truncateToWidth(vinciPlainPresentation() ? stripAnsiSequences(line) : line, width));
+  return lines.map((line) => truncateToWidth((vinciPlainPresentation() || vinciNoColor()) ? stripAnsiSequences(line) : line, width));
 }
 
 export type TranscriptKind = "user" | "toolCall" | "toolResult" | "toolError" | "narration";
@@ -1645,7 +1646,7 @@ async function openHelper(ctx: ExtensionContext, h: Helper): Promise<void> {
             ? [`${theme.fg("accent", theme.bold("  Vero · Crew"))}${brandNote}`, ""]
             : [];
           return [...brand, ...heads, ...(chrome.task ? [task] : []), ...body, ...compose, foot].map((line) =>
-            truncateToWidth(vinciPlainPresentation() ? stripAnsiSequences(line) : line, width));
+            truncateToWidth((vinciPlainPresentation() || vinciNoColor()) ? stripAnsiSequences(line) : line, width));
         },
         invalidate: () => input.invalidate(),
         handleInput: (data: string) => {

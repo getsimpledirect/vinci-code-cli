@@ -1,7 +1,7 @@
-  Vinci v0.0.64 Code
-  Vero DONE · Vinci · <repo>
-  ● connected · Read the receipt. · /undo · Ctrl+T thinking
-
+  Vinci Code 0.0.64 · Made, not generated.
+  <workspace> · Vinci
+  Connected · /undo to undo · /help
+  Try: fix a bug · add a feature · explain this code
 
 
  Plan mode — exploring and designing without changing your project.
@@ -16,7 +16,7 @@
  target users or contributors?
 
 
-╭ ◇ Plan with Vinci ────────────────────────────────────────────── ● connected ╮
+╭─ Done ───────────────────────────────────────────────────────────────────────╮
 │                                                                              │
 │›                                                                             │
 │                                                                              │

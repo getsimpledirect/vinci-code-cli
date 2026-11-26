@@ -8,14 +8,18 @@
 import { statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
+import { resetCapabilitiesCache, setCapabilities } from "@earendil-works/pi-tui";
 import chalk from "chalk";
+import { vinciNoColor, vinciPlainPresentation } from "../../../vinci/extensions/lib/cli-presentation.ts";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.ts";
 import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
-import { selectSession } from "./cli/session-picker.ts";
+import { selectPlainSession, selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
+import { selectVinciPlain } from "./cli/vinci-lines.ts";
+import { filterVinciOutput } from "./cli/vinci-output.ts";
 import { ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
@@ -52,6 +56,7 @@ import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { armStartupLivenessWatchdog, markStartupPhase } from "./modes/print-mode.ts";
+import { runVinciPlainMode } from "./modes/vinci-plain-mode.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
@@ -339,12 +344,20 @@ async function createSessionManager(
 	}
 
 	if (parsed.resume) {
+		const vinci = process.env.VINCI_CODE === "1";
+		if (vinci && resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY) !== "interactive") {
+			console.error("No session selected. Use --session <id> or --continue to resume without a picker.");
+			process.exit(0);
+		}
 		try {
-			const selectedPath = await selectSession(
-				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
-				(onProgress) => SessionManager.listAll(sessionDir, onProgress),
-				settingsManager,
-			);
+			const selectedPath =
+				vinci && vinciPlainPresentation()
+					? await selectPlainSession(await SessionManager.listAll(sessionDir))
+					: await selectSession(
+							(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
+							(onProgress) => SessionManager.listAll(sessionDir, onProgress),
+							settingsManager,
+						);
 			if (!selectedPath) {
 				console.log(chalk.dim("No session selected"));
 				process.exit(0);
@@ -537,6 +550,27 @@ export interface MainOptions {
 }
 
 export async function main(args: string[], options?: MainOptions) {
+	const parsed = parseArgs(args);
+	if (process.env.VINCI_CODE !== "1") return runMain(args, parsed, options);
+	const oldNoColor = process.env.NO_COLOR;
+	if (parsed.noColor) process.env.NO_COLOR = "";
+	const appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	const plain = vinciPlainPresentation() || appMode !== "interactive";
+	const protocol = appMode === "json" || appMode === "rpc";
+	const restore = !protocol && (plain || vinciNoColor()) ? filterVinciOutput(plain) : undefined;
+	if (plain) setCapabilities({ images: null, trueColor: false, hyperlinks: false });
+	try {
+		await runMain(args, parsed, options);
+	} finally {
+		if (plain || restore) restoreStdout();
+		restore?.();
+		if (oldNoColor === undefined) delete process.env.NO_COLOR;
+		else process.env.NO_COLOR = oldNoColor;
+		if (plain) resetCapabilitiesCache();
+	}
+}
+
+async function runMain(args: string[], parsed: Args, options?: MainOptions) {
 	resetTimings();
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
@@ -571,7 +605,6 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	const parsed = parseArgs(args);
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;
@@ -603,6 +636,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	const vinciPlain = process.env.VINCI_CODE === "1" && vinciPlainPresentation();
 	if (appMode === "print" || appMode === "json") {
 		// This bounds startup in the CLI process only. A bootstrap updater that runs as a separate
 		// Node process before this one on some launch paths remains an explicit residual for #138.
@@ -637,7 +671,13 @@ export async function main(args: string[], options?: MainOptions) {
 
 	// Experimental first-time setup: theme choice and analytics opt-in.
 	// Runs before any runtime services are created so the chosen settings apply everywhere.
-	if (appMode === "interactive" && !parsed.help && parsed.listModels === undefined && shouldRunFirstTimeSetup()) {
+	if (
+		appMode === "interactive" &&
+		process.env.VINCI_CODE !== "1" &&
+		!parsed.help &&
+		parsed.listModels === undefined &&
+		shouldRunFirstTimeSetup()
+	) {
 		await showFirstTimeSetup(startupSettingsManager);
 		time("firstTimeSetup");
 	}
@@ -657,7 +697,11 @@ export async function main(args: string[], options?: MainOptions) {
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
-			const selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
+			const selectedCwd = vinciPlain
+				? await selectVinciPlain(formatMissingSessionCwdPrompt(missingSessionCwdIssue), [
+						missingSessionCwdIssue.fallbackCwd,
+					])
+				: await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
 			if (!selectedCwd) {
 				process.exit(0);
 			}
@@ -859,7 +903,7 @@ export async function main(args: string[], options?: MainOptions) {
 		stdinContent,
 	);
 	time("prepareInitialMessage");
-	initTheme(settingsManager.getTheme(), appMode === "interactive");
+	initTheme(settingsManager.getTheme(), appMode === "interactive" && !vinciPlain);
 	time("initTheme");
 
 	// Show deprecation warnings in interactive mode
@@ -891,6 +935,8 @@ export async function main(args: string[], options?: MainOptions) {
 	if (appMode === "rpc") {
 		printTimings();
 		await runRpcMode(runtime);
+	} else if (appMode === "interactive" && vinciPlain) {
+		await runVinciPlainMode(runtime, { agentDir, initialMessage, initialImages, messages: parsed.messages });
 	} else if (appMode === "interactive") {
 		const tuiMode = parsed.tuiMode ?? settingsManager.getTuiMode();
 		// [vinci] The launcher's identity gate owns Vinci's startup-only clipboard environment override.
@@ -905,6 +951,7 @@ export async function main(args: string[], options?: MainOptions) {
 			initialImages,
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
+			vinciWelcome: process.env.VINCI_CODE === "1" && !startupBenchmark,
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();

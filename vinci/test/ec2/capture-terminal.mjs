@@ -13,7 +13,10 @@ import { viewportSvg, viewportText } from "./terminal-render.mjs";
 const XtermTerminal = xterm.Terminal;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 // Measure the composer's pulse; a static header separator can precede the same activity text.
-const ACTIVITY = /^╭ (·|•|●)\s+(Contemplating|Considering|Looking|Making|Checking|Reviewing|Organizing|Coordinating|Adjusting|Running|Updating|Working)/m;
+const READY = /^[+╭][-─] Ready /m;
+const ACTIVITY = /^[+╭][-─] ([.o*·•●]) Thinking\b/m;
+const CONTINUING = /^[+╭][-─] [.o*·•●] Thinking [-·] Continuing the task/m;
+const SETTLED = /^[+╭][-─] (?:Ready|Done|Not sure) /m;
 
 function readOption(name, fallback) {
 	const index = process.argv.indexOf(name);
@@ -194,8 +197,7 @@ async function capture() {
 		VINCI_HOME: join(home, ".vinci-code"),
 		VINCI_NO_BOOTSTRAP_HEAL: "1",
 		VINCI_API_KEY: "visual-test",
-		// This is the animation positive control. Plain/accessibility/reduced-motion negatives have
-		// separate registered-renderer coverage and must not disable the pulse this run measures.
+		// Exercise the rich composer under the inherited CI motion gate.
 		VINCI_ASCII_WORDMARK: undefined,
 		VINCI_REDUCED_MOTION: undefined,
 		VINCI_PLAIN: undefined,
@@ -206,6 +208,7 @@ async function capture() {
 		VINCI_NO_SANDBOX: "1",
 		VINCI_NO_VERIFY: "1",
 	};
+	const ciMotionDisabled = !["", "0", "false", "no", "off"].includes(environment.CI?.trim().toLowerCase() ?? "");
 
 	const flush = async () => {
 		await writeQueue;
@@ -265,10 +268,10 @@ async function capture() {
 			child.once("exit", (code, signal) => resolvePromise({ code, signal }));
 		});
 
-		await waitForScreen(/Ask Vinci|Vinci Forte/, 10_000, "the Vinci composer");
+		await waitForScreen(READY, 10_000, "the Ready composer border");
 		await saveFrame("startup");
 		childInput.write("Reply with exactly: Visual test complete.\r");
-		await waitForScreen(ACTIVITY, 6_000, "an animated activity phase");
+		await waitForScreen(ACTIVITY, 6_000, "the Thinking composer border");
 
 		const seenPulses = new Set();
 		for (let attempt = 0; attempt < 12 && seenPulses.size < 3; attempt++) {
@@ -280,11 +283,17 @@ async function capture() {
 			}
 			await wait(140);
 		}
-		assert.ok(seenPulses.size >= 2, `Expected at least two native pulse frames, saw ${[...seenPulses].join(", ")}`);
-		await waitForScreen(/Continuing the/, 8_000, "the automatic continuation handoff");
+		if (ciMotionDisabled) {
+			assert.ok(seenPulses.size === 1 && (seenPulses.has("*") || seenPulses.has("●")),
+				`Expected one steady Thinking mark in CI, saw ${[...seenPulses].join(", ")}`);
+		} else {
+			assert.ok(seenPulses.size >= 2, `Expected at least two native pulse frames, saw ${[...seenPulses].join(", ")}`);
+		}
+		await waitForScreen(CONTINUING, 8_000, "the automatic continuation handoff on the Thinking composer border");
 		await saveFrame("continuing");
 
-		const completedScreen = await waitForScreen(/Ask Vinci/, 12_000, "the completed Vinci composer");
+		await waitForScreen(/^ *Visual test complete\./m, 12_000, "the final synthetic response");
+		const completedScreen = await waitForScreen(SETTLED, 12_000, "the settled Vinci composer border");
 		assert.match(completedScreen, /Visual test complete\./);
 		assert.match(completedScreen, /changed · \+1 −1/);
 		assert.match(completedScreen, /quiet/);
@@ -302,7 +311,8 @@ async function capture() {
 			const observation = JSON.parse(readFileSync(resizeMarker, "utf8"));
 			assert.equal(observation.columns, resizeColumns, "The CLI must observe the actual resized PTY columns");
 			assert.equal(observation.rows, rows, "The CLI must observe the actual resized PTY rows");
-			await waitForScreen(/Ask Vinci/, 5_000, "the resized Vinci composer");
+			const resizedBorder = new RegExp(`(?=^.{${resizeColumns - 1}}[+╮]$)${SETTLED.source}`, "m");
+			await waitForScreen(resizedBorder, 5_000, "the resized Vinci composer border");
 			await wait(100);
 			await saveFrame(`resized-${resizeColumns}`);
 			writeFileSync(join(outputDir, `${prefix}-resize-observation.json`), `${JSON.stringify(observation)}\n`);

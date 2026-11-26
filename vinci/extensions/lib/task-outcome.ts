@@ -34,6 +34,7 @@ import {
   isVerdictStatus,
   type VerdictStatus,
 } from "./canonical-verdicts.ts";
+import { registerVeroTaskOutcomeSource } from "./vero-presentation.ts";
 
 export const VINCI_TASK_OUTCOME_ENTRY = "vinci-task-outcome";
 export const VINCI_FALSE_COMPLETION_ENTRY = "vinci-false-completion-report";
@@ -225,6 +226,7 @@ vinciGlobal[STORE_KEY] = store;
 const gitCheckpointDeclines = store.gitCheckpointDeclines ??= new Map<string, number>();
 const gitCheckpointDeclinedToolCallIds = store.gitCheckpointDeclinedToolCallIds ??= new Map<string, Set<string>>();
 const shellWriteRedirectToolCallIds = store.shellWriteRedirectToolCallIds ??= new Map<string, Set<string>>();
+registerVeroTaskOutcomeSource(() => getVinciTaskOutcome()?.state);
 
 export function recordVinciGitCheckpointDecline(taskId: string): void {
   gitCheckpointDeclines.set(taskId, (gitCheckpointDeclines.get(taskId) ?? 0) + 1);

@@ -4,6 +4,7 @@ import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { afterEach, describe, test } from "vitest";
+import { vinciReducedMotion } from "../../extensions/lib/cli-presentation.ts";
 import { sendVinciControl } from "../../extensions/lib/control.ts";
 import vinciLoopbreak from "../../extensions/vinci-loopbreak.ts";
 import vinciTodo from "../../extensions/vinci-todo.ts";
@@ -99,8 +100,8 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 		const ui = await createUi({ connected: false });
 		const screen = await ui.screen();
 		assert.match(screen, /\/login to connect/);
-		assert.match(screen, /Vinci\b/);
-		assert.match(screen, /Ask Vinci/);
+		assert.match(screen, /Vinci Code \d+\.\d+\.\d+/);
+		assert.match(screen, /^[+╭][-─] Ready /m);
 		assert.match(screen, /AUTO/);
 		assert.doesNotMatch(screen, /\bpi v\d/i);
 		await expectSnapshot("startup-disconnected-80x24", ui);
@@ -108,8 +109,8 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 
 	test("saved-credential startup remains honest and usable in a narrow terminal", async () => {
 		const ui = await createUi({ columns: 60, rows: 20, connected: true });
-		assert.match(await ui.screen(), /● credential saved/);
-		assert.doesNotMatch(await ui.screen(), /● connected/);
+		assert.match(await ui.screen(), /^  Signed in\b/m);
+		assert.doesNotMatch(await ui.screen(), /^  Connected\b/m);
 		await expectSnapshot("startup-connected-60x20", ui);
 	});
 
@@ -123,18 +124,18 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 			assert.match(await ui.screen(), /DRAFT-SENTINEL/);
 			await ui.resize(80, 24);
 			assert.equal(ui.mode.editor.getText(), "DRAFT-SENTINEL");
-			assert.match(await ui.screen(), /Vinci v\d+\.\d+\.\d+/);
+			assert.match(await ui.screen(), /Vinci Code \d+\.\d+\.\d+/);
 			assert.equal(ui.core.faux.callCount, 0);
 		});
 	}
 
 	test("removing credentials refreshes a signed-in header to signed out", async () => {
 		const ui = await createUi({ connected: true });
-		assert.match(await ui.screen(), /● credential saved/);
+		assert.match(await ui.screen(), /^  Signed in\b/m);
 		unlinkSync(join(ui.core.tempDir, "auth.json"));
 		ui.sendKeys("x", "\x7f");
 		assert.match(await ui.screen(), /\/login to connect/);
-		assert.doesNotMatch(await ui.screen(), /● credential saved/);
+		assert.doesNotMatch(await ui.screen(), /^  Signed in\b/m);
 	});
 
 	// Fortissimo remains a legacy alias, while new selections expose only the managed choices.
@@ -167,7 +168,7 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 		ui.sendKeys("\x1b");
 		screen = await ui.screen();
 		assert.doesNotMatch(screen, /Keyboard Shortcuts|Operation aborted/);
-		assert.match(screen, /Ask Vinci/);
+		assert.match(screen, /^[+╭][-─] Ready /m);
 
 		ui.sendKeys("/changelog", "\r");
 		screen = await ui.waitForText("What's New");
@@ -176,7 +177,7 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 		ui.sendKeys("\x1b");
 		screen = await ui.screen();
 		assert.doesNotMatch(screen, /What's New|Operation aborted/);
-		assert.match(screen, /Ask Vinci/);
+		assert.match(screen, /^[+╭][-─] Ready /m);
 	});
 
 	test("helper status renders below the editor without a native PTY", async () => {
@@ -195,7 +196,7 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 		const screen = await ui.screen();
 		assert.match(screen, /Explain this project/);
 		assert.match(screen, /mapped the project structure/);
-		assert.match(screen, /● connected/);
+		assert.match(screen, /^  Connected\b/m);
 		await expectSnapshot("prompt-complete-80x24", ui);
 	});
 
@@ -687,21 +688,28 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 			],
 		});
 		const { completion } = await ui.startPrompt("Check the project");
-		await ui.waitForText("verify the result");
-		const activeScreen = await ui.screen();
-		assert.doesNotMatch(activeScreen, /Ask Vinci/);
-		assert.match(activeScreen, /Checking the result…/);
-		const firstPulse = ui.terminal.getViewport().join("\n").match(/╭ ([·•●])\s/)?.[1];
+		const activeScreen = await ui.waitForText("Checking the result");
+		assert.doesNotMatch(activeScreen, /^[+╭][-─] Ready /m);
+		const pulse = /^[+╭][-─] ([.o*·•●]) Thinking [-·] Checking the result/m;
+		const rawPulse = () => ui.terminal.getViewport().join("\n").match(pulse)?.[1];
+		const firstPulse = rawPulse();
 		await new Promise((resolve) => setTimeout(resolve, 310));
 		await ui.settle();
-		const secondPulse = ui.terminal.getViewport().join("\n").match(/╭ ([·•●])\s/)?.[1];
+		const secondPulse = rawPulse();
 		assert.ok(firstPulse);
 		assert.ok(secondPulse);
-		assert.notEqual(firstPulse, secondPulse);
+		if (vinciReducedMotion()) {
+			assert.match(firstPulse, /^[*●]$/);
+			assert.equal(firstPulse, secondPulse);
+		} else {
+			assert.notEqual(firstPulse, secondPulse);
+		}
 		await expectSnapshot("active-working-80x24", ui);
 		await completion;
 		await ui.settle();
-		assert.match(await ui.screen(), /Ask Vinci/);
+		const completedScreen = await ui.screen();
+		assert.match(completedScreen, /^[+╭][-─] (?:Ready|Done) /m);
+		assert.doesNotMatch(completedScreen, pulse);
 	});
 
 	test("changed files produce a transparent completion receipt", async () => {
@@ -795,9 +803,9 @@ describe("Vinci interactive UI", { concurrency: false }, () => {
 		});
 		await ui.prompt("Explain this project");
 		const screen = await ui.screen();
-		assert.match(screen, /! reconnect/);
+		assert.match(screen, /^  Reconnect [-·] \/login\b/m);
 		assert.match(screen, /Stopped — needs you/);
-		assert.doesNotMatch(screen, /● connected/);
+		assert.doesNotMatch(screen, /^  Connected\b/m);
 		await expectSnapshot("expired-credentials-80x24", ui);
 	});
 

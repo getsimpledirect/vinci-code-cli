@@ -37,6 +37,7 @@ export interface Args {
 	extensions?: string[];
 	noExtensions?: boolean;
 	print?: boolean;
+	noColor?: boolean;
 	export?: string;
 	noSkills?: boolean;
 	skills?: string[];
@@ -75,6 +76,8 @@ export function parseArgs(args: string[]): Args {
 
 		if (arg === "--help" || arg === "-h") {
 			result.help = true;
+		} else if (arg === "--no-color" && process.env.VINCI_CODE === "1") {
+			result.noColor = true;
 		} else if (arg === "--version" || arg === "-v") {
 			result.version = true;
 		} else if (arg === "--mode" && process.env.VINCI_CODE === "1") {
@@ -344,7 +347,7 @@ ${chalk.bold("Options:")}
 ${providerRouteOptionsText}  --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
-  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
+${process.env.VINCI_CODE === "1" ? "  --no-color                    Remove colour while keeping the interactive layout\n" : ""}  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
 ${fullscreenDisclosure}  --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume

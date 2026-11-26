@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { getCapabilities, setCapabilities, setCellDimensions, TUI, Text } from "@earendil-works/pi-tui";
@@ -11,10 +12,10 @@ import { createJiti } from "jiti/static";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
 const productVersion = JSON.parse(readFileSync(join(root, "vinci/identity.json"), "utf8")).version;
-const testDir = mkdtempSync(join(root, "node_modules/.vero-integration-"));
+const testDir = mkdtempSync(join(tmpdir(), "look-registered-"));
 const environmentKeys = [
-  "TMPDIR", "GIT_CEILING_DIRECTORIES", "PI_OFFLINE", "VINCI_CODE", "VINCI_NO_VERIFY", "VINCI_NO_SANDBOX",
-  "VINCI_ASCII_WORDMARK", "VINCI_HERO_HEADER", "VINCI_VERO_IMAGES", "NO_COLOR", "TERM", "VINCI_PLAIN", "VINCI_SCREEN_READER", "VINCI_REDUCED_MOTION",
+  "TMPDIR", "GIT_CEILING_DIRECTORIES", "PI_OFFLINE", "VINCI_CODE", "VINCI_NO_VERIFY", "VINCI_NO_SANDBOX", "OPENAI_API_KEY",
+  "CI", "LC_ALL", "VINCI_ASCII", "VINCI_ASCII_WORDMARK", "VINCI_HERO_HEADER", "VINCI_VERO_IMAGES", "NO_COLOR", "TERM", "VINCI_PLAIN", "VINCI_SCREEN_READER", "VINCI_REDUCED_MOTION",
 ];
 const originalEnvironment = new Map(environmentKeys.map((key) => [key, process.env[key]]));
 const originalCapabilities = { ...getCapabilities() };
@@ -28,7 +29,7 @@ function check(name, condition) {
 }
 
 function presentationEnvironment(overrides = {}) {
-  for (const key of ["VINCI_ASCII_WORDMARK", "VINCI_HERO_HEADER", "VINCI_VERO_IMAGES", "NO_COLOR", "VINCI_PLAIN", "VINCI_SCREEN_READER", "VINCI_REDUCED_MOTION"]) {
+  for (const key of ["CI", "VINCI_ASCII", "VINCI_ASCII_WORDMARK", "VINCI_HERO_HEADER", "VINCI_VERO_IMAGES", "NO_COLOR", "VINCI_PLAIN", "VINCI_SCREEN_READER", "VINCI_REDUCED_MOTION"]) {
     delete process.env[key];
   }
   process.env.TERM = "xterm-256color";
@@ -37,21 +38,9 @@ function presentationEnvironment(overrides = {}) {
 
 function imagePayload(lines, protocol) {
   const text = lines.join("\n");
-  if (protocol === "kitty") {
-    const chunks = [...text.matchAll(/\x1b_G([^;]*);([^\x1b]*)\x1b\\/g)];
-    if (!chunks.length) return undefined;
-    return {
-      bytes: Buffer.from(chunks.map((chunk) => chunk[2]).join(""), "base64"),
-      parameters: Object.fromEntries(chunks[0][1].split(",").map((item) => item.split("="))),
-    };
-  }
-  const match = text.match(/\x1b\]1337;File=([^:]*):([^\x07]*)\x07/);
-  if (!match) return undefined;
-  return { bytes: Buffer.from(match[2], "base64"), parameters: Object.fromEntries(match[1].split(";").map((item) => item.split("="))) };
-}
-
-function withoutImages(text) {
-  return text.replace(/\x1b_G[^\x1b]*\x1b\\/g, "").replace(/\x1b\]1337;File=[^\x07]*\x07/g, "");
+  const chunks = protocol === "kitty" ? text.matchAll(/\x1b_G[^;]*;([^\x1b]*)\x1b\\/g)
+    : text.matchAll(/\x1b\]1337;File=[^:]*:([^\x07]*)\x07/g);
+  return Buffer.from(Array.from(chunks, (chunk) => chunk[1]).join(""), "base64");
 }
 
 async function bounded(promise, description, timeoutMs = 5_000) {
@@ -173,39 +162,39 @@ try {
   }
 
   const transitions = [
-    ["READY", "pixel", () => {}],
-    ["WORKING", "working", (ui) => ui.emit("agent_start")],
-    ["REVIEW", "review", (ui) => ui.emit("tool_call", { toolCallId: "check", toolName: "rerun_check", input: {} })],
-    ["BLOCKED", "blocked", () => control.requestVinciAutomationStop("A real fixture stop")],
-    ["WAITING", "review", () => { control.clearVinciAutomationStop(); state.setVinciWorking(false); outcome("WAITING"); }],
-    ["DONE-UNVERIFIED", "review", () => outcome("DONE_UNVERIFIED")],
-    ["DONE", "done", () => outcome("DONE")],
+    ["Ready", () => {}],
+    ["Thinking", (ui) => ui.emit("agent_start")],
+    ["Thinking - Checking...", (ui) => ui.emit("tool_call", { toolCallId: "check", toolName: "rerun_check", input: {} })],
+    ["Blocked", () => control.requestVinciAutomationStop("A real fixture stop")],
+    ["Waiting for you", () => { control.clearVinciAutomationStop(); state.setVinciWorking(false); outcome("WAITING"); }],
+    ["Not sure", () => outcome("DONE_UNVERIFIED")],
+    ["Done", () => outcome("DONE")],
   ];
-
-  // Native image capability alone must not enable the unqualified preview.
-  for (const protocol of ["kitty", "iterm2"]) {
-    presentationEnvironment({ VINCI_REDUCED_MOTION: "1", VINCI_HERO_HEADER: "1" });
+  for (const protocol of ["kitty", "iterm2", null]) {
+    presentationEnvironment({ VINCI_ASCII: "1", VINCI_REDUCED_MOTION: "1", VINCI_VERO_IMAGES: "1", VINCI_HERO_HEADER: "1" });
     for (const themeName of ["dark", "light"]) {
       const ui = await registeredUi(protocol, 80, themeName);
       try {
-        ui.context.model = undefined;
-        for (const width of [20, 39, 40, 60, 80, 120]) {
-          for (const rows of [10, 24]) {
-            ui.terminal.resize(width, rows);
-            resetPresentation();
+        for (const width of [40, 80, 120, 40]) {
+          ui.terminal.resize(width, 24);
+          resetPresentation();
+          const baseline = await ui.frame();
+          const composerRow = baseline.findIndex((line) => line.includes("UNSENT COMPOSER SENTINEL"));
+          check(`${protocol ?? "text"} composer is visible at ${width} columns`, composerRow >= 0);
+          for (const [label, transition] of transitions) {
+            await transition(ui);
             const lines = ui.header.render(width);
             const text = stripVTControlCharacters(lines.join("\n"));
-            check(`default ${protocol} ${themeName} ${width}x${rows} fits the compact header`, lines.length === (rows < 12 ? 3 : 5));
-            check(`default ${protocol} ${width}x${rows} retains product, version, Vero and login`, text.includes(`Vinci v${productVersion}`) && /Vero READY/.test(text) && /\/login to connect/.test(text));
-            check(`default ${protocol} ${width}x${rows} has no image or former aperture`, !/\x1b_G|\x1b\]1337;File=|✹|[\u2800-\u28ff]/.test(lines.join("\n")));
-            check(`default ${protocol} has a truthful missing-model hint at ${width} columns`, text.includes(width < 40 ? "/model" : "Choose a model: /model") && !text.includes("GLM 5.2"));
-            await ui.frame();
-            check(`default ${protocol} ${width}x${rows} preserves the unsent draft`, ui.editor.getText() === "UNSENT COMPOSER SENTINEL");
+            check(`${protocol ?? "text"} header keeps four content rows and product identity`,
+              lines.length === 5 && text.includes("Vinci Code") && text.includes(productVersion));
+            check("legacy image flags have no effect on the wordmark", !/\x1b_G|\x1b\]1337;File=|✹|𝐯/.test(lines.join("\n")));
+            check(`${label} is visible on the editor border`, stripVTControlCharacters(ui.editor.render(width)[1]).includes(label));
+            const frame = await ui.frame();
+            check(`${label} leaves the draft on the same row`, frame.findIndex((line) =>
+              line.includes("UNSENT COMPOSER SENTINEL")) === composerRow && ui.editor.getText() === "UNSENT COMPOSER SENTINEL");
           }
         }
-        state.setVinciWorking(false);
-        outcome("DONE_UNVERIFIED");
-        check("20-column completion remains explicitly unverified", stripVTControlCharacters(ui.header.render(20).join("\n")).includes("Vero UNVERIFIED"));
+        check("header and shell add no presentation transcript entries", ui.writes.length === 0);
       } finally {
         await ui.close();
       }
@@ -219,96 +208,57 @@ try {
   writeFileSync(join(fallbackAssets, "manifest.json"), JSON.stringify(manifest));
   const fallbackUrl = pathToFileURL(`${fallbackRoot}/`);
   check("missing assets retain the text path", veroImages.createVeroImages(fallbackUrl).size === 0);
-  writeFileSync(join(fallbackAssets, "vero-pixel.png"), assets.get("pixel"));
-  check("approved asset fallback positive control loads exact bytes", veroImages.createVeroImages(fallbackUrl).has("pixel"));
-  const corruptPixel = Buffer.from(assets.get("pixel"));
-  corruptPixel[corruptPixel.length - 1] ^= 1;
-  writeFileSync(join(fallbackAssets, "vero-pixel.png"), corruptPixel);
-  check("a corrupt asset with intact dimensions is rejected", !veroImages.createVeroImages(fallbackUrl).has("pixel"));
-
-  for (const protocol of ["kitty", "iterm2", null]) {
-    presentationEnvironment({ VINCI_REDUCED_MOTION: "1", VINCI_VERO_IMAGES: "1" });
-    for (const themeName of ["dark", "light"]) {
-      const ui = await registeredUi(protocol, 80, themeName);
-      try {
-        for (const width of [40, 80, 120, 40]) {
-          ui.terminal.resize(width, 24);
-          resetPresentation();
-          const baseline = await ui.frame();
-          const composerRow = baseline.findIndex((line) => line.includes("UNSENT COMPOSER SENTINEL"));
-          check(`${protocol ?? "text"} ${themeName} composer is visible at ${width} columns`, composerRow >= 0);
-          for (const [label, pose, transition] of transitions) {
-            await transition(ui);
-            const presentation = vero.getVeroPresentation();
-            const lines = ui.header.render(width);
-            check(`${protocol ?? "text"} ${themeName} ${label} keeps a five-row header at ${width} columns`, lines.length === 5 &&
-              presentation.pose === pose && presentation.label === label);
-            check(`${protocol ?? "text"} ${label} keeps its explicit state in header text at ${width} columns`,
-              stripVTControlCharacters(withoutImages(lines.join("\n"))).includes(`Vero ${label}`));
-            check(`${label} explains the next action without claiming approval or verification`, presentation.nextAction.length > 0 &&
-              !/\b(?:approved|verified|passed|safe|secure)\b/i.test(presentation.nextAction));
-            const payload = protocol ? imagePayload(lines, protocol) : undefined;
-            if (protocol) {
-              check(`${protocol} ${pose} transmits the unmodified approved PNG at ${width} columns`, payload?.bytes.equals(assets.get(pose)));
-              check(`${protocol} ${pose} stays within the reserved image cells at ${width} columns`, protocol === "kitty"
-                ? Number(payload.parameters.c) <= 6 && Number(payload.parameters.r) <= 3 && payload.parameters.C === "1"
-                : Number(payload.parameters.width) <= 6 && payload.parameters.height === "auto" && payload.parameters.preserveAspectRatio !== "0");
-              check(`${protocol} text returns to column 11 after image rows at ${width} columns`, lines.slice(1, 4).every((line) => line.includes("\x1b[11G")));
-            } else {
-              check(`text ${label} fallback contains no image protocol at ${width} columns`, !/\x1b_G|\x1b\]1337;File=/.test(lines.join("\n")));
-            }
-            // Headless xterm does not implement iTerm OSC images' native cursor movement. The
-            // Kitty C=1 path and text path are admissible for measured composer row placement.
-            if (protocol !== "iterm2") {
-              const frame = await ui.frame();
-              check(`${protocol ?? "text"} ${label} leaves the draft on the same row at ${width} columns`, frame.findIndex((line) =>
-                line.includes("UNSENT COMPOSER SENTINEL")) === composerRow && ui.editor.getText() === "UNSENT COMPOSER SENTINEL");
-              check(`${protocol ?? "text"} header retains its brand after ${label} at ${width} columns`, frame.some((line) => line.includes(`Vinci v${productVersion}`)));
-            }
-          }
-        }
-        check(`${protocol ?? "text"} header and shell add no Vero transcript entries`, ui.writes.length === 0);
-      } finally {
-        await ui.close();
-      }
-    }
-  }
+  writeFileSync(join(fallbackAssets, "vero-rich.png"), assets.get("rich"));
+  check("the approved hero asset loads", veroImages.createVeroImages(fallbackUrl).has("rich"));
+  const corruptHero = Buffer.from(assets.get("rich"));
+  corruptHero[corruptHero.length - 1] ^= 1;
+  writeFileSync(join(fallbackAssets, "vero-rich.png"), corruptHero);
+  check("a corrupt hero asset with intact dimensions is rejected", !veroImages.createVeroImages(fallbackUrl).has("rich"));
 
   for (const protocol of ["kitty", "iterm2"]) {
-    presentationEnvironment({ VINCI_HERO_HEADER: "1", VINCI_REDUCED_MOTION: "1", VINCI_VERO_IMAGES: "1" });
+    presentationEnvironment({ LC_ALL: "C.UTF-8", VINCI_REDUCED_MOTION: "1" });
+    const compact = await registeredUi(protocol);
+    let compactLines;
+    try {
+      compactLines = compact.header.render(80);
+      const text = stripVTControlCharacters(compactLines.join("\n"));
+      check(`${protocol} compact header retains its identity and login`, compactLines.length === 5 &&
+        text.includes(`Vinci Code ${productVersion}`) && text.includes("/login to connect"));
+    } finally {
+      await compact.close();
+    }
+
+    process.env.VINCI_VERO_IMAGES = "1";
+    const imagesOnly = await registeredUi(protocol);
+    try {
+      check(`${protocol} image support alone leaves compact header bytes identical`,
+        JSON.stringify(imagesOnly.header.render(80)) === JSON.stringify(compactLines));
+    } finally {
+      await imagesOnly.close();
+    }
+
+    process.env.VINCI_HERO_HEADER = "1";
     const ui = await registeredUi(protocol);
     try {
       const idle = ui.header.render(80);
-      const idlePayloads = idle.map((line) => imagePayload([line], protocol)).filter(Boolean);
-      check(`${protocol} hero idle sends the approved rich PNG`, idlePayloads.some((payload) => payload.bytes.equals(assets.get("rich"))));
-      const idleHeight = idle.length;
+      check(`${protocol} hero idle sends the approved rich PNG`, imagePayload(idle, protocol).equals(assets.get("rich")));
       await ui.emit("agent_start");
       const working = ui.header.render(80);
-      const workingPayloads = working.map((line) => imagePayload([line], protocol)).filter(Boolean);
-      check(`${protocol} hero working sends the approved working PNG without changing height`, working.length === idleHeight &&
-        workingPayloads.some((payload) => payload.bytes.equals(assets.get("working"))));
-      check(`${protocol} hero working keeps its identity and activity readable`, stripVTControlCharacters(withoutImages(working.join("\n"))).includes("Vero WORKING"));
+      check(`${protocol} hero working sends the approved working PNG without changing height`, working.length === idle.length &&
+        imagePayload(working, protocol).equals(assets.get("working")));
+      check(`${protocol} hero working keeps its identity and activity readable`,
+        stripVTControlCharacters(working[0]).includes(`Vinci Code ${productVersion}`) &&
+        stripVTControlCharacters(ui.editor.render(80)[1]).includes("Thinking"));
+      state.setVinciProviderError("Fixture provider failure.");
+      check(`${protocol} hero provider failure sends the approved blocked PNG`,
+        imagePayload(ui.header.render(80), protocol).equals(assets.get("blocked")));
+      check(`${protocol} narrow header omits the hero`, imagePayload(ui.header.render(39), protocol).length === 0);
     } finally {
       await ui.close();
     }
   }
 
-  presentationEnvironment({ VINCI_REDUCED_MOTION: "1" });
-  const nextActionUi = await registeredUi(null, 120);
-  try {
-    for (const stateName of ["WAITING", "DONE_UNVERIFIED", "BLOCKED", "DONE"]) {
-      state.setVinciWorking(false);
-      outcome(stateName);
-      const presentation = vero.getVeroPresentation();
-      const text = stripVTControlCharacters(nextActionUi.editor.render(120).join("\n"));
-      check(`${presentation.label} composer retains the call to action and receipt-grounded next step`, text.includes("Ask Vinci") &&
-        text.includes(presentation.label) && text.includes(presentation.nextAction));
-    }
-  } finally {
-    await nextActionUi.close();
-  }
-
-  presentationEnvironment({ VINCI_REDUCED_MOTION: "1", VINCI_VERO_IMAGES: "1" });
+  presentationEnvironment({ VINCI_ASCII: "1", VINCI_REDUCED_MOTION: "1" });
   const failedActivityUi = await registeredUi("kitty");
   try {
     await failedActivityUi.emit("agent_start");
@@ -316,42 +266,26 @@ try {
       message: { role: "assistant", provider: "vinci", stopReason: "error", errorMessage: "Fixture provider returned 503." },
     });
     await failedActivityUi.emit("agent_end");
-    check("a reported provider failure remains visibly blocked after activity ends", vero.getVeroPresentation().pose === "blocked" &&
-      imagePayload(failedActivityUi.header.render(80), "kitty")?.bytes.equals(assets.get("blocked")));
+    check("a reported provider failure remains visible after activity ends",
+      stripVTControlCharacters(failedActivityUi.editor.render(80)[1]).includes("Error - Fixture provider returned 503."));
     await failedActivityUi.emit("agent_start");
-    check("starting a new activity retains the unremediated provider blocker", vero.getVeroPresentation().pose === "blocked" &&
-      imagePayload(failedActivityUi.header.render(80), "kitty")?.bytes.equals(assets.get("blocked")));
+    check("starting new activity retains an unresolved provider error", vero.getVeroPresentation().label === "Error");
     await failedActivityUi.emit("message_end", { message: { role: "assistant", provider: "vinci", stopReason: "stop", content: [{ type: "text", text: "Observed successful response." }] } });
-    check("an observed successful same-provider response clears its blocker", vero.getVeroPresentation().pose === "working" &&
-      imagePayload(failedActivityUi.header.render(80), "kitty")?.bytes.equals(assets.get("working")));
+    check("observed success clears its provider error", vero.getVeroPresentation().label === "Thinking");
   } finally {
     await failedActivityUi.close();
   }
 
-  for (const [name, environment] of [
-    ["NO_COLOR", { NO_COLOR: "" }], ["plain", { VINCI_PLAIN: "1" }],
-    ["screen reader", { VINCI_SCREEN_READER: "1" }], ["dumb terminal", { TERM: "dumb" }],
+  const tty = [process.stdin, process.stdout].map((stream) => Object.getOwnPropertyDescriptor(stream, "isTTY"));
+  for (const [name, environment, ttyAttached, frames] of [
+    ["animated", {}, true, [".", "o", "*", "o"]],
+    ["NO_COLOR with motion allowed", { NO_COLOR: "1" }, true, [".", "o", "*", "o"]],
+    ["reduced motion", { VINCI_REDUCED_MOTION: "1" }, true, []],
+    ["CI", { CI: "true" }, true, []],
+    ["non-TTY", {}, false, []],
   ]) {
-    presentationEnvironment({ ...environment, VINCI_HERO_HEADER: "1", VINCI_VERO_IMAGES: "1" });
-    // A fresh module matches a fresh process's environment-derived wordmark selection.
-    const plainLoader = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
-    const plainHeader = await plainLoader.import(resolve(here, "../extensions/vinci-header.ts"), { default: false });
-    const ui = await registeredUi("kitty", 80, "dark", "tui", plainHeader);
-    try {
-      state.setVinciWorking(false);
-      outcome("DONE_UNVERIFIED");
-      const plain = ui.header.render(80);
-      check(`${name} keeps an explicit DONE-UNVERIFIED text fallback without artwork`, plain.length === 5 &&
-        stripVTControlCharacters(plain.join("\n")).includes("Vero DONE-UNVERIFIED") && !/\x1b_G|\x1b\]1337;File=|[\u2800-\u28ff]/.test(plain.join("\n")));
-      check(`${name} header has no SGR colors or decorative wordmark glyphs`, !/\x1b|[\u2800-\u28ff]|𝐯|✹/.test(plain.join("\n")) &&
-        plain.join("\n").includes("Vinci"));
-    } finally {
-      await ui.close();
-    }
-  }
-
-  for (const staticMode of [false, true]) {
-    presentationEnvironment(staticMode ? { VINCI_REDUCED_MOTION: "1" } : {});
+    presentationEnvironment({ VINCI_ASCII: "1", ...environment });
+    for (const stream of [process.stdin, process.stdout]) Object.defineProperty(stream, "isTTY", { value: ttyAttached, configurable: true });
     const ui = await registeredUi("kitty");
     const originalSetInterval = globalThis.setInterval;
     const originalClearInterval = globalThis.clearInterval;
@@ -362,18 +296,44 @@ try {
       return interval;
     };
     globalThis.clearInterval = (interval) => intervals.delete(interval);
+    const stateLine = () => stripVTControlCharacters(ui.editor.render(80)[1]);
     try {
       await ui.emit("agent_start");
-      check(staticMode ? "reduced motion starts no animation interval" : "ordinary working presentation starts one pulse interval", intervals.size === (staticMode ? 0 : 1));
-      const first = ui.header.render(80);
-      const second = ui.header.render(80);
-      check("Vero artwork remains static during working activity", first.join("\n") === second.join("\n"));
+      check(`${name} starts the expected number of pulse timers`, intervals.size === Number(frames.length > 0));
+      if (frames.length) {
+        const [timer] = intervals;
+        check("pulse interval is 260 ms", timer.intervalMs === 260);
+        for (const frame of frames) {
+          check(`pulse frame ${frame} keeps Thinking visible`, stateLine().includes(`${frame} Thinking`));
+          timer.callback();
+        }
+      } else {
+        check(`${name} keeps a steady thinking mark`, stateLine().includes("* Thinking"));
+      }
+      if (name === "animated") {
+        check("provider error starts with a live pulse timer", intervals.size === 1);
+        await ui.emit("message_end", {
+          message: { role: "assistant", provider: "vinci", stopReason: "error", errorMessage: "Fixture provider returned 503." },
+        });
+        check("provider error clears the live pulse timer before agent end", intervals.size === 0);
+        check("provider error replaces the Thinking border", stateLine().includes("Error - Fixture provider returned 503.") && !stateLine().includes("Thinking"));
+        await ui.emit("message_end", { message: { role: "assistant", provider: "vinci", stopReason: "stop", content: [{ type: "text", text: "Observed successful response." }] } });
+      }
       await ui.emit("agent_end");
       check("agent end clears animation intervals", intervals.size === 0);
+      outcome("WAITING");
+      check("a wait shows state text", stateLine().includes("Waiting for you"));
+      await ui.emit("agent_start");
+      await ui.emit("session_shutdown");
+      check("shutdown clears animation intervals", intervals.size === 0);
     } finally {
       await ui.close();
       globalThis.setInterval = originalSetInterval;
       globalThis.clearInterval = originalClearInterval;
+      for (const [index, stream] of [process.stdin, process.stdout].entries()) {
+        if (tty[index]) Object.defineProperty(stream, "isTTY", tty[index]);
+        else Reflect.deleteProperty(stream, "isTTY");
+      }
     }
   }
 
@@ -415,8 +375,21 @@ try {
     await bounded(runtimeUi.close(), "real-runtime UI shutdown");
   }
 
+  presentationEnvironment({ LC_ALL: "C.UTF-8", OPENAI_API_KEY: "fixture-key", VINCI_REDUCED_MOTION: "1" });
+  const authPath = join(profile, "auth.json");
+  utimesSync(authPath, 1, 1);
+  const authUi = await registeredUi(null);
+  try {
+    const headerText = () => stripVTControlCharacters(authUi.header.render(80).join("\n"));
+    check("rich header prompts for Vinci login with only an environment provider key", headerText().includes("/login to connect"));
+    writeFileSync(authPath, JSON.stringify({ vinci: { type: "api_key", key: "fixture-key" } }));
+    utimesSync(authPath, 2, 2);
+    check("rich header shows signed in with a saved Vinci credential", headerText().includes("Signed in"));
+  } finally {
+    await authUi.close();
+  }
+
   process.stdout.write(`\nvero-integration: ${checks}/${checks} checks passed (registered renderers, protocol bytes, measured text geometry and transcript isolation).\n`);
-  process.stdout.write("Native Kitty/iTerm image appearance and physical iTerm row placement remain unqualified by the headless terminal.\n");
 } finally {
   if (agentDirKey) {
     if (originalAgentDir === undefined) delete process.env[agentDirKey];

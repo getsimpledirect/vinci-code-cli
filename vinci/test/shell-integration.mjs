@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
-import { TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { resetCapabilitiesCache, setCapabilities, TUI, visibleWidth } from "@earendil-works/pi-tui";
 import xterm from "@xterm/headless";
 import { createJiti } from "jiti/static";
 import { parseLauncherExtensions } from "./launcher-extensions.mjs";
@@ -312,11 +312,15 @@ const { VirtualTerminal } = await loader.import(
 const { KeybindingsManager } = await loader.import(
   fileURLToPath(new URL("../../packages/coding-agent/src/core/keybindings.ts", import.meta.url)),
 );
+process.env.TERM = "xterm-256color";
+process.env.LC_ALL = "en_US.UTF-8";
+process.env.VINCI_ASCII = "0";
 initTheme("dark", false);
 const terminal = new VirtualTerminal(116, 41);
 const tui = new TUI(terminal);
 let editor;
 const footerContext = {
+  ...shellContext,
   cwd: "/workspace/scratch/08d999a8bd37/vinci-cli-ui-qa-20261006/project",
   model: { name: "Offline UI QA" },
   getContextUsage: () => ({ percent: 20, tokens: 26_000 }),
@@ -330,6 +334,41 @@ const footerContext = {
 };
 await emit("session_start", {}, footerContext);
 
+const footerEnv = ["TERM", "FORCE_COLOR", "NO_COLOR"].map((key) => [key, process.env[key]]);
+try {
+  setCapabilities({ images: null, trueColor: false, hyperlinks: false });
+  process.env.TERM = "xterm";
+  delete process.env.FORCE_COLOR;
+  delete process.env.NO_COLOR;
+  const footer16 = editor.render(80).at(-1);
+  const sgr16 = [...footer16.matchAll(/\x1b\[([0-9;]*)m/g)].flatMap((match) => match[1].split(";"));
+  check("16-colour composer footer uses ANSI green and omits extended colour and SGR 2",
+    sgr16.includes("32") && !sgr16.includes("38") && !sgr16.includes("2"));
+  process.env.TERM = "xterm-256color";
+  for (const width of [80, 116]) {
+    const line = editor.render(width).at(-1);
+    const plain = stripVTControlCharacters(line);
+    const display = new xterm.Terminal({ cols: width, rows: 2, allowProposedApi: true });
+    await new Promise((resolve) => display.write(`${line}\x1b[2;1H\x1b[38;5;102mx`, resolve));
+    const expected = display.buffer.active.getLine(1).getCell(0);
+    for (const marker of ["20%", "26k", ...(width === 116 ? ["…"] : [])]) {
+      const column = visibleWidth(plain.slice(0, plain.indexOf(marker)));
+      const actual = display.buffer.active.getLine(0).getCell(column);
+      check(
+        `${marker} keeps its Vinci dim foreground after fitting to ${width}`,
+        actual.getFgColorMode() === expected.getFgColorMode() && actual.getFgColor() === expected.getFgColor(),
+      );
+    }
+    display.dispose();
+  }
+} finally {
+  resetCapabilitiesCache();
+  for (const [key, value] of footerEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
 function footerAt(width) {
   const line = editor.render(width).at(-1);
   assert.equal(visibleWidth(line), width, `footer must use exactly ${width} terminal cells`);
@@ -341,23 +380,6 @@ for (const width of [80, 116, 80, 116]) {
   check(`footer keeps complete metrics after resize to ${width}`, /20% full · ↓ 26k ╯$/.test(line));
   check(`footer keeps mode and model at ${width}`, line.includes("▶ AUTO  ·  Offline UI QA"));
   if (width === 116) check("over-budget full path is visibly ellipsized", line.includes("…"));
-}
-
-for (const width of [80, 116]) {
-  const line = editor.render(width).at(-1);
-  const plain = stripVTControlCharacters(line);
-  const display = new xterm.Terminal({ cols: width, rows: 2, allowProposedApi: true });
-  await new Promise((resolve) => display.write(`${line}\x1b[2;1H${theme.fg("dim", "x")}`, resolve));
-  const expected = display.buffer.active.getLine(1).getCell(0);
-  for (const marker of ["20%", "26k", ...(width === 116 ? ["…"] : [])]) {
-    const column = visibleWidth(plain.slice(0, plain.indexOf(marker)));
-    const actual = display.buffer.active.getLine(0).getCell(column);
-    check(
-      `${marker} keeps its dim foreground after fitting to ${width}`,
-      actual.getFgColorMode() === expected.getFgColorMode() && actual.getFgColor() === expected.getFgColor(),
-    );
-  }
-  display.dispose();
 }
 
 for (const cwd of [
@@ -401,6 +423,44 @@ footerContext.getContextUsage = () => ({ percent: 20, tokens: null });
 check("unknown tokens preserve the complete known percentage", /20% full ╯$/.test(footerAt(80)));
 footerContext.getContextUsage = () => ({ percent: null, tokens: null });
 check("unknown context renders no invented or partial metric", !/full|↓|null/.test(footerAt(116)));
-await emit("session_shutdown", {});
+const beforeTty = [process.stdin, process.stdout].map((stream) => Object.getOwnPropertyDescriptor(stream, "isTTY"));
+const beforeCI = process.env.CI;
+const pulseTimers = new Map();
+globalThis.setInterval = (callback, delay) => {
+  const timer = { callback };
+  pulseTimers.set(timer, delay);
+  return timer;
+};
+globalThis.clearInterval = (timer) => pulseTimers.delete(timer);
+try {
+  for (const [tty, ci, expected] of [[true, "0", 1], [true, "true", 0], [false, "0", 0]]) {
+    for (const stream of [process.stdin, process.stdout]) Object.defineProperty(stream, "isTTY", { value: tty, configurable: true });
+    process.env.CI = ci;
+    await emit("agent_start", {});
+    check(`TTY=${tty}, CI=${ci} starts ${expected} pulse timers`, pulseTimers.size === expected);
+    if (expected) check("the shell schedules one 260 ms pulse", [...pulseTimers.values()][0] === 260);
+    uiState.setVinciPromptState("approval");
+    check("approval stops pulse and shows the state", pulseTimers.size === 0 &&
+      stripVTControlCharacters(editor.render(80)[1]).includes("Needs your OK"));
+    uiState.setVinciPromptState("input");
+    check("ordinary input wait keeps its own state", pulseTimers.size === 0 &&
+      stripVTControlCharacters(editor.render(80)[1]).includes("Waiting for you"));
+    uiState.setVinciPromptState(undefined);
+    check("Thinking is visible after returning to work", stripVTControlCharacters(editor.render(80)[1]).includes("Thinking"));
+    await emit("agent_end", {});
+    check("completion disposes the pulse", pulseTimers.size === 0);
+  }
+  await emit("session_shutdown", {});
+  check("shutdown leaves no pulse timer", pulseTimers.size === 0);
+} finally {
+  globalThis.setInterval = originalSetInterval;
+  globalThis.clearInterval = originalClearInterval;
+  for (const [index, stream] of [process.stdin, process.stdout].entries()) {
+    if (beforeTty[index]) Object.defineProperty(stream, "isTTY", beforeTty[index]);
+    else Reflect.deleteProperty(stream, "isTTY");
+  }
+  if (beforeCI === undefined) delete process.env.CI;
+  else process.env.CI = beforeCI;
+}
 
 console.log(`\nshell-integration: ${pass}/${pass} checks passed (semantic activity, pulse, and footer layout)`);

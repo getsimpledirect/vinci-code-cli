@@ -7,7 +7,7 @@ import { keyHint } from "./keybinding-hints.ts";
 
 const URL_CONTROL_BYTES = /[\x00-\x1f\x7f-\x9f]/;
 
-function isSupportedSignInUrl(target: unknown, allowLocalFileLinks: boolean): target is string {
+export function isSupportedSignInUrl(target: unknown, allowLocalFileLinks: boolean): target is string {
 	if (
 		typeof target !== "string" ||
 		target.trim() !== target ||

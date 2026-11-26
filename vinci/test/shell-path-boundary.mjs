@@ -42,6 +42,7 @@ const terminal = new VirtualTerminal(140, 20);
 const tui = new TUI(terminal);
 let editor;
 const footerContext = {
+  mode: "tui",
   cwd: process.cwd(),
   model: { name: "Offline UI QA" },
   getContextUsage: () => ({ percent: 20, tokens: 26_000 }),
@@ -55,6 +56,36 @@ const footerContext = {
     },
   },
 };
+
+await test("shell footer skips editor installation in print mode", async () => {
+  let editorInstalled = false;
+  await emit("session_start", {}, {
+    ...footerContext,
+    mode: "print",
+    ui: {
+      ...footerContext.ui,
+      setEditorComponent() {
+        editorInstalled = true;
+      },
+    },
+  });
+  assert.equal(editorInstalled, false, "print mode must not install a shell editor");
+});
+
+await test("shell footer skips editor installation in rpc mode", async () => {
+  let editorInstalled = false;
+  await emit("session_start", {}, {
+    ...footerContext,
+    mode: "rpc",
+    ui: {
+      ...footerContext.ui,
+      setEditorComponent() {
+        editorInstalled = true;
+      },
+    },
+  });
+  assert.equal(editorInstalled, false, "rpc mode must not install a shell editor");
+});
 
 await emit("session_start", {}, footerContext);
 

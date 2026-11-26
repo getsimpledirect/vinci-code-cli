@@ -107,14 +107,19 @@ controls around each negative.
 
 ## Terminal Presentation
 
-Vero uses the original approved artwork from the provenance manifest in `assets/vero/`.
-The compact header and composer retain explicit task state and next action. The image
-slot has a fixed height as poses change, and the receipt remains the evidence for any
-completion or verification claim. Text output, transcripts, `/copy` and exports do not
-contain presentation artwork.
+The header uses the **Vinci Code** text wordmark and shows the environment badge on
+the connection row. The composer border shows the work state. `VINCI_ASCII=1`,
+`TERM=linux` and non-UTF-8 locales use ASCII punctuation and borders.
 
-Use `VINCI_REDUCED_MOTION=1` for a static indicator. `NO_COLOR`, `TERM=dumb`,
-`VINCI_PLAIN=1` and `VINCI_SCREEN_READER=1` disable decorative images and the pulse and
-select the plain compact header. `VINCI_ASCII_WORDMARK=1` retains its original font
-fallback and suppresses images; it does not imply reduced motion. For plain logs use
-the existing noninteractive text mode; JSON/JSONL remain machine output.
+`NO_COLOR` (including an empty value) and `--no-color` remove colour only.
+The rich layout and motion settings still apply.
+
+`TERM=dumb`, `VINCI_PLAIN=1` and `VINCI_SCREEN_READER=1` give interactive sessions
+append-only text, numbered choices and state updates without escape bytes. Non-TTY
+streams, `-p`/`--print`, JSON and RPC keep their requested output without escape
+bytes or startup decoration.
+
+Use `VINCI_REDUCED_MOTION=1` for a steady activity mark. An enabled `CI` also
+disables animation on a PTY. CI checks the trimmed, case-insensitive environment
+value and treats empty, `0`, `false`, `no` and `off` as disabled. Plain and non-TTY
+output have no animation.
